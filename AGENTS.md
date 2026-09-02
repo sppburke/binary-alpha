@@ -54,7 +54,7 @@ Protect credentials, broker and account material, proprietary source data, locke
 
 ## Engineering
 
-Preserve intent and record scope changes. Extend the semantic owner and every affected consumer; fix the evidenced class, not one example. Compare the strongest simpler repository-native alternative and the strongest complete alternative, then choose the minimum complete design. Add safeguards, fallbacks, or redundancy only for a binding contract or direct current-revision evidence. Preserve dirty user work, avoid unrelated refactors, run focused then broad gates, and bind proof to an exact clean commit.
+Preserve intent and record scope changes. Extend the semantic owner and every affected consumer; fix the evidenced class, not one example. Among materially distinct, evidence-supported repository-native options, compare the strongest simpler reuse and strongest complete alternative, then choose the smallest complete resolution that preserves correctness and intent while minimizing new code, ownership, blast radius, and implementation time; do not accept a locally convenient design when another complete option is better on those grounds. Add safeguards, fallbacks, or redundancy only for a binding contract or direct current-revision evidence. Preserve dirty user work, avoid unrelated refactors, run focused then broad gates, and bind proof to an exact clean commit.
 
 A third-party package requires explicit authorization in the reviewed issue, evidence that the standard library and current packages are insufficient, checked-in manifest and lockfile ownership, and compile or import proof at the reviewed commit. A machine-local installation is not portable evidence.
 
