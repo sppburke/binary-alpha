@@ -50,10 +50,13 @@ fn checked_in_example_and_its_equivalent_produce_the_fixed_report() {
 
 #[test]
 fn the_report_validates_to_itself() {
-    let report = String::from_utf8(validate(&example()).stdout).unwrap();
+    let first = validate(&example());
     let path = format!("{}/report.toml", env!("CARGO_TARGET_TMPDIR"));
-    std::fs::write(&path, &report).unwrap();
-    assert_eq!(String::from_utf8(validate(&path).stdout).unwrap(), report);
+    std::fs::write(&path, &first.stdout).unwrap();
+    let second = validate(&path);
+    assert!(first.status.success() && second.status.success());
+    assert!(first.stderr.is_empty() && second.stderr.is_empty());
+    assert_eq!(second.stdout, first.stdout);
 }
 
 #[test]
