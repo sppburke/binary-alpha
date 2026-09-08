@@ -1,0 +1,4 @@
+# The same values as configs/example.toml with different order, spacing, and comments.
+
+run_mode   =   "research"   # trailing comment
+schema_version=1

@@ -1,0 +1,15 @@
+[workspace]
+resolver = "3"
+members = ["crates/engine", "crates/app"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.98.1"
+publish = false
+
+[workspace.dependencies]
+clap = { version = "4.6.6", default-features = false, features = ["std", "derive", "help", "usage", "error-context"] }
+serde = { version = "1.0.229", features = ["derive"] }
+sha2 = { version = "0.11.0", default-features = false }
+toml = "1.1.5"

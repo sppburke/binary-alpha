@@ -1,0 +1,5 @@
+# Binary Alpha configuration, schema version 1.
+# Only fields implemented by the current checkout appear here; see docs/contracts.md.
+# Credentials never appear in a configuration document.
+schema_version = 1
+run_mode = "research"
