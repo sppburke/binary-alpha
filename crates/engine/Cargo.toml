@@ -1,0 +1,10 @@
+[package]
+name = "binary-alpha-engine"
+description = "Neutral core of Binary Alpha: configuration validation and canonical configuration identity"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+serde.workspace = true
+sha2.workspace = true
+toml.workspace = true

@@ -1,0 +1,3 @@
+schema_version = 1
+run_mode = "research"
+retry_count = 3

@@ -1,0 +1,13 @@
+[package]
+name = "binary-alpha-app"
+description = "The binary-alpha executable: configuration loading and external adapters"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "binary-alpha"
+path = "src/main.rs"
+
+[dependencies]
+binary-alpha-engine = { path = "../engine" }
+clap.workspace = true
