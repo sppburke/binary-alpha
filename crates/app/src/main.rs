@@ -9,8 +9,8 @@ use clap::{Parser, Subcommand};
 #[derive(Parser)]
 #[command(
     name = "binary-alpha",
-    version,
-    about = "Binary-options research and execution system"
+    about = "Binary-options research and execution system",
+    disable_help_subcommand = true
 )]
 struct Cli {
     #[command(subcommand)]
@@ -20,6 +20,7 @@ struct Cli {
 #[derive(Subcommand)]
 enum Command {
     /// Inspect configuration documents.
+    #[command(disable_help_subcommand = true)]
     Config {
         #[command(subcommand)]
         command: ConfigCommand,

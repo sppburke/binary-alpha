@@ -19,6 +19,10 @@ fn fixture(name: &str) -> String {
     format!("{}/tests/fixtures/{name}", env!("CARGO_MANIFEST_DIR"))
 }
 
+fn example() -> String {
+    format!("{}/../../configs/example.toml", env!("CARGO_MANIFEST_DIR"))
+}
+
 #[test]
 fn help_names_the_config_command() {
     let output = binary_alpha(&["--help"]);
@@ -28,8 +32,7 @@ fn help_names_the_config_command() {
 
 #[test]
 fn checked_in_example_and_its_equivalent_produce_the_fixed_report() {
-    let example = format!("{}/../../configs/example.toml", env!("CARGO_MANIFEST_DIR"));
-    for path in [example, fixture("equivalent.toml")] {
+    for path in [example(), fixture("equivalent.toml")] {
         let output = validate(&path);
         assert!(
             output.status.success(),
@@ -46,26 +49,55 @@ fn checked_in_example_and_its_equivalent_produce_the_fixed_report() {
 }
 
 #[test]
+fn the_report_validates_to_itself() {
+    let report = String::from_utf8(validate(&example()).stdout).unwrap();
+    let path = format!("{}/report.toml", env!("CARGO_TARGET_TMPDIR"));
+    std::fs::write(&path, &report).unwrap();
+    assert_eq!(String::from_utf8(validate(&path).stdout).unwrap(), report);
+}
+
+#[test]
 fn invalid_documents_fail_with_field_specific_errors() {
     let cases = [
         (
             "missing_schema_version.toml",
+            "schema_version",
             "missing field `schema_version`",
         ),
-        ("missing_run_mode.toml", "missing field `run_mode`"),
+        (
+            "missing_run_mode.toml",
+            "run_mode",
+            "missing field `run_mode`",
+        ),
         (
             "unsupported_schema_version.toml",
+            "schema_version",
             "unsupported schema_version 2, expected 1",
         ),
-        ("unsupported_run_mode.toml", "unknown variant `browser`"),
-        ("unknown_field.toml", "unknown field `retry_count`"),
-        ("raw_secret.toml", "unknown field `api_token`"),
+        (
+            "schema_version_string.toml",
+            "schema_version",
+            "expected u32",
+        ),
+        (
+            "unsupported_run_mode.toml",
+            "run_mode",
+            "unknown run_mode `browser`, expected one of `research`, `replay`, `paper`, `live`",
+        ),
+        ("run_mode_table.toml", "run_mode", "expected a string"),
+        (
+            "unknown_field.toml",
+            "retry_count",
+            "unknown field `retry_count`",
+        ),
+        ("raw_secret.toml", "api_token", "unknown field `api_token`"),
     ];
-    for (name, expected) in cases {
+    for (name, key, message) in cases {
         let output = validate(&fixture(name));
         let stderr = String::from_utf8(output.stderr).unwrap();
         assert_eq!(output.status.code(), Some(1), "{name}");
         assert!(output.stdout.is_empty(), "{name}");
-        assert!(stderr.contains(expected), "{name}: {stderr}");
+        assert!(stderr.contains(key), "{name}: {stderr}");
+        assert!(stderr.contains(message), "{name}: {stderr}");
     }
 }

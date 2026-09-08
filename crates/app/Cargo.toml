@@ -3,8 +3,6 @@ name = "binary-alpha-app"
 description = "The binary-alpha executable: configuration loading and external adapters"
 version.workspace = true
 edition.workspace = true
-rust-version.workspace = true
-publish.workspace = true
 
 [[bin]]
 name = "binary-alpha"

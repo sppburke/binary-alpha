@@ -40,8 +40,9 @@ canonical record order, so the merged sequence is reproducible.
 `Tick` and `Bar` are distinct records. A source declares which of them it can provide. There is no
 universal market event with optional fields, and no implicit conversion from bars to ticks. A
 bar-only source cannot satisfy a request that needs a tick path, a tick count, an entry tick, or tick
-settlement. An instrument is a neutral typed identifier bound to a broker, a provider symbol, and a
-base and quote currency; the owning phase records its observed profile rather than assuming one.
+settlement. An instrument is a neutral typed identifier bound to a broker and a provider symbol; the
+owning phase declares its currency metadata and records its observed profile rather than assuming
+one.
 
 ## Currency and money
 
@@ -101,9 +102,20 @@ and content hash; the application package owns reading it from a path.
 | `schema_version` | integer | `1` |
 | `run_mode` | string | `research`, `replay`, `paper`, `live` |
 
-Both fields are required. Any other field is rejected as unknown, so a raw secret value has no place
-to live: credentials are always references that the application resolves outside the document. Each
-later phase adds the fields it implements to this table.
+Both fields are required and have no defaults. Any other field is rejected as unknown, so a raw
+secret value has no place to live.
+
+### Deferred entries
+
+The envelope will also carry lists of brokers, accounts, instruments, candle definitions, feature
+definitions, contract terms, research splits, objectives, risk policies, storage settings, and live
+settings. The phase that first consumes each one adds it to the table above together with its
+validation: neutral typed identifiers rather than strings with implicit meaning; durations and times
+with explicit units; currency-bearing exact amounts parsed from decimal text without binary floating
+point; credentials only as references that the application resolves outside the document; and
+rejection of duplicate identifiers, invalid references, unsupported combinations, and any value that
+would relax causal ordering, holdout isolation, or a financial invariant. None of these exists in
+the current checkout.
 
 ### Run modes
 
@@ -130,6 +142,8 @@ digits. Any change to the hash input or to the canonical form increments the ver
 
 `binary-alpha config validate --config PATH` writes to standard output the line
 `# content-hash: v1:sha256:...` terminated by a line feed, then the canonical document, and exits
-with status 0. It writes nothing else and mutates nothing. On failure it writes one field-specific error with the line
-and column to standard error and exits with status 1. Validating the canonical output again yields
-the same canonical document and hash.
+with status 0. It writes nothing else and mutates nothing. On failure it writes nothing to standard
+output, writes one diagnostic to standard error, and exits with status 1: a document error names the
+offending or missing key and, for a present value, its line and column; an unreadable path is
+reported with the operating-system error. Validating the canonical output again yields the same
+canonical document and hash.

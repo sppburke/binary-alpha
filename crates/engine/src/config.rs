@@ -2,13 +2,12 @@
 //!
 //! `docs/contracts.md`, section "Configuration", is the normative description of every rule here.
 
-use std::fmt;
-
-use serde::{Deserialize, Serialize};
+use serde::de::Error as _;
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use sha2::{Digest, Sha256};
 
 /// Domain separator hashed before the canonical document; changing it or the canonical form
-/// increments the version rendered by [`ContentHash`].
+/// increments the `v1` prefix rendered by [`Config::content_hash`].
 const HASH_DOMAIN_V1: &[u8] = b"binary-alpha config hash v1\n";
 
 /// A validated configuration document.
@@ -32,8 +31,8 @@ impl Config {
     /// assert_eq!(config.run_mode, RunMode::Research);
     /// assert!(Config::parse("schema_version = 1\nrun_mode = \"research\"\napi_token = \"x\"\n").is_err());
     /// ```
-    pub fn parse(source: &str) -> Result<Self, Error> {
-        toml::from_str(source).map_err(Error)
+    pub fn parse(source: &str) -> Result<Self, toml::de::Error> {
+        toml::from_str(source)
     }
 
     /// The canonical TOML document: schema field order, standard formatting, no comments.
@@ -41,12 +40,18 @@ impl Config {
         toml::to_string(self).expect("a validated configuration serializes")
     }
 
-    /// The version-one content hash of the canonical document.
-    pub fn content_hash(&self) -> ContentHash {
+    /// The version-one content hash of the canonical document, rendered as `v1:sha256:`
+    /// followed by sixty-four lowercase hexadecimal digits.
+    pub fn content_hash(&self) -> String {
         let mut hasher = Sha256::new();
         hasher.update(HASH_DOMAIN_V1);
         hasher.update(self.canonical_toml().as_bytes());
-        ContentHash(hasher.finalize().into())
+        let digits: String = hasher
+            .finalize()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        format!("v1:sha256:{digits}")
     }
 }
 
@@ -73,8 +78,7 @@ impl From<SchemaVersion> for u32 {
 }
 
 /// The run mode a configuration is written for; it selects capabilities, never semantics.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
-#[serde(rename_all = "snake_case")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RunMode {
     Research,
     Replay,
@@ -82,54 +86,61 @@ pub enum RunMode {
     Live,
 }
 
-/// A version-one content hash, rendered as `v1:sha256:` followed by sixty-four hexadecimal digits.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ContentHash([u8; 32]);
+impl RunMode {
+    const ALL: [Self; 4] = [Self::Research, Self::Replay, Self::Paper, Self::Live];
 
-impl fmt::Display for ContentHash {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("v1:sha256:")?;
-        self.0.iter().try_for_each(|byte| write!(f, "{byte:02x}"))
+    /// The spelling accepted and emitted in a configuration document.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Research => "research",
+            Self::Replay => "replay",
+            Self::Paper => "paper",
+            Self::Live => "live",
+        }
     }
 }
 
-/// A field-specific validation error carrying the offending line and column.
-#[derive(Debug)]
-pub struct Error(toml::de::Error);
-
-impl fmt::Display for Error {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        self.0.fmt(f)
+impl Serialize for RunMode {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.as_str())
     }
 }
 
-impl std::error::Error for Error {}
+/// Accepts only a string; a derived enum deserializer would also accept a single-key table.
+impl<'de> Deserialize<'de> for RunMode {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let name = String::deserialize(deserializer)?;
+        Self::ALL
+            .into_iter()
+            .find(|mode| mode.as_str() == name)
+            .ok_or_else(|| {
+                let expected = Self::ALL
+                    .map(|mode| format!("`{}`", mode.as_str()))
+                    .join(", ");
+                D::Error::custom(format!(
+                    "unknown run_mode `{name}`, expected one of {expected}"
+                ))
+            })
+    }
+}
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    const CANONICAL: &str = "schema_version = 1\nrun_mode = \"research\"\n";
-    const HASH: &str = "v1:sha256:c62f3b3e1a61e1897c2c08f5d39db1e2b7aa8e96229623c73affb9a1862b7e2d";
-
     #[test]
-    fn equivalent_documents_share_canonical_form_and_hash() {
-        let reordered = "# comment\nrun_mode = \"research\" # trailing\n\nschema_version=1\n";
-        for source in [CANONICAL, reordered] {
-            let config = Config::parse(source).unwrap();
-            assert_eq!(config.canonical_toml(), CANONICAL);
-            assert_eq!(config.content_hash().to_string(), HASH);
+    fn every_run_mode_has_one_canonical_form_and_the_example_hash_is_fixed() {
+        for mode in RunMode::ALL {
+            let name = mode.as_str();
+            let source =
+                format!("# comment\nrun_mode = \"{name}\" # trailing\n\nschema_version=1\n");
+            let canonical = format!("schema_version = 1\nrun_mode = \"{name}\"\n");
+            assert_eq!(Config::parse(&source).unwrap().canonical_toml(), canonical);
         }
-    }
-
-    #[test]
-    fn unsupported_schema_version_is_rejected_with_its_value() {
-        let error = Config::parse("schema_version = 2\nrun_mode = \"research\"\n").unwrap_err();
-        assert!(
-            error
-                .to_string()
-                .contains("unsupported schema_version 2, expected 1"),
-            "{error}"
+        let research = Config::parse("schema_version = 1\nrun_mode = \"research\"\n").unwrap();
+        assert_eq!(
+            research.content_hash(),
+            "v1:sha256:c62f3b3e1a61e1897c2c08f5d39db1e2b7aa8e96229623c73affb9a1862b7e2d"
         );
     }
 }
