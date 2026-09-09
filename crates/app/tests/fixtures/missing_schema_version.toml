@@ -1,1 +1,5 @@
 run_mode = "research"
+
+[storage]
+historical_data_dir = "../historical_data"
+publication_uri = "gs://example-bucket/historical"

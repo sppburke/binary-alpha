@@ -1,10 +1,11 @@
 [package]
 name = "binary-alpha-engine"
-description = "Neutral core of Binary Alpha: configuration validation and canonical configuration identity"
+description = "Neutral core of Binary Alpha: configuration, immutable market records, dataset manifests, and their identities"
 version.workspace = true
 edition.workspace = true
 
 [dependencies]
 serde.workspace = true
+serde_json.workspace = true
 sha2.workspace = true
 toml.workspace = true

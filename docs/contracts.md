@@ -1,8 +1,9 @@
 # System contracts
 
-These contracts bind every phase of Binary Alpha. The current checkout implements only the
-[configuration](#configuration) section; the other sections are frozen now so that later phases
-implement them once, in one place, without reinterpretation. Specification intent, checkout
+These contracts bind every phase of Binary Alpha. The current checkout implements the
+[configuration](#configuration) and [historical datasets](#historical-datasets) sections; the other
+sections are frozen now so that later phases implement them once, in one place, without
+reinterpretation. Specification intent, checkout
 implementation, observed runtime state, immutable measured artifacts, and hosted Git state are
 distinct kinds of truth and are never substituted for one another.
 
@@ -33,16 +34,19 @@ one, a local receipt sequence that is monotonic per source, the parser and adapt
 payload identity. Gaps, duplicates, stale data, reconnects, backpressure, and reconciliation are
 recorded as explicit events with their clocks; none is silent, and none is repaired by fabrication.
 Cross-source merges order by provider event time, then a configured stable source order, then a
-canonical record order, so the merged sequence is reproducible.
+canonical record order, so the merged sequence is reproducible. Historical inputs imported from
+existing files carry no observed receipt metadata: their local receipt time and receipt sequence
+are unavailable and are never fabricated. Live ingestion retains local receipt sequencing.
 
 ## Instruments, ticks, and bars
 
 `Tick` and `Bar` are distinct records. A source declares which of them it can provide. There is no
 universal market event with optional fields, and no implicit conversion from bars to ticks. A
 bar-only source cannot satisfy a request that needs a tick path, a tick count, an entry tick, or tick
-settlement. An instrument is a neutral typed identifier bound to a broker and a provider symbol; the
-owning phase declares its currency metadata and records its observed profile rather than assuming
-one.
+settlement. An instrument is a neutral typed identifier bound to a broker and a provider symbol,
+rendered `BROKER:PROVIDER_SYMBOL`; both parts are non-empty and contain no ASCII control character.
+The owning phase declares its currency metadata and records its observed profile rather than
+assuming one.
 
 ## Currency and money
 
@@ -101,15 +105,27 @@ and content hash; the application package owns reading it from a path.
 | --- | --- | --- |
 | `schema_version` | integer | `1` |
 | `run_mode` | string | `research`, `replay`, `paper`, `live` |
+| `storage.historical_data_dir` | string | a non-empty path of the retained historical-data folder; a relative path resolves against the configuration file's directory |
+| `storage.publication_uri` | string | `gs://BUCKET` or `gs://BUCKET/PREFIX` in every run mode; `file:///ABSOLUTE/DIR` only with `run_mode = "research"`, as the non-live test boundary |
+| `import.sources` | array of tables | optional; consumed only by `data import`, which requires at least one entry |
 
-Both fields are required and have no defaults. Any other field is rejected as unknown, so a raw
-secret value has no place to live.
+Every `import.sources` entry declares `kind`, `path` (a relative path resolves against the
+configuration file's directory), `broker`, and `role` (`development` or `evaluation`; `holdout` is
+rejected). Kind `tick_csv` names one native tick file and also declares `provider_symbol`,
+`source_symbol` (the symbol text every row must carry), and `price_scale` (`0` to `18`). Kind
+`bar_parquet_collection` names one collection root and also declares `manifest` (the collection
+manifest inside that root) and an optional `provenance` list of further files inside that root.
+`manifest` and `provenance` entries contain only normal path components. Broker and symbol values
+are non-empty and contain no ASCII control character. Duplicate source paths are rejected.
+
+Every field is required and has no default, except that the `import` table and the `provenance`
+list may be absent. Any other field is rejected as unknown, so a raw secret value has no place to
+live. Validation opens no source or destination and mutates nothing.
 
 ### Deferred entries
 
 The envelope will also carry lists of brokers, accounts, instruments, candle definitions, feature
-definitions, contract terms, research splits, objectives, risk policies, storage settings, and live
-settings. The phase that first consumes each one adds it to the table above together with its
+definitions, contract terms, research splits, objectives, risk policies, and live settings. The phase that first consumes each one adds it to the table above together with its
 validation: neutral typed identifiers rather than strings with implicit meaning; durations and times
 with explicit units; currency-bearing exact amounts parsed from decimal text without binary floating
 point; credentials only as references that the application resolves outside the document; and
@@ -129,21 +145,130 @@ checkout validates the value and executes no mode.
 
 The canonical document serializes the validated configuration with keys in the schema-table order,
 one key per line, standard TOML formatting, double-quoted strings, no comments, and a trailing
-newline. Two documents with the same values have the same canonical form regardless of key order,
-whitespace, or comments.
+newline. Top-level keys come first; the `[storage]` table and each `[[import.sources]]` entry follow
+in schema order, each introduced by one blank line and its header, with the entry's `kind` first
+and its remaining keys in the order of the table above. Two documents with the same values have the
+same canonical form regardless of key order, whitespace, or comments.
 
-### Content hash, version 1
+### Content hash, version 2
 
-The content hash is SHA-256 over the bytes `binary-alpha config hash v1`, one line feed, and the
-canonical document. It is rendered as `v1:sha256:` followed by sixty-four lowercase hexadecimal
+The content hash is SHA-256 over the bytes `binary-alpha config hash v2`, one line feed, and the
+canonical document. It is rendered as `v2:sha256:` followed by sixty-four lowercase hexadecimal
 digits. Any change to the hash input or to the canonical form increments the version prefix.
+Version 1 hashed the two-field envelope of the previous checkout under the domain
+`binary-alpha config hash v1`; a hash recorded under an earlier version is never reinterpreted.
 
 ### Validation output
 
 `binary-alpha config validate --config PATH` writes to standard output the line
-`# content-hash: v1:sha256:...` terminated by a line feed, then the canonical document, and exits
+`# content-hash: v2:sha256:...` terminated by a line feed, then the canonical document, and exits
 with status 0. It writes nothing else and mutates nothing. On failure it writes nothing to standard
 output, writes one diagnostic to standard error, and exits with status 1: a document error names the
 offending or missing key and, for a present value, its line and column; an unreadable path is
 reported with the operating-system error. Validating the canonical output again yields the same
 canonical document and hash.
+
+## Historical datasets
+
+The engine owns the immutable `Tick` and `Bar` records, dataset roles, source capabilities,
+instrument identity, generation identity, and the ready manifest; the application owns reading
+sources, the retained historical-data folder, publication, and verification.
+
+### Layout and identity
+
+Every retained or published object is content-addressed at the relative key `objects/SHA256HEX`
+beneath both the historical-data folder and the publication destination. A generation's identity is
+the SHA-256, rendered as sixty-four lowercase hexadecimal digits, of the UTF-8 text
+`binary-alpha dataset generation v1`, one line feed, then the broker, provider symbol, source kind,
+and role each followed by one line feed, then the price scale and one line feed for tick sources,
+then one line `ROLE`, tab, `PATH`, tab, `SHA256HEX`, tab, `BYTES`, line feed per input object sorted
+by path, where `ROLE` is `source` or `provenance` and `PATH` is the object's path relative to its
+dataset root. Normalized outputs are not part of the identity, so equal inputs always name the same
+generation. Its ready manifest lives at `manifests/GENERATION/ready.json` beneath the same two roots
+and is the sole publication record; there is no other catalog or authority. Object paths, broker, and
+provider symbol contain no ASCII control character.
+
+### Ready manifest
+
+The ready manifest is pretty-printed JSON with two-space indentation, keys in the order below, and
+one trailing line feed. It records `schema_version` (`1`); `generation`; `broker`; `provider_symbol`;
+`instrument` (`BROKER:PROVIDER_SYMBOL`); `role`; `source_kind` (`tick_csv` or `bar_parquet`);
+`native_granularity` (`{"kind": "tick"}` or `{"kind": "bar", "period_seconds": N}`); `time_unit`
+(`microsecond` for ticks, `second` for bars); `price_representation`
+(`{"kind": "integer_units", "scale": N}` or `{"kind": "binary_float64"}`); `coverage` with
+`first_event_time` and `last_event_time` rendered as `YYYY-MM-DDTHH:MM:SS.ffffffZ`; `row_count`;
+`capabilities` (`["ticks"]` or `["bars"]`); `config_hash`; `code_revision` (the producing Git commit,
+`-dirty` appended for a dirty tree, or `unavailable`); `inputs` (every original input location with
+`bytes` and `sha256`); `interval` (the bar archive's contract with its `provenance`, `null` for
+ticks); and `objects`, each with `role` (`source`, `provenance`, or `normalized`), `path`, `key`,
+`bytes`, `sha256`, `crc32c`, and `generation`. The last two are the destination's values and are
+`null` when the destination is the filesystem implementation. Consumers derive every rejection from
+`capabilities`: a request for a capability the list lacks fails with a machine-readable reason that
+names the required capability, the provided list, the instrument, and the generation.
+
+### Tick sources
+
+A native tick file has the exact header `time_utc,symbol,price`. Every row carries the declared
+`source_symbol`; a timestamp `YYYY-MM-DDTHH:MM:SS[.fraction]Z` with at most six fraction digits,
+converted to Unix microseconds by integer arithmetic; and decimal price text converted directly into
+checked signed 64-bit units at the declared `price_scale`, rejecting overflow, non-numeric text, and
+more fraction digits than the scale. Rows keep their input order; backwards time and two rows at one
+timestamp with different units are rejected, while identical repeated rows are accepted once each.
+The normalized object `normalized/ticks.parquet` is Zstandard Parquet with the required `int64`
+columns `event_time_micros` (`TIMESTAMP(MICROS, true)`) and `price_units`, and file metadata
+`broker`, `provider_symbol`, `price_scale`, and `dataset_schema_version`. The raw file is retained
+byte-for-byte as the `source` object. No provider sequence, receipt sequence, or receipt time is
+fabricated.
+
+### Bar sources
+
+A collection manifest lists assets; each asset root lies inside the collection root and holds
+`dataset/` with the listed monthly Parquet files. Every listed file must carry exactly the archive
+schema (symbol, symbol identifier, timestamp, Unix seconds, server seconds, five doubles, period)
+with Zstandard column chunks. Embedded interval metadata, when present, must equal the declared
+contract; when absent, the collection manifest must declare the contract and its provenance, which
+the ready manifest preserves (`parquet_metadata` when every file embeds it). Per row: no nulls, the
+symbol equals the asset, one constant symbol identifier equal to the manifest's expected or recorded
+identifier, the period equals the declared one, finite prices and volume, non-negative volume, high
+at least the greater of open and close, low at most the lesser of open and close, Unix seconds on the
+period grid, the timestamp column equal to the Unix seconds, the server seconds minus the Unix
+seconds equal to the recorded server offset, and strictly increasing time across files in manifest
+order. Per-file rows and SHA-256 equal the manifest, and the total equals the recorded row count.
+The collection manifest must declare exactly the approved contract (left-closed, `5s`,
+`[timestamp,timestamp+5s)`, label `left`, offset `0`, origin `unix_epoch_utc`, semantics
+`bar_start`) and an expected or recorded symbol identifier for every asset. Listed files are
+`source` objects in manifest order; every other regular file beneath the asset root, the collection
+manifest, and the declared `provenance` files follow as `provenance` objects, the collection-level
+ones at `collection/NAME`. Symbolic links anywhere in the declared inventory are rejected. Parquet
+bytes are never re-encoded. A bar generation provides only `bars`.
+
+### Commands
+
+`binary-alpha data import --config PATH` enumerates only the declared inventory, rejects a source
+inside the historical-data folder or a `file://` destination and either of those inside a listed
+asset root before it enumerates or writes anything, hashes every input, retains each input in the
+historical-data folder while checking that the copied bytes still carry that identity, validates and
+normalizes each dataset from its retained copy, creates each missing destination object with a
+generation-match-zero precondition while verifying the returned size and checksum, reuses an
+identical existing object, fails on different content at the same key without replacing anything,
+publishes the ready manifest last, and mirrors it byte-for-byte into the historical-data folder. A
+ready manifest already at the destination is reused only after its recorded inputs match the
+declared ones, every committed child is present at the destination with its recorded size, checksum,
+and generation, and the retained folder holds every child; it writes one line per dataset to
+standard output: `published INSTRUMENT ROLE generation GENERATION rows N objects K reused R` followed
+either by `[hash S retain S validate S publish S]` stage durations in seconds or by
+`(already published)`.
+
+`binary-alpha data verify --manifest URI` accepts a `file://` or `gs://` location ending in
+`manifests/GENERATION/ready.json`, resolves object keys against the prefix before `manifests/`, reads
+every object from that store alone, and asserts byte count, SHA-256, and any recorded CRC32C against
+the bytes read; the store's own checksum and generation when the store reports them (only `gs://`
+reads do; for `file://` reads a recorded Google generation is provenance); and, for data objects,
+the reconstructed row count and coverage. A manifest is trusted only after its generation is
+sixty-four hexadecimal digits that match its recorded inputs, its keys are content-addressed, and
+its paths are unique and clean. It writes one line to standard output:
+`verified INSTRUMENT ROLE generation GENERATION rows N objects K bytes B`.
+
+Both commands exit with status 0 on success and, on any failure, write nothing further to standard
+output, write one diagnostic to standard error, and exit with status 1. Neither removes source files,
+retained objects, or published objects.

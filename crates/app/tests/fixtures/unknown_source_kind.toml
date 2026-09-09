@@ -1,0 +1,12 @@
+schema_version = 1
+run_mode = "research"
+
+[storage]
+historical_data_dir = "../historical_data"
+publication_uri = "file:///tmp/published"
+
+[[import.sources]]
+kind = "browser_capture"
+path = "ticks.csv"
+broker = "pocket_option"
+role = "development"

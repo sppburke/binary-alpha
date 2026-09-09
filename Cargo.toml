@@ -8,6 +8,10 @@ edition = "2024"
 
 [workspace.dependencies]
 clap = { version = "4.6.6", default-features = false, features = ["std", "derive", "help", "usage", "error-context"] }
+google-cloud-storage = "1.18.0"
+parquet = { version = "59.3.0", default-features = false, features = ["zstd"] }
 serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
 sha2 = { version = "0.11.0", default-features = false }
+tokio = { version = "1.53.1", features = ["macros", "rt-multi-thread", "fs", "io-util"] }
 toml = "1.1.5"
