@@ -823,3 +823,87 @@ fn validate_bars(
     }
     Ok((total, all_embedded))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use binary_alpha_engine::dataset::Coverage;
+    use binary_alpha_engine::market::{BrokerId, ProviderSymbol};
+
+    /// A tick manifest with one source object carrying the given destination metadata.
+    fn manifest(crc32c: Option<u32>, generation: Option<i64>) -> GenerationManifest {
+        let sha256 = "a".repeat(64);
+        GenerationManifest {
+            schema_version: MANIFEST_SCHEMA_VERSION,
+            generation: "g".repeat(64),
+            broker: BrokerId::try_from("b".to_string()).unwrap(),
+            provider_symbol: ProviderSymbol::try_from("s".to_string()).unwrap(),
+            instrument: "b:s".to_string(),
+            role: DatasetRole::Development,
+            source_kind: SourceKind::TickCsv,
+            native_granularity: NativeGranularity::Tick,
+            time_unit: TimeUnit::Microsecond,
+            price_representation: PriceRepresentation::IntegerUnits {
+                scale: PriceScale::try_from(6).unwrap(),
+            },
+            coverage: Coverage {
+                first_event_time: "1970-01-01T00:00:00.000000Z".to_string(),
+                last_event_time: "1970-01-01T00:00:01.000000Z".to_string(),
+            },
+            row_count: 2,
+            capabilities: vec![Capability::Ticks],
+            config_hash: String::new(),
+            code_revision: String::new(),
+            inputs: vec![],
+            interval: None,
+            objects: vec![ObjectRecord {
+                role: ObjectRole::Source,
+                path: "ticks.csv".to_string(),
+                key: object_key(&sha256),
+                bytes: 1,
+                sha256,
+                crc32c,
+                generation,
+            }],
+        }
+    }
+
+    #[test]
+    fn committed_manifests_must_match_the_fresh_result_and_reported_metadata() {
+        let identities = [ObjectIdentity {
+            bytes: 1,
+            sha256: "a".repeat(64),
+            crc32c: 7,
+        }];
+        let filesystem = manifest(None, None);
+        let google = manifest(Some(7), Some(3));
+        assert!(same_result(&manifest(None, None), &filesystem, &identities));
+        assert!(
+            same_result(&manifest(Some(7), Some(3)), &filesystem, &identities),
+            "Google provenance in a filesystem mirror is compared against the bytes only"
+        );
+        assert!(
+            !same_result(&manifest(Some(8), None), &filesystem, &identities),
+            "a recorded checksum must match the bytes"
+        );
+        assert!(same_result(
+            &manifest(Some(7), Some(3)),
+            &google,
+            &identities
+        ));
+        assert!(
+            !same_result(&manifest(None, Some(3)), &google, &identities),
+            "a checksum the destination reports must be recorded"
+        );
+        assert!(
+            !same_result(&manifest(Some(7), Some(4)), &google, &identities),
+            "a reported generation must match the record"
+        );
+        let mut rows = manifest(None, None);
+        rows.row_count += 1;
+        assert!(!same_result(&rows, &filesystem, &identities));
+        let mut role = manifest(None, None);
+        role.role = DatasetRole::Evaluation;
+        assert!(!same_result(&role, &filesystem, &identities));
+    }
+}
