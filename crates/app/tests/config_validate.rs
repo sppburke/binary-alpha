@@ -2,7 +2,7 @@
 
 use std::process::{Command, Output};
 
-const EXPECTED_REPORT: &str = "# content-hash: v1:sha256:c62f3b3e1a61e1897c2c08f5d39db1e2b7aa8e96229623c73affb9a1862b7e2d\nschema_version = 1\nrun_mode = \"research\"\n";
+const EXPECTED_REPORT: &str = "# content-hash: v2:sha256:285c28bd02de8cbc1669602b0c651fe0599ea64dd762d78b1d3bb1b895e4b01a\nschema_version = 1\nrun_mode = \"research\"\n\n[storage]\nhistorical_data_dir = \"../historical_data\"\npublication_uri = \"gs://example-bucket/historical\"\n";
 
 fn binary_alpha(args: &[&str]) -> Output {
     Command::new(env!("CARGO_BIN_EXE_binary-alpha"))
@@ -24,10 +24,13 @@ fn example() -> String {
 }
 
 #[test]
-fn help_names_the_config_command() {
+fn help_names_every_command() {
     let output = binary_alpha(&["--help"]);
     assert!(output.status.success());
-    assert!(String::from_utf8(output.stdout).unwrap().contains("config"));
+    let help = String::from_utf8(output.stdout).unwrap();
+    assert!(help.contains("config") && help.contains("data"));
+    let data = String::from_utf8(binary_alpha(&["data", "--help"]).stdout).unwrap();
+    assert!(data.contains("import") && data.contains("verify"));
 }
 
 #[test]
@@ -94,6 +97,47 @@ fn invalid_documents_fail_with_field_specific_errors() {
             "unknown field `retry_count`",
         ),
         ("raw_secret.toml", "api_token", "unknown field `api_token`"),
+        ("missing_storage.toml", "storage", "missing field `storage`"),
+        (
+            "missing_publication_uri.toml",
+            "publication_uri",
+            "missing field `publication_uri`",
+        ),
+        (
+            "unsupported_publication_uri.toml",
+            "publication_uri",
+            "must start with `gs://` or `file:///`",
+        ),
+        (
+            "file_destination_outside_research.toml",
+            "storage.publication_uri",
+            "requires run_mode `research`, not `replay`",
+        ),
+        (
+            "holdout_source.toml",
+            "import.sources[0].role",
+            "holdout data is never an import input",
+        ),
+        (
+            "unknown_source_kind.toml",
+            "kind",
+            "unknown variant `browser_capture`, expected `tick_csv` or `bar_parquet_collection`",
+        ),
+        (
+            "escaping_manifest.toml",
+            "import.sources[0].manifest",
+            "must stay inside its root",
+        ),
+        (
+            "control_character_symbol.toml",
+            "import.sources",
+            "contains a control character",
+        ),
+        (
+            "price_scale_too_large.toml",
+            "import.sources",
+            "price_scale 19 exceeds 18",
+        ),
     ];
     for (name, key, message) in cases {
         let output = validate(&fixture(name));

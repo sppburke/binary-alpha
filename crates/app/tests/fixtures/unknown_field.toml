@@ -1,3 +1,7 @@
 schema_version = 1
 run_mode = "research"
 retry_count = 3
+
+[storage]
+historical_data_dir = "../historical_data"
+publication_uri = "gs://example-bucket/historical"

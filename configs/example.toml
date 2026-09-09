@@ -3,3 +3,10 @@
 # Credentials never appear in a configuration document.
 schema_version = 1
 run_mode = "research"
+
+[storage]
+# A relative path resolves against this file's directory: the repository-local historical_data folder.
+historical_data_dir = "../historical_data"
+# Google Cloud Storage is production truth in every run mode; the bucket name is illustrative and
+# the client resolves Application Default Credentials outside this document.
+publication_uri = "gs://example-bucket/historical"

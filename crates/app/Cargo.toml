@@ -1,6 +1,6 @@
 [package]
 name = "binary-alpha-app"
-description = "The binary-alpha executable: configuration loading and external adapters"
+description = "The binary-alpha executable: configuration loading, historical-data import and verification, and external adapters"
 version.workspace = true
 edition.workspace = true
 
@@ -11,3 +11,9 @@ path = "src/main.rs"
 [dependencies]
 binary-alpha-engine = { path = "../engine" }
 clap.workspace = true
+google-cloud-storage.workspace = true
+parquet.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+tokio.workspace = true

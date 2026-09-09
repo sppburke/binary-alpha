@@ -1,6 +1,5 @@
-schema_version = 2
+schema_version = 1
 run_mode = "research"
 
 [storage]
 historical_data_dir = "../historical_data"
-publication_uri = "gs://example-bucket/historical"

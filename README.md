@@ -8,9 +8,10 @@ Document Object Model, Chrome DevTools Protocol, profile, cookie, or click-execu
 ## Modes
 
 The configuration vocabulary freezes four run modes: `research`, `replay`, `paper`, and `live` (see
-[docs/contracts.md](docs/contracts.md)). The current checkout validates configuration documents and
-executes no mode. Browser-driven operation, click execution, and any live, paper, certification,
-deployment, or production action without its own authorization are unsupported.
+[docs/contracts.md](docs/contracts.md)). The current checkout validates configuration documents,
+imports existing historical data into immutable published generations, and verifies them; it executes
+no mode. Browser-driven operation, click execution, and any live, paper, certification, deployment,
+or production action without its own authorization are unsupported.
 
 ## Build and entry points
 
@@ -19,11 +20,19 @@ rustup toolchain install        # installs the toolchain pinned in rust-toolchai
 cargo build --workspace --locked
 cargo run --locked -p binary-alpha-app -- --help
 cargo run --locked -p binary-alpha-app -- config validate --config configs/example.toml
+cargo run --release --locked -p binary-alpha-app -- data import --config PATH
+cargo run --release --locked -p binary-alpha-app -- data verify --manifest URI
 ```
 
-`binary-alpha --help` and `binary-alpha config validate --config PATH` are the only commands.
-Validation prints the content hash and the canonical document to standard output and mutates
-nothing. Verification runs `cargo fmt --all --check`,
+`binary-alpha config validate --config PATH` prints the content hash and the canonical document to
+standard output and mutates nothing. `binary-alpha data import --config PATH` copies the declared
+sources into the retained historical-data folder named by `storage.historical_data_dir`, normalizes
+ticks, validates bars, publishes every object and one ready manifest per dataset to
+`storage.publication_uri`, and mirrors the manifest locally; `binary-alpha data verify --manifest URI`
+re-reads one generation from its manifest and objects alone. Both are documented in
+[docs/contracts.md](docs/contracts.md) and [docs/operations.md](docs/operations.md). The example
+configuration retains data in the repository-local `historical_data/` folder, which Git ignores.
+Verification runs `cargo fmt --all --check`,
 `cargo clippy --workspace --all-targets --all-features --locked -- -D warnings`,
 `cargo test --workspace --all-features --locked`, and `cargo build --workspace --locked`; the
 workflow in `.github/workflows/ci.yml` runs the same commands plus the validation of
@@ -33,8 +42,8 @@ workflow in `.github/workflows/ci.yml` runs the same commands plus the validatio
 
 | Path | Owns |
 | --- | --- |
-| `crates/engine` | Package `binary-alpha-engine`: configuration validation and canonical configuration identity. No files, network, cloud, broker, command-line, or device calls. |
-| `crates/app` | Package `binary-alpha-app`: the `binary-alpha` executable, configuration loading, and all external adapters. |
+| `crates/engine` | Package `binary-alpha-engine`: configuration validation and identity, immutable tick and bar records, dataset roles and capabilities, generation identity, and ready manifests. No files, network, cloud, broker, command-line, or device calls. |
+| `crates/app` | Package `binary-alpha-app`: the `binary-alpha` executable, configuration loading, historical-data import and verification, Parquet input and output, the filesystem and Google Cloud Storage artifact stores, and all other external adapters. |
 | `configs/example.toml` | The checked-in example configuration; it contains only implemented fields and no credentials. |
 | `docs/` | [architecture](docs/architecture.md), [contracts](docs/contracts.md), [migration map](docs/migration-map.md), and [operations](docs/operations.md). |
 

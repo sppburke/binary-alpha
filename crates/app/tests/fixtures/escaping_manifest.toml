@@ -1,0 +1,13 @@
+schema_version = 1
+run_mode = "research"
+
+[storage]
+historical_data_dir = "../historical_data"
+publication_uri = "file:///tmp/published"
+
+[[import.sources]]
+kind = "bar_parquet_collection"
+path = "/data/bars"
+broker = "pocket_option"
+role = "development"
+manifest = "../collection.json"
