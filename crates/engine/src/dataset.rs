@@ -106,6 +106,47 @@ pub struct IntervalContract {
     pub provenance: String,
 }
 
+impl IntervalContract {
+    /// The exact contract this checkout admits: left-closed five-second bars whose timestamp is
+    /// the bar start on the Unix epoch grid, with a non-empty provenance.
+    pub fn validate(&self) -> Result<(), String> {
+        let expected = [
+            ("closed", self.closed.as_str(), "left"),
+            ("frequency", self.frequency.as_str(), "5s"),
+            (
+                "interval",
+                self.interval.as_str(),
+                "[timestamp,timestamp+5s)",
+            ),
+            ("label", self.label.as_str(), "left"),
+            ("origin", self.origin.as_str(), "unix_epoch_utc"),
+            (
+                "timestamp_semantics",
+                self.timestamp_semantics.as_str(),
+                "bar_start",
+            ),
+        ];
+        for (key, actual, approved) in expected {
+            if actual != approved {
+                return Err(format!(
+                    "interval contract `{key}` is `{actual}`, expected `{approved}`"
+                ));
+            }
+        }
+        if self.offset_seconds != 0 {
+            return Err(format!(
+                "interval contract `offset_seconds` is {}, expected 0",
+                self.offset_seconds
+            ));
+        }
+        if self.provenance.is_empty() || self.provenance.bytes().any(|byte| byte.is_ascii_control())
+        {
+            return Err("interval contract provenance must be non-empty plain text".to_string());
+        }
+        Ok(())
+    }
+}
+
 /// One retained or published object.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub struct ObjectRecord {
@@ -276,6 +317,9 @@ impl GenerationManifest {
                 ));
             }
         };
+        if let Some(interval) = &self.interval {
+            interval.validate()?;
+        }
         let mut normalized = 0;
         for (index, object) in self.objects.iter().enumerate() {
             if !is_hex64(&object.sha256) || object.key != object_key(&object.sha256) {

@@ -697,8 +697,11 @@ fn import_publishes_retains_and_verifies_from_either_copy() {
 
 #[test]
 fn interrupted_runs_resume_without_duplicates_or_early_ready_state() {
-    // Each scenario reproduces one interruption state on a freshly published tree.
-    let snapshot = |scratch: &Scratch| -> (Vec<String>, Vec<(PathBuf, Vec<u8>)>) {
+    // Each scenario reproduces one interruption state on a freshly published tree, reruns the
+    // command, and requires identical objects and manifests plus successful verification of
+    // both copies.
+    type Snapshot = (Vec<String>, Vec<(PathBuf, Vec<u8>)>);
+    let snapshot = |scratch: &Scratch| -> Snapshot {
         let manifests = scratch
             .manifests("published")
             .into_iter()
@@ -709,11 +712,21 @@ fn interrupted_runs_resume_without_duplicates_or_early_ready_state() {
             .collect();
         (scratch.objects("published"), manifests)
     };
-    let assert_same = |scratch: &Scratch, before: &(Vec<String>, Vec<(PathBuf, Vec<u8>)>)| {
+    let mirror_of = |scratch: &Scratch, path: &Path| {
+        scratch
+            .path("retained")
+            .join(path.strip_prefix(scratch.path("published")).unwrap())
+    };
+    let assert_recovered = |scratch: &Scratch, before: &Snapshot| {
         assert_eq!(
             scratch.objects("published"),
             before.0,
             "no duplicate objects"
+        );
+        assert_eq!(
+            scratch.objects("retained"),
+            before.0,
+            "every child retained"
         );
         assert_eq!(scratch.manifests("published").len(), before.1.len());
         for (path, bytes) in &before.1 {
@@ -722,15 +735,38 @@ fn interrupted_runs_resume_without_duplicates_or_early_ready_state() {
                 bytes,
                 "identical ready manifest after resumption"
             );
-            let mirror = scratch
-                .path("retained")
-                .join(path.strip_prefix(scratch.path("published")).unwrap());
-            assert_eq!(&fs::read(&mirror).unwrap(), bytes, "restored local mirror");
+            assert_eq!(
+                &fs::read(mirror_of(scratch, path)).unwrap(),
+                bytes,
+                "restored local mirror"
+            );
+            assert!(verify(path).is_ok(), "{}", path.display());
+            assert!(
+                verify(&mirror_of(scratch, path)).is_ok(),
+                "{}",
+                path.display()
+            );
         }
     };
+    let remove_manifests = |scratch: &Scratch, before: &Snapshot, mirrors_too: bool| {
+        for (path, _) in &before.1 {
+            fs::remove_file(path).unwrap();
+            if mirrors_too {
+                fs::remove_file(mirror_of(scratch, path)).unwrap();
+            }
+        }
+    };
+    let manifest_for = |before: &Snapshot, symbol: &str| {
+        before
+            .1
+            .iter()
+            .map(|(path, _)| manifest_json(path))
+            .find(|json| json["provider_symbol"] == symbol)
+            .unwrap()
+    };
 
-    // Interrupted at local close: the normalized object was never closed, no ready manifest
-    // exists, and temporary files are left in the retained object directory.
+    // 1. Interrupted at local close: the normalized object was never closed, no ready manifest
+    //    exists anywhere, and temporary files are left in the retained object directory.
     let (scratch, config, lines) = published("resume_local_close");
     let before = snapshot(&scratch);
     let ticks = before
@@ -739,18 +775,10 @@ fn interrupted_runs_resume_without_duplicates_or_early_ready_state() {
         .map(|(path, _)| manifest_json(path))
         .find(|json| json["source_kind"] == "tick_csv")
         .unwrap();
-    let normalized_key = ticks["objects"][1]["key"].as_str().unwrap();
-    fs::remove_file(scratch.path("published").join(normalized_key)).unwrap();
-    fs::remove_file(scratch.path("retained").join(normalized_key)).unwrap();
-    for (path, _) in &before.1 {
-        fs::remove_file(path).unwrap();
-        fs::remove_file(
-            scratch
-                .path("retained")
-                .join(path.strip_prefix(scratch.path("published")).unwrap()),
-        )
-        .unwrap();
-    }
+    let normalized_key = ticks["objects"][1]["key"].as_str().unwrap().to_string();
+    fs::remove_file(scratch.path("published").join(&normalized_key)).unwrap();
+    fs::remove_file(scratch.path("retained").join(&normalized_key)).unwrap();
+    remove_manifests(&scratch, &before, true);
     fs::write(scratch.path("retained/objects/.tmp-leftover-1"), b"partial").unwrap();
     fs::write(
         scratch.path(&format!(
@@ -766,25 +794,18 @@ fn interrupted_runs_resume_without_duplicates_or_early_ready_state() {
         "the normalized object is rebuilt from the retained source: {}",
         again[0]
     );
-    assert!(scratch.path("published").join(normalized_key).is_file());
-    assert_same(&scratch, &before);
+    assert_recovered(&scratch, &before);
 
-    // Interrupted during upload: one destination object and every ready manifest are missing.
+    // 2. Interrupted during upload: one destination object is missing and no ready manifest
+    //    exists anywhere.
     let (scratch, config, _) = published("resume_upload");
     let before = snapshot(&scratch);
-    let apple = before
-        .1
-        .iter()
-        .map(|(path, _)| manifest_json(path))
-        .find(|json| json["provider_symbol"] == "#AAPL")
-        .unwrap();
+    let apple = manifest_for(&before, "#AAPL");
     let removed = scratch
         .path("published")
         .join(apple["objects"][0]["key"].as_str().unwrap());
     fs::remove_file(&removed).unwrap();
-    for (path, _) in &before.1 {
-        fs::remove_file(path).unwrap();
-    }
+    remove_manifests(&scratch, &before, true);
     let again = import(&config).unwrap();
     assert!(
         again[1].contains(" objects 10 reused 9 ["),
@@ -793,21 +814,31 @@ fn interrupted_runs_resume_without_duplicates_or_early_ready_state() {
     );
     assert!(again[2].contains(" objects 9 reused 9 ["), "{}", again[2]);
     assert!(removed.is_file());
-    assert_same(&scratch, &before);
+    assert_recovered(&scratch, &before);
 
-    // Interrupted after object creation and before ready publication: every object exists,
-    // no ready manifest does.
+    // 3. Interrupted after object creation: the first half of a dataset's objects exist at the
+    //    destination, the rest do not, and no ready manifest exists anywhere.
+    let (scratch, config, _) = published("resume_after_object");
+    let before = snapshot(&scratch);
+    let apple = manifest_for(&before, "#AAPL");
+    let objects = apple["objects"].as_array().unwrap();
+    for object in &objects[objects.len() / 2..] {
+        let _ = fs::remove_file(
+            scratch
+                .path("published")
+                .join(object["key"].as_str().unwrap()),
+        );
+    }
+    remove_manifests(&scratch, &before, true);
+    let again = import(&config).unwrap();
+    assert!(again[1].contains(" objects 10 reused "), "{}", again[1]);
+    assert_recovered(&scratch, &before);
+
+    // 4. Interrupted before ready publication: every object exists at both copies and no ready
+    //    manifest exists anywhere.
     let (scratch, config, _) = published("resume_before_ready");
     let before = snapshot(&scratch);
-    for (path, _) in &before.1 {
-        fs::remove_file(path).unwrap();
-        fs::remove_file(
-            scratch
-                .path("retained")
-                .join(path.strip_prefix(scratch.path("published")).unwrap()),
-        )
-        .unwrap();
-    }
+    remove_manifests(&scratch, &before, true);
     let again = import(&config).unwrap();
     assert!(
         again
@@ -815,18 +846,15 @@ fn interrupted_runs_resume_without_duplicates_or_early_ready_state() {
             .all(|line| line.contains(" reused ") && line.ends_with("s]")),
         "{again:?}"
     );
-    assert_same(&scratch, &before);
+    assert_recovered(&scratch, &before);
 
-    // Interrupted after destination ready creation and before the local mirror.
+    // 5. Interrupted after destination ready creation and before the local mirror.
     let (scratch, config, _) = published("resume_mirror");
     let before = snapshot(&scratch);
+    remove_manifests(&scratch, &before, false);
     for (path, _) in &before.1 {
-        fs::remove_file(
-            scratch
-                .path("retained")
-                .join(path.strip_prefix(scratch.path("published")).unwrap()),
-        )
-        .unwrap();
+        fs::write(path, fs::read(mirror_of(&scratch, path)).unwrap()).unwrap();
+        fs::remove_file(mirror_of(&scratch, path)).unwrap();
     }
     let again = import(&config).unwrap();
     assert!(
@@ -835,12 +863,13 @@ fn interrupted_runs_resume_without_duplicates_or_early_ready_state() {
             .all(|line| line.ends_with("(already published)")),
         "{again:?}"
     );
-    assert_same(&scratch, &before);
+    assert_recovered(&scratch, &before);
 
     // Conflicting bytes at an existing key fail closed without replacing either copy, whether
     // or not the committed ready manifest is still present.
     let (scratch, config, _) = published("resume_conflict");
     let before = snapshot(&scratch);
+    let apple = manifest_for(&before, "#AAPL");
     let victim_key = apple["objects"][1]["key"].as_str().unwrap();
     let victim = scratch.path("published").join(victim_key);
     let victim_bytes = fs::read(&victim).unwrap();
@@ -852,19 +881,31 @@ fn interrupted_runs_resume_without_duplicates_or_early_ready_state() {
         fs::read(scratch.path("retained").join(victim_key)).unwrap(),
         victim_bytes
     );
-    for (path, _) in &before.1 {
-        fs::remove_file(path).unwrap();
-    }
+    remove_manifests(&scratch, &before, false);
     let error = import(&config).unwrap_err();
     assert!(error.contains("already holds different content"), "{error}");
     assert_eq!(fs::read(&victim).unwrap(), b"different bytes");
-    assert_eq!(
-        fs::read(scratch.path("retained").join(victim_key)).unwrap(),
-        victim_bytes
-    );
     assert!(
         scratch.manifests("published").len() < before.1.len(),
         "no early ready state after a conflict"
+    );
+
+    // A committed ready manifest that misrecords a child's checksum is never reused or mirrored.
+    let (scratch, config, _) = published("resume_bad_checksum");
+    let before = snapshot(&scratch);
+    let (path, bytes) = &before.1[0];
+    let text = String::from_utf8(bytes.clone()).unwrap();
+    fs::write(
+        path,
+        text.replacen("\"crc32c\": null", "\"crc32c\": 12345", 1),
+    )
+    .unwrap();
+    fs::remove_file(mirror_of(&scratch, path)).unwrap();
+    let error = import(&config).unwrap_err();
+    assert!(error.contains("records a different generation"), "{error}");
+    assert!(
+        !mirror_of(&scratch, path).exists(),
+        "the incorrect manifest was not mirrored"
     );
 }
 
@@ -1084,7 +1125,7 @@ fn malformed_inputs_and_unsafe_layouts_are_rejected() {
         rewrite("unapproved interval contract", &|_, manifest| {
             edit_manifest(manifest, "\"frequency\": \"5s\"", "\"frequency\": \"10s\"");
         })
-        .contains("expected the approved five-second contract")
+        .contains("interval contract `frequency` is `10s`")
     );
     assert!(
         rewrite("missing symbol identifier", &|_, manifest| {
@@ -1176,6 +1217,25 @@ fn malformed_inputs_and_unsafe_layouts_are_rejected() {
     assert!(
         import(&beside).is_ok(),
         "a destination beside the asset roots is inside no listed inventory"
+    );
+    let inside_destination = scratch.config_with(
+        "inside_destination.toml",
+        "sources/bars/retained",
+        &scratch
+            .bar_source()
+            .replace("collection.json", "retained/collection.json"),
+    );
+    fs::create_dir_all(scratch.path("sources/bars/retained")).unwrap();
+    fs::copy(
+        scratch.path("sources/bars/collection.json"),
+        scratch.path("sources/bars/retained/collection.json"),
+    )
+    .unwrap();
+    assert!(
+        import(&inside_destination)
+            .unwrap_err()
+            .contains("inside the historical-data folder"),
+        "a collection manifest inside a destination is never an input"
     );
     let twice = scratch.config(
         "twice.toml",
@@ -1293,6 +1353,33 @@ fn verify_rejects_incomplete_or_tampered_generations() {
     )
     .unwrap();
     assert!(verify(&manifest).unwrap_err().contains("CRC32C"));
+
+    // A bar manifest whose interval contract was altered after publication is rejected before
+    // any object is trusted, even though the generation identity is unchanged.
+    let scratch = Scratch::new("verify_interval");
+    write_collection(
+        &scratch.path("sources/bars"),
+        &[AssetSpec {
+            asset: "AEDCNY_otc",
+            expected_symbol_id: None,
+            symbol_id: Some(538),
+            files: vec![bars("AEDCNY_otc", 538, 1_747_653_300, 4)],
+            metadata: false,
+        }],
+    );
+    import(&scratch.config("bars.toml", &scratch.bar_source())).unwrap();
+    let manifest = scratch.manifests("published").remove(0);
+    let text = fs::read_to_string(&manifest).unwrap();
+    fs::write(
+        &manifest,
+        text.replace("\"closed\": \"left\"", "\"closed\": \"right\""),
+    )
+    .unwrap();
+    assert!(
+        verify(&manifest)
+            .unwrap_err()
+            .contains("interval contract `closed`")
+    );
 }
 
 fn walk(root: &Path) -> Vec<PathBuf> {

@@ -27,16 +27,7 @@ use crate::store::{self, ObjectIdentity, Put, Store};
 /// The producing code revision, captured by `build.rs`.
 pub const CODE_REVISION: &str = env!("BINARY_ALPHA_CODE_REVISION");
 
-/// The one bar interval contract this checkout admits: left-closed five-second bars whose
-/// timestamp is the bar start on the Unix epoch grid.
-const FIVE_SECOND_TEXT: [(&str, &str); 6] = [
-    ("closed", "left"),
-    ("frequency", "5s"),
-    ("interval", "[timestamp,timestamp+5s)"),
-    ("label", "left"),
-    ("origin", "unix_epoch_utc"),
-    ("timestamp_semantics", "bar_start"),
-];
+/// The period of the one bar interval contract the engine admits.
 const BAR_PERIOD_S: u16 = 5;
 
 /// One input file of a dataset before it is retained.
@@ -255,7 +246,7 @@ fn plan_collection(
     provenance: &[PathBuf],
     protected: &[PathBuf],
 ) -> Result<Vec<Dataset>, String> {
-    let manifest_path = contained_file(root, manifest)?;
+    let manifest_path = contained_file(root, manifest, protected)?;
     let text = fs::read(&manifest_path)
         .map_err(|error| format!("cannot read {}: {error}", manifest_path.display()))?;
     let manifest_sha256 = binary_alpha_engine::hex(&sha2::Sha256::digest(&text));
@@ -267,7 +258,7 @@ fn plan_collection(
     })?;
     let mut collection_files = Vec::new();
     for relative in std::iter::once(manifest).chain(provenance.iter().map(PathBuf::as_path)) {
-        let absolute = contained_file(root, relative)?;
+        let absolute = contained_file(root, relative, protected)?;
         collection_files.push(PlannedFile {
             role: ObjectRole::Provenance,
             path: object_path(&format!("collection/{}", relative.display()))?,
@@ -392,8 +383,8 @@ fn plan_collection(
 }
 
 /// A declared collection-level file resolved through every symbolic link: it must be a regular
-/// file that still lies beneath the canonical collection root.
-fn contained_file(root: &Path, relative: &Path) -> Result<PathBuf, String> {
+/// file that still lies beneath the canonical collection root and outside both destinations.
+fn contained_file(root: &Path, relative: &Path, protected: &[PathBuf]) -> Result<PathBuf, String> {
     let absolute = canonical(&root.join(relative))?;
     if !absolute.starts_with(root) {
         return Err(format!(
@@ -403,52 +394,49 @@ fn contained_file(root: &Path, relative: &Path) -> Result<PathBuf, String> {
             root.display()
         ));
     }
+    if protected.iter().any(|dir| absolute.starts_with(dir)) {
+        return Err(format!(
+            "{} resolves to {}, inside the historical-data folder or the file destination",
+            relative.display(),
+            absolute.display()
+        ));
+    }
     regular_file(&absolute)?;
     Ok(absolute)
 }
 
-/// The asset's declared interval contract, which must be exactly the approved five-second one.
+/// The asset's declared interval contract, which the engine requires to be the approved one.
 fn five_second_contract(asset: &Asset) -> Result<IntervalContract, String> {
     let declared = &asset.interval_contract;
-    let mismatch = |key: &str| {
-        format!(
-            "{}: interval contract `{key}` is {}, expected the approved five-second contract",
-            asset.asset,
-            declared
-                .get(key)
-                .map_or("absent".to_string(), |value| value.to_string())
-        )
-    };
-    for (key, expected) in FIVE_SECOND_TEXT {
-        if declared.get(key).and_then(|value| value.as_str()) != Some(expected) {
-            return Err(mismatch(key));
-        }
-    }
-    if declared
-        .get("offset_seconds")
-        .and_then(|value| value.as_i64())
-        != Some(0)
-    {
-        return Err(mismatch("offset_seconds"));
-    }
     let text = |key: &str| {
-        FIVE_SECOND_TEXT
-            .iter()
-            .find(|(name, _)| *name == key)
-            .expect("declared above")
-            .1
-            .to_string()
+        declared
+            .get(key)
+            .and_then(|value| value.as_str())
+            .map(str::to_string)
+            .ok_or_else(|| format!("{}: interval contract `{key}` is missing", asset.asset))
     };
-    Ok(IntervalContract {
-        closed: text("closed"),
-        frequency: text("frequency"),
-        interval: text("interval"),
-        label: text("label"),
-        offset_seconds: 0,
-        origin: text("origin"),
-        timestamp_semantics: text("timestamp_semantics"),
+    let contract = IntervalContract {
+        closed: text("closed")?,
+        frequency: text("frequency")?,
+        interval: text("interval")?,
+        label: text("label")?,
+        offset_seconds: declared
+            .get("offset_seconds")
+            .and_then(|value| value.as_i64())
+            .ok_or_else(|| {
+                format!(
+                    "{}: interval contract `offset_seconds` is missing",
+                    asset.asset
+                )
+            })?,
+        origin: text("origin")?,
+        timestamp_semantics: text("timestamp_semantics")?,
         provenance: asset.interval_contract_provenance.clone(),
-    })
+    };
+    contract
+        .validate()
+        .map_err(|reason| format!("{}: {reason}", asset.asset))?;
+    Ok(contract)
 }
 
 /// An object path free of control characters, so manifest lines stay unambiguous.
@@ -672,7 +660,7 @@ fn publish(
             destination.read_to(&key, None, &mut bytes)?;
             let committed = GenerationManifest::from_json(&bytes)
                 .map_err(|error| format!("{}: {error}", destination.uri(&key)))?;
-            if !same_result(&committed, &manifest) {
+            if !same_result(&committed, &manifest, &identities) {
                 return Err(format!(
                     "{} records a different generation, object set, row count, or coverage than this import produced",
                     destination.uri(&key)
@@ -703,17 +691,33 @@ fn publish(
     })
 }
 
-/// A committed manifest describes this import's result when it names the same generation and
-/// role, the same objects by role, path, identity, and size, and the same rows and coverage.
-fn same_result(committed: &GenerationManifest, fresh: &GenerationManifest) -> bool {
+/// A committed manifest describes this import's result when it names the same generation, role,
+/// rows, coverage, and interval, and the same objects by role, path, identity, and size, with
+/// every recorded checksum matching the bytes and every recorded generation matching what the
+/// destination reports now (a store that reports no generation leaves it as provenance).
+fn same_result(
+    committed: &GenerationManifest,
+    fresh: &GenerationManifest,
+    identities: &[ObjectIdentity],
+) -> bool {
     committed.generation == fresh.generation
         && committed.role == fresh.role
         && committed.row_count == fresh.row_count
         && committed.coverage == fresh.coverage
+        && committed.interval == fresh.interval
         && committed.objects.len() == fresh.objects.len()
-        && committed.objects.iter().zip(&fresh.objects).all(|(a, b)| {
-            a.role == b.role && a.path == b.path && a.sha256 == b.sha256 && a.bytes == b.bytes
-        })
+        && committed
+            .objects
+            .iter()
+            .zip(fresh.objects.iter().zip(identities))
+            .all(|(a, (b, identity))| {
+                a.role == b.role
+                    && a.path == b.path
+                    && a.sha256 == b.sha256
+                    && a.bytes == b.bytes
+                    && a.crc32c.is_none_or(|crc32c| crc32c == identity.crc32c)
+                    && (b.generation.is_none() || a.generation == b.generation)
+            })
 }
 
 fn record(role: ObjectRole, path: &str, identity: &ObjectIdentity) -> ObjectRecord {
