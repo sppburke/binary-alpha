@@ -729,22 +729,44 @@ fn interrupted_runs_resume_without_duplicates_or_early_ready_state() {
         }
     };
 
-    // Interrupted at local close: temporary files are left in the retained object directory.
+    // Interrupted at local close: the normalized object was never closed, no ready manifest
+    // exists, and temporary files are left in the retained object directory.
     let (scratch, config, lines) = published("resume_local_close");
     let before = snapshot(&scratch);
-    fs::write(scratch.path("retained/objects/.tmp-leftover"), b"partial").unwrap();
+    let ticks = before
+        .1
+        .iter()
+        .map(|(path, _)| manifest_json(path))
+        .find(|json| json["source_kind"] == "tick_csv")
+        .unwrap();
+    let normalized_key = ticks["objects"][1]["key"].as_str().unwrap();
+    fs::remove_file(scratch.path("published").join(normalized_key)).unwrap();
+    fs::remove_file(scratch.path("retained").join(normalized_key)).unwrap();
+    for (path, _) in &before.1 {
+        fs::remove_file(path).unwrap();
+        fs::remove_file(
+            scratch
+                .path("retained")
+                .join(path.strip_prefix(scratch.path("published")).unwrap()),
+        )
+        .unwrap();
+    }
+    fs::write(scratch.path("retained/objects/.tmp-leftover-1"), b"partial").unwrap();
     fs::write(
-        scratch.path(&format!("retained/objects/.tmp-{}", generation(&lines[0]))),
+        scratch.path(&format!(
+            "retained/objects/.tmp-{}-1",
+            generation(&lines[0])
+        )),
         b"partial normalized",
     )
     .unwrap();
     let again = import(&config).unwrap();
     assert!(
-        again
-            .iter()
-            .all(|line| line.ends_with("(already published)")),
-        "{again:?}"
+        again[0].contains(" objects 2 reused 1 ["),
+        "the normalized object is rebuilt from the retained source: {}",
+        again[0]
     );
+    assert!(scratch.path("published").join(normalized_key).is_file());
     assert_same(&scratch, &before);
 
     // Interrupted during upload: one destination object and every ready manifest are missing.
@@ -824,10 +846,7 @@ fn interrupted_runs_resume_without_duplicates_or_early_ready_state() {
     let victim_bytes = fs::read(&victim).unwrap();
     fs::write(&victim, b"different bytes").unwrap();
     let error = import(&config).unwrap_err();
-    assert!(
-        error.contains("whose destination size, checksum, or generation differs"),
-        "{error}"
-    );
+    assert!(error.contains("already holds different content"), "{error}");
     assert_eq!(fs::read(&victim).unwrap(), b"different bytes");
     assert_eq!(
         fs::read(scratch.path("retained").join(victim_key)).unwrap(),
@@ -1102,12 +1121,15 @@ fn malformed_inputs_and_unsafe_layouts_are_rejected() {
         .contains("symbolic link")
     );
     assert!(
-        rewrite("symbolic collection manifest", &|_, manifest| {
-            let real = manifest.with_file_name("real.json");
-            fs::rename(manifest, &real).unwrap();
-            std::os::unix::fs::symlink(&real, manifest).unwrap();
-        })
-        .contains("symbolic link")
+        rewrite(
+            "collection manifest resolving outside the root",
+            &|_, manifest| {
+                let outside = scratch.path("outside.json");
+                fs::rename(manifest, &outside).unwrap();
+                std::os::unix::fs::symlink(&outside, manifest).unwrap();
+            }
+        )
+        .contains("outside the collection root")
     );
     assert!(
         rewrite("control character in a file name", &|file, _| {
@@ -1128,7 +1150,7 @@ fn malformed_inputs_and_unsafe_layouts_are_rejected() {
     assert!(
         import(&inside_asset)
             .unwrap_err()
-            .contains("lies inside the asset root")
+            .contains("overlaps the historical-data folder")
     );
     assert!(
         !scratch.path("sources/bars/#AAPL/retained").exists(),

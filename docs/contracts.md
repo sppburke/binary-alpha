@@ -251,13 +251,15 @@ historical-data folder while checking that the copied bytes still carry that ide
 normalizes each dataset from its retained copy, creates each missing destination object with a
 generation-match-zero precondition while verifying the returned size and checksum, reuses an
 identical existing object, fails on different content at the same key without replacing anything,
-publishes the ready manifest last, and mirrors it byte-for-byte into the historical-data folder. A
-ready manifest already at the destination is reused only after its recorded inputs match the
-declared ones, every committed child is present at the destination with its recorded size, checksum,
-and generation, and the retained folder holds every child; it writes one line per dataset to
-standard output: `published INSTRUMENT ROLE generation GENERATION rows N objects K reused R` followed
-either by `[hash S retain S validate S publish S]` stage durations in seconds or by
-`(already published)`.
+publishes the ready manifest last, and mirrors it byte-for-byte into the historical-data folder.
+Every run does that complete work; a ready manifest already at the destination must describe
+exactly the same generation, objects, row count, and coverage as the fresh result, and its committed
+bytes are the ones mirrored. Collection-level files are resolved through symbolic links and must
+stay beneath the collection root; the collection manifest's bytes parsed for expectations must be
+the bytes retained. It writes one line per dataset to standard output:
+`published INSTRUMENT ROLE generation GENERATION rows N objects K reused R` followed either by
+`[hash S retain S validate S publish S]` stage durations in seconds or by `(already published)`
+when the ready manifest already existed.
 
 `binary-alpha data verify --manifest URI` accepts a `file://` or `gs://` location ending in
 `manifests/GENERATION/ready.json`, resolves object keys against the prefix before `manifests/`, reads

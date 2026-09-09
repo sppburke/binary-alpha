@@ -18,6 +18,7 @@ use binary_alpha_engine::market::{
     BrokerId, InstrumentId, PriceScale, ProviderSymbol, TICK_HEADER, parse_tick_line,
 };
 use serde::Deserialize;
+use sha2::Digest;
 
 use crate::archive::{self, BarExpectation, DataSummary, TICK_OBJECT_PATH};
 use crate::parallel;
@@ -57,6 +58,8 @@ enum Data {
         /// Listed archive files in manifest order, with their recorded identities and rows.
         listed: Vec<ListedFile>,
         canonical_rows: u64,
+        /// The collection manifest's object path and the SHA-256 of the bytes that were parsed.
+        collection_manifest: (String, String),
     },
 }
 
@@ -252,10 +255,10 @@ fn plan_collection(
     provenance: &[PathBuf],
     protected: &[PathBuf],
 ) -> Result<Vec<Dataset>, String> {
-    let manifest_path = root.join(manifest);
-    regular_file(&manifest_path)?;
+    let manifest_path = contained_file(root, manifest)?;
     let text = fs::read(&manifest_path)
         .map_err(|error| format!("cannot read {}: {error}", manifest_path.display()))?;
+    let manifest_sha256 = binary_alpha_engine::hex(&sha2::Sha256::digest(&text));
     let collection: Collection = serde_json::from_slice(&text).map_err(|error| {
         format!(
             "{} is not a collection manifest: {error}",
@@ -264,8 +267,7 @@ fn plan_collection(
     })?;
     let mut collection_files = Vec::new();
     for relative in std::iter::once(manifest).chain(provenance.iter().map(PathBuf::as_path)) {
-        let absolute = root.join(relative);
-        regular_file(&absolute)?;
+        let absolute = contained_file(root, relative)?;
         collection_files.push(PlannedFile {
             role: ObjectRole::Provenance,
             path: object_path(&format!("collection/{}", relative.display()))?,
@@ -282,9 +284,12 @@ fn plan_collection(
                 root.display()
             ));
         }
-        if protected.iter().any(|dir| dir.starts_with(&asset_root)) {
+        if protected
+            .iter()
+            .any(|dir| dir.starts_with(&asset_root) || asset_root.starts_with(dir))
+        {
             return Err(format!(
-                "the historical-data folder or the file destination lies inside the asset root {}",
+                "asset root {} overlaps the historical-data folder or the file destination",
                 asset_root.display()
             ));
         }
@@ -338,6 +343,17 @@ fn plan_collection(
             path: file.path.clone(),
             absolute: file.absolute.clone(),
         }));
+        for (index, file) in files.iter().enumerate() {
+            if files[..index]
+                .iter()
+                .any(|earlier| earlier.path == file.path)
+            {
+                return Err(format!(
+                    "{}: object path {} is inventoried twice",
+                    asset.asset, file.path
+                ));
+            }
+        }
         let interval = five_second_contract(asset)?;
         let symbol_id = asset
             .expected_symbol_id
@@ -368,10 +384,27 @@ fn plan_collection(
                 }),
                 listed,
                 canonical_rows: asset.canonical_rows,
+                collection_manifest: (collection_files[0].path.clone(), manifest_sha256.clone()),
             },
         });
     }
     Ok(datasets)
+}
+
+/// A declared collection-level file resolved through every symbolic link: it must be a regular
+/// file that still lies beneath the canonical collection root.
+fn contained_file(root: &Path, relative: &Path) -> Result<PathBuf, String> {
+    let absolute = canonical(&root.join(relative))?;
+    if !absolute.starts_with(root) {
+        return Err(format!(
+            "{} resolves to {}, outside the collection root {}",
+            relative.display(),
+            absolute.display(),
+            root.display()
+        ));
+    }
+    regular_file(&absolute)?;
+    Ok(absolute)
 }
 
 /// The asset's declared interval contract, which must be exactly the approved five-second one.
@@ -459,7 +492,9 @@ fn walk(root: &Path) -> Result<Vec<PathBuf>, String> {
     Ok(files)
 }
 
-/// Retains, publishes, and commits one dataset generation, returning its report line.
+/// Retains, validates, publishes, and commits one dataset generation, returning its report
+/// line. Every run does the complete work from the retained copies; a ready manifest already at
+/// the destination must describe exactly this result, and its committed bytes are mirrored.
 fn publish(
     dataset: &Dataset,
     local: &Store,
@@ -477,6 +512,18 @@ fn publish(
         .zip(&identities)
         .map(|(file, identity)| record(file.role, &file.path, identity))
         .collect();
+    if let Data::Bars {
+        collection_manifest: (path, sha256),
+        ..
+    } = &dataset.data
+        && objects
+            .iter()
+            .any(|object| object.path == *path && object.sha256 != *sha256)
+    {
+        return Err(format!(
+            "{path} changed after its expectations were read; nothing was published"
+        ));
+    }
     let hashed = started.elapsed();
     let (source_kind, scale) = match &dataset.data {
         Data::Ticks { scale, .. } => (SourceKind::TickCsv, Some(*scale)),
@@ -501,23 +548,6 @@ fn publish(
             .local_path(&object.key)
             .expect("the retained folder is a filesystem store")
     };
-
-    if destination.head(&key)?.is_some() {
-        let mut bytes = Vec::new();
-        destination.read_to(&key, None, &mut bytes)?;
-        let committed = GenerationManifest::from_json(&bytes)
-            .map_err(|error| format!("{}: {error}", destination.uri(&key)))?;
-        reuse(dataset, &committed, &objects, local, destination)?;
-        mirror(local, &key, &bytes)?;
-        return Ok(format!(
-            "published {} {} generation {generation} rows {} objects {} reused {} (already published)",
-            dataset.instrument,
-            dataset.role,
-            committed.row_count,
-            committed.objects.len(),
-            committed.objects.len()
-        ));
-    }
 
     let validating = Instant::now();
     let (summary, native_granularity, time_unit, price_representation, interval, capability) =
@@ -552,6 +582,7 @@ fn publish(
                 expectation,
                 listed,
                 canonical_rows,
+                ..
             } => {
                 let paths: Vec<PathBuf> =
                     objects[..listed.len()].iter().map(retained_path).collect();
@@ -588,10 +619,7 @@ fn publish(
     let publishing = Instant::now();
     let mut reused = 0;
     for (object, identity) in objects.iter_mut().zip(&identities) {
-        let path = local
-            .local_path(&object.key)
-            .expect("the retained folder is a filesystem store");
-        let put = destination.put_new(&object.key, &path, identity)?;
+        let put = destination.put_new(&object.key, &retained_path(object), identity)?;
         if let Put::Reused(_) = put {
             reused += 1;
         }
@@ -631,27 +659,61 @@ fn publish(
         interval,
         objects,
     };
-    let bytes = manifest.to_json();
+    let report = format!(
+        "published {} {} generation {generation} rows {} objects {} reused {reused}",
+        dataset.instrument,
+        dataset.role,
+        manifest.row_count,
+        manifest.objects.len()
+    );
+    let committed = match destination.head(&key)? {
+        Some(_) => {
+            let mut bytes = Vec::new();
+            destination.read_to(&key, None, &mut bytes)?;
+            let committed = GenerationManifest::from_json(&bytes)
+                .map_err(|error| format!("{}: {error}", destination.uri(&key)))?;
+            if !same_result(&committed, &manifest) {
+                return Err(format!(
+                    "{} records a different generation, object set, row count, or coverage than this import produced",
+                    destination.uri(&key)
+                ));
+            }
+            bytes
+        }
+        None => manifest.to_json(),
+    };
     let temporary = temporary_path(local, &format!("manifest-{generation}"))?;
-    fs::write(&temporary, &bytes)
+    fs::write(&temporary, &committed)
         .map_err(|error| format!("cannot write {}: {error}", temporary.display()))?;
     let identity = store::identify(&temporary)?;
-    destination.put_new(&key, &temporary, &identity)?;
+    let put = destination.put_new(&key, &temporary, &identity)?;
     local.put_new(&key, &temporary, &identity)?;
     fs::remove_file(&temporary)
         .map_err(|error| format!("cannot remove {}: {error}", temporary.display()))?;
     let published = publishing.elapsed();
-    Ok(format!(
-        "published {} {} generation {generation} rows {} objects {} reused {reused} [hash {:.3}s retain {:.3}s validate {:.3}s publish {:.3}s]",
-        dataset.instrument,
-        dataset.role,
-        manifest.row_count,
-        manifest.objects.len(),
-        hashed.as_secs_f64(),
-        retained.as_secs_f64(),
-        validated.as_secs_f64(),
-        published.as_secs_f64()
-    ))
+    Ok(match put {
+        Put::Reused(_) => format!("{report} (already published)"),
+        Put::Created(_) => format!(
+            "{report} [hash {:.3}s retain {:.3}s validate {:.3}s publish {:.3}s]",
+            hashed.as_secs_f64(),
+            retained.as_secs_f64(),
+            validated.as_secs_f64(),
+            published.as_secs_f64()
+        ),
+    })
+}
+
+/// A committed manifest describes this import's result when it names the same generation and
+/// role, the same objects by role, path, identity, and size, and the same rows and coverage.
+fn same_result(committed: &GenerationManifest, fresh: &GenerationManifest) -> bool {
+    committed.generation == fresh.generation
+        && committed.role == fresh.role
+        && committed.row_count == fresh.row_count
+        && committed.coverage == fresh.coverage
+        && committed.objects.len() == fresh.objects.len()
+        && committed.objects.iter().zip(&fresh.objects).all(|(a, b)| {
+            a.role == b.role && a.path == b.path && a.sha256 == b.sha256 && a.bytes == b.bytes
+        })
 }
 
 fn record(role: ObjectRole, path: &str, identity: &ObjectIdentity) -> ObjectRecord {
@@ -666,106 +728,16 @@ fn record(role: ObjectRole, path: &str, identity: &ObjectIdentity) -> ObjectReco
     }
 }
 
-/// A committed ready manifest is reused only when it records exactly the computed inputs, every
-/// committed child still exists at the destination with its recorded size and checksum, and the
-/// retained folder holds every child.
-fn reuse(
-    dataset: &Dataset,
-    committed: &GenerationManifest,
-    inputs: &[ObjectRecord],
-    local: &Store,
-    destination: &Store,
-) -> Result<(), String> {
-    let uri = destination.uri(&committed.key());
-    let committed_inputs: Vec<&ObjectRecord> = committed
-        .objects
-        .iter()
-        .filter(|object| object.role != ObjectRole::Normalized)
-        .collect();
-    let same = committed_inputs.len() == inputs.len()
-        && inputs.iter().all(|input| {
-            committed_inputs.iter().any(|object| {
-                object.role == input.role
-                    && object.path == input.path
-                    && object.sha256 == input.sha256
-                    && object.bytes == input.bytes
-            })
-        });
-    if !same {
-        return Err(format!(
-            "{uri} records different inputs than the declared source"
-        ));
-    }
-    for object in &committed.objects {
-        let stored = destination
-            .head(&object.key)?
-            .ok_or_else(|| format!("{uri} names {}, which is missing", object.key))?;
-        if stored.bytes != object.bytes
-            || (stored.crc32c.is_some() && stored.crc32c != object.crc32c)
-            || (stored.generation.is_some() && stored.generation != object.generation)
-        {
-            return Err(format!(
-                "{uri} names {}, whose destination size, checksum, or generation differs",
-                object.key
-            ));
-        }
-        if object.role == ObjectRole::Normalized && local.head(&object.key)?.is_none() {
-            let Data::Ticks {
-                scale,
-                source_symbol,
-            } = &dataset.data
-            else {
-                return Err(format!(
-                    "{uri} records a normalized object for a bar source"
-                ));
-            };
-            let source = local
-                .local_path(&inputs[0].key)
-                .expect("the retained folder is a filesystem store");
-            let temporary = temporary_path(local, &committed.generation)?;
-            archive::write_ticks(
-                &temporary,
-                &dataset.instrument,
-                *scale,
-                tick_rows(&source, source_symbol, *scale)?,
-            )?;
-            let identity = store::identify(&temporary)?;
-            if identity.sha256 != object.sha256 {
-                return Err(format!(
-                    "{uri} records normalized object {}, but normalizing the retained source yields {}",
-                    object.sha256, identity.sha256
-                ));
-            }
-            local.put_new(&object.key, &temporary, &identity)?;
-            fs::remove_file(&temporary)
-                .map_err(|error| format!("cannot remove {}: {error}", temporary.display()))?;
-        }
-    }
-    Ok(())
-}
-
-/// A scratch path inside the retained folder's object directory; a leftover from an
-/// interrupted run is simply overwritten.
+/// A process-specific scratch path inside the retained folder's object directory; a leftover
+/// from an interrupted run is ignored by every reader and overwritten by the same process id.
 fn temporary_path(local: &Store, name: &str) -> Result<PathBuf, String> {
     let path = local
-        .local_path(&format!("objects/.tmp-{name}"))
+        .local_path(&format!("objects/.tmp-{name}-{}", std::process::id()))
         .expect("the retained folder is a filesystem store");
     let parent = path.parent().expect("objects directory");
     fs::create_dir_all(parent)
         .map_err(|error| format!("cannot create {}: {error}", parent.display()))?;
     Ok(path)
-}
-
-/// Writes the exact committed ready-manifest bytes into the retained folder through the same
-/// create-once primitive as every other object.
-fn mirror(local: &Store, key: &str, bytes: &[u8]) -> Result<(), String> {
-    let temporary = temporary_path(local, "mirror")?;
-    fs::write(&temporary, bytes)
-        .map_err(|error| format!("cannot write {}: {error}", temporary.display()))?;
-    let identity = store::identify(&temporary)?;
-    local.put_new(key, &temporary, &identity)?;
-    fs::remove_file(&temporary)
-        .map_err(|error| format!("cannot remove {}: {error}", temporary.display()))
 }
 
 /// The rows of a native tick file, checked against the declared symbol and scale.

@@ -249,6 +249,7 @@ impl GenerationManifest {
             self.source_kind,
             self.price_representation,
             self.native_granularity,
+            self.time_unit,
             self.interval.is_some(),
             self.capabilities.as_slice(),
         ) {
@@ -256,6 +257,7 @@ impl GenerationManifest {
                 SourceKind::TickCsv,
                 PriceRepresentation::IntegerUnits { scale },
                 NativeGranularity::Tick,
+                TimeUnit::Microsecond,
                 false,
                 [Capability::Ticks],
             ) => Some(scale),
@@ -263,12 +265,13 @@ impl GenerationManifest {
                 SourceKind::BarParquet,
                 PriceRepresentation::BinaryFloat64,
                 NativeGranularity::Bar { .. },
+                TimeUnit::Second,
                 true,
                 [Capability::Bars],
             ) => None,
             _ => {
                 return Err(format!(
-                    "source kind {}, price representation, granularity, interval, and capabilities disagree",
+                    "source kind {}, price representation, granularity, time unit, interval, and capabilities disagree",
                     self.source_kind
                 ));
             }
@@ -281,12 +284,14 @@ impl GenerationManifest {
                     object.path
                 ));
             }
-            if object.path.is_empty() || object.path.bytes().any(|byte| byte.is_ascii_control()) {
+            if object.path.bytes().any(|byte| byte.is_ascii_control()) {
                 return Err(format!(
-                    "object path `{}` is empty or contains a control character",
+                    "object path `{}` contains a control character",
                     object.path.escape_default()
                 ));
             }
+            crate::config::relative_path(&object.path)
+                .map_err(|reason| format!("object path `{}`: {reason}", object.path))?;
             if self.objects[..index]
                 .iter()
                 .any(|earlier| earlier.path == object.path)
