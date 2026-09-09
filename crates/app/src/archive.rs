@@ -222,7 +222,6 @@ pub struct BarExpectation {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BarFileSummary {
     pub data: DataSummary,
-    pub symbol_id: i32,
     pub embedded_interval: bool,
 }
 
@@ -357,12 +356,6 @@ pub fn validate_bar_file(
     }
     Ok(BarFileSummary {
         data: summary,
-        symbol_id: symbol_id.ok_or_else(|| {
-            format!(
-                "{} has no rows to establish a symbol identifier",
-                path.display()
-            )
-        })?,
         embedded_interval,
     })
 }

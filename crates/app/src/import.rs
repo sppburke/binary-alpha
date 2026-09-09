@@ -693,8 +693,8 @@ fn publish(
 
 /// A committed manifest describes this import's result when it names the same generation, role,
 /// rows, coverage, and interval, and the same objects by role, path, identity, and size, with
-/// every recorded checksum matching the bytes and every recorded generation matching what the
-/// destination reports now (a store that reports no generation leaves it as provenance).
+/// every recorded checksum matching the bytes, and every checksum or generation the destination
+/// reports now matching the record (a store that reports neither leaves them as provenance).
 fn same_result(
     committed: &GenerationManifest,
     fresh: &GenerationManifest,
@@ -716,6 +716,7 @@ fn same_result(
                     && a.sha256 == b.sha256
                     && a.bytes == b.bytes
                     && a.crc32c.is_none_or(|crc32c| crc32c == identity.crc32c)
+                    && (b.crc32c.is_none() || a.crc32c == b.crc32c)
                     && (b.generation.is_none() || a.generation == b.generation)
             })
 }

@@ -305,7 +305,7 @@ impl GenerationManifest {
             (
                 SourceKind::BarParquet,
                 PriceRepresentation::BinaryFloat64,
-                NativeGranularity::Bar { .. },
+                NativeGranularity::Bar { period_seconds: 5 },
                 TimeUnit::Second,
                 true,
                 [Capability::Bars],
@@ -540,6 +540,13 @@ mod tests {
             GenerationManifest::from_json(&duplicated.to_json())
                 .unwrap_err()
                 .contains("listed twice")
+        );
+        let mut period = manifest();
+        period.native_granularity = NativeGranularity::Bar { period_seconds: 10 };
+        assert!(
+            GenerationManifest::from_json(&period.to_json())
+                .unwrap_err()
+                .contains("disagree")
         );
         let mut ticks = manifest();
         ticks.capabilities = vec![Capability::Ticks];
