@@ -5886,7 +5886,7 @@ mod tests {
                 anatomy.upper_wick_units,
                 anatomy.lower_wick_units
             ),
-            (Some(1), None, Some(0), None)
+            (Some(1), None, Some(0), Some(i64::MAX))
         );
     }
 
