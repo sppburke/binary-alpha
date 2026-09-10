@@ -173,7 +173,7 @@ type Table = (Vec<String>, Vec<Vec<Option<Value>>>);
 struct PublishedFeatures {
     manifest: FeatureManifest,
     plan: FeaturePlan,
-    tables: Vec<[Table; 4]>,
+    tables: Vec<Vec<Table>>,
 }
 
 fn published_features(store: &Path, manifest: &Path) -> PublishedFeatures {
@@ -192,7 +192,13 @@ fn published_features(store: &Path, manifest: &Path) -> PublishedFeatures {
     let tables = plan
         .streams
         .iter()
-        .map(|stream| stream.object_paths().map(|path| read_table(&object(&path))))
+        .map(|stream| {
+            stream
+                .object_paths()
+                .iter()
+                .map(|path| read_table(&object(path)))
+                .collect()
+        })
         .collect();
     PublishedFeatures {
         manifest,
@@ -252,6 +258,73 @@ fn feed(
         }
     }
     out
+}
+
+/// The prefix length at `percent` of the ticks, extended until the last kept tick's event time
+/// is strictly before the next tick's, so the cutoff time names exactly the kept ticks.
+fn cutoff(ticks: &[Tick], percent: usize) -> usize {
+    let mut cut = ticks.len() * percent / 100;
+    while cut < ticks.len() && ticks[cut].event_time_micros == ticks[cut - 1].event_time_micros {
+        cut += 1;
+    }
+    cut
+}
+
+/// A feed cut at `cutoff` is exactly the rows and events the full feed made known by then.
+fn assert_prefix(prefix: &FeatureOutput, full: &FeatureOutput, cutoff: i64, percent: usize) {
+    assert!(
+        !prefix.rows.is_empty(),
+        "{percent} percent: the prefix emits rows"
+    );
+    assert_eq!(
+        prefix.rows,
+        full.rows[..prefix.rows.len()],
+        "{percent} percent"
+    );
+    assert_eq!(
+        prefix.structure_events,
+        full.structure_events[..prefix.structure_events.len()],
+        "{percent} percent"
+    );
+    assert_eq!(
+        prefix.sequence_events,
+        full.sequence_events[..prefix.sequence_events.len()],
+        "{percent} percent"
+    );
+    let known = |output: &FeatureOutput| {
+        (
+            output
+                .rows
+                .iter()
+                .filter(|(_, row)| row.known_at_micros <= cutoff)
+                .count(),
+            output
+                .structure_events
+                .iter()
+                .filter(|(_, event)| event.known_at_micros <= cutoff)
+                .count(),
+            output
+                .sequence_events
+                .iter()
+                .filter(|(_, event)| event.known_at_micros <= cutoff)
+                .count(),
+        )
+    };
+    let counts = (
+        prefix.rows.len(),
+        prefix.structure_events.len(),
+        prefix.sequence_events.len(),
+    );
+    assert_eq!(
+        known(prefix),
+        counts,
+        "{percent} percent: nothing in the prefix is known after the cutoff"
+    );
+    assert_eq!(
+        known(full),
+        counts,
+        "{percent} percent: the prefix holds everything known by the cutoff"
+    );
 }
 
 fn value_of<'a>(row: &'a [Option<Value>], names: &[String], name: &str) -> Option<&'a Value> {
@@ -327,6 +400,17 @@ fn features_build_fits_publishes_reconstructs_freezes_and_isolates() {
         [scratch.path(&format!(
             "retained/manifests/{feature_generation}/ready.json"
         ))]
+    );
+    // A manifest listing an object outside the generation's object set is rejected.
+    let mut json: serde_json::Value =
+        serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
+    let mut extra = json["objects"][0].clone();
+    extra["path"] = "notes.txt".into();
+    json["objects"].as_array_mut().unwrap().push(extra);
+    assert!(
+        FeatureManifest::from_json(&serde_json::to_vec(&json).unwrap())
+            .unwrap_err()
+            .contains("`notes.txt` is not part of a feature generation")
     );
     let published = published_features(&scratch.path("published"), &manifest_path);
     let (manifest, plan) = (&published.manifest, &published.plan);
@@ -418,7 +502,10 @@ fn features_build_fits_publishes_reconstructs_freezes_and_isolates() {
             (_, structure),
             (_, sequence),
             (code_names, codes),
-        ] = &published.tables[index];
+        ] = published.tables[index].as_slice()
+        else {
+            panic!("four tables");
+        };
         assert_eq!(
             names,
             &stream_plan
@@ -579,25 +666,9 @@ fn features_build_fits_publishes_reconstructs_freezes_and_isolates() {
         assert_eq!(feed(plan, &dataset, &ticks, chunk), full, "chunk {chunk}");
     }
     for percent in [25, 50, 75] {
-        let prefix = feed(
-            plan,
-            &dataset,
-            &ticks[..ticks.len() * percent / 100],
-            usize::MAX,
-        );
-        assert_eq!(
-            prefix.rows,
-            full.rows[..prefix.rows.len()],
-            "{percent} percent"
-        );
-        assert_eq!(
-            prefix.structure_events,
-            full.structure_events[..prefix.structure_events.len()]
-        );
-        assert_eq!(
-            prefix.sequence_events,
-            full.sequence_events[..prefix.sequence_events.len()]
-        );
+        let cut = cutoff(&ticks, percent);
+        let prefix = feed(plan, &dataset, &ticks[..cut], usize::MAX);
+        assert_prefix(&prefix, &full, ticks[cut - 1].event_time_micros, percent);
     }
 
     // Repeating the build reuses every immutable object and the manifest.
@@ -761,6 +832,44 @@ fn features_build_fits_publishes_reconstructs_freezes_and_isolates() {
     );
     let error = build(&other_profile).unwrap_err();
     assert!(error.contains("development-only"), "{error}");
+    // One owner per instrument, role, and stream: a second development profile of the same
+    // instrument is refused before anything is streamed or published.
+    let other_audit = scratch.config(
+        "audit_other.toml",
+        &tick_instrument().replace("min_observations = 20", "min_observations = 21"),
+    );
+    let other_stream = scratch.path(&format!(
+        "published/manifests/{}/ready.json",
+        generation(&audit(&other_audit, &dataset_manifest))
+    ));
+    assert_ne!(other_stream, stream_manifest);
+    let before = feature_manifests(&scratch, "published");
+    let duplicate = scratch.config(
+        "duplicate.toml",
+        &format!(
+            "{}{}",
+            feature_entry(
+                "development",
+                &dataset_manifest,
+                &stream_manifest,
+                TICK_SETTINGS
+            ),
+            feature_entry(
+                "development",
+                &dataset_manifest,
+                &other_stream,
+                TICK_SETTINGS
+            )
+        ),
+    );
+    let error = build(&duplicate).unwrap_err();
+    assert!(
+        error.contains(
+            "features.instruments[1]: pocket_option:AEDCNY_otc development 15s/5s is already owned by features.instruments[0]"
+        ),
+        "{error}"
+    );
+    assert_eq!(feature_manifests(&scratch, "published"), before);
 }
 
 #[test]
@@ -906,7 +1015,7 @@ fn bars_exclude_tick_outputs_with_their_reason_and_named_tick_requests_fail() {
         Some(1),
         "0.001 at scale 3"
     );
-    let [(names, rows), _, _, _] = &published.tables[0];
+    let (names, rows) = &published.tables[0][0];
     assert!(rows.len() > 30);
     assert!(
         rows.iter()
@@ -963,6 +1072,30 @@ fn bars_exclude_tick_outputs_with_their_reason_and_named_tick_requests_fail() {
         ),
     );
     assert!(build(&unknown).unwrap_err().contains("not_an_output"));
+    // Without encodings a stream publishes its three tables and no encoded object.
+    let unencoded = scratch.config(
+        "unencoded.toml",
+        &feature_entry(
+            "development",
+            &dataset_manifest,
+            &stream_manifest,
+            &BAR_SETTINGS[..BAR_SETTINGS.find("encodings").unwrap()],
+        ),
+    );
+    let lines = build(&unencoded).unwrap();
+    let unencoded_manifest = scratch.path(&format!(
+        "published/manifests/{}/ready.json",
+        generation(&lines[0])
+    ));
+    let bare = published_features(&scratch.path("published"), &unencoded_manifest);
+    assert!(bare.plan.streams[0].encodings.is_empty());
+    assert_eq!(bare.manifest.objects.len(), 4);
+    assert_eq!(bare.tables[0].len(), 3);
+    assert_eq!(
+        bare.tables[0][0], published.tables[0][0],
+        "rows do not depend on encodings"
+    );
+    assert_eq!(lines[1], verify(&unencoded_manifest).unwrap());
     // Any settings change is another raw identity and therefore another plan.
     let mut other = plan.settings.clone();
     other.rolling_window = Some(31);
@@ -1906,7 +2039,8 @@ fn governed_reference_parity() {
                     .key,
             )
         };
-        let [rows_path, structure_path, sequence_path, _] = stream.object_paths();
+        let paths = stream.object_paths();
+        let (rows_path, structure_path, sequence_path) = (&paths[0], &paths[1], &paths[2]);
         let mut legacy = [
             LegacyCsv::open(&root.join(format!(
                 "labels/phase4b_structure_sequence_swing_3x3/sequenced_labeled_candles_{}.csv",
@@ -1937,16 +2071,16 @@ fn governed_reference_parity() {
         let started = std::time::Instant::now();
         let rows = compare_rows(
             &reference.label,
-            &object(&rows_path),
+            &object(rows_path),
             &mut legacy,
             &projection,
             stream.tick_path,
         );
         assert_eq!(rows, reference.rows);
-        let structure = compare_events(&reference.label, &object(&structure_path), &mut LegacyCsv::open(&root.join(format!("labels/phase4_structure_swing_3x3/aedcny_structure_labels_v1/swing_3x3/offset_mode=tek/structure_events_{}.csv", reference.label))), &structure_event_projection(reference));
+        let structure = compare_events(&reference.label, &object(structure_path), &mut LegacyCsv::open(&root.join(format!("labels/phase4_structure_swing_3x3/aedcny_structure_labels_v1/swing_3x3/offset_mode=tek/structure_events_{}.csv", reference.label))), &structure_event_projection(reference));
         let sequence = compare_events(
             &reference.label,
-            &object(&sequence_path),
+            &object(sequence_path),
             &mut LegacyCsv::open(&root.join(format!(
                 "labels/phase4b_structure_sequence_swing_3x3/structure_sequence_events_{}.csv",
                 reference.label
@@ -1989,7 +2123,8 @@ fn governed_reference_parity() {
         in_process_peak_kb()
     );
     for (index, stream) in plan.streams.iter().enumerate() {
-        let [rows_path, structure_path, sequence_path, _] = stream.object_paths();
+        let paths = stream.object_paths();
+        let (rows_path, structure_path, sequence_path) = (&paths[0], &paths[1], &paths[2]);
         let object = |path: &str| {
             published_root.join(
                 &manifest
@@ -2000,7 +2135,7 @@ fn governed_reference_parity() {
                     .key,
             )
         };
-        let (_, rows) = table_rows(&object(&rows_path));
+        let (_, rows) = table_rows(&object(rows_path));
         let mut direct = full
             .rows
             .iter()
@@ -2018,7 +2153,7 @@ fn governed_reference_parity() {
         }
         assert!(direct.next().is_none());
         assert_eq!(count, manifest.streams[index].rows);
-        let (_, structure) = table_rows(&object(&structure_path));
+        let (_, structure) = table_rows(&object(structure_path));
         assert_eq!(
             structure.count(),
             full.structure_events
@@ -2026,7 +2161,7 @@ fn governed_reference_parity() {
                 .filter(|(s, _)| *s == index)
                 .count()
         );
-        let (_, sequence) = table_rows(&object(&sequence_path));
+        let (_, sequence) = table_rows(&object(sequence_path));
         assert_eq!(
             sequence.count(),
             full.sequence_events
@@ -2036,27 +2171,9 @@ fn governed_reference_parity() {
         );
     }
     for percent in [25, 50, 75] {
-        let prefix = feed(
-            plan,
-            &input,
-            &ticks[..ticks.len() * percent / 100],
-            usize::MAX,
-        );
-        assert_eq!(
-            prefix.rows,
-            full.rows[..prefix.rows.len()],
-            "{percent} percent"
-        );
-        assert_eq!(
-            prefix.structure_events,
-            full.structure_events[..prefix.structure_events.len()],
-            "{percent} percent"
-        );
-        assert_eq!(
-            prefix.sequence_events,
-            full.sequence_events[..prefix.sequence_events.len()],
-            "{percent} percent"
-        );
+        let cut = cutoff(&ticks, percent);
+        let prefix = feed(plan, &input, &ticks[..cut], usize::MAX);
+        assert_prefix(&prefix, &full, ticks[cut - 1].event_time_micros, percent);
         println!(
             "stable prefix {percent} percent: {} rows and {} events are a prefix of the full output",
             prefix.rows.len(),

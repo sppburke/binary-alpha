@@ -164,8 +164,8 @@ table of `swing_left`, `swing_right`, `rolling_windows` (positive, sorted, uniqu
 finite positive strictly increasing `compression_ratio_threshold`, `expanded_ratio_threshold`,
 and `extreme_ratio_threshold`, and positive `pullback_min_trend_age`,
 `trend_reset_sideways_bars`, and `failed_breakout_max_bars`; `price_epsilon`, non-negative
-decimal price text that must convert exactly at the instrument's price scale (`"0"` is strict
-equality); `tick_path_streams`, a unique subset of `streams`; and `encodings`, a table of
+decimal price text (`"0"` is strict equality) whose units resolve at the bound profile's price
+scale when the plan resolves; `tick_path_streams`, a unique subset of `streams`; and `encodings`, a table of
 `max_labels` (`1` to `32768`) and `outputs`, a unique list of `{ output, bins }` entries where
 `bins` is absent for a category output or a compiled projection and is either
 `"development_fifths"` or a finite strictly increasing list of right-closed edges for a numeric
@@ -514,8 +514,10 @@ reconstruction. Every formula reproduces the pinned reference (legacy revision
 
 ### Resolution
 
-`binary-alpha features build --config PATH` handles every `features.instruments` entry in order.
-It reads the input ready manifest and the profile ready manifest as metadata first: the input is
+`binary-alpha features build --config PATH` resolves every `features.instruments` entry, then
+builds each in order. Every resolved instrument, role, and stream has one owning entry; a second
+entry owning one is refused before anything is streamed or published. Resolution reads the input
+ready manifest and the profile ready manifest as metadata first: the input is
 a dataset generation whose role equals the declared `role` (holdout never enters), the profile
 is an instrument stream generation of role `development` for the same instrument identity and
 native granularity, and only then is the profile object read. A new plan requires the input to
@@ -538,7 +540,13 @@ and 20 plus `price_epsilon` for the trend regime; `price_epsilon` for sequence o
 `rolling_window` and `min_history` for prior-history ratios; and each configured
 moving-average period for its outputs, with 20 and 50 for the pair outputs. Under
 `all_supported` every unmet output is excluded with the exact missing prerequisite; under a
-named list an unmet or unknown output is an error naming the missing prerequisite. Bars never
+named list an unmet or unknown output is an error naming the missing prerequisite, and the
+candle identity and clock outputs (open, close, known-at, first and last event time, ordinal,
+and the four unit prices) are always selected. Each selected output records its kind, stage,
+whether it is predictive, and a readiness text stating when it is available and what an
+unavailable value means; the engine folds ticks and holds rolling, structure, sequence,
+prior-history, and moving-average state only for the stages and periods the selected outputs
+read. Bars never
 substitute volume, counts, zero diagnostics, or `clean`; bar-compatible geometry, patterns,
 prior ratios, moving averages, returns, momentum, efficiency, structure, sequences, and the
 trend, volatility, structure, transition, and bias regime components remain available.
@@ -569,7 +577,9 @@ distances, ratios, and moving-average basis points) are stored as those six-plac
 tick-path categories read the unrounded ratios, moving-average state stays unrounded, and
 `ema{p}` is stored unrounded. Canonical units (`open_units`, `high_units`, `low_units`,
 `close_units`, `body_units`, `range_units`, wick units, swing and confirmed-swing units, event
-price and level units) are exact integers; time-valued members carry microseconds. Category
+price and level units) are exact integers, and candle direction, color, tick-move sign and
+flatness, and the sequence epsilon comparison are decided on exact units (a unit difference
+beyond signed 64-bit is unavailable, never wrapped); time-valued members carry microseconds. Category
 vocabularies, thresholds, and comparisons are the reference's, and the gap-class ladder,
 tick-path thresholds, shape thresholds, moving-average states, and regime rules are versioned
 compiled policies named in the plan, not settings.
@@ -583,7 +593,9 @@ computation; the raw rows carry that identity and never a plan hash. After the r
 application rereads one selected column at a time and fits each encoding on every development
 row: a category or boolean output labels its text (empty text is `none`, missing is
 `missing`); a compiled `NAME_bucketed` projection classifies its input into the source-defined
-right-closed bins with the first edge included; a compiled `NAME_dev_quantile` projection or a
+right-closed bins with the first edge included (the four `_micros` duration inputs are divided
+by the plan's recorded `input_divisor` of 1000 first, so their bins and labels are the
+reference's millisecond values); a compiled `NAME_dev_quantile` projection or a
 `development_fifths` output cuts at the linear-interpolated development quantiles 0.2, 0.4,
 0.6, and 0.8 with duplicate cuts removed and unbounded tails, and fewer than four distinct
 development values yield no labels; bin labels are `LEFT_to_RIGHT` in the reference's
@@ -606,12 +618,14 @@ feed, the plan identity, one line feed, and the input generation. Its objects, a
 `rows/DURATIONs_OFFSETs.parquet` (one optional column per selected output in plan order, schema
 `binary_alpha_feature_rows`), `events/structure_DURATIONs_OFFSETs.parquet`
 (`binary_alpha_structure_events`: event identity, type, direction, event and confirm close,
-rows and ordinals, price and level units, and the reference kind and close),
-`events/sequence_DURATIONs_OFFSETs.parquet` (`binary_alpha_sequence_events`: event identity,
-row and ordinal, decision close, swing type and side, prices and clocks of the swing and the
-previous same-side swing, and the sequence and bias after it), and
+the confirming candle's known-at time, rows and ordinals, price and level units, and the
+reference kind and close), `events/sequence_DURATIONs_OFFSETs.parquet`
+(`binary_alpha_sequence_events`: event identity, row and ordinal, decision close, the confirming
+candle's known-at time, swing type and side, prices and clocks of the swing and the previous
+same-side swing, and the sequence and bias after it), and, only for a stream with encodings,
 `encoded/DURATIONs_OFFSETs.parquet` (`binary_alpha_encoded_rows`: one required 16-bit column per
-encoding). Every table is Zstandard Parquet with footer metadata `broker`, `provider_symbol`,
+encoding). A manifest naming any other object is invalid. Every table is Zstandard Parquet with
+footer metadata `broker`, `provider_symbol`,
 `price_scale`, `duration_seconds`, `offset_seconds`, `raw_identity` (rows and events) or
 `plan_identity` (encoded rows), and `feature_schema_version`. The ready manifest at
 `manifests/GENERATION/ready.json`, published last and mirrored, records `kind`
@@ -621,7 +635,10 @@ plan was frozen by, or `null` for a fit), `profile_generation`, `config_hash`,
 `code_revision`, `observations`, `streams` (per stream the rows, structure and sequence event
 counts, and first and last decision time), and `objects`. Before publishing, the command
 requires the observed records and coverage to equal the input manifest and, for a fit, the
-recomputed profile to equal the bound profile. It writes two lines to standard output:
+recomputed profile to equal the bound profile; after publishing the objects and before the
+ready manifest, it reconstructs the generation from the published objects under the manifest
+bytes about to become ready, so a generation its verifier rejects is never marked ready. It
+writes two lines to standard output:
 `features INSTRUMENT ROLE generation GENERATION plan PLAN input INPUT observations N rows R events E objects K reused U`
 followed by `[stream S fit S encode S publish S]` stage durations in seconds or by
 `(already published)`, then the reconstruction line below. `data verify` on a feature

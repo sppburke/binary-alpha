@@ -392,6 +392,129 @@ struct OutputDef {
     requires: Vec<Req>,
 }
 
+/// When an output is available and what an unavailable value means, per field group.
+fn readiness(field: Field) -> &'static str {
+    use Field as F;
+    match field {
+        F::Return1Bps => {
+            "unavailable on the first accepted candle; state advances across every accepted candle"
+        }
+        F::Momentum(_) | F::RangeMean(_) | F::TickVolumeMean(_) => {
+            "unavailable until the window count of accepted candles; state advances across every accepted candle"
+        }
+        F::Efficiency(_) | F::AbsReturnMean(_) => {
+            "unavailable until the window count of returns; efficiency also needs a positive absolute-return sum"
+        }
+        F::RangeToAvg20 => "unavailable until windows 5 and 20 fill with a positive 20-window mean",
+        F::CompressionState => "`unknown` until windows 5 and 20 fill",
+        F::DirectionalState => {
+            "`unknown` until the direction window fills; then `sideways`, `up`, or `down`"
+        }
+        F::RangeLike | F::PullbackAgainstTrend => "false until its inputs are available",
+        F::TrendLegDirection => "`none` until a directional state holds",
+        F::TrendLegAge => "zero until a directional state holds",
+        F::LastSwingHighUnits
+        | F::LastSwingHighEventClose
+        | F::LastSwingHighConfirmClose
+        | F::BarsSinceSwingHigh
+        | F::DistanceToSwingHighBps => {
+            "unavailable until a swing high is confirmed after the right-side candles close"
+        }
+        F::LastSwingLowUnits
+        | F::LastSwingLowEventClose
+        | F::LastSwingLowConfirmClose
+        | F::BarsSinceSwingLow
+        | F::DistanceToSwingLowBps => {
+            "unavailable until a swing low is confirmed after the right-side candles close"
+        }
+        F::CurrentEventTypes => "empty text on a row without an event",
+        F::CurrentEventClose => "unavailable on a row without an event",
+        F::SwingHighType | F::SwingLowType => {
+            "empty text on a row that confirms no swing of that side"
+        }
+        F::LastSwingHighType | F::LastSwingLowType => {
+            "empty text until a swing of that side is confirmed"
+        }
+        F::MarketStructureSequence | F::MarketStructureBias => {
+            "`unknown` until both sides have a confirmed swing; `warming_up` while either is the first"
+        }
+        F::LastConfirmedUnits(_)
+        | F::LastConfirmedEventClose(_)
+        | F::LastConfirmedConfirmClose(_)
+        | F::BarsSinceConfirmed(_) => {
+            "unavailable until a swing of that sequence type is confirmed"
+        }
+        F::PriorCleanHistoryCount => {
+            "the count of adjacent accepted candles before this one; resets when the accepted ordinal is not adjacent"
+        }
+        F::RangeVsRecentRatio | F::BodyVsRecentRatio | F::TickVolumeVsRecentRatio => {
+            "unavailable until `min_history` adjacent accepted candles with a positive mean; resets when the accepted ordinal is not adjacent"
+        }
+        F::RangeVsRecentBucket | F::BodyVsRecentBucket | F::TickVolumeVsRecentBucket => {
+            "`unknown_warmup` while the ratio is unavailable"
+        }
+        F::IsExpansionCandle | F::IsCompressionCandle => {
+            "false while the range ratio is unavailable"
+        }
+        F::PreviousCandleRelation => {
+            "`first_clean_candle` on the first accepted candle and `no_adjacent_previous_clean_candle` after a non-adjacent ordinal"
+        }
+        F::IsInsideBar | F::IsOutsideBar => "false without an adjacent previous accepted candle",
+        F::Ema(_) => {
+            "numeric preview from the first close of a segment; resets when the accepted ordinal is not adjacent"
+        }
+        F::EmaReady(_) => "true once the period count of adjacent accepted candles has been seen",
+        F::CloseVsEmaBps(_) | F::CloseAboveEma(_) | F::Ema20MinusEma50Bps | F::Ema20AboveEma50 => {
+            "available from the first close of a segment; readiness is separate"
+        }
+        F::EmaSlopeBps(_) => "unavailable on the first candle of a segment",
+        F::EmaSlopeState(_) | F::CloseVsEmaState(_) | F::Ema20Ema50AlignmentState => {
+            "`not_ready` until ready or while the value is unavailable"
+        }
+        F::TickPathReady => "true once the interval saw three directional moves",
+        F::TickPathPressureBucket
+        | F::TickPathShapeBucket
+        | F::TickPathTerminalPressureBucket
+        | F::TickPathFailedPressureDirection
+        | F::TickPathEfficiencyBucket
+        | F::TickPathReversalBucket => "`insufficient_tick_path` until three directional moves",
+        F::TickPathDirectionalMoves
+        | F::TickPathUpticks
+        | F::TickPathDownticks
+        | F::TickPathFlats
+        | F::TickPathDirectionChanges
+        | F::TickPathSignedImbalance
+        | F::TickPathReversalRate
+        | F::TickPathEfficiency
+        | F::TickPathTerminalMoves
+        | F::TickPathTerminalSignedImbalance
+        | F::TickPathClosePosition => "available on every accepted candle of a tick-path stream",
+        F::BodyBps | F::RangeBps | F::UpperWickBps | F::LowerWickBps => {
+            "unavailable when the open is zero"
+        }
+        F::BodyUnits | F::RangeUnits | F::UpperWickUnits | F::LowerWickUnits => {
+            "unavailable when the difference exceeds signed 64-bit units"
+        }
+        F::MaxAbsTickJumpBps | F::MaxTrueTickJumpBps | F::MaxGapReopenJumpBps => {
+            "zero on a candle without a qualifying move"
+        }
+        F::RegimeTrendState
+        | F::RegimeVolatilityState
+        | F::RegimeStructureState
+        | F::RegimeTransitionState
+        | F::RegimeQualityState
+        | F::RegimeDirectionalBias
+        | F::RegimeComposite
+        | F::IsRegimeClean
+        | F::IsRegimeTrending
+        | F::IsRegimeRanging
+        | F::IsRegimeTransition => {
+            "available on every accepted candle; an unavailable input reads as its component's `unknown` or `neutral`"
+        }
+        _ => "available on every accepted candle",
+    }
+}
+
 fn def(
     name: impl Into<String>,
     field: Field,
@@ -900,8 +1023,8 @@ fn field_name(field: Field) -> String {
 }
 
 /// The source-defined fixed right-closed bins of the named numeric projections, keyed by the
-/// canonical input output. Time-valued members carry the reference's millisecond edges in
-/// microseconds.
+/// canonical input output. Time-valued members keep the reference's millisecond edges and
+/// labels; their microsecond inputs are divided by [`DURATION_DIVISOR`] before bucketing.
 const FIXED_BINS: &[(&str, &[f64])] = &[
     ("close_position", &[0.0, 0.2, 0.4, 0.6, 0.8, 1.0]),
     ("body_to_range", &[0.0, 0.1, 0.25, 0.45, 0.65, 0.85, 1.0]),
@@ -1232,14 +1355,14 @@ const FIXED_BINS: &[(&str, &[f64])] = &[
         &[
             f64::NEG_INFINITY,
             0.0,
-            250_000.0,
-            500_000.0,
-            1_000_000.0,
-            2_000_000.0,
-            5_000_000.0,
-            10_000_000.0,
-            30_000_000.0,
-            60_000_000.0,
+            250.0,
+            500.0,
+            1_000.0,
+            2_000.0,
+            5_000.0,
+            10_000.0,
+            30_000.0,
+            60_000.0,
             f64::INFINITY,
         ],
     ),
@@ -1248,14 +1371,14 @@ const FIXED_BINS: &[(&str, &[f64])] = &[
         &[
             f64::NEG_INFINITY,
             0.0,
-            250_000.0,
-            500_000.0,
-            1_000_000.0,
-            2_000_000.0,
-            5_000_000.0,
-            10_000_000.0,
-            30_000_000.0,
-            60_000_000.0,
+            250.0,
+            500.0,
+            1_000.0,
+            2_000.0,
+            5_000.0,
+            10_000.0,
+            30_000.0,
+            60_000.0,
             f64::INFINITY,
         ],
     ),
@@ -1264,14 +1387,14 @@ const FIXED_BINS: &[(&str, &[f64])] = &[
         &[
             f64::NEG_INFINITY,
             0.0,
-            250_000.0,
-            500_000.0,
-            1_000_000.0,
-            2_000_000.0,
-            5_000_000.0,
-            10_000_000.0,
-            30_000_000.0,
-            60_000_000.0,
+            250.0,
+            500.0,
+            1_000.0,
+            2_000.0,
+            5_000.0,
+            10_000.0,
+            30_000.0,
+            60_000.0,
             f64::INFINITY,
         ],
     ),
@@ -1280,14 +1403,14 @@ const FIXED_BINS: &[(&str, &[f64])] = &[
         &[
             f64::NEG_INFINITY,
             0.0,
-            250_000.0,
-            500_000.0,
-            1_000_000.0,
-            2_000_000.0,
-            5_000_000.0,
-            10_000_000.0,
-            30_000_000.0,
-            60_000_000.0,
+            250.0,
+            500.0,
+            1_000.0,
+            2_000.0,
+            5_000.0,
+            10_000.0,
+            30_000.0,
+            60_000.0,
             f64::INFINITY,
         ],
     ),
@@ -1470,6 +1593,30 @@ const FIXED_BINS: &[(&str, &[f64])] = &[
     ),
 ];
 
+/// Microseconds per millisecond: the divisor applied to a duration input before its
+/// millisecond-defined fixed bins.
+const DURATION_DIVISOR: f64 = 1_000.0;
+
+/// The inputs whose fixed bins are defined over the reference's millisecond values.
+const DURATION_INPUTS: [&str; 4] = [
+    "max_gap_micros",
+    "max_internal_gap_micros",
+    "starts_after_gap_micros",
+    "max_same_price_run_micros",
+];
+
+fn input_divisor(input: &str) -> f64 {
+    if DURATION_INPUTS.contains(&input) {
+        DURATION_DIVISOR
+    } else {
+        1.0
+    }
+}
+
+fn is_one(value: &f64) -> bool {
+    *value == 1.0
+}
+
 /// The named development-quantile projections, keyed by the canonical input output.
 const QUANTILE_PROJECTIONS: &[&str] = &[
     "tick_volume",
@@ -1576,6 +1723,8 @@ pub struct OutputSpec {
     pub kind: Kind,
     pub stage: Stage,
     pub predictive: bool,
+    /// When the output is available and what an unavailable value means.
+    pub readiness: String,
 }
 
 /// One output a stream cannot provide and the exact missing prerequisite.
@@ -1596,8 +1745,16 @@ pub struct FittedEncoding {
     /// Serialized as exact decimal text so infinite tails and every binary value round-trip.
     #[serde(with = "edge_text")]
     pub edges: Option<Vec<f64>>,
+    /// The input is divided by this before bucketing: 1000 for a microsecond duration whose
+    /// bins and labels the reference defined in milliseconds, otherwise 1.
+    #[serde(default = "one", skip_serializing_if = "is_one")]
+    pub input_divisor: f64,
     /// Labels in code order; a value outside the list encodes as `-1`.
     pub labels: Vec<String>,
+}
+
+fn one() -> f64 {
+    1.0
 }
 
 /// Bin edges as text: Rust's shortest round-trip rendering, which also spells `inf` and `-inf`.
@@ -1657,22 +1814,32 @@ impl StreamPlan {
         }
     }
 
-    /// The object paths of this stream's rows, structure events, sequence events, and
-    /// encoded rows inside a feature generation.
-    pub fn object_paths(&self) -> [String; 4] {
-        let stem = format!("{}s_{}s", self.duration_seconds, self.offset_seconds);
-        [
-            format!("rows/{stem}.parquet"),
-            format!("events/structure_{stem}.parquet"),
-            format!("events/sequence_{stem}.parquet"),
-            format!("encoded/{stem}.parquet"),
-        ]
+    /// The object paths of this stream's rows, structure events, sequence events, and, when
+    /// the stream has encodings, encoded rows inside a feature generation.
+    pub fn object_paths(&self) -> Vec<String> {
+        let mut paths = stream_object_paths(self.duration_seconds, self.offset_seconds);
+        if self.encodings.is_empty() {
+            paths.pop();
+        }
+        paths
     }
 
     /// The position of an output in this stream's rows.
     pub fn output_index(&self, name: &str) -> Option<usize> {
         self.outputs.iter().position(|output| output.name == name)
     }
+}
+
+/// The four object paths a stream may own: rows, structure events, sequence events, and
+/// encoded rows.
+pub fn stream_object_paths(duration_seconds: u32, offset_seconds: u32) -> Vec<String> {
+    let stem = format!("{duration_seconds}s_{offset_seconds}s");
+    vec![
+        format!("rows/{stem}.parquet"),
+        format!("events/structure_{stem}.parquet"),
+        format!("events/sequence_{stem}.parquet"),
+        format!("encoded/{stem}.parquet"),
+    ]
 }
 
 /// The development fit window: the decision-time span of the rows the encodings were fitted
@@ -1841,14 +2008,17 @@ impl FeaturePlan {
                     kind: output.kind,
                     stage: output.stage,
                     predictive: output.predictive,
+                    readiness: readiness(output.field).to_string(),
                 };
+                // Row identity and clocks are always persisted, whatever a named list selects.
+                let identity = output.stage == Stage::Candle && !output.predictive;
                 match (&settings.outputs, verdict) {
                     (Outputs::AllSupported, Ok(())) => outputs.push(spec),
                     (Outputs::AllSupported, Err(reason)) => excluded.push(Exclusion {
                         name: output.name.clone(),
                         reason,
                     }),
-                    (Outputs::Named(names), Ok(())) if names.contains(&output.name) => {
+                    (Outputs::Named(names), Ok(())) if identity || names.contains(&output.name) => {
                         outputs.push(spec);
                     }
                     (Outputs::Named(names), Err(reason)) if names.contains(&output.name) => {
@@ -1978,6 +2148,10 @@ fn compile_encoding(
         input: input.to_string(),
         encoding,
         edges,
+        input_divisor: match kind {
+            Some(_) => input_divisor(input),
+            None => 1.0,
+        },
         labels: Vec::new(),
     }))
 }
@@ -2036,6 +2210,14 @@ fn bps_size(value: f64, reference: f64) -> Option<f64> {
     (reference != 0.0).then(|| value / reference.abs() * 10_000.0)
 }
 
+/// One accepted tick as the path folds it: its event time, floating price, and exact units.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct TickSeen {
+    event: i64,
+    price: f64,
+    units: i64,
+}
+
 /// The within-candle tick path and the tick-to-tick jump magnitudes of one stream's working
 /// interval, folded from ordered accepted ticks before the candle finalizes.
 #[derive(Debug, Clone)]
@@ -2080,16 +2262,20 @@ impl TickPath {
     /// Folds one accepted tick given the previous tick of the stream, in the reference's
     /// order: the jump entering or inside the interval, then the path move when the previous
     /// tick lies inside this interval.
-    fn fold(
-        &mut self,
-        previous: Option<(i64, f64)>,
-        event: i64,
-        price: f64,
-        gap: Option<(i64, i64)>,
-    ) {
-        let Some((previous_event, previous_price)) = previous else {
+    fn fold(&mut self, previous: Option<TickSeen>, tick: TickSeen, gap: Option<(i64, i64)>) {
+        let Some(TickSeen {
+            event: previous_event,
+            price: previous_price,
+            units: previous_units,
+        }) = previous
+        else {
             return;
         };
+        let TickSeen {
+            event,
+            price,
+            units,
+        } = tick;
         let delta = event - previous_event;
         if previous_price != 0.0 {
             let bps = (price - previous_price).abs() / previous_price.abs() * 10_000.0;
@@ -2105,12 +2291,17 @@ impl TickPath {
         if !(self.open_time..self.close_time).contains(&previous_event) {
             return;
         }
+        // The sign and flatness of a move are exact unit decisions; its size feeds the
+        // reference's floating sum.
+        let direction: i8 = match units.cmp(&previous_units) {
+            std::cmp::Ordering::Equal => {
+                self.flat += 1;
+                return;
+            }
+            std::cmp::Ordering::Greater => 1,
+            std::cmp::Ordering::Less => -1,
+        };
         let move_ = price - previous_price;
-        if move_ == 0.0 {
-            self.flat += 1;
-            return;
-        }
-        let direction: i8 = if move_ > 0.0 { 1 } else { -1 };
         if direction > 0 {
             self.up += 1;
         } else {
@@ -2296,10 +2487,11 @@ struct Anatomy {
     low: f64,
     close: f64,
     direction: &'static str,
-    body_units: i64,
-    range_units: i64,
-    upper_wick_units: i64,
-    lower_wick_units: i64,
+    /// Exact unit differences, unavailable only when they exceed signed 64-bit units.
+    body_units: Option<i64>,
+    range_units: Option<i64>,
+    upper_wick_units: Option<i64>,
+    lower_wick_units: Option<i64>,
     /// Six-place normalized values, as every downstream reference stage read them.
     body_bps: Option<f64>,
     range_bps: Option<f64>,
@@ -2325,6 +2517,13 @@ impl Anatomy {
         let upper_wick = (high - open.max(close)).max(0.0);
         let lower_wick = (open.min(close) - low).max(0.0);
         let ratio = |value: f64, zero: f64| if range > 0.0 { value / range } else { zero };
+        let (open_units, high_units, low_units, close_units) = (
+            i128::from(candle.open_units),
+            i128::from(candle.high_units),
+            i128::from(candle.low_units),
+            i128::from(candle.close_units),
+        );
+        let units = |difference: i128| i64::try_from(difference).ok();
         Self {
             unit,
             close_units: candle.close_units,
@@ -2332,17 +2531,15 @@ impl Anatomy {
             high,
             low,
             close,
-            direction: if close > open {
-                "up"
-            } else if close < open {
-                "down"
-            } else {
-                "flat"
+            direction: match close_units.cmp(&open_units) {
+                std::cmp::Ordering::Greater => "up",
+                std::cmp::Ordering::Less => "down",
+                std::cmp::Ordering::Equal => "flat",
             },
-            body_units: (candle.close_units - candle.open_units).abs(),
-            range_units: candle.high_units - candle.low_units,
-            upper_wick_units: candle.high_units - candle.open_units.max(candle.close_units),
-            lower_wick_units: candle.open_units.min(candle.close_units) - candle.low_units,
+            body_units: units((close_units - open_units).abs()),
+            range_units: units(high_units - low_units),
+            upper_wick_units: units(high_units - open_units.max(close_units)),
+            lower_wick_units: units(open_units.min(close_units) - low_units),
             body_bps: bps_size(body, open).map(six),
             range_bps: bps_size(range, open).map(six),
             upper_wick_bps: bps_size(upper_wick, open).map(six),
@@ -2578,6 +2775,8 @@ struct SwingCandle {
     row: u64,
     ordinal: u64,
     close_time: i64,
+    /// The candle's actual availability: the known-at time of the record that finalized it.
+    known_at: i64,
     high_units: i64,
     low_units: i64,
 }
@@ -2618,6 +2817,8 @@ pub struct StructureEvent {
     pub event_close_micros: i64,
     /// The close time of the candle that made the event known.
     pub confirm_close_micros: i64,
+    /// The actual availability of the event: the confirming candle's known-at time.
+    pub known_at_micros: i64,
     pub event_row: u64,
     pub confirm_row: u64,
     pub event_candle_ordinal: u64,
@@ -2700,6 +2901,7 @@ impl Structure {
             direction,
             event_close_micros: candle.close_time,
             confirm_close_micros: candle.close_time,
+            known_at_micros: candle.known_at,
             event_row: candle.row,
             confirm_row: candle.row,
             event_candle_ordinal: candle.ordinal,
@@ -2771,6 +2973,7 @@ impl Structure {
                     direction,
                     event_close_micros: center.close_time,
                     confirm_close_micros: candle.close_time,
+                    known_at_micros: candle.known_at,
                     event_row: center.row,
                     confirm_row: candle.row,
                     event_candle_ordinal: center.ordinal,
@@ -3010,6 +3213,8 @@ pub struct SequenceEvent {
     pub row: u64,
     pub candle_ordinal: u64,
     pub decision_close_micros: i64,
+    /// The actual availability of the event: the confirming candle's known-at time.
+    pub known_at_micros: i64,
     pub swing_event_type: &'static str,
     pub swing_type: &'static str,
     pub swing_price_units: i64,
@@ -3107,10 +3312,16 @@ impl Sequence {
             let point = point.expect("a newly confirmed swing has a point");
             let swing_type = match *previous {
                 None => first,
-                Some(before) if point.price_units > before.price_units + self.epsilon_units => {
+                Some(before)
+                    if i128::from(point.price_units)
+                        > i128::from(before.price_units) + i128::from(self.epsilon_units) =>
+                {
                     higher
                 }
-                Some(before) if point.price_units < before.price_units - self.epsilon_units => {
+                Some(before)
+                    if i128::from(point.price_units)
+                        < i128::from(before.price_units) - i128::from(self.epsilon_units) =>
+                {
                     lower
                 }
                 Some(_) => equal,
@@ -3151,6 +3362,7 @@ impl Sequence {
                 row: candle.row,
                 candle_ordinal: candle.ordinal,
                 decision_close_micros: candle.close_time,
+                known_at_micros: candle.known_at,
                 swing_event_type,
                 swing_type: point.swing_type,
                 swing_price_units: point.price_units,
@@ -3507,12 +3719,10 @@ impl Shape {
             anatomy.body_to_range,
             anatomy.close_position,
         );
-        let color = if anatomy.close > anatomy.open {
-            "bullish"
-        } else if anatomy.close < anatomy.open {
-            "bearish"
-        } else {
-            "neutral"
+        let color = match anatomy.direction {
+            "up" => "bullish",
+            "down" => "bearish",
+            _ => "neutral",
         };
         let (history, range_ratio, body_ratio, volume_ratio) = match &self.relative {
             None => (None, None, None, None),
@@ -3925,10 +4135,10 @@ impl Scratch<'_> {
             F::TickPathEfficiencyBucket => text(tick?.efficiency_bucket),
             F::TickPathReversalBucket => text(tick?.reversal_bucket),
             F::CandleDirection => text(self.anatomy.direction),
-            F::BodyUnits => Int(self.anatomy.body_units),
-            F::RangeUnits => Int(self.anatomy.range_units),
-            F::UpperWickUnits => Int(self.anatomy.upper_wick_units),
-            F::LowerWickUnits => Int(self.anatomy.lower_wick_units),
+            F::BodyUnits => Int(self.anatomy.body_units?),
+            F::RangeUnits => Int(self.anatomy.range_units?),
+            F::UpperWickUnits => Int(self.anatomy.upper_wick_units?),
+            F::LowerWickUnits => Int(self.anatomy.lower_wick_units?),
             F::BodyBps => Float(self.anatomy.body_bps?),
             F::RangeBps => Float(self.anatomy.range_bps?),
             F::UpperWickBps => Float(self.anatomy.upper_wick_bps?),
@@ -4139,7 +4349,10 @@ struct StreamState {
     offset_micros: i64,
     fields: Vec<Field>,
     tick_path: Option<TickPath>,
+    /// Whether any selected output reads the path summary, and whether any reads the jump
+    /// magnitudes; ticks are folded only when one of them does.
     tick_path_enabled: bool,
+    jumps_needed: bool,
     ordinal: u64,
     accepted: u64,
     rolling: Option<Rolling>,
@@ -4158,8 +4371,60 @@ pub struct FeatureEngine {
     unit: f64,
     ticks: bool,
     gap: Option<(i64, i64)>,
-    previous_tick: Option<(i64, f64)>,
+    previous_tick: Option<TickSeen>,
     finalized: Vec<(usize, Candle)>,
+}
+
+/// Which calculations the selected outputs of one stream need; unselected stages hold no state.
+#[derive(Debug, Clone, Copy, Default)]
+struct Needs {
+    tick_path: bool,
+    jumps: bool,
+    rolling: bool,
+    structure: bool,
+    sequence: bool,
+    relative: bool,
+    regime: bool,
+}
+
+impl Needs {
+    fn of(fields: &[Field], stages: impl Fn(Field) -> Stage) -> Self {
+        use Field as F;
+        let mut needs = Self::default();
+        for &field in fields {
+            match stages(field) {
+                Stage::TickPath => needs.tick_path = true,
+                Stage::Rolling => needs.rolling = true,
+                Stage::Structure => needs.structure = true,
+                Stage::Sequence => needs.sequence = true,
+                Stage::Regime => needs.regime = true,
+                _ => {}
+            }
+            match field {
+                F::MaxAbsTickJumpBps
+                | F::MaxTrueTickJumpBps
+                | F::MaxGapReopenJumpBps
+                | F::RegimeQualityState
+                | F::RegimeComposite
+                | F::IsRegimeClean => needs.jumps = true,
+                F::PriorCleanHistoryCount
+                | F::RangeVsRecentRatio
+                | F::BodyVsRecentRatio
+                | F::TickVolumeVsRecentRatio
+                | F::RangeVsRecentBucket
+                | F::BodyVsRecentBucket
+                | F::TickVolumeVsRecentBucket
+                | F::IsExpansionCandle
+                | F::IsCompressionCandle => needs.relative = true,
+                _ => {}
+            }
+        }
+        // Later stages read earlier ones.
+        needs.sequence |= needs.regime;
+        needs.structure |= needs.sequence;
+        needs.rolling |= needs.structure;
+        needs
+    }
 }
 
 impl FeatureEngine {
@@ -4182,36 +4447,75 @@ impl FeatureEngine {
                 .ok_or_else(|| format!("plan stream {key} is not a stream of the definition"))?;
             let spec = &definition.candles[definition_index];
             let table = catalog(settings);
-            let fields = stream_plan
+            let defs = stream_plan
                 .outputs
                 .iter()
                 .map(|output| {
                     table
                         .iter()
                         .find(|def| def.name == output.name)
-                        .map(|def| def.field)
                         .ok_or_else(|| format!("plan output `{}` is not compiled", output.name))
                 })
                 .collect::<Result<Vec<_>, _>>()?;
+            let fields: Vec<Field> = defs.iter().map(|def| def.field).collect();
+            let needs = Needs::of(&fields, |field| {
+                table
+                    .iter()
+                    .find(|def| def.field == field)
+                    .map_or(Stage::Candle, |def| def.stage)
+            });
+            let periods: Vec<u32> = settings
+                .moving_average_periods
+                .iter()
+                .copied()
+                .filter(|period| {
+                    fields.iter().any(|field| match field {
+                        Field::Ema(p)
+                        | Field::EmaReady(p)
+                        | Field::CloseVsEmaBps(p)
+                        | Field::CloseAboveEma(p)
+                        | Field::EmaSlopeBps(p)
+                        | Field::EmaSlopeState(p)
+                        | Field::CloseVsEmaState(p) => p == period,
+                        Field::Ema20MinusEma50Bps
+                        | Field::Ema20AboveEma50
+                        | Field::Ema20Ema50AlignmentState => matches!(period, 20 | 50),
+                        _ => false,
+                    })
+                })
+                .collect();
             states.push(StreamState {
                 definition_index,
                 duration_micros: i64::from(spec.duration_seconds) * MICROS_PER_SECOND,
                 offset_micros: i64::from(spec.offset_seconds) * MICROS_PER_SECOND,
                 fields,
                 tick_path: None,
-                tick_path_enabled: stream_plan.tick_path && ticks,
+                tick_path_enabled: stream_plan.tick_path && ticks && needs.tick_path,
+                jumps_needed: ticks && needs.jumps,
                 ordinal: 0,
                 accepted: 0,
-                rolling: settings.structure.as_ref().map(Rolling::new),
-                structure: settings.structure.as_ref().map(Structure::new),
+                rolling: settings
+                    .structure
+                    .as_ref()
+                    .filter(|_| needs.rolling)
+                    .map(Rolling::new),
+                structure: settings
+                    .structure
+                    .as_ref()
+                    .filter(|_| needs.structure)
+                    .map(Structure::new),
                 sequence: settings
                     .structure
                     .as_ref()
+                    .filter(|_| needs.sequence)
                     .and(settings.price_epsilon_units)
                     .map(Sequence::new),
                 shape: Shape::new(
-                    settings.rolling_window.zip(settings.min_history),
-                    &settings.moving_average_periods,
+                    settings
+                        .rolling_window
+                        .zip(settings.min_history)
+                        .filter(|_| needs.relative),
+                    &periods,
                 ),
             });
         }
@@ -4252,11 +4556,17 @@ impl FeatureEngine {
         if let Observation::Tick(tick) = observation
             && self.ticks
         {
-            let price = tick.price_units as f64 / self.unit;
+            let seen = TickSeen {
+                event: tick.event_time_micros,
+                price: tick.price_units as f64 / self.unit,
+                units: tick.price_units,
+            };
             for state in &mut self.states {
-                state.fold_tick(self.previous_tick, tick.event_time_micros, price, self.gap);
+                if state.tick_path_enabled || state.jumps_needed {
+                    state.fold_tick(self.previous_tick, seen, self.gap);
+                }
             }
-            self.previous_tick = Some((tick.event_time_micros, price));
+            self.previous_tick = Some(seen);
         }
         Ok(())
     }
@@ -4268,19 +4578,13 @@ impl FeatureEngine {
 }
 
 impl StreamState {
-    fn fold_tick(
-        &mut self,
-        previous: Option<(i64, f64)>,
-        event: i64,
-        price: f64,
-        gap: Option<(i64, i64)>,
-    ) {
-        let open = interval_open(event, self.duration_micros, self.offset_micros);
+    fn fold_tick(&mut self, previous: Option<TickSeen>, tick: TickSeen, gap: Option<(i64, i64)>) {
+        let open = interval_open(tick.event, self.duration_micros, self.offset_micros);
         let path = match &mut self.tick_path {
             Some(path) if path.open_time == open => path,
             slot => slot.insert(TickPath::new(open, open + self.duration_micros)),
         };
-        path.fold(previous, event, price, gap);
+        path.fold(previous, tick, gap);
     }
 
     /// Folds one finalized candle: consumes its tick path, applies strict eligibility, and, for
@@ -4334,6 +4638,7 @@ impl StreamState {
             row: self.accepted,
             ordinal: self.ordinal,
             close_time: candle.close_time_micros,
+            known_at: candle.known_at_micros,
             high_units: candle.high_units,
             low_units: candle.low_units,
         };
@@ -4419,7 +4724,7 @@ pub fn format_general(value: f64) -> String {
         return if value > 0.0 { "inf" } else { "-inf" }.to_string();
     }
     if value == 0.0 {
-        return "0".to_string();
+        return if value.is_sign_negative() { "-0" } else { "0" }.to_string();
     }
     let scientific = format!("{value:.5e}");
     let (mantissa, exponent) = scientific
@@ -4522,7 +4827,7 @@ impl FittedEncoding {
             }),
             ProjectionKind::Fixed | ProjectionKind::DevelopmentFifths => {
                 let edges = self.full_edges()?;
-                let index = bucket(value.as_f64()?, &edges)?;
+                let index = bucket(value.as_f64()? / self.input_divisor, &edges)?;
                 Some(Cow::Owned(edge_label(edges[index], edges[index + 1])))
             }
         }
@@ -4536,6 +4841,7 @@ impl FittedEncoding {
             let mut values: Vec<f64> = column
                 .iter()
                 .filter_map(|value| value.as_ref()?.as_f64())
+                .map(|value| value / self.input_divisor)
                 .collect();
             self.edges = development_fifths(&mut values);
         }
@@ -4678,18 +4984,25 @@ impl FeatureManifest {
         {
             return Err(format!("expected one `{PLAN_OBJECT_PATH}` object"));
         }
+        let mut allowed = vec![PLAN_OBJECT_PATH.to_string()];
         for summary in &manifest.streams {
-            let stem = format!("{}s_{}s", summary.duration_seconds, summary.offset_seconds);
-            for path in [
-                format!("rows/{stem}.parquet"),
-                format!("events/structure_{stem}.parquet"),
-                format!("events/sequence_{stem}.parquet"),
-                format!("encoded/{stem}.parquet"),
-            ] {
-                if !manifest.objects.iter().any(|object| object.path == path) {
+            let paths = stream_object_paths(summary.duration_seconds, summary.offset_seconds);
+            for path in &paths[..3] {
+                if !manifest.objects.iter().any(|object| object.path == *path) {
                     return Err(format!("expected a `{path}` object"));
                 }
             }
+            allowed.extend(paths);
+        }
+        if let Some(object) = manifest
+            .objects
+            .iter()
+            .find(|object| !allowed.contains(&object.path))
+        {
+            return Err(format!(
+                "object `{}` is not part of a feature generation",
+                object.path
+            ));
         }
         if manifest
             .objects
@@ -4874,7 +5187,17 @@ mod tests {
             input: "x".to_string(),
             encoding: kind,
             edges,
+            input_divisor: 1.0,
             labels: Vec::new(),
+        }
+    }
+
+    /// A tick as the path folds it, with exact units at scale six.
+    fn seen(event: i64, price: f64) -> TickSeen {
+        TickSeen {
+            event,
+            price,
+            units: (price * 1e6).round() as i64,
         }
     }
 
@@ -5008,6 +5331,7 @@ mod tests {
             (3.4000000000000004, "3.4"),
             (1_234_567.0, "1.23457e+06"),
             (-0.25, "-0.25"),
+            (-0.0, "-0"),
             (f64::INFINITY, "inf"),
             (f64::NEG_INFINITY, "-inf"),
             (0.0, "0"),
@@ -5023,6 +5347,42 @@ mod tests {
         ] {
             assert_eq!(format_general(value), text, "{value}");
         }
+    }
+
+    #[test]
+    fn duration_projections_bucket_and_label_in_milliseconds() {
+        let mut request = entry(&[(5, 0)], Outputs::AllSupported);
+        request.encodings = Some(Encodings {
+            max_labels: 32_768,
+            outputs: vec![EncodingSpec {
+                output: "max_gap_micros_bucketed".to_string(),
+                bins: None,
+            }],
+        });
+        let plan = FeaturePlan::resolve(
+            &request,
+            profile(NativeGranularity::Tick, true, &[(5, 0)]),
+            "input",
+        )
+        .unwrap();
+        let mut fitted = plan.streams[0].encodings[0].clone();
+        assert_eq!(
+            (fitted.input.as_str(), fitted.input_divisor),
+            ("max_gap_micros", 1_000.0)
+        );
+        let values = numbers(&[0.0, 300_000.0, 750_000.0, 2_000_000.0]);
+        fitted.fit(&values, 32_768).unwrap();
+        assert_eq!(
+            fitted.labels,
+            ["-inf_to_0", "1000_to_2000", "250_to_500", "500_to_1000"]
+        );
+        assert_eq!(fitted.encode(&values), [0, 2, 3, 1]);
+        let json = serde_json::to_string(&fitted).unwrap();
+        assert!(json.contains("\"input_divisor\":1000.0"), "{json}");
+        assert_eq!(
+            serde_json::from_str::<FittedEncoding>(&json).unwrap(),
+            fitted
+        );
     }
 
     #[test]
@@ -5049,7 +5409,7 @@ mod tests {
     #[test]
     fn tick_path_deque_matches_the_whole_list_formula_at_every_prefix() {
         let mut path = TickPath::new(0, 5_000_000);
-        let mut previous = Some((0, 1.0));
+        let mut previous = Some(seen(0, 1.0));
         let mut signs: Vec<i8> = Vec::new();
         let mut price = 1.0;
         let mut state = 7u64;
@@ -5062,11 +5422,10 @@ mod tests {
             price += delta;
             path.fold(
                 previous,
-                step * 10_000,
-                price,
+                seen(step * 10_000, price),
                 Some((2_000_000, 60_000_000)),
             );
-            previous = Some((step * 10_000, price));
+            previous = Some(seen(step * 10_000, price));
             if delta != 0.0 {
                 signs.push(if delta > 0.0 { 1 } else { -1 });
             }
@@ -5085,8 +5444,8 @@ mod tests {
             let mut previous = None;
             for (index, price) in prices.iter().enumerate() {
                 let event = index as i64 * 100_000;
-                path.fold(previous, event, *price, gap);
-                previous = Some((event, *price));
+                path.fold(previous, seen(event, *price), gap);
+                previous = Some(seen(event, *price));
             }
             let (high, low) = prices.iter().fold((f64::MIN, f64::MAX), |(high, low), p| {
                 (high.max(*p), low.min(*p))
@@ -5133,8 +5492,8 @@ mod tests {
         let prices = [1.0, 1.1, 1.2, 1.3];
         let mut previous = None;
         for (index, price) in prices.iter().enumerate() {
-            path.fold(previous, index as i64 * 1_000, *price, gap);
-            previous = Some((index as i64 * 1_000, *price));
+            path.fold(previous, seen(index as i64 * 1_000, *price), gap);
+            previous = Some(seen(index as i64 * 1_000, *price));
         }
         let unrounded = path.summary(1.0, 2.0, 1.0, 1.450_000_49);
         assert_eq!(unrounded.close_position, 0.45);
@@ -5147,12 +5506,12 @@ mod tests {
     fn tick_path_ignores_the_transition_from_the_previous_interval_and_duplicates_are_flat() {
         let gap = Some((2_000_000, 60_000_000));
         let mut path = TickPath::new(5_000_000, 10_000_000);
-        path.fold(Some((4_900_000, 1.0)), 5_000_000, 1.5, gap);
+        path.fold(Some(seen(4_900_000, 1.0)), seen(5_000_000, 1.5), gap);
         assert_eq!((path.up, path.down, path.flat), (0, 0, 0));
         assert!(path.max_abs_bps > 4_999.0, "the entering jump still counts");
-        path.fold(Some((5_000_000, 1.5)), 5_000_000, 1.5, gap);
+        path.fold(Some(seen(5_000_000, 1.5)), seen(5_000_000, 1.5), gap);
         assert_eq!(path.flat, 1, "an identical repeat is a flat move");
-        path.fold(Some((5_000_000, 1.5)), 5_100_000, 1.6, gap);
+        path.fold(Some(seen(5_000_000, 1.5)), seen(5_100_000, 1.6), gap);
         assert_eq!(path.up, 1);
     }
 
@@ -5380,7 +5739,10 @@ mod tests {
         let anatomy = Anatomy::new(&candle, instrument.price_scale.unit() as f64);
         assert_eq!(anatomy.direction, "up");
         assert_eq!(anatomy.body_to_range, 0.5);
-        assert_eq!((anatomy.body_units, anatomy.range_units), (1, 2));
+        assert_eq!(
+            (anatomy.body_units, anatomy.range_units),
+            (Some(1), Some(2))
+        );
         assert_eq!(
             format!("{:.8}", anatomy.close),
             "0.00000000",
@@ -5390,9 +5752,21 @@ mod tests {
 
     #[test]
     fn the_engine_emits_rows_only_for_accepted_candles_and_stays_prefix_stable() {
-        let profile = profile(NativeGranularity::Tick, true, &[(5, 0)]);
-        let plan = FeaturePlan::resolve(&entry(&[(5, 0)], Outputs::AllSupported), profile, "input")
-            .unwrap();
+        let plan = FeaturePlan::resolve(
+            &entry(&[(5, 0)], Outputs::AllSupported),
+            profile(NativeGranularity::Tick, true, &[(5, 0)]),
+            "input",
+        )
+        .unwrap();
+        let named = FeaturePlan::resolve(
+            &entry(
+                &[(5, 0)],
+                Outputs::Named(vec!["body_bps".to_string(), "ema20".to_string()]),
+            ),
+            profile(NativeGranularity::Tick, true, &[(5, 0)]),
+            "input",
+        )
+        .unwrap();
         let mut ticks = Vec::new();
         let mut price = 1_000_000;
         let mut state = 3u64;
@@ -5405,16 +5779,16 @@ mod tests {
                 ticks.push(tick(second * 1_000 + sub * 150, price));
             }
         }
-        let run = |ticks: &[Observation]| {
+        let run = |plan: &FeaturePlan, ticks: &[Observation]| {
             let mut engine =
-                FeatureEngine::new(&plan, source(NativeGranularity::Tick, true)).unwrap();
+                FeatureEngine::new(plan, source(NativeGranularity::Tick, true)).unwrap();
             let mut out = FeatureOutput::default();
             for observation in ticks {
                 engine.push(*observation, &mut out).unwrap();
             }
             (out, engine.profile())
         };
-        let (full, profile) = run(&ticks);
+        let (full, profile) = run(&plan, &ticks);
         assert_eq!(full.rows.len() as u64, profile.streams[0].flagged.clean);
         assert!(
             full.rows.len() > 100
@@ -5430,7 +5804,7 @@ mod tests {
                 .all(|(_, row)| row.values[close].is_some() && row.values[regime].is_some())
         );
         for percent in [25, 50, 75] {
-            let (prefix, _) = run(&ticks[..ticks.len() * percent / 100]);
+            let (prefix, _) = run(&plan, &ticks[..ticks.len() * percent / 100]);
             assert_eq!(prefix.rows, full.rows[..prefix.rows.len()]);
             assert_eq!(
                 prefix.structure_events,
@@ -5440,6 +5814,40 @@ mod tests {
                 prefix.sequence_events,
                 full.sequence_events[..prefix.sequence_events.len()]
             );
+        }
+        // A named selection keeps the row identity and clocks, reproduces the selected values
+        // exactly, and holds no state for the stages it does not read.
+        let identity: Vec<&str> = stream.outputs[..10]
+            .iter()
+            .map(|output| output.name.as_str())
+            .collect();
+        assert!(identity.contains(&"known_at_micros") && identity.contains(&"close_units"));
+        let names: Vec<&str> = named.streams[0]
+            .outputs
+            .iter()
+            .map(|output| output.name.as_str())
+            .collect();
+        assert_eq!(
+            names,
+            [identity.as_slice(), &["body_bps", "ema20"]].concat()
+        );
+        assert!(
+            stream
+                .outputs
+                .iter()
+                .all(|output| !output.readiness.is_empty())
+        );
+        let (selected, _) = run(&named, &ticks);
+        assert_eq!(selected.rows.len(), full.rows.len());
+        assert!(selected.structure_events.is_empty() && selected.sequence_events.is_empty());
+        for ((_, row), (_, all)) in selected.rows.iter().zip(&full.rows) {
+            for (index, name) in names.iter().enumerate() {
+                assert_eq!(
+                    row.values[index],
+                    all.values[stream.output_index(name).unwrap()],
+                    "{name}"
+                );
+            }
         }
         let plan_bytes = plan.to_json();
         assert_eq!(FeaturePlan::from_json(&plan_bytes).unwrap(), plan);

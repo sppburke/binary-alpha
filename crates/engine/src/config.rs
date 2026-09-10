@@ -749,11 +749,11 @@ impl FeatureInstrument {
                 .validate()
                 .map_err(|reason| format!("structure.{reason}"))?;
         }
+        // Units resolve under the profile's price scale at plan time; here only the syntax.
         if let Some(text) = &self.price_epsilon {
-            let units =
-                crate::market::parse_price_units(text, PriceScale::try_from(PriceScale::MAX)?)
-                    .map_err(|reason| format!("price_epsilon: {reason}"))?;
-            if units < 0 {
+            let (negative, _, _) = crate::market::split_decimal(text)
+                .map_err(|reason| format!("price_epsilon: {reason}"))?;
+            if negative {
                 return Err(format!("price_epsilon: `{text}` must not be negative"));
             }
         }
@@ -1310,6 +1310,14 @@ mod feature_tests {
 
     fn entry_named(rest: &str) -> String {
         entry(rest)
+    }
+
+    #[test]
+    fn price_epsilon_is_checked_for_syntax_only() {
+        // Units resolve under the profile's price scale at plan time; no scale bounds the text.
+        for text in ["10", "99999999999999999999", "0.000000000000000001"] {
+            Config::parse(&entry(&format!("price_epsilon = \"{text}\"\n"))).unwrap();
+        }
     }
 
     #[test]

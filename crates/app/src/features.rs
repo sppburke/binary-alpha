@@ -6,9 +6,10 @@
 //! manifests and objects, temporary files, one-column-at-a-time encoding, publication through
 //! the same store as every other generation, and the reconstruction proof.
 
+use std::collections::HashMap;
 use std::fs;
 use std::io::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use binary_alpha_engine::config::{Config, FeatureInstrument, StreamKey};
@@ -44,6 +45,7 @@ pub fn structure_columns() -> Vec<TableColumn> {
         ("event_direction", Text),
         ("event_close_micros", Time),
         ("confirm_close_micros", Time),
+        ("known_at_micros", Time),
         ("event_row", Int64),
         ("confirm_row", Int64),
         ("event_candle_ordinal", Int64),
@@ -66,6 +68,7 @@ pub fn sequence_columns() -> Vec<TableColumn> {
         ("row", Int64),
         ("candle_ordinal", Int64),
         ("decision_close_micros", Time),
+        ("known_at_micros", Time),
         ("swing_event_type", Text),
         ("swing_type", Text),
         ("swing_price_units", Int64),
@@ -91,6 +94,7 @@ fn structure_values(event: &StructureEvent) -> Vec<Option<Value>> {
         text(event.direction),
         Some(Value::Time(event.event_close_micros)),
         Some(Value::Time(event.confirm_close_micros)),
+        Some(Value::Time(event.known_at_micros)),
         count(event.event_row),
         count(event.confirm_row),
         count(event.event_candle_ordinal),
@@ -110,6 +114,7 @@ fn sequence_values(event: &SequenceEvent) -> Vec<Option<Value>> {
         count(event.row),
         count(event.candle_ordinal),
         Some(Value::Time(event.decision_close_micros)),
+        Some(Value::Time(event.known_at_micros)),
         text(event.swing_event_type),
         text(event.swing_type),
         Some(Value::Int(event.swing_price_units)),
@@ -156,8 +161,31 @@ pub fn run(config_path: &Path, out: &mut dyn Write) -> Result<(), String> {
         .map_err(|error| format!("cannot create {}: {error}", historical_dir.display()))?;
     let local = Store::filesystem(&historical_dir);
     let destination = Store::open(&config.storage.publication_uri)?;
+    // Every entry resolves, and every resolved instrument and stream has one owner in one role,
+    // before anything is streamed or published.
+    let mut resolved = Vec::with_capacity(entries.instruments.len());
+    let mut owners: HashMap<String, usize> = HashMap::new();
     for (index, entry) in entries.instruments.iter().enumerate() {
-        let line = build(entry, &config, &local, &destination)
+        let item =
+            resolve(entry).map_err(|reason| format!("features.instruments[{index}]: {reason}"))?;
+        for stream in &item.plan.streams {
+            let owned = format!(
+                "{} {} {}s/{}s",
+                item.plan.instrument,
+                item.bound.input.role,
+                stream.duration_seconds,
+                stream.offset_seconds
+            );
+            if let Some(owner) = owners.insert(owned.clone(), index) {
+                return Err(format!(
+                    "features.instruments[{index}]: {owned} is already owned by features.instruments[{owner}]"
+                ));
+            }
+        }
+        resolved.push(item);
+    }
+    for (index, item) in resolved.into_iter().enumerate() {
+        let line = build(item, &config, &local, &destination)
             .map_err(|reason| format!("features.instruments[{index}]: {reason}"))?;
         writeln!(out, "{line}")
             .and_then(|()| out.flush())
@@ -315,19 +343,21 @@ struct StreamOutput {
     last_decision: Option<i64>,
 }
 
-fn build(
-    entry: &FeatureInstrument,
-    config: &Config,
-    local: &Store,
-    destination: &Store,
-) -> Result<String, String> {
+/// One entry's bound inputs and its resolved or frozen plan.
+struct Resolved {
+    bound: Bound,
+    plan: FeaturePlan,
+    frozen_from: Option<String>,
+}
+
+fn resolve(entry: &FeatureInstrument) -> Result<Resolved, String> {
     let bound = bind(entry)?;
     let reference = profile_reference(
         &bound.stream_manifest,
         &bound.profile,
         &bound.profile_sha256,
     );
-    let (mut plan, frozen_from) = match &entry.frozen_plan {
+    let (plan, frozen_from) = match &entry.frozen_plan {
         None => {
             if bound.stream_manifest.source_generation != bound.input.generation {
                 return Err(format!(
@@ -350,6 +380,24 @@ fn build(
             (plan, Some(manifest.generation))
         }
     };
+    Ok(Resolved {
+        bound,
+        plan,
+        frozen_from,
+    })
+}
+
+fn build(
+    resolved: Resolved,
+    config: &Config,
+    local: &Store,
+    destination: &Store,
+) -> Result<String, String> {
+    let Resolved {
+        bound,
+        mut plan,
+        frozen_from,
+    } = resolved;
     let id = bound.stream_manifest.definition.id();
     let generation_of =
         |plan: &FeaturePlan| feature_generation_id(&plan.identity(), &bound.input.generation);
@@ -492,8 +540,12 @@ fn build(
 
     // Encode every stream under the frozen encodings, row group by row group.
     let encoding = Instant::now();
-    let mut encoded_paths = Vec::with_capacity(plan.streams.len());
+    let mut encoded_paths: Vec<Option<PathBuf>> = Vec::with_capacity(plan.streams.len());
     for (stream, temporary) in plan.streams.iter().zip(temporaries.chunks(3)) {
+        if stream.encodings.is_empty() {
+            encoded_paths.push(None);
+            continue;
+        }
         let path = import::temporary_path(
             local,
             &format!(
@@ -532,7 +584,7 @@ fn build(
             }
         }
         writer.finish()?;
-        encoded_paths.push(path);
+        encoded_paths.push(Some(path));
     }
     let plan_path = import::temporary_path(local, &format!("features-{generation}-plan"))?;
     fs::write(&plan_path, plan.to_json())
@@ -549,11 +601,11 @@ fn build(
         .zip(temporaries.chunks(3))
         .zip(encoded_paths)
     {
-        let [rows, structure, sequence, encoded] = stream.object_paths();
-        paths.extend([rows, structure, sequence, encoded]);
+        paths.extend(stream.object_paths());
         files.extend(temporary.iter().cloned());
-        files.push(encoded_path);
+        files.extend(encoded_path);
     }
+    assert_eq!(paths.len(), files.len(), "one file per object path");
     let identities: Vec<ObjectIdentity> = files
         .iter()
         .map(|path| store::identify(path))
@@ -626,6 +678,10 @@ fn build(
         }
         None => manifest.to_json(),
     };
+    // Reconstruct from the published objects under the manifest bytes about to become ready;
+    // a generation its own verifier rejects is never marked ready.
+    let uri = destination.uri(&key);
+    let verified = verify_feature(&uri, destination, &key, &committed)?;
     let temporary = import::temporary_path(local, &format!("manifest-{generation}"))?;
     fs::write(&temporary, &committed)
         .map_err(|error| format!("cannot write {}: {error}", temporary.display()))?;
@@ -635,9 +691,6 @@ fn build(
     fs::remove_file(&temporary)
         .map_err(|error| format!("cannot remove {}: {error}", temporary.display()))?;
     let published = publishing.elapsed();
-
-    // Reconstruct from the published manifest and objects alone.
-    let verified = verify::run(&destination.uri(&key))?;
     let line = match put {
         Put::Reused(_) => format!("{report} (already published)"),
         Put::Created(_) => format!(
