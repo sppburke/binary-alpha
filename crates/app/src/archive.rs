@@ -698,7 +698,9 @@ fn int_field(candle: &Candle, column: usize) -> i64 {
         10 => i64::from(candle.observations),
         11 => i64::from(candle.duplicates),
         14 => candle.max_gap_inside_micros,
-        15 => i64::from(candle.missing_buckets_before),
+        // Bounded by the stream's time range, far below the column's limit.
+        15 => i64::try_from(candle.missing_buckets_before)
+            .expect("missing intervals are bounded by the representable time range"),
         16 => i64::from(candle.frozen_observations),
         17 => candle.frozen_micros,
         18 => i64::from(candle.max_jump_basis_points),
@@ -819,7 +821,9 @@ pub fn read_candles(
                 volume: volumes[row],
                 gap_before_micros: gaps[row],
                 max_gap_inside_micros: ints[14][row],
-                missing_buckets_before: observation(15)?,
+                missing_buckets_before: u64::try_from(ints[15][row]).map_err(|_| {
+                    format!("{} row {row}: column 15 is not a count", path.display())
+                })?,
                 frozen_observations: observation(16)?,
                 frozen_micros: ints[17][row],
                 max_jump_basis_points: observation(18)?,

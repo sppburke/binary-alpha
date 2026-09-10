@@ -203,7 +203,7 @@ pub struct Candle {
     /// record of the stream.
     pub gap_before_micros: Option<i64>,
     pub max_gap_inside_micros: i64,
-    pub missing_buckets_before: u32,
+    pub missing_buckets_before: u64,
     /// The longest run of consecutive records showing one unchanged price inside the candle.
     pub frozen_observations: u32,
     pub frozen_micros: i64,
@@ -501,7 +501,7 @@ struct Working {
     volume: Option<f64>,
     gap_before: Option<i64>,
     max_gap_inside: i64,
-    missing_before: u32,
+    missing_before: u64,
     run: Option<Run>,
     frozen_observations: u32,
     frozen_micros: i64,
@@ -787,29 +787,29 @@ impl InstrumentStream {
             source: self.source.generation.clone(),
             detail,
         };
-        let out_of_range = |event: i64, known_at: i64| {
-            reject(
+        // Both clocks are bounded before anything else looks at them, so every later sum and
+        // difference is representable.
+        let (event, known_at) = match &observation {
+            Observation::Tick(tick) => (tick.event_time_micros, tick.event_time_micros),
+            Observation::Bar(bar) => (
+                bar.start_micros,
+                bar.start_micros.saturating_add(bar.period_micros),
+            ),
+        };
+        if event.unsigned_abs() > MAX_EVENT_MICROS as u64
+            || known_at.unsigned_abs() > MAX_EVENT_MICROS as u64
+        {
+            return Err(reject(
                 RejectionReason::OutOfRange,
                 event,
                 known_at,
                 format!("event time beyond {MAX_EVENT_MICROS} micros either side of the epoch"),
-            )
-        };
+            ));
+        }
         match (observation, self.source.native_granularity) {
-            (Observation::Tick(tick), NativeGranularity::Tick) => {
-                if tick.event_time_micros.unsigned_abs() > MAX_EVENT_MICROS as u64 {
-                    return Err(out_of_range(tick.event_time_micros, tick.event_time_micros));
-                }
-                Ok(Record::tick(tick))
-            }
+            (Observation::Tick(tick), NativeGranularity::Tick) => Ok(Record::tick(tick)),
             (Observation::Bar(bar), NativeGranularity::Bar { period_seconds }) => {
                 let period = i64::from(period_seconds) * MICROS_PER_SECOND;
-                if bar.start_micros.unsigned_abs() > MAX_EVENT_MICROS as u64 {
-                    return Err(out_of_range(
-                        bar.start_micros,
-                        bar.start_micros.saturating_add(period),
-                    ));
-                }
                 let known_at = bar.start_micros + period;
                 if bar.period_micros != period {
                     return Err(reject(
@@ -987,8 +987,9 @@ impl InstrumentStream {
             out.push((index, Self::finalize(stream, &self.checks, record.known_at)));
         }
         let close_time = open_time + stream.duration;
+        // The previous open lies at least one duration earlier, so the count is never negative.
         let missing_before = stream.previous_open_time.map_or(0, |previous| {
-            u32::try_from((open_time - previous) / stream.duration - 1).unwrap_or(u32::MAX)
+            ((open_time - previous) / stream.duration - 1) as u64
         });
         let mut working = Working {
             open_time,
@@ -1971,7 +1972,8 @@ mod tests {
             source(granularity, None),
         )
         .unwrap();
-        // The start converts to micros, but its end would not fit.
+        // The start converts to micros, but its end would not fit; a tick stream refuses the
+        // same bar for its range before its granularity.
         let far = Bar {
             start_unix_s: 9_223_372_036_850,
             open: 1.0,
@@ -1981,10 +1983,23 @@ mod tests {
             volume: 0.0,
             period_s: 5,
         };
+        for stream in [&mut bars, &mut ticks] {
+            let rejection = stream
+                .push(Observation::from_bar(&far, scale(2)).unwrap(), &mut out)
+                .unwrap_err();
+            assert_eq!(rejection.reason, RejectionReason::OutOfRange);
+        }
+        // A start inside the bound whose end lies beyond it is refused on its known-at time.
+        let edge = Bar {
+            start_unix_s: MAX_EVENT_MICROS / MICROS_PER_SECOND / 5 * 5,
+            ..far
+        };
         let rejection = bars
-            .push(Observation::from_bar(&far, scale(2)).unwrap(), &mut out)
+            .push(Observation::from_bar(&edge, scale(2)).unwrap(), &mut out)
             .unwrap_err();
         assert_eq!(rejection.reason, RejectionReason::OutOfRange);
+        assert!(rejection.known_at_micros > MAX_EVENT_MICROS);
+        assert_eq!(bars.profile().observations, 0);
         assert!(
             Observation::from_bar(
                 &Bar {
@@ -1997,6 +2012,22 @@ mod tests {
             "a start that does not convert is an error, not a panic"
         );
         assert!(out.is_empty());
+    }
+
+    #[test]
+    fn missing_buckets_keep_their_exact_count() {
+        // 4,294,967,296 five-second intervals lie between the first two ticks: one more than a
+        // 32-bit count can hold, and exactly what the pinned resampler reports.
+        let mut stream = tick_stream(&[(5, 0)]);
+        let mut out = Vec::new();
+        for (index, seconds) in [10, 21_474_836_495, 21_474_836_500].into_iter().enumerate() {
+            stream
+                .push(tick(seconds * 1_000, 1_000_000 + index as i64), &mut out)
+                .unwrap();
+        }
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[1].1.missing_buckets_before, 4_294_967_296);
+        assert!(out[1].1.flags.missing_before);
     }
 
     #[test]

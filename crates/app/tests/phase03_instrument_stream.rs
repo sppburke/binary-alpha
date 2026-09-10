@@ -122,7 +122,7 @@ impl From<&Candle> for Row {
             gap_before: candle.gap_before_micros,
             facts: [
                 candle.max_gap_inside_micros,
-                i64::from(candle.missing_buckets_before),
+                i64::try_from(candle.missing_buckets_before).unwrap(),
                 i64::from(candle.frozen_observations),
                 candle.frozen_micros,
                 i64::from(candle.max_jump_basis_points),
