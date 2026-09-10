@@ -176,8 +176,21 @@ struct PublishedFeatures {
     tables: Vec<Vec<Table>>,
 }
 
-fn published_features(store: &Path, manifest: &Path) -> PublishedFeatures {
+/// The published manifest and plan at `manifest`, without reading any table.
+fn published_plan(store: &Path, manifest: &Path) -> (FeatureManifest, FeaturePlan) {
     let manifest = FeatureManifest::from_json(&fs::read(manifest).unwrap()).unwrap();
+    let plan_key = &manifest
+        .objects
+        .iter()
+        .find(|object| object.path == "plan.json")
+        .expect("plan object")
+        .key;
+    let plan = FeaturePlan::from_json(&fs::read(store.join(plan_key)).unwrap()).unwrap();
+    (manifest, plan)
+}
+
+fn published_features(store: &Path, manifest: &Path) -> PublishedFeatures {
+    let (manifest, plan) = published_plan(store, manifest);
     let object = |path: &str| {
         store.join(
             &manifest
@@ -188,7 +201,6 @@ fn published_features(store: &Path, manifest: &Path) -> PublishedFeatures {
                 .key,
         )
     };
-    let plan = FeaturePlan::from_json(&fs::read(object("plan.json")).unwrap()).unwrap();
     let tables = plan
         .streams
         .iter()
@@ -1940,8 +1952,9 @@ fn governed_reference_parity() {
     };
     let manifest_path = published_root.join(format!("manifests/{generation}/ready.json"));
     println!("verify: {}", verify(&manifest_path).unwrap());
-    let published = published_features(&published_root, &manifest_path);
-    let (manifest, plan) = (&published.manifest, &published.plan);
+    // Only the manifest and plan are held; every table is streamed below.
+    let (manifest, plan) = published_plan(&published_root, &manifest_path);
+    let (manifest, plan) = (&manifest, &plan);
     assert_eq!(manifest.code_revision, env!("BINARY_ALPHA_CODE_REVISION"));
     assert!(
         !manifest.code_revision.ends_with("-dirty") && manifest.code_revision != "unavailable",

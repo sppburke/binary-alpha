@@ -406,7 +406,9 @@ fn readiness(field: Field) -> &'static str {
             "unavailable until the window count of returns; efficiency also needs a positive absolute-return sum"
         }
         F::RangeToAvg20 => "unavailable until windows 5 and 20 fill with a positive 20-window mean",
-        F::CompressionState => "`unknown` until windows 5 and 20 fill",
+        F::CompressionState => {
+            "`unknown` until windows 5 and 20 fill with a positive 20-window mean"
+        }
         F::DirectionalState => {
             "`unknown` until the direction window fills; then `sideways`, `up`, or `down`"
         }
@@ -435,8 +437,11 @@ fn readiness(field: Field) -> &'static str {
         F::LastSwingHighType | F::LastSwingLowType => {
             "empty text until a swing of that side is confirmed"
         }
-        F::MarketStructureSequence | F::MarketStructureBias => {
+        F::MarketStructureSequence => {
             "`unknown` until both sides have a confirmed swing; `warming_up` while either is the first"
+        }
+        F::MarketStructureBias => {
+            "`unknown` until both sides have a confirmed swing beyond their first"
         }
         F::LastConfirmedUnits(_)
         | F::LastConfirmedEventClose(_)
