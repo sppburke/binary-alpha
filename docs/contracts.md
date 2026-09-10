@@ -131,8 +131,8 @@ which an integer-unit source must already carry and into which a binary floating
 converts exactly or is rejected; `native_granularity`, `{ kind = "tick" }` or
 `{ kind = "bar", period_seconds = N }` with a positive period and no other key, which the audited
 generation must provide; the optional check tables `gap` (`max_seconds` and a larger
-`reopen_seconds`), `frozen` (`min_observations` and `min_seconds`), `jump` (`min_basis_points`),
-and `span` (`min_percent`, `0` to `100`), each enabled by its presence; the optional `sessions` list of weekly windows, each with a unique non-empty
+`reopen_seconds`), `frozen` (positive `min_observations` and `min_seconds`), `jump` (positive
+`min_basis_points`), and `span` (`min_percent`, `0` to `100`), each enabled by its presence; the optional `sessions` list of weekly windows, each with a unique non-empty
 `name` and `open_seconds` less than `close_seconds` at most `604800` (seconds since Monday
 00:00 Coordinated Universal Time), pairwise non-overlapping and non-empty when present; and the
 non-empty `candles` list, each stream declaring a positive `duration_seconds`, an
@@ -355,7 +355,8 @@ the instrument's price scale or are rejected. Records arrive in event-time order
 through the same `push` for historical, replay, and live feeds; a refused record (backwards time,
 a bar that does not strictly follow the previous bar, a tick with a different price at the
 previous tick's event time, a bar off its grid or of another period, a non-finite or negative
-volume, a contradicted high/low relationship, or a record of the other granularity) is reported
+volume, a contradicted high/low relationship, a bar whose volume would push a candle's summed
+volume out of the finite range, or a record of the other granularity) is reported
 with its reason, event time, known-at time, and source generation, and leaves the state
 unchanged. A tick identical to the previous tick is accepted, counted as a duplicate, and folded
 like the source retained it. The one observed move between consecutive records is from the
@@ -406,8 +407,8 @@ granularity, scale, and capabilities; record and duplicate counts and first and 
 the cadence (event-time micros between consecutive records by bit length, where bucket `k`
 holds values in `[2^(k-1), 2^k)` and bucket `0` holds zeros); observed prices (minimum, maximum,
 the number of nonzero moves between consecutive records, and the greatest common divisor of
-every nonzero difference between a record's prices and the previous close as the observed price
-step); gaps over the threshold (count, longest, total); closed frozen runs that met the
+every nonzero difference between a record's prices and the previous close, or the record's own
+open for the first record, as the observed price step); gaps over the threshold (count, longest, total); closed frozen runs that met the
 thresholds (count, longest in records and in time); moves in whole basis points by bit length
 with the counts that reached the jump threshold in each context; records inside each
 session window and outside every window; per stream the finalized count, the withheld record
@@ -426,8 +427,9 @@ the generation to the configured
 instrument that maps its identity and native granularity (an identity mapped only at another
 granularity is bound so that the capability error names what the source lacks; an unmapped
 identity is an error, never a default), verifies and decodes every data object in manifest order
-through the Phase 02 readers, feeds every record, and writes one candle object per stream and the
-profile. The stream generation's identity is the SHA-256, rendered as sixty-four lowercase
+through the Phase 02 readers, feeds every record, requires the observed record count and
+coverage to equal the manifest's `row_count` and `coverage` before it writes anything, and writes
+one candle object per stream and the profile. The stream generation's identity is the SHA-256, rendered as sixty-four lowercase
 hexadecimal digits, of the UTF-8 text `binary-alpha instrument stream generation v1`, one line
 feed, the source generation, one line feed, and the instrument's canonical definition. Its objects
 are `profile.json` (the profile as pretty-printed JSON with two-space indentation and one trailing
@@ -448,6 +450,7 @@ standard output:
 `audited INSTRUMENT ROLE generation GENERATION from SOURCE observations N candles C objects K reused R`
 followed by `[stream S publish S]` stage durations in seconds or by `(already published)`.
 `data verify` on a stream generation asserts every object's bytes and hashes, decodes the profile
-and every candle object, checks that they describe the manifest's instrument, source,
-observations, coverage, and per-stream rows and bounds, and writes
+and every candle object, checks that they describe the manifest's instrument, price scale,
+source generation, kind, and role, observations, coverage, and per-stream rows and bounds (every
+volume finite), and writes
 `verified INSTRUMENT ROLE generation GENERATION candles C objects K bytes B`.

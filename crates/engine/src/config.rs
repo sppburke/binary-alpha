@@ -535,6 +535,18 @@ impl Instrument {
                 ));
             }
         }
+        if let Some(frozen) = &self.frozen
+            && (frozen.min_observations == 0 || frozen.min_seconds == 0)
+        {
+            return Err(
+                "frozen.min_observations: both frozen thresholds must be positive".to_string(),
+            );
+        }
+        if let Some(jump) = &self.jump
+            && jump.min_basis_points == 0
+        {
+            return Err("jump.min_basis_points: must be positive".to_string());
+        }
         if let Some(gap) = &self.gap
             && gap.reopen_seconds <= gap.max_seconds
         {
@@ -847,6 +859,14 @@ mod instrument_tests {
             (
                 format!("{tick}gap = {{ max_seconds = 60, reopen_seconds = 60 }}\ncandles = [{{ duration_seconds = 5, offset_seconds = 0 }}]\n"),
                 "instruments[0].gap.reopen_seconds",
+            ),
+            (
+                format!("{tick}jump = {{ min_basis_points = 0 }}\ncandles = [{{ duration_seconds = 5, offset_seconds = 0 }}]\n"),
+                "instruments[0].jump.min_basis_points",
+            ),
+            (
+                format!("{tick}frozen = {{ min_observations = 10, min_seconds = 0 }}\ncandles = [{{ duration_seconds = 5, offset_seconds = 0 }}]\n"),
+                "instruments[0].frozen.min_observations",
             ),
             (
                 "native_granularity = { kind = \"tick\", unexpected = 1 }\ncandles = [{ duration_seconds = 5, offset_seconds = 0 }]\n".to_string(),

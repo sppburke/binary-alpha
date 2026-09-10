@@ -720,6 +720,21 @@ impl InstrumentStream {
             delta = Some(record.event - last.known_at);
             previous_close = Some(last.close());
         }
+        if let Some(volume) = record.volume
+            && self.streams.iter().any(|stream| {
+                stream.working.as_ref().is_some_and(|working| {
+                    stream.open_time(record.event) == working.open_time
+                        && working
+                            .volume
+                            .is_some_and(|total| !(total + volume).is_finite())
+                })
+            })
+        {
+            return Err(reject(
+                RejectionReason::NonFinite,
+                "the candle's summed volume would not be finite".to_string(),
+            ));
+        }
         self.observations += 1;
         self.first_event.get_or_insert(record.event);
         if let Some(last) = self.last {
@@ -818,6 +833,8 @@ impl InstrumentStream {
     /// consecutive records (the previous close to this open), the jump distribution; returns
     /// that move in whole basis points under its inter-arrival context. A bar's high and low
     /// bound its prices and its step, never a path: their order inside the bar is unobserved.
+    /// The step anchors every resolved price to the previous close, or to the record's own open
+    /// for the first record.
     fn observe_prices(
         &mut self,
         previous_close: Option<i64>,
@@ -825,13 +842,12 @@ impl InstrumentStream {
         record: &Record,
     ) -> Jump {
         let mut jump = Jump::default();
+        let anchor = previous_close.unwrap_or(record.open());
         for &price in record.resolved_prices() {
             self.prices.min_units = Some(self.prices.min_units.map_or(price, |min| min.min(price)));
             self.prices.max_units = Some(self.prices.max_units.map_or(price, |max| max.max(price)));
-            if let Some(previous) = previous_close
-                && previous != price
-            {
-                let step = previous.abs_diff(price);
+            if anchor != price {
+                let step = anchor.abs_diff(price);
                 self.prices.step_units = Some(match self.prices.step_units {
                     Some(current) => gcd(current.unsigned_abs(), step) as i64,
                     None => step as i64,
@@ -1779,6 +1795,74 @@ mod tests {
     }
 
     #[test]
+    fn the_first_bar_anchors_its_step_to_its_own_open_and_volume_sums_stay_finite() {
+        let granularity = NativeGranularity::Bar { period_seconds: 5 };
+        let mut stream = InstrumentStream::new(
+            &instrument(granularity, &[(10, 0)]),
+            source(granularity, None),
+        )
+        .unwrap();
+        let mut out = Vec::new();
+        stream
+            .push(bar(0, [100, 101, 99, 100], f64::MAX), &mut out)
+            .unwrap();
+        assert_eq!(
+            stream.profile().prices.step_units,
+            Some(1),
+            "high and low against the open"
+        );
+        let overflow = stream
+            .push(bar(5, [102, 102, 102, 102], f64::MAX), &mut out)
+            .unwrap_err();
+        assert_eq!(overflow.reason, RejectionReason::NonFinite);
+        assert_eq!(
+            stream.profile().observations,
+            1,
+            "the refused bar changed nothing"
+        );
+        stream
+            .push(bar(5, [102, 102, 102, 102], 1.0), &mut out)
+            .unwrap();
+        assert_eq!(out[0].1.volume, Some(f64::MAX + 1.0));
+        assert_eq!(stream.profile().prices.step_units, Some(1));
+        let mut lone = InstrumentStream::new(
+            &instrument(granularity, &[(10, 0)]),
+            source(granularity, None),
+        )
+        .unwrap();
+        lone.push(bar(0, [100; 4], 0.0), &mut out).unwrap();
+        assert_eq!(
+            lone.profile().prices.step_units,
+            None,
+            "one flat bar shows no step"
+        );
+    }
+
+    #[test]
+    fn gaps_keep_their_exact_microseconds() {
+        // The pinned resampler parses milliseconds, so it would see a two-second delay here
+        // and no gap; the target keeps the extra microsecond and reports a gap. Parity inputs
+        // must therefore carry whole-millisecond timestamps.
+        let mut stream = tick_stream(&[(5, 0)]);
+        let out = feed(
+            &mut stream,
+            &[
+                Observation::Tick(Tick {
+                    event_time_micros: 100_000,
+                    price_units: 1,
+                }),
+                Observation::Tick(Tick {
+                    event_time_micros: 2_100_001,
+                    price_units: 1,
+                }),
+                tick(5_100, 1),
+            ],
+        );
+        assert_eq!(out[0].1.max_gap_inside_micros, 2_000_001);
+        assert!(out[0].1.flags.gap_inside && !out[0].1.flags.complete());
+    }
+
+    #[test]
     fn one_bar_can_close_a_stale_candle_and_its_own_interval() {
         let granularity = NativeGranularity::Bar { period_seconds: 5 };
         let mut stream = InstrumentStream::new(
@@ -1907,11 +1991,25 @@ mod tests {
                 profile.coverage.as_ref().unwrap().first_event_time,
                 full_profile.coverage.as_ref().unwrap().first_event_time
             );
-            assert!(profile.observations < full_profile.observations);
-            assert!(profile.duplicates <= full_profile.duplicates);
-            assert!(
-                profile.gaps.as_ref().unwrap().count <= full_profile.gaps.as_ref().unwrap().count
+            assert_eq!(profile.observations, cut as u64);
+            let pairs: Vec<(Observation, Observation)> = ticks[..cut]
+                .windows(2)
+                .map(|pair| (pair[0], pair[1]))
+                .collect();
+            assert_eq!(
+                profile.duplicates,
+                pairs.iter().filter(|(a, b)| a == b).count() as u64
             );
+            let gaps = pairs
+                .iter()
+                .filter(|(a, b)| match (a, b) {
+                    (Observation::Tick(a), Observation::Tick(b)) => {
+                        b.event_time_micros - a.event_time_micros > 2 * SECOND
+                    }
+                    _ => unreachable!(),
+                })
+                .count() as u64;
+            assert_eq!(profile.gaps.as_ref().unwrap().count, gaps);
             assert!(
                 profile.frozen_runs.as_ref().unwrap().count
                     <= full_profile.frozen_runs.as_ref().unwrap().count

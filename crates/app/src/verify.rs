@@ -275,6 +275,9 @@ fn verify_stream(uri: &str, store: &Store, key: &str, bytes: &[u8]) -> Result<St
                 .map_err(|reason| format!("{location}: {reason}"))?;
             let consistent = profile.instrument == manifest.instrument
                 && profile.source.generation == manifest.source_generation
+                && profile.source.source_kind == manifest.source_kind
+                && profile.source.role == manifest.role
+                && profile.price_scale == manifest.definition.price_scale
                 && profile.observations == manifest.observations
                 && profile.coverage == manifest.coverage
                 && profile.streams.len() == manifest.streams.len()

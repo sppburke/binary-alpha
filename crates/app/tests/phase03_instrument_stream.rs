@@ -597,6 +597,43 @@ fn audit_binds_only_a_configured_matching_instrument() {
     assert!(error.contains("holdout generation"), "{error}");
     assert_eq!(stream_manifests(&scratch, "published").len(), 1);
 
+    // A source manifest whose recorded row count disagrees with its objects is refused before
+    // anything is published, and a stream manifest whose source kind contradicts its profile
+    // fails verification: both under a second store that shares the objects.
+    let tampered = scratch.path("tampered");
+    fs::create_dir_all(tampered.join("objects")).unwrap();
+    for entry in fs::read_dir(scratch.path("published/objects")).unwrap() {
+        let entry = entry.unwrap();
+        if !entry.file_name().to_string_lossy().starts_with('.') {
+            fs::hard_link(
+                entry.path(),
+                tampered.join("objects").join(entry.file_name()),
+            )
+            .unwrap();
+        }
+    }
+    let mut miscounted = GenerationManifest::from_json(&fs::read(&euro).unwrap()).unwrap();
+    miscounted.row_count += 1;
+    let miscounted_path = tampered.join(miscounted.key());
+    fs::create_dir_all(miscounted_path.parent().unwrap()).unwrap();
+    fs::write(&miscounted_path, miscounted.to_json()).unwrap();
+    let error = audit(&mismatched, &miscounted_path).unwrap_err();
+    assert!(
+        error.contains("manifest records 5 rows") && error.contains("nothing was published"),
+        "{error}"
+    );
+    let mut contradicted = StreamManifest::from_json(&fs::read(manifest_path).unwrap()).unwrap();
+    contradicted.source_kind = binary_alpha_engine::dataset::SourceKind::TickCsv;
+    let contradicted_path = tampered.join(contradicted.key());
+    fs::create_dir_all(contradicted_path.parent().unwrap()).unwrap();
+    fs::write(&contradicted_path, contradicted.to_json()).unwrap();
+    assert!(
+        verify(&contradicted_path)
+            .unwrap_err()
+            .contains("does not describe the manifest's instrument"),
+        "a contradicted source kind fails verification"
+    );
+
     // A stream manifest is not an audit input.
     let error = audit(&mismatched, manifest_path).unwrap_err();
     assert!(
@@ -621,8 +658,8 @@ struct GovernedConfig {
     legacy_candles: Vec<LegacyCandles>,
     /// Three Phase 02 bar ready manifests selected from the collection manifest.
     bar_manifests: Vec<BarCase>,
-    /// The recorded selection evidence.
-    selection: String,
+    /// The collection manifest the bar cases were selected from; its `selection` records why.
+    collection_manifest: PathBuf,
 }
 
 #[derive(serde::Deserialize)]
@@ -714,6 +751,8 @@ struct LegacyRow {
     same_price_run: [i64; 2],
     true_jump_bps: f64,
     reopen_jump_bps: f64,
+    abs_jump_bps: f64,
+    gap_classes: [String; 2],
     flags: [bool; 12],
     eligible: bool,
 }
@@ -751,6 +790,9 @@ fn legacy_rows(path: &Path, scale: PriceScale) -> Vec<LegacyRow> {
         "complete",
         "has_gap",
         "max_gap_reopen_jump_bps",
+        "max_abs_tick_jump_bps",
+        "starts_after_gap_class",
+        "worst_gap_class",
     ]
     .iter()
     .map(|name| column(name))
@@ -808,6 +850,8 @@ fn legacy_rows(path: &Path, scale: PriceScale) -> Vec<LegacyRow> {
                 same_price_run: [int(13), int(14) * 1_000],
                 true_jump_bps: field(15).parse().unwrap(),
                 reopen_jump_bps: field(26).parse().unwrap(),
+                abs_jump_bps: field(27).parse().unwrap(),
+                gap_classes: [field(28).to_string(), field(29).to_string()],
                 flags: [
                     low,
                     hard_low,
@@ -828,6 +872,32 @@ fn legacy_rows(path: &Path, scale: PriceScale) -> Vec<LegacyRow> {
         .collect()
 }
 
+/// The pinned audit's gap ladder over a duration, and `none` for a candle with no record before
+/// it; the target keeps the durations and the test derives the class from them.
+fn gap_class(micros: Option<i64>) -> &'static str {
+    match micros {
+        None => "none",
+        Some(micros) if micros <= 0 => "duplicate_or_backwards",
+        Some(micros) if micros <= 2_000_000 => "normal_small_tick_delay",
+        Some(micros) if micros <= 15_000_000 => "medium_feed_delay",
+        Some(micros) if micros <= 60_000_000 => "large_feed_delay",
+        Some(micros) if micros <= 300_000_000 => "short_data_gap",
+        Some(micros) if micros <= 1_800_000_000 => "session_or_collection_gap",
+        Some(_) => "major_data_outage_or_session_break",
+    }
+}
+
+const GAP_LADDER: [&str; 8] = [
+    "none",
+    "duplicate_or_backwards",
+    "normal_small_tick_delay",
+    "medium_feed_delay",
+    "large_feed_delay",
+    "short_data_gap",
+    "session_or_collection_gap",
+    "major_data_outage_or_session_break",
+];
+
 /// The candle duration in seconds from a legacy row's open and close times.
 fn timeframe(open: &str, close: &str) -> i64 {
     (parse_event_time_micros(close).unwrap() - parse_event_time_micros(open).unwrap()) / 1_000_000
@@ -845,6 +915,16 @@ fn assert_parity(target: &[Row], legacy: &[LegacyRow], label: &str) -> usize {
     assert!(
         last.times[3] < last.times[1],
         "{label}: the legacy tail is unfinished"
+    );
+    // The reference parses milliseconds, so parity presumes whole-millisecond inputs.
+    assert!(
+        legacy
+            .iter()
+            .all(|row| row.times[2] % 1_000 == 0 && row.times[3] % 1_000 == 0)
+            && target
+                .iter()
+                .all(|row| row.times[3] % 1_000 == 0 && row.times[4] % 1_000 == 0),
+        "{label}: parity inputs carry whole-millisecond timestamps"
     );
     let mut boundary = 0;
     for (index, (row, reference)) in target.iter().zip(legacy).enumerate() {
@@ -890,9 +970,34 @@ fn assert_parity(target: &[Row], legacy: &[LegacyRow], label: &str) -> usize {
         // Continuous diagnostic: the legacy value is binary floating point rendered to six
         // decimals; the target floors the exact ratio. A difference of one whole basis point at
         // an integer boundary is the documented tolerance and never changes the flag above.
+        // The reference starts a candle's worst class at its starts-after class, or at the
+        // normal class for the first candle, then raises it by every gap inside.
+        let starts_after = gap_class(row.gap_before);
+        let rank = |class: &str| GAP_LADDER.iter().position(|entry| *entry == class).unwrap();
+        let mut worst = if row.gap_before.is_none() {
+            GAP_LADDER[2]
+        } else {
+            starts_after
+        };
+        if row.counts[0] >= 2 && rank(gap_class(Some(row.facts[0]))) > rank(worst) {
+            worst = gap_class(Some(row.facts[0]));
+        }
+        assert_eq!(
+            [starts_after, worst],
+            [
+                reference.gap_classes[0].as_str(),
+                reference.gap_classes[1].as_str()
+            ],
+            "{context}: gap classes"
+        );
         for (name, legacy, target) in [
             ("true jump", reference.true_jump_bps, row.facts[4]),
             ("reopen jump", reference.reopen_jump_bps, row.facts[6]),
+            (
+                "absolute jump",
+                reference.abs_jump_bps,
+                row.facts[4].max(row.facts[5]).max(row.facts[6]),
+            ),
         ] {
             let floored = legacy.floor() as i64;
             if floored != target {
@@ -909,35 +1014,127 @@ fn assert_parity(target: &[Row], legacy: &[LegacyRow], label: &str) -> usize {
 }
 
 /// Every profile fact whose window has closed, recomputed independently from the records and
-/// the finalized candles: a longer input can only extend these, never revise them.
+/// the finalized candles under the governed thresholds (gap 2 s, reopen 60 s, jump 5 basis
+/// points, frozen 10 records or 5 s, one week-long session): a longer input can only extend
+/// these, never revise them.
 fn assert_closed_window_facts(
     profile: &InstrumentProfile,
     ticks: &[Tick],
     candles: &[(usize, Candle)],
 ) {
+    const SECOND: i64 = 1_000_000;
+    fn bucket(value: u64) -> usize {
+        (u64::BITS - value.leading_zeros()) as usize
+    }
+    fn histogram(values: impl Iterator<Item = u64>) -> Vec<u64> {
+        let mut buckets = Vec::new();
+        for value in values {
+            let index = bucket(value);
+            if buckets.len() <= index {
+                buckets.resize(index + 1, 0);
+            }
+            buckets[index] += 1;
+        }
+        buckets
+    }
+    fn gcd(mut a: u64, mut b: u64) -> u64 {
+        while b != 0 {
+            (a, b) = (b, a % b);
+        }
+        a
+    }
     assert_eq!(profile.observations, ticks.len() as u64);
-    let pairs = ticks.windows(2);
+    let pairs: Vec<(&Tick, &Tick)> = ticks.windows(2).map(|pair| (&pair[0], &pair[1])).collect();
     assert_eq!(
         profile.duplicates,
-        pairs.clone().filter(|pair| pair[0] == pair[1]).count() as u64
+        pairs.iter().filter(|(a, b)| a == b).count() as u64
     );
     let deltas: Vec<i64> = pairs
-        .map(|pair| pair[1].event_time_micros - pair[0].event_time_micros)
+        .iter()
+        .map(|(a, b)| b.event_time_micros - a.event_time_micros)
         .collect();
     let gaps = profile.gaps.as_ref().unwrap();
     let over: Vec<i64> = deltas
         .iter()
         .copied()
-        .filter(|delta| *delta > 2_000_000)
+        .filter(|delta| *delta > 2 * SECOND)
         .collect();
     assert_eq!(gaps.count, over.len() as u64);
     assert_eq!(gaps.max_micros, over.iter().copied().max().unwrap_or(0));
     assert_eq!(gaps.total_micros, over.iter().sum::<i64>());
-    assert_eq!(profile.cadence.total(), deltas.len() as u64);
     assert_eq!(
-        profile.jumps.as_ref().unwrap().basis_points.total(),
-        deltas.len() as u64
+        profile.cadence.buckets(),
+        histogram(deltas.iter().map(|delta| *delta as u64)),
+        "cadence buckets"
     );
+    // Prices: bounds, the step as the divisor of every move, and the move count.
+    let prices = ticks.iter().map(|tick| tick.price_units);
+    assert_eq!(profile.prices.min_units, prices.clone().min());
+    assert_eq!(profile.prices.max_units, prices.max());
+    let moves: Vec<u64> = pairs
+        .iter()
+        .map(|(a, b)| a.price_units.abs_diff(b.price_units))
+        .filter(|delta| *delta != 0)
+        .collect();
+    assert_eq!(profile.prices.moves, moves.len() as u64);
+    assert_eq!(
+        profile.prices.step_units,
+        moves.iter().copied().reduce(gcd).map(|step| step as i64)
+    );
+    // Jumps by context and the exact basis-point buckets.
+    let jumps = profile.jumps.as_ref().unwrap();
+    let mut flagged = [0u64; 3];
+    let mut basis_points = Vec::new();
+    for ((a, b), delta) in pairs.iter().zip(&deltas) {
+        if a.price_units == 0 {
+            continue;
+        }
+        let bps = (i128::from(b.price_units) - i128::from(a.price_units)).abs() * 10_000
+            / i128::from(a.price_units).abs();
+        let bps = u32::try_from(bps).unwrap_or(u32::MAX);
+        basis_points.push(u64::from(bps));
+        if bps >= 5 {
+            let context = if *delta <= 2 * SECOND {
+                0
+            } else if *delta < 60 * SECOND {
+                1
+            } else {
+                2
+            };
+            flagged[context] += 1;
+        }
+    }
+    assert_eq!(
+        jumps.basis_points.buckets(),
+        histogram(basis_points.into_iter())
+    );
+    assert_eq!(
+        [jumps.flagged, jumps.flagged_delayed, jumps.flagged_reopen],
+        flagged
+    );
+    // Closed runs of one price that met the thresholds.
+    let mut runs = (0u64, 0u32, 0i64);
+    let mut start = 0;
+    for index in 1..=ticks.len() {
+        if index == ticks.len() || ticks[index].price_units != ticks[start].price_units {
+            if index < ticks.len() {
+                let count = (index - start) as u32;
+                let span = ticks[index - 1].event_time_micros - ticks[start].event_time_micros;
+                if count >= 10 || span >= 5 * SECOND {
+                    runs = (runs.0 + 1, runs.1.max(count), runs.2.max(span));
+                }
+            }
+            start = index;
+        }
+    }
+    let frozen = profile.frozen_runs.as_ref().unwrap();
+    assert_eq!(
+        (frozen.count, frozen.max_observations, frozen.max_micros),
+        runs
+    );
+    let sessions = profile.sessions.as_ref().unwrap();
+    assert_eq!(sessions.windows[0].observations, ticks.len() as u64);
+    assert_eq!(sessions.outside, 0);
     for (index, facts) in profile.streams.iter().enumerate() {
         let rows: Vec<&Candle> = candles
             .iter()
@@ -945,22 +1142,32 @@ fn assert_closed_window_facts(
             .map(|(_, candle)| candle)
             .collect();
         assert_eq!(facts.finalized, rows.len() as u64);
-        assert_eq!(facts.activity.total(), rows.len() as u64);
+        assert_eq!(
+            facts.activity.buckets(),
+            histogram(rows.iter().map(|row| u64::from(row.observations)))
+        );
         let count =
             |select: fn(&Candle) -> bool| rows.iter().filter(|row| select(row)).count() as u64;
-        assert_eq!(facts.flagged.clean, count(|row| row.flags.clean()));
-        assert_eq!(facts.flagged.complete, count(|row| row.flags.complete()));
-        assert_eq!(facts.flagged.gap_before, count(|row| row.flags.gap_before));
-        assert_eq!(facts.flagged.frozen, count(|row| row.flags.frozen));
-        assert_eq!(facts.flagged.jump, count(|row| row.flags.jump));
-        assert_eq!(
-            facts.flagged.reopen_jump,
-            count(|row| row.flags.reopen_jump)
-        );
-        assert_eq!(
-            facts.flagged.low_activity,
-            count(|row| row.flags.low_activity)
-        );
+        let counts = &facts.flagged;
+        for (actual, expected) in [
+            (counts.low_activity, count(|row| row.flags.low_activity)),
+            (
+                counts.hard_low_activity,
+                count(|row| row.flags.hard_low_activity),
+            ),
+            (counts.gap_before, count(|row| row.flags.gap_before)),
+            (counts.gap_inside, count(|row| row.flags.gap_inside)),
+            (counts.missing_before, count(|row| row.flags.missing_before)),
+            (counts.frozen, count(|row| row.flags.frozen)),
+            (counts.jump, count(|row| row.flags.jump)),
+            (counts.delayed_jump, count(|row| row.flags.delayed_jump)),
+            (counts.reopen_jump, count(|row| row.flags.reopen_jump)),
+            (counts.short_span, count(|row| row.flags.short_span)),
+            (counts.complete, count(|row| row.flags.complete())),
+            (counts.clean, count(|row| row.flags.clean())),
+        ] {
+            assert_eq!(actual, expected);
+        }
     }
 }
 
@@ -1052,6 +1259,11 @@ fn governed_fixture_proof() {
     assert_eq!(manifest.definition, instrument);
     assert_eq!(manifest.config_hash, parsed.content_hash());
     assert_eq!(manifest.code_revision, env!("BINARY_ALPHA_CODE_REVISION"));
+    assert!(
+        !manifest.code_revision.ends_with("-dirty") && manifest.code_revision != "unavailable",
+        "the governed proof binds to a clean commit, not {}",
+        manifest.code_revision
+    );
     assert_eq!(manifest.source_generation, dataset.generation);
     assert_eq!(manifest.observations, dataset.row_count);
     assert_eq!(manifest.coverage.as_ref().unwrap(), &dataset.coverage);
@@ -1222,7 +1434,23 @@ fn governed_fixture_proof() {
         );
         steps.push((case.base_currency.is_some(), case.price_scale));
     }
-    println!("bar selection evidence: {}", governed.selection);
+    let collection: Value =
+        serde_json::from_slice(&fs::read(&governed.collection_manifest).unwrap()).unwrap();
+    for dataset in &bar_datasets {
+        assert!(
+            collection["assets"]
+                .get(dataset.provider_symbol.as_str())
+                .is_some(),
+            "{} is an asset of the collection manifest",
+            dataset.provider_symbol
+        );
+    }
+    println!(
+        "bar selection evidence: collection manifest {} sha256 {} selection {}",
+        governed.collection_manifest.display(),
+        sha256(&governed.collection_manifest),
+        collection["selection"]
+    );
     let currencies: Vec<_> = steps.iter().filter(|(currency, _)| *currency).collect();
     assert_eq!(currencies.len(), 2, "two currency instruments");
     assert_ne!(

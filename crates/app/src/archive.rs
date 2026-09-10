@@ -829,6 +829,12 @@ pub fn read_candles(
                     short_span: flags[9][row],
                 },
             };
+            if candle.volume.is_some_and(|volume| !volume.is_finite()) {
+                return Err(format!(
+                    "{} row {row}: volume is not finite",
+                    path.display()
+                ));
+            }
             if flags[10][row] != candle.flags.complete() || flags[11][row] != candle.flags.clean() {
                 return Err(format!(
                     "{} row {row}: recorded complete/clean disagree with the flags",

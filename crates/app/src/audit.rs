@@ -121,6 +121,18 @@ pub fn run(config_path: &Path, uri: &str, out: &mut dyn Write) -> Result<(), Str
         .map_err(|reason| format!("{location}: {reason}"))?;
     }
     let profile = stream.profile();
+    if profile.observations != manifest.row_count
+        || profile.coverage.as_ref() != Some(&manifest.coverage)
+    {
+        return Err(format!(
+            "{uri}: observed {} records from {:?}, but the manifest records {} rows from {} to {}; nothing was published",
+            profile.observations,
+            profile.coverage,
+            manifest.row_count,
+            manifest.coverage.first_event_time,
+            manifest.coverage.last_event_time
+        ));
+    }
     let mut streams = Vec::with_capacity(writers.len());
     for (writer, spec) in writers.into_iter().zip(&instrument.candles) {
         let (rows, first_open, last_close) = writer.finish()?;
