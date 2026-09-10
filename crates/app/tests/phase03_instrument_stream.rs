@@ -902,6 +902,41 @@ fn legacy_rows(path: &Path, scale: PriceScale) -> Vec<LegacyRow> {
         .collect()
 }
 
+/// Whether a legacy floating-point diagnostic agrees with the target's exact whole basis points,
+/// and if so whether they differed at all: within one point (the floor at an integer boundary)
+/// plus the reference's floating-point error (three rounded operations, bounded by 2^-50 of the
+/// value), or saturated at the column's limit while the reference lies at or beyond it.
+fn diagnostic_agrees(legacy: f64, target: i64) -> Option<bool> {
+    if legacy >= MAX_BASIS_POINTS as f64 {
+        return (target == MAX_BASIS_POINTS as i64).then_some(true);
+    }
+    let floored = legacy.floor() as i64;
+    let tolerance = 1.0 + legacy * 2f64.powi(-50);
+    ((floored - target).unsigned_abs() as f64 <= tolerance).then_some(floored != target)
+}
+
+#[test]
+fn diagnostic_tolerance_follows_the_references_precision() {
+    assert_eq!(diagnostic_agrees(5.0, 5), Some(false));
+    assert_eq!(diagnostic_agrees(4.999_999, 5), Some(true));
+    assert_eq!(diagnostic_agrees(12.0, 10), None);
+    // The reference's value for a move from 0.000087 to 55401382.015568 at scale six, two
+    // points above the exact floor; and its value for a move from one unit to a billion,
+    // beyond the column's limit the target saturates at.
+    assert_eq!(
+        diagnostic_agrees(6_367_974_944_308_162.0, 6_367_974_944_308_160),
+        Some(true)
+    );
+    assert_eq!(
+        diagnostic_agrees(9.999_999_999_999_992e18, MAX_BASIS_POINTS as i64),
+        Some(true)
+    );
+    assert_eq!(
+        diagnostic_agrees(9.999_999_999_999_992e18, MAX_BASIS_POINTS as i64 - 1),
+        None
+    );
+}
+
 /// The pinned audit's gap ladder over a duration, and `none` for a candle with no record before
 /// it; the target keeps the durations and the test derives the class from them.
 fn gap_class(micros: Option<i64>) -> &'static str {
@@ -998,8 +1033,8 @@ fn assert_parity(target: &[Row], legacy: &[LegacyRow], label: &str) -> usize {
             "{context}: strict eligibility"
         );
         // Continuous diagnostic: the legacy value is binary floating point rendered to six
-        // decimals; the target floors the exact ratio. A difference of one whole basis point at
-        // an integer boundary is the documented tolerance and never changes the flag above.
+        // decimals; the target floors the exact ratio. The tolerance in `diagnostic_agrees`
+        // never changes the flags above.
         // The reference starts a candle's worst class at its starts-after class, or at the
         // normal class for the first candle, then raises it by every gap inside.
         let starts_after = gap_class(row.gap_before);
@@ -1029,14 +1064,9 @@ fn assert_parity(target: &[Row], legacy: &[LegacyRow], label: &str) -> usize {
                 row.facts[4].max(row.facts[5]).max(row.facts[6]),
             ),
         ] {
-            let floored = legacy.floor() as i64;
-            if floored != target {
-                assert_eq!(
-                    (floored - target).abs(),
-                    1,
-                    "{context}: {name} {legacy} vs {target}"
-                );
-                boundary += 1;
+            match diagnostic_agrees(legacy, target) {
+                Some(differed) => boundary += usize::from(differed),
+                None => panic!("{context}: {name} {legacy} vs {target}"),
             }
         }
     }
