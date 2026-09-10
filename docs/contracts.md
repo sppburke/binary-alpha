@@ -1,7 +1,8 @@
 # System contracts
 
 These contracts bind every phase of Binary Alpha. The current checkout implements the
-[configuration](#configuration) and [historical datasets](#historical-datasets) sections; the other
+[configuration](#configuration), [historical datasets](#historical-datasets), and
+[instrument streams](#instrument-streams) sections; the other
 sections are frozen now so that later phases implement them once, in one place, without
 reinterpretation. Specification intent, checkout
 implementation, observed runtime state, immutable measured artifacts, and hosted Git state are
@@ -108,6 +109,7 @@ and content hash; the application package owns reading it from a path.
 | `storage.historical_data_dir` | string | a non-empty path of the retained historical-data folder; a relative path resolves against the configuration file's directory |
 | `storage.publication_uri` | string | `gs://BUCKET` or `gs://BUCKET/PREFIX` in every run mode; `file:///ABSOLUTE/DIR` only with `run_mode = "research"`, as the non-live test boundary |
 | `import.sources` | array of tables | optional; consumed only by `data import`, which requires at least one entry |
+| `instruments` | array of tables | optional; consumed only by `data audit`, which requires the entry that maps the audited generation |
 
 Every `import.sources` entry declares `kind`, `path` (a relative path resolves against the
 configuration file's directory), `broker`, and `role` (`development` or `evaluation`; `holdout` is
@@ -121,14 +123,35 @@ Kind `tick_parquet_daily` names one daily tick archive root and also declares `p
 path component without an ASCII control character. Broker and symbol values are non-empty and
 contain no ASCII control character. Duplicate source paths are rejected.
 
-Every field is required and has no default, except that the `import` table and the `provenance`
-list may be absent. Any other field is rejected as unknown, so a raw secret value has no place to
-live. Validation opens no source or destination and mutates nothing.
+Every `instruments` entry declares, in this order: `broker` and `provider_symbol` (the neutral
+instrument identity `BROKER:PROVIDER_SYMBOL` the entry maps); `base_currency` (optional; absent for
+a stock, index, or commodity, never invented) and `quote_currency`, both non-empty codes without an
+ASCII control character; `price_scale` (`0` to `18`), the integer-unit scale of every candle price,
+which an integer-unit source must already carry and into which a binary floating-point bar source
+converts exactly or is rejected; `native_granularity`, `{ kind = "tick" }` or
+`{ kind = "bar", period_seconds = N }` with a positive period and no other key, which the audited
+generation must provide; the optional check tables `gap` (`max_seconds` and a larger
+`reopen_seconds`), `frozen` (positive `min_observations` and `min_seconds`), `jump` (positive
+`min_basis_points`), and `span` (`min_percent`, `0` to `100`), each enabled by its presence; the optional `sessions` list of weekly windows, each with a unique non-empty
+`name` and `open_seconds` less than `close_seconds` at most `604800` (seconds since Monday
+00:00 Coordinated Universal Time), pairwise non-overlapping and non-empty when present; and the
+non-empty `candles` list, each stream declaring a positive `duration_seconds`, an
+`offset_seconds` below the duration, and the optional `min_observations` and
+`hard_min_observations` counts. A bar instrument's durations and offsets are multiples of its bar
+period. Two entries may map one identity only at different native granularities; the same
+duration and offset pair is listed once per entry. Ordering, causality, interval boundaries,
+finite values, and source capability are stream invariants that no field relaxes.
+
+Every field is required and has no default, except that the `import` table, the `provenance`
+list, the `instruments` list, and the optional instrument fields named above may be absent. Any
+other field is rejected as unknown, so a raw secret value has no place to live. Validation opens
+no source or destination and mutates nothing.
 
 ### Deferred entries
 
-The envelope will also carry lists of brokers, accounts, instruments, candle definitions, feature
-definitions, contract terms, research splits, objectives, risk policies, and live settings. The phase that first consumes each one adds it to the table above together with its
+The envelope will also carry lists of brokers, accounts, feature definitions, contract terms,
+research splits, objectives, risk policies, and live settings. The phase that first consumes each
+one adds it to the table above together with its
 validation: neutral typed identifiers rather than strings with implicit meaning; durations and times
 with explicit units; currency-bearing exact amounts parsed from decimal text without binary floating
 point; credentials only as references that the application resolves outside the document; and
@@ -148,23 +171,31 @@ checkout validates the value and executes no mode.
 
 The canonical document serializes the validated configuration with keys in the schema-table order,
 one key per line, standard TOML formatting, double-quoted strings, no comments, and a trailing
-newline. Top-level keys come first; the `[storage]` table and each `[[import.sources]]` entry follow
-in schema order, each introduced by one blank line and its header, with the entry's `kind` first
-and its remaining keys in the order of the table above. Two documents with the same values have the
-same canonical form regardless of key order, whitespace, or comments.
+newline. Top-level keys come first; the `[storage]` table, each `[[import.sources]]` entry, and each
+`[[instruments]]` entry follow
+in schema order, each introduced by one blank line and its header, with a source entry's `kind`
+first and its remaining keys in the order of the table above. An instrument entry lists its scalar
+keys in the declared order, then its `[instruments.native_granularity]`, `[instruments.gap]`,
+`[instruments.frozen]`, `[instruments.jump]`, and `[instruments.span]` tables, then its
+`[[instruments.sessions]]` and `[[instruments.candles]]` entries, each present table or entry
+introduced by one blank line and its header. An instrument entry rendered alone as a document in
+the same order is its canonical definition, the text a stream generation's identity hashes. Two
+documents with the same values have the same canonical form regardless of key order, whitespace,
+or comments.
 
-### Content hash, version 2
+### Content hash, version 3
 
-The content hash is SHA-256 over the bytes `binary-alpha config hash v2`, one line feed, and the
-canonical document. It is rendered as `v2:sha256:` followed by sixty-four lowercase hexadecimal
+The content hash is SHA-256 over the bytes `binary-alpha config hash v3`, one line feed, and the
+canonical document. It is rendered as `v3:sha256:` followed by sixty-four lowercase hexadecimal
 digits. Any change to the hash input or to the canonical form increments the version prefix.
-Version 1 hashed the two-field envelope of the previous checkout under the domain
+Version 2 hashed the canonical form without `instruments` under the domain
+`binary-alpha config hash v2`, and version 1 the two-field envelope of the first checkout under
 `binary-alpha config hash v1`; a hash recorded under an earlier version is never reinterpreted.
 
 ### Validation output
 
 `binary-alpha config validate --config PATH` writes to standard output the line
-`# content-hash: v2:sha256:...` terminated by a line feed, then the canonical document, and exits
+`# content-hash: v3:sha256:...` terminated by a line feed, then the canonical document, and exits
 with status 0. It writes nothing else and mutates nothing. On failure it writes nothing to standard
 output, writes one diagnostic to standard error, and exits with status 1: a document error names the
 offending or missing key and, for a present value, its line and column; an unreadable path is
@@ -296,8 +327,143 @@ reads do; for `file://` reads a recorded Google generation is provenance); and, 
 the reconstructed row count and coverage. A manifest is trusted only after its generation is
 sixty-four hexadecimal digits that match its recorded inputs, its keys are content-addressed, and
 its paths are unique and clean. It writes one line to standard output:
-`verified INSTRUMENT ROLE generation GENERATION rows N objects K bytes B`.
+`verified INSTRUMENT ROLE generation GENERATION rows N objects K bytes B`. A manifest whose
+top-level `kind` is `instrument_stream` is verified as a stream generation (see
+[instrument streams](#instrument-streams)); a manifest with no `kind` is a dataset generation; any
+other kind is rejected.
 
-Both commands exit with status 0 on success and, on any failure, write nothing further to standard
-output, write one diagnostic to standard error, and exit with status 1. Neither removes source files,
-retained objects, or published objects.
+`data import`, `data audit`, and `data verify` exit with status 0 on success and, on any failure,
+write nothing further to standard output, write one diagnostic to standard error, and exit with
+status 1. None removes source files, retained objects, or published objects.
+
+## Instrument streams
+
+The engine owns the `InstrumentStream` state machine, its `Observation` input, `Candle` output,
+`InstrumentProfile`, and the stream manifest and generation identity; the application owns
+reading a published generation, feeding it in order, and publishing the outputs.
+
+### Records and clocks
+
+A stream is bound to one configured instrument and one source generation whose capabilities,
+native granularity, and, for an integer-unit source, price scale agree with the definition;
+a tick instrument bound to a bar-only generation is refused with the machine-readable capability
+error, and a bar instrument's profile records every tick calculation (`tick_count`, `tick_path`,
+`tick_gaps`, `entry_tick`, `tick_settlement`) as unsupported with that same reason. Every record
+carries a provider event time and a known-at time: a tick is known at its event time; a bar
+starts at its event time and is known at its end. Bar prices convert exactly to integer units at
+the instrument's price scale or are rejected. Records arrive in event-time order, one at a time,
+through the same `push` for historical, replay, and live feeds; a refused record (backwards time,
+a bar that does not strictly follow the previous bar, a tick with a different price at the
+previous tick's event time, a bar off its grid or of another period, a non-finite or negative
+volume, a contradicted high/low relationship, a bar whose volume would push a candle's summed
+volume out of the finite range, a time beyond `i64::MAX / 4` microseconds either side of the
+epoch (about 73,000 years, so every interval boundary and difference stays representable), or a
+record of the other granularity) is reported
+with its reason, event time, known-at time, and source generation, and leaves the state
+unchanged. A tick identical to the previous tick is accepted, counted as a duplicate, and folded
+like the source retained it. The one observed move between consecutive records is from the
+previous close to the record's open; a bar's high and low bound its prices and the observed
+price step but never form a path, because their order inside the bar is unobserved. The time
+between consecutive records is measured from the previous record's known-at time to the
+record's event time (zero for contiguous bars), so a gap is uncovered time; the cadence is
+measured between event times. Nothing is filled, interpolated, defaulted, or inferred from a
+symbol.
+
+### Candles
+
+Each configured stream buckets records into left-closed intervals of `duration_seconds` whose
+boundaries lie `offset_seconds` after the Unix-epoch grid. A candle finalizes only when a record
+whose known-at time reaches the interval's close arrives: a record inside the interval is folded
+first and finalizes it when its own known-at time reaches the close (a bar ending at the close),
+while a record at or after the close finalizes it without contributing and opens the next
+interval. The candle's known-at time is that record's known-at time. The end of input finalizes
+nothing; the unfinished last interval is withheld and its record count is reported in the
+profile. Missing intervals are never emitted. A finalized candle records its open and close time,
+known-at time, first and last event time, active span (last known-at time minus first event
+time), open, high, low, and close units, record and duplicate counts, the summed source volume
+for bars, the time from the previous record to its first record (absent for the first record of
+the stream), the longest inter-arrival time inside it, the number of missing intervals before it,
+the most records in one run of one unchanged price and the longest span of such a run
+(independent maxima), and the
+largest relative move in whole basis points (`floor(10000 · |move| / |previous price|)`, exact
+in integer arithmetic, `i64::MAX` at most (the candle column's limit, far past the 2^53 basis
+points where the reference's floating-point value stops being exact), undefined and skipped
+after a zero price) over the
+moves that enter or lie inside it, in each of three inter-arrival contexts: contiguous (the
+time before the move is at most `gap.max_seconds`), delayed (over that but under
+`gap.reopen_seconds`), and reopen (at least `gap.reopen_seconds`); without a `gap` check every
+move is contiguous.
+
+The enabled checks decide the flags, with the same comparisons the pinned resampler and research
+policy applied: `low_activity` and `hard_low_activity` when the record count is below the
+stream's `min_observations` or `hard_min_observations`; `gap_before` and `gap_inside` when the
+gap before or the longest inter-arrival inside exceeds `gap.max_seconds`; `missing_before` when an
+interval before it is missing; `frozen` when a run reaches `frozen.min_observations` records or
+`frozen.min_seconds`; `jump`, `delayed_jump`, and `reopen_jump` when the largest move of that
+context reaches `jump.min_basis_points`; and `short_span` when the active span is below
+`span.min_percent` of the duration. `complete` is the absence of every gap flag and of hard low
+activity; `clean` is the strict eligibility verdict, the absence of every flag. The pinned
+resampler is a reference with three limitations the target does not reproduce: it parses every
+timestamp to whole milliseconds through binary floating point (a sub-millisecond time is
+truncated and a whole-millisecond time can shift by one), it parses prices as binary floating
+point (two prices that differ at the configured scale but share one binary value are one price
+to it), and it treats a run of one price that starts at the Unix epoch as absent; the target
+keeps exact microseconds, exact units, and every run.
+
+### Profile
+
+The profile records only facts a validator or a feature-compatibility check consumes: the
+instrument identity, currencies, and price scale; the source generation, kind, role, native
+granularity, scale, and capabilities; record and duplicate counts and first and last event time;
+the cadence (event-time micros between consecutive records by bit length, where bucket `k`
+holds values in `[2^(k-1), 2^k)` and bucket `0` holds zeros); observed prices (minimum, maximum,
+the number of nonzero moves between consecutive records, and the greatest common divisor of
+every nonzero difference between a record's prices and the previous close, or the record's own
+open for the first record, as the observed price step); gaps over the threshold (count, longest, total); closed frozen runs that met the
+thresholds (count, most records in one run, longest span of one run); moves in whole basis points by bit length
+with the counts that reached the jump threshold in each context; records inside each
+session window and outside every window; per stream the finalized count, the withheld record
+count, records per finalized candle by bit length, and how many candles carried each flag,
+`complete`, and `clean`; and the supported calculations. Every count except the withheld record
+count covers only closed windows, so a longer input extends the profile and never revises what a
+shorter input reported, and the
+finalized candles of any prefix are a prefix of the full output. The profile is evidence, never
+self-modifying configuration.
+
+### Stream generations
+
+`binary-alpha data audit --config PATH --manifest URI` reads the dataset ready manifest at `URI`
+through the same store grammar as `data verify`, refuses a holdout generation before reading any
+object (research never audits holdout data; certification is a separate authorization), binds
+the generation to the configured
+instrument that maps its identity and native granularity (an identity mapped only at another
+granularity is bound so that the capability error names what the source lacks; an unmapped
+identity is an error, never a default), verifies and decodes every data object in manifest order
+through the Phase 02 readers, feeds every record, requires the observed record count and
+coverage to equal the manifest's `row_count` and `coverage` before it publishes anything (candle
+rows stream into temporary files under the retained folder while the input is read), and writes
+one candle object per stream and the profile. The stream generation's identity is the SHA-256, rendered as sixty-four lowercase
+hexadecimal digits, of the UTF-8 text `binary-alpha instrument stream generation v1`, one line
+feed, the source generation, one line feed, and the instrument's canonical definition. Its objects
+are `profile.json` (the profile as pretty-printed JSON with two-space indentation and one trailing
+line feed) and `candles/DURATIONs_OFFSETs.parquet` per stream (Zstandard Parquet with the fixed
+`binary_alpha_candles` schema, `TIMESTAMP(MICROS, true)` clocks, signed 64-bit units and counts,
+optional `volume` and `gap_before_micros`, and boolean flags, plus file metadata `broker`,
+`provider_symbol`, `price_scale`, `duration_seconds`, `offset_seconds`, and
+`stream_schema_version`), all with the object role `normalized`. They are retained in the
+historical-data folder and published under the content-addressed keys and create-once rules of
+dataset generations; the ready manifest at `manifests/GENERATION/ready.json` is published last
+and mirrored, and a committed manifest must describe the same generation, role, observations,
+coverage, streams, and objects. It records, in order, `kind` (`instrument_stream`),
+`schema_version` (`1`), `generation`, `broker`, `provider_symbol`, `instrument`, `role`,
+`source_generation`, `source_kind`, `definition` (the instrument entry), `config_hash`,
+`code_revision`, `observations`, `coverage`, `streams` (per stream the duration, offset, row
+count, first open time, and last close time), and `objects`. The command writes one line to
+standard output:
+`audited INSTRUMENT ROLE generation GENERATION from SOURCE observations N candles C objects K reused R`
+followed by `[stream S publish S]` stage durations in seconds or by `(already published)`.
+`data verify` on a stream generation asserts every object's bytes and hashes, decodes the profile
+and every candle object, checks that they describe the manifest's instrument, price scale,
+source generation, kind, and role, observations, coverage, and per-stream rows and bounds (every
+volume finite), and writes
+`verified INSTRUMENT ROLE generation GENERATION candles C objects K bytes B`.

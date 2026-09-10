@@ -17,6 +17,10 @@ declared sources ──▶ app: enumerate, hash ──▶ engine: parse ticks, v
 
 ready manifest URI ──▶ app: read manifest and objects from one store ──▶ engine: parse, validate rows
    ──▶ app: compare bytes, hashes, rows, coverage ──▶ standard output
+
+dataset ready manifest URI ──▶ app: bind the configured instrument, decode records in order
+   ──▶ engine: InstrumentStream audit, finalized candles, profile ──▶ app: candle objects, profile,
+   stream manifest through the same store ──▶ standard output
 ```
 
 `binary-alpha config validate --config PATH` reads the document; the engine parses it into typed
@@ -27,7 +31,10 @@ canonical document. `binary-alpha data import --config PATH` and
 [docs/contracts.md](contracts.md), section "Historical datasets"; the engine supplies the records,
 validators, identities, and manifest, and the application supplies file, Parquet, and cloud effects
 through one artifact-store interface with a filesystem implementation and a Google Cloud Storage
-implementation.
+implementation. `binary-alpha data audit --config PATH --manifest URI` is the instrument-stream
+path described in section "Instrument streams": the engine owns the ordered state machine, the
+profile, the candles, and the stream manifest, and the application feeds it one record at a time
+from the published generation and publishes the outputs through the same store.
 
 ## Data flow owned by later phases
 
@@ -36,7 +43,7 @@ names the issue that implements it; nothing on this list exists in the current c
 
 ```
 historical import (#3) ──┐
-                         ├─▶ instrument stream and candles (#4) ─▶ features and regimes (#5) ─▶ outcomes (#6)
+                         ├─▶ instrument stream and candles (#4, this checkout) ─▶ features and regimes (#5) ─▶ outcomes (#6)
 live feed (#11) ─────────┘                                                                            │
                                                                                                       ▼
 artifacts: Google Cloud Storage, Supabase references (#3)  ◀── strategy, replay, settlement, accounting, risk (#7)
@@ -55,7 +62,8 @@ live runtime and cutover (#13) ─▶ execution ─▶ broker adapter (#11)
 | Reading configuration from a path, command-line surface, exit status | `binary-alpha-app` | this checkout |
 | Immutable tick and bar records, dataset roles, source capability, generation identity, ready manifests | `binary-alpha-engine`, modules `market` and `dataset` | this checkout |
 | Source enumeration, normalization, the retained historical-data folder, publication, verification | `binary-alpha-app`, modules `import`, `verify`, `archive`, `store` | this checkout |
-| Instrument profile and causal candles | `binary-alpha-engine` | [#4](https://github.com/sppburke/binary-alpha/issues/4) |
+| Instrument definitions, the ordered instrument stream, profile, finalized candles, stream manifests | `binary-alpha-engine`, modules `config` and `stream` | this checkout ([#4](https://github.com/sppburke/binary-alpha/issues/4)) |
+| Feeding a published generation through its stream and publishing candle objects and profiles | `binary-alpha-app`, modules `audit` and `archive` | this checkout ([#4](https://github.com/sppburke/binary-alpha/issues/4)) |
 | Causal features and regimes | `binary-alpha-engine` | [#5](https://github.com/sppburke/binary-alpha/issues/5) |
 | Future-only binary-expiry outcomes | `binary-alpha-engine` | [#6](https://github.com/sppburke/binary-alpha/issues/6) |
 | Strategy intent, chronological execution, settlement, accounting, risk | `binary-alpha-engine` | [#7](https://github.com/sppburke/binary-alpha/issues/7) |

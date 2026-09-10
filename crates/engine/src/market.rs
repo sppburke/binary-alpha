@@ -59,6 +59,11 @@ identifier! {
     ProviderSymbol
 }
 
+identifier! {
+    /// A currency code as the configuration declares it, such as `USD`.
+    Currency
+}
+
 /// A neutral instrument identity: one broker and that broker's provider symbol.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Deserialize, Serialize)]
 pub struct InstrumentId {
@@ -376,6 +381,9 @@ impl Bar {
                 "invalid high/low relationship in bar at {}",
                 self.start_unix_s
             ));
+        }
+        if period_s == 0 {
+            return Err(format!("bar at {} has no period", self.start_unix_s));
         }
         if self.period_s != period_s {
             return Err(format!(

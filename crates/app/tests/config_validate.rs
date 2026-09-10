@@ -2,7 +2,7 @@
 
 use std::process::{Command, Output};
 
-const EXPECTED_REPORT: &str = "# content-hash: v2:sha256:285c28bd02de8cbc1669602b0c651fe0599ea64dd762d78b1d3bb1b895e4b01a\nschema_version = 1\nrun_mode = \"research\"\n\n[storage]\nhistorical_data_dir = \"../historical_data\"\npublication_uri = \"gs://example-bucket/historical\"\n";
+const EXPECTED_REPORT: &str = "# content-hash: v3:sha256:69c7e52a379adf4c76edd6745a60b12cdccf6c56658afdaa37d6b2ecb7185c1b\nschema_version = 1\nrun_mode = \"research\"\n\n[storage]\nhistorical_data_dir = \"../historical_data\"\npublication_uri = \"gs://example-bucket/historical\"\n\n[[instruments]]\nbroker = \"pocket_option\"\nprovider_symbol = \"AEDCNY_otc\"\nbase_currency = \"AED\"\nquote_currency = \"CNY\"\nprice_scale = 6\n\n[instruments.native_granularity]\nkind = \"tick\"\n\n[instruments.gap]\nmax_seconds = 2\nreopen_seconds = 60\n\n[instruments.frozen]\nmin_observations = 10\nmin_seconds = 5\n\n[instruments.jump]\nmin_basis_points = 5\n\n[instruments.span]\nmin_percent = 75\n\n[[instruments.sessions]]\nname = \"week\"\nopen_seconds = 0\nclose_seconds = 604800\n\n[[instruments.candles]]\nduration_seconds = 5\noffset_seconds = 0\nmin_observations = 9\nhard_min_observations = 5\n\n[[instruments.candles]]\nduration_seconds = 15\noffset_seconds = 5\nmin_observations = 29\nhard_min_observations = 15\n";
 
 fn binary_alpha(args: &[&str]) -> Output {
     Command::new(env!("CARGO_BIN_EXE_binary-alpha"))
@@ -30,7 +30,7 @@ fn help_names_every_command() {
     let help = String::from_utf8(output.stdout).unwrap();
     assert!(help.contains("config") && help.contains("data"));
     let data = String::from_utf8(binary_alpha(&["data", "--help"]).stdout).unwrap();
-    assert!(data.contains("import") && data.contains("verify"));
+    assert!(data.contains("import") && data.contains("audit") && data.contains("verify"));
 }
 
 #[test]
@@ -142,6 +142,16 @@ fn invalid_documents_fail_with_field_specific_errors() {
             "price_scale_too_large.toml",
             "import.sources",
             "price_scale 19 exceeds 18",
+        ),
+        (
+            "instrument_mapped_twice.toml",
+            "instruments[1].provider_symbol",
+            "pocket_option:AEDCNY_otc with tick granularity is already mapped by instruments[0]",
+        ),
+        (
+            "candle_off_the_bar_grid.toml",
+            "instruments[0].candles[0].duration_seconds",
+            "must be multiples of the 5-second bar",
         ),
     ];
     for (name, key, message) in cases {
