@@ -12,6 +12,7 @@
 //! integer units throughout.
 
 use std::borrow::Cow;
+use std::cmp::Ordering;
 use std::collections::{HashMap, VecDeque};
 use std::fmt;
 
@@ -399,7 +400,10 @@ fn readiness(field: Field) -> &'static str {
         F::Return1Bps => {
             "unavailable on the first accepted candle; state advances across every accepted candle"
         }
-        F::Momentum(_) | F::RangeMean(_) | F::TickVolumeMean(_) => {
+        F::Momentum(_) => {
+            "unavailable until the window count of previous accepted candles; state advances across every accepted candle"
+        }
+        F::RangeMean(_) | F::TickVolumeMean(_) => {
             "unavailable until the window count of accepted candles; state advances across every accepted candle"
         }
         F::Efficiency(_) | F::AbsReturnMean(_) => {
@@ -469,10 +473,15 @@ fn readiness(field: Field) -> &'static str {
             "numeric preview from the first close of a segment; resets when the accepted ordinal is not adjacent"
         }
         F::EmaReady(_) => "true once the period count of adjacent accepted candles has been seen",
-        F::CloseVsEmaBps(_) | F::CloseAboveEma(_) | F::Ema20MinusEma50Bps | F::Ema20AboveEma50 => {
+        F::CloseVsEmaBps(_) | F::Ema20MinusEma50Bps => {
+            "available from the first close of a segment unless the dividing average is zero; readiness is separate"
+        }
+        F::CloseAboveEma(_) | F::Ema20AboveEma50 => {
             "available from the first close of a segment; readiness is separate"
         }
-        F::EmaSlopeBps(_) => "unavailable on the first candle of a segment",
+        F::EmaSlopeBps(_) => {
+            "unavailable on the first candle of a segment or when the previous average is zero"
+        }
         F::EmaSlopeState(_) | F::CloseVsEmaState(_) | F::Ema20Ema50AlignmentState => {
             "`not_ready` until ready or while the value is unavailable"
         }
@@ -1602,12 +1611,14 @@ const FIXED_BINS: &[(&str, &[f64])] = &[
 /// millisecond-defined fixed bins.
 const DURATION_DIVISOR: f64 = 1_000.0;
 
-/// The inputs whose fixed bins are defined over the reference's millisecond values.
-const DURATION_INPUTS: [&str; 4] = [
+/// The microsecond inputs whose compiled bins or development quantiles the reference defined
+/// over millisecond values.
+const DURATION_INPUTS: [&str; 5] = [
     "max_gap_micros",
     "max_internal_gap_micros",
     "starts_after_gap_micros",
     "max_same_price_run_micros",
+    "active_span_micros",
 ];
 
 fn input_divisor(input: &str) -> f64 {
@@ -2597,6 +2608,19 @@ impl<T: Copy> History<T> {
     }
 }
 
+/// Whether `point` lies above, below, or within `epsilon` units of `before`, decided on exact
+/// units without overflow.
+fn beyond(point: i64, before: i64, epsilon: i64) -> Ordering {
+    let (point, before, epsilon) = (i128::from(point), i128::from(before), i128::from(epsilon));
+    if point > before + epsilon {
+        Ordering::Greater
+    } else if point < before - epsilon {
+        Ordering::Less
+    } else {
+        Ordering::Equal
+    }
+}
+
 /// The reference's `sum()` over floats: CPython 3.12's left-to-right Neumaier-compensated
 /// addition, which differs from a plain fold in the last bits and therefore, on some windows,
 /// in the sixth decimal place of the emitted mean.
@@ -3333,19 +3357,13 @@ impl Sequence {
             let point = point.expect("a newly confirmed swing has a point");
             let swing_type = match *previous {
                 None => first,
-                Some(before)
-                    if i128::from(point.price_units)
-                        > i128::from(before.price_units) + i128::from(self.epsilon_units) =>
-                {
-                    higher
+                Some(before) => {
+                    match beyond(point.price_units, before.price_units, self.epsilon_units) {
+                        Ordering::Greater => higher,
+                        Ordering::Less => lower,
+                        Ordering::Equal => equal,
+                    }
                 }
-                Some(before)
-                    if i128::from(point.price_units)
-                        < i128::from(before.price_units) - i128::from(self.epsilon_units) =>
-                {
-                    lower
-                }
-                Some(_) => equal,
             };
             let classified = SequencePoint {
                 price_units: point.price_units,
@@ -4405,7 +4423,6 @@ struct Needs {
     structure: bool,
     sequence: bool,
     relative: bool,
-    regime: bool,
 }
 
 impl Needs {
@@ -4418,7 +4435,6 @@ impl Needs {
                 Stage::Rolling => needs.rolling = true,
                 Stage::Structure => needs.structure = true,
                 Stage::Sequence => needs.sequence = true,
-                Stage::Regime => needs.regime = true,
                 _ => {}
             }
             match field {
@@ -4426,8 +4442,19 @@ impl Needs {
                 | F::MaxTrueTickJumpBps
                 | F::MaxGapReopenJumpBps
                 | F::RegimeQualityState
-                | F::RegimeComposite
                 | F::IsRegimeClean => needs.jumps = true,
+                // A regime component reads only the state its rule reads.
+                F::RegimeComposite => {
+                    needs.jumps = true;
+                    needs.sequence = true;
+                }
+                F::RegimeVolatilityState => needs.rolling = true,
+                F::RegimeTransitionState | F::IsRegimeTransition => needs.structure = true,
+                F::RegimeTrendState
+                | F::RegimeStructureState
+                | F::RegimeDirectionalBias
+                | F::IsRegimeTrending
+                | F::IsRegimeRanging => needs.sequence = true,
                 F::PriorCleanHistoryCount
                 | F::RangeVsRecentRatio
                 | F::BodyVsRecentRatio
@@ -4441,7 +4468,6 @@ impl Needs {
             }
         }
         // Later stages read earlier ones.
-        needs.sequence |= needs.regime;
         needs.structure |= needs.sequence;
         needs.rolling |= needs.structure;
         needs
@@ -5421,6 +5447,50 @@ mod tests {
     }
 
     #[test]
+    fn the_active_span_quantile_fits_in_milliseconds() {
+        let mut request = entry(&[(5, 0)], Outputs::AllSupported);
+        request.encodings = Some(Encodings {
+            max_labels: 32_768,
+            outputs: vec![EncodingSpec {
+                output: "active_span_micros_dev_quantile".to_string(),
+                bins: None,
+            }],
+        });
+        let plan = FeaturePlan::resolve(
+            &request,
+            profile(NativeGranularity::Tick, true, &[(5, 0)]),
+            "input",
+        )
+        .unwrap();
+        let mut fitted = plan.streams[0].encodings[0].clone();
+        assert_eq!(fitted.input_divisor, 1_000.0);
+        // The pinned quantile witness [1, 2, 3, 4], supplied in microseconds.
+        let development = numbers(&[1_000.0, 2_000.0, 3_000.0, 4_000.0]);
+        fitted.fit(&development, 32_768).unwrap();
+        assert_eq!(fitted.edges, Some(vec![1.6, 2.2, 2.8, 3.4000000000000004]));
+        assert_eq!(
+            fitted.labels,
+            ["-inf_to_1.6", "1.6_to_2.2", "2.8_to_3.4", "3.4_to_inf"]
+        );
+        assert_eq!(fitted.encode(&development), [0, 1, 2, 3]);
+        assert_eq!(fitted.encode(&numbers(&[2_500.0])), [-1]);
+        let reloaded: FittedEncoding =
+            serde_json::from_str(&serde_json::to_string(&fitted).unwrap()).unwrap();
+        assert_eq!(reloaded.encode(&development), [0, 1, 2, 3]);
+    }
+
+    #[test]
+    fn epsilon_comparisons_do_not_overflow() {
+        assert_eq!(beyond(i64::MAX, i64::MIN, i64::MAX), Ordering::Greater);
+        assert_eq!(beyond(i64::MIN, i64::MAX, i64::MAX), Ordering::Less);
+        assert_eq!(beyond(i64::MAX, i64::MAX - 1, 0), Ordering::Greater);
+        assert_eq!(beyond(6, 3, 2), Ordering::Greater);
+        assert_eq!(beyond(5, 3, 2), Ordering::Equal);
+        assert_eq!(beyond(1, 3, 2), Ordering::Equal);
+        assert_eq!(beyond(0, 3, 2), Ordering::Less);
+    }
+
+    #[test]
     fn gap_classes_follow_the_ladder() {
         assert_eq!(gap_class(0), "duplicate_or_backwards");
         assert_eq!(gap_class(2_000_000), "normal_small_tick_delay");
@@ -5548,6 +5618,21 @@ mod tests {
         assert_eq!(path.flat, 1, "an identical repeat is a flat move");
         path.fold(Some(seen(5_000_000, 1.5)), seen(5_100_000, 1.6), gap);
         assert_eq!(path.up, 1);
+        // Distinct units that collapse to one binary float are still distinct moves: the sign
+        // is an exact-unit decision, unlike the reference's floating subtraction.
+        let unit = TickSeen {
+            event: 5_100_000,
+            price: 1.0,
+            units: 1_000_000_000_000_000_000,
+        };
+        let next = TickSeen {
+            units: unit.units + 1,
+            event: 5_200_000,
+            ..unit
+        };
+        assert_eq!(next.price - unit.price, 0.0);
+        path.fold(Some(unit), next, gap);
+        assert_eq!((path.up, path.flat), (2, 1));
     }
 
     fn tick(millis: i64, price_units: i64) -> Observation {
@@ -5782,6 +5867,26 @@ mod tests {
             format!("{:.8}", anatomy.close),
             "0.00000000",
             "the eight-place projection alone would erase the move"
+        );
+        // Unit differences beyond signed 64 bits are unavailable, never wrapped, and the
+        // direction is still decided on units.
+        let wide = Candle {
+            open_units: i64::MAX,
+            high_units: i64::MAX,
+            low_units: -1,
+            close_units: i64::MAX - 1,
+            ..candle
+        };
+        let anatomy = Anatomy::new(&wide, instrument.price_scale.unit() as f64);
+        assert_eq!(anatomy.direction, "down");
+        assert_eq!(
+            (
+                anatomy.body_units,
+                anatomy.range_units,
+                anatomy.upper_wick_units,
+                anatomy.lower_wick_units
+            ),
+            (Some(1), None, Some(0), None)
         );
     }
 

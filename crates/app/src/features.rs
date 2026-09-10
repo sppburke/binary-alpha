@@ -735,6 +735,27 @@ pub fn verify_feature(uri: &str, store: &Store, key: &str, bytes: &[u8]) -> Resu
             store.uri(&plan_object.key)
         ));
     }
+    let mut expected_paths = vec![PLAN_OBJECT_PATH.to_string()];
+    for stream in &plan.streams {
+        expected_paths.extend(stream.object_paths());
+    }
+    expected_paths.sort_unstable();
+    let mut recorded: Vec<&str> = manifest
+        .objects
+        .iter()
+        .map(|object| object.path.as_str())
+        .collect();
+    recorded.sort_unstable();
+    if recorded
+        != expected_paths
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>()
+    {
+        return Err(format!(
+            "{uri}: the manifest's objects are not the plan's object set"
+        ));
+    }
     let mut rows = 0;
     let mut events = 0;
     for (stream, summary) in plan.streams.iter().zip(&manifest.streams) {

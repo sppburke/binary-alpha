@@ -150,8 +150,9 @@ Phase 03 stream generation whose recorded definition binds the candle streams, q
 and price scale and whose profile records the source capabilities; and either `frozen_plan`, the
 ready manifest of a completed feature generation whose plan is applied unchanged, or the new-plan
 settings below, which require `role = "development"`. Manifest locations use the
-`manifests/GENERATION/ready.json` grammar of `data verify`. Two entries never name one
-`profile_manifest`: an instrument's streams have one feature owner. A frozen plan admits no
+`manifests/GENERATION/ready.json` grammar of `data verify`. One `profile_manifest` may serve
+several entries (a fit and the frozen applications of its plan); every resolved instrument, role,
+and stream has one owning entry, checked at build before anything is streamed. A frozen plan admits no
 new-plan setting. The new-plan settings are all optional at parse time; the resolver requires
 exactly the ones the selected outputs and their compiled prerequisites need and names a missing
 one: `streams`, unique positive duration and smaller offset pairs, each a stream of the bound
@@ -594,12 +595,13 @@ computation; the raw rows carry that identity and never a plan hash. After the r
 application rereads one selected column at a time and fits each encoding on every development
 row: a category or boolean output labels its text (empty text is `none`, missing is
 `missing`); a compiled `NAME_bucketed` projection classifies its input into the source-defined
-right-closed bins with the first edge included (the four `_micros` duration inputs are divided
-by the plan's recorded `input_divisor` of 1000 first, so their bins and labels are the
-reference's millisecond values); a compiled `NAME_dev_quantile` projection or a
+right-closed bins with the first edge included; a compiled `NAME_dev_quantile` projection or a
 `development_fifths` output cuts at the linear-interpolated development quantiles 0.2, 0.4,
 0.6, and 0.8 with duplicate cuts removed and unbounded tails, and fewer than four distinct
-development values yield no labels; bin labels are `LEFT_to_RIGHT` in the reference's
+development values yield no labels (a compiled projection of a `_micros` duration input,
+including the active-span quantile, first divides by the plan's recorded `input_divisor` of
+1000, so its edges and labels are the reference's millisecond values); bin labels are
+`LEFT_to_RIGHT` in the reference's
 six-significant-digit general format, and duplicate labels are an error rather than merged
 intervals. Labels rank by development count descending then text ascending, are limited to
 `max_labels`, and take zero-based signed 16-bit codes; a missing, unseen, out-of-range, or
@@ -644,7 +646,8 @@ writes two lines to standard output:
 followed by `[stream S fit S encode S publish S]` stage durations in seconds or by
 `(already published)`, then the reconstruction line below. `data verify` on a feature
 generation asserts every object's bytes and hashes, decodes the plan and checks its identity,
-instrument, profile, fit, and streams against the manifest, checks every table's columns,
+instrument, profile, fit, and streams against the manifest and the manifest's object set against
+the plan's, checks every table's columns,
 footer metadata, and row count against the plan and manifest and the rows' decision-time
 bounds, and writes
 `verified INSTRUMENT ROLE generation GENERATION rows R events E objects K bytes B`.

@@ -15,8 +15,8 @@ use std::path::{Path, PathBuf};
 use binary_alpha_engine::config::Config;
 use binary_alpha_engine::dataset::GenerationManifest;
 use binary_alpha_engine::features::{
-    FeatureEngine, FeatureManifest, FeatureOutput, FeaturePlan, Value, feature_generation_id,
-    raw_identity,
+    Exclusion, FeatureEngine, FeatureManifest, FeatureOutput, FeaturePlan, Value,
+    feature_generation_id, raw_identity,
 };
 use binary_alpha_engine::market::{Tick, format_event_time_micros};
 use binary_alpha_engine::stream::{Observation, Source, StreamManifest};
@@ -737,18 +737,28 @@ fn features_build_fits_publishes_reconstructs_freezes_and_isolates() {
         generation(&import(&scratch.config("import_eval.toml", &eval_source)).unwrap()[0]);
     assert_ne!(evaluation, development);
     let eval_manifest = scratch.path(&format!("published/manifests/{evaluation}/ready.json"));
+    // One configuration carries the fit and its frozen application: they share the profile and
+    // differ in role, so each owns its streams.
     let frozen = scratch.config(
         "frozen.toml",
         &format!(
-            "\n[[features.instruments]]\nrole = \"evaluation\"\ninput_manifest = \"{}\"\nprofile_manifest = \"{}\"\nfrozen_plan = \"{}\"\n",
+            "{}\n[[features.instruments]]\nrole = \"evaluation\"\ninput_manifest = \"{}\"\nprofile_manifest = \"{}\"\nfrozen_plan = \"{}\"\n",
+            feature_entry(
+                "development",
+                &dataset_manifest,
+                &stream_manifest,
+                TICK_SETTINGS
+            ),
             manifest_uri(&eval_manifest),
             manifest_uri(&stream_manifest),
             manifest_uri(&manifest_path)
         ),
     );
     let lines = build(&frozen).unwrap();
-    assert!(lines[0].contains(" evaluation generation "), "{}", lines[0]);
-    let applied_generation = generation(&lines[0]);
+    assert_eq!(lines.len(), 4, "{lines:?}");
+    assert!(lines[0].ends_with("(already published)"), "{}", lines[0]);
+    assert!(lines[2].contains(" evaluation generation "), "{}", lines[2]);
+    let applied_generation = generation(&lines[2]);
     assert_ne!(applied_generation, feature_generation);
     let applied = published_features(
         &scratch.path("published"),
@@ -1108,6 +1118,41 @@ fn bars_exclude_tick_outputs_with_their_reason_and_named_tick_requests_fail() {
         "rows do not depend on encodings"
     );
     assert_eq!(lines[1], verify(&unencoded_manifest).unwrap());
+    // The verifier requires the manifest's object set to equal the plan's: an encoded object on
+    // an unencoded plan, or a missing one on an encoded plan, is refused rather than skipped.
+    let tampered = scratch.path("tampered");
+    fs::create_dir_all(&tampered).unwrap();
+    std::os::unix::fs::symlink(scratch.path("published/objects"), tampered.join("objects"))
+        .unwrap();
+    let tamper = |source: &Path, edit: &dyn Fn(&mut Vec<serde_json::Value>)| -> String {
+        let mut json: serde_json::Value =
+            serde_json::from_slice(&fs::read(source).unwrap()).unwrap();
+        edit(json["objects"].as_array_mut().unwrap());
+        let target = tampered.join(source.strip_prefix(scratch.path("published")).unwrap());
+        fs::create_dir_all(target.parent().unwrap()).unwrap();
+        fs::write(&target, serde_json::to_vec(&json).unwrap()).unwrap();
+        verify(&target).unwrap_err()
+    };
+    let is_encoded =
+        |object: &serde_json::Value| object["path"].as_str().unwrap().starts_with("encoded/");
+    let encoded_record: serde_json::Value = serde_json::from_slice::<serde_json::Value>(
+        &fs::read(&manifest_path).unwrap(),
+    )
+    .unwrap()["objects"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|object| is_encoded(object))
+        .unwrap()
+        .clone();
+    let extra = tamper(&unencoded_manifest, &|objects| {
+        objects.push(encoded_record.clone());
+    });
+    assert!(extra.contains("object set"), "{extra}");
+    let missing = tamper(&manifest_path, &|objects| {
+        objects.retain(|object| !is_encoded(object));
+    });
+    assert!(missing.contains("object set"), "{missing}");
     // Any settings change is another raw identity and therefore another plan.
     let mut other = plan.settings.clone();
     other.rolling_window = Some(31);
@@ -1999,15 +2044,24 @@ fn governed_reference_parity() {
             (stream.duration_seconds, stream.offset_seconds),
             (reference.duration_seconds, reference.offset_seconds)
         );
-        // The reference configured no moving averages, so only the fixed 20/50 pair outputs are
-        // excluded, each with the missing period as its reason.
-        let excluded: Vec<&str> = stream
+        // The reference configured no moving averages, so the fixed 20/50 pair outputs are
+        // excluded on every stream with the missing period as their reason; the streams the
+        // reference left without a tick path (60 and 300 seconds) also exclude the eighteen
+        // path outputs and the one projection over them, naming the missing stream.
+        assert_eq!(
+            stream.tick_path,
+            reference.duration_seconds <= 30,
+            "the reference enabled paths on 5, 15, and 30 seconds"
+        );
+        let (path, other): (Vec<&Exclusion>, Vec<&Exclusion>) = stream
             .excluded
             .iter()
-            .map(|exclusion| exclusion.name.as_str())
-            .collect();
+            .partition(|exclusion| exclusion.name.starts_with("tick_path_"));
         assert_eq!(
-            excluded,
+            other
+                .iter()
+                .map(|exclusion| exclusion.name.as_str())
+                .collect::<Vec<_>>(),
             [
                 "ema20_minus_ema50_bps",
                 "is_ema20_above_ema50",
@@ -2017,16 +2071,17 @@ fn governed_reference_parity() {
             stream.excluded
         );
         assert!(
-            stream
-                .excluded
+            other
                 .iter()
                 .all(|exclusion| exclusion.reason.contains("moving-average period 20"))
         );
-        assert_eq!(
-            stream.tick_path,
-            reference.duration_seconds <= 30,
-            "the reference enabled paths on 5, 15, and 30 seconds"
-        );
+        assert_eq!(path.len(), if stream.tick_path { 0 } else { 19 });
+        assert!(path.iter().all(|exclusion| {
+            exclusion.reason.contains(&format!(
+                "stream {}s/{}s in tick_path_streams",
+                stream.duration_seconds, stream.offset_seconds
+            ))
+        }));
         let summary = &manifest.streams[index];
         assert_eq!(
             (
@@ -2124,9 +2179,9 @@ fn governed_reference_parity() {
         physical.len()
     );
 
-    // The whole-input in-process feed reproduces the published rows one by one, and every prefix
-    // is exactly what the full feed made known by its cutoff. Only known-at times are retained,
-    // so the test holds bounded state rather than every row.
+    // The whole-input in-process feed reproduces the published rows and events one by one, and
+    // every prefix is exactly what the full feed made known by its cutoff. Only known-at times
+    // are retained, so the test holds bounded state rather than every row.
     let ticks = read_normalized_ticks(&published_root, &input);
     assert_eq!(ticks.len() as u64, input.row_count);
     let object = |path: &str| {
@@ -2141,20 +2196,27 @@ fn governed_reference_parity() {
     };
     // Per stream: the known-at times of every emitted row, structure event, and sequence event.
     let run = |ticks: &[Tick]| -> Vec<[Vec<i64>; 3]> {
-        let mut published: Vec<_> = plan
+        // Per stream: the streamed rows, structure events, and sequence events tables.
+        let mut tables: Vec<Vec<_>> = plan
             .streams
             .iter()
-            .map(|stream| table_rows(&object(&stream.object_paths()[0])).1)
+            .map(|stream| {
+                stream.object_paths()[..3]
+                    .iter()
+                    .map(|path| table_rows(&object(path)))
+                    .collect()
+            })
             .collect();
         let mut known: Vec<[Vec<i64>; 3]> = vec![Default::default(); plan.streams.len()];
         let mut engine = FeatureEngine::new(plan, Source::from_manifest(&input)).unwrap();
         let mut out = FeatureOutput::default();
+        let int = |value: u64| Some(Value::Int(value as i64));
         for tick in ticks {
             engine.push(Observation::Tick(*tick), &mut out).unwrap();
             for (index, row) in out.rows.drain(..) {
                 assert_eq!(
                     Some(row.values),
-                    published[index].next(),
+                    tables[index][0].1.next(),
                     "{}s row {}",
                     plan.streams[index].duration_seconds,
                     known[index][0].len()
@@ -2162,9 +2224,57 @@ fn governed_reference_parity() {
                 known[index][0].push(row.known_at_micros);
             }
             for (index, event) in out.structure_events.drain(..) {
+                let (names, rows) = &mut tables[index][1];
+                let published = rows.next().expect("a published structure event");
+                let pick = |name: &str| value_of(&published, names, name).cloned();
+                assert_eq!(
+                    [
+                        pick("event_id"),
+                        pick("event_type"),
+                        pick("event_row"),
+                        pick("confirm_row"),
+                        pick("price_units"),
+                        pick("level_units"),
+                        pick("known_at_micros"),
+                    ],
+                    [
+                        int(event.event_id),
+                        Some(Value::Text(event.event_type.into())),
+                        int(event.event_row),
+                        int(event.confirm_row),
+                        Some(Value::Int(event.price_units)),
+                        Some(Value::Int(event.level_units)),
+                        Some(Value::Time(event.known_at_micros)),
+                    ],
+                    "{}s structure event {}",
+                    plan.streams[index].duration_seconds,
+                    known[index][1].len()
+                );
                 known[index][1].push(event.known_at_micros);
             }
             for (index, event) in out.sequence_events.drain(..) {
+                let (names, rows) = &mut tables[index][2];
+                let published = rows.next().expect("a published sequence event");
+                let pick = |name: &str| value_of(&published, names, name).cloned();
+                assert_eq!(
+                    [
+                        pick("event_id"),
+                        pick("row"),
+                        pick("swing_event_type"),
+                        pick("swing_price_units"),
+                        pick("known_at_micros"),
+                    ],
+                    [
+                        int(event.event_id),
+                        int(event.row),
+                        Some(Value::Text(event.swing_event_type.into())),
+                        Some(Value::Int(event.swing_price_units)),
+                        Some(Value::Time(event.known_at_micros)),
+                    ],
+                    "{}s sequence event {}",
+                    plan.streams[index].duration_seconds,
+                    known[index][2].len()
+                );
                 known[index][2].push(event.known_at_micros);
             }
         }

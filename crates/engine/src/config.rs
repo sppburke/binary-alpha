@@ -82,15 +82,6 @@ impl Config {
                 entry
                     .validate()
                     .map_err(|reason| format!("features.instruments[{index}].{reason}"))?;
-                if let Some(earlier) = features.instruments[..index]
-                    .iter()
-                    .position(|earlier| earlier.profile_manifest == entry.profile_manifest)
-                {
-                    return Err(format!(
-                        "features.instruments[{index}].profile_manifest: {} is already owned by features.instruments[{earlier}]; an instrument's streams have one owner",
-                        entry.profile_manifest
-                    ));
-                }
             }
         }
         let Some(import) = &self.import else {
@@ -1460,10 +1451,16 @@ mod feature_tests {
             "{}\n[[features.instruments]]\nrole = \"development\"\ninput_manifest = \"{INPUT}\"\nprofile_manifest = \"{PROFILE}\"\n",
             entry("")
         );
-        let error = Config::parse(&twice).unwrap_err().to_string();
-        assert!(
-            error.contains("features.instruments[1].profile_manifest"),
-            "{error}"
+        // One profile may serve several entries (a fit and its frozen applications); the
+        // resolved instrument, role, and streams have one owner, checked at build.
+        assert_eq!(
+            Config::parse(&twice)
+                .unwrap()
+                .features
+                .unwrap()
+                .instruments
+                .len(),
+            2
         );
         for uri in [
             "file:///p/manifests/abc/ready.json",
