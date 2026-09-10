@@ -68,24 +68,51 @@ impl Config {
                     field("role")
                 ));
             }
-            if let Source::BarParquetCollection {
-                manifest,
-                provenance,
-                ..
-            } = source
-            {
-                relative_path(&manifest.to_string_lossy())
-                    .map_err(|reason| format!("{}: {reason}", field("manifest")))?;
-                let provenance = provenance.as_deref().unwrap_or(&[]);
-                for (position, entry) in provenance.iter().enumerate() {
-                    relative_path(&entry.to_string_lossy())
-                        .map_err(|reason| format!("{}: {reason}", field("provenance")))?;
-                    if entry == manifest || provenance[..position].contains(entry) {
+            match source {
+                Source::TickCsv { .. } => {}
+                Source::BarParquetCollection {
+                    manifest,
+                    provenance,
+                    ..
+                } => {
+                    relative_path(&manifest.to_string_lossy())
+                        .map_err(|reason| format!("{}: {reason}", field("manifest")))?;
+                    let provenance = provenance.as_deref().unwrap_or(&[]);
+                    for (position, entry) in provenance.iter().enumerate() {
+                        relative_path(&entry.to_string_lossy())
+                            .map_err(|reason| format!("{}: {reason}", field("provenance")))?;
+                        if entry == manifest || provenance[..position].contains(entry) {
+                            return Err(format!(
+                                "{}: {} is listed twice",
+                                field("provenance"),
+                                entry.display()
+                            ));
+                        }
+                    }
+                }
+                Source::TickParquetDaily { instruments, .. } => {
+                    if instruments.is_empty() {
                         return Err(format!(
-                            "{}: {} is listed twice",
-                            field("provenance"),
-                            entry.display()
+                            "{}: at least one directory name is required",
+                            field("instruments")
                         ));
+                    }
+                    for (position, name) in instruments.iter().enumerate() {
+                        relative_path(name)
+                            .map_err(|reason| format!("{}: {reason}", field("instruments")))?;
+                        if name.contains('/') || name.bytes().any(|byte| byte.is_ascii_control()) {
+                            return Err(format!(
+                                "{}: `{}` must be one path component without a control character",
+                                field("instruments"),
+                                name.escape_default()
+                            ));
+                        }
+                        if instruments[..position].contains(name) {
+                            return Err(format!(
+                                "{}: {name} is listed twice",
+                                field("instruments")
+                            ));
+                        }
                     }
                 }
             }
@@ -299,25 +326,42 @@ pub enum Source {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         provenance: Option<Vec<PathBuf>>,
     },
+    /// One archive root holding, per listed directory, daily Parquet tick files and their
+    /// metadata.
+    #[serde(rename = "tick_parquet_daily")]
+    TickParquetDaily {
+        path: ConfigPath,
+        broker: BrokerId,
+        role: DatasetRole,
+        price_scale: PriceScale,
+        /// The directory names to import, each one path component.
+        instruments: Vec<String>,
+    },
 }
 
 impl Source {
     /// The declared file or collection root as written.
     pub fn path(&self) -> &Path {
         match self {
-            Self::TickCsv { path, .. } | Self::BarParquetCollection { path, .. } => path.as_path(),
+            Self::TickCsv { path, .. }
+            | Self::BarParquetCollection { path, .. }
+            | Self::TickParquetDaily { path, .. } => path.as_path(),
         }
     }
 
     pub fn broker(&self) -> &BrokerId {
         match self {
-            Self::TickCsv { broker, .. } | Self::BarParquetCollection { broker, .. } => broker,
+            Self::TickCsv { broker, .. }
+            | Self::BarParquetCollection { broker, .. }
+            | Self::TickParquetDaily { broker, .. } => broker,
         }
     }
 
     pub fn role(&self) -> DatasetRole {
         match self {
-            Self::TickCsv { role, .. } | Self::BarParquetCollection { role, .. } => *role,
+            Self::TickCsv { role, .. }
+            | Self::BarParquetCollection { role, .. }
+            | Self::TickParquetDaily { role, .. } => *role,
         }
     }
 }
@@ -341,7 +385,7 @@ mod tests {
 
     #[test]
     fn sources_round_trip_through_the_canonical_form() {
-        let source = "schema_version = 1\nrun_mode = \"research\"\n\n[storage]\nhistorical_data_dir = \"/data/historical\"\npublication_uri = \"file:///data/published\"\n\n[[import.sources]]\nkind = \"tick_csv\"\npath = \"ticks.csv\"\nbroker = \"pocket_option\"\nrole = \"development\"\nprovider_symbol = \"AEDCNY_otc\"\nsource_symbol = \"AEDCNY\"\nprice_scale = 6\n\n[[import.sources]]\nkind = \"bar_parquet_collection\"\npath = \"/data/bars\"\nbroker = \"pocket_option\"\nrole = \"evaluation\"\nmanifest = \"collection.json\"\nprovenance = [\"batch.json\"]\n".to_string();
+        let source = "schema_version = 1\nrun_mode = \"research\"\n\n[storage]\nhistorical_data_dir = \"/data/historical\"\npublication_uri = \"file:///data/published\"\n\n[[import.sources]]\nkind = \"tick_csv\"\npath = \"ticks.csv\"\nbroker = \"pocket_option\"\nrole = \"development\"\nprovider_symbol = \"AEDCNY_otc\"\nsource_symbol = \"AEDCNY\"\nprice_scale = 6\n\n[[import.sources]]\nkind = \"bar_parquet_collection\"\npath = \"/data/bars\"\nbroker = \"pocket_option\"\nrole = \"evaluation\"\nmanifest = \"collection.json\"\nprovenance = [\"batch.json\"]\n\n[[import.sources]]\nkind = \"tick_parquet_daily\"\npath = \"/data/deriv/ticks\"\nbroker = \"deriv\"\nrole = \"development\"\nprice_scale = 5\ninstruments = [\"AUDUSD\", \"USDJPY\"]\n".to_string();
         let config = Config::parse(&source).unwrap();
         assert_eq!(config.canonical_toml(), source);
         assert_eq!(
@@ -418,6 +462,27 @@ mod tests {
             ))
             .is_ok()
         );
+        let daily = |instruments: &str| {
+            format!(
+                "{research}\n[[import.sources]]\nkind = \"tick_parquet_daily\"\npath = \"/ticks\"\nbroker = \"deriv\"\nrole = \"development\"\nprice_scale = 5\ninstruments = {instruments}\n"
+            )
+        };
+        for instruments in [
+            "[]",
+            "[\"\"]",
+            "[\"..\"]",
+            "[\"a/b\"]",
+            "[\"/a\"]",
+            "[\"a\\tb\"]",
+            "[\"a\", \"a\"]",
+        ] {
+            let error = Config::parse(&daily(instruments)).unwrap_err().to_string();
+            assert!(
+                error.contains("import.sources[0].instruments"),
+                "{instruments}: {error}"
+            );
+        }
+        assert!(Config::parse(&daily("[\"AUDUSD\", \"USDJPY\"]")).is_ok());
     }
 
     #[test]

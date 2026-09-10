@@ -292,6 +292,144 @@ const NORMALIZED_TICKS: [(i64, i64); 4] = [
     (1_774_159_360_001_000, 1_914_290),
 ];
 
+/// The exact schema of one daily tick archive file.
+const DAILY_SCHEMA: &str = "message schema {
+  OPTIONAL INT64 datetime_utc (TIMESTAMP(NANOS,true));
+  OPTIONAL DOUBLE price;
+}
+";
+
+/// Unix seconds at 2025-08-11T00:00:00Z.
+const DAY_2025_08_11: i64 = 1_754_870_400;
+
+fn ns(seconds: i64) -> i64 {
+    seconds * 1_000_000_000
+}
+
+/// Writes one Snappy daily archive file of `(nanoseconds, price)` rows; `null_row` leaves both
+/// cells of that row null.
+fn write_daily_file(path: &Path, rows: &[(i64, f64)], null_row: Option<usize>) {
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let schema = Arc::new(parse_message_type(DAILY_SCHEMA).unwrap());
+    let properties = Arc::new(
+        WriterProperties::builder()
+            .set_compression(Compression::SNAPPY)
+            .build(),
+    );
+    let mut writer =
+        SerializedFileWriter::new(File::create(path).unwrap(), schema, properties).unwrap();
+    let mut group = writer.next_row_group().unwrap();
+    let present: Vec<&(i64, f64)> = rows
+        .iter()
+        .enumerate()
+        .filter(|(row, _)| Some(*row) != null_row)
+        .map(|(_, cells)| cells)
+        .collect();
+    let levels: Vec<i16> = (0..rows.len())
+        .map(|row| i16::from(Some(row) != null_row))
+        .collect();
+    let times: Vec<i64> = present.iter().map(|(nanos, _)| *nanos).collect();
+    let prices: Vec<f64> = present.iter().map(|(_, price)| *price).collect();
+    let mut column = group.next_column().unwrap().unwrap();
+    if let ColumnWriter::Int64ColumnWriter(typed) = column.untyped() {
+        typed.write_batch(&times, Some(&levels), None).unwrap();
+    }
+    column.close().unwrap();
+    let mut column = group.next_column().unwrap().unwrap();
+    if let ColumnWriter::DoubleColumnWriter(typed) = column.untyped() {
+        typed.write_batch(&prices, Some(&levels), None).unwrap();
+    }
+    column.close().unwrap();
+    group.close().unwrap();
+    writer.close().unwrap();
+}
+
+/// The metadata document of one archive day, with every field the observed archive records.
+fn daily_metadata(symbol: &str, date: &str, ticks: u64) -> String {
+    json!({
+        "symbol": symbol,
+        "date": date,
+        "calendar": "UTC",
+        "ticks": ticks,
+        "windows_requested": 96,
+        "windows_skipped_closed": 0,
+        "gaps": [],
+        "clipped_by_retention": false,
+        "clipped_by_now": false,
+        "market_closed": false,
+        "complete": true,
+        "written_at": "2026-08-10T07:18:42.882488+00:00"
+    })
+    .to_string()
+}
+
+/// Writes one listed directory: a metadata file per day and a Parquet file for each day with
+/// rows.
+fn write_daily_directory(dir: &Path, name: &str, symbol: &str, days: &[(&str, &[(i64, f64)])]) {
+    fs::create_dir_all(dir).unwrap();
+    for (date, rows) in days {
+        fs::write(
+            dir.join(format!("{name}_{date}_ticks.meta.json")),
+            daily_metadata(symbol, date, rows.len() as u64),
+        )
+        .unwrap();
+        if !rows.is_empty() {
+            write_daily_file(
+                &dir.join(format!("{name}_{date}_ticks.parquet")),
+                rows,
+                None,
+            );
+        }
+    }
+}
+
+/// A two-directory daily archive beside entries that are never inspected.
+fn daily_sources(scratch: &Scratch) {
+    let root = scratch.path("sources/deriv");
+    write_daily_directory(
+        &root.join("AUDUSD"),
+        "AUDUSD",
+        "frxAUDUSD",
+        &[
+            ("2025-08-10", &[]),
+            (
+                "2025-08-11",
+                &[
+                    (ns(DAY_2025_08_11), 0.65165),
+                    (ns(DAY_2025_08_11 + 1), 0.65166),
+                    (ns(DAY_2025_08_11 + 1), 0.65166),
+                    (ns(DAY_2025_08_11 + 86_399), 0.65135),
+                ],
+            ),
+            ("2025-08-12", &[(ns(DAY_2025_08_11 + 86_400), 0.6514)]),
+        ],
+    );
+    write_daily_directory(
+        &root.join("USDJPY"),
+        "USDJPY",
+        "frxUSDJPY",
+        &[(
+            "2025-08-11",
+            &[
+                (ns(DAY_2025_08_11), 158.424),
+                (ns(DAY_2025_08_11 + 2), 157.8),
+            ],
+        )],
+    );
+    fs::create_dir_all(root.join("EURUSD")).unwrap();
+    fs::write(root.join("EURUSD/junk.txt"), b"not a daily file").unwrap();
+    fs::write(root.join("README"), b"not a directory").unwrap();
+}
+
+/// The exact normalized rows of the `AUDUSD` directory: microseconds and units at scale five.
+const NORMALIZED_DAILY_TICKS: [(i64, i64); 5] = [
+    (1_754_870_400_000_000, 65_165),
+    (1_754_870_401_000_000, 65_166),
+    (1_754_870_401_000_000, 65_166),
+    (1_754_956_799_000_000, 65_135),
+    (1_754_956_800_000_000, 65_140),
+];
+
 /// A fresh scratch tree for one test.
 struct Scratch {
     root: PathBuf,
@@ -333,6 +471,10 @@ impl Scratch {
 
     fn bar_source(&self) -> String {
         "\n[[import.sources]]\nkind = \"bar_parquet_collection\"\npath = \"sources/bars\"\nbroker = \"pocket_option\"\nrole = \"evaluation\"\nmanifest = \"collection.json\"\n".to_string()
+    }
+
+    fn daily_source(&self) -> String {
+        "\n[[import.sources]]\nkind = \"tick_parquet_daily\"\npath = \"sources/deriv\"\nbroker = \"deriv\"\nrole = \"development\"\nprice_scale = 5\ninstruments = [\"AUDUSD\", \"USDJPY\"]\n".to_string()
     }
 
     fn objects(&self, store: &str) -> Vec<String> {
@@ -1254,6 +1396,373 @@ fn malformed_inputs_and_unsafe_layouts_are_rejected() {
             .unwrap_err()
             .contains("at least one entry")
     );
+}
+
+#[test]
+fn daily_tick_archives_publish_one_generation_per_listed_directory() {
+    let scratch = Scratch::new("daily");
+    daily_sources(&scratch);
+    let config = scratch.config("daily.toml", &scratch.daily_source());
+
+    let lines = import(&config).unwrap();
+    assert_eq!(lines.len(), 2, "{lines:?}");
+    assert!(
+        lines[0].starts_with("published deriv:frxAUDUSD development generation ")
+            && lines[0].contains(" rows 5 objects 6 reused 0 ["),
+        "{}",
+        lines[0]
+    );
+    assert!(
+        lines[1].starts_with("published deriv:frxUSDJPY development generation ")
+            && lines[1].contains(" rows 2 objects 3 reused 0 ["),
+        "{}",
+        lines[1]
+    );
+    let manifests = scratch.manifests("published");
+    assert_eq!(manifests.len(), 2);
+    let audusd = manifests
+        .iter()
+        .find(|path| manifest_json(path)["provider_symbol"] == "frxAUDUSD")
+        .unwrap();
+    let json = manifest_json(audusd);
+    assert_eq!(json["source_kind"], "tick_parquet_daily");
+    assert_eq!(json["instrument"], "deriv:frxAUDUSD");
+    assert_eq!(json["capabilities"], json!(["ticks"]));
+    assert_eq!(json["native_granularity"], json!({"kind": "tick"}));
+    assert_eq!(json["time_unit"], "microsecond");
+    assert_eq!(
+        json["price_representation"],
+        json!({"kind": "integer_units", "scale": 5})
+    );
+    assert!(json["interval"].is_null());
+    assert_eq!(json["row_count"], 5);
+    assert_eq!(
+        json["coverage"],
+        json!({"first_event_time": "2025-08-11T00:00:00.000000Z", "last_event_time": "2025-08-12T00:00:00.000000Z"})
+    );
+    let objects: Vec<(&str, &str)> = json["objects"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|object| {
+            (
+                object["role"].as_str().unwrap(),
+                object["path"].as_str().unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        objects,
+        [
+            ("source", "AUDUSD_2025-08-11_ticks.parquet"),
+            ("source", "AUDUSD_2025-08-12_ticks.parquet"),
+            ("provenance", "AUDUSD_2025-08-10_ticks.meta.json"),
+            ("provenance", "AUDUSD_2025-08-11_ticks.meta.json"),
+            ("provenance", "AUDUSD_2025-08-12_ticks.meta.json"),
+            ("normalized", "normalized/ticks.parquet"),
+        ],
+        "Parquet days first, then metadata, each in date order"
+    );
+    let inputs = json["inputs"].as_array().unwrap();
+    assert_eq!(inputs.len(), 5);
+    let first = scratch.path("sources/deriv/AUDUSD/AUDUSD_2025-08-11_ticks.parquet");
+    assert_eq!(inputs[0]["path"], first.to_str().unwrap());
+    assert_eq!(inputs[0]["sha256"], sha256(&first));
+    let text = fs::read_to_string(audusd).unwrap();
+    assert!(
+        !text.contains("EURUSD") && !text.contains("README"),
+        "unlisted root entries are never inventoried"
+    );
+    let normalized = scratch
+        .path("published")
+        .join(json["objects"][5]["key"].as_str().unwrap());
+    let reader = SerializedFileReader::new(File::open(&normalized).unwrap()).unwrap();
+    let pairs: Vec<(i64, i64)> = reader
+        .get_row_iter(None)
+        .unwrap()
+        .map(|row| {
+            let row = row.unwrap();
+            (
+                row.get_timestamp_micros(0).unwrap(),
+                row.get_long(1).unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        pairs, NORMALIZED_DAILY_TICKS,
+        "exact rows across days, duplicates kept in order"
+    );
+    let metadata = reader
+        .metadata()
+        .file_metadata()
+        .key_value_metadata()
+        .unwrap();
+    for (key, value) in [
+        ("broker", "deriv"),
+        ("provider_symbol", "frxAUDUSD"),
+        ("price_scale", "5"),
+    ] {
+        assert!(
+            metadata
+                .iter()
+                .any(|pair| pair.key == key && pair.value.as_deref() == Some(value)),
+            "{key}"
+        );
+    }
+
+    let again = import(&config).unwrap();
+    assert!(
+        again
+            .iter()
+            .all(|line| line.ends_with("(already published)")),
+        "{again:?}"
+    );
+    fs::remove_dir_all(scratch.path("sources")).unwrap();
+    for manifest in &manifests {
+        let json = manifest_json(manifest);
+        let objects = json["objects"].as_array().unwrap();
+        assert_eq!(
+            verify(manifest).unwrap(),
+            format!(
+                "verified {} development generation {} rows {} objects {} bytes {}",
+                json["instrument"].as_str().unwrap(),
+                json["generation"].as_str().unwrap(),
+                json["row_count"],
+                objects.len(),
+                objects
+                    .iter()
+                    .map(|object| object["bytes"].as_u64().unwrap())
+                    .sum::<u64>()
+            )
+        );
+        let mirror = scratch
+            .path("retained")
+            .join(manifest.strip_prefix(scratch.path("published")).unwrap());
+        assert!(
+            verify(&mirror).is_ok(),
+            "the retained mirror verifies alone"
+        );
+    }
+}
+
+#[test]
+fn daily_tick_archives_reject_malformed_days_and_layouts() {
+    let scratch = Scratch::new("daily_reject");
+    let config = scratch.config("daily.toml", &scratch.daily_source());
+    // Each case rebuilds the archive, applies one change, and expects the import to stop before
+    // any ready manifest exists.
+    type Change<'a> = &'a dyn Fn(&Path);
+    let rejected = |name: &str, change: Change| -> String {
+        let _ = fs::remove_dir_all(scratch.path("sources"));
+        daily_sources(&scratch);
+        change(&scratch.path("sources/deriv"));
+        let error = import(&config).unwrap_err();
+        assert!(
+            !scratch.path("published/manifests").exists(),
+            "{name}: nothing was published: {error}"
+        );
+        error
+    };
+    let day = |root: &Path, date: &str| root.join(format!("AUDUSD/AUDUSD_{date}_ticks"));
+    let parquet =
+        |root: &Path, date: &str| PathBuf::from(format!("{}.parquet", day(root, date).display()));
+    let metadata =
+        |root: &Path, date: &str| PathBuf::from(format!("{}.meta.json", day(root, date).display()));
+    let next_day = ns(DAY_2025_08_11 + 86_400);
+    type Rows<'a> = &'a [(i64, f64)];
+    let row_cases: [(&str, Rows, &str); 6] = [
+        (
+            "more fraction digits than the scale",
+            &[(next_day, 0.651_401)],
+            "more than the declared price_scale",
+        ),
+        (
+            "non-finite price",
+            &[(next_day, f64::NAN)],
+            "invalid decimal price",
+        ),
+        (
+            "sub-microsecond timestamp",
+            &[(next_day + 1, 0.6514)],
+            "not on a microsecond boundary",
+        ),
+        (
+            "row outside its calendar day",
+            &[(next_day - ns(1), 0.6514)],
+            "outside the file's calendar day",
+        ),
+        (
+            "backwards time within a daily file",
+            &[(next_day + ns(1), 0.6514), (next_day, 0.6514)],
+            "backwards time",
+        ),
+        (
+            "conflicting duplicate timestamps",
+            &[(next_day, 0.6514), (next_day, 0.6515)],
+            "conflicting prices",
+        ),
+    ];
+    for (name, rows, message) in row_cases {
+        let error = rejected(name, &|root| {
+            write_daily_file(&parquet(root, "2025-08-12"), rows, None);
+            fs::write(
+                metadata(root, "2025-08-12"),
+                daily_metadata("frxAUDUSD", "2025-08-12", rows.len() as u64),
+            )
+            .unwrap();
+        });
+        assert!(error.contains(message), "{name}: {error}");
+        if error.contains(" row ") {
+            assert!(
+                error.starts_with("AUDUSD_2025-08-12_ticks.parquet: "),
+                "a decoder rejection names the day file: {error}"
+            );
+        }
+    }
+    let metadata_cases: [(&str, &str, &str); 5] = [
+        (
+            "tick count differing from the rows",
+            "\"ticks\":1",
+            "\"ticks\":2",
+        ),
+        (
+            "date differing from the file name",
+            "\"date\":\"2025-08-12\"",
+            "\"date\":\"2025-08-13\"",
+        ),
+        (
+            "symbol differing within the directory",
+            "\"symbol\":\"frxAUDUSD\"",
+            "\"symbol\":\"frxEURUSD\"",
+        ),
+        (
+            "calendar other than UTC",
+            "\"calendar\":\"UTC\"",
+            "\"calendar\":\"Europe/London\"",
+        ),
+        ("negative tick count", "\"ticks\":1", "\"ticks\":-1"),
+    ];
+    let metadata_messages = [
+        "metadata records 2 ticks",
+        "expected `UTC` and `2025-08-12`",
+        "earlier days record `frxAUDUSD`",
+        "expected `UTC` and `2025-08-12`",
+        "is not a daily metadata file",
+    ];
+    for ((name, from, to), message) in metadata_cases.iter().zip(metadata_messages) {
+        let error = rejected(name, &|root| {
+            let path = metadata(root, "2025-08-12");
+            let text = fs::read_to_string(&path).unwrap();
+            assert!(text.contains(from), "{name}: {text}");
+            fs::write(&path, text.replace(from, to)).unwrap();
+        });
+        assert!(error.contains(message), "{name}: {error}");
+    }
+    let layout_cases: [(&str, Change, &str); 9] = [
+        (
+            "null cell",
+            &|root| write_daily_file(&parquet(root, "2025-08-12"), &[(next_day, 0.6514)], Some(0)),
+            "null value",
+        ),
+        (
+            "metadata-only day recording ticks",
+            &|root| {
+                fs::write(
+                    metadata(root, "2025-08-10"),
+                    daily_metadata("frxAUDUSD", "2025-08-10", 3),
+                )
+                .unwrap();
+            },
+            "records 3 ticks but the day has no Parquet file",
+        ),
+        (
+            "Parquet day without metadata",
+            &|root| fs::remove_file(metadata(root, "2025-08-12")).unwrap(),
+            "has no metadata file",
+        ),
+        (
+            "extra file",
+            &|root| fs::write(root.join("AUDUSD/notes.txt"), b"x").unwrap(),
+            "is not `AUDUSD_YYYY-MM-DD_ticks.parquet`",
+        ),
+        (
+            "invalid calendar date",
+            &|root| {
+                fs::write(
+                    metadata(root, "2025-02-30"),
+                    daily_metadata("frxAUDUSD", "2025-02-30", 0),
+                )
+                .unwrap();
+            },
+            "`2025-02-30` is not a calendar date",
+        ),
+        (
+            "nested directory",
+            &|root| fs::create_dir(root.join("AUDUSD/nested")).unwrap(),
+            "is not a regular file",
+        ),
+        (
+            "symbolic link",
+            &|root| {
+                std::os::unix::fs::symlink(
+                    parquet(root, "2025-08-11"),
+                    parquet(root, "2025-08-13"),
+                )
+                .unwrap();
+            },
+            "symbolic link",
+        ),
+        (
+            "listed directory without a Parquet file",
+            &|root| {
+                fs::remove_file(root.join("USDJPY/USDJPY_2025-08-11_ticks.parquet")).unwrap();
+                fs::write(
+                    root.join("USDJPY/USDJPY_2025-08-11_ticks.meta.json"),
+                    daily_metadata("frxUSDJPY", "2025-08-11", 0),
+                )
+                .unwrap();
+            },
+            "holds no daily Parquet file",
+        ),
+        (
+            "listed directory resolving outside the root",
+            &|root| {
+                let outside = root.parent().unwrap().join("elsewhere");
+                fs::rename(root.join("AUDUSD"), &outside).unwrap();
+                std::os::unix::fs::symlink(&outside, root.join("AUDUSD")).unwrap();
+            },
+            "outside the root",
+        ),
+    ];
+    for (name, change, message) in layout_cases {
+        let error = rejected(name, change);
+        assert!(error.contains(message), "{name}: {error}");
+    }
+
+    // A destination inside a listed directory, and a listed directory that does not exist.
+    let _ = fs::remove_dir_all(scratch.path("sources"));
+    daily_sources(&scratch);
+    let inside = scratch.config_with(
+        "inside.toml",
+        "sources/deriv/AUDUSD/retained",
+        &scratch.daily_source(),
+    );
+    assert!(
+        import(&inside)
+            .unwrap_err()
+            .contains("overlaps the historical-data folder")
+    );
+    assert!(
+        !scratch.path("sources/deriv/AUDUSD/retained").exists(),
+        "nothing was created before the check"
+    );
+    let missing = scratch.config(
+        "missing.toml",
+        &scratch
+            .daily_source()
+            .replace("\"USDJPY\"", "\"USDJPY\", \"GBPUSD\""),
+    );
+    assert!(import(&missing).unwrap_err().contains("cannot resolve"));
 }
 
 #[test]

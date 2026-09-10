@@ -115,8 +115,11 @@ rejected). Kind `tick_csv` names one native tick file and also declares `provide
 `source_symbol` (the symbol text every row must carry), and `price_scale` (`0` to `18`). Kind
 `bar_parquet_collection` names one collection root and also declares `manifest` (the collection
 manifest inside that root) and an optional `provenance` list of further files inside that root.
-`manifest` and `provenance` entries contain only normal path components. Broker and symbol values
-are non-empty and contain no ASCII control character. Duplicate source paths are rejected.
+Kind `tick_parquet_daily` names one daily tick archive root and also declares `price_scale` and
+`instruments`, a non-empty list of unique directory names beneath that root. `manifest` and
+`provenance` entries contain only normal path components; each `instruments` entry is one normal
+path component without an ASCII control character. Broker and symbol values are non-empty and
+contain no ASCII control character. Duplicate source paths are rejected.
 
 Every field is required and has no default, except that the `import` table and the `provenance`
 list may be absent. Any other field is rejected as unknown, so a raw secret value has no place to
@@ -192,7 +195,8 @@ provider symbol contain no ASCII control character.
 
 The ready manifest is pretty-printed JSON with two-space indentation, keys in the order below, and
 one trailing line feed. It records `schema_version` (`1`); `generation`; `broker`; `provider_symbol`;
-`instrument` (`BROKER:PROVIDER_SYMBOL`); `role`; `source_kind` (`tick_csv` or `bar_parquet`);
+`instrument` (`BROKER:PROVIDER_SYMBOL`); `role`; `source_kind` (`tick_csv`, `tick_parquet_daily`,
+or `bar_parquet`);
 `native_granularity` (`{"kind": "tick"}` or `{"kind": "bar", "period_seconds": N}`); `time_unit`
 (`microsecond` for ticks, `second` for bars); `price_representation`
 (`{"kind": "integer_units", "scale": N}` or `{"kind": "binary_float64"}`); `coverage` with
@@ -220,6 +224,29 @@ columns `event_time_micros` (`TIMESTAMP(MICROS, true)`) and `price_units`, and f
 byte-for-byte as the `source` object. No provider sequence, receipt sequence, or receipt time is
 fabricated.
 
+### Daily tick archive sources
+
+A daily tick archive root holds one directory per instrument, and `data import` opens only the
+listed directories. Each listed directory must resolve beneath the archive root, must neither
+contain nor lie inside either destination, and holds only regular files named
+`NAME_YYYY-MM-DD_ticks.parquet` and `NAME_YYYY-MM-DD_ticks.meta.json`, where `NAME` is the
+directory name and the date is a valid calendar date; any other file, nested directory, or symbolic
+link is rejected, and at least one Parquet file is required. Each metadata file is JSON whose
+`calendar` is `UTC`, whose `date` equals the date in its name, and whose `ticks` is a non-negative
+integer; every metadata file in the directory records the same `symbol`, which is the generation's
+provider symbol. A Parquet day requires its metadata file, whose `ticks` must equal the file's row
+count; a metadata-only day must record `ticks` `0`. Every Parquet file carries exactly the schema
+`datetime_utc` (`int64`, `TIMESTAMP(NANOS, true)`) and `price` (`double`), both optional. Per row:
+no nulls, a timestamp on a whole microsecond inside the file's calendar day, and a price whose
+shortest round-trip decimal rendering converts under the tick-source price rule at the declared
+`price_scale`. Rows keep their order, across days in date order, under the tick-source sequence
+rules. Parquet days are `source` objects and metadata files are `provenance` objects, each at its
+file name, in date order; metadata bytes parsed while planning must be the bytes retained. The
+normalized object, its file metadata, `time_unit`, price representation, and capabilities are
+exactly those of a tick source, the ready manifest records `source_kind` `tick_parquet_daily`,
+and `data verify` decodes the generation from its normalized object exactly as a `tick_csv`
+generation. Archive bytes are never re-encoded.
+
 ### Bar sources
 
 A collection manifest lists assets; each asset root lies inside the collection root and holds
@@ -246,7 +273,7 @@ bytes are never re-encoded. A bar generation provides only `bars`.
 
 `binary-alpha data import --config PATH` enumerates only the declared inventory, rejects a source
 inside the historical-data folder or a `file://` destination and either of those inside a listed
-asset root before it enumerates or writes anything, hashes every input, retains each input in the
+asset root or listed archive directory before it enumerates or writes anything, hashes every input, retains each input in the
 historical-data folder while checking that the copied bytes still carry that identity, validates and
 normalizes each dataset from its retained copy, creates each missing destination object with a
 generation-match-zero precondition while verifying the returned size and checksum, reuses an

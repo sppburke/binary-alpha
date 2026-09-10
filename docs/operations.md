@@ -39,8 +39,8 @@ bucket and prefix. A `file://` destination is the non-live test boundary, accept
 
 Import: configure the folder, the destination, and the explicit `import.sources` inventory, then run
 `binary-alpha data import --config PATH`. Sources may live anywhere outside the folder and the
-destination; nothing outside the declared inventory is opened. Source files are never moved, renamed,
-or rewritten. Every object is retained locally and published under the same content-addressed key;
+destination; nothing outside the declared inventory is opened, and a `tick_parquet_daily` source
+opens only its listed directories. Source files are never moved, renamed, or rewritten. Every object is retained locally and published under the same content-addressed key;
 the ready manifest is published last and mirrored locally. The command is resumable: re-running it
 after an interruption at any point reuses identical existing objects, finishes the missing ones, and
 completes the local mirror; different content at an existing key stops the command without replacing

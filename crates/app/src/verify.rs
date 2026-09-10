@@ -44,8 +44,10 @@ pub fn run(uri: &str) -> Result<String, String> {
         }
         let decode = matches!(
             (object.role, manifest.source_kind),
-            (ObjectRole::Normalized, SourceKind::TickCsv)
-                | (ObjectRole::Source, SourceKind::BarParquet)
+            (
+                ObjectRole::Normalized,
+                SourceKind::TickCsv | SourceKind::TickParquetDaily
+            ) | (ObjectRole::Source, SourceKind::BarParquet)
         );
         let scratch = match (decode, store.local_path(&object.key)) {
             (true, None) => Some(std::env::temp_dir().join(format!(
@@ -158,9 +160,11 @@ fn reconstruct(
         manifest.price_representation,
         manifest.native_granularity,
     ) {
-        (SourceKind::TickCsv, PriceRepresentation::IntegerUnits { scale }, _) => {
-            archive::read_ticks(path, scale)?
-        }
+        (
+            SourceKind::TickCsv | SourceKind::TickParquetDaily,
+            PriceRepresentation::IntegerUnits { scale },
+            _,
+        ) => archive::read_ticks(path, scale)?,
         (
             SourceKind::BarParquet,
             PriceRepresentation::BinaryFloat64,
