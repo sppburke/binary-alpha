@@ -19,6 +19,7 @@ min_basis_points = 5
 min_seconds = 5
 min_observations = 10
 [instruments.gap]
+reopen_seconds = 60
 max_seconds = 2
 [instruments.native_granularity]
 kind = "tick"

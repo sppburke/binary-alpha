@@ -58,7 +58,8 @@ historical-data folder, publishes them and the stream manifest last to `storage.
 and mirrors the manifest. It is resumable and idempotent the same way import is: rerunning it reuses
 identical objects and a committed manifest, and different content at an existing key stops it
 without replacing anything. A generation whose identity no instrument maps is an error; no
-instrument is ever defaulted. Verify a stream generation with the same `data verify` command.
+instrument is ever defaulted, and a holdout generation is refused. Verify a stream generation
+with the same `data verify` command.
 
 Rollout to Google Cloud Storage: discover and reuse existing projects, buckets, identities, and
 regions first; create nothing in a region whose name begins `us-west`; provision the bucket and a

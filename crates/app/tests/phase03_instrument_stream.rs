@@ -50,7 +50,7 @@ fn audit(config: &Path, manifest: &Path) -> Result<String, String> {
 /// The `[[instruments]]` entry the synthetic tests use, with the legacy-shaped checks.
 fn tick_instrument(symbol: &str, scale: u8) -> String {
     format!(
-        "\n[[instruments]]\nbroker = \"pocket_option\"\nprovider_symbol = \"{symbol}\"\nbase_currency = \"AED\"\nquote_currency = \"CNY\"\nprice_scale = {scale}\nnative_granularity = {{ kind = \"tick\" }}\ngap = {{ max_seconds = 2 }}\nfrozen = {{ min_observations = 3, min_seconds = 5 }}\njump = {{ min_basis_points = 5 }}\nspan = {{ min_percent = 75 }}\nsessions = [{{ name = \"week\", open_seconds = 0, close_seconds = 604800 }}]\ncandles = [{{ duration_seconds = 5, offset_seconds = 0, min_observations = 3, hard_min_observations = 2 }}, {{ duration_seconds = 15, offset_seconds = 5 }}]\n"
+        "\n[[instruments]]\nbroker = \"pocket_option\"\nprovider_symbol = \"{symbol}\"\nbase_currency = \"AED\"\nquote_currency = \"CNY\"\nprice_scale = {scale}\nnative_granularity = {{ kind = \"tick\" }}\ngap = {{ max_seconds = 2, reopen_seconds = 60 }}\nfrozen = {{ min_observations = 3, min_seconds = 5 }}\njump = {{ min_basis_points = 5 }}\nspan = {{ min_percent = 75 }}\nsessions = [{{ name = \"week\", open_seconds = 0, close_seconds = 604800 }}]\ncandles = [{{ duration_seconds = 5, offset_seconds = 0, min_observations = 3, hard_min_observations = 2 }}, {{ duration_seconds = 15, offset_seconds = 5 }}]\n"
     )
 }
 
@@ -59,7 +59,7 @@ fn bar_instrument(symbol: &str, scale: u8, base: Option<&str>) -> String {
         format!("base_currency = \"{base}\"\n")
     });
     format!(
-        "\n[[instruments]]\nbroker = \"pocket_option\"\nprovider_symbol = \"{symbol}\"\n{base}quote_currency = \"USD\"\nprice_scale = {scale}\nnative_granularity = {{ kind = \"bar\", period_seconds = 5 }}\ngap = {{ max_seconds = 2 }}\nfrozen = {{ min_observations = 3, min_seconds = 5 }}\njump = {{ min_basis_points = 5 }}\ncandles = [{{ duration_seconds = 15, offset_seconds = 5 }}]\n"
+        "\n[[instruments]]\nbroker = \"pocket_option\"\nprovider_symbol = \"{symbol}\"\n{base}quote_currency = \"USD\"\nprice_scale = {scale}\nnative_granularity = {{ kind = \"bar\", period_seconds = 5 }}\ngap = {{ max_seconds = 2, reopen_seconds = 60 }}\nfrozen = {{ min_observations = 3, min_seconds = 5 }}\njump = {{ min_basis_points = 5 }}\ncandles = [{{ duration_seconds = 15, offset_seconds = 5 }}]\n"
     )
 }
 
@@ -72,8 +72,8 @@ struct Row {
     counts: [i64; 2],
     volume: Option<f64>,
     gap_before: Option<i64>,
-    facts: [i64; 6],
-    flags: [bool; 11],
+    facts: [i64; 7],
+    flags: [bool; 12],
 }
 
 impl From<&Candle> for Row {
@@ -103,7 +103,8 @@ impl From<&Candle> for Row {
                 i64::from(candle.frozen_observations),
                 candle.frozen_micros,
                 i64::from(candle.max_jump_basis_points),
-                i64::from(candle.max_gap_jump_basis_points),
+                i64::from(candle.max_delayed_jump_basis_points),
+                i64::from(candle.max_reopen_jump_basis_points),
             ],
             flags: [
                 flags.low_activity,
@@ -113,7 +114,8 @@ impl From<&Candle> for Row {
                 flags.missing_before,
                 flags.frozen,
                 flags.jump,
-                flags.gap_jump,
+                flags.delayed_jump,
+                flags.reopen_jump,
                 flags.short_span,
                 flags.complete(),
                 flags.clean(),
@@ -137,8 +139,16 @@ fn read_rows(path: &Path) -> Vec<Row> {
                 counts: [long(10), long(11)],
                 volume: row.get_double(12).ok(),
                 gap_before: row.get_long(13).ok(),
-                facts: [long(14), long(15), long(16), long(17), long(18), long(19)],
-                flags: std::array::from_fn(|index| row.get_bool(20 + index).unwrap()),
+                facts: [
+                    long(14),
+                    long(15),
+                    long(16),
+                    long(17),
+                    long(18),
+                    long(19),
+                    long(20),
+                ],
+                flags: std::array::from_fn(|index| row.get_bool(21 + index).unwrap()),
             }
         })
         .collect()
@@ -283,7 +293,7 @@ fn audit_publishes_a_stream_generation_that_verifies_and_matches_a_direct_feed()
     assert_eq!(manifest.definition, instrument);
     assert_eq!(manifest.config_hash, parsed.content_hash());
     assert!(manifest.config_hash.starts_with("v3:sha256:"));
-    assert_eq!(manifest.code_revision, dataset.code_revision);
+    assert_eq!(manifest.code_revision, env!("BINARY_ALPHA_CODE_REVISION"));
     assert_eq!(manifest.source_generation, dataset.generation);
     assert_eq!(manifest.observations, 14);
     assert_eq!(
@@ -360,8 +370,8 @@ fn audit_publishes_a_stream_generation_that_verifies_and_matches_a_direct_feed()
     assert_eq!(first.gap_before, None);
     assert_eq!(first.facts[2], 3, "three records at one price");
     assert!(first.flags[5], "frozen at three records");
-    assert!(first.flags[8], "0.218 seconds of five is a short span");
-    assert!(first.flags[9] && !first.flags[10]);
+    assert!(first.flags[9], "0.218 seconds of five is a short span");
+    assert!(first.flags[10] && !first.flags[11]);
     let second = &five[1];
     assert_eq!(
         second.times[0],
@@ -381,21 +391,23 @@ fn audit_publishes_a_stream_generation_that_verifies_and_matches_a_direct_feed()
     assert_eq!(profile.gaps.as_ref().unwrap().count, 4);
     let jumps = profile.jumps.as_ref().unwrap();
     assert_eq!(
-        (jumps.flagged, jumps.flagged_after_gap),
-        (1, 1),
-        "one true jump, one reopen jump"
+        (jumps.flagged, jumps.flagged_delayed, jumps.flagged_reopen),
+        (1, 1, 0),
+        "one contiguous jump, one after a twenty-second delay"
     );
-    let reopened = &five[3];
-    assert_eq!(reopened.gap_before, Some(20_001_000));
+    let delayed = &five[3];
+    assert_eq!(delayed.gap_before, Some(20_001_000));
     assert_eq!(
-        reopened.facts[5], 5,
+        delayed.facts[5], 5,
         "1.80902 to 1.81000 after a gap is 5.4 basis points"
     );
-    assert!(reopened.flags[2] && reopened.flags[7] && !reopened.flags[6]);
+    assert_eq!(delayed.facts[6], 0, "no reopen move");
+    assert!(delayed.flags[2] && delayed.flags[7] && !delayed.flags[6] && !delayed.flags[8]);
     assert!(
-        !reopened.flags[9],
+        !delayed.flags[10],
         "a gap before the candle makes it incomplete"
     );
+    assert_eq!(profile.prices.moves, 5, "moves between consecutive ticks");
     assert_eq!(
         profile.prices.step_units,
         Some(10),
@@ -564,6 +576,27 @@ fn audit_binds_only_a_configured_matching_instrument() {
             .contains(" candles 1 objects 2 ")
     );
 
+    // A holdout generation is refused before any object is read: the same objects under a
+    // manifest that records the holdout role, whose identity the role changes.
+    let mut holdout = GenerationManifest::from_json(&fs::read(&euro).unwrap()).unwrap();
+    holdout.role = binary_alpha_engine::dataset::DatasetRole::Holdout;
+    holdout.generation = binary_alpha_engine::dataset::generation_id(
+        &binary_alpha_engine::market::InstrumentId {
+            broker: holdout.broker.clone(),
+            provider_symbol: holdout.provider_symbol.clone(),
+        },
+        holdout.source_kind,
+        holdout.role,
+        None,
+        &holdout.objects,
+    );
+    let holdout_path = scratch.path("published").join(holdout.key());
+    fs::create_dir_all(holdout_path.parent().unwrap()).unwrap();
+    fs::write(&holdout_path, holdout.to_json()).unwrap();
+    let error = audit(&mismatched, &holdout_path).unwrap_err();
+    assert!(error.contains("holdout generation"), "{error}");
+    assert_eq!(stream_manifests(&scratch, "published").len(), 1);
+
     // A stream manifest is not an audit input.
     let error = audit(&mismatched, manifest_path).unwrap_err();
     assert!(
@@ -588,6 +621,8 @@ struct GovernedConfig {
     legacy_candles: Vec<LegacyCandles>,
     /// Three Phase 02 bar ready manifests selected from the collection manifest.
     bar_manifests: Vec<BarCase>,
+    /// The recorded selection evidence.
+    selection: String,
 }
 
 #[derive(serde::Deserialize)]
@@ -678,7 +713,8 @@ struct LegacyRow {
     missing_buckets: i64,
     same_price_run: [i64; 2],
     true_jump_bps: f64,
-    flags: [bool; 11],
+    reopen_jump_bps: f64,
+    flags: [bool; 12],
     eligible: bool,
 }
 
@@ -714,6 +750,7 @@ fn legacy_rows(path: &Path, scale: PriceScale) -> Vec<LegacyRow> {
         "has_gap_reopen_jump",
         "complete",
         "has_gap",
+        "max_gap_reopen_jump_bps",
     ]
     .iter()
     .map(|name| column(name))
@@ -745,7 +782,8 @@ fn legacy_rows(path: &Path, scale: PriceScale) -> Vec<LegacyRow> {
             let missing = int(12) > 0;
             let frozen = flag(20);
             let jump = flag(21);
-            let gap_jump = flag(22) || flag(23);
+            let delayed_jump = flag(22);
+            let reopen_jump = flag(23);
             let short_span = int(4) < (timeframe(field(0), field(1)) * 1_000 * 75) / 100;
             let complete = flag(24);
             let eligible = complete
@@ -757,7 +795,8 @@ fn legacy_rows(path: &Path, scale: PriceScale) -> Vec<LegacyRow> {
                 && !missing
                 && !frozen
                 && !jump
-                && !gap_jump
+                && !delayed_jump
+                && !reopen_jump
                 && !short_span;
             LegacyRow {
                 times: [micros(0), micros(1), micros(2), micros(3), int(4) * 1_000],
@@ -768,9 +807,20 @@ fn legacy_rows(path: &Path, scale: PriceScale) -> Vec<LegacyRow> {
                 missing_buckets: int(12),
                 same_price_run: [int(13), int(14) * 1_000],
                 true_jump_bps: field(15).parse().unwrap(),
+                reopen_jump_bps: field(26).parse().unwrap(),
                 flags: [
-                    low, hard_low, gap_before, gap_inside, missing, frozen, jump, gap_jump,
-                    short_span, complete, eligible,
+                    low,
+                    hard_low,
+                    gap_before,
+                    gap_inside,
+                    missing,
+                    frozen,
+                    jump,
+                    delayed_jump,
+                    reopen_jump,
+                    short_span,
+                    complete,
+                    eligible,
                 ],
                 eligible,
             }
@@ -834,25 +884,84 @@ fn assert_parity(target: &[Row], legacy: &[LegacyRow], label: &str) -> usize {
             row.flags, reference.flags
         );
         assert_eq!(
-            row.flags[10], reference.eligible,
+            row.flags[11], reference.eligible,
             "{context}: strict eligibility"
         );
         // Continuous diagnostic: the legacy value is binary floating point rendered to six
         // decimals; the target floors the exact ratio. A difference of one whole basis point at
         // an integer boundary is the documented tolerance and never changes the flag above.
-        let floored = reference.true_jump_bps.floor() as i64;
-        if floored != row.facts[4] {
-            assert_eq!(
-                (floored - row.facts[4]).abs(),
-                1,
-                "{context}: true jump {} vs {}",
-                reference.true_jump_bps,
-                row.facts[4]
-            );
-            boundary += 1;
+        for (name, legacy, target) in [
+            ("true jump", reference.true_jump_bps, row.facts[4]),
+            ("reopen jump", reference.reopen_jump_bps, row.facts[6]),
+        ] {
+            let floored = legacy.floor() as i64;
+            if floored != target {
+                assert_eq!(
+                    (floored - target).abs(),
+                    1,
+                    "{context}: {name} {legacy} vs {target}"
+                );
+                boundary += 1;
+            }
         }
     }
     boundary
+}
+
+/// Every profile fact whose window has closed, recomputed independently from the records and
+/// the finalized candles: a longer input can only extend these, never revise them.
+fn assert_closed_window_facts(
+    profile: &InstrumentProfile,
+    ticks: &[Tick],
+    candles: &[(usize, Candle)],
+) {
+    assert_eq!(profile.observations, ticks.len() as u64);
+    let pairs = ticks.windows(2);
+    assert_eq!(
+        profile.duplicates,
+        pairs.clone().filter(|pair| pair[0] == pair[1]).count() as u64
+    );
+    let deltas: Vec<i64> = pairs
+        .map(|pair| pair[1].event_time_micros - pair[0].event_time_micros)
+        .collect();
+    let gaps = profile.gaps.as_ref().unwrap();
+    let over: Vec<i64> = deltas
+        .iter()
+        .copied()
+        .filter(|delta| *delta > 2_000_000)
+        .collect();
+    assert_eq!(gaps.count, over.len() as u64);
+    assert_eq!(gaps.max_micros, over.iter().copied().max().unwrap_or(0));
+    assert_eq!(gaps.total_micros, over.iter().sum::<i64>());
+    assert_eq!(profile.cadence.total(), deltas.len() as u64);
+    assert_eq!(
+        profile.jumps.as_ref().unwrap().basis_points.total(),
+        deltas.len() as u64
+    );
+    for (index, facts) in profile.streams.iter().enumerate() {
+        let rows: Vec<&Candle> = candles
+            .iter()
+            .filter(|(stream, _)| *stream == index)
+            .map(|(_, candle)| candle)
+            .collect();
+        assert_eq!(facts.finalized, rows.len() as u64);
+        assert_eq!(facts.activity.total(), rows.len() as u64);
+        let count =
+            |select: fn(&Candle) -> bool| rows.iter().filter(|row| select(row)).count() as u64;
+        assert_eq!(facts.flagged.clean, count(|row| row.flags.clean()));
+        assert_eq!(facts.flagged.complete, count(|row| row.flags.complete()));
+        assert_eq!(facts.flagged.gap_before, count(|row| row.flags.gap_before));
+        assert_eq!(facts.flagged.frozen, count(|row| row.flags.frozen));
+        assert_eq!(facts.flagged.jump, count(|row| row.flags.jump));
+        assert_eq!(
+            facts.flagged.reopen_jump,
+            count(|row| row.flags.reopen_jump)
+        );
+        assert_eq!(
+            facts.flagged.low_activity,
+            count(|row| row.flags.low_activity)
+        );
+    }
 }
 
 fn in_process_peak_kb() -> u64 {
@@ -890,7 +999,7 @@ fn governed_fixture_proof() {
         .collect::<Vec<_>>()
         .join(", ");
     let mut instruments = format!(
-        "\n[[instruments]]\nbroker = \"{}\"\nprovider_symbol = \"{}\"\nbase_currency = \"AED\"\nquote_currency = \"CNY\"\nprice_scale = 6\nnative_granularity = {{ kind = \"tick\" }}\ngap = {{ max_seconds = 2 }}\nfrozen = {{ min_observations = 10, min_seconds = 5 }}\njump = {{ min_basis_points = 5 }}\nspan = {{ min_percent = 75 }}\nsessions = [{{ name = \"week\", open_seconds = 0, close_seconds = 604800 }}]\ncandles = [{candles}]\n",
+        "\n[[instruments]]\nbroker = \"{}\"\nprovider_symbol = \"{}\"\nbase_currency = \"AED\"\nquote_currency = \"CNY\"\nprice_scale = 6\nnative_granularity = {{ kind = \"tick\" }}\ngap = {{ max_seconds = 2, reopen_seconds = 60 }}\nfrozen = {{ min_observations = 10, min_seconds = 5 }}\njump = {{ min_basis_points = 5 }}\nspan = {{ min_percent = 75 }}\nsessions = [{{ name = \"week\", open_seconds = 0, close_seconds = 604800 }}]\ncandles = [{candles}]\n",
         dataset.broker, dataset.provider_symbol
     );
     let bar_datasets: Vec<GenerationManifest> = governed
@@ -905,7 +1014,7 @@ fn governed_fixture_proof() {
             format!("base_currency = \"{base}\"\n")
         });
         instruments.push_str(&format!(
-            "\n[[instruments]]\nbroker = \"{}\"\nprovider_symbol = \"{}\"\n{base}quote_currency = \"{}\"\nprice_scale = {}\nnative_granularity = {{ kind = \"bar\", period_seconds = 5 }}\ngap = {{ max_seconds = 2 }}\nfrozen = {{ min_observations = 10, min_seconds = 5 }}\njump = {{ min_basis_points = 5 }}\nspan = {{ min_percent = 75 }}\nsessions = [{{ name = \"week\", open_seconds = 0, close_seconds = 604800 }}]\ncandles = [{}]\n",
+            "\n[[instruments]]\nbroker = \"{}\"\nprovider_symbol = \"{}\"\n{base}quote_currency = \"{}\"\nprice_scale = {}\nnative_granularity = {{ kind = \"bar\", period_seconds = 5 }}\ngap = {{ max_seconds = 2, reopen_seconds = 60 }}\nfrozen = {{ min_observations = 10, min_seconds = 5 }}\njump = {{ min_basis_points = 5 }}\nspan = {{ min_percent = 75 }}\nsessions = [{{ name = \"week\", open_seconds = 0, close_seconds = 604800 }}]\ncandles = [{}]\n",
             manifest.broker,
             manifest.provider_symbol,
             case.quote_currency,
@@ -942,7 +1051,7 @@ fn governed_fixture_proof() {
     let manifest = &published.manifest;
     assert_eq!(manifest.definition, instrument);
     assert_eq!(manifest.config_hash, parsed.content_hash());
-    assert_eq!(manifest.code_revision, dataset.code_revision);
+    assert_eq!(manifest.code_revision, env!("BINARY_ALPHA_CODE_REVISION"));
     assert_eq!(manifest.source_generation, dataset.generation);
     assert_eq!(manifest.observations, dataset.row_count);
     assert_eq!(manifest.coverage.as_ref().unwrap(), &dataset.coverage);
@@ -1026,25 +1135,16 @@ fn governed_fixture_proof() {
         assert_eq!(out, direct, "chunk size {chunk}");
         assert_eq!(stream.profile(), profile, "chunk size {chunk}");
     }
+    assert_closed_window_facts(&profile, &ticks, &direct);
     for percent in [25, 50, 75] {
         let cut = ticks.len() * percent / 100;
         let (prefix, prefix_profile) = feed(&instrument, &dataset, &ticks[..cut]);
         assert_eq!(prefix, direct[..prefix.len()], "{percent} percent");
+        assert_closed_window_facts(&prefix_profile, &ticks[..cut], &prefix);
         assert_eq!(
             prefix_profile.coverage.as_ref().unwrap().first_event_time,
             profile.coverage.as_ref().unwrap().first_event_time
         );
-        assert!(
-            prefix_profile.gaps.as_ref().unwrap().count <= profile.gaps.as_ref().unwrap().count
-        );
-        assert!(
-            prefix_profile.frozen_runs.as_ref().unwrap().count
-                <= profile.frozen_runs.as_ref().unwrap().count
-        );
-        assert!(prefix_profile.duplicates <= profile.duplicates);
-        for (short, long) in prefix_profile.streams.iter().zip(&profile.streams) {
-            assert!(short.finalized <= long.finalized && short.flagged.clean <= long.flagged.clean);
-        }
         println!(
             "stable prefix {percent} percent: {} finalized candles are a prefix of the full output",
             prefix.len()
@@ -1115,20 +1215,22 @@ fn governed_fixture_proof() {
                 ))
                 .collect::<Vec<_>>()
         );
-        steps.push((
-            case.base_currency.is_some(),
-            case.price_scale,
+        assert_eq!(
             profile.prices.step_units,
-        ));
+            Some(1),
+            "the observed price step is one unit at the configured scale, so the configured scale is the observed one"
+        );
+        steps.push((case.base_currency.is_some(), case.price_scale));
     }
-    let currencies: Vec<_> = steps.iter().filter(|(currency, _, _)| *currency).collect();
+    println!("bar selection evidence: {}", governed.selection);
+    let currencies: Vec<_> = steps.iter().filter(|(currency, _)| *currency).collect();
     assert_eq!(currencies.len(), 2, "two currency instruments");
     assert_ne!(
         currencies[0].1, currencies[1].1,
-        "different configured price scales"
+        "different observed price scales"
     );
     assert_eq!(
-        steps.iter().filter(|(currency, _, _)| !*currency).count(),
+        steps.iter().filter(|(currency, _)| !*currency).count(),
         1,
         "one non-currency instrument"
     );

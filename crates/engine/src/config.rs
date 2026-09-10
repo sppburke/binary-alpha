@@ -429,11 +429,13 @@ pub struct Instrument {
     pub candles: Vec<CandleSpec>,
 }
 
-/// Inter-arrival times longer than `max_seconds` are gaps.
+/// Inter-arrival times longer than `max_seconds` are gaps; a move after a gap of at least
+/// `reopen_seconds` is a reopen move rather than a delayed one.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct GapCheck {
     pub max_seconds: u32,
+    pub reopen_seconds: u32,
 }
 
 /// A run of one unchanged price is frozen at `min_observations` records or `min_seconds`.
@@ -532,6 +534,14 @@ impl Instrument {
                     candle.offset_seconds
                 ));
             }
+        }
+        if let Some(gap) = &self.gap
+            && gap.reopen_seconds <= gap.max_seconds
+        {
+            return Err(format!(
+                "gap.reopen_seconds: {} must exceed max_seconds {}",
+                gap.reopen_seconds, gap.max_seconds
+            ));
         }
         if let Some(span) = &self.span
             && span.min_percent > 100
@@ -754,7 +764,7 @@ mod instrument_tests {
     #[test]
     fn instruments_round_trip_through_the_canonical_form() {
         let source = format!(
-            "{HEAD}\n[[instruments]]\nbroker = \"pocket_option\"\nprovider_symbol = \"AEDCNY_otc\"\nbase_currency = \"AED\"\nquote_currency = \"CNY\"\nprice_scale = 6\n\n[instruments.native_granularity]\nkind = \"tick\"\n\n[instruments.gap]\nmax_seconds = 2\n\n[instruments.frozen]\nmin_observations = 10\nmin_seconds = 5\n\n[instruments.jump]\nmin_basis_points = 5\n\n[instruments.span]\nmin_percent = 75\n\n[[instruments.sessions]]\nname = \"week\"\nopen_seconds = 0\nclose_seconds = 604800\n\n[[instruments.candles]]\nduration_seconds = 5\noffset_seconds = 0\nmin_observations = 9\nhard_min_observations = 5\n\n[[instruments.candles]]\nduration_seconds = 15\noffset_seconds = 5\n\n[[instruments]]\nbroker = \"pocket_option\"\nprovider_symbol = \"#AAPL\"\nquote_currency = \"USD\"\nprice_scale = 2\n\n[instruments.native_granularity]\nkind = \"bar\"\nperiod_seconds = 5\n\n[[instruments.candles]]\nduration_seconds = 15\noffset_seconds = 5\n"
+            "{HEAD}\n[[instruments]]\nbroker = \"pocket_option\"\nprovider_symbol = \"AEDCNY_otc\"\nbase_currency = \"AED\"\nquote_currency = \"CNY\"\nprice_scale = 6\n\n[instruments.native_granularity]\nkind = \"tick\"\n\n[instruments.gap]\nmax_seconds = 2\nreopen_seconds = 60\n\n[instruments.frozen]\nmin_observations = 10\nmin_seconds = 5\n\n[instruments.jump]\nmin_basis_points = 5\n\n[instruments.span]\nmin_percent = 75\n\n[[instruments.sessions]]\nname = \"week\"\nopen_seconds = 0\nclose_seconds = 604800\n\n[[instruments.candles]]\nduration_seconds = 5\noffset_seconds = 0\nmin_observations = 9\nhard_min_observations = 5\n\n[[instruments.candles]]\nduration_seconds = 15\noffset_seconds = 5\n\n[[instruments]]\nbroker = \"pocket_option\"\nprovider_symbol = \"#AAPL\"\nquote_currency = \"USD\"\nprice_scale = 2\n\n[instruments.native_granularity]\nkind = \"bar\"\nperiod_seconds = 5\n\n[[instruments.candles]]\nduration_seconds = 15\noffset_seconds = 5\n"
         );
         let config = Config::parse(&source).unwrap();
         assert_eq!(config.canonical_toml(), source);
@@ -765,8 +775,8 @@ mod instrument_tests {
                 "native_granularity = { kind = \"tick\" }\n",
             )
             .replace(
-                "\n[instruments.gap]\nmax_seconds = 2\n",
-                "gap = { max_seconds = 2 }\n",
+                "\n[instruments.gap]\nmax_seconds = 2\nreopen_seconds = 60\n",
+                "gap = { max_seconds = 2, reopen_seconds = 60 }\n",
             );
         assert_eq!(Config::parse(&inline).unwrap(), config);
         let id = InstrumentId {
@@ -833,6 +843,18 @@ mod instrument_tests {
             (
                 format!("{tick}span = {{ min_percent = 101 }}\ncandles = [{{ duration_seconds = 5, offset_seconds = 0 }}]\n"),
                 "instruments[0].span.min_percent",
+            ),
+            (
+                format!("{tick}gap = {{ max_seconds = 60, reopen_seconds = 60 }}\ncandles = [{{ duration_seconds = 5, offset_seconds = 0 }}]\n"),
+                "instruments[0].gap.reopen_seconds",
+            ),
+            (
+                "native_granularity = { kind = \"tick\", unexpected = 1 }\ncandles = [{ duration_seconds = 5, offset_seconds = 0 }]\n".to_string(),
+                "unexpected",
+            ),
+            (
+                "native_granularity = { kind = \"bar\", period_seconds = 5, unexpected = 1 }\ncandles = [{ duration_seconds = 5, offset_seconds = 0 }]\n".to_string(),
+                "unexpected",
             ),
             (
                 format!("{tick}sessions = []\ncandles = [{{ duration_seconds = 5, offset_seconds = 0 }}]\n"),

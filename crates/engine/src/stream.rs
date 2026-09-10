@@ -194,11 +194,13 @@ pub struct Candle {
     /// The longest run of consecutive records showing one unchanged price inside the candle.
     pub frozen_observations: u32,
     pub frozen_micros: i64,
-    /// `floor(10000 * |move| / |previous price|)` over every consecutive price pair that enters
-    /// or lies inside the candle without a gap before it, saturated at `u32::MAX`.
+    /// `floor(10000 * |move| / |previous price|)` over every move between consecutive records
+    /// that enters or lies inside the candle, saturated at `u32::MAX`, by the inter-arrival
+    /// context of the move: contiguous, delayed (over the gap but under the reopen threshold),
+    /// and reopen. A move after a zero price is undefined and skipped.
     pub max_jump_basis_points: u32,
-    /// The same measure over the pairs that follow a gap.
-    pub max_gap_jump_basis_points: u32,
+    pub max_delayed_jump_basis_points: u32,
+    pub max_reopen_jump_basis_points: u32,
     pub flags: Flags,
 }
 
@@ -214,7 +216,8 @@ pub struct Flags {
     pub missing_before: bool,
     pub frozen: bool,
     pub jump: bool,
-    pub gap_jump: bool,
+    pub delayed_jump: bool,
+    pub reopen_jump: bool,
     pub short_span: bool,
 }
 
@@ -225,7 +228,12 @@ impl Flags {
 
     pub fn clean(self) -> bool {
         self.complete()
-            && !(self.low_activity || self.frozen || self.jump || self.gap_jump || self.short_span)
+            && !(self.low_activity
+                || self.frozen
+                || self.jump
+                || self.delayed_jump
+                || self.reopen_jump
+                || self.short_span)
     }
 }
 
@@ -328,13 +336,14 @@ pub struct FrozenFacts {
     pub max_micros: i64,
 }
 
-/// Relative moves between consecutive prices, in whole basis points by bit length, and how
-/// many reached the configured jump with and without a gap before them.
+/// Relative moves between consecutive records, in whole basis points by bit length, and how
+/// many reached the configured jump in each inter-arrival context.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize, Serialize)]
 pub struct JumpFacts {
     pub basis_points: Histogram,
     pub flagged: u64,
-    pub flagged_after_gap: u64,
+    pub flagged_delayed: u64,
+    pub flagged_reopen: u64,
 }
 
 /// Records inside each configured weekly window and outside every window.
@@ -360,7 +369,8 @@ pub struct FlagCounts {
     pub missing_before: u64,
     pub frozen: u64,
     pub jump: u64,
-    pub gap_jump: u64,
+    pub delayed_jump: u64,
+    pub reopen_jump: u64,
     pub short_span: u64,
     pub complete: u64,
     pub clean: u64,
@@ -395,7 +405,7 @@ pub struct InstrumentProfile {
     pub observations: u64,
     pub duplicates: u64,
     pub coverage: Option<Coverage>,
-    /// Inter-arrival micros between consecutive records, by bit length.
+    /// Event-time micros between consecutive records, by bit length.
     pub cadence: Histogram,
     pub prices: PriceFacts,
     pub gaps: Option<GapFacts>,
@@ -482,8 +492,7 @@ struct Working {
     run: Option<Run>,
     frozen_observations: u32,
     frozen_micros: i64,
-    max_jump_basis_points: u32,
-    max_gap_jump_basis_points: u32,
+    max_jump: [u32; 3],
     duplicates: u32,
 }
 
@@ -518,7 +527,8 @@ impl CandleStream {
 /// The thresholds of the enabled checks, in the stream's units.
 #[derive(Debug, Clone, Copy)]
 struct Checks {
-    gap_micros: Option<i64>,
+    /// The gap and reopen thresholds.
+    gap_micros: Option<(i64, i64)>,
     frozen: Option<(u32, i64)>,
     jump_basis_points: Option<u32>,
     span_percent: Option<u8>,
@@ -598,7 +608,10 @@ impl InstrumentStream {
             .collect();
         let seconds = |value: u32| i64::from(value) * MICROS_PER_SECOND;
         let checks = Checks {
-            gap_micros: instrument.gap.as_ref().map(|gap| seconds(gap.max_seconds)),
+            gap_micros: instrument
+                .gap
+                .as_ref()
+                .map(|gap| (seconds(gap.max_seconds), seconds(gap.reopen_seconds))),
             frozen: instrument
                 .frozen
                 .as_ref()
@@ -660,14 +673,6 @@ impl InstrumentStream {
         })
     }
 
-    pub fn instrument(&self) -> &Instrument {
-        &self.instrument
-    }
-
-    pub fn source(&self) -> &Source {
-        &self.source
-    }
-
     /// Accepts the next record in event-time order and appends every candle it finalizes, as
     /// `(stream index, candle)` in configuration order, to `out`. A refused record leaves the
     /// state unchanged.
@@ -717,27 +722,27 @@ impl InstrumentStream {
         }
         self.observations += 1;
         self.first_event.get_or_insert(record.event);
-        if let Some(delta) = delta {
-            self.cadence.observe(delta as u64);
-            if let Some(max) = self.checks.gap_micros
-                && delta > max
-            {
-                self.gaps.count += 1;
-                self.gaps.max_micros = self.gaps.max_micros.max(delta);
-                self.gaps.total_micros += delta;
-            }
+        if let Some(last) = self.last {
+            self.cadence.observe((record.event - last.event) as u64);
         }
-        let after_gap = self
-            .checks
-            .gap_micros
-            .is_some_and(|max| delta.is_some_and(|delta| delta > max));
-        let jump = self.observe_prices(previous_close, after_gap, &record);
+        let mut context = GapContext::Contiguous;
+        if let (Some(delta), Some((max, reopen))) = (delta, self.checks.gap_micros)
+            && delta > max
+        {
+            self.gaps.count += 1;
+            self.gaps.max_micros = self.gaps.max_micros.max(delta);
+            self.gaps.total_micros += delta;
+            context = if delta >= reopen {
+                GapContext::Reopen
+            } else {
+                GapContext::Delayed
+            };
+        }
+        let jump = self.observe_prices(previous_close, context, &record);
         self.observe_run(&record);
         self.observe_session(record.event);
         for index in 0..self.streams.len() {
-            if let Some(candle) = self.fold(index, &record, delta, jump, duplicate) {
-                out.push((index, candle));
-            }
+            self.fold(index, &record, delta, jump, duplicate, out);
         }
         self.last = Some(record);
         Ok(())
@@ -809,51 +814,46 @@ impl InstrumentStream {
         }
     }
 
-    /// Folds the record's prices into the price facts and jump distribution; returns the
-    /// record's largest relative move in whole basis points, split into the pair that enters
-    /// the record after a gap and every other pair.
+    /// Folds the record's prices into the price facts and, for the one observed move between
+    /// consecutive records (the previous close to this open), the jump distribution; returns
+    /// that move in whole basis points under its inter-arrival context. A bar's high and low
+    /// bound its prices and its step, never a path: their order inside the bar is unobserved.
     fn observe_prices(
         &mut self,
         previous_close: Option<i64>,
-        after_gap: bool,
+        context: GapContext,
         record: &Record,
     ) -> Jump {
         let mut jump = Jump::default();
-        let mut previous = previous_close;
-        for (position, &price) in record.resolved_prices().iter().enumerate() {
+        for &price in record.resolved_prices() {
             self.prices.min_units = Some(self.prices.min_units.map_or(price, |min| min.min(price)));
             self.prices.max_units = Some(self.prices.max_units.map_or(price, |max| max.max(price)));
-            if let Some(previous) = previous {
-                let (basis_points, moved) = relative_move(previous, price);
-                if moved {
-                    self.prices.moves += 1;
-                    let step = previous.abs_diff(price);
-                    self.prices.step_units = Some(match self.prices.step_units {
-                        Some(current) => gcd(current.unsigned_abs(), step) as i64,
-                        None => step as i64,
-                    });
-                }
-                if let Some(basis_points) = basis_points {
-                    let gap_pair = after_gap && position == 0;
-                    let slot = if gap_pair {
-                        &mut jump.after_gap
-                    } else {
-                        &mut jump.contiguous
-                    };
-                    *slot = (*slot).max(basis_points);
-                    if let Some(min) = self.checks.jump_basis_points {
-                        self.jumps.basis_points.observe(u64::from(basis_points));
-                        if basis_points >= min {
-                            if gap_pair {
-                                self.jumps.flagged_after_gap += 1;
-                            } else {
-                                self.jumps.flagged += 1;
-                            }
-                        }
+            if let Some(previous) = previous_close
+                && previous != price
+            {
+                let step = previous.abs_diff(price);
+                self.prices.step_units = Some(match self.prices.step_units {
+                    Some(current) => gcd(current.unsigned_abs(), step) as i64,
+                    None => step as i64,
+                });
+            }
+        }
+        if let Some(previous) = previous_close {
+            let (basis_points, moved) = relative_move(previous, record.open());
+            self.prices.moves += u64::from(moved);
+            if let Some(basis_points) = basis_points {
+                jump.0[context as usize] = basis_points;
+                if let Some(min) = self.checks.jump_basis_points {
+                    self.jumps.basis_points.observe(u64::from(basis_points));
+                    if basis_points >= min {
+                        *match context {
+                            GapContext::Contiguous => &mut self.jumps.flagged,
+                            GapContext::Delayed => &mut self.jumps.flagged_delayed,
+                            GapContext::Reopen => &mut self.jumps.flagged_reopen,
+                        } += 1;
                     }
                 }
             }
-            previous = Some(price);
         }
         jump
     }
@@ -895,7 +895,9 @@ impl InstrumentStream {
         }
     }
 
-    /// Folds the record into stream `index`, returning the candle it finalizes, if any.
+    /// Folds the record into stream `index`, appending every candle it finalizes to `out`: a
+    /// stale working candle the record's interval leaves behind, and the record's own interval
+    /// when its known-at time already reaches that close.
     fn fold(
         &mut self,
         index: usize,
@@ -903,10 +905,10 @@ impl InstrumentStream {
         delta: Option<i64>,
         jump: Jump,
         duplicate: bool,
-    ) -> Option<Candle> {
+        out: &mut Vec<(usize, Candle)>,
+    ) {
         let stream = &mut self.streams[index];
         let open_time = stream.open_time(record.event);
-        let mut finalized = None;
         if let Some(working) = &mut stream.working {
             if open_time == working.open_time {
                 working.last_event = record.event;
@@ -922,16 +924,16 @@ impl InstrumentStream {
                 if let Some(delta) = delta {
                     working.max_gap_inside = working.max_gap_inside.max(delta);
                 }
-                working.max_jump_basis_points = working.max_jump_basis_points.max(jump.contiguous);
-                working.max_gap_jump_basis_points =
-                    working.max_gap_jump_basis_points.max(jump.after_gap);
+                for (current, incoming) in working.max_jump.iter_mut().zip(jump.0) {
+                    *current = (*current).max(incoming);
+                }
                 working.observe_run(record);
                 if working.last_known_at >= working.close_time {
-                    finalized = Some(Self::finalize(stream, &self.checks, record.known_at));
+                    out.push((index, Self::finalize(stream, &self.checks, record.known_at)));
                 }
-                return finalized;
+                return;
             }
-            finalized = Some(Self::finalize(stream, &self.checks, record.known_at));
+            out.push((index, Self::finalize(stream, &self.checks, record.known_at)));
         }
         let close_time = open_time + stream.duration;
         let missing_before = stream.previous_open_time.map_or(0, |previous| {
@@ -955,16 +957,14 @@ impl InstrumentStream {
             run: None,
             frozen_observations: 0,
             frozen_micros: 0,
-            max_jump_basis_points: jump.contiguous,
-            max_gap_jump_basis_points: jump.after_gap,
+            max_jump: jump.0,
             duplicates: u32::from(duplicate),
         };
         working.observe_run(record);
         stream.working = Some(working);
         if record.known_at >= close_time {
-            finalized = Some(Self::finalize(stream, &self.checks, record.known_at));
+            out.push((index, Self::finalize(stream, &self.checks, record.known_at)));
         }
-        finalized
     }
 
     /// Closes the stream's working candle, evaluates its checks, and records its facts.
@@ -981,20 +981,23 @@ impl InstrumentStream {
                 .is_some_and(|min| working.observations < min),
             gap_before: checks
                 .gap_micros
-                .is_some_and(|max| working.gap_before.is_some_and(|gap| gap > max)),
+                .is_some_and(|(max, _)| working.gap_before.is_some_and(|gap| gap > max)),
             gap_inside: checks
                 .gap_micros
-                .is_some_and(|max| working.max_gap_inside > max),
+                .is_some_and(|(max, _)| working.max_gap_inside > max),
             missing_before: working.missing_before > 0,
             frozen: checks.frozen.is_some_and(|(observations, micros)| {
                 working.frozen_observations >= observations || working.frozen_micros >= micros
             }),
             jump: checks
                 .jump_basis_points
-                .is_some_and(|min| working.max_jump_basis_points >= min),
-            gap_jump: checks
+                .is_some_and(|min| working.max_jump[0] >= min),
+            delayed_jump: checks
                 .jump_basis_points
-                .is_some_and(|min| working.max_gap_jump_basis_points >= min),
+                .is_some_and(|min| working.max_jump[1] >= min),
+            reopen_jump: checks
+                .jump_basis_points
+                .is_some_and(|min| working.max_jump[2] >= min),
             short_span: checks
                 .span_percent
                 .is_some_and(|percent| active_span < stream.duration * i64::from(percent) / 100),
@@ -1011,7 +1014,8 @@ impl InstrumentStream {
             (flags.missing_before, &mut counts.missing_before),
             (flags.frozen, &mut counts.frozen),
             (flags.jump, &mut counts.jump),
-            (flags.gap_jump, &mut counts.gap_jump),
+            (flags.delayed_jump, &mut counts.delayed_jump),
+            (flags.reopen_jump, &mut counts.reopen_jump),
             (flags.short_span, &mut counts.short_span),
             (flags.complete(), &mut counts.complete),
             (flags.clean(), &mut counts.clean),
@@ -1037,8 +1041,9 @@ impl InstrumentStream {
             missing_buckets_before: working.missing_before,
             frozen_observations: working.frozen_observations,
             frozen_micros: working.frozen_micros,
-            max_jump_basis_points: working.max_jump_basis_points,
-            max_gap_jump_basis_points: working.max_gap_jump_basis_points,
+            max_jump_basis_points: working.max_jump[0],
+            max_delayed_jump_basis_points: working.max_jump[1],
+            max_reopen_jump_basis_points: working.max_jump[2],
             flags,
         }
     }
@@ -1097,13 +1102,17 @@ impl InstrumentStream {
     }
 }
 
-/// The largest relative moves of one record: the pair entering it after a gap, and every other
-/// consecutive pair.
-#[derive(Debug, Clone, Copy, Default)]
-struct Jump {
-    contiguous: u32,
-    after_gap: u32,
+/// The inter-arrival context of the move entering a record.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GapContext {
+    Contiguous = 0,
+    Delayed = 1,
+    Reopen = 2,
 }
+
+/// The relative move entering one record, in whole basis points, in the slot of its context.
+#[derive(Debug, Clone, Copy, Default)]
+struct Jump([u32; 3]);
 
 /// `floor(10000 * |to - from| / |from|)` saturated at `u32::MAX`, or `None` when `from` is zero,
 /// and whether the price moved at all.
@@ -1268,23 +1277,6 @@ impl StreamManifest {
     pub fn key(&self) -> String {
         manifest_key(&self.generation)
     }
-
-    /// The candle object of one stream summary.
-    pub fn candle_object(&self, summary: &StreamSummary) -> &ObjectRecord {
-        let path = StreamSummary::object_path(summary.duration_seconds, summary.offset_seconds);
-        self.objects
-            .iter()
-            .find(|object| object.path == path)
-            .expect("validated manifests hold every stream object")
-    }
-
-    /// The profile object.
-    pub fn profile_object(&self) -> &ObjectRecord {
-        self.objects
-            .iter()
-            .find(|object| object.path == PROFILE_OBJECT_PATH)
-            .expect("validated manifests hold the profile object")
-    }
 }
 
 #[cfg(test)]
@@ -1307,7 +1299,10 @@ mod tests {
             quote_currency: Currency::try_from("USD".to_string()).unwrap(),
             price_scale: scale(6),
             native_granularity: granularity,
-            gap: Some(GapCheck { max_seconds: 2 }),
+            gap: Some(GapCheck {
+                max_seconds: 2,
+                reopen_seconds: 60,
+            }),
             frozen: Some(FrozenCheck {
                 min_observations: 3,
                 min_seconds: 5,
@@ -1439,6 +1434,8 @@ mod tests {
         assert_eq!(profile.streams[0].withheld_observations, 1);
         assert_eq!(profile.streams[0].flagged.complete, 1);
         assert_eq!(profile.cadence.total(), 4);
+        assert_eq!(profile.cadence.buckets()[20], 1, "one second");
+        assert_eq!(profile.cadence.buckets()[17], 1, "a tenth of a second");
         let gaps = profile.gaps.unwrap();
         assert_eq!(
             (gaps.count, gaps.max_micros, gaps.total_micros),
@@ -1509,6 +1506,22 @@ mod tests {
     }
 
     #[test]
+    fn a_run_starting_at_the_unix_epoch_keeps_its_span() {
+        // The pinned resampler treats a run start of zero milliseconds as absent and reports a
+        // zero span; the target keeps the epoch as a timestamp.
+        let mut stream = tick_stream(&[(15, 0)]);
+        let out = feed(&mut stream, &[tick(0, 1), tick(6_000, 1), tick(15_000, 2)]);
+        assert_eq!(
+            (out[0].1.frozen_observations, out[0].1.frozen_micros),
+            (2, 6 * SECOND)
+        );
+        assert!(
+            out[0].1.flags.frozen,
+            "six seconds at one price reaches the five-second rule"
+        );
+    }
+
+    #[test]
     fn frozen_runs_are_measured_inside_candles_and_across_the_stream() {
         let mut stream = tick_stream(&[(5, 0)]);
         let out = feed(
@@ -1553,11 +1566,35 @@ mod tests {
         );
         let candle = &out[0].1;
         assert_eq!(candle.max_jump_basis_points, 5, "exactly five basis points");
-        assert_eq!(candle.max_gap_jump_basis_points, 6);
-        assert!(candle.flags.jump && candle.flags.gap_jump);
+        assert_eq!(
+            candle.max_delayed_jump_basis_points, 6,
+            "three seconds is a delay"
+        );
+        assert_eq!(candle.max_reopen_jump_basis_points, 0);
+        assert!(candle.flags.jump && candle.flags.delayed_jump && !candle.flags.reopen_jump);
         let jumps = stream.profile().jumps.unwrap();
-        assert_eq!((jumps.flagged, jumps.flagged_after_gap), (1, 1));
+        assert_eq!(
+            (jumps.flagged, jumps.flagged_delayed, jumps.flagged_reopen),
+            (1, 1, 0)
+        );
         assert_eq!(jumps.basis_points.total(), 4);
+        let mut reopened = tick_stream(&[(60, 0)]);
+        let out = feed(
+            &mut reopened,
+            &[
+                tick(0, 1_000_000),
+                tick(60_000, 1_000_600),
+                tick(120_000, 1_000_600),
+            ],
+        );
+        assert!(
+            !out[0].1.flags.reopen_jump,
+            "the move enters the next candle"
+        );
+        assert!(out[1].1.flags.reopen_jump && !out[1].1.flags.delayed_jump);
+        assert_eq!(out[1].1.max_reopen_jump_basis_points, 6);
+        assert_eq!(out[1].1.gap_before_micros, Some(60 * SECOND));
+        assert_eq!(reopened.profile().jumps.unwrap().flagged_reopen, 1);
         assert_eq!(relative_move(1_000_000, 1_000_500), (Some(5), true));
         assert_eq!(relative_move(0, 5), (None, true));
         assert_eq!(relative_move(-100, -110), (Some(1_000), true));
@@ -1619,7 +1656,18 @@ mod tests {
         assert_eq!(candle.active_span_micros, 15 * SECOND);
         assert_eq!(candle.max_gap_inside_micros, 0);
         assert!(candle.flags.clean());
-        assert_eq!(stream.profile().streams[0].withheld_observations, 0);
+        let profile = stream.profile();
+        assert_eq!(profile.streams[0].withheld_observations, 0);
+        assert_eq!(
+            profile.cadence.buckets()[23],
+            2,
+            "five seconds start to start"
+        );
+        assert_eq!(
+            profile.prices.moves, 0,
+            "each bar opens at the previous close"
+        );
+        assert_eq!(profile.prices.step_units, Some(1));
         let flat = [100_001; 4];
         let out = feed(&mut stream, &[bar(20, flat, 0.0), bar(30, flat, 0.0)]);
         let candle = &out[0].1;
@@ -1731,6 +1779,45 @@ mod tests {
     }
 
     #[test]
+    fn one_bar_can_close_a_stale_candle_and_its_own_interval() {
+        let granularity = NativeGranularity::Bar { period_seconds: 5 };
+        let mut stream = InstrumentStream::new(
+            &instrument(granularity, &[(15, 5)]),
+            source(granularity, None),
+        )
+        .unwrap();
+        let flat = [100_001; 4];
+        let out = feed(
+            &mut stream,
+            &[bar(20, flat, 0.0), bar(25, flat, 0.0), bar(45, flat, 0.0)],
+        );
+        assert_eq!(
+            out.len(),
+            2,
+            "the stale candle and the bar's own candle both finalize"
+        );
+        assert_eq!(
+            (
+                out[0].1.open_time_micros,
+                out[0].1.known_at_micros,
+                out[0].1.observations
+            ),
+            (20 * SECOND, 50 * SECOND, 2)
+        );
+        assert_eq!(
+            (
+                out[1].1.open_time_micros,
+                out[1].1.known_at_micros,
+                out[1].1.observations
+            ),
+            (35 * SECOND, 50 * SECOND, 1)
+        );
+        assert_eq!(out[1].1.gap_before_micros, Some(15 * SECOND));
+        assert_eq!(out[1].1.missing_buckets_before, 0);
+        assert_eq!(stream.profile().streams[0].withheld_observations, 0);
+    }
+
+    #[test]
     fn binding_checks_capabilities_granularity_and_scale() {
         let bars = NativeGranularity::Bar { period_seconds: 5 };
         let error = InstrumentStream::new(
@@ -1760,7 +1847,7 @@ mod tests {
         assert!(
             InstrumentStream::new(&instrument(bars, &[(15, 5)]), mismatched)
                 .unwrap_err()
-                .contains("native granularity")
+                .contains("declares 5-second bar granularity")
         );
     }
 
@@ -1947,11 +2034,6 @@ mod tests {
         assert_eq!(
             parsed.key(),
             format!("manifests/{}/ready.json", manifest.generation)
-        );
-        assert_eq!(parsed.profile_object().path, PROFILE_OBJECT_PATH);
-        assert_eq!(
-            parsed.candle_object(&parsed.streams[1]).path,
-            "candles/15s_5s.parquet"
         );
         let mut renamed = manifest.clone();
         renamed.generation = "0".repeat(64);

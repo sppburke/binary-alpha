@@ -129,10 +129,10 @@ a stock, index, or commodity, never invented) and `quote_currency`, both non-emp
 ASCII control character; `price_scale` (`0` to `18`), the integer-unit scale of every candle price,
 which an integer-unit source must already carry and into which a binary floating-point bar source
 converts exactly or is rejected; `native_granularity`, `{ kind = "tick" }` or
-`{ kind = "bar", period_seconds = N }` with a positive period, which the audited generation must
-provide; the optional check tables `gap` (`max_seconds`), `frozen` (`min_observations` and
-`min_seconds`), `jump` (`min_basis_points`), and `span` (`min_percent`, `0` to `100`), each enabled
-by its presence; the optional `sessions` list of weekly windows, each with a unique non-empty
+`{ kind = "bar", period_seconds = N }` with a positive period and no other key, which the audited
+generation must provide; the optional check tables `gap` (`max_seconds` and a larger
+`reopen_seconds`), `frozen` (`min_observations` and `min_seconds`), `jump` (`min_basis_points`),
+and `span` (`min_percent`, `0` to `100`), each enabled by its presence; the optional `sessions` list of weekly windows, each with a unique non-empty
 `name` and `open_seconds` less than `close_seconds` at most `604800` (seconds since Monday
 00:00 Coordinated Universal Time), pairwise non-overlapping and non-empty when present; and the
 non-empty `candles` list, each stream declaring a positive `duration_seconds`, an
@@ -358,7 +358,12 @@ previous tick's event time, a bar off its grid or of another period, a non-finit
 volume, a contradicted high/low relationship, or a record of the other granularity) is reported
 with its reason, event time, known-at time, and source generation, and leaves the state
 unchanged. A tick identical to the previous tick is accepted, counted as a duplicate, and folded
-like the source retained it. Nothing is filled, interpolated, defaulted, or inferred from a
+like the source retained it. The one observed move between consecutive records is from the
+previous close to the record's open; a bar's high and low bound its prices and the observed
+price step but never form a path, because their order inside the bar is unobserved. The time
+between consecutive records is measured from the previous record's known-at time to the
+record's event time (zero for contiguous bars), so a gap is uncovered time; the cadence is
+measured between event times. Nothing is filled, interpolated, defaulted, or inferred from a
 symbol.
 
 ### Candles
@@ -378,16 +383,18 @@ the stream), the longest inter-arrival time inside it, the number of missing int
 the longest run of consecutive records showing one unchanged price and that run's span, and the
 largest relative move in whole basis points (`floor(10000 · |move| / |previous price|)`, exact
 in integer arithmetic, `u32::MAX` at most, undefined and skipped after a zero price) over the
-consecutive price pairs that enter or lie inside it, split into pairs preceded by a gap and every
-other pair.
+moves that enter or lie inside it, in each of three inter-arrival contexts: contiguous (the
+time before the move is at most `gap.max_seconds`), delayed (over that but under
+`gap.reopen_seconds`), and reopen (at least `gap.reopen_seconds`); without a `gap` check every
+move is contiguous.
 
 The enabled checks decide the flags, with the same comparisons the pinned resampler and research
 policy applied: `low_activity` and `hard_low_activity` when the record count is below the
 stream's `min_observations` or `hard_min_observations`; `gap_before` and `gap_inside` when the
 gap before or the longest inter-arrival inside exceeds `gap.max_seconds`; `missing_before` when an
 interval before it is missing; `frozen` when a run reaches `frozen.min_observations` records or
-`frozen.min_seconds`; `jump` and `gap_jump` when the largest contiguous or gap-preceded move
-reaches `jump.min_basis_points`; and `short_span` when the active span is below
+`frozen.min_seconds`; `jump`, `delayed_jump`, and `reopen_jump` when the largest move of that
+context reaches `jump.min_basis_points`; and `short_span` when the active span is below
 `span.min_percent` of the duration. `complete` is the absence of every gap flag and of hard low
 activity; `clean` is the strict eligibility verdict, the absence of every flag.
 
@@ -396,12 +403,13 @@ activity; `clean` is the strict eligibility verdict, the absence of every flag.
 The profile records only facts a validator or a feature-compatibility check consumes: the
 instrument identity, currencies, and price scale; the source generation, kind, role, native
 granularity, scale, and capabilities; record and duplicate counts and first and last event time;
-the cadence (inter-arrival micros by bit length, where bucket `k` holds values in
-`[2^(k-1), 2^k)` and bucket `0` holds zeros); observed prices (minimum, maximum, the number of
-moves, and the greatest common divisor of every nonzero move as the observed price step); gaps
-over the threshold (count, longest, total); closed frozen runs that met the thresholds (count,
-longest in records and in time); relative moves in whole basis points by bit length with the
-counts that reached the jump threshold with and without a gap before them; records inside each
+the cadence (event-time micros between consecutive records by bit length, where bucket `k`
+holds values in `[2^(k-1), 2^k)` and bucket `0` holds zeros); observed prices (minimum, maximum,
+the number of nonzero moves between consecutive records, and the greatest common divisor of
+every nonzero difference between a record's prices and the previous close as the observed price
+step); gaps over the threshold (count, longest, total); closed frozen runs that met the
+thresholds (count, longest in records and in time); moves in whole basis points by bit length
+with the counts that reached the jump threshold in each context; records inside each
 session window and outside every window; per stream the finalized count, the withheld record
 count, records per finalized candle by bit length, and how many candles carried each flag,
 `complete`, and `clean`; and the supported calculations. Every count covers only closed windows,
@@ -412,7 +420,9 @@ self-modifying configuration.
 ### Stream generations
 
 `binary-alpha data audit --config PATH --manifest URI` reads the dataset ready manifest at `URI`
-through the same store grammar as `data verify`, binds the generation to the configured
+through the same store grammar as `data verify`, refuses a holdout generation before reading any
+object (research never audits holdout data; certification is a separate authorization), binds
+the generation to the configured
 instrument that maps its identity and native granularity (an identity mapped only at another
 granularity is bound so that the capability error names what the source lacks; an unmapped
 identity is an error, never a default), verifies and decodes every data object in manifest order

@@ -82,7 +82,8 @@ const CANDLE_SCHEMA: &str = "message binary_alpha_candles {
   REQUIRED INT64 frozen_observations;
   REQUIRED INT64 frozen_micros;
   REQUIRED INT64 max_jump_basis_points;
-  REQUIRED INT64 max_gap_jump_basis_points;
+  REQUIRED INT64 max_delayed_jump_basis_points;
+  REQUIRED INT64 max_reopen_jump_basis_points;
   REQUIRED BOOLEAN low_activity;
   REQUIRED BOOLEAN hard_low_activity;
   REQUIRED BOOLEAN gap_before;
@@ -90,7 +91,8 @@ const CANDLE_SCHEMA: &str = "message binary_alpha_candles {
   REQUIRED BOOLEAN missing_before;
   REQUIRED BOOLEAN frozen;
   REQUIRED BOOLEAN jump;
-  REQUIRED BOOLEAN gap_jump;
+  REQUIRED BOOLEAN delayed_jump;
+  REQUIRED BOOLEAN reopen_jump;
   REQUIRED BOOLEAN short_span;
   REQUIRED BOOLEAN complete;
   REQUIRED BOOLEAN clean;
@@ -628,7 +630,6 @@ impl CandleWriter {
 
     fn flush(&mut self) -> Result<(), String> {
         let rows = &self.rows;
-        let present = vec![1i16; rows.len()];
         let mut group = self
             .writer
             .next_row_group()
@@ -661,7 +662,7 @@ impl CandleWriter {
                 }
                 ColumnWriter::BoolColumnWriter(typed) => {
                     let values: Vec<bool> = rows.iter().map(|row| flag_field(row, index)).collect();
-                    typed.write_batch(&values, Some(&present), None)
+                    typed.write_batch(&values, None, None)
                 }
                 _ => unreachable!("the candle schema has no other column type"),
             };
@@ -711,7 +712,8 @@ fn int_field(candle: &Candle, column: usize) -> i64 {
         16 => i64::from(candle.frozen_observations),
         17 => candle.frozen_micros,
         18 => i64::from(candle.max_jump_basis_points),
-        19 => i64::from(candle.max_gap_jump_basis_points),
+        19 => i64::from(candle.max_delayed_jump_basis_points),
+        20 => i64::from(candle.max_reopen_jump_basis_points),
         _ => unreachable!("column {column} is not an integer column"),
     }
 }
@@ -719,27 +721,28 @@ fn int_field(candle: &Candle, column: usize) -> i64 {
 fn flag_field(candle: &Candle, column: usize) -> bool {
     let flags = candle.flags;
     match column {
-        20 => flags.low_activity,
-        21 => flags.hard_low_activity,
-        22 => flags.gap_before,
-        23 => flags.gap_inside,
-        24 => flags.missing_before,
-        25 => flags.frozen,
-        26 => flags.jump,
-        27 => flags.gap_jump,
-        28 => flags.short_span,
-        29 => flags.complete(),
-        30 => flags.clean(),
+        21 => flags.low_activity,
+        22 => flags.hard_low_activity,
+        23 => flags.gap_before,
+        24 => flags.gap_inside,
+        25 => flags.missing_before,
+        26 => flags.frozen,
+        27 => flags.jump,
+        28 => flags.delayed_jump,
+        29 => flags.reopen_jump,
+        30 => flags.short_span,
+        31 => flags.complete(),
+        32 => flags.clean(),
         _ => unreachable!("column {column} is not a flag column"),
     }
 }
 
-/// Reads a candle object back row group by row group, checking the schema and the recorded
-/// scale, and hands every candle to `sink` in order; returns the row count and bounds.
+/// Reads a candle object back row group by row group, checking the schema, the recorded scale,
+/// every row's internal consistency, and the order of intervals; returns the row count and
+/// bounds.
 pub fn read_candles(
     path: &Path,
     scale: PriceScale,
-    mut sink: impl FnMut(Candle) -> Result<(), String>,
 ) -> Result<(u64, Option<i64>, Option<i64>), String> {
     let reader = open(path)?;
     let schema = printed_schema(&reader);
@@ -770,20 +773,16 @@ pub fn read_candles(
             .get_row_group(index)
             .map_err(|error| error.to_string())?;
         let count = group.metadata().num_rows() as usize;
-        let mut ints: Vec<Vec<i64>> = Vec::with_capacity(20);
-        for column in 0..20 {
+        let mut ints: Vec<Vec<i64>> = Vec::with_capacity(21);
+        for column in 0..21 {
             ints.push(match column {
-                12 => Vec::new(),
-                13 => read_optional_column::<Int64Type>(&*group, column, count)?
-                    .into_iter()
-                    .map(|value| value.unwrap_or(i64::MIN))
-                    .collect(),
+                12 | 13 => Vec::new(),
                 _ => read_column::<Int64Type>(&*group, column, Some(count))?,
             });
         }
         let volumes = read_optional_column::<DoubleType>(&*group, 12, count)?;
         let gaps = read_optional_column::<Int64Type>(&*group, 13, count)?;
-        let flags: Vec<Vec<bool>> = (20..31)
+        let flags: Vec<Vec<bool>> = (21..33)
             .map(|column| read_column::<BoolType>(&*group, column, Some(count)))
             .collect::<Result<_, _>>()?;
         for row in 0..count {
@@ -815,7 +814,8 @@ pub fn read_candles(
                 frozen_observations: observation(16)?,
                 frozen_micros: ints[17][row],
                 max_jump_basis_points: observation(18)?,
-                max_gap_jump_basis_points: observation(19)?,
+                max_delayed_jump_basis_points: observation(19)?,
+                max_reopen_jump_basis_points: observation(20)?,
                 flags: Flags {
                     low_activity: flags[0][row],
                     hard_low_activity: flags[1][row],
@@ -824,11 +824,12 @@ pub fn read_candles(
                     missing_before: flags[4][row],
                     frozen: flags[5][row],
                     jump: flags[6][row],
-                    gap_jump: flags[7][row],
-                    short_span: flags[8][row],
+                    delayed_jump: flags[7][row],
+                    reopen_jump: flags[8][row],
+                    short_span: flags[9][row],
                 },
             };
-            if flags[9][row] != candle.flags.complete() || flags[10][row] != candle.flags.clean() {
+            if flags[10][row] != candle.flags.complete() || flags[11][row] != candle.flags.clean() {
                 return Err(format!(
                     "{} row {row}: recorded complete/clean disagree with the flags",
                     path.display()
@@ -845,7 +846,6 @@ pub fn read_candles(
             rows += 1;
             first_open.get_or_insert(candle.open_time_micros);
             last_close = Some(candle.close_time_micros);
-            sink(candle)?;
         }
     }
     Ok((rows, first_open, last_close))

@@ -303,7 +303,7 @@ fn verify_stream(uri: &str, store: &Store, key: &str, bytes: &[u8]) -> Result<St
             })
             .ok_or_else(|| format!("{location} belongs to no stream"))?;
         let (rows, first_open, last_close) =
-            archive::read_candles(&local.path, manifest.definition.price_scale, |_| Ok(()))
+            archive::read_candles(&local.path, manifest.definition.price_scale)
                 .map_err(|reason| format!("{location}: {reason}"))?;
         if rows != summary.rows
             || first_open.map(format_event_time_micros) != summary.first_open_time

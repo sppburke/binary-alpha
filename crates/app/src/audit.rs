@@ -9,7 +9,8 @@ use std::time::Instant;
 
 use binary_alpha_engine::config::Config;
 use binary_alpha_engine::dataset::{
-    GenerationManifest, ObjectRecord, ObjectRole, PriceRepresentation, SourceKind, manifest_key,
+    DatasetRole, GenerationManifest, ObjectRecord, ObjectRole, PriceRepresentation, SourceKind,
+    manifest_key,
 };
 use binary_alpha_engine::market::{InstrumentId, format_event_time_micros};
 use binary_alpha_engine::stream::{
@@ -44,6 +45,11 @@ pub fn run(config_path: &Path, uri: &str, out: &mut dyn Write) -> Result<(), Str
         return Err(format!(
             "{uri} holds the manifest of generation {}",
             manifest.generation
+        ));
+    }
+    if manifest.role == DatasetRole::Holdout {
+        return Err(format!(
+            "{uri} is a holdout generation; research never audits holdout data, and certification is a separate authorization"
         ));
     }
     let id = InstrumentId {

@@ -60,11 +60,37 @@ crate::string_enum! {
 }
 
 /// The native granularity of the source.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum NativeGranularity {
     Tick,
     Bar { period_seconds: u16 },
+}
+
+impl<'de> Deserialize<'de> for NativeGranularity {
+    /// Accepts exactly `{ kind = "tick" }` or `{ kind = "bar", period_seconds = N }`; a derived
+    /// internally tagged deserializer would ignore any other key.
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Raw {
+            kind: String,
+            #[serde(default)]
+            period_seconds: Option<u16>,
+        }
+        let raw = Raw::deserialize(deserializer)?;
+        match (raw.kind.as_str(), raw.period_seconds) {
+            ("tick", None) => Ok(Self::Tick),
+            ("bar", Some(period_seconds)) => Ok(Self::Bar { period_seconds }),
+            ("tick", Some(_)) => Err(serde::de::Error::custom(
+                "period_seconds belongs to kind `bar`, not `tick`",
+            )),
+            ("bar", None) => Err(serde::de::Error::missing_field("period_seconds")),
+            (kind, _) => Err(serde::de::Error::custom(format!(
+                "unknown kind `{kind}`, expected one of `tick`, `bar`"
+            ))),
+        }
+    }
 }
 
 impl fmt::Display for NativeGranularity {
