@@ -29,6 +29,7 @@ crate::string_enum! {
     /// The observed input a generation was built from.
     SourceKind "source_kind" {
         TickCsv => "tick_csv",
+        TickParquetDaily => "tick_parquet_daily",
         BarParquet => "bar_parquet",
     }
 }
@@ -295,7 +296,7 @@ impl GenerationManifest {
             self.capabilities.as_slice(),
         ) {
             (
-                SourceKind::TickCsv,
+                SourceKind::TickCsv | SourceKind::TickParquetDaily,
                 PriceRepresentation::IntegerUnits { scale },
                 NativeGranularity::Tick,
                 TimeUnit::Microsecond,
@@ -554,6 +555,14 @@ mod tests {
             GenerationManifest::from_json(&ticks.to_json())
                 .unwrap_err()
                 .contains("disagree")
+        );
+        let mut daily = manifest();
+        daily.source_kind = SourceKind::TickParquetDaily;
+        assert!(
+            GenerationManifest::from_json(&daily.to_json())
+                .unwrap_err()
+                .contains("disagree"),
+            "a daily tick archive never carries the bar contract"
         );
         let mut instrument = manifest();
         instrument.instrument = "other".to_string();

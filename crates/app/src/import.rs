@@ -15,7 +15,8 @@ use binary_alpha_engine::dataset::{
     SourceKind, TimeUnit, generation_id, manifest_key, object_key,
 };
 use binary_alpha_engine::market::{
-    BrokerId, InstrumentId, PriceScale, ProviderSymbol, TICK_HEADER, parse_tick_line,
+    BrokerId, InstrumentId, PriceScale, ProviderSymbol, TICK_HEADER, Tick, parse_event_time_micros,
+    parse_tick_line,
 };
 use serde::Deserialize;
 use sha2::Digest;
@@ -42,16 +43,32 @@ struct PlannedFile {
 enum Data {
     Ticks {
         scale: PriceScale,
-        source_symbol: ProviderSymbol,
+        rows: TickRows,
     },
     Bars {
         expectation: Box<BarExpectation>,
         /// Listed archive files in manifest order, with their recorded identities and rows.
         listed: Vec<ListedFile>,
         canonical_rows: u64,
-        /// The collection manifest's object path and the SHA-256 of the bytes that were parsed.
-        collection_manifest: (String, String),
     },
+}
+
+/// Where a tick dataset's rows come from.
+enum TickRows {
+    /// One native three-column file whose rows carry this symbol.
+    Csv { source_symbol: ProviderSymbol },
+    /// Daily archive files in date order, aligned with the leading source objects.
+    Daily { days: Vec<Day> },
+}
+
+/// One daily archive file and what its metadata records about it.
+struct Day {
+    /// The Parquet file's object path.
+    path: String,
+    /// The first microsecond of the file's calendar day.
+    start_micros: i64,
+    /// The row count the metadata records.
+    ticks: u64,
 }
 
 /// One dataset to publish; `files` lists source objects in declared order, then provenance.
@@ -59,6 +76,9 @@ struct Dataset {
     instrument: InstrumentId,
     role: DatasetRole,
     files: Vec<PlannedFile>,
+    /// Object paths whose bytes were parsed while planning, with the SHA-256 of those bytes; the
+    /// retained bytes must carry the same identity.
+    parsed: Vec<(String, String)>,
     data: Data,
 }
 
@@ -187,9 +207,12 @@ fn plan(source: &Source, root: &Path, protected: &[PathBuf]) -> Result<Vec<Datas
                     path: name,
                     absolute: root.to_path_buf(),
                 }],
+                parsed: vec![],
                 data: Data::Ticks {
                     scale: *price_scale,
-                    source_symbol: source_symbol.clone(),
+                    rows: TickRows::Csv {
+                        source_symbol: source_symbol.clone(),
+                    },
                 },
             }])
         }
@@ -207,6 +230,13 @@ fn plan(source: &Source, root: &Path, protected: &[PathBuf]) -> Result<Vec<Datas
             provenance.as_deref().unwrap_or(&[]),
             protected,
         ),
+        Source::TickParquetDaily {
+            broker,
+            role,
+            price_scale,
+            instruments,
+            ..
+        } => plan_daily_archive(root, broker, *role, *price_scale, instruments, protected),
     }
 }
 
@@ -267,23 +297,7 @@ fn plan_collection(
     }
     let mut datasets = Vec::with_capacity(collection.assets.len());
     for asset in collection.assets.values() {
-        let asset_root = canonical(&root.join(&asset.asset_root))?;
-        if !asset_root.starts_with(root) {
-            return Err(format!(
-                "asset root {} is outside the collection root {}",
-                asset_root.display(),
-                root.display()
-            ));
-        }
-        if protected
-            .iter()
-            .any(|dir| dir.starts_with(&asset_root) || asset_root.starts_with(dir))
-        {
-            return Err(format!(
-                "asset root {} overlaps the historical-data folder or the file destination",
-                asset_root.display()
-            ));
-        }
+        let asset_root = contained_dir(root, &asset.asset_root, protected)?;
         let dataset_root = canonical(&root.join(&asset.dataset_root))?;
         let dataset_prefix = dataset_root.strip_prefix(&asset_root).map_err(|_| {
             format!(
@@ -363,6 +377,7 @@ fn plan_collection(
             },
             role,
             files,
+            parsed: vec![(collection_files[0].path.clone(), manifest_sha256.clone())],
             data: Data::Bars {
                 expectation: Box::new(BarExpectation {
                     symbol: asset.asset.clone(),
@@ -375,11 +390,193 @@ fn plan_collection(
                 }),
                 listed,
                 canonical_rows: asset.canonical_rows,
-                collection_manifest: (collection_files[0].path.clone(), manifest_sha256.clone()),
             },
         });
     }
     Ok(datasets)
+}
+
+/// The fields of a daily metadata file that the importer consumes.
+#[derive(Deserialize)]
+struct DailyMetadata {
+    symbol: String,
+    date: String,
+    calendar: String,
+    ticks: u64,
+}
+
+/// The Parquet file and the metadata file of one calendar day, as planned objects.
+#[derive(Default)]
+struct DayFiles {
+    parquet: Option<PlannedFile>,
+    metadata: Option<PlannedFile>,
+}
+
+/// Plans one generation per listed directory of a daily tick archive: the directory's Parquet
+/// days are source objects and its metadata files are provenance, both in date order, and the
+/// provider symbol is the one every metadata file records.
+fn plan_daily_archive(
+    root: &Path,
+    broker: &BrokerId,
+    role: DatasetRole,
+    scale: PriceScale,
+    instruments: &[String],
+    protected: &[PathBuf],
+) -> Result<Vec<Dataset>, String> {
+    let mut datasets = Vec::with_capacity(instruments.len());
+    for name in instruments {
+        let dir = contained_dir(root, Path::new(name), protected)?;
+        let listing = |error| format!("cannot list {}: {error}", dir.display());
+        let mut days: BTreeMap<String, DayFiles> = BTreeMap::new();
+        for entry in fs::read_dir(&dir).map_err(listing)? {
+            let entry = entry.map_err(listing)?;
+            let path = entry.path();
+            regular_file(&path)?;
+            let file_name = entry.file_name().to_string_lossy().into_owned();
+            let Some((date, is_parquet)) = daily_file(name, &file_name) else {
+                return Err(format!(
+                    "{} is not `{name}_YYYY-MM-DD_ticks.parquet` or `{name}_YYYY-MM-DD_ticks.meta.json`",
+                    path.display()
+                ));
+            };
+            let day = days.entry(date.to_string()).or_default();
+            let (slot, role) = if is_parquet {
+                (&mut day.parquet, ObjectRole::Source)
+            } else {
+                (&mut day.metadata, ObjectRole::Provenance)
+            };
+            *slot = Some(PlannedFile {
+                role,
+                path: file_name,
+                absolute: path,
+            });
+        }
+        let mut symbol: Option<String> = None;
+        let mut sources = Vec::new();
+        let mut provenance = Vec::new();
+        let mut parsed = Vec::new();
+        let mut decode = Vec::new();
+        for (date, DayFiles { parquet, metadata }) in days {
+            let start_micros = parse_event_time_micros(&format!("{date}T00:00:00Z"))
+                .map_err(|_| format!("{}: `{date}` is not a calendar date", dir.display()))?;
+            let Some(metadata) = metadata else {
+                return Err(format!(
+                    "{} has no metadata file",
+                    parquet
+                        .expect("a day has at least one file")
+                        .absolute
+                        .display()
+                ));
+            };
+            let text = fs::read(&metadata.absolute)
+                .map_err(|error| format!("cannot read {}: {error}", metadata.absolute.display()))?;
+            let record: DailyMetadata = serde_json::from_slice(&text).map_err(|error| {
+                format!(
+                    "{} is not a daily metadata file: {error}",
+                    metadata.absolute.display()
+                )
+            })?;
+            if record.calendar != "UTC" || record.date != date {
+                return Err(format!(
+                    "{} records calendar `{}` and date `{}`, expected `UTC` and `{date}`",
+                    metadata.absolute.display(),
+                    record.calendar,
+                    record.date
+                ));
+            }
+            match &symbol {
+                Some(symbol) if *symbol != record.symbol => {
+                    return Err(format!(
+                        "{} records symbol `{}`, but the directory's earlier days record `{symbol}`",
+                        metadata.absolute.display(),
+                        record.symbol
+                    ));
+                }
+                Some(_) => {}
+                None => symbol = Some(record.symbol),
+            }
+            parsed.push((
+                metadata.path.clone(),
+                binary_alpha_engine::hex(&sha2::Sha256::digest(&text)),
+            ));
+            match parquet {
+                Some(file) => {
+                    decode.push(Day {
+                        path: file.path.clone(),
+                        start_micros,
+                        ticks: record.ticks,
+                    });
+                    sources.push(file);
+                }
+                None if record.ticks != 0 => {
+                    return Err(format!(
+                        "{} records {} ticks but the day has no Parquet file",
+                        metadata.absolute.display(),
+                        record.ticks
+                    ));
+                }
+                None => {}
+            }
+            provenance.push(metadata);
+        }
+        if sources.is_empty() {
+            return Err(format!("{} holds no daily Parquet file", dir.display()));
+        }
+        let symbol = symbol.expect("every Parquet day has a metadata file");
+        sources.extend(provenance);
+        datasets.push(Dataset {
+            instrument: InstrumentId {
+                broker: broker.clone(),
+                provider_symbol: ProviderSymbol::try_from(symbol)
+                    .map_err(|reason| format!("{}: {reason}", dir.display()))?,
+            },
+            role,
+            files: sources,
+            parsed,
+            data: Data::Ticks {
+                scale,
+                rows: TickRows::Daily { days: decode },
+            },
+        });
+    }
+    Ok(datasets)
+}
+
+/// The date field of `NAME_YYYY-MM-DD_ticks.parquet` (`true`) or `NAME_YYYY-MM-DD_ticks.meta.json`
+/// (`false`), which the caller validates as a calendar date; any other name is `None`.
+fn daily_file<'a>(name: &str, file_name: &'a str) -> Option<(&'a str, bool)> {
+    let rest = file_name.strip_prefix(name)?.strip_prefix('_')?;
+    let (date, suffix) = rest.split_at_checked(10)?;
+    match suffix {
+        "_ticks.parquet" => Some((date, true)),
+        "_ticks.meta.json" => Some((date, false)),
+        _ => None,
+    }
+}
+
+/// A declared directory resolved through every symbolic link: it must still lie beneath `root`
+/// and neither contain nor lie inside either destination.
+fn contained_dir(root: &Path, relative: &Path, protected: &[PathBuf]) -> Result<PathBuf, String> {
+    let absolute = canonical(&root.join(relative))?;
+    if !absolute.starts_with(root) {
+        return Err(format!(
+            "{} resolves to {}, outside the root {}",
+            relative.display(),
+            absolute.display(),
+            root.display()
+        ));
+    }
+    if protected
+        .iter()
+        .any(|dir| dir.starts_with(&absolute) || absolute.starts_with(dir))
+    {
+        return Err(format!(
+            "{} resolves to {}, which overlaps the historical-data folder or the file destination",
+            relative.display(),
+            absolute.display()
+        ));
+    }
+    Ok(absolute)
 }
 
 /// A declared collection-level file resolved through every symbolic link: it must be a regular
@@ -500,21 +697,26 @@ fn publish(
         .zip(&identities)
         .map(|(file, identity)| record(file.role, &file.path, identity))
         .collect();
-    if let Data::Bars {
-        collection_manifest: (path, sha256),
-        ..
-    } = &dataset.data
-        && objects
+    for (path, sha256) in &dataset.parsed {
+        if objects
             .iter()
             .any(|object| object.path == *path && object.sha256 != *sha256)
-    {
-        return Err(format!(
-            "{path} changed after its expectations were read; nothing was published"
-        ));
+        {
+            return Err(format!(
+                "{path} changed after its expectations were read; nothing was published"
+            ));
+        }
     }
     let hashed = started.elapsed();
     let (source_kind, scale) = match &dataset.data {
-        Data::Ticks { scale, .. } => (SourceKind::TickCsv, Some(*scale)),
+        Data::Ticks {
+            scale,
+            rows: TickRows::Csv { .. },
+        } => (SourceKind::TickCsv, Some(*scale)),
+        Data::Ticks {
+            scale,
+            rows: TickRows::Daily { .. },
+        } => (SourceKind::TickParquetDaily, Some(*scale)),
         Data::Bars { .. } => (SourceKind::BarParquet, None),
     };
     let generation = generation_id(
@@ -540,17 +742,26 @@ fn publish(
     let validating = Instant::now();
     let (summary, native_granularity, time_unit, price_representation, interval, capability) =
         match &dataset.data {
-            Data::Ticks {
-                scale,
-                source_symbol,
-            } => {
+            Data::Ticks { scale, rows } => {
                 let temporary = temporary_path(local, &generation)?;
-                let summary = archive::write_ticks(
-                    &temporary,
-                    &dataset.instrument,
-                    *scale,
-                    tick_rows(&retained_path(&objects[0]), source_symbol, *scale)?,
-                )?;
+                let summary = match rows {
+                    TickRows::Csv { source_symbol } => archive::write_ticks(
+                        &temporary,
+                        &dataset.instrument,
+                        *scale,
+                        tick_rows(&retained_path(&objects[0]), source_symbol, *scale)?,
+                    )?,
+                    TickRows::Daily { days } => {
+                        let paths: Vec<PathBuf> =
+                            objects[..days.len()].iter().map(retained_path).collect();
+                        archive::write_ticks(
+                            &temporary,
+                            &dataset.instrument,
+                            *scale,
+                            daily_tick_rows(days, &paths, *scale),
+                        )?
+                    }
+                };
                 let identity = store::identify(&temporary)?;
                 local.put_new(&object_key(&identity.sha256), &temporary, &identity)?;
                 fs::remove_file(&temporary)
@@ -570,7 +781,6 @@ fn publish(
                 expectation,
                 listed,
                 canonical_rows,
-                ..
             } => {
                 let paths: Vec<PathBuf> =
                     objects[..listed.len()].iter().map(retained_path).collect();
@@ -750,7 +960,7 @@ fn tick_rows(
     path: &Path,
     source_symbol: &ProviderSymbol,
     scale: PriceScale,
-) -> Result<impl Iterator<Item = Result<binary_alpha_engine::market::Tick, String>>, String> {
+) -> Result<impl Iterator<Item = Result<Tick, String>>, String> {
     let file =
         File::open(path).map_err(|error| format!("cannot open {}: {error}", path.display()))?;
     let mut lines = BufReader::with_capacity(1 << 20, file).lines();
@@ -772,6 +982,36 @@ fn tick_rows(
         parse_tick_line(&line, &source_symbol, scale)
             .map_err(|reason| format!("{display} row {}: {reason}", index + 1))
     }))
+}
+
+/// The rows of every daily archive file in date order, each decoded from its retained copy and
+/// checked against the tick count its metadata records.
+fn daily_tick_rows<'a>(
+    days: &'a [Day],
+    paths: &'a [PathBuf],
+    scale: PriceScale,
+) -> impl Iterator<Item = Result<Tick, String>> + 'a {
+    days.iter().zip(paths).flat_map(move |(day, path)| {
+        let decoded = archive::read_daily_ticks(path, scale, day.start_micros)
+            .map_err(|reason| format!("{}: {reason}", day.path))
+            .and_then(|ticks| {
+                if ticks.len() as u64 == day.ticks {
+                    Ok(ticks)
+                } else {
+                    Err(format!(
+                        "{}: {} rows, metadata records {} ticks",
+                        day.path,
+                        ticks.len(),
+                        day.ticks
+                    ))
+                }
+            });
+        let (ticks, error) = match decoded {
+            Ok(ticks) => (ticks, None),
+            Err(error) => (Vec::new(), Some(Err(error))),
+        };
+        ticks.into_iter().map(Ok).chain(error)
+    })
 }
 
 /// Validates every listed archive file from its retained copy, in manifest order, and returns

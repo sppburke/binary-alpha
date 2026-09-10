@@ -26,8 +26,9 @@ cargo run --release --locked -p binary-alpha-app -- data verify --manifest URI
 
 `binary-alpha config validate --config PATH` prints the content hash and the canonical document to
 standard output and mutates nothing. `binary-alpha data import --config PATH` copies the declared
-sources into the retained historical-data folder named by `storage.historical_data_dir`, normalizes
-ticks, validates bars, publishes every object and one ready manifest per dataset to
+sources (native tick files, daily tick archives, and five-second bar collections) into the retained
+historical-data folder named by `storage.historical_data_dir`, normalizes ticks, validates bars,
+publishes every object and one ready manifest per dataset to
 `storage.publication_uri`, and mirrors the manifest locally; `binary-alpha data verify --manifest URI`
 re-reads one generation from its manifest and objects alone. Both are documented in
 [docs/contracts.md](docs/contracts.md) and [docs/operations.md](docs/operations.md). The example

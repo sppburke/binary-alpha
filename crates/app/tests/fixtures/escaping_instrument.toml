@@ -1,0 +1,14 @@
+schema_version = 1
+run_mode = "research"
+
+[storage]
+historical_data_dir = "../historical_data"
+publication_uri = "file:///tmp/published"
+
+[[import.sources]]
+kind = "tick_parquet_daily"
+path = "/data/deriv/ticks"
+broker = "deriv"
+role = "development"
+price_scale = 5
+instruments = ["AUDUSD", "../secrets"]

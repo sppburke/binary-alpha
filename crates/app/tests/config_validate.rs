@@ -121,11 +121,16 @@ fn invalid_documents_fail_with_field_specific_errors() {
         (
             "unknown_source_kind.toml",
             "kind",
-            "unknown variant `browser_capture`, expected `tick_csv` or `bar_parquet_collection`",
+            "unknown variant `browser_capture`, expected one of `tick_csv`, `bar_parquet_collection`, `tick_parquet_daily`",
         ),
         (
             "escaping_manifest.toml",
             "import.sources[0].manifest",
+            "must stay inside its root",
+        ),
+        (
+            "escaping_instrument.toml",
+            "import.sources[0].instruments",
             "must stay inside its root",
         ),
         (

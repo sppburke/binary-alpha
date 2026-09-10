@@ -1,5 +1,6 @@
-//! Parquet input and output through the direct reader and writer: the normalized tick object
-//! and validation of the observed five-second bar archive. Nothing here rewrites archive bytes.
+//! Parquet input and output through the direct reader and writer: the normalized tick object,
+//! decoding of the observed daily tick archive, and validation of the observed five-second bar
+//! archive. Nothing here rewrites archive bytes.
 
 use std::fs::File;
 use std::path::Path;
@@ -7,7 +8,8 @@ use std::sync::Arc;
 
 use binary_alpha_engine::dataset::{IntervalContract, MANIFEST_SCHEMA_VERSION};
 use binary_alpha_engine::market::{
-    Bar, BarSequence, InstrumentId, PriceScale, Tick, TickSequence, format_event_time_micros,
+    Bar, BarSequence, InstrumentId, PriceScale, Tick, TickSequence, float_price_units,
+    format_event_time_micros,
 };
 use parquet::basic::{Compression, ZstdLevel};
 use parquet::column::reader::{ColumnReader, get_typed_column_reader};
@@ -50,6 +52,16 @@ const TICK_SCHEMA: &str = "message binary_alpha_ticks {
   REQUIRED INT64 price_units;
 }
 ";
+
+/// The exact schema of one daily tick archive file, as the direct reader prints it.
+const DAILY_TICK_SCHEMA: &str = "message schema {
+  OPTIONAL INT64 datetime_utc (TIMESTAMP(NANOS,true));
+  OPTIONAL DOUBLE price;
+}
+";
+
+/// Microseconds in one calendar day.
+const DAY_MICROS: i64 = 86_400_000_000;
 
 /// Row count and provider event-time bounds of one data object.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -139,7 +151,9 @@ pub fn write_ticks(
     };
     for tick in ticks {
         let tick = tick?;
-        sequence.accept(tick)?;
+        sequence
+            .accept(tick)
+            .map_err(|reason| format!("{instrument}: {reason}"))?;
         summary.observe(tick.event_time_micros);
         times.push(tick.event_time_micros);
         prices.push(tick.price_units);
@@ -202,6 +216,57 @@ pub fn read_ticks(path: &Path, scale: PriceScale) -> Result<DataSummary, String>
         }
     }
     Ok(summary)
+}
+
+/// Decodes one daily tick archive file whose calendar day starts at `day_start_micros`: every
+/// nanosecond timestamp must fall on a whole microsecond inside that day, and every price is
+/// converted exactly to units at `scale`. Nulls are rejected.
+pub fn read_daily_ticks(
+    path: &Path,
+    scale: PriceScale,
+    day_start_micros: i64,
+) -> Result<Vec<Tick>, String> {
+    let reader = open(path)?;
+    let schema = printed_schema(&reader);
+    if schema != DAILY_TICK_SCHEMA {
+        return Err(format!(
+            "{} has an unexpected schema:\n{schema}",
+            path.display()
+        ));
+    }
+    let mut ticks = Vec::new();
+    for index in 0..reader.num_row_groups() {
+        let group = reader
+            .get_row_group(index)
+            .map_err(|error| error.to_string())?;
+        let rows = group.metadata().num_rows() as usize;
+        let times = read_column::<Int64Type>(&*group, 0, Some(rows))?;
+        let prices = read_column::<DoubleType>(&*group, 1, Some(rows))?;
+        for (nanos, price) in times.into_iter().zip(prices) {
+            let row = ticks.len();
+            if nanos % 1_000 != 0 {
+                return Err(format!(
+                    "{} row {row}: timestamp {nanos} ns is not on a microsecond boundary",
+                    path.display()
+                ));
+            }
+            let event_time_micros = nanos / 1_000;
+            if !(day_start_micros..day_start_micros + DAY_MICROS).contains(&event_time_micros) {
+                return Err(format!(
+                    "{} row {row}: {} is outside the file's calendar day",
+                    path.display(),
+                    format_event_time_micros(event_time_micros)
+                ));
+            }
+            let price_units = float_price_units(price, scale)
+                .map_err(|reason| format!("{} row {row}: {reason}", path.display()))?;
+            ticks.push(Tick {
+                event_time_micros,
+                price_units,
+            });
+        }
+    }
+    Ok(ticks)
 }
 
 /// What one archive file must satisfy.

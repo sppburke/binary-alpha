@@ -304,6 +304,13 @@ pub fn parse_price_units(text: &str, scale: PriceScale) -> Result<i64, String> {
     i64::try_from(if negative { -magnitude } else { magnitude }).map_err(|_| overflow())
 }
 
+/// Converts a binary floating-point archive price into integer units at `scale` by parsing its
+/// shortest round-trip decimal rendering, so a value whose rendering needs more fraction digits
+/// than the scale, or is not a plain finite number, is rejected rather than rounded.
+pub fn float_price_units(value: f64, scale: PriceScale) -> Result<i64, String> {
+    parse_price_units(&value.to_string(), scale)
+}
+
 /// Rejects backwards time and conflicting prices at one provider event time.
 #[derive(Debug, Default)]
 pub struct TickSequence {
@@ -473,6 +480,29 @@ mod tests {
         );
         assert!(parse_price_units("9223372036854775808", scale(0)).is_err());
         assert!(parse_price_units("-9223372036854775809", scale(0)).is_err());
+    }
+
+    #[test]
+    fn float_prices_convert_through_their_shortest_decimal_form() {
+        assert_eq!(float_price_units(0.65165, scale(5)).unwrap(), 65_165);
+        assert_eq!(float_price_units(158.424, scale(5)).unwrap(), 15_842_400);
+        assert_eq!(float_price_units(0.1, scale(1)).unwrap(), 1);
+        assert_eq!(float_price_units(-0.0, scale(5)).unwrap(), 0);
+        assert_eq!(float_price_units(1e-7, scale(7)).unwrap(), 1);
+        assert_eq!(
+            float_price_units(1e15, scale(3)).unwrap(),
+            1_000_000_000_000_000_000
+        );
+        for value in [
+            0.651_651,
+            0.1 + 0.2,
+            f64::NAN,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            1e300,
+        ] {
+            assert!(float_price_units(value, scale(5)).is_err(), "{value}");
+        }
     }
 
     #[test]
