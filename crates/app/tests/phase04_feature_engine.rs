@@ -2111,73 +2111,100 @@ fn governed_reference_parity() {
         physical.len()
     );
 
-    // The whole-input in-process feed reproduces the published tables; every prefix is stable.
+    // The whole-input in-process feed reproduces the published rows one by one, and every prefix
+    // is exactly what the full feed made known by its cutoff. Only known-at times are retained,
+    // so the test holds bounded state rather than every row.
     let ticks = read_normalized_ticks(&published_root, &input);
     assert_eq!(ticks.len() as u64, input.row_count);
+    let object = |path: &str| {
+        published_root.join(
+            &manifest
+                .objects
+                .iter()
+                .find(|object| object.path == path)
+                .unwrap()
+                .key,
+        )
+    };
+    // Per stream: the known-at times of every emitted row, structure event, and sequence event.
+    let run = |ticks: &[Tick]| -> Vec<[Vec<i64>; 3]> {
+        let mut published: Vec<_> = plan
+            .streams
+            .iter()
+            .map(|stream| table_rows(&object(&stream.object_paths()[0])).1)
+            .collect();
+        let mut known: Vec<[Vec<i64>; 3]> = vec![Default::default(); plan.streams.len()];
+        let mut engine = FeatureEngine::new(plan, Source::from_manifest(&input)).unwrap();
+        let mut out = FeatureOutput::default();
+        for tick in ticks {
+            engine.push(Observation::Tick(*tick), &mut out).unwrap();
+            for (index, row) in out.rows.drain(..) {
+                assert_eq!(
+                    Some(row.values),
+                    published[index].next(),
+                    "{}s row {}",
+                    plan.streams[index].duration_seconds,
+                    known[index][0].len()
+                );
+                known[index][0].push(row.known_at_micros);
+            }
+            for (index, event) in out.structure_events.drain(..) {
+                known[index][1].push(event.known_at_micros);
+            }
+            for (index, event) in out.sequence_events.drain(..) {
+                known[index][2].push(event.known_at_micros);
+            }
+        }
+        known
+    };
     let started = std::time::Instant::now();
-    let full = feed(plan, &input, &ticks, ticks.len());
+    let full = run(&ticks);
     println!(
         "in-process whole-input feed of {} ticks: {:.1} s, peak resident {} kB (bounded stream state, no fit)",
         ticks.len(),
         started.elapsed().as_secs_f64(),
         in_process_peak_kb()
     );
-    for (index, stream) in plan.streams.iter().enumerate() {
-        let paths = stream.object_paths();
-        let (rows_path, structure_path, sequence_path) = (&paths[0], &paths[1], &paths[2]);
-        let object = |path: &str| {
-            published_root.join(
-                &manifest
-                    .objects
-                    .iter()
-                    .find(|object| object.path == path)
-                    .unwrap()
-                    .key,
-            )
-        };
-        let (_, rows) = table_rows(&object(rows_path));
-        let mut direct = full
-            .rows
-            .iter()
-            .filter(|(s, _)| *s == index)
-            .map(|(_, row)| &row.values);
-        let mut count = 0;
-        for row in rows {
-            assert_eq!(
-                Some(&row),
-                direct.next(),
-                "{} row {count}",
-                stream.duration_seconds
-            );
-            count += 1;
-        }
-        assert!(direct.next().is_none());
-        assert_eq!(count, manifest.streams[index].rows);
-        let (_, structure) = table_rows(&object(structure_path));
+    for (known, summary) in full.iter().zip(&manifest.streams) {
         assert_eq!(
-            structure.count(),
-            full.structure_events
-                .iter()
-                .filter(|(s, _)| *s == index)
-                .count()
-        );
-        let (_, sequence) = table_rows(&object(sequence_path));
-        assert_eq!(
-            sequence.count(),
-            full.sequence_events
-                .iter()
-                .filter(|(s, _)| *s == index)
-                .count()
+            known.each_ref().map(|known| known.len() as u64),
+            [
+                summary.rows,
+                summary.structure_events,
+                summary.sequence_events
+            ],
+            "every published row was matched and every event counted"
         );
     }
     for percent in [25, 50, 75] {
         let cut = cutoff(&ticks, percent);
-        let prefix = feed(plan, &input, &ticks[..cut], usize::MAX);
-        assert_prefix(&prefix, &full, ticks[cut - 1].event_time_micros, percent);
+        let cutoff = ticks[cut - 1].event_time_micros;
+        let prefix = run(&ticks[..cut]);
+        for (index, (prefix, full)) in prefix.iter().zip(&full).enumerate() {
+            assert!(
+                !prefix[0].is_empty(),
+                "{percent} percent: stream {index} emits rows"
+            );
+            for (kind, (prefix, full)) in prefix.iter().zip(full).enumerate() {
+                assert_eq!(
+                    prefix.as_slice(),
+                    &full[..prefix.len()],
+                    "{percent} percent stream {index} kind {kind}: a prefix of the full output"
+                );
+                assert_eq!(
+                    full.iter().filter(|&&known| known <= cutoff).count(),
+                    prefix.len(),
+                    "{percent} percent stream {index} kind {kind}: exactly what was known by the cutoff"
+                );
+            }
+        }
         println!(
-            "stable prefix {percent} percent: {} rows and {} events are a prefix of the full output",
-            prefix.rows.len(),
-            prefix.structure_events.len() + prefix.sequence_events.len()
+            "stable prefix {percent} percent: {} rows and {} events are exactly the full output known by the cutoff",
+            prefix.iter().map(|known| known[0].len()).sum::<usize>(),
+            prefix
+                .iter()
+                .map(|known| known[1].len() + known[2].len())
+                .sum::<usize>()
         );
     }
 }
