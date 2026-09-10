@@ -787,63 +787,62 @@ struct LegacyRow {
     eligible: bool,
 }
 
+/// The legacy columns the parity adapter reads, in the order `LegacyRow` consumes them.
+const LEGACY_COLUMNS: [&str; 30] = [
+    "open_time_utc",
+    "close_time_utc",
+    "first_tick_time_utc",
+    "last_tick_time_utc",
+    "active_span_ms",
+    "open",
+    "high",
+    "low",
+    "close",
+    "tick_volume",
+    "starts_after_gap_ms",
+    "max_internal_gap_ms",
+    "missing_buckets_since_prev_candle",
+    "max_same_price_run_ticks",
+    "max_same_price_run_ms",
+    "max_true_tick_jump_bps",
+    "low_tick_volume",
+    "hard_low_tick_volume",
+    "starts_after_gap",
+    "has_internal_gap",
+    "frozen_price_flag",
+    "has_true_tick_jump",
+    "has_feed_delay_jump",
+    "has_gap_reopen_jump",
+    "complete",
+    "has_gap",
+    "max_gap_reopen_jump_bps",
+    "max_abs_tick_jump_bps",
+    "starts_after_gap_class",
+    "worst_gap_class",
+];
+
 fn legacy_rows(path: &Path, scale: PriceScale) -> Vec<LegacyRow> {
     let text = fs::read_to_string(path).unwrap();
     let mut lines = text.lines();
     let header: Vec<&str> = lines.next().unwrap().split(',').collect();
     let column = |name: &str| header.iter().position(|field| *field == name).unwrap();
-    let columns: Vec<usize> = [
-        "open_time_utc",
-        "close_time_utc",
-        "first_tick_time_utc",
-        "last_tick_time_utc",
-        "active_span_ms",
-        "open",
-        "high",
-        "low",
-        "close",
-        "tick_volume",
-        "starts_after_gap_ms",
-        "max_internal_gap_ms",
-        "missing_buckets_since_prev_candle",
-        "max_same_price_run_ticks",
-        "max_same_price_run_ms",
-        "max_true_tick_jump_bps",
-        "low_tick_volume",
-        "hard_low_tick_volume",
-        "starts_after_gap",
-        "has_internal_gap",
-        "frozen_price_flag",
-        "has_true_tick_jump",
-        "has_feed_delay_jump",
-        "has_gap_reopen_jump",
-        "complete",
-        "has_gap",
-        "max_gap_reopen_jump_bps",
-        "max_abs_tick_jump_bps",
-        "starts_after_gap_class",
-        "worst_gap_class",
-    ]
-    .iter()
-    .map(|name| column(name))
-    .collect();
+    let columns: Vec<usize> = LEGACY_COLUMNS.iter().map(|name| column(name)).collect();
     lines
         .map(|line| {
             let fields: Vec<&str> = line.split(',').collect();
             let field = |index: usize| fields[columns[index]];
             let micros = |index| parse_event_time_micros(field(index)).unwrap();
-            // The resampler renders prices with eight decimals; the governed fixture carries at
-            // most six, so the trailing digits are zero and the value normalizes exactly.
+            // The resampler renders prices with eight decimals; the digits beyond the source
+            // scale must be zero, and the rest parses at the source scale itself.
             let units = |index| {
-                let eight = PriceScale::try_from(scale.digits() + 2).unwrap();
-                let units = parse_price_units(field(index), eight).unwrap();
-                assert_eq!(
-                    units % 100,
-                    0,
-                    "{}: not representable at the scale",
-                    field(index)
+                let text: &str = field(index);
+                let excess = 8 - usize::from(scale.digits());
+                let (kept, dropped) = text.split_at(text.len() - excess);
+                assert!(
+                    text.contains('.') && dropped.bytes().all(|byte| byte == b'0'),
+                    "{text}: not representable at the scale"
                 );
-                units / 100
+                parse_price_units(kept, scale).unwrap()
             };
             let int = |index| field(index).parse::<i64>().unwrap();
             let flag = |index| field(index) == "1";
@@ -907,12 +906,39 @@ fn legacy_rows(path: &Path, scale: PriceScale) -> Vec<LegacyRow> {
 /// plus the reference's floating-point error (three rounded operations, bounded by 2^-50 of the
 /// value), or saturated at the column's limit while the reference lies at or beyond it.
 fn diagnostic_agrees(legacy: f64, target: i64) -> Option<bool> {
-    if legacy >= MAX_BASIS_POINTS as f64 {
-        return (target == MAX_BASIS_POINTS as i64).then_some(true);
-    }
-    let floored = legacy.floor() as i64;
     let tolerance = 1.0 + legacy * 2f64.powi(-50);
-    ((floored - target).unsigned_abs() as f64 <= tolerance).then_some(floored != target)
+    let saturated =
+        target == MAX_BASIS_POINTS as i64 && legacy >= MAX_BASIS_POINTS as f64 - tolerance;
+    let difference = (legacy.floor() - target as f64).abs();
+    (saturated || difference <= tolerance).then_some(saturated || difference != 0.0)
+}
+
+#[test]
+fn legacy_prices_normalize_at_the_source_scale() {
+    let scale = PriceScale::try_from(6).unwrap();
+    let dir = Scratch::new("phase03_legacy_prices");
+    let path = dir.path("candles.csv");
+    let header = LEGACY_COLUMNS.join(",");
+    let mut row: Vec<String> = LEGACY_COLUMNS.iter().map(|_| "0".to_string()).collect();
+    for name in [
+        "open_time_utc",
+        "close_time_utc",
+        "first_tick_time_utc",
+        "last_tick_time_utc",
+    ] {
+        row[LEGACY_COLUMNS.iter().position(|c| *c == name).unwrap()] =
+            "2025-01-01T00:00:00.000Z".to_string();
+    }
+    for name in ["open", "high", "low", "close"] {
+        row[LEGACY_COLUMNS.iter().position(|c| *c == name).unwrap()] =
+            "100000000000.00000000".to_string();
+    }
+    for name in ["starts_after_gap_class", "worst_gap_class"] {
+        row[LEGACY_COLUMNS.iter().position(|c| *c == name).unwrap()] = "none".to_string();
+    }
+    fs::write(&path, format!("{header}\n{}\n", row.join(","))).unwrap();
+    let rows = legacy_rows(&path, scale);
+    assert_eq!(rows[0].prices, [100_000_000_000_000_000; 4]);
 }
 
 #[test]
@@ -934,6 +960,12 @@ fn diagnostic_tolerance_follows_the_references_precision() {
     assert_eq!(
         diagnostic_agrees(9.999_999_999_999_992e18, MAX_BASIS_POINTS as i64 - 1),
         None
+    );
+    // The reference lands exactly on the saturation boundary for a move from 0.00000006 to
+    // 55340232.22112871 at scale eight while the exact value stays 808 points below it.
+    assert_eq!(
+        diagnostic_agrees(9_223_372_036_854_775_808.0, 9_223_372_036_854_775_000),
+        Some(true)
     );
 }
 
