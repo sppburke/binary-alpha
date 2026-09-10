@@ -2182,7 +2182,12 @@ fn governed_reference_parity() {
     // The whole-input in-process feed reproduces the published rows and events one by one, and
     // every prefix is exactly what the full feed made known by its cutoff. Only known-at times
     // are retained, so the test holds bounded state rather than every row.
-    let ticks = read_normalized_ticks(&published_root, &input);
+    // The input generation lives in its own store, named by the entry's input manifest.
+    let input_root = match &entry.input_manifest.root {
+        binary_alpha_engine::config::PublicationUri::Filesystem(path) => path.clone(),
+        other => panic!("{other} is not the filesystem boundary"),
+    };
+    let ticks = read_normalized_ticks(&input_root, &input);
     assert_eq!(ticks.len() as u64, input.row_count);
     let object = |path: &str| {
         published_root.join(
