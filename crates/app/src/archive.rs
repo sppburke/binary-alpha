@@ -7,15 +7,16 @@ use std::path::Path;
 use std::sync::Arc;
 
 use binary_alpha_engine::dataset::{IntervalContract, MANIFEST_SCHEMA_VERSION};
+use binary_alpha_engine::features::{Kind, OutputSpec, Value};
 use binary_alpha_engine::market::{
     Bar, BarSequence, InstrumentId, PriceScale, Tick, TickSequence, float_price_units,
     format_event_time_micros,
 };
 use binary_alpha_engine::stream::{Candle, Flags, STREAM_SCHEMA_VERSION};
-use parquet::basic::{Compression, ZstdLevel};
+use parquet::basic::{Compression, ConvertedType, Type, ZstdLevel};
 use parquet::column::reader::{ColumnReader, get_typed_column_reader};
 use parquet::column::writer::ColumnWriter;
-use parquet::data_type::{BoolType, ByteArrayType, DoubleType, Int32Type, Int64Type};
+use parquet::data_type::{BoolType, ByteArray, ByteArrayType, DoubleType, Int32Type, Int64Type};
 use parquet::file::metadata::KeyValue;
 use parquet::file::properties::WriterProperties;
 use parquet::file::reader::{FileReader, RowGroupReader, SerializedFileReader};
@@ -914,6 +915,387 @@ fn read_optional_column<T: parquet::data_type::DataType>(
         return Err(format!("column {} has ragged values", descriptor.name()));
     }
     Ok(result)
+}
+
+/// The physical column types of a dynamic table: feature rows, events, and encoded codes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ColumnType {
+    Int64,
+    Int16,
+    Float64,
+    Bool,
+    Text,
+    /// Unix microseconds.
+    Time,
+}
+
+impl ColumnType {
+    fn of(kind: Kind) -> Self {
+        match kind {
+            Kind::Int => Self::Int64,
+            Kind::Float => Self::Float64,
+            Kind::Bool => Self::Bool,
+            Kind::Text => Self::Text,
+            Kind::Time => Self::Time,
+        }
+    }
+
+    fn schema_type(self) -> &'static str {
+        match self {
+            Self::Int64 => "INT64",
+            Self::Int16 => "INT32 (INT_16)",
+            Self::Float64 => "DOUBLE",
+            Self::Bool => "BOOLEAN",
+            Self::Text => "BYTE_ARRAY (UTF8)",
+            Self::Time => "INT64 (TIMESTAMP(MICROS,true))",
+        }
+    }
+}
+
+/// One named column of a dynamic table; every column is optional except encoded codes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TableColumn {
+    pub name: String,
+    pub ty: ColumnType,
+}
+
+impl TableColumn {
+    pub fn new(name: &str, ty: ColumnType) -> Self {
+        Self {
+            name: name.to_string(),
+            ty,
+        }
+    }
+
+    pub fn of_output(output: &OutputSpec) -> Self {
+        Self::new(&output.name, ColumnType::of(output.kind))
+    }
+
+    fn required(&self) -> bool {
+        self.ty == ColumnType::Int16
+    }
+}
+
+/// The exact Parquet schema text of a dynamic table with the given message name.
+fn table_schema(message: &str, columns: &[TableColumn]) -> String {
+    let mut text = format!("message {message} {{\n");
+    for column in columns {
+        let repetition = if column.required() {
+            "REQUIRED"
+        } else {
+            "OPTIONAL"
+        };
+        let (physical, annotation) = match column.ty.schema_type().split_once(' ') {
+            Some((physical, annotation)) => (physical, format!(" {annotation}")),
+            None => (column.ty.schema_type(), String::new()),
+        };
+        text.push_str(&format!(
+            "  {repetition} {physical} {}{annotation};\n",
+            column.name
+        ));
+    }
+    text.push_str("}\n");
+    text
+}
+
+/// Rows per row group of a dynamic table: bounded, so a writer never holds more than this.
+pub const TABLE_ROW_GROUP_ROWS: usize = 1 << 13;
+
+/// Writes rows of typed optional values as one Zstandard Parquet object, one row group per
+/// bounded batch; the schema and footer metadata are fixed at creation.
+pub struct TableWriter {
+    writer: SerializedFileWriter<File>,
+    columns: Vec<TableColumn>,
+    rows: Vec<Vec<Option<Value>>>,
+    written: u64,
+}
+
+impl TableWriter {
+    pub fn create(
+        path: &Path,
+        message: &str,
+        columns: Vec<TableColumn>,
+        metadata: &[(&str, String)],
+    ) -> Result<Self, String> {
+        let schema = Arc::new(
+            parse_message_type(&table_schema(message, &columns))
+                .map_err(|error| error.to_string())?,
+        );
+        let properties = Arc::new(
+            WriterProperties::builder()
+                .set_compression(Compression::ZSTD(
+                    ZstdLevel::try_new(3).map_err(|error| error.to_string())?,
+                ))
+                .set_key_value_metadata(Some(
+                    metadata
+                        .iter()
+                        .map(|(key, value)| KeyValue::new((*key).to_string(), value.clone()))
+                        .collect(),
+                ))
+                .build(),
+        );
+        let file = File::create(path)
+            .map_err(|error| format!("cannot create {}: {error}", path.display()))?;
+        Ok(Self {
+            writer: SerializedFileWriter::new(file, schema, properties)
+                .map_err(|error| error.to_string())?,
+            columns,
+            rows: Vec::with_capacity(TABLE_ROW_GROUP_ROWS),
+            written: 0,
+        })
+    }
+
+    pub fn push(&mut self, row: Vec<Option<Value>>) -> Result<(), String> {
+        if row.len() != self.columns.len() {
+            return Err(format!(
+                "row has {} values, expected {}",
+                row.len(),
+                self.columns.len()
+            ));
+        }
+        self.rows.push(row);
+        if self.rows.len() == TABLE_ROW_GROUP_ROWS {
+            self.flush()?;
+        }
+        Ok(())
+    }
+
+    fn flush(&mut self) -> Result<(), String> {
+        let mut group = self
+            .writer
+            .next_row_group()
+            .map_err(|error| error.to_string())?;
+        let mut index = 0;
+        while let Some(mut column) = group.next_column().map_err(|error| error.to_string())? {
+            let column_type = self.columns[index].ty;
+            let name = &self.columns[index].name;
+            let levels: Vec<i16> = self
+                .rows
+                .iter()
+                .map(|row| i16::from(row[index].is_some()))
+                .collect();
+            let levels = (!self.columns[index].required()).then_some(levels);
+            let mismatch = || format!("column {name} received a value of another type");
+            let result = match column.untyped() {
+                ColumnWriter::Int64ColumnWriter(typed) => {
+                    let values = self
+                        .rows
+                        .iter()
+                        .filter_map(|row| row[index].as_ref())
+                        .map(|value| match (column_type, value) {
+                            (ColumnType::Int64, Value::Int(v))
+                            | (ColumnType::Time, Value::Time(v)) => Ok(*v),
+                            _ => Err(mismatch()),
+                        })
+                        .collect::<Result<Vec<i64>, _>>()?;
+                    typed.write_batch(&values, levels.as_deref(), None)
+                }
+                ColumnWriter::Int32ColumnWriter(typed) => {
+                    let values = self
+                        .rows
+                        .iter()
+                        .filter_map(|row| row[index].as_ref())
+                        .map(|value| match value {
+                            Value::Int(v) => i32::try_from(*v).map_err(|_| mismatch()),
+                            _ => Err(mismatch()),
+                        })
+                        .collect::<Result<Vec<i32>, _>>()?;
+                    typed.write_batch(&values, levels.as_deref(), None)
+                }
+                ColumnWriter::DoubleColumnWriter(typed) => {
+                    let values = self
+                        .rows
+                        .iter()
+                        .filter_map(|row| row[index].as_ref())
+                        .map(|value| match value {
+                            Value::Float(v) => Ok(*v),
+                            _ => Err(mismatch()),
+                        })
+                        .collect::<Result<Vec<f64>, _>>()?;
+                    typed.write_batch(&values, levels.as_deref(), None)
+                }
+                ColumnWriter::BoolColumnWriter(typed) => {
+                    let values = self
+                        .rows
+                        .iter()
+                        .filter_map(|row| row[index].as_ref())
+                        .map(|value| match value {
+                            Value::Bool(v) => Ok(*v),
+                            _ => Err(mismatch()),
+                        })
+                        .collect::<Result<Vec<bool>, _>>()?;
+                    typed.write_batch(&values, levels.as_deref(), None)
+                }
+                ColumnWriter::ByteArrayColumnWriter(typed) => {
+                    let values = self
+                        .rows
+                        .iter()
+                        .filter_map(|row| row[index].as_ref())
+                        .map(|value| match value {
+                            Value::Text(text) => Ok(ByteArray::from(text.as_ref())),
+                            _ => Err(mismatch()),
+                        })
+                        .collect::<Result<Vec<ByteArray>, _>>()?;
+                    typed.write_batch(&values, levels.as_deref(), None)
+                }
+                _ => unreachable!("dynamic tables have no other column type"),
+            };
+            result.map_err(|error| error.to_string())?;
+            column.close().map_err(|error| error.to_string())?;
+            index += 1;
+        }
+        group.close().map_err(|error| error.to_string())?;
+        self.written += self.rows.len() as u64;
+        self.rows.clear();
+        Ok(())
+    }
+
+    /// Closes the object and returns its row count.
+    pub fn finish(mut self) -> Result<u64, String> {
+        if !self.rows.is_empty() {
+            self.flush()?;
+        }
+        let file = self
+            .writer
+            .into_inner()
+            .map_err(|error| error.to_string())?;
+        file.sync_all()
+            .map_err(|error| format!("cannot close the table object: {error}"))?;
+        Ok(self.written)
+    }
+}
+
+/// Reads a dynamic table back one column of one row group at a time, so a consumer holds
+/// memory proportional to one column chunk.
+pub struct TableReader {
+    reader: SerializedFileReader<File>,
+    columns: Vec<TableColumn>,
+}
+
+impl TableReader {
+    /// Opens a table whose schema message is `message`, deriving its columns from the file.
+    pub fn open(path: &Path, message: &str) -> Result<Self, String> {
+        let reader = open(path)?;
+        let schema = reader.metadata().file_metadata().schema_descr_ptr();
+        if schema.name() != message {
+            return Err(format!(
+                "{} holds a `{}` table, expected `{message}`",
+                path.display(),
+                schema.name()
+            ));
+        }
+        let mut columns = Vec::with_capacity(schema.num_columns());
+        for descriptor in schema.columns() {
+            let ty = match (descriptor.physical_type(), descriptor.converted_type()) {
+                (Type::INT64, ConvertedType::TIMESTAMP_MICROS) => ColumnType::Time,
+                (Type::INT64, ConvertedType::NONE) => ColumnType::Int64,
+                (Type::INT32, ConvertedType::INT_16) => ColumnType::Int16,
+                (Type::DOUBLE, ConvertedType::NONE) => ColumnType::Float64,
+                (Type::BOOLEAN, ConvertedType::NONE) => ColumnType::Bool,
+                (Type::BYTE_ARRAY, ConvertedType::UTF8) => ColumnType::Text,
+                (physical, converted) => {
+                    return Err(format!(
+                        "{} column {} has type {physical} {converted}, which no table carries",
+                        path.display(),
+                        descriptor.name()
+                    ));
+                }
+            };
+            columns.push(TableColumn::new(descriptor.name(), ty));
+        }
+        let expected = table_schema(message, &columns);
+        let printed = printed_schema(&reader);
+        if printed != expected {
+            return Err(format!(
+                "{} has an unexpected schema:\n{printed}",
+                path.display()
+            ));
+        }
+        Ok(Self { reader, columns })
+    }
+
+    pub fn columns(&self) -> &[TableColumn] {
+        &self.columns
+    }
+
+    pub fn metadata(&self) -> Vec<(String, String)> {
+        self.reader
+            .metadata()
+            .file_metadata()
+            .key_value_metadata()
+            .map(|pairs| {
+                pairs
+                    .iter()
+                    .map(|pair| (pair.key.clone(), pair.value.clone().unwrap_or_default()))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    pub fn row_groups(&self) -> usize {
+        self.reader.num_row_groups()
+    }
+
+    pub fn rows(&self) -> u64 {
+        self.reader.metadata().file_metadata().num_rows() as u64
+    }
+
+    pub fn column_index(&self, name: &str) -> Option<usize> {
+        self.columns.iter().position(|column| column.name == name)
+    }
+
+    /// Every value of one column of one row group, in order.
+    pub fn column(&self, group: usize, index: usize) -> Result<Vec<Option<Value>>, String> {
+        let group = self
+            .reader
+            .get_row_group(group)
+            .map_err(|error| error.to_string())?;
+        let rows = group.metadata().num_rows() as usize;
+        Ok(match self.columns[index].ty {
+            ColumnType::Int64 => read_optional_column::<Int64Type>(&*group, index, rows)?
+                .into_iter()
+                .map(|value| value.map(Value::Int))
+                .collect(),
+            ColumnType::Time => read_optional_column::<Int64Type>(&*group, index, rows)?
+                .into_iter()
+                .map(|value| value.map(Value::Time))
+                .collect(),
+            ColumnType::Int16 => read_column::<Int32Type>(&*group, index, Some(rows))?
+                .into_iter()
+                .map(|value| Some(Value::Int(i64::from(value))))
+                .collect(),
+            ColumnType::Float64 => read_optional_column::<DoubleType>(&*group, index, rows)?
+                .into_iter()
+                .map(|value| value.map(Value::Float))
+                .collect(),
+            ColumnType::Bool => read_optional_column::<BoolType>(&*group, index, rows)?
+                .into_iter()
+                .map(|value| value.map(Value::Bool))
+                .collect(),
+            ColumnType::Text => read_optional_column::<ByteArrayType>(&*group, index, rows)?
+                .into_iter()
+                .map(|value| {
+                    value
+                        .map(|bytes| {
+                            bytes
+                                .as_utf8()
+                                .map(|text| Value::Text(std::borrow::Cow::Owned(text.to_string())))
+                                .map_err(|error| error.to_string())
+                        })
+                        .transpose()
+                })
+                .collect::<Result<_, _>>()?,
+        })
+    }
+
+    /// One whole column across every row group.
+    pub fn whole_column(&self, index: usize) -> Result<Vec<Option<Value>>, String> {
+        let mut values = Vec::with_capacity(self.rows() as usize);
+        for group in 0..self.row_groups() {
+            values.extend(self.column(group, index)?);
+        }
+        Ok(values)
+    }
 }
 
 /// Renders a summary's coverage bounds for a manifest.

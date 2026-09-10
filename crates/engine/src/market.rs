@@ -90,7 +90,7 @@ impl PriceScale {
     }
 
     /// Ten to the power of the scale.
-    const fn unit(self) -> i64 {
+    pub const fn unit(self) -> i64 {
         10_i64.pow(self.0 as u32)
     }
 }

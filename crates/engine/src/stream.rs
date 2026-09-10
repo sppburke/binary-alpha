@@ -537,8 +537,14 @@ struct CandleStream {
 
 impl CandleStream {
     fn open_time(&self, event: i64) -> i64 {
-        self.offset + (event - self.offset).div_euclid(self.duration) * self.duration
+        interval_open(event, self.duration, self.offset)
     }
+}
+
+/// The open time of the left-closed interval of `duration` micros, offset `offset` micros
+/// from the Unix-epoch grid, that contains `event`.
+pub fn interval_open(event: i64, duration: i64, offset: i64) -> i64 {
+    offset + (event - offset).div_euclid(duration) * duration
 }
 
 /// The thresholds of the enabled checks, in the stream's units.
