@@ -5288,6 +5288,62 @@ mod tests {
         )
         .unwrap_err();
         assert!(error.contains("not a compiled output"), "{error}");
+        // An encoding whose input a stream excludes is excluded on that stream with the input's
+        // reason; an encoding of nothing compiled is an error.
+        let encodings = |outputs: &[(&str, Option<Bins>)]| {
+            Some(crate::config::Encodings {
+                max_labels: 8,
+                outputs: outputs
+                    .iter()
+                    .map(|(output, bins)| EncodingSpec {
+                        output: (*output).to_string(),
+                        bins: bins.clone(),
+                    })
+                    .collect(),
+            })
+        };
+        let mut encoded = entry(&[(5, 0), (60, 30)], Outputs::AllSupported);
+        encoded.tick_path_streams = Some(vec![StreamKey {
+            duration_seconds: 5,
+            offset_seconds: 0,
+        }]);
+        encoded.encodings = encodings(&[
+            ("tick_path_signed_imbalance_bucketed", None),
+            ("candle_type", None),
+            ("body_bps", Some(Bins::DevelopmentFifths)),
+        ]);
+        let plan = FeaturePlan::resolve(&encoded, ticks.clone(), "input").unwrap();
+        assert_eq!(plan.streams[0].encodings.len(), 3);
+        assert_eq!(
+            plan.streams[1]
+                .encodings
+                .iter()
+                .map(|encoding| encoding.output.as_str())
+                .collect::<Vec<_>>(),
+            ["candle_type", "body_bps"]
+        );
+        assert!(plan.streams[1].excluded.iter().any(|exclusion| {
+            exclusion.name == "tick_path_signed_imbalance_bucketed"
+                && exclusion.reason.contains("60s/30s in tick_path_streams")
+        }));
+        for (outputs, expected) in [
+            (&[("nothing", None)][..], "not a selected output"),
+            (&[("close_time_micros", None)][..], "never encoded"),
+            (&[("body_bps", None)][..], "needs `bins`"),
+            (
+                &[("candle_type", Some(Bins::DevelopmentFifths))][..],
+                "takes no bins",
+            ),
+            (
+                &[("body_bps_bucketed", Some(Bins::DevelopmentFifths))][..],
+                "its own bins",
+            ),
+        ] {
+            let mut bad = entry(&[(5, 0)], Outputs::AllSupported);
+            bad.encodings = encodings(outputs);
+            let error = FeaturePlan::resolve(&bad, ticks.clone(), "input").unwrap_err();
+            assert!(error.contains(expected), "{outputs:?}: {error}");
+        }
         let error = FeaturePlan::resolve(&entry(&[(15, 5)], Outputs::AllSupported), ticks, "input")
             .unwrap_err();
         assert!(error.contains("15s/5s"), "{error}");

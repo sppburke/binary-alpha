@@ -133,7 +133,7 @@ fn feature_entry(role: &str, input: &Path, profile: &Path, settings: &str) -> St
 }
 
 /// Every row of a published table through the generic row API, as engine values.
-fn read_table(path: &Path) -> (Vec<String>, Vec<Vec<Option<Value>>>) {
+fn read_table(path: &Path) -> Table {
     let reader = SerializedFileReader::new(fs::File::open(path).unwrap()).unwrap();
     let names: Vec<String> = reader
         .metadata()
@@ -167,10 +167,13 @@ fn read_table(path: &Path) -> (Vec<String>, Vec<Vec<Option<Value>>>) {
 }
 
 /// The published feature generation at `manifest`: manifest, plan, and every stream's tables.
+/// One published table: its column names and every row.
+type Table = (Vec<String>, Vec<Vec<Option<Value>>>);
+
 struct PublishedFeatures {
     manifest: FeatureManifest,
     plan: FeaturePlan,
-    tables: Vec<[(Vec<String>, Vec<Vec<Option<Value>>>); 4]>,
+    tables: Vec<[Table; 4]>,
 }
 
 fn published_features(store: &Path, manifest: &Path) -> PublishedFeatures {
@@ -317,7 +320,7 @@ fn features_build_fits_publishes_reconstructs_freezes_and_isolates() {
     ));
     assert_eq!(
         feature_manifests(&scratch, "published"),
-        [manifest_path.clone()]
+        std::slice::from_ref(&manifest_path)
     );
     assert_eq!(
         feature_manifests(&scratch, "retained"),
@@ -861,7 +864,7 @@ fn bars_exclude_tick_outputs_with_their_reason_and_named_tick_requests_fail() {
         );
     }
     assert!(
-        excluded.get("tick_volume_dev_quantile").is_none() && excluded.len() < 70,
+        !excluded.contains_key("tick_volume_dev_quantile") && excluded.len() < 70,
         "{excluded:?}"
     );
     let selected: Vec<&str> = stream.outputs.iter().map(|o| o.name.as_str()).collect();

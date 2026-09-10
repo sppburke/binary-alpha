@@ -757,8 +757,10 @@ pub fn verify_feature(uri: &str, store: &Store, key: &str, bytes: &[u8]) -> Resu
                     "{location}: columns, metadata, or row count disagree with the plan and manifest"
                 ));
             }
-            if message == ROWS_MESSAGE {
-                if let Some(index) = reader.column_index("close_time_micros") {
+            if message == ROWS_MESSAGE
+                && let Some(index) = reader.column_index("close_time_micros")
+            {
+                {
                     for group in 0..reader.row_groups() {
                         for value in reader.column(group, index)?.into_iter().flatten() {
                             if let Value::Time(micros) = value {
