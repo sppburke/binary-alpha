@@ -1853,7 +1853,29 @@ fn governed_reference_parity() {
             (stream.duration_seconds, stream.offset_seconds),
             (reference.duration_seconds, reference.offset_seconds)
         );
-        assert!(stream.excluded.is_empty(), "{:?}", stream.excluded);
+        // The reference configured no moving averages, so only the fixed 20/50 pair outputs are
+        // excluded, each with the missing period as its reason.
+        let excluded: Vec<&str> = stream
+            .excluded
+            .iter()
+            .map(|exclusion| exclusion.name.as_str())
+            .collect();
+        assert_eq!(
+            excluded,
+            [
+                "ema20_minus_ema50_bps",
+                "is_ema20_above_ema50",
+                "ema20_ema50_alignment_state"
+            ],
+            "{:?}",
+            stream.excluded
+        );
+        assert!(
+            stream
+                .excluded
+                .iter()
+                .all(|exclusion| exclusion.reason.contains("moving-average period 20"))
+        );
         assert_eq!(
             stream.tick_path,
             reference.duration_seconds <= 30,
