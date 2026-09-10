@@ -14,7 +14,7 @@ use std::process::Command;
 use std::time::Instant;
 
 use binary_alpha_engine::config::Config;
-use binary_alpha_engine::dataset::{GenerationManifest, ObjectRole};
+use binary_alpha_engine::dataset::{GenerationManifest, ObjectRole, PriceRepresentation};
 use binary_alpha_engine::market::{PriceScale, Tick, parse_event_time_micros, parse_price_units};
 use binary_alpha_engine::stream::{
     Candle, InstrumentProfile, InstrumentStream, Observation, Source, StreamManifest,
@@ -1349,6 +1349,25 @@ fn governed_fixture_proof() {
             micros % 1_000 == 0 && ((micros as f64 / 1e6) * 1e3) as i64 == micros / 1_000
         }),
         "the reference's millisecond conversion preserves every input record"
+    );
+    // The reference parses prices as binary floating point and renders them with eight
+    // decimals; every input price must survive that round trip, or two distinct prices could
+    // be one price to the reference.
+    let PriceRepresentation::IntegerUnits { scale } = dataset.price_representation else {
+        panic!("the governed tick generation carries integer units");
+    };
+    let digits = usize::from(scale.digits());
+    assert!(digits <= 8, "the reference renders eight decimals");
+    let unit = 10_i64.pow(scale.digits().into());
+    assert!(
+        ticks.iter().all(|tick| {
+            let units = tick.price_units;
+            let text = format!("{}.{:0digits$}", units / unit, units % unit);
+            units >= 0
+                && format!("{:.8}", text.parse::<f64>().unwrap())
+                    == format!("{text}{}", "0".repeat(8 - digits))
+        }),
+        "the reference's floating-point price round trip preserves every input price"
     );
     assert_eq!(ticks.len() as u64, dataset.row_count);
     let started = Instant::now();

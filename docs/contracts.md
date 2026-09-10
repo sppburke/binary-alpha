@@ -399,10 +399,12 @@ interval before it is missing; `frozen` when a run reaches `frozen.min_observati
 context reaches `jump.min_basis_points`; and `short_span` when the active span is below
 `span.min_percent` of the duration. `complete` is the absence of every gap flag and of hard low
 activity; `clean` is the strict eligibility verdict, the absence of every flag. The pinned
-resampler is a reference with two limitations the target does not reproduce: it parses every
+resampler is a reference with three limitations the target does not reproduce: it parses every
 timestamp to whole milliseconds through binary floating point (a sub-millisecond time is
-truncated and a whole-millisecond time can shift by one), and it treats a run of one price that
-starts at the Unix epoch as absent; the target keeps exact microseconds and every run.
+truncated and a whole-millisecond time can shift by one), it parses prices as binary floating
+point (two prices that differ at the configured scale but share one binary value are one price
+to it), and it treats a run of one price that starts at the Unix epoch as absent; the target
+keeps exact microseconds, exact units, and every run.
 
 ### Profile
 

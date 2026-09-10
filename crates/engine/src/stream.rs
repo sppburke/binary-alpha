@@ -598,7 +598,8 @@ impl InstrumentStream {
                 scale.digits()
             ));
         }
-        let ticks = source.capabilities.contains(&Capability::Ticks);
+        // Support follows the verified granularity, never a capability list on its own.
+        let ticks = required == Capability::Ticks;
         let calculations = Calculation::ALL
             .iter()
             .map(|&calculation| CalculationSupport {
@@ -1872,6 +1873,46 @@ mod tests {
             Some(3),
             "the greatest common divisor of u64::MAX and 3"
         );
+    }
+
+    #[test]
+    fn a_bar_source_never_supports_tick_calculations() {
+        let granularity = NativeGranularity::Bar { period_seconds: 5 };
+        let mut contradictory = source(granularity, None);
+        contradictory.capabilities = vec![Capability::Bars, Capability::Ticks];
+        let stream =
+            InstrumentStream::new(&instrument(granularity, &[(10, 0)]), contradictory).unwrap();
+        assert!(
+            stream
+                .profile()
+                .calculations
+                .iter()
+                .all(|support| !support.supported && support.reason.is_some()),
+            "every tick calculation stays unsupported on bars"
+        );
+    }
+
+    #[test]
+    fn prices_that_share_one_binary_float_stay_distinct() {
+        // 100000000000.000000 and 100000000000.000001 are one `f64`; the pinned resampler
+        // would see ten unchanged prices and a frozen candle. Exact units keep them apart.
+        let mut stream = tick_stream(&[(5, 0)]);
+        let mut out = Vec::new();
+        for index in 0..10_i64 {
+            let price = 100_000_000_000_000_000 + index % 2;
+            stream
+                .push(tick(10_100 + index * 500, price), &mut out)
+                .unwrap();
+        }
+        stream
+            .push(tick(15_100, 100_000_000_000_000_000), &mut out)
+            .unwrap();
+        let (_, candle) = &out[0];
+        assert_eq!(candle.observations, 10);
+        assert_eq!((candle.frozen_observations, candle.frozen_micros), (1, 0));
+        assert!(!candle.flags.frozen);
+        assert_eq!(stream.profile().prices.moves, 10);
+        assert_eq!(stream.profile().prices.step_units, Some(1));
     }
 
     #[test]
