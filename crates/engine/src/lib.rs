@@ -5,6 +5,7 @@
 
 pub mod config;
 pub mod dataset;
+pub mod features;
 pub mod market;
 pub mod stream;
 

@@ -19,7 +19,7 @@ const HASH_DOMAIN_V3: &[u8] = b"binary-alpha config hash v3\n";
 /// A validated configuration document.
 ///
 /// Field order is the canonical serialization order.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
     pub schema_version: SchemaVersion,
@@ -29,6 +29,8 @@ pub struct Config {
     pub import: Option<Import>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub instruments: Vec<Instrument>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub features: Option<Features>,
 }
 
 impl Config {
@@ -73,6 +75,13 @@ impl Config {
                     instrument.id(),
                     instrument.native_granularity
                 ));
+            }
+        }
+        if let Some(features) = &self.features {
+            for (index, entry) in features.instruments.iter().enumerate() {
+                entry
+                    .validate()
+                    .map_err(|reason| format!("features.instruments[{index}].{reason}"))?;
             }
         }
         let Some(import) = &self.import else {
@@ -399,6 +408,465 @@ impl Source {
             | Self::BarParquetCollection { role, .. }
             | Self::TickParquetDaily { role, .. } => *role,
         }
+    }
+}
+
+/// A ready-manifest location: a `file://` or `gs://` store root followed by
+/// `manifests/GENERATION/ready.json`, where the generation is sixty-four lowercase hexadecimal
+/// digits.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ManifestUri {
+    pub root: PublicationUri,
+    /// `manifests/GENERATION/ready.json`, the key inside the root.
+    pub key: String,
+}
+
+impl ManifestUri {
+    /// The generation the manifest belongs to.
+    pub fn generation(&self) -> &str {
+        &self.key["manifests/".len().."manifests/".len() + 64]
+    }
+}
+
+impl fmt::Display for ManifestUri {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}/{}", self.root, self.key)
+    }
+}
+
+impl std::str::FromStr for ManifestUri {
+    type Err = String;
+
+    fn from_str(uri: &str) -> Result<Self, Self::Err> {
+        let (root, key) = uri
+            .rsplit_once("/manifests/")
+            .filter(|(_, key)| {
+                key.strip_suffix("/ready.json").is_some_and(|generation| {
+                    generation.len() == 64
+                        && generation
+                            .bytes()
+                            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+                })
+            })
+            .ok_or_else(|| {
+                format!(
+                    "{uri} must end with manifests/GENERATION/ready.json, where GENERATION is sixty-four lowercase hexadecimal digits"
+                )
+            })?;
+        let root: PublicationUri = root
+            .parse()
+            .map_err(|error: String| format!("{uri}: {error}"))?;
+        Ok(Self {
+            root,
+            key: format!("manifests/{key}"),
+        })
+    }
+}
+
+impl Serialize for ManifestUri {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_str(self)
+    }
+}
+
+impl<'de> Deserialize<'de> for ManifestUri {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        String::deserialize(deserializer)?
+            .parse()
+            .map_err(D::Error::custom)
+    }
+}
+
+/// The feature-engine inventory consumed only by `features build`.
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct Features {
+    pub instruments: Vec<FeatureInstrument>,
+}
+
+/// One instrument's feature build: the declared input role, the Phase 02 input generation, the
+/// Phase 03 stream generation whose definition and profile bind the streams, and either a
+/// frozen plan to apply or the settings of a new plan. Settings are required only for the
+/// outputs that need them; the resolver names a missing one.
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct FeatureInstrument {
+    pub role: DatasetRole,
+    pub input_manifest: ManifestUri,
+    pub profile_manifest: ManifestUri,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub frozen_plan: Option<ManifestUri>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub streams: Option<Vec<StreamKey>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outputs: Option<Outputs>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub moving_average_periods: Option<Vec<u32>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rolling_window: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_history: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub structure: Option<StructureSettings>,
+    /// Sequence equality tolerance as decimal price text at the instrument's price scale;
+    /// `"0"` means strict equality.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub price_epsilon: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tick_path_streams: Option<Vec<StreamKey>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub encodings: Option<Encodings>,
+}
+
+/// One configured duration and offset pair naming a stream of the bound definition.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct StreamKey {
+    pub duration_seconds: u32,
+    pub offset_seconds: u32,
+}
+
+impl fmt::Display for StreamKey {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}s/{}s", self.duration_seconds, self.offset_seconds)
+    }
+}
+
+/// Which compiled outputs a new plan selects: every supported one, or an explicit list.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Outputs {
+    AllSupported,
+    Named(Vec<String>),
+}
+
+impl Serialize for Outputs {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Self::AllSupported => serializer.serialize_str("all_supported"),
+            Self::Named(names) => names.serialize(serializer),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for Outputs {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Raw {
+            Text(String),
+            Names(Vec<String>),
+        }
+        match Raw::deserialize(deserializer)? {
+            Raw::Text(text) if text == "all_supported" => Ok(Self::AllSupported),
+            Raw::Text(text) => Err(D::Error::custom(format!(
+                "unknown outputs `{text}`, expected `all_supported` or a list of output identifiers"
+            ))),
+            Raw::Names(names) => Ok(Self::Named(names)),
+        }
+    }
+}
+
+/// The structure-label policy: swing confirmation, rolling windows, and the classification
+/// thresholds of the pinned reference, all explicit.
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct StructureSettings {
+    pub swing_left: u32,
+    pub swing_right: u32,
+    pub rolling_windows: Vec<u32>,
+    pub direction_window: u32,
+    pub trend_efficiency_threshold: f64,
+    pub trend_min_abs_momentum_bps: f64,
+    pub range_efficiency_threshold: f64,
+    pub compression_ratio_threshold: f64,
+    pub expanded_ratio_threshold: f64,
+    pub extreme_ratio_threshold: f64,
+    pub pullback_min_trend_age: u32,
+    pub trend_reset_sideways_bars: u32,
+    pub failed_breakout_max_bars: u32,
+}
+
+/// The encodings a new plan fits: the selected outputs and projections, and the label limit of
+/// the signed 16-bit code space.
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct Encodings {
+    /// `1` to `32768`.
+    pub max_labels: u32,
+    pub outputs: Vec<EncodingSpec>,
+}
+
+/// One encoded output: a category output or a compiled projection needs no bins; a numeric
+/// output names fixed right-closed bin edges or `development_fifths`.
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct EncodingSpec {
+    pub output: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bins: Option<Bins>,
+}
+
+/// Numeric bin edges: fixed right-closed edges, or the development-fitted fifths.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Bins {
+    DevelopmentFifths,
+    Fixed(Vec<f64>),
+}
+
+impl Serialize for Bins {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Self::DevelopmentFifths => serializer.serialize_str("development_fifths"),
+            Self::Fixed(edges) => edges.serialize(serializer),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for Bins {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Raw {
+            Text(String),
+            Edges(Vec<f64>),
+        }
+        match Raw::deserialize(deserializer)? {
+            Raw::Text(text) if text == "development_fifths" => Ok(Self::DevelopmentFifths),
+            Raw::Text(text) => Err(D::Error::custom(format!(
+                "unknown bins `{text}`, expected `development_fifths` or a list of edges"
+            ))),
+            Raw::Edges(edges) => Ok(Self::Fixed(edges)),
+        }
+    }
+}
+
+/// The largest label count a signed 16-bit code space holds.
+pub const MAX_ENCODING_LABELS: u32 = 32_768;
+
+fn sorted_unique(values: &[u32]) -> bool {
+    values.windows(2).all(|pair| pair[0] < pair[1])
+}
+
+fn unique_streams(streams: &[StreamKey]) -> Result<(), String> {
+    for (index, stream) in streams.iter().enumerate() {
+        if stream.duration_seconds == 0 || stream.offset_seconds >= stream.duration_seconds {
+            return Err(format!(
+                "[{index}]: stream {stream} needs a positive duration and a smaller offset"
+            ));
+        }
+        if streams[..index].contains(stream) {
+            return Err(format!("[{index}]: stream {stream} is listed twice"));
+        }
+    }
+    Ok(())
+}
+
+impl FeatureInstrument {
+    /// The rules a single field's deserializer cannot see; an error names the field. Whether a
+    /// setting is required depends on the selected outputs, which the resolver decides.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.role == DatasetRole::Holdout {
+            return Err("role: holdout data is never a feature-build input".to_string());
+        }
+        let settings = [
+            ("streams", self.streams.is_some()),
+            ("outputs", self.outputs.is_some()),
+            (
+                "moving_average_periods",
+                self.moving_average_periods.is_some(),
+            ),
+            ("rolling_window", self.rolling_window.is_some()),
+            ("min_history", self.min_history.is_some()),
+            ("structure", self.structure.is_some()),
+            ("price_epsilon", self.price_epsilon.is_some()),
+            ("tick_path_streams", self.tick_path_streams.is_some()),
+            ("encodings", self.encodings.is_some()),
+        ];
+        if self.frozen_plan.is_some() {
+            if let Some((name, _)) = settings.iter().find(|(_, present)| *present) {
+                return Err(format!(
+                    "{name}: a frozen plan fixes membership, parameters, and encodings; no new-plan setting may accompany it"
+                ));
+            }
+            return Ok(());
+        }
+        if self.role != DatasetRole::Development {
+            return Err(format!(
+                "role: a new plan fits on development data, not `{}`",
+                self.role
+            ));
+        }
+        if let Some(streams) = &self.streams {
+            if streams.is_empty() {
+                return Err("streams: at least one stream is required when present".to_string());
+            }
+            unique_streams(streams).map_err(|reason| format!("streams{reason}"))?;
+        }
+        if let Some(Outputs::Named(names)) = &self.outputs {
+            for (index, name) in names.iter().enumerate() {
+                if name.is_empty() || name.bytes().any(|byte| byte.is_ascii_control()) {
+                    return Err(format!(
+                        "outputs[{index}]: must be a non-empty identifier without a control character"
+                    ));
+                }
+                if names[..index].contains(name) {
+                    return Err(format!("outputs[{index}]: `{name}` is listed twice"));
+                }
+            }
+        }
+        if let Some(periods) = &self.moving_average_periods
+            && (!sorted_unique(periods) || periods.iter().any(|period| *period < 2))
+        {
+            return Err(
+                "moving_average_periods: periods must be sorted, unique, and greater than one"
+                    .to_string(),
+            );
+        }
+        match (self.rolling_window, self.min_history) {
+            (None, None) => {}
+            (Some(window), Some(history)) if 1 <= history && history <= window => {}
+            (Some(_), Some(_)) => {
+                return Err("min_history: requires 1 <= min_history <= rolling_window".to_string());
+            }
+            _ => {
+                return Err(
+                    "rolling_window: rolling_window and min_history are declared together"
+                        .to_string(),
+                );
+            }
+        }
+        if let Some(structure) = &self.structure {
+            structure
+                .validate()
+                .map_err(|reason| format!("structure.{reason}"))?;
+        }
+        // Units resolve under the profile's price scale at plan time; here only the syntax.
+        if let Some(text) = &self.price_epsilon {
+            let (negative, _, _) = crate::market::split_decimal(text)
+                .map_err(|reason| format!("price_epsilon: {reason}"))?;
+            if negative {
+                return Err(format!("price_epsilon: `{text}` must not be negative"));
+            }
+        }
+        if let Some(streams) = &self.tick_path_streams {
+            unique_streams(streams).map_err(|reason| format!("tick_path_streams{reason}"))?;
+            if let Some(selected) = &self.streams
+                && let Some(stream) = streams.iter().find(|stream| !selected.contains(stream))
+            {
+                return Err(format!(
+                    "tick_path_streams: stream {stream} is not a selected stream"
+                ));
+            }
+        }
+        if let Some(encodings) = &self.encodings {
+            encodings
+                .validate()
+                .map_err(|reason| format!("encodings.{reason}"))?;
+        }
+        Ok(())
+    }
+}
+
+impl StructureSettings {
+    pub fn validate(&self) -> Result<(), String> {
+        let counts = [
+            ("swing_left", self.swing_left),
+            ("swing_right", self.swing_right),
+            ("direction_window", self.direction_window),
+            ("pullback_min_trend_age", self.pullback_min_trend_age),
+            ("trend_reset_sideways_bars", self.trend_reset_sideways_bars),
+            ("failed_breakout_max_bars", self.failed_breakout_max_bars),
+        ];
+        if let Some((name, _)) = counts.iter().find(|(_, count)| *count == 0) {
+            return Err(format!("{name}: must be positive"));
+        }
+        if self.rolling_windows.is_empty()
+            || !sorted_unique(&self.rolling_windows)
+            || self.rolling_windows[0] == 0
+        {
+            return Err(
+                "rolling_windows: windows must be positive, sorted, and unique".to_string(),
+            );
+        }
+        if !self.rolling_windows.contains(&self.direction_window) {
+            return Err(format!(
+                "direction_window: {} is not one of the rolling windows",
+                self.direction_window
+            ));
+        }
+        for (name, value) in [
+            (
+                "trend_efficiency_threshold",
+                self.trend_efficiency_threshold,
+            ),
+            (
+                "range_efficiency_threshold",
+                self.range_efficiency_threshold,
+            ),
+        ] {
+            if !(0.0..=1.0).contains(&value) {
+                return Err(format!("{name}: {value} must lie in [0, 1]"));
+            }
+        }
+        if !self.trend_min_abs_momentum_bps.is_finite() || self.trend_min_abs_momentum_bps < 0.0 {
+            return Err(format!(
+                "trend_min_abs_momentum_bps: {} must be finite and non-negative",
+                self.trend_min_abs_momentum_bps
+            ));
+        }
+        let ratios = [
+            self.compression_ratio_threshold,
+            self.expanded_ratio_threshold,
+            self.extreme_ratio_threshold,
+        ];
+        if ratios
+            .iter()
+            .any(|ratio| !ratio.is_finite() || *ratio <= 0.0)
+            || !(ratios[0] < ratios[1] && ratios[1] < ratios[2])
+        {
+            return Err(
+                "compression_ratio_threshold: compression, expanded, and extreme ratio thresholds must be finite, positive, and strictly increasing"
+                    .to_string(),
+            );
+        }
+        Ok(())
+    }
+}
+
+impl Encodings {
+    pub fn validate(&self) -> Result<(), String> {
+        if !(1..=MAX_ENCODING_LABELS).contains(&self.max_labels) {
+            return Err(format!(
+                "max_labels: {} must lie in 1..={MAX_ENCODING_LABELS}",
+                self.max_labels
+            ));
+        }
+        for (index, spec) in self.outputs.iter().enumerate() {
+            if spec.output.is_empty() || spec.output.bytes().any(|byte| byte.is_ascii_control()) {
+                return Err(format!(
+                    "outputs[{index}].output: must be a non-empty identifier without a control character"
+                ));
+            }
+            if self.outputs[..index]
+                .iter()
+                .any(|earlier| earlier.output == spec.output)
+            {
+                return Err(format!(
+                    "outputs[{index}].output: `{}` is listed twice",
+                    spec.output
+                ));
+            }
+            if let Some(Bins::Fixed(edges)) = &spec.bins
+                && (edges.is_empty()
+                    || edges.iter().any(|edge| !edge.is_finite())
+                    || edges.windows(2).any(|pair| pair[0] >= pair[1]))
+            {
+                return Err(format!(
+                    "outputs[{index}].bins: fixed edges must be finite and strictly increasing"
+                ));
+            }
+        }
+        Ok(())
     }
 }
 
@@ -758,6 +1226,254 @@ mod tests {
         assert!("gs://bucket/a//b".parse::<PublicationUri>().is_err());
         assert!("file://relative".parse::<PublicationUri>().is_err());
         assert!("s3://bucket".parse::<PublicationUri>().is_err());
+    }
+}
+
+#[cfg(test)]
+mod feature_tests {
+    use super::*;
+
+    const HEAD: &str = "schema_version = 1\nrun_mode = \"research\"\n\n[storage]\nhistorical_data_dir = \"h\"\npublication_uri = \"file:///p\"\n";
+    const INPUT: &str = "file:///p/manifests/1111111111111111111111111111111111111111111111111111111111111111/ready.json";
+    const PROFILE: &str = "file:///p/manifests/2222222222222222222222222222222222222222222222222222222222222222/ready.json";
+    const PLAN: &str = "gs://bucket/prefix/manifests/3333333333333333333333333333333333333333333333333333333333333333/ready.json";
+
+    fn entry(rest: &str) -> String {
+        format!(
+            "{HEAD}\n[[features.instruments]]\nrole = \"development\"\ninput_manifest = \"{INPUT}\"\nprofile_manifest = \"{PROFILE}\"\n{rest}"
+        )
+    }
+
+    #[test]
+    fn feature_entries_round_trip_through_the_canonical_form() {
+        let source = entry(
+            "outputs = \"all_supported\"\nmoving_average_periods = [20, 50]\nrolling_window = 100\nmin_history = 20\nprice_epsilon = \"0\"\n\n[[features.instruments.streams]]\nduration_seconds = 5\noffset_seconds = 0\n\n[[features.instruments.streams]]\nduration_seconds = 15\noffset_seconds = 5\n\n[features.instruments.structure]\nswing_left = 3\nswing_right = 3\nrolling_windows = [5, 10, 20]\ndirection_window = 10\ntrend_efficiency_threshold = 0.35\ntrend_min_abs_momentum_bps = 3.0\nrange_efficiency_threshold = 0.25\ncompression_ratio_threshold = 0.7\nexpanded_ratio_threshold = 1.3\nextreme_ratio_threshold = 1.8\npullback_min_trend_age = 3\ntrend_reset_sideways_bars = 3\nfailed_breakout_max_bars = 5\n\n[[features.instruments.tick_path_streams]]\nduration_seconds = 5\noffset_seconds = 0\n\n[features.instruments.encodings]\nmax_labels = 32768\n\n[[features.instruments.encodings.outputs]]\noutput = \"candle_type\"\n\n[[features.instruments.encodings.outputs]]\noutput = \"body_bps\"\nbins = \"development_fifths\"\n\n[[features.instruments.encodings.outputs]]\noutput = \"range_bps\"\nbins = [0.5, 1.0, 2.0]\n",
+        );
+        let config = Config::parse(&source).unwrap();
+        assert_eq!(config.canonical_toml(), source);
+        assert_eq!(
+            Config::parse(&config.canonical_toml()).unwrap(),
+            config,
+            "the canonical form parses to the same values"
+        );
+        let entry = &config.features.as_ref().unwrap().instruments[0];
+        assert_eq!(entry.outputs, Some(Outputs::AllSupported));
+        assert_eq!(
+            entry.input_manifest.generation(),
+            "1".repeat(64),
+            "the generation is the sixty-four digits of the key"
+        );
+        assert_eq!(entry.input_manifest.to_string(), INPUT);
+        assert_eq!(
+            entry.encodings.as_ref().unwrap().outputs[2].bins,
+            Some(Bins::Fixed(vec![0.5, 1.0, 2.0]))
+        );
+        let named = entry_named("outputs = [\"body_bps\", \"candle_type\"]\n");
+        assert_eq!(
+            Config::parse(&named).unwrap().features.unwrap().instruments[0].outputs,
+            Some(Outputs::Named(vec![
+                "body_bps".to_string(),
+                "candle_type".to_string()
+            ]))
+        );
+        let frozen = format!(
+            "{HEAD}\n[[features.instruments]]\nrole = \"evaluation\"\ninput_manifest = \"{INPUT}\"\nprofile_manifest = \"{PROFILE}\"\nfrozen_plan = \"{PLAN}\"\n"
+        );
+        let config = Config::parse(&frozen).unwrap();
+        assert_eq!(config.canonical_toml(), frozen);
+        assert_eq!(
+            config.features.unwrap().instruments[0]
+                .frozen_plan
+                .as_ref()
+                .unwrap()
+                .root,
+            PublicationUri::GoogleCloudStorage {
+                bucket: "bucket".to_string(),
+                prefix: "prefix".to_string()
+            }
+        );
+        assert_eq!(
+            Config::parse(HEAD).unwrap().content_hash(),
+            "v3:sha256:d7be0fdf6fb030fdfaa543417aad386f84bdb7e06ff06a61ae5646ca8e7c1256",
+            "a document that omits `features` keeps the identity the previous checkout gave it"
+        );
+    }
+
+    fn entry_named(rest: &str) -> String {
+        entry(rest)
+    }
+
+    #[test]
+    fn price_epsilon_is_checked_for_syntax_only() {
+        // Units resolve under the profile's price scale at plan time; no scale bounds the text.
+        for text in ["10", "99999999999999999999", "0.000000000000000001"] {
+            Config::parse(&entry(&format!("price_epsilon = \"{text}\"\n"))).unwrap();
+        }
+    }
+
+    #[test]
+    fn feature_rules_reject_with_the_field_name() {
+        let structure = |body: &str| format!("[features.instruments.structure]\n{body}");
+        let full_structure = "swing_left = 3\nswing_right = 3\nrolling_windows = [5, 10, 20]\ndirection_window = 10\ntrend_efficiency_threshold = 0.35\ntrend_min_abs_momentum_bps = 3.0\nrange_efficiency_threshold = 0.25\ncompression_ratio_threshold = 0.7\nexpanded_ratio_threshold = 1.3\nextreme_ratio_threshold = 1.8\npullback_min_trend_age = 3\ntrend_reset_sideways_bars = 3\nfailed_breakout_max_bars = 5\n";
+        let cases = [
+            (
+                format!("frozen_plan = \"{PLAN}\"\noutputs = \"all_supported\"\n"),
+                "features.instruments[0].outputs: a frozen plan",
+            ),
+            (
+                "outputs = \"everything\"\n".to_string(),
+                "unknown outputs `everything`",
+            ),
+            (
+                "outputs = []\nmoving_average_periods = [50, 20]\n".to_string(),
+                "features.instruments[0].moving_average_periods",
+            ),
+            (
+                "moving_average_periods = [1]\n".to_string(),
+                "features.instruments[0].moving_average_periods",
+            ),
+            (
+                "rolling_window = 10\n".to_string(),
+                "features.instruments[0].rolling_window",
+            ),
+            (
+                "rolling_window = 10\nmin_history = 11\n".to_string(),
+                "features.instruments[0].min_history",
+            ),
+            (
+                "rolling_window = 10\nmin_history = 0\n".to_string(),
+                "features.instruments[0].min_history",
+            ),
+            (
+                "outputs = [\"a\", \"a\"]\n".to_string(),
+                "features.instruments[0].outputs[1]",
+            ),
+            (
+                "outputs = [\"\"]\n".to_string(),
+                "features.instruments[0].outputs[0]",
+            ),
+            (
+                "price_epsilon = \"-0.1\"\n".to_string(),
+                "features.instruments[0].price_epsilon",
+            ),
+            (
+                "price_epsilon = \"1e-3\"\n".to_string(),
+                "features.instruments[0].price_epsilon",
+            ),
+            (
+                "streams = []\n".to_string(),
+                "features.instruments[0].streams",
+            ),
+            (
+                "streams = [{ duration_seconds = 5, offset_seconds = 5 }]\n".to_string(),
+                "features.instruments[0].streams[0]",
+            ),
+            (
+                "streams = [{ duration_seconds = 5, offset_seconds = 0 }, { duration_seconds = 5, offset_seconds = 0 }]\n".to_string(),
+                "features.instruments[0].streams[1]",
+            ),
+            (
+                "streams = [{ duration_seconds = 5, offset_seconds = 0 }]\ntick_path_streams = [{ duration_seconds = 15, offset_seconds = 5 }]\n".to_string(),
+                "features.instruments[0].tick_path_streams: stream 15s/5s",
+            ),
+            (
+                "tick_path_streams = [{ duration_seconds = 5, offset_seconds = 0 }, { duration_seconds = 5, offset_seconds = 0 }]\n".to_string(),
+                "features.instruments[0].tick_path_streams[1]",
+            ),
+            (
+                structure(&full_structure.replace("swing_left = 3", "swing_left = 0")),
+                "features.instruments[0].structure.swing_left",
+            ),
+            (
+                structure(&full_structure.replace("[5, 10, 20]", "[5, 20, 10]")),
+                "features.instruments[0].structure.rolling_windows",
+            ),
+            (
+                structure(&full_structure.replace("direction_window = 10", "direction_window = 7")),
+                "features.instruments[0].structure.direction_window",
+            ),
+            (
+                structure(&full_structure.replace("trend_efficiency_threshold = 0.35", "trend_efficiency_threshold = 1.5")),
+                "features.instruments[0].structure.trend_efficiency_threshold",
+            ),
+            (
+                structure(&full_structure.replace("trend_min_abs_momentum_bps = 3.0", "trend_min_abs_momentum_bps = -1.0")),
+                "features.instruments[0].structure.trend_min_abs_momentum_bps",
+            ),
+            (
+                structure(&full_structure.replace("expanded_ratio_threshold = 1.3", "expanded_ratio_threshold = 0.7")),
+                "features.instruments[0].structure.compression_ratio_threshold",
+            ),
+            (
+                structure(&full_structure.replace("failed_breakout_max_bars = 5\n", "")),
+                "failed_breakout_max_bars",
+            ),
+            (
+                "encodings = { max_labels = 0, outputs = [] }\n".to_string(),
+                "features.instruments[0].encodings.max_labels",
+            ),
+            (
+                "encodings = { max_labels = 32769, outputs = [] }\n".to_string(),
+                "features.instruments[0].encodings.max_labels",
+            ),
+            (
+                "encodings = { max_labels = 8, outputs = [{ output = \"a\" }, { output = \"a\" }] }\n".to_string(),
+                "features.instruments[0].encodings.outputs[1].output",
+            ),
+            (
+                "encodings = { max_labels = 8, outputs = [{ output = \"a\", bins = [] }] }\n".to_string(),
+                "features.instruments[0].encodings.outputs[0].bins",
+            ),
+            (
+                "encodings = { max_labels = 8, outputs = [{ output = \"a\", bins = [2.0, 1.0] }] }\n".to_string(),
+                "features.instruments[0].encodings.outputs[0].bins",
+            ),
+            (
+                "encodings = { max_labels = 8, outputs = [{ output = \"a\", bins = \"tenths\" }] }\n".to_string(),
+                "unknown bins `tenths`",
+            ),
+            ("retry = 1\n".to_string(), "retry"),
+        ];
+        for (rest, key) in cases {
+            let error = Config::parse(&entry(&rest)).unwrap_err().to_string();
+            assert!(error.contains(key), "{rest}: {error}");
+        }
+        let holdout = entry("").replace("\"development\"", "\"holdout\"");
+        let error = Config::parse(&holdout).unwrap_err().to_string();
+        assert!(error.contains("features.instruments[0].role"), "{error}");
+        let evaluation = entry("").replace("\"development\"", "\"evaluation\"");
+        let error = Config::parse(&evaluation).unwrap_err().to_string();
+        assert!(
+            error.contains("features.instruments[0].role") && error.contains("new plan"),
+            "{error}"
+        );
+        let twice = format!(
+            "{}\n[[features.instruments]]\nrole = \"development\"\ninput_manifest = \"{INPUT}\"\nprofile_manifest = \"{PROFILE}\"\n",
+            entry("")
+        );
+        // One profile may serve several entries (a fit and its frozen applications); the
+        // resolved instrument, role, and streams have one owner, checked at build.
+        assert_eq!(
+            Config::parse(&twice)
+                .unwrap()
+                .features
+                .unwrap()
+                .instruments
+                .len(),
+            2
+        );
+        for uri in [
+            "file:///p/manifests/abc/ready.json",
+            "file:///p/manifests/1111111111111111111111111111111111111111111111111111111111111111/other.json",
+            "s3://p/manifests/1111111111111111111111111111111111111111111111111111111111111111/ready.json",
+            "file://p/manifests/1111111111111111111111111111111111111111111111111111111111111111/ready.json",
+        ] {
+            assert!(uri.parse::<ManifestUri>().is_err(), "{uri}");
+            let error = Config::parse(&entry("").replace(INPUT, uri))
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("input_manifest"), "{uri}: {error}");
+        }
     }
 }
 

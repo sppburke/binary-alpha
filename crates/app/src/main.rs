@@ -1,8 +1,9 @@
 //! The `binary-alpha` executable: configuration validation, historical-data import, instrument
-//! audit, verification, and the external adapters those commands need.
+//! audit, feature builds, verification, and the external adapters those commands need.
 
 mod archive;
 mod audit;
+mod features;
 mod import;
 mod parallel;
 mod store;
@@ -38,6 +39,23 @@ enum Command {
     Data {
         #[command(subcommand)]
         command: DataCommand,
+    },
+    /// Build feature generations from published instrument streams.
+    #[command(disable_help_subcommand = true)]
+    Features {
+        #[command(subcommand)]
+        command: FeaturesCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum FeaturesCommand {
+    /// Resolve or apply one feature plan per configured instrument and publish the feature
+    /// generation.
+    Build {
+        /// Path of the TOML configuration document naming the feature instruments.
+        #[arg(long)]
+        config: PathBuf,
     },
 }
 
@@ -91,6 +109,9 @@ fn main() -> ExitCode {
         Command::Data {
             command: DataCommand::Verify { manifest },
         } => verify::run(&manifest).map(|line| println!("{line}")),
+        Command::Features {
+            command: FeaturesCommand::Build { config },
+        } => features::run(&config, &mut std::io::stdout().lock()),
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,

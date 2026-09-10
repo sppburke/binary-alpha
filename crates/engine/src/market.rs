@@ -90,7 +90,7 @@ impl PriceScale {
     }
 
     /// Ten to the power of the scale.
-    const fn unit(self) -> i64 {
+    pub const fn unit(self) -> i64 {
         10_i64.pow(self.0 as u32)
     }
 }
@@ -262,7 +262,9 @@ fn civil_from_days(days: i64) -> (i64, i64, i64) {
 
 /// Parses decimal text such as `-1.80787` into checked integer units at `scale`, rejecting
 /// text that is not a plain decimal number, needs rounding, or overflows.
-pub fn parse_price_units(text: &str, scale: PriceScale) -> Result<i64, String> {
+/// Splits a plain decimal price into its sign, whole digits, and fraction digits, accepting
+/// only `[-]DIGITS[.DIGITS]` with at least one digit.
+pub fn split_decimal(text: &str) -> Result<(bool, &str, &str), String> {
     let (negative, unsigned) = match text.strip_prefix('-') {
         Some(rest) => (true, rest),
         None => (false, text),
@@ -278,6 +280,11 @@ pub fn parse_price_units(text: &str, scale: PriceScale) -> Result<i64, String> {
     if !digits(whole) || !digits(fraction) {
         return Err(format!("invalid decimal price `{text}`"));
     }
+    Ok((negative, whole, fraction))
+}
+
+pub fn parse_price_units(text: &str, scale: PriceScale) -> Result<i64, String> {
+    let (negative, whole, fraction) = split_decimal(text)?;
     if fraction.len() > usize::from(scale.digits()) {
         return Err(format!(
             "price `{text}` has {} fraction digits, more than the declared price_scale {}",

@@ -1,8 +1,8 @@
 # System contracts
 
 These contracts bind every phase of Binary Alpha. The current checkout implements the
-[configuration](#configuration), [historical datasets](#historical-datasets), and
-[instrument streams](#instrument-streams) sections; the other
+[configuration](#configuration), [historical datasets](#historical-datasets),
+[instrument streams](#instrument-streams), and [feature plans](#feature-plans) sections; the other
 sections are frozen now so that later phases implement them once, in one place, without
 reinterpretation. Specification intent, checkout
 implementation, observed runtime state, immutable measured artifacts, and hosted Git state are
@@ -110,6 +110,7 @@ and content hash; the application package owns reading it from a path.
 | `storage.publication_uri` | string | `gs://BUCKET` or `gs://BUCKET/PREFIX` in every run mode; `file:///ABSOLUTE/DIR` only with `run_mode = "research"`, as the non-live test boundary |
 | `import.sources` | array of tables | optional; consumed only by `data import`, which requires at least one entry |
 | `instruments` | array of tables | optional; consumed only by `data audit`, which requires the entry that maps the audited generation |
+| `features.instruments` | array of tables | optional; consumed only by `features build`, which requires at least one entry |
 
 Every `import.sources` entry declares `kind`, `path` (a relative path resolves against the
 configuration file's directory), `broker`, and `role` (`development` or `evaluation`; `holdout` is
@@ -142,8 +143,38 @@ period. Two entries may map one identity only at different native granularities;
 duration and offset pair is listed once per entry. Ordering, causality, interval boundaries,
 finite values, and source capability are stream invariants that no field relaxes.
 
+Every `features.instruments` entry declares, in this order: `role` (`development` or
+`evaluation`; `holdout` is rejected before anything is resolved); `input_manifest`, the ready
+manifest of the Phase 02 generation to compute on; `profile_manifest`, the ready manifest of the
+Phase 03 stream generation whose recorded definition binds the candle streams, quality checks,
+and price scale and whose profile records the source capabilities; and either `frozen_plan`, the
+ready manifest of a completed feature generation whose plan is applied unchanged, or the new-plan
+settings below, which require `role = "development"`. Manifest locations use the
+`manifests/GENERATION/ready.json` grammar of `data verify`. One `profile_manifest` may serve
+several entries (a fit and the frozen applications of its plan); every resolved instrument, role,
+and stream has one owning entry, checked at build before anything is streamed. A frozen plan admits no
+new-plan setting. The new-plan settings are all optional at parse time; the resolver requires
+exactly the ones the selected outputs and their compiled prerequisites need and names a missing
+one: `streams`, unique positive duration and smaller offset pairs, each a stream of the bound
+definition; `outputs`, the string `all_supported` or a unique non-empty list of compiled output
+identifiers; `moving_average_periods`, sorted unique integers greater than one; `rolling_window`
+and `min_history`, declared together with `1 <= min_history <= rolling_window`; `structure`, the
+table of `swing_left`, `swing_right`, `rolling_windows` (positive, sorted, unique),
+`direction_window` (one of the rolling windows), `trend_efficiency_threshold` and
+`range_efficiency_threshold` in `[0, 1]`, finite non-negative `trend_min_abs_momentum_bps`,
+finite positive strictly increasing `compression_ratio_threshold`, `expanded_ratio_threshold`,
+and `extreme_ratio_threshold`, and positive `pullback_min_trend_age`,
+`trend_reset_sideways_bars`, and `failed_breakout_max_bars`; `price_epsilon`, non-negative
+decimal price text (`"0"` is strict equality) whose units resolve at the bound profile's price
+scale when the plan resolves; `tick_path_streams`, a unique subset of `streams`; and `encodings`, a table of
+`max_labels` (`1` to `32768`) and `outputs`, a unique list of `{ output, bins }` entries where
+`bins` is absent for a category output or a compiled projection and is either
+`"development_fifths"` or a finite strictly increasing list of right-closed edges for a numeric
+output. Section [feature plans](#feature-plans) gives the resolution rules.
+
 Every field is required and has no default, except that the `import` table, the `provenance`
-list, the `instruments` list, and the optional instrument fields named above may be absent. Any
+list, the `instruments` list, the `features` table, and the optional instrument and feature
+fields named above may be absent. Any
 other field is rejected as unknown, so a raw secret value has no place to live. Validation opens
 no source or destination and mutates nothing.
 
@@ -179,7 +210,10 @@ keys in the declared order, then its `[instruments.native_granularity]`, `[instr
 `[instruments.frozen]`, `[instruments.jump]`, and `[instruments.span]` tables, then its
 `[[instruments.sessions]]` and `[[instruments.candles]]` entries, each present table or entry
 introduced by one blank line and its header. An instrument entry rendered alone as a document in
-the same order is its canonical definition, the text a stream generation's identity hashes. Two
+the same order is its canonical definition, the text a stream generation's identity hashes. Each
+`[[features.instruments]]` entry follows the instrument entries, its scalar keys in the declared
+order, then its `[features.instruments.structure]` and `[features.instruments.encodings]` tables
+and `[[features.instruments.encodings.outputs]]` entries. Two
 documents with the same values have the same canonical form regardless of key order, whitespace,
 or comments.
 
@@ -187,7 +221,9 @@ or comments.
 
 The content hash is SHA-256 over the bytes `binary-alpha config hash v3`, one line feed, and the
 canonical document. It is rendered as `v3:sha256:` followed by sixty-four lowercase hexadecimal
-digits. Any change to the hash input or to the canonical form increments the version prefix.
+digits. Any change to the hash input or to the canonical form increments the version prefix; the
+optional `features` table changed neither for a document that omits it, so such a document keeps
+its version-3 identity.
 Version 2 hashed the canonical form without `instruments` under the domain
 `binary-alpha config hash v2`, and version 1 the two-field envelope of the first checkout under
 `binary-alpha config hash v1`; a hash recorded under an earlier version is never reinterpreted.
@@ -467,3 +503,151 @@ and every candle object, checks that they describe the manifest's instrument, pr
 source generation, kind, and role, observations, coverage, and per-stream rows and bounds (every
 volume finite), and writes
 `verified INSTRUMENT ROLE generation GENERATION candles C objects K bytes B`.
+
+## Feature plans
+
+The engine owns the finite compiled output table, the immutable `FeaturePlan`, the
+`FeatureEngine` that extends the instrument stream with per-stream feature state, the structure
+and sequence events, and the pure encoder; the application owns reading the input and profile
+generations, the temporary tables, one-column-at-a-time fitting and encoding, publication, and
+reconstruction. Every formula reproduces the pinned reference (legacy revision
+`b509964cd1c40180e9d98b0e55a95699b0abe9ed`) at its evidenced precision.
+
+### Resolution
+
+`binary-alpha features build --config PATH` resolves every `features.instruments` entry, then
+builds each in order. Every resolved instrument, role, and stream has one owning entry; a second
+entry owning one is refused before anything is streamed or published. Resolution reads the input
+ready manifest and the profile ready manifest as metadata first: the input is
+a dataset generation whose role equals the declared `role` (holdout never enters), the profile
+is an instrument stream generation of role `development` for the same instrument identity and
+native granularity, and only then is the profile object read. A new plan requires the input to
+be the generation the profile was audited from; a frozen plan requires the profile reference
+the plan was frozen under, and the input may be a development or evaluation generation of that
+instrument. Certification against holdout data is a separate authorization that this command
+never performs.
+
+The bound definition supplies the candle streams, quality checks, and price scale; the profile
+supplies whether individual ticks exist (every tick calculation supported). A new plan freezes
+the entry's formula settings, then compiles the output table for those settings and resolves
+every output per stream against its prerequisites: individual ticks for tick counts, tick-path,
+tick-volume means and ratios, tick gap, jump, and frozen diagnostics, the quality regime
+component, and the composite regime; the stream's presence in `tick_path_streams` for the
+eighteen tick-path outputs (any configured tick stream may carry a path); the definition's
+`gap`, `frozen`, `jump`, `min_observations`, and `hard_min_observations` for the flags that
+read them; the `structure` settings for rolling, swing, event, and state outputs, with rolling
+windows 5 and 20 for compression, `range_to_avg20`, and `structure_state`, and windows 5, 10,
+and 20 plus `price_epsilon` for the trend regime; `price_epsilon` for sequence outputs;
+`rolling_window` and `min_history` for prior-history ratios; and each configured
+moving-average period for its outputs, with 20 and 50 for the pair outputs. Under
+`all_supported` every unmet output is excluded with the exact missing prerequisite; under a
+named list an unmet or unknown output is an error naming the missing prerequisite, and the
+candle identity and clock outputs (open, close, known-at, first and last event time, ordinal,
+and the four unit prices) are always selected. Each selected output records its kind, stage,
+whether it is predictive, and a readiness text stating when it is available and what an
+unavailable value means; the engine folds ticks and holds rolling, structure, sequence,
+prior-history, and moving-average state only for the stages and periods the selected outputs
+read. Bars never
+substitute volume, counts, zero diagnostics, or `clean`; bar-compatible geometry, patterns,
+prior ratios, moving averages, returns, momentum, efficiency, structure, sequences, and the
+trend, volatility, structure, transition, and bias regime components remain available.
+
+### Computation
+
+One ordered chain per stream consumes the Phase 03 stream's records: the tick path and the
+floating jump magnitudes of an interval are folded from ordered accepted ticks before its
+candle finalizes (the move entering an interval is ignored by the path, an identical repeat is a
+flat move, and only the last `ceil(directional moves / 3)` nonzero signs are retained); every
+finalized candle advances the ordinal; only a candle whose Phase 03 verdict is `clean` becomes a
+row, in this order: candle facts, tick-path summary, anatomy, rolling structure, swings and
+events, sequences, candle shape with moving averages, and regime components. Structure, swing,
+sequence, and rolling state advance across every accepted candle; the prior-history ratios and
+moving averages reset when the accepted candle's ordinal is not the previous accepted ordinal
+plus one. A swing is confirmed only after the configured right-side candles close; its event
+close is the center candle's close and its confirm close the confirming candle's close, and the
+row that confirms it applies it before that row's own events. A row carries its candle's close
+time (the logical decision clock the reference calls `row_decision_time_utc`) and its known-at
+time (actual availability); no clock is backdated.
+
+Prices convert from canonical integer units to binary floating point exactly where the
+reference parsed decimal text; anatomy, rolling, and moving-average arithmetic follow the
+reference's operation order (window sums use the reference interpreter's compensated
+left-to-right `sum`); and the normalized values the reference wrote to six-place text
+before a later stage read them (`body_bps`, `range_bps`, wick basis points, `close_position`,
+`body_to_range`, wick ratios, returns, momentum, efficiency, means, `range_to_avg20`,
+distances, ratios, and moving-average basis points) are stored as those six-place values, while
+tick-path categories read the unrounded ratios, moving-average state stays unrounded, and
+`ema{p}` is stored unrounded. Canonical units (`open_units`, `high_units`, `low_units`,
+`close_units`, `body_units`, `range_units`, wick units, swing and confirmed-swing units, event
+price and level units) are exact integers, and candle direction, color, tick-move sign and
+flatness, and the sequence epsilon comparison are decided on exact units (a unit difference
+beyond signed 64-bit is unavailable, never wrapped); time-valued members carry microseconds. Category
+vocabularies, thresholds, and comparisons are the reference's, and the gap-class ladder,
+tick-path thresholds, shape thresholds, moving-average states, and regime rules are versioned
+compiled policies named in the plan, not settings.
+
+### Encoding and freeze
+
+The formula settings and the raw identity (SHA-256 over
+`binary-alpha feature raw identity v1`, the stream generation, the profile object hash, the
+development generation, the canonical settings, and the definition versions) freeze before
+computation; the raw rows carry that identity and never a plan hash. After the rows exist, the
+application rereads one selected column at a time and fits each encoding on every development
+row: a category or boolean output labels its text (empty text is `none`, missing is
+`missing`); a compiled `NAME_bucketed` projection classifies its input into the source-defined
+right-closed bins with the first edge included; a compiled `NAME_dev_quantile` projection or a
+`development_fifths` output cuts at the linear-interpolated development quantiles 0.2, 0.4,
+0.6, and 0.8 with duplicate cuts removed and unbounded tails, and fewer than four distinct
+development values yield no labels (a compiled projection of a `_micros` duration input,
+including the active-span quantile, first divides by the plan's recorded `input_divisor` of
+1000, so its edges and labels are the reference's millisecond values); bin labels are
+`LEFT_to_RIGHT` in the reference's
+six-significant-digit general format, and duplicate labels are an error rather than merged
+intervals. Labels rank by development count descending then text ascending, are limited to
+`max_labels`, and take zero-based signed 16-bit codes; a missing, unseen, out-of-range, or
+uncoded (`""`, `missing`, `none`, `<NA>`, `nan`, `NaT`) label encodes as `-1`, and raw values
+stay beside their codes. The fitted plan records the fit windows (rows and first and last
+decision time per stream), every label list and edge list, and its identity is SHA-256 over
+`binary-alpha feature plan v1` and the plan's JSON bytes. Applying a frozen plan recomputes
+rows under its settings and encodes under its labels without refitting; no artifact records
+wall-clock time.
+
+### Feature generations
+
+A feature generation's identity is SHA-256 over `binary-alpha feature generation v1`, one line
+feed, the plan identity, one line feed, and the input generation. Its objects, all role
+`normalized` under the content-addressed create-once rules of dataset generations, are
+`plan.json` (the plan as pretty-printed JSON with one trailing line feed) and, per stream,
+`rows/DURATIONs_OFFSETs.parquet` (one optional column per selected output in plan order, schema
+`binary_alpha_feature_rows`), `events/structure_DURATIONs_OFFSETs.parquet`
+(`binary_alpha_structure_events`: event identity, type, direction, event and confirm close,
+the confirming candle's known-at time, rows and ordinals, price and level units, and the
+reference kind and close), `events/sequence_DURATIONs_OFFSETs.parquet`
+(`binary_alpha_sequence_events`: event identity, row and ordinal, decision close, the confirming
+candle's known-at time, swing type and side, prices and clocks of the swing and the previous
+same-side swing, and the sequence and bias after it), and, only for a stream with encodings,
+`encoded/DURATIONs_OFFSETs.parquet` (`binary_alpha_encoded_rows`: one required 16-bit column per
+encoding). A manifest naming any other object is invalid. Every table is Zstandard Parquet with
+footer metadata `broker`, `provider_symbol`,
+`price_scale`, `duration_seconds`, `offset_seconds`, `raw_identity` (rows and events) or
+`plan_identity` (encoded rows), and `feature_schema_version`. The ready manifest at
+`manifests/GENERATION/ready.json`, published last and mirrored, records `kind`
+(`feature_generation`), `schema_version` (`1`), `generation`, `broker`, `provider_symbol`,
+`instrument`, `role`, `input_generation`, `plan_identity`, `frozen_from` (the generation the
+plan was frozen by, or `null` for a fit), `profile_generation`, `config_hash`,
+`code_revision`, `observations`, `streams` (per stream the rows, structure and sequence event
+counts, and first and last decision time), and `objects`. Before publishing, the command
+requires the observed records and coverage to equal the input manifest and, for a fit, the
+recomputed profile to equal the bound profile; after publishing the objects and before the
+ready manifest, it reconstructs the generation from the published objects under the manifest
+bytes about to become ready, so a generation its verifier rejects is never marked ready. It
+writes two lines to standard output:
+`features INSTRUMENT ROLE generation GENERATION plan PLAN input INPUT observations N rows R events E objects K reused U`
+followed by `[stream S fit S encode S publish S]` stage durations in seconds or by
+`(already published)`, then the reconstruction line below. `data verify` on a feature
+generation asserts every object's bytes and hashes, decodes the plan and checks its identity,
+instrument, profile, fit, and streams against the manifest and the manifest's object set against
+the plan's, checks every table's columns,
+footer metadata, and row count against the plan and manifest and the rows' decision-time
+bounds, and writes
+`verified INSTRUMENT ROLE generation GENERATION rows R events E objects K bytes B`.

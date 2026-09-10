@@ -93,33 +93,7 @@ pub fn run(config_path: &Path, uri: &str, out: &mut dyn Write) -> Result<(), Str
         }
         Ok(())
     };
-    let data_role = match manifest.source_kind {
-        SourceKind::TickCsv | SourceKind::TickParquetDaily => ObjectRole::Normalized,
-        SourceKind::BarParquet => ObjectRole::Source,
-    };
-    for object in manifest
-        .objects
-        .iter()
-        .filter(|object| object.role == data_role)
-    {
-        let (_, fetched) = verify::fetch(&source_store, object, true)?;
-        let path = &fetched.expect("decoded objects have a local path").path;
-        let location = source_store.uri(&object.key);
-        match manifest.price_representation {
-            PriceRepresentation::IntegerUnits { scale } => {
-                archive::read_ticks_with(path, scale, |tick| push(Observation::Tick(tick)))
-                    .map(|_| ())
-            }
-            PriceRepresentation::BinaryFloat64 => {
-                let expectation = verify::bar_expectation(&manifest)?;
-                archive::validate_bar_file_with(path, &expectation, |bar| {
-                    push(Observation::from_bar(&bar, instrument.price_scale)?)
-                })
-                .map(|_| ())
-            }
-        }
-        .map_err(|reason| format!("{location}: {reason}"))?;
-    }
+    feed_generation(&source_store, &manifest, instrument.price_scale, &mut push)?;
     let profile = stream.profile();
     if profile.observations != manifest.row_count
         || profile.coverage.as_ref() != Some(&manifest.coverage)
@@ -237,6 +211,44 @@ pub fn run(config_path: &Path, uri: &str, out: &mut dyn Write) -> Result<(), Str
     writeln!(out, "{line}")
         .and_then(|()| out.flush())
         .map_err(|error| format!("cannot write the report: {error}"))
+}
+
+/// Verifies and decodes every data object of a published generation in manifest order through
+/// the Phase 02 readers, handing every record to `push` as a stream observation.
+pub(crate) fn feed_generation(
+    source_store: &Store,
+    manifest: &GenerationManifest,
+    price_scale: binary_alpha_engine::market::PriceScale,
+    push: &mut dyn FnMut(Observation) -> Result<(), String>,
+) -> Result<(), String> {
+    let data_role = match manifest.source_kind {
+        SourceKind::TickCsv | SourceKind::TickParquetDaily => ObjectRole::Normalized,
+        SourceKind::BarParquet => ObjectRole::Source,
+    };
+    for object in manifest
+        .objects
+        .iter()
+        .filter(|object| object.role == data_role)
+    {
+        let (_, fetched) = verify::fetch(source_store, object, true)?;
+        let path = &fetched.expect("decoded objects have a local path").path;
+        let location = source_store.uri(&object.key);
+        match manifest.price_representation {
+            PriceRepresentation::IntegerUnits { scale } => {
+                archive::read_ticks_with(path, scale, |tick| push(Observation::Tick(tick)))
+                    .map(|_| ())
+            }
+            PriceRepresentation::BinaryFloat64 => {
+                let expectation = verify::bar_expectation(manifest)?;
+                archive::validate_bar_file_with(path, &expectation, |bar| {
+                    push(Observation::from_bar(&bar, price_scale)?)
+                })
+                .map(|_| ())
+            }
+        }
+        .map_err(|reason| format!("{location}: {reason}"))?;
+    }
+    Ok(())
 }
 
 /// A committed stream manifest describes this audit's result when it names the same
