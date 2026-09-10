@@ -304,9 +304,9 @@ pub fn parse_price_units(text: &str, scale: PriceScale) -> Result<i64, String> {
     i64::try_from(if negative { -magnitude } else { magnitude }).map_err(|_| overflow())
 }
 
-/// Converts a binary floating-point archive price into integer units at `scale` through its
-/// shortest round-trip decimal rendering, so a value whose exact decimal form needs more fraction
-/// digits than the scale, or is not a plain finite number, is rejected rather than rounded.
+/// Converts a binary floating-point archive price into integer units at `scale` by parsing its
+/// shortest round-trip decimal rendering, so a value whose rendering needs more fraction digits
+/// than the scale, or is not a plain finite number, is rejected rather than rounded.
 pub fn float_price_units(value: f64, scale: PriceScale) -> Result<i64, String> {
     parse_price_units(&value.to_string(), scale)
 }

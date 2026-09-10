@@ -542,8 +542,8 @@ fn plan_daily_archive(
     Ok(datasets)
 }
 
-/// The date of `NAME_YYYY-MM-DD_ticks.parquet` (`true`) or `NAME_YYYY-MM-DD_ticks.meta.json`
-/// (`false`); any other name is `None`.
+/// The date field of `NAME_YYYY-MM-DD_ticks.parquet` (`true`) or `NAME_YYYY-MM-DD_ticks.meta.json`
+/// (`false`), which the caller validates as a calendar date; any other name is `None`.
 fn daily_file<'a>(name: &str, file_name: &'a str) -> Option<(&'a str, bool)> {
     let rest = file_name.strip_prefix(name)?.strip_prefix('_')?;
     let (date, suffix) = rest.split_at_checked(10)?;
@@ -575,9 +575,6 @@ fn contained_dir(root: &Path, relative: &Path, protected: &[PathBuf]) -> Result<
             relative.display(),
             absolute.display()
         ));
-    }
-    if !absolute.is_dir() {
-        return Err(format!("{} is not a directory", absolute.display()));
     }
     Ok(absolute)
 }

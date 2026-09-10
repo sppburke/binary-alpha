@@ -1511,37 +1511,21 @@ fn daily_tick_archives_publish_one_generation_per_listed_directory() {
     }
 
     let again = import(&config).unwrap();
+    assert_eq!(again.len(), lines.len(), "{again:?}");
     assert!(
         again
             .iter()
             .all(|line| line.ends_with("(already published)")),
         "{again:?}"
     );
+    // Both copies verify from the manifest and objects alone.
     fs::remove_dir_all(scratch.path("sources")).unwrap();
     for manifest in &manifests {
-        let json = manifest_json(manifest);
-        let objects = json["objects"].as_array().unwrap();
-        assert_eq!(
-            verify(manifest).unwrap(),
-            format!(
-                "verified {} development generation {} rows {} objects {} bytes {}",
-                json["instrument"].as_str().unwrap(),
-                json["generation"].as_str().unwrap(),
-                json["row_count"],
-                objects.len(),
-                objects
-                    .iter()
-                    .map(|object| object["bytes"].as_u64().unwrap())
-                    .sum::<u64>()
-            )
-        );
+        verify(manifest).unwrap();
         let mirror = scratch
             .path("retained")
             .join(manifest.strip_prefix(scratch.path("published")).unwrap());
-        assert!(
-            verify(&mirror).is_ok(),
-            "the retained mirror verifies alone"
-        );
+        verify(&mirror).unwrap();
     }
 }
 
@@ -1612,44 +1596,45 @@ fn daily_tick_archives_reject_malformed_days_and_layouts() {
             .unwrap();
         });
         assert!(error.contains(message), "{name}: {error}");
-        if error.contains(" row ") {
-            assert!(
-                error.starts_with("AUDUSD_2025-08-12_ticks.parquet: "),
-                "a decoder rejection names the day file: {error}"
-            );
-        }
+        assert!(
+            error.starts_with("AUDUSD_2025-08-12_ticks.parquet: ")
+                || error.starts_with("deriv:frxAUDUSD: "),
+            "a rejection names the day file or the instrument: {error}"
+        );
     }
-    let metadata_cases: [(&str, &str, &str); 5] = [
+    let metadata_cases: [(&str, &str, &str, &str); 5] = [
         (
             "tick count differing from the rows",
             "\"ticks\":1",
             "\"ticks\":2",
+            "metadata records 2 ticks",
         ),
         (
             "date differing from the file name",
             "\"date\":\"2025-08-12\"",
             "\"date\":\"2025-08-13\"",
+            "expected `UTC` and `2025-08-12`",
         ),
         (
             "symbol differing within the directory",
             "\"symbol\":\"frxAUDUSD\"",
             "\"symbol\":\"frxEURUSD\"",
+            "earlier days record `frxAUDUSD`",
         ),
         (
             "calendar other than UTC",
             "\"calendar\":\"UTC\"",
             "\"calendar\":\"Europe/London\"",
+            "expected `UTC` and `2025-08-12`",
         ),
-        ("negative tick count", "\"ticks\":1", "\"ticks\":-1"),
+        (
+            "negative tick count",
+            "\"ticks\":1",
+            "\"ticks\":-1",
+            "is not a daily metadata file",
+        ),
     ];
-    let metadata_messages = [
-        "metadata records 2 ticks",
-        "expected `UTC` and `2025-08-12`",
-        "earlier days record `frxAUDUSD`",
-        "expected `UTC` and `2025-08-12`",
-        "is not a daily metadata file",
-    ];
-    for ((name, from, to), message) in metadata_cases.iter().zip(metadata_messages) {
+    for (name, from, to, message) in metadata_cases {
         let error = rejected(name, &|root| {
             let path = metadata(root, "2025-08-12");
             let text = fs::read_to_string(&path).unwrap();

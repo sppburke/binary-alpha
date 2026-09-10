@@ -151,7 +151,9 @@ pub fn write_ticks(
     };
     for tick in ticks {
         let tick = tick?;
-        sequence.accept(tick)?;
+        sequence
+            .accept(tick)
+            .map_err(|reason| format!("{instrument}: {reason}"))?;
         summary.observe(tick.event_time_micros);
         times.push(tick.event_time_micros);
         prices.push(tick.price_units);
