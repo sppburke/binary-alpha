@@ -2597,9 +2597,25 @@ impl<T: Copy> History<T> {
     }
 }
 
-/// The reference's left-to-right floating sum.
+/// The reference's `sum()` over floats: CPython 3.12's left-to-right Neumaier-compensated
+/// addition, which differs from a plain fold in the last bits and therefore, on some windows,
+/// in the sixth decimal place of the emitted mean.
 fn sum(values: impl Iterator<Item = f64>) -> f64 {
-    values.fold(0.0, |total, value| total + value)
+    let (mut total, mut compensation) = (0.0_f64, 0.0_f64);
+    for value in values {
+        let next = total + value;
+        compensation += if total.abs() >= value.abs() {
+            (total - next) + value
+        } else {
+            (value - next) + total
+        };
+        total = next;
+    }
+    if compensation != 0.0 && compensation.is_finite() {
+        total + compensation
+    } else {
+        total
+    }
 }
 
 /// One window's rolling outputs.
@@ -5388,6 +5404,20 @@ mod tests {
             serde_json::from_str::<FittedEncoding>(&json).unwrap(),
             fitted
         );
+    }
+
+    #[test]
+    fn window_sums_are_compensated_like_the_reference() {
+        // Ten consecutive five-second range values of the governed reference: the plain fold
+        // rounds their mean to 1.804135, the reference's compensated sum to 1.804134.
+        let window = [
+            0.885_514, 2.767_17, 1.272_715, 2.656_425, 1.549_307, 2.379_582, 0.719_556, 1.715_807,
+            1.881_79, 2.213_479,
+        ];
+        let plain = window.iter().fold(0.0, |total, value| total + value) / 10.0;
+        assert_eq!(six(plain), 1.804_135);
+        assert_eq!(six(sum(window.iter().copied()) / 10.0), 1.804_134);
+        assert_eq!(sum(window.iter().copied()).to_bits(), 0x4032_0A95_95FE_DA66);
     }
 
     #[test]

@@ -570,7 +570,8 @@ time (actual availability); no clock is backdated.
 
 Prices convert from canonical integer units to binary floating point exactly where the
 reference parsed decimal text; anatomy, rolling, and moving-average arithmetic follow the
-reference's operation order; and the normalized values the reference wrote to six-place text
+reference's operation order (window sums use the reference interpreter's compensated
+left-to-right `sum`); and the normalized values the reference wrote to six-place text
 before a later stage read them (`body_bps`, `range_bps`, wick basis points, `close_position`,
 `body_to_range`, wick ratios, returns, momentum, efficiency, means, `range_to_avg20`,
 distances, ratios, and moving-average basis points) are stored as those six-place values, while
