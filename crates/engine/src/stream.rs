@@ -1777,16 +1777,18 @@ mod tests {
             bar(65, [125, 130, 120, 126], 2.0)
         );
         assert!(Observation::from_bar(&archive, scale(1)).is_err());
-        assert!(
-            Observation::from_bar(
-                &Bar {
-                    high: 1.0,
-                    ..archive
-                },
-                scale(2)
-            )
-            .is_err()
-        );
+        for invalid in [
+            Bar {
+                high: 1.0,
+                ..archive
+            },
+            Bar {
+                period_s: 0,
+                ..archive
+            },
+        ] {
+            assert!(Observation::from_bar(&invalid, scale(2)).is_err());
+        }
         let mut tick_stream = tick_stream(&[(5, 0)]);
         assert_eq!(
             tick_stream

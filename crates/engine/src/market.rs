@@ -382,6 +382,9 @@ impl Bar {
                 self.start_unix_s
             ));
         }
+        if period_s == 0 {
+            return Err(format!("bar at {} has no period", self.start_unix_s));
+        }
         if self.period_s != period_s {
             return Err(format!(
                 "bar at {} has period {} seconds, expected {period_s}",
