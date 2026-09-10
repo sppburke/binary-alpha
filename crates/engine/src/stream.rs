@@ -316,7 +316,7 @@ pub struct PriceFacts {
     pub max_units: Option<i64>,
     /// The greatest common divisor of every nonzero move between consecutive prices: the
     /// observed price step, never inferred from a symbol.
-    pub step_units: Option<i64>,
+    pub step_units: Option<u64>,
     pub moves: u64,
 }
 
@@ -564,6 +564,7 @@ impl InstrumentStream {
     /// error, and the profile of a bar instrument records every tick calculation as unsupported
     /// with that same reason.
     pub fn new(instrument: &Instrument, source: Source) -> Result<Self, String> {
+        instrument.validate()?;
         let required = match instrument.native_granularity {
             NativeGranularity::Tick => Capability::Ticks,
             NativeGranularity::Bar { .. } => Capability::Bars,
@@ -848,10 +849,11 @@ impl InstrumentStream {
             self.prices.max_units = Some(self.prices.max_units.map_or(price, |max| max.max(price)));
             if anchor != price {
                 let step = anchor.abs_diff(price);
-                self.prices.step_units = Some(match self.prices.step_units {
-                    Some(current) => gcd(current.unsigned_abs(), step) as i64,
-                    None => step as i64,
-                });
+                self.prices.step_units = Some(
+                    self.prices
+                        .step_units
+                        .map_or(step, |current| gcd(current, step)),
+                );
             }
         }
         if let Some(previous) = previous_close {
@@ -1835,6 +1837,40 @@ mod tests {
             lone.profile().prices.step_units,
             None,
             "one flat bar shows no step"
+        );
+    }
+
+    #[test]
+    fn construction_applies_the_instrument_rules() {
+        let mut zero_jump = instrument(NativeGranularity::Tick, &[(5, 0)]);
+        zero_jump.jump = Some(JumpCheck {
+            min_basis_points: 0,
+        });
+        let error =
+            InstrumentStream::new(&zero_jump, source(NativeGranularity::Tick, Some(scale(6))))
+                .unwrap_err();
+        assert!(error.contains("jump.min_basis_points"), "{error}");
+        let error = InstrumentStream::new(
+            &instrument(NativeGranularity::Tick, &[(0, 0)]),
+            source(NativeGranularity::Tick, Some(scale(6))),
+        )
+        .unwrap_err();
+        assert!(error.contains("candles[0].duration_seconds"), "{error}");
+    }
+
+    #[test]
+    fn the_price_step_is_an_unsigned_magnitude() {
+        let mut stream = tick_stream(&[(5, 0)]);
+        let mut out = Vec::new();
+        for (index, price) in [i64::MIN, i64::MAX, i64::MAX - 3].into_iter().enumerate() {
+            stream
+                .push(tick(index as i64 * 1_000, price), &mut out)
+                .unwrap();
+        }
+        assert_eq!(
+            stream.profile().prices.step_units,
+            Some(3),
+            "the greatest common divisor of u64::MAX and 3"
         );
     }
 

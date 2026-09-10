@@ -7,13 +7,14 @@
 
 mod common;
 
+use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Instant;
 
 use binary_alpha_engine::config::Config;
-use binary_alpha_engine::dataset::GenerationManifest;
+use binary_alpha_engine::dataset::{GenerationManifest, ObjectRole};
 use binary_alpha_engine::market::{PriceScale, Tick, parse_event_time_micros, parse_price_units};
 use binary_alpha_engine::stream::{
     Candle, InstrumentProfile, InstrumentStream, Observation, Source, StreamManifest,
@@ -45,6 +46,28 @@ fn audit(config: &Path, manifest: &Path) -> Result<String, String> {
         assert!(stdout.is_empty(), "{stdout}");
         Err(stderr)
     }
+}
+
+/// A second store under `name` that shares every published object, for manifests tampered
+/// with in one field.
+fn store_sharing_objects(scratch: &Scratch, name: &str) -> PathBuf {
+    let store = scratch.path(name);
+    fs::create_dir_all(store.join("objects")).unwrap();
+    for entry in fs::read_dir(scratch.path("published/objects")).unwrap() {
+        let entry = entry.unwrap();
+        if !entry.file_name().to_string_lossy().starts_with('.') {
+            fs::hard_link(entry.path(), store.join("objects").join(entry.file_name())).unwrap();
+        }
+    }
+    store
+}
+
+/// Writes a tampered stream manifest into `store` and returns its path.
+fn tampered_manifest(store: &Path, manifest: &StreamManifest) -> PathBuf {
+    let path = store.join(manifest.key());
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    fs::write(&path, manifest.to_json()).unwrap();
+    path
 }
 
 /// The `[[instruments]]` entry the synthetic tests use, with the legacy-shaped checks.
@@ -287,6 +310,24 @@ fn audit_publishes_a_stream_generation_that_verifies_and_matches_a_direct_feed()
             .unwrap(),
     );
     assert_eq!(fs::read(manifest_path).unwrap(), fs::read(&mirror).unwrap());
+
+    // A candle object that belongs to another stream of the same instrument fails verification
+    // on its footer, before any row is compared: the two candle objects trade paths.
+    let mut swapped = StreamManifest::from_json(&fs::read(manifest_path).unwrap()).unwrap();
+    let candles: Vec<usize> = (0..swapped.objects.len())
+        .filter(|&index| swapped.objects[index].path.starts_with("candles/"))
+        .collect();
+    assert_eq!(candles.len(), 2);
+    let path = swapped.objects[candles[0]].path.clone();
+    swapped.objects[candles[0]].path =
+        std::mem::replace(&mut swapped.objects[candles[1]].path, path);
+    let swapped_path = tampered_manifest(&store_sharing_objects(&scratch, "swapped"), &swapped);
+    assert!(
+        verify(&swapped_path)
+            .unwrap_err()
+            .contains("carries metadata"),
+        "a candle object of another stream fails verification"
+    );
 
     let published = published_stream(&scratch.path("published"), manifest_path);
     let manifest = &published.manifest;
@@ -600,18 +641,7 @@ fn audit_binds_only_a_configured_matching_instrument() {
     // A source manifest whose recorded row count disagrees with its objects is refused before
     // anything is published, and a stream manifest whose source kind contradicts its profile
     // fails verification: both under a second store that shares the objects.
-    let tampered = scratch.path("tampered");
-    fs::create_dir_all(tampered.join("objects")).unwrap();
-    for entry in fs::read_dir(scratch.path("published/objects")).unwrap() {
-        let entry = entry.unwrap();
-        if !entry.file_name().to_string_lossy().starts_with('.') {
-            fs::hard_link(
-                entry.path(),
-                tampered.join("objects").join(entry.file_name()),
-            )
-            .unwrap();
-        }
-    }
+    let tampered = store_sharing_objects(&scratch, "tampered");
     let mut miscounted = GenerationManifest::from_json(&fs::read(&euro).unwrap()).unwrap();
     miscounted.row_count += 1;
     let miscounted_path = tampered.join(miscounted.key());
@@ -624,11 +654,8 @@ fn audit_binds_only_a_configured_matching_instrument() {
     );
     let mut contradicted = StreamManifest::from_json(&fs::read(manifest_path).unwrap()).unwrap();
     contradicted.source_kind = binary_alpha_engine::dataset::SourceKind::TickCsv;
-    let contradicted_path = tampered.join(contradicted.key());
-    fs::create_dir_all(contradicted_path.parent().unwrap()).unwrap();
-    fs::write(&contradicted_path, contradicted.to_json()).unwrap();
     assert!(
-        verify(&contradicted_path)
+        verify(&tampered_manifest(&tampered, &contradicted))
             .unwrap_err()
             .contains("does not describe the manifest's instrument"),
         "a contradicted source kind fails verification"
@@ -1077,10 +1104,7 @@ fn assert_closed_window_facts(
         .filter(|delta| *delta != 0)
         .collect();
     assert_eq!(profile.prices.moves, moves.len() as u64);
-    assert_eq!(
-        profile.prices.step_units,
-        moves.iter().copied().reduce(gcd).map(|step| step as i64)
-    );
+    assert_eq!(profile.prices.step_units, moves.iter().copied().reduce(gcd));
     // Jumps by context and the exact basis-point buckets.
     let jumps = profile.jumps.as_ref().unwrap();
     let mut flagged = [0u64; 3];
@@ -1316,6 +1340,16 @@ fn governed_fixture_proof() {
                 .key,
         );
     let ticks = read_normalized_ticks(&normalized);
+    // The reference converts every timestamp through binary floating point
+    // (`int(dt.timestamp() * 1000)`), which can shift a whole millisecond by one; the same
+    // conversion, modelled exactly, must preserve every input record for parity to hold.
+    assert!(
+        ticks.iter().all(|tick| {
+            let micros = tick.event_time_micros;
+            micros % 1_000 == 0 && ((micros as f64 / 1e6) * 1e3) as i64 == micros / 1_000
+        }),
+        "the reference's millisecond conversion preserves every input record"
+    );
     assert_eq!(ticks.len() as u64, dataset.row_count);
     let started = Instant::now();
     let (direct, profile) = feed(&instrument, &dataset, &ticks);
@@ -1366,7 +1400,44 @@ fn governed_fixture_proof() {
 
     // The separate bar acceptance case: three explicitly supplied generations.
     let mut steps = Vec::new();
+    let collection: Value =
+        serde_json::from_slice(&fs::read(&governed.collection_manifest).unwrap()).unwrap();
     for (case, bar_dataset) in governed.bar_manifests.iter().zip(&bar_datasets) {
+        // The collection manifest's entry for the symbol lists exactly the source files the
+        // ready manifest imported, the same row count, and the class that decides the base
+        // currency.
+        let symbol = bar_dataset.provider_symbol.as_str();
+        let entry = &collection["assets"][symbol];
+        assert!(
+            entry.is_object(),
+            "{symbol} is an asset of the collection manifest"
+        );
+        let listed: BTreeSet<&str> = entry["parquet_files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|file| file["sha256"].as_str().unwrap())
+            .collect();
+        let imported: BTreeSet<&str> = bar_dataset
+            .objects
+            .iter()
+            .filter(|object| object.role == ObjectRole::Source)
+            .map(|object| object.sha256.as_str())
+            .collect();
+        assert_eq!(
+            imported, listed,
+            "{symbol}: the ready manifest's source objects are the collection's listed files"
+        );
+        assert_eq!(entry["canonical_rows"], bar_dataset.row_count);
+        let currency = entry["asset_type"] == "currency" || entry["batch"] == "fx_currency";
+        assert_eq!(
+            currency,
+            case.base_currency.is_some(),
+            "{symbol}: the collection's class decides the base currency"
+        );
+        if !currency {
+            assert_eq!(entry["asset_type"], "stock", "{symbol}");
+        }
         let (line, wall, peak) = timed_audit(&config, &case.manifest);
         println!("audit: {line}");
         println!("audit wall {wall:.3} s, peak resident {peak} kB");
@@ -1433,17 +1504,6 @@ fn governed_fixture_proof() {
             "the observed price step is one unit at the configured scale, so the configured scale is the observed one"
         );
         steps.push((case.base_currency.is_some(), case.price_scale));
-    }
-    let collection: Value =
-        serde_json::from_slice(&fs::read(&governed.collection_manifest).unwrap()).unwrap();
-    for dataset in &bar_datasets {
-        assert!(
-            collection["assets"]
-                .get(dataset.provider_symbol.as_str())
-                .is_some(),
-            "{} is an asset of the collection manifest",
-            dataset.provider_symbol
-        );
     }
     println!(
         "bar selection evidence: collection manifest {} sha256 {} selection {}",

@@ -273,7 +273,13 @@ fn verify_stream(uri: &str, store: &Store, key: &str, bytes: &[u8]) -> Result<St
                 .map_err(|error| format!("cannot read {location}: {error}"))
                 .and_then(|bytes| InstrumentProfile::from_json(&bytes))
                 .map_err(|reason| format!("{location}: {reason}"))?;
+            let definition = &manifest.definition;
             let consistent = profile.instrument == manifest.instrument
+                && profile.broker == definition.broker
+                && profile.provider_symbol == definition.provider_symbol
+                && profile.base_currency == definition.base_currency
+                && profile.quote_currency == definition.quote_currency
+                && profile.source.native_granularity == definition.native_granularity
                 && profile.source.generation == manifest.source_generation
                 && profile.source.source_kind == manifest.source_kind
                 && profile.source.role == manifest.role
@@ -305,9 +311,14 @@ fn verify_stream(uri: &str, store: &Store, key: &str, bytes: &[u8]) -> Result<St
                     == object.path
             })
             .ok_or_else(|| format!("{location} belongs to no stream"))?;
-        let (rows, first_open, last_close) =
-            archive::read_candles(&local.path, manifest.definition.price_scale)
-                .map_err(|reason| format!("{location}: {reason}"))?;
+        let (rows, first_open, last_close) = archive::read_candles(
+            &local.path,
+            &manifest.definition.id(),
+            manifest.definition.price_scale,
+            summary.duration_seconds,
+            summary.offset_seconds,
+        )
+        .map_err(|reason| format!("{location}: {reason}"))?;
         if rows != summary.rows
             || first_open.map(format_event_time_micros) != summary.first_open_time
             || last_close.map(format_event_time_micros) != summary.last_close_time

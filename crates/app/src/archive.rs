@@ -586,17 +586,7 @@ impl CandleWriter {
     ) -> Result<Self, String> {
         let schema =
             Arc::new(parse_message_type(CANDLE_SCHEMA).map_err(|error| error.to_string())?);
-        let metadata = [
-            ("broker", instrument.broker.to_string()),
-            ("provider_symbol", instrument.provider_symbol.to_string()),
-            ("price_scale", scale.digits().to_string()),
-            ("duration_seconds", duration_seconds.to_string()),
-            ("offset_seconds", offset_seconds.to_string()),
-            ("stream_schema_version", STREAM_SCHEMA_VERSION.to_string()),
-        ]
-        .into_iter()
-        .map(|(key, value)| KeyValue::new(key.to_string(), value))
-        .collect();
+        let metadata = candle_metadata(instrument, scale, duration_seconds, offset_seconds);
         let properties = Arc::new(
             WriterProperties::builder()
                 .set_compression(Compression::ZSTD(
@@ -737,12 +727,36 @@ fn flag_field(candle: &Candle, column: usize) -> bool {
     }
 }
 
-/// Reads a candle object back row group by row group, checking the schema, the recorded scale,
-/// every row's internal consistency, and the order of intervals; returns the row count and
-/// bounds.
+/// The footer metadata every candle object carries: the instrument, scale, and stream it
+/// belongs to, so a read-back is bound to exactly one stream of one instrument.
+fn candle_metadata(
+    instrument: &InstrumentId,
+    scale: PriceScale,
+    duration_seconds: u32,
+    offset_seconds: u32,
+) -> Vec<KeyValue> {
+    [
+        ("broker", instrument.broker.to_string()),
+        ("provider_symbol", instrument.provider_symbol.to_string()),
+        ("price_scale", scale.digits().to_string()),
+        ("duration_seconds", duration_seconds.to_string()),
+        ("offset_seconds", offset_seconds.to_string()),
+        ("stream_schema_version", STREAM_SCHEMA_VERSION.to_string()),
+    ]
+    .into_iter()
+    .map(|(key, value)| KeyValue::new(key.to_string(), value))
+    .collect()
+}
+
+/// Reads a candle object back row group by row group, checking the schema, the recorded
+/// instrument, scale, and stream, every row's internal consistency, and the order of intervals;
+/// returns the row count and bounds.
 pub fn read_candles(
     path: &Path,
+    instrument: &InstrumentId,
     scale: PriceScale,
+    duration_seconds: u32,
+    offset_seconds: u32,
 ) -> Result<(u64, Option<i64>, Option<i64>), String> {
     let reader = open(path)?;
     let schema = printed_schema(&reader);
@@ -752,17 +766,12 @@ pub fn read_candles(
             path.display()
         ));
     }
-    let embedded_scale = reader
-        .metadata()
-        .file_metadata()
-        .key_value_metadata()
-        .and_then(|pairs| pairs.iter().find(|pair| pair.key == "price_scale"))
-        .and_then(|pair| pair.value.as_deref()?.parse::<u8>().ok());
-    if embedded_scale != Some(scale.digits()) {
+    let expected = candle_metadata(instrument, scale, duration_seconds, offset_seconds);
+    let embedded = reader.metadata().file_metadata().key_value_metadata();
+    if embedded != Some(&expected) {
         return Err(format!(
-            "{} declares price_scale {embedded_scale:?}, expected {}",
-            path.display(),
-            scale.digits()
+            "{} carries metadata {embedded:?}, expected {expected:?}",
+            path.display()
         ));
     }
     let mut rows = 0;

@@ -381,7 +381,8 @@ known-at time, first and last event time, active span (last known-at time minus 
 time), open, high, low, and close units, record and duplicate counts, the summed source volume
 for bars, the time from the previous record to its first record (absent for the first record of
 the stream), the longest inter-arrival time inside it, the number of missing intervals before it,
-the longest run of consecutive records showing one unchanged price and that run's span, and the
+the most records in one run of one unchanged price and the longest span of such a run
+(independent maxima), and the
 largest relative move in whole basis points (`floor(10000 · |move| / |previous price|)`, exact
 in integer arithmetic, `u32::MAX` at most, undefined and skipped after a zero price) over the
 moves that enter or lie inside it, in each of three inter-arrival contexts: contiguous (the
@@ -397,7 +398,11 @@ interval before it is missing; `frozen` when a run reaches `frozen.min_observati
 `frozen.min_seconds`; `jump`, `delayed_jump`, and `reopen_jump` when the largest move of that
 context reaches `jump.min_basis_points`; and `short_span` when the active span is below
 `span.min_percent` of the duration. `complete` is the absence of every gap flag and of hard low
-activity; `clean` is the strict eligibility verdict, the absence of every flag.
+activity; `clean` is the strict eligibility verdict, the absence of every flag. The pinned
+resampler is a reference with two limitations the target does not reproduce: it parses every
+timestamp to whole milliseconds through binary floating point (a sub-millisecond time is
+truncated and a whole-millisecond time can shift by one), and it treats a run of one price that
+starts at the Unix epoch as absent; the target keeps exact microseconds and every run.
 
 ### Profile
 
@@ -409,12 +414,13 @@ holds values in `[2^(k-1), 2^k)` and bucket `0` holds zeros); observed prices (m
 the number of nonzero moves between consecutive records, and the greatest common divisor of
 every nonzero difference between a record's prices and the previous close, or the record's own
 open for the first record, as the observed price step); gaps over the threshold (count, longest, total); closed frozen runs that met the
-thresholds (count, longest in records and in time); moves in whole basis points by bit length
+thresholds (count, most records in one run, longest span of one run); moves in whole basis points by bit length
 with the counts that reached the jump threshold in each context; records inside each
 session window and outside every window; per stream the finalized count, the withheld record
 count, records per finalized candle by bit length, and how many candles carried each flag,
-`complete`, and `clean`; and the supported calculations. Every count covers only closed windows,
-so a longer input extends the profile and never revises what a shorter input reported, and the
+`complete`, and `clean`; and the supported calculations. Every count except the withheld record
+count covers only closed windows, so a longer input extends the profile and never revises what a
+shorter input reported, and the
 finalized candles of any prefix are a prefix of the full output. The profile is evidence, never
 self-modifying configuration.
 
@@ -428,7 +434,8 @@ instrument that maps its identity and native granularity (an identity mapped onl
 granularity is bound so that the capability error names what the source lacks; an unmapped
 identity is an error, never a default), verifies and decodes every data object in manifest order
 through the Phase 02 readers, feeds every record, requires the observed record count and
-coverage to equal the manifest's `row_count` and `coverage` before it writes anything, and writes
+coverage to equal the manifest's `row_count` and `coverage` before it publishes anything (candle
+rows stream into temporary files under the retained folder while the input is read), and writes
 one candle object per stream and the profile. The stream generation's identity is the SHA-256, rendered as sixty-four lowercase
 hexadecimal digits, of the UTF-8 text `binary-alpha instrument stream generation v1`, one line
 feed, the source generation, one line feed, and the instrument's canonical definition. Its objects
