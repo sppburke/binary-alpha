@@ -414,7 +414,7 @@ fn readiness(field: Field) -> &'static str {
             "`unknown` until windows 5 and 20 fill with a positive 20-window mean"
         }
         F::DirectionalState => {
-            "`unknown` until the direction window fills; then `sideways`, `up`, or `down`"
+            "`unknown` while the direction window's momentum or efficiency is unavailable (the window unfilled, or a zero absolute-return sum); then `sideways`, `up`, or `down`"
         }
         F::RangeLike | F::PullbackAgainstTrend => "false until its inputs are available",
         F::TrendLegDirection => "`none` until a directional state holds",

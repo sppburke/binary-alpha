@@ -15,8 +15,8 @@ use std::path::{Path, PathBuf};
 use binary_alpha_engine::config::Config;
 use binary_alpha_engine::dataset::GenerationManifest;
 use binary_alpha_engine::features::{
-    Exclusion, FeatureEngine, FeatureManifest, FeatureOutput, FeaturePlan, Value,
-    feature_generation_id, raw_identity,
+    Exclusion, FeatureEngine, FeatureManifest, FeatureOutput, FeaturePlan, SequenceEvent,
+    StructureEvent, Value, feature_generation_id, raw_identity,
 };
 use binary_alpha_engine::market::{Tick, format_event_time_micros};
 use binary_alpha_engine::stream::{Observation, Source, StreamManifest};
@@ -339,6 +339,86 @@ fn assert_prefix(prefix: &FeatureOutput, full: &FeatureOutput, cutoff: i64, perc
     );
 }
 
+/// The structure-event table's columns, and one engine event rendered as that table's row.
+const STRUCTURE_COLUMNS: [&str; 14] = [
+    "event_id",
+    "event_type",
+    "event_direction",
+    "event_close_micros",
+    "confirm_close_micros",
+    "known_at_micros",
+    "event_row",
+    "confirm_row",
+    "event_candle_ordinal",
+    "confirm_candle_ordinal",
+    "price_units",
+    "level_units",
+    "reference",
+    "reference_close_micros",
+];
+
+fn structure_row(event: &StructureEvent) -> Vec<Option<Value>> {
+    let count = |value: u64| Some(Value::Int(value as i64));
+    let text = |value: &'static str| Some(Value::Text(value.into()));
+    vec![
+        count(event.event_id),
+        text(event.event_type),
+        text(event.direction),
+        Some(Value::Time(event.event_close_micros)),
+        Some(Value::Time(event.confirm_close_micros)),
+        Some(Value::Time(event.known_at_micros)),
+        count(event.event_row),
+        count(event.confirm_row),
+        count(event.event_candle_ordinal),
+        count(event.confirm_candle_ordinal),
+        Some(Value::Int(event.price_units)),
+        Some(Value::Int(event.level_units)),
+        text(event.reference),
+        event.reference_close_micros.map(Value::Time),
+    ]
+}
+
+/// The sequence-event table's columns, and one engine event rendered as that table's row.
+const SEQUENCE_COLUMNS: [&str; 15] = [
+    "event_id",
+    "row",
+    "candle_ordinal",
+    "decision_close_micros",
+    "known_at_micros",
+    "swing_event_type",
+    "swing_type",
+    "swing_price_units",
+    "swing_event_close_micros",
+    "swing_confirm_close_micros",
+    "previous_price_units",
+    "previous_event_close_micros",
+    "previous_confirm_close_micros",
+    "sequence_after",
+    "bias_after",
+];
+
+fn sequence_row(event: &SequenceEvent) -> Vec<Option<Value>> {
+    let count = |value: u64| Some(Value::Int(value as i64));
+    let text = |value: &'static str| Some(Value::Text(value.into()));
+    vec![
+        count(event.event_id),
+        count(event.row),
+        count(event.candle_ordinal),
+        Some(Value::Time(event.decision_close_micros)),
+        Some(Value::Time(event.known_at_micros)),
+        text(event.swing_event_type),
+        text(event.swing_type),
+        Some(Value::Int(event.swing_price_units)),
+        Some(Value::Time(event.swing_event_close_micros)),
+        Some(Value::Time(event.swing_confirm_close_micros)),
+        event.previous_price_units.map(Value::Int),
+        event.previous_event_close_micros.map(Value::Time),
+        event.previous_confirm_close_micros.map(Value::Time),
+        text(event.sequence_after),
+        text(event.bias_after),
+    ]
+}
+
 fn value_of<'a>(row: &'a [Option<Value>], names: &[String], name: &str) -> Option<&'a Value> {
     row[names.iter().position(|n| n == name).unwrap()].as_ref()
 }
@@ -511,8 +591,8 @@ fn features_build_fits_publishes_reconstructs_freezes_and_isolates() {
     for (index, stream_plan) in plan.streams.iter().enumerate() {
         let [
             (names, rows),
-            (_, structure),
-            (_, sequence),
+            (structure_names, structure),
+            (sequence_names, sequence),
             (code_names, codes),
         ] = published.tables[index].as_slice()
         else {
@@ -546,19 +626,26 @@ fn features_build_fits_publishes_reconstructs_freezes_and_isolates() {
             sequence.len() as u64,
             manifest.streams[index].sequence_events
         );
+        // Every event field is persisted as the engine emitted it.
+        assert_eq!(structure_names, &STRUCTURE_COLUMNS.map(str::to_string));
         assert_eq!(
+            *structure,
             full.structure_events
                 .iter()
                 .filter(|(s, _)| *s == index)
-                .count(),
-            structure.len()
+                .map(|(_, event)| structure_row(event))
+                .collect::<Vec<_>>(),
+            "stream {index} structure events"
         );
+        assert_eq!(sequence_names, &SEQUENCE_COLUMNS.map(str::to_string));
         assert_eq!(
+            *sequence,
             full.sequence_events
                 .iter()
                 .filter(|(s, _)| *s == index)
-                .count(),
-            sequence.len()
+                .map(|(_, event)| sequence_row(event))
+                .collect::<Vec<_>>(),
+            "stream {index} sequence events"
         );
         // Encoded codes are the frozen encodings applied to the raw columns.
         assert_eq!(
@@ -2179,9 +2266,9 @@ fn governed_reference_parity() {
         physical.len()
     );
 
-    // The whole-input in-process feed reproduces the published rows and events one by one, and
-    // every prefix is exactly what the full feed made known by its cutoff. Only known-at times
-    // are retained, so the test holds bounded state rather than every row.
+    // The whole-input in-process feed reproduces the published rows and complete event rows one
+    // by one, and every prefix is exactly what the full feed made known by its cutoff. Only
+    // known-at times are retained, so the test holds bounded state rather than every row.
     // The input generation lives in its own store, named by the entry's input manifest.
     let input_root = match &entry.input_manifest.root {
         binary_alpha_engine::config::PublicationUri::Filesystem(path) => path.clone(),
@@ -2212,10 +2299,13 @@ fn governed_reference_parity() {
                     .collect()
             })
             .collect();
+        for stream in &tables {
+            assert_eq!(stream[1].0, STRUCTURE_COLUMNS.map(str::to_string));
+            assert_eq!(stream[2].0, SEQUENCE_COLUMNS.map(str::to_string));
+        }
         let mut known: Vec<[Vec<i64>; 3]> = vec![Default::default(); plan.streams.len()];
         let mut engine = FeatureEngine::new(plan, Source::from_manifest(&input)).unwrap();
         let mut out = FeatureOutput::default();
-        let int = |value: u64| Some(Value::Int(value as i64));
         for tick in ticks {
             engine.push(Observation::Tick(*tick), &mut out).unwrap();
             for (index, row) in out.rows.drain(..) {
@@ -2229,28 +2319,9 @@ fn governed_reference_parity() {
                 known[index][0].push(row.known_at_micros);
             }
             for (index, event) in out.structure_events.drain(..) {
-                let (names, rows) = &mut tables[index][1];
-                let published = rows.next().expect("a published structure event");
-                let pick = |name: &str| value_of(&published, names, name).cloned();
                 assert_eq!(
-                    [
-                        pick("event_id"),
-                        pick("event_type"),
-                        pick("event_row"),
-                        pick("confirm_row"),
-                        pick("price_units"),
-                        pick("level_units"),
-                        pick("known_at_micros"),
-                    ],
-                    [
-                        int(event.event_id),
-                        Some(Value::Text(event.event_type.into())),
-                        int(event.event_row),
-                        int(event.confirm_row),
-                        Some(Value::Int(event.price_units)),
-                        Some(Value::Int(event.level_units)),
-                        Some(Value::Time(event.known_at_micros)),
-                    ],
+                    tables[index][1].1.next(),
+                    Some(structure_row(&event)),
                     "{}s structure event {}",
                     plan.streams[index].duration_seconds,
                     known[index][1].len()
@@ -2258,24 +2329,9 @@ fn governed_reference_parity() {
                 known[index][1].push(event.known_at_micros);
             }
             for (index, event) in out.sequence_events.drain(..) {
-                let (names, rows) = &mut tables[index][2];
-                let published = rows.next().expect("a published sequence event");
-                let pick = |name: &str| value_of(&published, names, name).cloned();
                 assert_eq!(
-                    [
-                        pick("event_id"),
-                        pick("row"),
-                        pick("swing_event_type"),
-                        pick("swing_price_units"),
-                        pick("known_at_micros"),
-                    ],
-                    [
-                        int(event.event_id),
-                        int(event.row),
-                        Some(Value::Text(event.swing_event_type.into())),
-                        Some(Value::Int(event.swing_price_units)),
-                        Some(Value::Time(event.known_at_micros)),
-                    ],
+                    tables[index][2].1.next(),
+                    Some(sequence_row(&event)),
                     "{}s sequence event {}",
                     plan.streams[index].duration_seconds,
                     known[index][2].len()
