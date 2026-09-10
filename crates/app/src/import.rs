@@ -915,11 +915,21 @@ fn same_result(
         && committed.row_count == fresh.row_count
         && committed.coverage == fresh.coverage
         && committed.interval == fresh.interval
-        && committed.objects.len() == fresh.objects.len()
+        && same_objects(&committed.objects, &fresh.objects, identities)
+}
+
+/// Committed objects describe fresh ones when they agree by role, path, identity, and size,
+/// every recorded checksum matches the bytes, and every checksum or generation the destination
+/// reports now matches the record.
+pub(crate) fn same_objects(
+    committed: &[ObjectRecord],
+    fresh: &[ObjectRecord],
+    identities: &[ObjectIdentity],
+) -> bool {
+    committed.len() == fresh.len()
         && committed
-            .objects
             .iter()
-            .zip(fresh.objects.iter().zip(identities))
+            .zip(fresh.iter().zip(identities))
             .all(|(a, (b, identity))| {
                 a.role == b.role
                     && a.path == b.path
@@ -931,7 +941,7 @@ fn same_result(
             })
 }
 
-fn record(role: ObjectRole, path: &str, identity: &ObjectIdentity) -> ObjectRecord {
+pub(crate) fn record(role: ObjectRole, path: &str, identity: &ObjectIdentity) -> ObjectRecord {
     ObjectRecord {
         role,
         path: path.to_string(),
@@ -945,7 +955,7 @@ fn record(role: ObjectRole, path: &str, identity: &ObjectIdentity) -> ObjectReco
 
 /// A process-specific scratch path inside the retained folder's object directory; a leftover
 /// from an interrupted run is ignored by every reader and overwritten by the same process id.
-fn temporary_path(local: &Store, name: &str) -> Result<PathBuf, String> {
+pub(crate) fn temporary_path(local: &Store, name: &str) -> Result<PathBuf, String> {
     let path = local
         .local_path(&format!("objects/.tmp-{name}-{}", std::process::id()))
         .expect("the retained folder is a filesystem store");

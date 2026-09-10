@@ -6,6 +6,7 @@
 pub mod config;
 pub mod dataset;
 pub mod market;
+pub mod stream;
 
 /// Lowercase hexadecimal rendering of a digest or checksum.
 pub fn hex(bytes: &[u8]) -> String {

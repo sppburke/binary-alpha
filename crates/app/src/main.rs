@@ -1,7 +1,8 @@
-//! The `binary-alpha` executable: configuration validation, historical-data import and
-//! verification, and the external adapters those commands need.
+//! The `binary-alpha` executable: configuration validation, historical-data import, instrument
+//! audit, verification, and the external adapters those commands need.
 
 mod archive;
+mod audit;
 mod import;
 mod parallel;
 mod store;
@@ -32,7 +33,7 @@ enum Command {
         #[command(subcommand)]
         command: ConfigCommand,
     },
-    /// Import and verify immutable historical datasets.
+    /// Import, audit, and verify immutable historical generations.
     #[command(disable_help_subcommand = true)]
     Data {
         #[command(subcommand)]
@@ -58,6 +59,16 @@ enum DataCommand {
         #[arg(long)]
         config: PathBuf,
     },
+    /// Feed one published dataset generation through its configured instrument stream and
+    /// publish the profile, finalized candles, and stream manifest.
+    Audit {
+        /// Path of the TOML configuration document naming the instrument.
+        #[arg(long)]
+        config: PathBuf,
+        /// `file://` or `gs://` location of the dataset ready manifest.
+        #[arg(long)]
+        manifest: String,
+    },
     /// Re-read one published generation from its ready manifest and objects alone.
     Verify {
         /// `file://` or `gs://` location ending in `manifests/GENERATION/ready.json`.
@@ -74,6 +85,9 @@ fn main() -> ExitCode {
         Command::Data {
             command: DataCommand::Import { config },
         } => import::run(&config, &mut std::io::stdout().lock()),
+        Command::Data {
+            command: DataCommand::Audit { config, manifest },
+        } => audit::run(&config, &manifest, &mut std::io::stdout().lock()),
         Command::Data {
             command: DataCommand::Verify { manifest },
         } => verify::run(&manifest).map(|line| println!("{line}")),

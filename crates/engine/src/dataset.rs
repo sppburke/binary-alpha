@@ -60,11 +60,20 @@ crate::string_enum! {
 }
 
 /// The native granularity of the source.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum NativeGranularity {
     Tick,
     Bar { period_seconds: u16 },
+}
+
+impl fmt::Display for NativeGranularity {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Tick => f.write_str("tick"),
+            Self::Bar { period_seconds } => write!(f, "{period_seconds}-second bar"),
+        }
+    }
 }
 
 /// How prices are represented in the generation's data objects.
@@ -321,30 +330,12 @@ impl GenerationManifest {
         if let Some(interval) = &self.interval {
             interval.validate()?;
         }
-        let mut normalized = 0;
-        for (index, object) in self.objects.iter().enumerate() {
-            if !is_hex64(&object.sha256) || object.key != object_key(&object.sha256) {
-                return Err(format!(
-                    "object `{}` is not content-addressed by its SHA-256",
-                    object.path
-                ));
-            }
-            if object.path.bytes().any(|byte| byte.is_ascii_control()) {
-                return Err(format!(
-                    "object path `{}` contains a control character",
-                    object.path.escape_default()
-                ));
-            }
-            crate::config::relative_path(&object.path)
-                .map_err(|reason| format!("object path `{}`: {reason}", object.path))?;
-            if self.objects[..index]
-                .iter()
-                .any(|earlier| earlier.path == object.path)
-            {
-                return Err(format!("object path `{}` is listed twice", object.path));
-            }
-            normalized += usize::from(object.role == ObjectRole::Normalized);
-        }
+        validate_objects(&self.objects)?;
+        let normalized = self
+            .objects
+            .iter()
+            .filter(|object| object.role == ObjectRole::Normalized)
+            .count();
         let expected = usize::from(scale.is_some());
         if normalized != expected || self.objects.len() == normalized {
             return Err(format!(
@@ -385,6 +376,34 @@ impl GenerationManifest {
             generation: self.generation.clone(),
         })
     }
+}
+
+/// The object invariants every consumer relies on before it trusts a key: content-addressed
+/// keys and unique clean paths without a control character.
+pub fn validate_objects(objects: &[ObjectRecord]) -> Result<(), String> {
+    for (index, object) in objects.iter().enumerate() {
+        if !is_hex64(&object.sha256) || object.key != object_key(&object.sha256) {
+            return Err(format!(
+                "object `{}` is not content-addressed by its SHA-256",
+                object.path
+            ));
+        }
+        if object.path.bytes().any(|byte| byte.is_ascii_control()) {
+            return Err(format!(
+                "object path `{}` contains a control character",
+                object.path.escape_default()
+            ));
+        }
+        crate::config::relative_path(&object.path)
+            .map_err(|reason| format!("object path `{}`: {reason}", object.path))?;
+        if objects[..index]
+            .iter()
+            .any(|earlier| earlier.path == object.path)
+        {
+            return Err(format!("object path `{}` is listed twice", object.path));
+        }
+    }
+    Ok(())
 }
 
 /// A consumer asked a generation for a capability its source does not provide.

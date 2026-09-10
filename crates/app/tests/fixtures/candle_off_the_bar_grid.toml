@@ -1,0 +1,14 @@
+schema_version = 1
+run_mode = "research"
+
+[storage]
+historical_data_dir = "../historical_data"
+publication_uri = "gs://example-bucket/historical"
+
+[[instruments]]
+broker = "pocket_option"
+provider_symbol = "#AAPL"
+quote_currency = "USD"
+price_scale = 2
+native_granularity = { kind = "bar", period_seconds = 5 }
+candles = [{ duration_seconds = 15, offset_seconds = 3 }]

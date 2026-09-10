@@ -49,6 +49,17 @@ either copy. No quiescence is required; readers of the source files continue dur
 Verify: `binary-alpha data verify --manifest URI` re-reads one generation from its ready manifest and
 objects alone, from either the destination or the retained mirror.
 
+Audit: declare the instrument under `[[instruments]]` (identity, currencies, price scale, native
+granularity, the enabled checks, sessions, and candle streams), then run
+`binary-alpha data audit --config PATH --manifest URI` against the published dataset generation.
+The command reads the generation from the store the manifest names, verifies every data object as
+it decodes it, feeds the instrument stream in order, retains the profile and candle objects in the
+historical-data folder, publishes them and the stream manifest last to `storage.publication_uri`,
+and mirrors the manifest. It is resumable and idempotent the same way import is: rerunning it reuses
+identical objects and a committed manifest, and different content at an existing key stops it
+without replacing anything. A generation whose identity no instrument maps is an error; no
+instrument is ever defaulted. Verify a stream generation with the same `data verify` command.
+
 Rollout to Google Cloud Storage: discover and reuse existing projects, buckets, identities, and
 regions first; create nothing in a region whose name begins `us-west`; provision the bucket and a
 least-privilege identity that can read and create objects but not create or delete buckets, outside
@@ -62,9 +73,10 @@ service, runner, and secret.
 
 ## Rollback
 
-A repository change rolls back by reverting its merge commit. Published dataset generations are
+A repository change rolls back by reverting its merge commit. Published dataset and stream
+generations are
 immutable and are never deleted by rollback; the retained historical-data folder and the original
-source files stay intact. Schema, broker, and other production state do not exist at this phase; the
+source files stay intact, and a consumer selects the prior stream generation by its identity. Schema, broker, and other production state do not exist at this phase; the
 phase that creates any of them records its own cause-specific verification and rollback before it
 ships. Production work minimizes downtime, prefers
 a safe non-quiescent alternative when one preserves proof and rollback, checkpoints each mutation for
