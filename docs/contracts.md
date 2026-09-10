@@ -386,7 +386,9 @@ the stream), the longest inter-arrival time inside it, the number of missing int
 the most records in one run of one unchanged price and the longest span of such a run
 (independent maxima), and the
 largest relative move in whole basis points (`floor(10000 · |move| / |previous price|)`, exact
-in integer arithmetic, `u32::MAX` at most, undefined and skipped after a zero price) over the
+in integer arithmetic, `i64::MAX` at most (the candle column's limit, far past the 2^53 basis
+points where the reference's floating-point value stops being exact), undefined and skipped
+after a zero price) over the
 moves that enter or lie inside it, in each of three inter-arrival contexts: contiguous (the
 time before the move is at most `gap.max_seconds`), delayed (over that but under
 `gap.reopen_seconds`), and reopen (at least `gap.reopen_seconds`); without a `gap` check every

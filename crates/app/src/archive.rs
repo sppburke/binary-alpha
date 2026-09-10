@@ -695,19 +695,23 @@ fn int_field(candle: &Candle, column: usize) -> i64 {
         7 => candle.high_units,
         8 => candle.low_units,
         9 => candle.close_units,
-        10 => i64::from(candle.observations),
-        11 => i64::from(candle.duplicates),
+        10 => count(candle.observations),
+        11 => count(candle.duplicates),
         14 => candle.max_gap_inside_micros,
-        // Bounded by the stream's time range, far below the column's limit.
-        15 => i64::try_from(candle.missing_buckets_before)
-            .expect("missing intervals are bounded by the representable time range"),
-        16 => i64::from(candle.frozen_observations),
+        15 => count(candle.missing_buckets_before),
+        16 => count(candle.frozen_observations),
         17 => candle.frozen_micros,
-        18 => i64::from(candle.max_jump_basis_points),
-        19 => i64::from(candle.max_delayed_jump_basis_points),
-        20 => i64::from(candle.max_reopen_jump_basis_points),
+        18 => count(candle.max_jump_basis_points),
+        19 => count(candle.max_delayed_jump_basis_points),
+        20 => count(candle.max_reopen_jump_basis_points),
         _ => unreachable!("column {column} is not an integer column"),
     }
+}
+
+/// A candle count in its `INT64` column: every count is bounded by the stream's time range or
+/// by `MAX_BASIS_POINTS`, both below the column's limit.
+fn count(value: u64) -> i64 {
+    i64::try_from(value).expect("candle counts stay below the column's limit")
 }
 
 fn flag_field(candle: &Candle, column: usize) -> bool {
@@ -797,8 +801,8 @@ pub fn read_candles(
             .map(|column| read_column::<BoolType>(&*group, column, Some(count)))
             .collect::<Result<_, _>>()?;
         for row in 0..count {
-            let observation = |column: usize| -> Result<u32, String> {
-                u32::try_from(ints[column][row]).map_err(|_| {
+            let observation = |column: usize| -> Result<u64, String> {
+                u64::try_from(ints[column][row]).map_err(|_| {
                     format!(
                         "{} row {row}: column {column} is not a count",
                         path.display()
@@ -821,9 +825,7 @@ pub fn read_candles(
                 volume: volumes[row],
                 gap_before_micros: gaps[row],
                 max_gap_inside_micros: ints[14][row],
-                missing_buckets_before: u64::try_from(ints[15][row]).map_err(|_| {
-                    format!("{} row {row}: column 15 is not a count", path.display())
-                })?,
+                missing_buckets_before: observation(15)?,
                 frozen_observations: observation(16)?,
                 frozen_micros: ints[17][row],
                 max_jump_basis_points: observation(18)?,

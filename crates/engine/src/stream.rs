@@ -35,6 +35,10 @@ const MICROS_PER_SECOND: i64 = 1_000_000;
 /// The largest event or known-at time a record may carry, in microseconds either side of the
 /// epoch (about 73,000 years): every interval boundary and every difference then fits in `i64`.
 pub const MAX_EVENT_MICROS: i64 = i64::MAX / 4;
+/// The largest relative move a candle records, in whole basis points: the candle column's
+/// limit, and far past the point where the reference's floating-point value stops being exact
+/// (2^53 basis points).
+pub const MAX_BASIS_POINTS: u64 = i64::MAX as u64;
 const SECONDS_PER_WEEK: i64 = 7 * 86_400;
 /// 1970-01-01 was a Thursday; adding three days makes Monday 00:00 the week origin.
 const WEEK_ORIGIN_SHIFT_SECONDS: i64 = 3 * 86_400;
@@ -194,9 +198,9 @@ pub struct Candle {
     pub high_units: i64,
     pub low_units: i64,
     pub close_units: i64,
-    pub observations: u32,
+    pub observations: u64,
     /// Identical repeats of the previous record that were accepted inside the candle.
-    pub duplicates: u32,
+    pub duplicates: u64,
     /// The summed source volume, only when the source provides one.
     pub volume: Option<f64>,
     /// Time from the previous record to the first record of this candle; `None` for the first
@@ -205,15 +209,15 @@ pub struct Candle {
     pub max_gap_inside_micros: i64,
     pub missing_buckets_before: u64,
     /// The longest run of consecutive records showing one unchanged price inside the candle.
-    pub frozen_observations: u32,
+    pub frozen_observations: u64,
     pub frozen_micros: i64,
     /// `floor(10000 * |move| / |previous price|)` over every move between consecutive records
-    /// that enters or lies inside the candle, saturated at `u32::MAX`, by the inter-arrival
+    /// that enters or lies inside the candle, saturated at `MAX_BASIS_POINTS`, by the inter-arrival
     /// context of the move: contiguous, delayed (over the gap but under the reopen threshold),
     /// and reopen. A move after a zero price is undefined and skipped.
-    pub max_jump_basis_points: u32,
-    pub max_delayed_jump_basis_points: u32,
-    pub max_reopen_jump_basis_points: u32,
+    pub max_jump_basis_points: u64,
+    pub max_delayed_jump_basis_points: u64,
+    pub max_reopen_jump_basis_points: u64,
     pub flags: Flags,
 }
 
@@ -345,7 +349,7 @@ pub struct GapFacts {
 #[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize, Serialize)]
 pub struct FrozenFacts {
     pub count: u64,
-    pub max_observations: u32,
+    pub max_observations: u64,
     pub max_micros: i64,
 }
 
@@ -396,7 +400,7 @@ pub struct StreamFacts {
     pub offset_seconds: u32,
     pub finalized: u64,
     /// Records inside the unfinished last candle, which is withheld.
-    pub withheld_observations: u32,
+    pub withheld_observations: u64,
     /// Records per finalized candle, by bit length.
     pub activity: Histogram,
     pub flagged: FlagCounts,
@@ -456,7 +460,7 @@ struct Run {
     price: i64,
     start_event: i64,
     last_known_at: i64,
-    observations: u32,
+    observations: u64,
 }
 
 impl Run {
@@ -497,16 +501,16 @@ struct Working {
     high: i64,
     low: i64,
     close: i64,
-    observations: u32,
+    observations: u64,
     volume: Option<f64>,
     gap_before: Option<i64>,
     max_gap_inside: i64,
     missing_before: u64,
     run: Option<Run>,
-    frozen_observations: u32,
+    frozen_observations: u64,
     frozen_micros: i64,
-    max_jump: [u32; 3],
-    duplicates: u32,
+    max_jump: [u64; 3],
+    duplicates: u64,
 }
 
 impl Working {
@@ -810,7 +814,6 @@ impl InstrumentStream {
             (Observation::Tick(tick), NativeGranularity::Tick) => Ok(Record::tick(tick)),
             (Observation::Bar(bar), NativeGranularity::Bar { period_seconds }) => {
                 let period = i64::from(period_seconds) * MICROS_PER_SECOND;
-                let known_at = bar.start_micros + period;
                 if bar.period_micros != period {
                     return Err(reject(
                         RejectionReason::WrongGranularity,
@@ -895,8 +898,8 @@ impl InstrumentStream {
             if let Some(basis_points) = basis_points {
                 jump.0[context as usize] = basis_points;
                 if let Some(min) = self.checks.jump_basis_points {
-                    self.jumps.basis_points.observe(u64::from(basis_points));
-                    if basis_points >= min {
+                    self.jumps.basis_points.observe(basis_points);
+                    if basis_points >= u64::from(min) {
                         *match context {
                             GapContext::Contiguous => &mut self.jumps.flagged,
                             GapContext::Delayed => &mut self.jumps.flagged_delayed,
@@ -922,7 +925,7 @@ impl InstrumentStream {
             (None, _) => None,
         };
         if let (Some(run), Some((min_observations, min_micros))) = (closed, self.checks.frozen)
-            && (run.observations >= min_observations || run.micros() >= min_micros)
+            && (run.observations >= u64::from(min_observations) || run.micros() >= min_micros)
         {
             self.frozen_runs.count += 1;
             self.frozen_runs.max_observations =
@@ -968,7 +971,7 @@ impl InstrumentStream {
                 working.low = working.low.min(record.low());
                 working.close = record.close();
                 working.observations += 1;
-                working.duplicates += u32::from(duplicate);
+                working.duplicates += u64::from(duplicate);
                 if let (Some(total), Some(volume)) = (&mut working.volume, record.volume) {
                     *total += volume;
                 }
@@ -1010,7 +1013,7 @@ impl InstrumentStream {
             frozen_observations: 0,
             frozen_micros: 0,
             max_jump: jump.0,
-            duplicates: u32::from(duplicate),
+            duplicates: u64::from(duplicate),
         };
         working.observe_run(record);
         stream.working = Some(working);
@@ -1027,10 +1030,10 @@ impl InstrumentStream {
         let flags = Flags {
             low_activity: stream
                 .min_observations
-                .is_some_and(|min| working.observations < min),
+                .is_some_and(|min| working.observations < u64::from(min)),
             hard_low_activity: stream
                 .hard_min_observations
-                .is_some_and(|min| working.observations < min),
+                .is_some_and(|min| working.observations < u64::from(min)),
             gap_before: checks
                 .gap_micros
                 .is_some_and(|(max, _)| working.gap_before.is_some_and(|gap| gap > max)),
@@ -1039,24 +1042,25 @@ impl InstrumentStream {
                 .is_some_and(|(max, _)| working.max_gap_inside > max),
             missing_before: working.missing_before > 0,
             frozen: checks.frozen.is_some_and(|(observations, micros)| {
-                working.frozen_observations >= observations || working.frozen_micros >= micros
+                working.frozen_observations >= u64::from(observations)
+                    || working.frozen_micros >= micros
             }),
             jump: checks
                 .jump_basis_points
-                .is_some_and(|min| working.max_jump[0] >= min),
+                .is_some_and(|min| working.max_jump[0] >= u64::from(min)),
             delayed_jump: checks
                 .jump_basis_points
-                .is_some_and(|min| working.max_jump[1] >= min),
+                .is_some_and(|min| working.max_jump[1] >= u64::from(min)),
             reopen_jump: checks
                 .jump_basis_points
-                .is_some_and(|min| working.max_jump[2] >= min),
+                .is_some_and(|min| working.max_jump[2] >= u64::from(min)),
             short_span: checks
                 .span_percent
                 .is_some_and(|percent| active_span < stream.duration * i64::from(percent) / 100),
         };
         let facts = &mut stream.facts;
         facts.finalized += 1;
-        facts.activity.observe(u64::from(working.observations));
+        facts.activity.observe(working.observations);
         let counts = &mut facts.flagged;
         for (flag, count) in [
             (flags.low_activity, &mut counts.low_activity),
@@ -1164,17 +1168,23 @@ enum GapContext {
 
 /// The relative move entering one record, in whole basis points, in the slot of its context.
 #[derive(Debug, Clone, Copy, Default)]
-struct Jump([u32; 3]);
+struct Jump([u64; 3]);
 
-/// `floor(10000 * |to - from| / |from|)` saturated at `u32::MAX`, or `None` when `from` is zero,
+/// `floor(10000 * |to - from| / |from|)` saturated at `MAX_BASIS_POINTS`, or `None` when `from` is zero,
 /// and whether the price moved at all.
-fn relative_move(from: i64, to: i64) -> (Option<u32>, bool) {
+fn relative_move(from: i64, to: i64) -> (Option<u64>, bool) {
     let moved = from != to;
     if from == 0 {
         return (None, moved);
     }
     let basis_points = (i128::from(to) - i128::from(from)).abs() * 10_000 / i128::from(from).abs();
-    (Some(u32::try_from(basis_points).unwrap_or(u32::MAX)), moved)
+    (
+        Some(
+            u64::try_from(basis_points)
+                .map_or(MAX_BASIS_POINTS, |value| value.min(MAX_BASIS_POINTS)),
+        ),
+        moved,
+    )
 }
 
 fn gcd(mut a: u64, mut b: u64) -> u64 {
@@ -1651,9 +1661,9 @@ mod tests {
         assert_eq!(relative_move(0, 5), (None, true));
         assert_eq!(relative_move(-100, -110), (Some(1_000), true));
         assert_eq!(relative_move(7, 7), (Some(0), false));
-        assert_eq!(relative_move(1, i64::MAX), (Some(u32::MAX), true));
+        assert_eq!(relative_move(1, i64::MAX), (Some(MAX_BASIS_POINTS), true));
         assert_eq!(relative_move(i64::MIN, i64::MAX), (Some(19_999), true));
-        assert_eq!(relative_move(1, i64::MIN), (Some(u32::MAX), true));
+        assert_eq!(relative_move(1, i64::MIN), (Some(MAX_BASIS_POINTS), true));
         // The pinned resampler evaluates the same move in binary floating point and lands just
         // under the threshold; exact units decide the boundary case deterministically.
         let (from, to) = (
@@ -2028,6 +2038,67 @@ mod tests {
         assert_eq!(out.len(), 2);
         assert_eq!(out[1].1.missing_buckets_before, 4_294_967_296);
         assert!(out[1].1.flags.missing_before);
+    }
+
+    #[test]
+    fn a_wrong_period_rejection_keeps_the_bars_own_clocks() {
+        let granularity = NativeGranularity::Bar { period_seconds: 5 };
+        let mut stream = InstrumentStream::new(
+            &instrument(granularity, &[(10, 0)]),
+            source(granularity, None),
+        )
+        .unwrap();
+        let mut out = Vec::new();
+        let ten_second = Observation::Bar(BarUnits {
+            start_micros: 60 * SECOND,
+            period_micros: 10 * SECOND,
+            open: 1,
+            high: 1,
+            low: 1,
+            close: 1,
+            volume: 0.0,
+        });
+        let rejection = stream.push(ten_second, &mut out).unwrap_err();
+        assert_eq!(rejection.reason, RejectionReason::WrongGranularity);
+        assert_eq!(
+            (rejection.event_micros, rejection.known_at_micros),
+            (60 * SECOND, 70 * SECOND)
+        );
+        assert_eq!(stream.profile().observations, 0);
+    }
+
+    #[test]
+    fn counts_and_basis_points_do_not_wrap_at_thirty_two_bits() {
+        // Seeded state stands in for 4,294,967,295 identical ticks inside one candle and one run.
+        let mut stream = tick_stream(&[(5, 0)]);
+        let mut out = Vec::new();
+        stream.push(tick(10_000, 1_000_000), &mut out).unwrap();
+        let working = stream.streams[0].working.as_mut().unwrap();
+        working.observations = u64::from(u32::MAX);
+        working.run.as_mut().unwrap().observations = u64::from(u32::MAX);
+        stream.run.as_mut().unwrap().observations = u64::from(u32::MAX);
+        stream.push(tick(11_000, 1_000_000), &mut out).unwrap();
+        stream.push(tick(15_000, 1_000_001), &mut out).unwrap();
+        let (_, candle) = &out[0];
+        assert_eq!(candle.observations, u64::from(u32::MAX) + 1);
+        assert_eq!(candle.frozen_observations, u64::from(u32::MAX) + 1);
+        assert!(candle.flags.complete() && !candle.flags.low_activity);
+        assert_eq!(
+            stream.profile().frozen_runs.unwrap().max_observations,
+            u64::from(u32::MAX) + 1
+        );
+        // A move from one unit to a million units is 9,999,990,000 basis points, as the
+        // reference reports it.
+        let mut stream = tick_stream(&[(5, 0)]);
+        for (millis, price) in [(10_000, 1), (11_000, 1_000_000), (15_000, 1_000_001)] {
+            stream.push(tick(millis, price), &mut out).unwrap();
+        }
+        assert_eq!(out[1].1.max_jump_basis_points, 9_999_990_000);
+        assert_eq!(
+            relative_move(1, i64::MAX).0,
+            Some(MAX_BASIS_POINTS),
+            "saturated at the column's limit"
+        );
     }
 
     #[test]

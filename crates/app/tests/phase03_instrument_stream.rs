@@ -17,8 +17,8 @@ use binary_alpha_engine::config::Config;
 use binary_alpha_engine::dataset::{GenerationManifest, ObjectRole, PriceRepresentation};
 use binary_alpha_engine::market::{PriceScale, Tick, parse_event_time_micros, parse_price_units};
 use binary_alpha_engine::stream::{
-    Candle, InstrumentProfile, InstrumentStream, Observation, Source, StreamManifest,
-    stream_generation_id,
+    Candle, InstrumentProfile, InstrumentStream, MAX_BASIS_POINTS, Observation, Source,
+    StreamManifest, stream_generation_id,
 };
 use common::*;
 use parquet::file::reader::{FileReader, SerializedFileReader};
@@ -117,17 +117,20 @@ impl From<&Candle> for Row {
                 candle.low_units,
                 candle.close_units,
             ],
-            counts: [i64::from(candle.observations), i64::from(candle.duplicates)],
+            counts: [
+                i64::try_from(candle.observations).unwrap(),
+                i64::try_from(candle.duplicates).unwrap(),
+            ],
             volume: candle.volume,
             gap_before: candle.gap_before_micros,
             facts: [
                 candle.max_gap_inside_micros,
                 i64::try_from(candle.missing_buckets_before).unwrap(),
-                i64::from(candle.frozen_observations),
+                i64::try_from(candle.frozen_observations).unwrap(),
                 candle.frozen_micros,
-                i64::from(candle.max_jump_basis_points),
-                i64::from(candle.max_delayed_jump_basis_points),
-                i64::from(candle.max_reopen_jump_basis_points),
+                i64::try_from(candle.max_jump_basis_points).unwrap(),
+                i64::try_from(candle.max_delayed_jump_basis_points).unwrap(),
+                i64::try_from(candle.max_reopen_jump_basis_points).unwrap(),
             ],
             flags: [
                 flags.low_activity,
@@ -1115,8 +1118,8 @@ fn assert_closed_window_facts(
         }
         let bps = (i128::from(b.price_units) - i128::from(a.price_units)).abs() * 10_000
             / i128::from(a.price_units).abs();
-        let bps = u32::try_from(bps).unwrap_or(u32::MAX);
-        basis_points.push(u64::from(bps));
+        let bps = u64::try_from(bps).map_or(MAX_BASIS_POINTS, |bps| bps.min(MAX_BASIS_POINTS));
+        basis_points.push(bps);
         if bps >= 5 {
             let context = if *delta <= 2 * SECOND {
                 0
@@ -1137,12 +1140,12 @@ fn assert_closed_window_facts(
         flagged
     );
     // Closed runs of one price that met the thresholds.
-    let mut runs = (0u64, 0u32, 0i64);
+    let mut runs = (0u64, 0u64, 0i64);
     let mut start = 0;
     for index in 1..=ticks.len() {
         if index == ticks.len() || ticks[index].price_units != ticks[start].price_units {
             if index < ticks.len() {
-                let count = (index - start) as u32;
+                let count = (index - start) as u64;
                 let span = ticks[index - 1].event_time_micros - ticks[start].event_time_micros;
                 if count >= 10 || span >= 5 * SECOND {
                     runs = (runs.0 + 1, runs.1.max(count), runs.2.max(span));
@@ -1168,7 +1171,7 @@ fn assert_closed_window_facts(
         assert_eq!(facts.finalized, rows.len() as u64);
         assert_eq!(
             facts.activity.buckets(),
-            histogram(rows.iter().map(|row| u64::from(row.observations)))
+            histogram(rows.iter().map(|row| row.observations))
         );
         let count =
             |select: fn(&Candle) -> bool| rows.iter().filter(|row| select(row)).count() as u64;
