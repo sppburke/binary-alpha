@@ -32,6 +32,9 @@ pub const STREAM_MANIFEST_KIND: &str = "instrument_stream";
 pub const PROFILE_OBJECT_PATH: &str = "profile.json";
 
 const MICROS_PER_SECOND: i64 = 1_000_000;
+/// The largest event or known-at time a record may carry, in microseconds either side of the
+/// epoch (about 73,000 years): every interval boundary and every difference then fits in `i64`.
+pub const MAX_EVENT_MICROS: i64 = i64::MAX / 4;
 const SECONDS_PER_WEEK: i64 = 7 * 86_400;
 /// 1970-01-01 was a Thursday; adding three days makes Monday 00:00 the week origin.
 const WEEK_ORIGIN_SHIFT_SECONDS: i64 = 3 * 86_400;
@@ -65,8 +68,17 @@ impl Observation {
             float_price_units(value, scale)
                 .map_err(|reason| format!("bar at {}: {reason}", bar.start_unix_s))
         };
+        let start_micros = bar
+            .start_unix_s
+            .checked_mul(MICROS_PER_SECOND)
+            .ok_or_else(|| {
+                format!(
+                    "bar at {} lies outside the representable time range",
+                    bar.start_unix_s
+                )
+            })?;
         Ok(Self::Bar(BarUnits {
-            start_micros: bar.start_unix_s * MICROS_PER_SECOND,
+            start_micros,
             period_micros: i64::from(bar.period_s) * MICROS_PER_SECOND,
             open: units(bar.open)?,
             high: units(bar.high)?,
@@ -136,6 +148,7 @@ crate::string_enum! {
         WrongGranularity => "wrong_granularity",
         OffGrid => "off_grid",
         NonFinite => "non_finite",
+        OutOfRange => "out_of_range",
     }
 }
 
@@ -774,10 +787,29 @@ impl InstrumentStream {
             source: self.source.generation.clone(),
             detail,
         };
+        let out_of_range = |event: i64, known_at: i64| {
+            reject(
+                RejectionReason::OutOfRange,
+                event,
+                known_at,
+                format!("event time beyond {MAX_EVENT_MICROS} micros either side of the epoch"),
+            )
+        };
         match (observation, self.source.native_granularity) {
-            (Observation::Tick(tick), NativeGranularity::Tick) => Ok(Record::tick(tick)),
+            (Observation::Tick(tick), NativeGranularity::Tick) => {
+                if tick.event_time_micros.unsigned_abs() > MAX_EVENT_MICROS as u64 {
+                    return Err(out_of_range(tick.event_time_micros, tick.event_time_micros));
+                }
+                Ok(Record::tick(tick))
+            }
             (Observation::Bar(bar), NativeGranularity::Bar { period_seconds }) => {
                 let period = i64::from(period_seconds) * MICROS_PER_SECOND;
+                if bar.start_micros.unsigned_abs() > MAX_EVENT_MICROS as u64 {
+                    return Err(out_of_range(
+                        bar.start_micros,
+                        bar.start_micros.saturating_add(period),
+                    ));
+                }
                 let known_at = bar.start_micros + period;
                 if bar.period_micros != period {
                     return Err(reject(
@@ -1915,6 +1947,56 @@ mod tests {
         assert!(!candle.flags.frozen);
         assert_eq!(stream.profile().prices.moves, 10);
         assert_eq!(stream.profile().prices.step_units, Some(1));
+    }
+
+    #[test]
+    fn times_beyond_the_representable_range_are_refused() {
+        let mut out = Vec::new();
+        let mut ticks = tick_stream(&[(5, 0)]);
+        let rejection = ticks
+            .push(
+                Observation::Tick(Tick {
+                    event_time_micros: i64::MAX,
+                    price_units: 1,
+                }),
+                &mut out,
+            )
+            .unwrap_err();
+        assert_eq!(rejection.reason, RejectionReason::OutOfRange);
+        assert!(rejection.to_string().contains("out_of_range"));
+        assert_eq!(ticks.profile().observations, 0);
+        let granularity = NativeGranularity::Bar { period_seconds: 5 };
+        let mut bars = InstrumentStream::new(
+            &instrument(granularity, &[(10, 0)]),
+            source(granularity, None),
+        )
+        .unwrap();
+        // The start converts to micros, but its end would not fit.
+        let far = Bar {
+            start_unix_s: 9_223_372_036_850,
+            open: 1.0,
+            high: 1.0,
+            low: 1.0,
+            close: 1.0,
+            volume: 0.0,
+            period_s: 5,
+        };
+        let rejection = bars
+            .push(Observation::from_bar(&far, scale(2)).unwrap(), &mut out)
+            .unwrap_err();
+        assert_eq!(rejection.reason, RejectionReason::OutOfRange);
+        assert!(
+            Observation::from_bar(
+                &Bar {
+                    start_unix_s: i64::MAX,
+                    ..far
+                },
+                scale(2)
+            )
+            .is_err(),
+            "a start that does not convert is an error, not a panic"
+        );
+        assert!(out.is_empty());
     }
 
     #[test]

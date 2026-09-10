@@ -356,7 +356,9 @@ through the same `push` for historical, replay, and live feeds; a refused record
 a bar that does not strictly follow the previous bar, a tick with a different price at the
 previous tick's event time, a bar off its grid or of another period, a non-finite or negative
 volume, a contradicted high/low relationship, a bar whose volume would push a candle's summed
-volume out of the finite range, or a record of the other granularity) is reported
+volume out of the finite range, a time beyond `i64::MAX / 4` microseconds either side of the
+epoch (about 73,000 years, so every interval boundary and difference stays representable), or a
+record of the other granularity) is reported
 with its reason, event time, known-at time, and source generation, and leaves the state
 unchanged. A tick identical to the previous tick is accepted, counted as a duplicate, and folded
 like the source retained it. The one observed move between consecutive records is from the
