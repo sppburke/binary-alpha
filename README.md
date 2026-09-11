@@ -25,6 +25,7 @@ cargo run --release --locked -p binary-alpha-app -- data import --config PATH
 cargo run --release --locked -p binary-alpha-app -- data audit --config PATH --manifest URI
 cargo run --release --locked -p binary-alpha-app -- data verify --manifest URI
 cargo run --release --locked -p binary-alpha-app -- features build --config PATH
+cargo run --release --locked -p binary-alpha-app -- outcomes build --config PATH
 ```
 
 `binary-alpha config validate --config PATH` prints the content hash and the canonical document to
@@ -37,8 +38,10 @@ publishes every object and one ready manifest per dataset to
 publishes its profile, one candle object per configured stream, and a stream manifest the same way;
 `binary-alpha features build --config PATH` resolves or applies one feature plan per
 `[[features.instruments]]` entry over a published stream generation and publishes the plan, rows,
-events, and encoded rows as a feature generation; `binary-alpha data verify --manifest URI`
-re-reads one generation of any kind from its manifest and objects alone. All four are documented in
+events, and encoded rows as a feature generation; `binary-alpha outcomes build --config PATH`
+labels every decision row of the `[outcomes]` feature generation against its tick generation and
+publishes the future-only outcome generation; `binary-alpha data verify --manifest URI`
+re-reads one generation of any kind from its manifest and objects alone. All five are documented in
 [docs/contracts.md](docs/contracts.md) and [docs/operations.md](docs/operations.md). The example
 configuration retains data in the repository-local `historical_data/` folder, which Git ignores,
 and declares one instrument. The governed-fixture proof of the instrument stream is
@@ -46,7 +49,9 @@ and declares one instrument. The governed-fixture proof of the instrument stream
 where `PATH` is an untracked JSON document naming the published Phase 02 generations and the
 legacy parity files; the feature-engine proof is
 `BINARY_ALPHA_TEST_CONFIG=PATH cargo test --locked -p binary-alpha-app --test phase04_feature_engine -- --ignored --nocapture`,
-where `PATH` names the research configuration and the reference root.
+where `PATH` names the research configuration and the reference root; the outcome proof is
+`BINARY_ALPHA_TEST_CONFIG=PATH cargo test --locked -p binary-alpha-app --test phase05_future_outcomes -- --ignored --nocapture`
+with the same document shape.
 Verification runs `cargo fmt --all --check`,
 `cargo clippy --workspace --all-targets --all-features --locked -- -D warnings`,
 `cargo test --workspace --all-features --locked`, and `cargo build --workspace --locked`; the

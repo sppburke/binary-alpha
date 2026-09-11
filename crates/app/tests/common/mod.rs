@@ -354,8 +354,9 @@ pub fn binary_alpha(args: &[&str]) -> Output {
         .expect("binary-alpha runs")
 }
 
-pub fn import(config: &Path) -> Result<Vec<String>, String> {
-    let output = binary_alpha(&["data", "import", "--config", config.to_str().unwrap()]);
+/// The standard-output lines of a successful command, or the diagnostic of a failed one.
+pub fn command(args: &[&str]) -> Result<Vec<String>, String> {
+    let output = binary_alpha(args);
     let stdout = String::from_utf8(output.stdout).unwrap();
     let stderr = String::from_utf8(output.stderr).unwrap();
     if output.status.success() {
@@ -365,6 +366,10 @@ pub fn import(config: &Path) -> Result<Vec<String>, String> {
         assert_eq!(output.status.code(), Some(1));
         Err(stderr)
     }
+}
+
+pub fn import(config: &Path) -> Result<Vec<String>, String> {
+    command(&["data", "import", "--config", config.to_str().unwrap()])
 }
 
 pub fn verify(manifest: &Path) -> Result<String, String> {
@@ -379,6 +384,45 @@ pub fn verify(manifest: &Path) -> Result<String, String> {
         assert!(stdout.is_empty(), "{stdout}");
         Err(stderr)
     }
+}
+
+/// Runs one command under GNU time, returning its standard-output lines, wall seconds, and the
+/// child's peak resident kilobytes.
+pub fn timed(args: &[&str]) -> (Vec<String>, f64, u64) {
+    let started = std::time::Instant::now();
+    let output = Command::new("/usr/bin/time")
+        .arg("-v")
+        .arg(env!("CARGO_BIN_EXE_binary-alpha"))
+        .args(args)
+        .output()
+        .expect("GNU time runs the command");
+    let wall = started.elapsed().as_secs_f64();
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(output.status.success(), "{stderr}");
+    let peak = stderr
+        .lines()
+        .find_map(|line| {
+            line.trim()
+                .strip_prefix("Maximum resident set size (kbytes): ")
+        })
+        .expect("GNU time reports the peak")
+        .parse()
+        .unwrap();
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    (stdout.lines().map(str::to_string).collect(), wall, peak)
+}
+
+/// The peak resident size of this test process, in kilobytes.
+pub fn in_process_peak_kb() -> u64 {
+    fs::read_to_string("/proc/self/status")
+        .unwrap()
+        .lines()
+        .find_map(|line| line.strip_prefix("VmHWM:"))
+        .unwrap()
+        .trim()
+        .trim_end_matches(" kB")
+        .parse()
+        .unwrap()
 }
 
 pub fn manifest_json(path: &Path) -> Value {

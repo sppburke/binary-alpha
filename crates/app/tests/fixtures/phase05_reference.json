@@ -1,0 +1,121 @@
+{
+  "legacy_revision": "b509964cd1c40180e9d98b0e55a95699b0abe9ed",
+  "builder_sha256": "0af744c17895b70362502efbfb4dbc5e383ca010a711211375a477061f814e75",
+  "source_sha256": "c8df903de5e9f31b8ba93f32aeb8f9262178cd61deaeabfba697f1f6a1a16816",
+  "source_rows": 10028294,
+  "policies": {
+    "outcomes/phase5a_binary_expiry_30s_300s/binary_expiry_outcome_policy.json": "2ac2367a38acc8a4bca0cd92e7924ac0f30dcba6d34709c15e8acecdd93095bf",
+    "outcomes/phase5a_binary_expiry_30s_300s/aedcny_phase5_binary_expiry_outcomes_summary.json": "8ab30abbaa77992b38b3f8f2de7d5cf11b5f1943da9b27c02a147ffcce900db7"
+  },
+  "reference_files": [
+    {
+      "path": "outcomes/phase5a_binary_expiry_30s_300s/expiry_seconds.csv",
+      "sha256": "af19cac6a3d7c931a7e7bc9ee8039209fbda1f0e4336e4c87318cf0790d5a32f"
+    },
+    {
+      "path": "outcomes/phase5a_binary_expiry_30s_300s/tick_times_ms_i64.npy",
+      "sha256": "5e0aaf722413db417f808ef0124a238541129fdeb31f3a7eff7895e9f2e8683f"
+    },
+    {
+      "path": "outcomes/phase5a_binary_expiry_30s_300s/tick_prices_scaled_1e8_i64.npy",
+      "sha256": "32f657b23d99bc5a95dee9db239d5a6a7e8356b3985a48e6a6b63c90e300838b"
+    },
+    {
+      "path": "outcomes/phase5a_binary_expiry_30s_300s/entry_reference_5s_offset0s.csv",
+      "sha256": "3f9f5e6ab9a2baf5b65585bf7e3c7e7a12ec6b8a22c5cb851172cc2f79c8294c"
+    },
+    {
+      "path": "outcomes/phase5a_binary_expiry_30s_300s/settlement_tick_index_5s_offset0s.npy",
+      "sha256": "2d048323e0889030661bfc0d5da0b68fbbfd2ceea3e6e432831acb107d00fa3a"
+    },
+    {
+      "path": "outcomes/phase5a_binary_expiry_30s_300s/invalid_reason_5s_offset0s.npy",
+      "sha256": "21045db3a31376598cc6c18901c5fff8a8fc4bbbc6a41ad5b9e9586dfaf2a3a8"
+    },
+    {
+      "path": "outcomes/phase5a_binary_expiry_30s_300s/entry_reference_15s_offset5s.csv",
+      "sha256": "1945e457d458a9188f541cf5a0f6ddab6d1229341a89a4bcc8d3ad56d941138e"
+    },
+    {
+      "path": "outcomes/phase5a_binary_expiry_30s_300s/settlement_tick_index_15s_offset5s.npy",
+      "sha256": "fef4defea8e6c0cc0b450fe02f7569f653f42a8e23f1e6327ba79733f043569c"
+    },
+    {
+      "path": "outcomes/phase5a_binary_expiry_30s_300s/invalid_reason_15s_offset5s.npy",
+      "sha256": "330a1066edd2539ca80b8a81c108ec87e9c06be143c7897e4a1bd73a0a24e093"
+    },
+    {
+      "path": "outcomes/phase5a_binary_expiry_30s_300s/entry_reference_30s_offset15s.csv",
+      "sha256": "72e3fe93918cb25371e92de7a95ae38bae3ad7d58cd0973f0e6803c746be17c5"
+    },
+    {
+      "path": "outcomes/phase5a_binary_expiry_30s_300s/settlement_tick_index_30s_offset15s.npy",
+      "sha256": "5cccc43eed65b37d57afb2cb7078e796fd4fb3a3d55865d1ba78b40204290987"
+    },
+    {
+      "path": "outcomes/phase5a_binary_expiry_30s_300s/invalid_reason_30s_offset15s.npy",
+      "sha256": "4e2f32a0a9b9606e958d2be1ec2e3b8db01a04347093d4fe56410a01d8f40cf5"
+    },
+    {
+      "path": "outcomes/phase5a_binary_expiry_30s_300s/entry_reference_1m_offset30s.csv",
+      "sha256": "f18160b62c4f857081c6948427295e8306f192769e5f73be06dc357a9aee3545"
+    },
+    {
+      "path": "outcomes/phase5a_binary_expiry_30s_300s/settlement_tick_index_1m_offset30s.npy",
+      "sha256": "9f8e1b2700dd3e90e23e0f149f9402e71926519de91550f0e89d9ad6ece3045e"
+    },
+    {
+      "path": "outcomes/phase5a_binary_expiry_30s_300s/invalid_reason_1m_offset30s.npy",
+      "sha256": "7b73bce4e32721e99d25a253372b96a4d9132f39dd19a3c132c42aef2fdf7f58"
+    },
+    {
+      "path": "outcomes/phase5a_binary_expiry_30s_300s/entry_reference_5m_offset150s.csv",
+      "sha256": "2f6f78a3dd69d6b0473b3c99a5cc30496a312b2e4967ff8a66f5bce78349801a"
+    },
+    {
+      "path": "outcomes/phase5a_binary_expiry_30s_300s/settlement_tick_index_5m_offset150s.npy",
+      "sha256": "6b59b6569972cacf0642728327f46b662b4b48f69aba156d0848f97ee74947d1"
+    },
+    {
+      "path": "outcomes/phase5a_binary_expiry_30s_300s/invalid_reason_5m_offset150s.npy",
+      "sha256": "2993ce4f1d63281a2f41ae7cb1bf4c3930dc56b84917b67ae6a7a8cfdbc4b6f7"
+    }
+  ],
+  "expiry_seconds": {
+    "min": 30,
+    "max": 300,
+    "count": 271
+  },
+  "streams": [
+    {
+      "label": "5s_offset0s",
+      "duration_seconds": 5,
+      "offset_seconds": 0,
+      "rows": 955155
+    },
+    {
+      "label": "15s_offset5s",
+      "duration_seconds": 15,
+      "offset_seconds": 5,
+      "rows": 315281
+    },
+    {
+      "label": "30s_offset15s",
+      "duration_seconds": 30,
+      "offset_seconds": 15,
+      "rows": 155116
+    },
+    {
+      "label": "1m_offset30s",
+      "duration_seconds": 60,
+      "offset_seconds": 30,
+      "rows": 75707
+    },
+    {
+      "label": "5m_offset150s",
+      "duration_seconds": 300,
+      "offset_seconds": 150,
+      "rows": 13832
+    }
+  ]
+}

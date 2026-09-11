@@ -129,7 +129,7 @@ fn sequence_values(event: &SequenceEvent) -> Vec<Option<Value>> {
 }
 
 /// The footer metadata of every table of one stream of one plan.
-fn table_metadata(
+pub(crate) fn table_metadata(
     plan: &FeaturePlan,
     stream: &StreamPlan,
     identity: (&'static str, &str),
@@ -294,43 +294,77 @@ fn bind(entry: &FeatureInstrument) -> Result<Bound, String> {
     })
 }
 
-/// Loads a frozen plan from a completed feature generation's ready manifest.
-fn frozen_plan(uri: &str) -> Result<(FeaturePlan, FeatureManifest), String> {
+/// Reads the ready manifest of a completed feature generation, naming `field`, the
+/// configuration field that referenced it, in every refusal.
+pub(crate) fn feature_manifest(field: &str, uri: &str) -> Result<(Store, FeatureManifest), String> {
     let (store, key) = verify::open(uri)?;
     let mut bytes = Vec::new();
     store.read_to(&key, None, &mut bytes)?;
     if verify::manifest_kind(&bytes)?.as_deref() != Some(FEATURE_MANIFEST_KIND) {
         return Err(format!(
-            "frozen_plan: {uri} is not a feature generation manifest"
+            "{field}: {uri} is not a feature generation manifest"
         ));
     }
-    let manifest = FeatureManifest::from_json(&bytes)
-        .map_err(|error| format!("frozen_plan: {uri}: {error}"))?;
+    let manifest =
+        FeatureManifest::from_json(&bytes).map_err(|error| format!("{field}: {uri}: {error}"))?;
     if manifest.key() != key {
         return Err(format!(
-            "frozen_plan: {uri} holds the manifest of generation {}",
+            "{field}: {uri} holds the manifest of generation {}",
             manifest.generation
         ));
     }
+    Ok((store, manifest))
+}
+
+/// Reads the plan a feature manifest names and checks that it is fitted and carries the
+/// manifest's plan identity and streams.
+pub(crate) fn fitted_plan(
+    field: &str,
+    store: &Store,
+    manifest: &FeatureManifest,
+) -> Result<FeaturePlan, String> {
     let object = manifest
         .objects
         .iter()
         .find(|object| object.path == PLAN_OBJECT_PATH)
-        .ok_or("frozen_plan: no plan object")?;
-    let (_, fetched) = verify::fetch(&store, object, true)?;
+        .expect("a validated manifest lists its plan");
+    let (_, fetched) = verify::fetch(store, object, true)?;
     let plan = fs::read(&fetched.expect("decoded objects have a local path").path)
         .map_err(|error| format!("cannot read the plan: {error}"))
         .and_then(|bytes| FeaturePlan::from_json(&bytes))
-        .map_err(|reason| format!("frozen_plan: {reason}"))?;
-    if plan.identity() != manifest.plan_identity {
+        .map_err(|reason| format!("{field}: {reason}"))?;
+    plan_describes(&plan, manifest).map_err(|reason| format!("{field}: {reason}"))?;
+    Ok(plan)
+}
+
+/// The consistency every consumer relies on between a plan and the manifest that names it: the
+/// plan identity, instrument, profile generation, fit, and the same streams in order.
+pub(crate) fn plan_describes(plan: &FeaturePlan, manifest: &FeatureManifest) -> Result<(), String> {
+    if plan.identity() != manifest.plan_identity
+        || plan.instrument != manifest.instrument
+        || plan.broker != manifest.broker
+        || plan.provider_symbol != manifest.provider_symbol
+        || plan.profile.stream_generation != manifest.profile_generation
+        || !plan.is_fitted()
+        || plan.streams.len() != manifest.streams.len()
+        || plan
+            .streams
+            .iter()
+            .zip(&manifest.streams)
+            .any(|(stream, summary)| {
+                stream.key()
+                    != StreamKey {
+                        duration_seconds: summary.duration_seconds,
+                        offset_seconds: summary.offset_seconds,
+                    }
+            })
+    {
         return Err(
-            "frozen_plan: the plan object does not carry the manifest's plan identity".to_string(),
+            "the plan does not describe the manifest's plan identity, instrument, profile, fit, and streams"
+                .to_string(),
         );
     }
-    if !plan.is_fitted() {
-        return Err("frozen_plan: the plan was never fitted".to_string());
-    }
-    Ok((plan, manifest))
+    Ok(())
 }
 
 /// One stream's temporary tables and running summary while the input streams through.
@@ -371,7 +405,8 @@ fn resolve(entry: &FeatureInstrument) -> Result<Resolved, String> {
             )
         }
         Some(uri) => {
-            let (plan, manifest) = frozen_plan(&uri.to_string())?;
+            let (store, manifest) = feature_manifest("frozen_plan", &uri.to_string())?;
+            let plan = fitted_plan("frozen_plan", &store, &manifest)?;
             if plan.profile != reference {
                 return Err(
                     "frozen_plan: the plan was frozen under another profile reference".to_string(),
@@ -719,22 +754,8 @@ pub fn verify_feature(uri: &str, store: &Store, key: &str, bytes: &[u8]) -> Resu
         .iter()
         .find(|object| object.path == PLAN_OBJECT_PATH)
         .expect("a validated manifest lists its plan");
-    let (mut bytes_verified, plan_local) = verify::fetch(store, plan_object, true)?;
-    let plan = fs::read(&plan_local.expect("decoded objects have a local path").path)
-        .map_err(|error| error.to_string())
-        .and_then(|bytes| FeaturePlan::from_json(&bytes))
-        .map_err(|reason| format!("{}: {reason}", store.uri(&plan_object.key)))?;
-    if plan.identity() != manifest.plan_identity
-        || plan.instrument != manifest.instrument
-        || plan.profile.stream_generation != manifest.profile_generation
-        || !plan.is_fitted()
-        || plan.streams.len() != manifest.streams.len()
-    {
-        return Err(format!(
-            "{}: the plan does not describe the manifest's plan identity, instrument, profile, and streams",
-            store.uri(&plan_object.key)
-        ));
-    }
+    let plan = fitted_plan(uri, store, &manifest)?;
+    let mut bytes_verified = plan_object.bytes;
     let mut expected_paths = vec![PLAN_OBJECT_PATH.to_string()];
     for stream in &plan.streams {
         expected_paths.extend(stream.object_paths());
@@ -759,15 +780,6 @@ pub fn verify_feature(uri: &str, store: &Store, key: &str, bytes: &[u8]) -> Resu
     let mut rows = 0;
     let mut events = 0;
     for (stream, summary) in plan.streams.iter().zip(&manifest.streams) {
-        let key = StreamKey {
-            duration_seconds: summary.duration_seconds,
-            offset_seconds: summary.offset_seconds,
-        };
-        if stream.key() != key {
-            return Err(format!(
-                "{uri}: the plan's streams do not match the manifest's streams"
-            ));
-        }
         let expected = [
             (
                 ROWS_MESSAGE,

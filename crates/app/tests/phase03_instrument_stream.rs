@@ -10,7 +10,6 @@ mod common;
 use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::time::Instant;
 
 use binary_alpha_engine::config::Config;
@@ -712,40 +711,15 @@ struct BarCase {
 /// Runs the audit under GNU `time -v`, returning the report line, wall seconds, and peak
 /// resident kilobytes of the child.
 fn timed_audit(config: &Path, manifest: &str) -> (String, f64, u64) {
-    let started = Instant::now();
-    let output = Command::new("/usr/bin/time")
-        .args([
-            "-v",
-            env!("CARGO_BIN_EXE_binary-alpha"),
-            "data",
-            "audit",
-            "--config",
-            config.to_str().unwrap(),
-            "--manifest",
-            manifest,
-        ])
-        .output()
-        .expect("GNU time runs the audit");
-    let wall = started.elapsed().as_secs_f64();
-    let stderr = String::from_utf8(output.stderr).unwrap();
-    assert!(output.status.success(), "{stderr}");
-    let peak = stderr
-        .lines()
-        .find_map(|line| {
-            line.trim()
-                .strip_prefix("Maximum resident set size (kbytes): ")
-        })
-        .expect("GNU time reports the peak")
-        .parse()
-        .unwrap();
-    (
-        String::from_utf8(output.stdout)
-            .unwrap()
-            .trim_end()
-            .to_string(),
-        wall,
-        peak,
-    )
+    let (lines, wall, peak) = timed(&[
+        "data",
+        "audit",
+        "--config",
+        config.to_str().unwrap(),
+        "--manifest",
+        manifest,
+    ]);
+    (lines.join("\n"), wall, peak)
 }
 
 fn verify_uri(uri: &str) -> String {
@@ -1258,18 +1232,6 @@ fn assert_closed_window_facts(
             assert_eq!(actual, expected);
         }
     }
-}
-
-fn in_process_peak_kb() -> u64 {
-    fs::read_to_string("/proc/self/status")
-        .unwrap()
-        .lines()
-        .find_map(|line| line.strip_prefix("VmHWM:"))
-        .unwrap()
-        .trim()
-        .trim_end_matches(" kB")
-        .parse()
-        .unwrap()
 }
 
 #[test]

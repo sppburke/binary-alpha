@@ -2,8 +2,8 @@
 
 These contracts bind every phase of Binary Alpha. The current checkout implements the
 [configuration](#configuration), [historical datasets](#historical-datasets),
-[instrument streams](#instrument-streams), and [feature plans](#feature-plans) sections; the other
-sections are frozen now so that later phases implement them once, in one place, without
+[instrument streams](#instrument-streams), [feature plans](#feature-plans), and
+[outcomes](#outcomes) sections; the other sections are frozen now so that later phases implement them once, in one place, without
 reinterpretation. Specification intent, checkout
 implementation, observed runtime state, immutable measured artifacts, and hosted Git state are
 distinct kinds of truth and are never substituted for one another.
@@ -111,6 +111,7 @@ and content hash; the application package owns reading it from a path.
 | `import.sources` | array of tables | optional; consumed only by `data import`, which requires at least one entry |
 | `instruments` | array of tables | optional; consumed only by `data audit`, which requires the entry that maps the audited generation |
 | `features.instruments` | array of tables | optional; consumed only by `features build`, which requires at least one entry |
+| `outcomes` | table | optional; consumed only by `outcomes build`, which requires it |
 
 Every `import.sources` entry declares `kind`, `path` (a relative path resolves against the
 configuration file's directory), `broker`, and `role` (`development` or `evaluation`; `holdout` is
@@ -172,9 +173,11 @@ scale when the plan resolves; `tick_path_streams`, a unique subset of `streams`;
 `"development_fifths"` or a finite strictly increasing list of right-closed edges for a numeric
 output. Section [feature plans](#feature-plans) gives the resolution rules.
 
+Section [outcomes](#outcomes) gives the fields of the `outcomes` table.
+
 Every field is required and has no default, except that the `import` table, the `provenance`
-list, the `instruments` list, the `features` table, and the optional instrument and feature
-fields named above may be absent. Any
+list, the `instruments` list, the `features` table, the `outcomes` table, and the optional
+instrument and feature fields named above may be absent. Any
 other field is rejected as unknown, so a raw secret value has no place to live. Validation opens
 no source or destination and mutates nothing.
 
@@ -651,3 +654,106 @@ the plan's, checks every table's columns,
 footer metadata, and row count against the plan and manifest and the rows' decision-time
 bounds, and writes
 `verified INSTRUMENT ROLE generation GENERATION rows R events E objects K bytes B`.
+
+## Outcomes
+
+A future-only binary-expiry outcome is a historical research label, never a decision-time
+feature or part of the live feature graph: for one decision row of a feature generation and one
+expiry it names the tick a contract would have entered at, the tick it would have settled at,
+and whether a buy or a sell would have paid. The engine module `outcomes` owns the label rule,
+the reader, the identities, and the manifest; `binary-alpha outcomes build --config PATH` binds
+the inputs, publishes the generation, and reconstructs it; `data verify` re-reads it. No feature
+implementation reads an outcome, and research reads labels only after feature identity and any
+fitted encodings are frozen.
+
+### Configuration
+
+The optional `outcomes` table declares, in this order: `role` (`development` or `evaluation`;
+`holdout` is rejected before anything is resolved); `tick_manifest`, the ready manifest of the
+Phase 02 tick generation; `feature_manifest`, the ready manifest of the Phase 04 feature
+generation computed from that tick generation; `expiry_seconds`, a non-empty sorted unique list
+of positive seconds (the reference's 30 through 300 seconds is a fixture choice, never a limit);
+the non-negative millisecond thresholds `max_entry_delay_ms`, `max_settlement_delay_ms`,
+`max_tick_gap_ms`, and `true_jump_max_gap_ms`; `true_jump_basis_points`, positive decimal text
+such as `"5"` or `"2.5"` with at most eighteen fraction digits, parsed through the exact price
+boundary and compared exactly; and the positive `frozen_min_ticks` and `frozen_min_ms`. A
+millisecond threshold that overflows microseconds is rejected. Manifest locations use the
+`manifests/GENERATION/ready.json` grammar of `data verify`. Omitting the table preserves every
+existing configuration identity. The build requires `run_mode = "research"`.
+
+### Binding
+
+The tick manifest must be a dataset ready manifest whose generation provides ticks in integer
+price units at microsecond event times and carries the declared role; a holdout generation and
+a bar generation are refused on the manifest bytes alone. The feature manifest must be a feature
+generation whose `input_generation` is the tick generation; its plan is read and checked as a
+frozen plan, and every stream's rows table must carry the plan's frozen `raw_identity` in its
+footer. The `close_time_micros` column of each stream is read in physical order and must equal
+the feature manifest's row count and first and last decision times before anything is labeled;
+outcome row `i` of a stream is feature row `i` of the same `(duration_seconds, offset_seconds)`
+stream. The command does not rebuild features, fit encodings, or resolve holdout.
+
+### Label rule
+
+Every tick of the generation is loaded in order; a backwards time and more ticks than can be
+indexed below the missing index are rejected. Three flags are folded once over the whole
+generation: a transition into a tick is a gap when its inter-arrival exceeds `max_tick_gap_ms`;
+it is a true jump when its inter-arrival is at most `true_jump_max_gap_ms` and
+`10000 · |move| ≥ true_jump_basis_points · |previous price|`, compared exactly and never after a
+zero price (the pinned builder divides by the signed previous price, so a negative previous
+price is a documented departure that no registered instrument reaches); and every member of a run of one unchanged price is frozen when the run reaches
+`frozen_min_ticks` ticks or `frozen_min_ms` elapsed. Names declare units; every comparison is
+made in native microseconds and price units.
+
+The reference time of a decision row is its `close_time_micros`, the logical decision clock of
+Phase 04; its `known_at_micros` remains its actual availability, and these labels establish no
+executable decision or broker entry evidence. The entry tick is the first tick at or after the
+reference time. For each expiry the due time is the entry tick's time plus the expiry, the
+settlement tick is the first tick at or after the due time, and the cell's reason is the first
+that applies in this order, stored as its position: `0` valid; `1` no entry (no tick at or after
+the reference time); `2` stale entry (the entry tick is more than `max_entry_delay_ms` after the
+reference time); `3` no settlement; `4` stale settlement (the settlement tick is more than
+`max_settlement_delay_ms` after the due time); `5` internal gap; `6` frozen run; `7` true jump.
+Gap and jump checks cover the transitions after the entry tick through the transition into the
+settlement tick; the frozen check covers the entry tick through the settlement tick. A later
+reason never overwrites an earlier one. A missing entry or settlement leaves its dependent
+fields unavailable, an invalid cell is never a result, and a valid cell whose settlement price
+equals its entry price is a tie, never an assumed loss; otherwise a higher settlement price pays
+a buy and a lower one pays a sell.
+
+### Outcome generations
+
+An outcome generation's identity is SHA-256 over `binary-alpha outcome generation v1`, one line
+feed, the tick generation, one line feed, the feature generation, one line feed, and the JSON of
+the resolved rule (expiries in seconds, thresholds in microseconds, the jump text, and the
+frozen thresholds); the domain names the outcome definition, so a change to the label rule
+changes every identity. Its objects, all role `normalized` under the content-addressed
+create-once rules of dataset generations, are little-endian arrays: `ticks/event_time_micros.bin`
+and `ticks/price_units.bin` (one signed 64-bit value per tick) and, per stream,
+`reference/DURATIONs_OFFSETs.bin` (one signed 64-bit reference time per row),
+`entry/DURATIONs_OFFSETs.bin` (one unsigned 32-bit entry index per row),
+`settlement/DURATIONs_OFFSETs.bin` (the row-major rows by expiries unsigned 32-bit
+settlement-index matrix), and `reason/DURATIONs_OFFSETs.bin` (the row-major unsigned 8-bit
+reason matrix). The maximum unsigned 32-bit value is the missing index. Due times, entry and
+settlement times and prices, and results are derived through the reader, never stored. The
+ready manifest at `manifests/GENERATION/ready.json`, published last and mirrored, records
+`kind` (`outcome_generation`), `schema_version` (`1`), `generation`, `broker`,
+`provider_symbol`, `instrument`, `role`, `tick_generation`, `tick_manifest`,
+`feature_generation`, `feature_manifest`, `raw_identity`, `config_hash`, `code_revision`,
+`rule`, `reference_clock` (`feature_row_close_time`), `time_unit` (`microsecond`),
+`price_representation`, `missing_index`, `tick_count`, `streams` (per stream the rows and
+first and last reference time), and `objects`. Wall time and peak memory belong to run
+evidence, never to the artifact.
+
+The command writes
+`outcomes INSTRUMENT ROLE generation GENERATION tick TICK feature FEATURE ticks N rows R cells C objects K reused U`
+followed by `[load S label S publish S]` stage durations in seconds or by `(already published)`,
+then the reconstruction line. After publishing the objects and before the ready manifest, it
+reconstructs the generation from the published objects under the manifest bytes about to become
+ready. Parsing a manifest rejects one whose manifest references do not name its recorded
+generations, whose rule is invalid, or whose tick count cannot be indexed below the missing
+index. `data verify` on an outcome generation asserts every object's bytes, hashes, and
+dimensions, reads the tick arrays (under the tick sequence rules) and every stream's reference
+times back, recomputes every entry index, settlement index, and reason under the manifest's
+rule, compares them with the stored arrays, and writes
+`verified INSTRUMENT ROLE generation GENERATION rows R cells C objects K bytes B`.

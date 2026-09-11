@@ -1899,18 +1899,6 @@ fn table_rows(
     (names, rows)
 }
 
-fn in_process_peak_kb() -> u64 {
-    fs::read_to_string("/proc/self/status")
-        .unwrap()
-        .lines()
-        .find_map(|line| line.strip_prefix("VmHWM:"))
-        .unwrap()
-        .trim()
-        .trim_end_matches(" kB")
-        .parse()
-        .unwrap()
-}
-
 /// Compares a published table against legacy CSV tables row by row under a projection,
 /// returning the number of rows compared; the first mismatches fail the test with detail.
 fn compare_rows(
@@ -2046,38 +2034,18 @@ fn governed_reference_parity() {
         input.inputs[0].sha256, fixture.source_sha256,
         "the input generation was imported from the registered source"
     );
-    let started = std::time::Instant::now();
-    let output = std::process::Command::new("/usr/bin/time")
-        .args([
-            "-v",
-            env!("CARGO_BIN_EXE_binary-alpha"),
-            "features",
-            "build",
-            "--config",
-            governed.application_config.to_str().unwrap(),
-        ])
-        .output()
-        .expect("GNU time runs the build");
-    let wall = started.elapsed().as_secs_f64();
-    let stderr = String::from_utf8(output.stderr).unwrap();
-    assert!(output.status.success(), "{stderr}");
-    let peak: u64 = stderr
-        .lines()
-        .find_map(|line| {
-            line.trim()
-                .strip_prefix("Maximum resident set size (kbytes): ")
-        })
-        .unwrap()
-        .parse()
-        .unwrap();
-    let stdout = String::from_utf8(output.stdout).unwrap();
-    let lines: Vec<&str> = stdout.lines().collect();
+    let (lines, wall, peak) = timed(&[
+        "features",
+        "build",
+        "--config",
+        governed.application_config.to_str().unwrap(),
+    ]);
     println!("build: {}", lines[0]);
     println!(
         "build wall {wall:.3} s, peak resident {peak} kB (streaming, fit, encoding, and publication in one process)"
     );
     println!("reconstruction: {}", lines[1]);
-    let generation = generation(lines[0]);
+    let generation = generation(&lines[0]);
     let published_root = match &config.storage.publication_uri {
         binary_alpha_engine::config::PublicationUri::Filesystem(path) => path.clone(),
         other => panic!("{other} is not the filesystem boundary"),
