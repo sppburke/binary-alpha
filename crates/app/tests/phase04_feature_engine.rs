@@ -7,7 +7,6 @@
 
 mod common;
 
-use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -21,8 +20,6 @@ use binary_alpha_engine::features::{
 use binary_alpha_engine::market::{Tick, format_event_time_micros};
 use binary_alpha_engine::stream::{Observation, Source, StreamManifest};
 use common::*;
-use parquet::file::reader::{FileReader, SerializedFileReader};
-use parquet::record::Field;
 
 /// The report lines of a successful build, or the diagnostic of a failed one.
 fn build(config: &Path) -> Result<Vec<String>, String> {
@@ -1764,41 +1761,6 @@ fn sequence_event_projection(stream: &ReferenceStream) -> Vec<(&'static str, Pro
         ("market_structure_bias_after", Text("bias_after")),
         ("no_lookahead_check_pass", Const("1".to_string())),
     ]
-}
-
-/// A streaming reader of one legacy CSV: the header and one split row at a time.
-/// Streams the rows of a published table through the row API.
-fn table_rows(
-    path: &Path,
-) -> (
-    Vec<String>,
-    impl Iterator<Item = Vec<Option<Value>>> + use<>,
-) {
-    let reader = SerializedFileReader::new(fs::File::open(path).unwrap()).unwrap();
-    let names: Vec<String> = reader
-        .metadata()
-        .file_metadata()
-        .schema_descr()
-        .columns()
-        .iter()
-        .map(|column| column.name().to_string())
-        .collect();
-    let rows = reader.into_iter().map(|row| {
-        row.unwrap()
-            .get_column_iter()
-            .map(|(_, field)| match field {
-                Field::Null => None,
-                Field::Long(value) => Some(Value::Int(*value)),
-                Field::Short(value) => Some(Value::Int(i64::from(*value))),
-                Field::Double(value) => Some(Value::Float(*value)),
-                Field::Bool(value) => Some(Value::Bool(*value)),
-                Field::Str(value) => Some(Value::Text(Cow::Owned(value.clone()))),
-                Field::TimestampMicros(value) => Some(Value::Time(*value)),
-                other => panic!("unexpected field {other:?}"),
-            })
-            .collect()
-    });
-    (names, rows)
 }
 
 /// Compares a published table against legacy CSV tables row by row under a projection,

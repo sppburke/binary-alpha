@@ -1346,19 +1346,6 @@ impl Observation {
             )),
         }
     }
-
-    fn source(&self) -> Option<&EventSource> {
-        match self {
-            Self::Tick { .. } | Self::Row { .. } => None,
-            Self::Acknowledged { source, .. }
-            | Self::Accepted { source, .. }
-            | Self::Rejected { source, .. }
-            | Self::NotSent { source, .. }
-            | Self::PossiblySent { source, .. }
-            | Self::Settlement { source, .. }
-            | Self::Reconciliation { source, .. } => Some(source),
-        }
-    }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1824,6 +1811,11 @@ struct Obligation {
     unresolved: Option<UnresolvedReason>,
     #[serde(skip)]
     path: Option<PathMetrics>,
+    /// The latest tick time the obligation has continuity evidence from: the quote tick at
+    /// acceptance, then every tick it observed. Not ledger state, so a restored engine starts
+    /// again from the quote tick.
+    #[serde(skip)]
+    continuity_micros: Option<i64>,
 }
 
 /// The exact postings of one terminal settlement.
@@ -2419,8 +2411,8 @@ impl Engine {
         }
     }
 
-    /// The contract, account scale, account, and binding of an open obligation.
-    fn terms(&self, command: &str) -> Result<(&ContractTerms, u8, usize, usize), String> {
+    /// The contract, account scale, and account of an open obligation.
+    fn terms(&self, command: &str) -> Result<(&ContractTerms, u8, usize), String> {
         let obligation = self
             .obligations
             .get(command)
@@ -2430,7 +2422,6 @@ impl Engine {
             &self.definition.replay.contracts[binding.contract],
             self.accounts[binding.account].scale,
             binding.account,
-            obligation.binding,
         ))
     }
 
@@ -2467,26 +2458,23 @@ impl Engine {
             self.same_entry.clear();
             self.logic_seen.clear();
         }
-        self.now = time;
-        self.advance_pauses()?;
+        // Each rate that became available since the last step is observed at its own
+        // availability time, so every valuation between market observations is recorded.
         while let Some(rate) = self.rates.get(self.next_rate)
             && rate.available_at_micros <= time
         {
+            let at = rate
+                .available_at_micros
+                .max(self.decision_start)
+                .max(self.now);
             let rate = rate.id.clone();
-            self.emit(time, EventKind::RateAvailable { rate })?;
+            self.now = at;
+            self.emit(at, EventKind::RateAvailable { rate })?;
         }
+        self.now = time;
+        self.advance_pauses()?;
         let mut installed: Vec<(usize, usize)> = Vec::new();
         for observation in observations {
-            if let Some(source) = observation.source()
-                && (source.available_at_micros > time
-                    || source.provider_time_micros > source.available_at_micros)
-            {
-                return Err(format!(
-                    "external event `{}` is not available at {}",
-                    source.id,
-                    format_event_time_micros(time)
-                ));
-            }
             if let Some((key, payload)) = observation.external() {
                 match self.externals.get(&key) {
                     Some(seen) if *seen == payload => continue,
@@ -2693,7 +2681,7 @@ impl Engine {
         let tracked = std::mem::take(&mut state.tracked);
         let mut kept = Vec::with_capacity(tracked.len());
         for command in tracked {
-            if self.drive(&command, previous, time, price_units)? {
+            if self.drive(&command, time, price_units)? {
                 kept.push(command);
             }
         }
@@ -2703,21 +2691,16 @@ impl Engine {
 
     /// Updates one accepted obligation's path with a tick and settles or leaves it unresolved
     /// under `price_at_due_v1`. Returns whether the tick stream still drives it.
-    fn drive(
-        &mut self,
-        command: &str,
-        previous: Option<TickState>,
-        time: i64,
-        price_units: i64,
-    ) -> Result<bool, String> {
+    fn drive(&mut self, command: &str, time: i64, price_units: i64) -> Result<bool, String> {
         let Some(obligation) = self.obligations.get(command) else {
             return Ok(false);
         };
-        let (Some(entry_time), Some(entry_price), Some(due), Some(mut path), None) = (
+        let (Some(entry_time), Some(entry_price), Some(due), Some(mut path), Some(anchor), None) = (
             obligation.entry_time_micros,
             obligation.entry_price_units,
             obligation.due_time_micros,
             obligation.path,
+            obligation.continuity_micros,
             obligation.unresolved,
         ) else {
             return Ok(false);
@@ -2726,16 +2709,20 @@ impl Engine {
             &self.definition.replay.contracts[self.bindings[obligation.binding].contract];
         let settlement = contract.settlement;
         let direction = contract.direction;
-        // Ticks at or before the entry are not path evidence.
+        // Ticks at or before the entry are continuity evidence, not path evidence.
         if time <= entry_time {
+            self.obligations
+                .get_mut(command)
+                .expect("present")
+                .continuity_micros = Some(time.max(anchor));
             return Ok(true);
         }
-        // A gap into this tick that intersects the contract window is not settlement evidence;
-        // the obligation stays open with the path observed before the gap. Without a known
-        // previous tick (an engine restored after the acceptance) continuity is measured from
-        // the entry, never assumed.
-        let previous_time = previous.map_or(entry_time, |previous| previous.provider_time_micros);
-        if previous_time < due && time - previous_time > settlement.max_tick_gap_micros {
+        // Continuity is measured from the obligation's own evidence: the quote tick at
+        // acceptance and the ticks it observed since. Ticks the instrument saw while the command
+        // was unaccepted, or before an engine was restored, are not assumed: a gap into this
+        // tick that exceeds the maximum is not settlement evidence, and the obligation stays
+        // open with the path observed before it.
+        if time - anchor > settlement.max_tick_gap_micros {
             self.emit(
                 self.now,
                 EventKind::Unresolved {
@@ -2743,8 +2730,8 @@ impl Engine {
                     reason: UnresolvedReason::Gap,
                     evidence: format!(
                         "a gap of {} microseconds from {} to {} exceeds {} inside the contract window",
-                        time - previous_time,
-                        format_event_time_micros(previous_time),
+                        time - anchor,
+                        format_event_time_micros(anchor),
                         format_event_time_micros(time),
                         settlement.max_tick_gap_micros
                     ),
@@ -2756,7 +2743,9 @@ impl Engine {
         let move_units = signed_move(entry_price, price_units, direction)
             .map_err(|reason| format!("{command}: {reason}"))?;
         path.observe(time, move_units);
-        self.obligations.get_mut(command).expect("present").path = Some(path);
+        let obligation = self.obligations.get_mut(command).expect("present");
+        obligation.path = Some(path);
+        obligation.continuity_micros = Some(time);
         if time < due {
             return Ok(true);
         }
@@ -2832,7 +2821,7 @@ impl Engine {
         command: &str,
         entry_time_micros: i64,
     ) -> Result<(Decimal, Decimal, i64), String> {
-        let (contract, scale, _, _) = self.terms(command)?;
+        let (contract, scale, _) = self.terms(command)?;
         Ok((
             contract.purchase()?.rescale(scale)?,
             contract.terminal_reserve()?.rescale(scale)?,
@@ -2898,7 +2887,7 @@ impl Engine {
         gross_return: Decimal,
         terminal_fee: Decimal,
     ) -> Result<SettlementPostings, String> {
-        let (contract, scale, _, _) = self.terms(command)?;
+        let (contract, scale, _) = self.terms(command)?;
         let obligation = &self.obligations[command];
         let expected = contract.cashflow(outcome);
         let discrepancy = gross_return.compare(expected.gross_return)? != Ordering::Equal
@@ -2932,7 +2921,7 @@ impl Engine {
         terminal_fee: Decimal,
         observe_price: bool,
     ) -> Result<(), String> {
-        let (contract, _, account, binding) = self.terms(command)?;
+        let (contract, _, account) = self.terms(command)?;
         let direction = contract.direction;
         let postings = self.settlement_postings(command, outcome, gross_return, terminal_fee)?;
         let obligation = self.obligations.get_mut(command).expect("present");
@@ -2966,23 +2955,36 @@ impl Engine {
                 path,
             },
         )?;
-        self.maybe_pause(account, binding)
+        self.maybe_pause(account)
+    }
+
+    /// The pause an account's bindings declare; validation makes every binding of one account
+    /// declare it identically.
+    fn pause_of(&self, account: usize) -> Option<Pause> {
+        self.bindings
+            .iter()
+            .find(|binding| binding.account == account)
+            .and_then(|binding| self.definition.replay.risk_policies[binding.policy].pause)
+    }
+
+    /// Whether an account's epoch drawdown has reached its configured pause threshold.
+    fn pause_due(&self, account: usize) -> Result<bool, String> {
+        let Some(pause) = self.pause_of(account) else {
+            return Ok(false);
+        };
+        let state = &self.accounts[account];
+        let drawdown = state.epoch_peak.checked_sub(state.completed_profit)?;
+        Ok(drawdown.compare(pause.drawdown)? != Ordering::Less)
     }
 
     /// Starts the configured pause of an account whose epoch drawdown reached its threshold.
-    fn maybe_pause(&mut self, account: usize, binding: usize) -> Result<(), String> {
-        let Some(pause) = self.definition.replay.risk_policies[self.bindings[binding].policy].pause
-        else {
-            return Ok(());
-        };
+    fn maybe_pause(&mut self, account: usize) -> Result<(), String> {
         let state = &self.accounts[account];
-        if state.paused_until_micros.is_some() {
+        if state.paused_until_micros.is_some() || !self.pause_due(account)? {
             return Ok(());
         }
+        let pause = self.pause_of(account).expect("due");
         let drawdown = state.epoch_peak.checked_sub(state.completed_profit)?;
-        if drawdown.compare(pause.drawdown)? == Ordering::Less {
-            return Ok(());
-        }
         let until_micros = self
             .now
             .checked_add(pause.duration_micros)
@@ -3005,7 +3007,7 @@ impl Engine {
         command: &str,
         resolution: &Resolution,
     ) -> Result<ReconciliationPostings, String> {
-        let (contract, scale, _, _) = self.terms(command)?;
+        let (contract, scale, _) = self.terms(command)?;
         let obligation = &self.obligations[command];
         let purchase = contract.purchase()?.rescale(scale)?;
         let zero = Decimal::zero(scale);
@@ -3097,10 +3099,6 @@ impl Engine {
         resolution: Resolution,
     ) -> Result<(), String> {
         let (postings, account) = self.reconciliation_of(&command, &resolution)?;
-        let binding = self
-            .obligations
-            .get(&command)
-            .map(|obligation| obligation.binding);
         self.emit(
             self.now,
             EventKind::Reconciled {
@@ -3113,10 +3111,7 @@ impl Engine {
                 profit: postings.profit,
             },
         )?;
-        match binding {
-            Some(binding) => self.maybe_pause(account, binding),
-            None => Ok(()),
-        }
+        self.maybe_pause(account)
     }
 
     // ------------------------------------------------------------------------------------------
@@ -3283,7 +3278,7 @@ impl Engine {
         let policy = &self.definition.replay.risk_policies[binding.policy];
         let account = &self.accounts[binding.account];
         let blocked = |disposition| Ok((disposition, Vec::new()));
-        if account.paused_until_micros.is_some() {
+        if account.paused_until_micros.is_some() || self.pause_due(binding.account)? {
             return blocked(Disposition::AccountPaused);
         }
         if !account.blocked.is_empty() {
@@ -3451,15 +3446,25 @@ impl Engine {
     /// debited once, only `reservation` (the terminal reserve) stays reserved, and the
     /// instrument's ticks start driving it. A reconciled acceptance of a possibly sent command
     /// also ends its unresolved state.
+    #[allow(clippy::too_many_arguments)]
     fn apply_acceptance(
         &mut self,
         command: &str,
         entry_time_micros: i64,
         entry_price_units: i64,
+        price_time_micros: i64,
         due_time_micros: i64,
         debit: Decimal,
         reservation: Decimal,
     ) -> Result<(), String> {
+        if price_time_micros > entry_time_micros || entry_time_micros > self.now {
+            return Err(format!(
+                "{command} acceptance clocks are inconsistent: quote {}, entry {}, decision {}",
+                format_event_time_micros(price_time_micros),
+                format_event_time_micros(entry_time_micros),
+                format_event_time_micros(self.now)
+            ));
+        }
         let obligation = self.open_obligation(command)?;
         let binding = obligation.binding;
         let release = obligation.reservation.checked_sub(reservation)?;
@@ -3471,6 +3476,7 @@ impl Engine {
         obligation.entry_price_units = Some(entry_price_units);
         obligation.due_time_micros = Some(due_time_micros);
         obligation.path = Some(PathMetrics::new(entry_time_micros));
+        obligation.continuity_micros = Some(price_time_micros);
         let split = obligation.split.clone();
         let account = &mut self.accounts[self.bindings[binding].account];
         account.reserved = account.reserved.checked_sub(release)?;
@@ -3599,6 +3605,7 @@ impl Engine {
                             due_time_micros: None,
                             unresolved: None,
                             path: None,
+                            continuity_micros: None,
                         },
                     );
                     self.open_delta(index, 1);
@@ -3623,6 +3630,7 @@ impl Engine {
                 command,
                 entry_time_micros,
                 entry_price_units,
+                price_time_micros,
                 due_time_micros,
                 debit,
                 reservation,
@@ -3640,6 +3648,7 @@ impl Engine {
                     command,
                     *entry_time_micros,
                     *entry_price_units,
+                    *price_time_micros,
                     *due_time_micros,
                     *debit,
                     *reservation,
@@ -3756,7 +3765,7 @@ impl Engine {
                         Resolution::Accepted {
                             entry_time_micros,
                             entry_price_units,
-                            ..
+                            price_time_micros,
                         } => {
                             let (_, reservation, due_time_micros) =
                                 self.acceptance_postings(command, *entry_time_micros)?;
@@ -3764,6 +3773,7 @@ impl Engine {
                                 command,
                                 *entry_time_micros,
                                 *entry_price_units,
+                                *price_time_micros,
                                 due_time_micros,
                                 *debit,
                                 reservation,
@@ -3794,17 +3804,29 @@ impl Engine {
             EventKind::PauseStarted {
                 account,
                 until_micros,
-                ..
+                drawdown,
             } => {
-                let state = self
+                let index = self
                     .accounts
-                    .iter_mut()
-                    .find(|state| state.id == *account)
+                    .iter()
+                    .position(|state| state.id == *account)
                     .ok_or_else(|| format!("unknown account `{account}`"))?;
+                let state = &self.accounts[index];
+                let pause = self
+                    .pause_of(index)
+                    .ok_or_else(|| format!("account `{account}` declares no pause"))?;
                 if state.paused_until_micros.is_some() {
                     return Err(format!("account `{account}` is already paused"));
                 }
-                state.paused_until_micros = Some(*until_micros);
+                if *drawdown != state.epoch_peak.checked_sub(state.completed_profit)?
+                    || !self.pause_due(index)?
+                    || Some(*until_micros) != event.time_micros.checked_add(pause.duration_micros)
+                {
+                    return Err(format!(
+                        "account `{account}` pause disagrees with its drawdown and policy"
+                    ));
+                }
+                self.accounts[index].paused_until_micros = Some(*until_micros);
             }
             EventKind::PauseEnded { account } => {
                 let state = self

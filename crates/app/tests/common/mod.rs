@@ -515,9 +515,14 @@ pub type Table = (
     Vec<Vec<Option<binary_alpha_engine::features::Value>>>,
 );
 
-/// Reads a whole published table through the generic row API, independently of the
-/// application's readers.
-pub fn read_table(path: &Path) -> Table {
+/// Streams a published table's column names and rows through the generic row API,
+/// independently of the application's readers.
+pub fn table_rows(
+    path: &Path,
+) -> (
+    Vec<String>,
+    impl Iterator<Item = Vec<Option<binary_alpha_engine::features::Value>>> + use<>,
+) {
     use binary_alpha_engine::features::Value;
     let reader = SerializedFileReader::new(File::open(path).unwrap()).unwrap();
     let names: Vec<String> = reader
@@ -528,27 +533,29 @@ pub fn read_table(path: &Path) -> Table {
         .iter()
         .map(|column| column.name().to_string())
         .collect();
-    let rows = reader
-        .get_row_iter(None)
-        .unwrap()
-        .map(|row| {
-            row.unwrap()
-                .get_column_iter()
-                .map(|(_, field)| match field {
-                    Field::Null => None,
-                    Field::Long(value) => Some(Value::Int(*value)),
-                    Field::Short(value) => Some(Value::Int(i64::from(*value))),
-                    Field::Int(value) => Some(Value::Int(i64::from(*value))),
-                    Field::Double(value) => Some(Value::Float(*value)),
-                    Field::Bool(value) => Some(Value::Bool(*value)),
-                    Field::Str(value) => Some(Value::Text(Cow::Owned(value.clone()))),
-                    Field::TimestampMicros(value) => Some(Value::Time(*value)),
-                    other => panic!("unexpected field {other:?}"),
-                })
-                .collect()
-        })
-        .collect();
+    let rows = reader.into_iter().map(|row| {
+        row.unwrap()
+            .get_column_iter()
+            .map(|(_, field)| match field {
+                Field::Null => None,
+                Field::Long(value) => Some(Value::Int(*value)),
+                Field::Short(value) => Some(Value::Int(i64::from(*value))),
+                Field::Int(value) => Some(Value::Int(i64::from(*value))),
+                Field::Double(value) => Some(Value::Float(*value)),
+                Field::Bool(value) => Some(Value::Bool(*value)),
+                Field::Str(value) => Some(Value::Text(Cow::Owned(value.clone()))),
+                Field::TimestampMicros(value) => Some(Value::Time(*value)),
+                other => panic!("unexpected field {other:?}"),
+            })
+            .collect()
+    });
     (names, rows)
+}
+
+/// Reads a whole published table.
+pub fn read_table(path: &Path) -> Table {
+    let (names, rows) = table_rows(path);
+    (names, rows.collect())
 }
 
 /// Every normalized tick of a published dataset generation, through the generic row API.

@@ -1225,11 +1225,11 @@ fn rows_are_monotonic_and_a_failed_step_ends_the_engine() {
 }
 
 #[test]
-fn a_restored_engine_measures_continuity_from_the_entry() {
+fn continuity_is_the_obligation_s_own_evidence() {
     // With a maximum gap of five and ticks at 10, 14, and 18, the uninterrupted engine settles
-    // at 21; an engine restored right after the acceptance knows no tick after the entry, so
-    // the same tick is a gap from the entry: the obligation stays unresolved with its cash and
-    // capacity retained, and no settlement is manufactured.
+    // at 21; an engine restored right after the acceptance knows no tick after the quote, so
+    // the same tick is a gap from the quote tick: the obligation stays unresolved with its cash
+    // and capacity retained, and no settlement is manufactured.
     let mut live = Live::new(definition(|replay| {
         replay.contracts[0].settlement.max_tick_gap_micros = 5;
     }));
@@ -1262,7 +1262,23 @@ fn a_restored_engine_measures_continuity_from_the_entry() {
         )
     );
     restored.assert_restorable();
-    // Ticks at or before the entry time, delivered late, are not path evidence.
+    // The anchor is the quote tick, not the entry: quote 100, entry 103, maximum gap 12, next
+    // tick 113. The uninterrupted engine measures 13 from the quote tick and retains the
+    // obligation; so does an engine restored after the acceptance.
+    let mut live = Live::new(definition(|replay| {
+        replay.contracts[0].settlement.max_tick_gap_micros = 12;
+    }));
+    live.simulate(103, vec![tick(100, 500), row(0, 100, 103, true)]);
+    let mut restored = live.restored();
+    for engine in [&mut live, &mut restored] {
+        let events = engine.simulate(113, vec![tick(113, 520)]);
+        let EventKind::Unresolved { reason, .. } = &events[0].kind else {
+            panic!("{events:?}")
+        };
+        assert_eq!(*reason, UnresolvedReason::Gap);
+    }
+    // Ticks at or before the entry time, delivered late, are continuity evidence but not path
+    // evidence.
     let mut live = Live::new(definition(|_| {}));
     live.simulate(103, vec![tick(100, 500), row(0, 100, 103, true)]);
     assert!(live.step(104, vec![tick(101, 520)]).is_empty());
@@ -1275,6 +1291,52 @@ fn a_restored_engine_measures_continuity_from_the_entry() {
         (path.max_favorable_units, path.first_favorable_time_micros),
         (0, None)
     );
+    // A delayed acceptance: ticks the instrument saw while the command was unaccepted are not
+    // the obligation's evidence. Sent at 10, a tick at 20 during the wait, accepted at 21 with
+    // entry 10: the next tick at 22 is 12 from the quote tick, so the obligation stays
+    // unresolved instead of settling across the unobserved interval.
+    let mut live = Live::new(definition(|replay| {
+        replay.contracts[0].settlement.max_tick_gap_micros = 5;
+    }));
+    let command = Live::command(&live.step(10, vec![tick(10, 500), row(0, 10, 10, true)]));
+    assert!(live.step(20, vec![tick(20, 400)]).is_empty());
+    let events = live.step(
+        21,
+        vec![Observation::Accepted {
+            command: command.clone(),
+            source: source("broker:late", 21),
+            entry_time_micros: 10,
+            entry_price_units: 500,
+            price_time_micros: 10,
+        }],
+    );
+    assert_eq!(kinds(&events), ["accepted"]);
+    let events = live.simulate(22, vec![tick(22, 600)]);
+    let EventKind::Unresolved { reason, .. } = &events[0].kind else {
+        panic!("{events:?}")
+    };
+    assert_eq!(*reason, UnresolvedReason::Gap);
+    // Acceptance clocks: a quote dated after its entry, or an entry after the decision, fail.
+    for (what, entry, price_time) in [
+        ("quote after entry", 30, 31),
+        ("entry after decision", 32, 30),
+    ] {
+        let mut fresh = Live::new(definition(|_| {}));
+        let command = Live::command(&fresh.step(30, vec![tick(30, 500), row(0, 30, 30, true)]));
+        let error = fresh
+            .try_step(
+                31,
+                vec![Observation::Accepted {
+                    command,
+                    source: source("broker:accept", 31),
+                    entry_time_micros: entry,
+                    entry_price_units: 500,
+                    price_time_micros: price_time,
+                }],
+            )
+            .unwrap_err();
+        assert!(error.contains("acceptance clocks"), "{what}: {error}");
+    }
 }
 
 #[test]
@@ -2045,6 +2107,35 @@ fn quote_envelopes_pauses_conversion_and_projections_are_exact() {
     assert_eq!(live.account("a").epoch_peak.to_string(), "-2.00");
     assert_eq!(live.account("a").paused_until_micros, None);
     live.assert_restorable();
+    // The pause record is checked against the account's drawdown and policy on application: a
+    // shortened deadline fails, and a ledger that omits the pause and its end fails at the
+    // admission the pause would have blocked.
+    let error = Engine::restore(
+        tampered(&live.lines, "\"until_micros\":120,", "\"until_micros\":21,")
+            .into_iter()
+            .map(Ok),
+    )
+    .err()
+    .unwrap();
+    assert!(error.contains("pause disagrees"), "{error}");
+    let without_pause: Vec<Vec<u8>> = live
+        .lines
+        .iter()
+        .filter(|line| {
+            !line.windows(15).any(|w| w == b"\"pause_started\"")
+                && !line.windows(13).any(|w| w == b"\"pause_ended\"")
+        })
+        .enumerate()
+        .map(|(sequence, line)| {
+            let text = String::from_utf8(line.clone()).unwrap();
+            let (_, rest) = text.split_once(',').unwrap();
+            format!("{{\"sequence\":{sequence},{rest}").into_bytes()
+        })
+        .collect();
+    let error = Engine::restore(without_pause.into_iter().map(Ok))
+        .err()
+        .unwrap();
+    assert!(error.contains("not admissible"), "{error}");
     // Conversion: exact same-currency rescaling, and a supplied rate only when its provider and
     // availability times are no later than the decision and its provider age is within bound.
     let v: Currency = "v".to_string().try_into().unwrap();
@@ -2122,6 +2213,37 @@ fn quote_envelopes_pauses_conversion_and_projections_are_exact() {
         (0, 1, None),
         "the definition record is observed without a rate"
     );
+    // Rates are observed at their own availability times, between market steps: 2.5 at 103
+    // then 1 at 106 without any account posting show the peak 3500 and the drawdown 1500.
+    let mut two_rates = foreign(None);
+    two_rates.replay.rates.as_mut().unwrap().push(RateEvent {
+        id: "r2".into(),
+        provider_time: "1970-01-01T00:00:00.000105Z".into(),
+        available_at: "1970-01-01T00:00:00.000106Z".into(),
+        rate: decimal("1"),
+        ..rate.clone()
+    });
+    let mut between = Live::new(two_rates);
+    let events = between.simulate(110, vec![tick(110, 500)]);
+    assert_eq!(kinds(&events), ["rate_available", "rate_available"]);
+    assert_eq!(
+        events.iter().map(|e| e.time_micros).collect::<Vec<_>>(),
+        [103, 106]
+    );
+    let reporting = between.engine.summary().reporting.clone();
+    assert_eq!(
+        (
+            reporting.settled_equity.map(|e| e.to_string()),
+            reporting.peak_equity.map(|e| e.to_string()),
+            reporting.max_drawdown.map(|e| e.to_string())
+        ),
+        (
+            Some("2000.00".into()),
+            Some("3500.00".into()),
+            Some("1500.00".into())
+        )
+    );
+    between.assert_restorable();
     assert!(
         live.simulate(100, vec![tick(100, 500)]).is_empty(),
         "the rate's provider time is not its availability"
@@ -2751,14 +2873,49 @@ fn governed_reference_parity() {
             (
                 contract.stake.to_string(),
                 contract.quoted_cost.to_string(),
+                contract.entry_fee.to_string(),
                 contract.win.gross_return.to_string(),
-                contract.tie.gross_return.to_string()
+                contract.win.terminal_fee.to_string(),
+                contract.loss.gross_return.to_string(),
+                contract.loss.terminal_fee.to_string(),
+                contract.tie.gross_return.to_string(),
+                contract.tie.terminal_fee.to_string()
             ),
-            ("1".into(), "1".into(), "1.92".into(), "1".into())
+            (
+                "1".into(),
+                "1".into(),
+                "0".into(),
+                "1.92".into(),
+                "0".into(),
+                "0".into(),
+                "0".into(),
+                "1".into(),
+                "0".into()
+            ),
+            "the complete fixture cashflow table: no refund on a loss and no fees"
         );
         assert_eq!(
-            contract.settlement.max_tick_gap_micros,
-            run["max_valid_tick_gap_ms"].as_i64().unwrap() * 1000
+            (
+                contract.settlement.rule,
+                contract.settlement.max_tick_gap_micros,
+                contract.settlement.max_settlement_delay_micros
+            ),
+            (
+                SettlementRule::PriceAtDueV1,
+                run["max_valid_tick_gap_ms"].as_i64().unwrap() * 1000,
+                run["max_valid_tick_gap_ms"].as_i64().unwrap() * 1000
+            )
+        );
+        assert_eq!(
+            (binding.account.as_str(), contract.currency.as_str()),
+            ("simulated", settings.accounts[0].currency.as_str())
+        );
+        assert_eq!(
+            (
+                binding.envelope.max_purchase_cost.to_string(),
+                binding.envelope.min_winning_net_return.to_string()
+            ),
+            ("1".into(), "0.92".into())
         );
         let policy = settings
             .risk_policies
@@ -2777,9 +2934,26 @@ fn governed_reference_parity() {
         assert_eq!(policy.same_entry, SameEntry::All);
         assert!(!policy.deduplicate_signal_logic && policy.pause.is_none());
     }
+    assert_eq!(settings.accounts.len(), 1);
     assert_eq!(
-        settings.accounts[0].initial_cash.to_string(),
-        run["starting_amount"].as_str().unwrap()
+        (
+            settings.accounts[0].id.as_str(),
+            settings.accounts[0].scale,
+            settings.accounts[0].initial_cash.to_string()
+        ),
+        (
+            "simulated",
+            2,
+            run["starting_amount"].as_str().unwrap().to_string()
+        )
+    );
+    assert_eq!(
+        (
+            settings.reporting_currency.as_str(),
+            settings.rates.is_none()
+        ),
+        (settings.accounts[0].currency.as_str(), true),
+        "same-currency reporting, no supplied rates"
     );
     let store = match &config.storage.publication_uri {
         binary_alpha_engine::config::PublicationUri::Filesystem(path) => path.clone(),

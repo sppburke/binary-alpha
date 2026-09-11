@@ -893,11 +893,12 @@ with the current available quote as entry price, preserving the quote tick's pro
 time is the entry time plus the contract duration. The first observed tick at or after the due time
 settles when its delay is at most `max_settlement_delay_micros`; the outcome compares the
 settlement price with the entry price for the contract direction, an equal price is a tie. Ticks
-at or before the entry time are not path or settlement evidence. A gap into a tick larger than
-`max_tick_gap_micros` whose interval intersects `[entry, due)`, a later settlement tick, or an
-exhausted input window leaves the obligation `unresolved` with its reason, evidence, and path so
-far; an engine restored after an acceptance knows no tick after the entry, so it measures the gap
-from the entry time and never assumes continuity; it keeps its paid basis, capacity, and exposure until an authoritative
+at or before the entry time are continuity evidence but not path or settlement evidence.
+Continuity is the obligation's own evidence: the quote tick recorded at acceptance and every
+tick it observed since, never ticks the instrument saw while the command was unaccepted or
+before an engine was restored. A tick more than `max_tick_gap_micros` after that evidence, a
+later settlement tick, or an exhausted input window leaves the obligation `unresolved` with its
+reason, evidence, and path so far; it keeps its paid basis, capacity, and exposure until an authoritative
 settlement or reconciliation. Every settlement credits the actual `gross_return - terminal_fee`,
 releases the remaining reservation and capacity once, and records the path; an authoritative
 settlement's price is observed in the path at its provider time. A confirmed cashflow that
@@ -906,10 +907,14 @@ reservation is a `deficit`; either blocks the account pending reconciliation wit
 the configured amount. A reconciliation resolves an open command as not sent, accepted (posting
 the purchase and keeping the terminal reserve), or settled with its actual cashflow, or lifts with
 zero postings the block a settled discrepancy left, and records the block that remains on the
-account. Every admission, acceptance, settlement, and reconciliation record is checked when it is
-applied: the state-based admission checks run again on an admitted signal, and every posting is
-recomputed from the obligation and the frozen terms, so an admission the state cannot fund or a
-posting that disagrees fails at generation and at restoration alike. An external event's payload
+account. Every admission, acceptance, settlement, reconciliation, and pause record is checked when it
+is applied: the state-based admission checks run again on an admitted signal (an account whose
+drawdown has reached its pause threshold counts as paused, so an omitted pause fails at the
+admission it would have blocked), an acceptance's quote time is no later than its entry and the
+entry no later than the decision, every posting is recomputed from the obligation and the frozen
+terms, and a pause must state the account's exact epoch drawdown at or beyond its threshold with
+the deadline the policy's duration gives, so a record that disagrees fails at generation and at
+restoration alike. An external event's payload
 is its transition fields and its source's provider time, availability, and simulation flag: the
 same identity with the exact payload is a no-op, before and after restoration; the same identity
 with another payload, including an equal amount written at another scale, fails; a ledger that
@@ -927,9 +932,11 @@ source and reporting currency at a decision time, the latest supplied rate whose
 availability times are no later than the decision and whose provider age is at most
 `max_rate_age_micros`, multiplies once with checked arithmetic, and rejects lost precision;
 same-currency amounts only rescale. The reporting-currency projection is observed at the run
-definition, at each supplied rate's availability (a `rate_available` record, so a rate change is
-visible without an account posting), and after every record that changes an account: an admitted
-signal, an acceptance, a release, a settlement, or a reconciliation. Missing or stale rates leave that observation
+definition, at each supplied rate's own availability time (a `rate_available` record emitted
+before the market observations of the step that reaches it, so every valuation between market
+observations is recorded and a rate change is visible without an account posting), and after
+every record that changes an account: an admitted signal, an acceptance, a release, a settlement,
+or a reconciliation. Missing or stale rates leave that observation
 unavailable and make the total unresolved-loss limit unavailable, which blocks admissions that
 need it; native history is never substituted, while native cash, account pause, and confirmed
 native settlement never depend on conversion. The path of a contract
