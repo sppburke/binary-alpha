@@ -2108,6 +2108,17 @@ fn the_exact_cashflow_counterexample_and_fees_post_exactly() {
         );
         assert_eq!(fresh.account("a"), live.account("a"));
     }
+    // The same settlement with evidence before the entry cannot lift the block either.
+    let booked = Resolution::Settled {
+        outcome: Outcome::Loss,
+        gross_return: decimal("0"),
+        terminal_fee: decimal("0.50"),
+    };
+    let mut fresh = live.restored();
+    let error = fresh
+        .try_step(32, vec![reconciliation(&command, 21, booked)])
+        .unwrap_err();
+    assert!(error.contains("precedes its entry or dispatch"), "{error}");
     // Tampered ledgers: the accepted record under the acknowledgement's source identity, an
     // acceptance available after its decision time, and an admission the definition's cash
     // cannot fund all fail restoration.
@@ -2189,6 +2200,18 @@ fn the_exact_cashflow_counterexample_and_fees_post_exactly() {
     assert_eq!(live.cash(), "8.90");
     assert!(live.account("a").blocked.is_empty());
     live.assert_restorable();
+    let error = Engine::restore(
+        tampered(
+            &live.lines,
+            "\"provider_time_micros\":32,\"available_at_micros\":32",
+            "\"provider_time_micros\":21,\"available_at_micros\":32",
+        )
+        .into_iter()
+        .map(Ok),
+    )
+    .err()
+    .unwrap();
+    assert!(error.contains("precedes its entry or dispatch"), "{error}");
     // Blocks are kept per command: two discrepant settlements block until each is reconciled.
     let mut definition = fractional();
     definition.replay.risk_policies[0].max_open_per_strategy = Some(5);
@@ -2645,6 +2668,31 @@ fn quote_envelopes_pauses_conversion_and_projections_are_exact() {
         )
     );
     between.assert_restorable();
+    // A rate record is at its availability or the first later record time and precedes any other
+    // record at that time: a postponed or omitted rate record fails restoration.
+    let error = Engine::restore(
+        tampered(
+            &between.lines,
+            "\"time_micros\":103,\"kind\":\"rate_available\"",
+            "\"time_micros\":106,\"kind\":\"rate_available\"",
+        )
+        .into_iter()
+        .map(Ok),
+    )
+    .err()
+    .unwrap();
+    assert!(error.contains("must be observed at"), "{error}");
+    let error = Engine::restore(
+        without(
+            &between.lines,
+            |kind| matches!(kind, EventKind::RateAvailable { rate } if rate == "r1"),
+        )
+        .into_iter()
+        .map(Ok),
+    )
+    .err()
+    .unwrap();
+    assert!(error.contains("must be observed at"), "{error}");
     let mut tail = Live::new(two_rates_definition);
     tail.simulate(100, vec![tick(100, 500)]);
     let events = tail.finish();

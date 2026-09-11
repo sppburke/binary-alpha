@@ -1772,12 +1772,14 @@ pub struct AccountState {
 #[serde(tag = "reason", rename_all = "snake_case")]
 pub enum Block {
     PossiblySent,
-    /// The terminal cashflow booked at settlement; only a reconciliation that states the same
-    /// settlement lifts the block, since no corrective posting exists.
+    /// The terminal cashflow booked at settlement and the entry it followed; only a
+    /// reconciliation that states the same settlement, with evidence no earlier than that entry,
+    /// lifts the block, since no corrective posting exists.
     Settled {
         outcome: Outcome,
         gross_return: Decimal,
         terminal_fee: Decimal,
+        entry_time_micros: i64,
     },
 }
 
@@ -1847,6 +1849,14 @@ struct Obligation {
     /// again from the quote tick.
     #[serde(skip)]
     continuity_micros: Option<i64>,
+}
+
+impl Obligation {
+    /// The earliest time settlement evidence can carry: the entry, or the dispatch while no
+    /// acceptance is proved.
+    fn evidence_bound(&self) -> i64 {
+        self.entry_time_micros.unwrap_or(self.sent_micros)
+    }
 }
 
 /// The exact postings of one terminal settlement.
@@ -2386,10 +2396,6 @@ impl Engine {
                     return Err(format!("ledger record {expected} repeats the definition"));
                 }
                 (Some(engine), kind) => {
-                    if event.time_micros < engine.now {
-                        return Err(format!("ledger record {expected} goes back in time"));
-                    }
-                    engine.now = event.time_micros;
                     engine.emit(event.time_micros, kind)?;
                     engine.events.clear();
                 }
@@ -3166,10 +3172,14 @@ impl Engine {
         &self,
         command: &str,
         resolution: &Resolution,
-    ) -> Result<(ReconciliationPostings, usize), String> {
+    ) -> Result<(ReconciliationPostings, usize, i64), String> {
         if let Some(obligation) = self.obligations.get(command) {
             let account = self.bindings[obligation.binding].account;
-            return Ok((self.reconciliation_postings(command, resolution)?, account));
+            return Ok((
+                self.reconciliation_postings(command, resolution)?,
+                account,
+                obligation.evidence_bound(),
+            ));
         }
         let account = self.blocked_by(command).ok_or_else(|| {
             format!("{command} is neither an open obligation nor a settled discrepancy")
@@ -3182,24 +3192,26 @@ impl Engine {
                     outcome,
                     gross_return,
                     terminal_fee,
+                    entry_time_micros,
                 },
                 Resolution::Settled {
                     outcome: stated,
                     gross_return: stated_return,
                     terminal_fee: stated_fee,
                 },
-            ) => {
-                outcome == stated
-                    && gross_return.compare(*stated_return)? == Ordering::Equal
-                    && terminal_fee.compare(*stated_fee)? == Ordering::Equal
+            ) if outcome == stated
+                && gross_return.compare(*stated_return)? == Ordering::Equal
+                && terminal_fee.compare(*stated_fee)? == Ordering::Equal =>
+            {
+                Some(*entry_time_micros)
             }
-            _ => false,
+            _ => None,
         };
-        if !matches {
+        let Some(entry_time_micros) = matches else {
             return Err(format!(
                 "{command} reconciliation contradicts the settlement already booked; reconciliation failed"
             ));
-        }
+        };
         let zero = Decimal::zero(self.accounts[account].scale);
         Ok((
             ReconciliationPostings {
@@ -3209,6 +3221,7 @@ impl Engine {
                 profit: None,
             },
             account,
+            entry_time_micros,
         ))
     }
 
@@ -3218,7 +3231,7 @@ impl Engine {
         source: EventSource,
         resolution: Resolution,
     ) -> Result<(), String> {
-        let (postings, account) = self.reconciliation_of(&command, &resolution)?;
+        let (postings, account, _) = self.reconciliation_of(&command, &resolution)?;
         self.emit(
             self.now,
             EventKind::Reconciled {
@@ -3524,6 +3537,37 @@ impl Engine {
         {
             return Err(format!("external event `{key}` is already applied"));
         }
+        if time_micros < self.now {
+            return Err(format!(
+                "the record at {} goes back in time from {}",
+                format_event_time_micros(time_micros),
+                format_event_time_micros(self.now)
+            ));
+        }
+        if let Some(next) = self.rates.get(self.next_rate)
+            && !matches!(event.kind, EventKind::RunDefinition { .. })
+        {
+            let due = next
+                .available_at_micros
+                .max(self.decision_start)
+                .max(self.now);
+            let allowed = if matches!(&event.kind, EventKind::RateAvailable { rate } if *rate == next.id)
+            {
+                time_micros == due
+            } else {
+                next.available_at_micros > time_micros
+                    || (matches!(event.kind, EventKind::PauseEnded { .. }) && time_micros == due)
+            };
+            if !allowed {
+                return Err(format!(
+                    "rate `{}` must be observed at {} before the record at {}",
+                    next.id,
+                    format_event_time_micros(due),
+                    format_event_time_micros(time_micros)
+                ));
+            }
+        }
+        self.now = time_micros;
         if let Some((pending, due_micros)) = self.pause_pending
             && !matches!(&event.kind, EventKind::PauseStarted { account, .. } if *account == self.accounts[pending].id && time_micros == due_micros)
         {
@@ -3968,7 +4012,9 @@ impl Engine {
                         "{command} settlement postings disagree with its obligation and terms"
                     ));
                 }
-                let account = self.bindings[self.obligations[command].binding].account;
+                let obligation = &self.obligations[command];
+                let account = self.bindings[obligation.binding].account;
+                let entry_time_micros = obligation.evidence_bound();
                 self.apply_closure(command, *credit, Some((*outcome, *profit)))?;
                 if *discrepancy || deficit.is_some() {
                     self.accounts[account].blocked.insert(
@@ -3977,6 +4023,7 @@ impl Engine {
                             outcome: *outcome,
                             gross_return: *gross_return,
                             terminal_fee: *terminal_fee,
+                            entry_time_micros,
                         },
                     );
                 }
@@ -4014,7 +4061,8 @@ impl Engine {
                 credit,
                 profit,
             } => {
-                let (postings, account) = self.reconciliation_of(command, resolution)?;
+                let (postings, account, evidence_bound) =
+                    self.reconciliation_of(command, resolution)?;
                 if postings
                     != (ReconciliationPostings {
                         release: *release,
@@ -4025,6 +4073,13 @@ impl Engine {
                 {
                     return Err(format!(
                         "{command} reconciliation postings disagree with its resolution"
+                    ));
+                }
+                if matches!(resolution, Resolution::Settled { .. })
+                    && source.provider_time_micros < evidence_bound
+                {
+                    return Err(format!(
+                        "{command} settlement evidence precedes its entry or dispatch"
                     ));
                 }
                 if self.obligations.contains_key(command) {
@@ -4050,16 +4105,6 @@ impl Engine {
                             )?;
                         }
                         Resolution::Settled { outcome, .. } => {
-                            let obligation = &self.obligations[command];
-                            if source.provider_time_micros
-                                < obligation
-                                    .entry_time_micros
-                                    .unwrap_or(obligation.sent_micros)
-                            {
-                                return Err(format!(
-                                    "{command} settlement evidence precedes its entry or dispatch"
-                                ));
-                            }
                             let profit = profit.expect("checked against the postings");
                             let cash = &mut self.accounts[account].cash;
                             *cash = cash.checked_sub(*debit)?;
@@ -4070,14 +4115,12 @@ impl Engine {
                 self.accounts[account].blocked.remove(command);
             }
             EventKind::RateAvailable { rate } => {
-                let next = self.rates.get(self.next_rate);
-                if next.is_none_or(|next| {
-                    next.id != *rate || next.available_at_micros > event.time_micros
-                }) {
-                    return Err(format!(
-                        "rate `{rate}` is not the next available rate at {}",
-                        format_event_time_micros(event.time_micros)
-                    ));
+                if self
+                    .rates
+                    .get(self.next_rate)
+                    .is_none_or(|next| next.id != *rate)
+                {
+                    return Err(format!("rate `{rate}` is not the next rate"));
                 }
                 self.next_rate += 1;
             }

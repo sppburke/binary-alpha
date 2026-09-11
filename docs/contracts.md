@@ -933,7 +933,7 @@ freshness bounds with a quote), the state-based admission checks run again on an
 drawdown has reached its pause threshold counts as paused, so an omitted pause fails at the
 admission it would have blocked), an acceptance's quote time is no later than its entry and the
 entry no earlier than the command's dispatch and no later than the decision, a settlement's
-time is its source's provider time and no earlier than the entry, a settled reconciliation's evidence is no earlier than the entry or, without a proved acceptance, the dispatch, every posting is recomputed from the obligation and the frozen
+time is its source's provider time and no earlier than the entry, a settled reconciliation's evidence, including one lifting a settled discrepancy's block, is no earlier than the entry or, without a proved acceptance, the dispatch, every posting is recomputed from the obligation and the frozen
 terms, and a pause must state the account's exact epoch drawdown at or beyond its threshold with
 the deadline the policy's duration gives and must directly follow, at the same decision time, the
 settlement or reconciliation that made it due, an expired pause must end before any other record at or after
@@ -959,8 +959,10 @@ same-currency amounts only rescale. The reporting-currency projection is observe
 definition, at each supplied rate's own availability time (a `rate_available` record emitted
 before the market observations of the step that reaches it, and at the end of the run for the
 rates available by `decision_end`; an expired pause ends when a rate observation advances the
-clock past its deadline; so every valuation between market observations is recorded and a rate
-change is visible without an account posting), and after every record that changes an
+clock past its deadline; a rate record is at its availability or at the first later record time
+and precedes every other record at that time, at generation and at restoration alike; so every
+valuation between market observations is recorded and a rate change is visible without an
+account posting), and after every record that changes an
 account: an admitted signal, an acceptance, a release, a settlement, or a reconciliation. Missing or stale rates, or an aggregate the reporting scale cannot
 hold, leave that observation unavailable (and missing or stale rates make the total
 unresolved-loss limit unavailable, which blocks admissions that need it); native history is
