@@ -834,9 +834,12 @@ and whose every stream's first and last decision times lie inside the decision w
 optional outcome manifest must label exactly those two generations. A strategy binds through its
 plan identity to exactly one input; every condition names a compiled output or fitted encoding of
 a plan stream with a threshold of the output's kind (an encoding compares its label text). The
-feature owner's readiness flags of a value (`is_ema{p}_ready` for the moving-average family,
-`tick_path_ready` for the tick-path buckets) are resolved from the frozen plan and read beside
-it; a value whose flag is not true is not ready and fails its condition. An optional outcome
+feature owner's readiness of a value is resolved from the frozen plan: its readiness flags
+(`is_ema{p}_ready` for the moving-average family, `tick_path_ready` for the tick-path buckets)
+are read beside it, and its declared not-ready text values (`not_ready`, `unknown_warmup`,
+`insufficient_tick_path`, `warming_up`, and the state outputs' `unknown`) are recorded with it;
+a value whose flag is not true or that reads a not-ready value fails its condition before any
+comparison. An optional outcome
 manifest must label the bound tick and feature generations and the plan's raw rows. The resolved
 run definition records, per instrument, the identities and only the streams and columns the
 strategies read, in frozen-plan order; the adapter reads exactly those columns. Historical
@@ -858,8 +861,10 @@ engine: its state may hold observations the ledger does not, so every later step
 the adapter restores a fresh engine from the ledger instead of retrying. A
 condition fails when its stream has no row, when that row closes after the base row, when the
 value is unavailable, or when a readiness flag of the value is not true; the engine never searches
-backward. A signal is decided once per binding and base close time: a row redelivered to a
-restored engine, whose row state is not ledger state, is installed but never decided again. A matching signal is always a ledger
+backward. A signal is decided once per binding and base close time, and the selection and
+deduplication slots of an instant are rebuilt from the signal records: a row redelivered to a
+restored engine, whose row state is not ledger state, is installed but never decided again, and
+a candidate the uninterrupted engine refused a slot is refused it again. A matching signal is always a ledger
 record with one disposition, decided in this order: `same_entry_duplicate` (`first` selection
 per account, instrument, contract duration, and entry event; a blocked first candidate keeps the
 slot), `duplicate_logic` (repeated signal logic per account, instrument, and entry event when
@@ -913,8 +918,11 @@ reservation is a `deficit`; either blocks the account pending reconciliation wit
 the configured amount. A reconciliation resolves an open command as not sent, accepted (posting
 the purchase and keeping the terminal reserve), or settled with its actual cashflow, or lifts with
 zero postings the block a settled discrepancy left, and records the block that remains on the
-account. Every admission, acceptance, settlement, reconciliation, and pause record is checked when it
-is applied: the state-based admission checks run again on an admitted signal (an account whose
+account. Every signal, acceptance, settlement, reconciliation, and pause record is checked when it
+is applied: a signal must name its binding's instrument, base stream, identities, and split, its
+clocks must be ones its decision could have seen (close no later than known, known and quote no
+later than the decision, the decision inside the window, and an admitted signal within both
+freshness bounds with a quote), the state-based admission checks run again on an admitted signal (an account whose
 drawdown has reached its pause threshold counts as paused, so an omitted pause fails at the
 admission it would have blocked), an acceptance's quote time is no later than its entry and the
 entry no later than the decision, every posting is recomputed from the obligation and the frozen
@@ -941,8 +949,9 @@ availability times are no later than the decision and whose provider age is at m
 same-currency amounts only rescale. The reporting-currency projection is observed at the run
 definition, at each supplied rate's own availability time (a `rate_available` record emitted
 before the market observations of the step that reaches it, and at the end of the run for the
-rates available by `decision_end`, so every valuation between market observations is recorded
-and a rate change is visible without an account posting), and after every record that changes an
+rates available by `decision_end`; an expired pause ends when a rate observation advances the
+clock past its deadline; so every valuation between market observations is recorded and a rate
+change is visible without an account posting), and after every record that changes an
 account: an admitted signal, an acceptance, a release, a settlement, or a reconciliation. Missing or stale rates leave that observation
 unavailable and make the total unresolved-loss limit unavailable, which blocks admissions that
 need it; native history is never substituted, while native cash, account pause, and confirmed

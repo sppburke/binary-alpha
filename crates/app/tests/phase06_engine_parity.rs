@@ -616,8 +616,8 @@ fn condition(
 }
 
 /// The bound instrument `BROKER:SYMBOL` with a boolean `signal` column on stream 5s/0s and the
-/// columns `signal`, `other`, `count`, and `count_ready` (the readiness flag of `count`) on
-/// stream 15s/5s.
+/// columns `signal`, `other`, `count`, `count_ready` (the readiness flag of `count`), and the
+/// text `state` (not ready while it reads `not_ready`) on stream 15s/5s.
 fn instrument(id: &str, generation: char, plan: &str) -> InstrumentBinding {
     let column = |name: &str, kind: Kind| ColumnSpec {
         name: name.to_string(),
@@ -625,6 +625,7 @@ fn instrument(id: &str, generation: char, plan: &str) -> InstrumentBinding {
         kind,
         encoding: None,
         readiness: Vec::new(),
+        unready: Vec::new(),
     };
     let (broker, symbol) = id.split_once(':').unwrap();
     InstrumentBinding {
@@ -652,6 +653,10 @@ fn instrument(id: &str, generation: char, plan: &str) -> InstrumentBinding {
                         ..column("count", Kind::Int)
                     },
                     column("count_ready", Kind::Bool),
+                    ColumnSpec {
+                        unready: vec!["not_ready".into()],
+                        ..column("state", Kind::Text)
+                    },
                 ],
             },
         ],
@@ -714,8 +719,8 @@ fn tick_of(instrument: usize, time: i64, price: i64) -> Observation {
     }
 }
 
-/// A row of `stream` with `signal`; the second stream's `other` is true and its `count` a ready
-/// four.
+/// A row of `stream` with `signal`; the second stream's `other` is true, its `count` a ready
+/// four, and its `state` `flat`.
 fn row(stream: usize, close: i64, known: i64, signal: bool) -> Observation {
     let mut values = vec![Some(Value::Bool(signal))];
     if stream == 1 {
@@ -723,6 +728,7 @@ fn row(stream: usize, close: i64, known: i64, signal: bool) -> Observation {
             Some(Value::Bool(true)),
             Some(Value::Int(4)),
             Some(Value::Bool(true)),
+            Some(Value::Text(std::borrow::Cow::Borrowed("flat"))),
         ]);
     }
     row_of(0, stream, close, known, values)
@@ -808,6 +814,14 @@ impl Live {
         let mut engine = Engine::new(definition).unwrap();
         let lines = engine.drain().iter().map(FinancialEvent::to_line).collect();
         Self { engine, lines }
+    }
+
+    /// An engine restored from a ledger prefix.
+    fn from_lines(lines: Vec<Vec<u8>>) -> Self {
+        Self {
+            engine: Engine::restore(lines.iter().cloned().map(Ok)).unwrap(),
+            lines,
+        }
     }
 
     fn step(&mut self, time: i64, observations: Vec<Observation>) -> Vec<FinancialEvent> {
@@ -1447,9 +1461,24 @@ fn selection_deduplication_and_repair_keep_their_slots() {
         [Disposition::RepairBlocked, Disposition::SameEntryDuplicate]
     );
     assert_eq!(
-        entry(&mut Live::new(two(SameEntry::All, false, repair))),
+        entry(&mut Live::new(two(SameEntry::All, false, repair.clone()))),
         [Disposition::RepairBlocked, Disposition::Admitted]
     );
+    // The slots are ledger state: an engine restored between the two decisions of one instant
+    // and given the batch again skips the decided first candidate and still refuses the second
+    // its slot, exactly as the uninterrupted engine did.
+    for (same_entry, deduplicate, expected) in [
+        (SameEntry::First, false, Disposition::SameEntryDuplicate),
+        (SameEntry::All, true, Disposition::DuplicateLogic),
+    ] {
+        let mut live = Live::new(two(same_entry, deduplicate, Vec::new()));
+        let batch = || vec![tick(10, 500), row(0, 10, 10, true), row(1, 10, 10, true)];
+        let events = live.simulate(10, batch());
+        assert_eq!(dispositions(&events), [Disposition::Admitted, expected]);
+        let first_decision = live.lines.len() - events.len() + 1;
+        let mut restored = Live::from_lines(live.lines[..first_decision].to_vec());
+        assert_eq!(dispositions(&restored.simulate(10, batch())), [expected]);
+    }
 }
 
 #[test]
@@ -1859,6 +1888,18 @@ fn the_exact_cashflow_counterexample_and_fees_post_exactly() {
             "\"initial_cash\":\"19\"",
             "\"initial_cash\":\"9\"",
             "not admissible",
+        ),
+        (
+            "a signal known after its decision",
+            "\"known_at_micros\":10,",
+            "\"known_at_micros\":11,",
+            "clocks its decision could not have seen",
+        ),
+        (
+            "a signal under another logic identity",
+            "\",\"stream\":{\"duration_seconds\":5,\"offset_seconds\":0},\"close_time_micros\":10,",
+            "0\",\"stream\":{\"duration_seconds\":5,\"offset_seconds\":0},\"close_time_micros\":10,",
+            "disagrees with its binding's definition",
         ),
     ] {
         let error = Engine::restore(tampered(&live.lines, from, to).into_iter().map(Ok))
@@ -2322,6 +2363,32 @@ fn quote_envelopes_pauses_conversion_and_projections_are_exact() {
         Some("1500.00".into())
     );
     tail.assert_restorable();
+    // A pause that expires before a tail rate ends when the rate observation advances the clock.
+    let mut paused = Live::new(definition(|replay| {
+        replay.risk_policies[0].pause = Some(Pause {
+            drawdown: decimal("1"),
+            duration_micros: 100,
+        });
+        replay.rates = Some(vec![RateEvent {
+            id: "late".into(),
+            provider_time: "1970-01-01T00:00:00.000125Z".into(),
+            available_at: "1970-01-01T00:00:00.000130Z".into(),
+            ..rate.clone()
+        }]);
+    }));
+    paused.simulate(10, vec![tick(10, 500), row(0, 10, 10, true)]);
+    assert_eq!(
+        kinds(&paused.simulate(20, vec![tick(20, 400)])),
+        ["settled", "pause_started"]
+    );
+    let events = paused.finish();
+    assert_eq!(kinds(&events), ["pause_ended", "rate_available"]);
+    assert_eq!(
+        events.iter().map(|e| e.time_micros).collect::<Vec<_>>(),
+        [130, 130]
+    );
+    assert_eq!(paused.account("a").paused_until_micros, None);
+    paused.assert_restorable();
     assert!(
         live.simulate(100, vec![tick(100, 500)]).is_empty(),
         "the rate's provider time is not its availability"
@@ -2562,6 +2629,7 @@ fn definitions_reject_mismatched_plans_columns_and_negative_cash_and_accept_many
                 Some(Value::Bool(true)),
                 Some(Value::Int(count)),
                 Some(Value::Bool(ready)),
+                Some(Value::Text(std::borrow::Cow::Borrowed("flat"))),
             ],
         )
     };
@@ -2581,6 +2649,38 @@ fn definitions_reject_mismatched_plans_columns_and_negative_cash_and_accept_many
         dispositions(&live.simulate(26, vec![tick(26, 500), row(0, 26, 26, true)])),
         [Disposition::Admitted],
         "all five hold again"
+    );
+    // A text value the feature owner declares not ready fails its condition before any
+    // comparison, even one that `not_ready` would otherwise satisfy.
+    let mut live = Live::new(definition(|replay| {
+        replay.strategies[0].conditions.push(condition(
+            stream(15, 5),
+            "state",
+            Comparator::Ne,
+            Threshold::Text("up".into()),
+        ));
+    }));
+    let state = |close: i64, state: &'static str| {
+        row_of(
+            0,
+            1,
+            close,
+            close,
+            vec![
+                Some(Value::Bool(true)),
+                Some(Value::Bool(true)),
+                Some(Value::Int(4)),
+                Some(Value::Bool(true)),
+                Some(Value::Text(std::borrow::Cow::Borrowed(state))),
+            ],
+        )
+    };
+    live.simulate(9, vec![state(9, "not_ready")]);
+    assert!(dispositions(&live.simulate(10, vec![tick(10, 500), row(0, 10, 10, true)])).is_empty());
+    live.simulate(15, vec![state(15, "flat")]);
+    assert_eq!(
+        dispositions(&live.simulate(16, vec![tick(16, 500), row(0, 16, 16, true)])),
+        [Disposition::Admitted]
     );
 }
 

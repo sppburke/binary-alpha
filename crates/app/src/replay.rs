@@ -18,7 +18,7 @@ use binary_alpha_engine::execution::{
     ColumnSpec, EVENTS_OBJECT_PATH, Engine, EventKind, EventSource, FinancialEvent,
     HISTORICAL_AVAILABILITY, InstrumentBinding, Observation, REPLAY_MANIFEST_KIND,
     REPLAY_SCHEMA_VERSION, ReplayManifest, RunDefinition, SUMMARY_OBJECT_PATH, StreamColumns,
-    Summary, replay_generation_id,
+    replay_generation_id,
 };
 use binary_alpha_engine::features::{FeaturePlan, StreamPlan, Value};
 use binary_alpha_engine::market::parse_event_time_micros;
@@ -122,17 +122,20 @@ fn bind_instrument(settings: &Replay, index: usize) -> Result<BoundInstrument, S
                     outcome.generation
                 ));
             }
-            if outcome.tick_generation != tick.generation
+            if outcome.role != settings.role
+                || outcome.tick_generation != tick.generation
                 || outcome.feature_generation != feature.generation
                 || outcome.raw_identity != plan.raw_identity
             {
                 return Err(format!(
-                    "{}: outcome generation {} labels tick generation {}, feature generation {}, and raw rows {}, not this input's {}, {}, and {}",
+                    "{}: outcome generation {} labels role {}, tick generation {}, feature generation {}, and raw rows {}, not this input's {}, {}, {}, and {}",
                     field("outcome_manifest"),
                     outcome.generation,
+                    outcome.role,
                     outcome.tick_generation,
                     outcome.feature_generation,
                     outcome.raw_identity,
+                    settings.role,
                     tick.generation,
                     feature.generation,
                     plan.raw_identity
@@ -214,7 +217,9 @@ fn stream_columns(
                     )
                 })?;
                 // The feature owner's readiness flags of the value are read beside it.
-                spec.readiness = plan.readiness_of(&spec.source);
+                let readiness = plan.readiness_of(&spec.source);
+                spec.readiness = readiness.flags;
+                spec.unready = readiness.unready;
                 for flag in spec.readiness.clone() {
                     if streams[stream]
                         .columns
@@ -256,6 +261,7 @@ fn column_spec(stream: &StreamPlan, name: &str) -> Option<ColumnSpec> {
             kind: output.kind,
             encoding: None,
             readiness: Vec::new(),
+            unready: Vec::new(),
         });
     }
     let encoding = stream
@@ -272,6 +278,7 @@ fn column_spec(stream: &StreamPlan, name: &str) -> Option<ColumnSpec> {
         kind: input.kind,
         encoding: Some(encoding.clone()),
         readiness: Vec::new(),
+        unready: Vec::new(),
     })
 }
 
@@ -727,9 +734,7 @@ pub fn verify_replay(uri: &str, store: &Store, key: &str, bytes: &[u8]) -> Resul
     }
     let published = fs::read(&summary.path)
         .map_err(|error| format!("cannot read {summary_location}: {error}"))?;
-    if Summary::from_json(&published)? != *engine.summary()
-        || published != engine.summary().to_json()
-    {
+    if published != engine.summary().to_json() {
         return Err(format!(
             "{summary_location}: the published summary disagrees with the projection restored from the ledger"
         ));

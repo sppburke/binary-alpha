@@ -1127,6 +1127,9 @@ pub struct ColumnSpec {
     /// The boolean columns of the same stream that must be true for the value to be ready.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub readiness: Vec<String>,
+    /// The text values that mean the value is not ready.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unready: Vec<String>,
 }
 
 /// The columns one stream must supply, in the order a row's values are indexed.
@@ -1691,6 +1694,8 @@ struct CompiledCondition {
     column: usize,
     /// Readiness flag columns of the stream; a false or unavailable flag fails the condition.
     readiness: Vec<usize>,
+    /// Text values that mean not ready; they fail the condition before any comparison.
+    unready: Vec<String>,
     comparator: Comparator,
     threshold: Threshold,
 }
@@ -2031,11 +2036,14 @@ pub struct Engine {
     externals: HashMap<String, String>,
     sequence: u64,
     now: i64,
+    /// The selection and deduplication slots claimed at `slot_time`, rebuilt from signal
+    /// records so a restored engine keeps them.
     same_entry: HashSet<(usize, usize, i64)>,
     logic_seen: HashSet<(usize, usize, String)>,
-    /// Every signal decided, by binding and base close time, so a row redelivered after
+    slot_time: i64,
+    /// The latest base close time each binding decided, so a row redelivered after
     /// restoration is not decided twice.
-    decided: HashSet<(usize, i64)>,
+    decided: Vec<Option<i64>>,
     /// The account whose closure just made its pause due; the next record must start it.
     pause_pending: Option<usize>,
     summary: Summary,
@@ -2180,6 +2188,7 @@ impl Engine {
                             stream,
                             column,
                             readiness,
+                            unready: spec.unready.clone(),
                             comparator: condition.comparator,
                             threshold: condition.threshold.clone(),
                         })
@@ -2313,7 +2322,8 @@ impl Engine {
             now: decision_start,
             same_entry: HashSet::new(),
             logic_seen: HashSet::new(),
-            decided: HashSet::new(),
+            slot_time: i64::MIN,
+            decided: vec![None; replay.bindings.len()],
             pause_pending: None,
             summary,
             events: Vec::new(),
@@ -2486,10 +2496,6 @@ impl Engine {
                 format_event_time_micros(self.now)
             ));
         }
-        if time != self.now {
-            self.same_entry.clear();
-            self.logic_seen.clear();
-        }
         self.observe_rates(time)?;
         self.now = time;
         self.advance_pauses()?;
@@ -2638,6 +2644,7 @@ impl Engine {
                 .max(self.now);
             let rate = rate.id.clone();
             self.now = at;
+            self.advance_pauses()?;
             self.emit(at, EventKind::RateAvailable { rate })?;
         }
         Ok(())
@@ -3175,6 +3182,14 @@ impl Engine {
         let Some(value) = &row.values[condition.column] else {
             return false;
         };
+        if let Value::Text(text) = value
+            && condition
+                .unready
+                .iter()
+                .any(|unready| unready == text.as_ref())
+        {
+            return false;
+        }
         let spec = &self.definition.instruments[instrument].streams[condition.stream].columns
             [condition.column];
         let label: Option<Cow<'_, str>> = spec
@@ -3219,7 +3234,7 @@ impl Engine {
             return Ok(());
         };
         let (close, known_at) = (row.close_time_micros, row.known_at_micros);
-        if self.decided.contains(&(binding_index, close)) {
+        if self.decided[binding_index].is_some_and(|last| close <= last) {
             return Ok(());
         }
         if !strategy
@@ -3244,9 +3259,9 @@ impl Engine {
         let stream =
             self.definition.instruments[binding.instrument].streams[strategy.base_stream].stream;
         let logic_identity = strategy.logic.clone();
-        let (disposition, rates) = if first_only && !self.same_entry.insert(same_entry) {
+        let (disposition, rates) = if first_only && self.same_entry.contains(&same_entry) {
             (Disposition::SameEntryDuplicate, Vec::new())
-        } else if deduplicate && !self.logic_seen.insert(logic) {
+        } else if deduplicate && self.logic_seen.contains(&logic) {
             (Disposition::DuplicateLogic, Vec::new())
         } else if !self.strategies[binding.strategy]
             .repair
@@ -3598,34 +3613,88 @@ impl Engine {
 
     fn apply(&mut self, event: &FinancialEvent) -> Result<(), String> {
         match &event.kind {
-            EventKind::RunDefinition { definition } => {
-                if event.sequence != 0 || **definition != self.definition {
-                    return Err("the definition record does not describe this engine".to_string());
-                }
-            }
+            EventKind::RunDefinition { .. } => {}
             EventKind::Signal {
+                instrument,
                 binding,
+                deployment_identity,
+                signal_logic_identity,
+                stream,
+                close_time_micros,
+                known_at_micros,
+                split,
                 disposition,
+                quote_price_units,
+                quote_time_micros,
                 command,
                 reservation,
                 rates,
-                split,
-                close_time_micros,
-                ..
             } => {
                 let index = *self
                     .binding_index
                     .get(binding)
                     .ok_or_else(|| format!("unknown binding `{binding}`"))?;
                 let compiled = self.bindings[index].clone();
+                let strategy = &self.strategies[compiled.strategy];
+                let bound = &self.definition.instruments[compiled.instrument];
                 let contract = &self.definition.replay.contracts[compiled.contract];
+                let policy = &self.definition.replay.risk_policies[compiled.policy];
                 let scale = self.accounts[compiled.account].scale;
                 let admitted = *disposition == Disposition::Admitted;
-                if !self.decided.insert((index, *close_time_micros)) {
+                let time = event.time_micros;
+                if *instrument != bound.instrument
+                    || *stream != bound.streams[strategy.base_stream].stream
+                    || *deployment_identity != compiled.identity
+                    || *signal_logic_identity != strategy.logic
+                    || *split != self.split_of(time)
+                {
                     return Err(format!(
-                        "binding `{binding}` already decided its signal at {}",
+                        "the signal of `{binding}` at {} disagrees with its binding's definition",
                         format_event_time_micros(*close_time_micros)
                     ));
+                }
+                if close_time_micros > known_at_micros
+                    || *known_at_micros > time
+                    || quote_time_micros.is_some_and(|quote| quote > time)
+                    || quote_price_units.is_some() != quote_time_micros.is_some()
+                    || time < self.decision_start
+                    || time >= self.decision_end
+                    || admitted
+                        && (quote_time_micros.is_none()
+                            || time - close_time_micros > policy.max_feature_age_micros
+                            || quote_time_micros
+                                .is_some_and(|quote| time - quote > policy.max_quote_age_micros))
+                {
+                    return Err(format!(
+                        "the signal of `{binding}` at {} carries clocks its decision could not have seen",
+                        format_event_time_micros(*close_time_micros)
+                    ));
+                }
+                if self.decided[index].is_some_and(|last| *close_time_micros <= last) {
+                    return Err(format!(
+                        "binding `{binding}` already decided its signal at or after {}",
+                        format_event_time_micros(*close_time_micros)
+                    ));
+                }
+                self.decided[index] = Some(*close_time_micros);
+                if time != self.slot_time {
+                    self.same_entry.clear();
+                    self.logic_seen.clear();
+                    self.slot_time = time;
+                }
+                if *disposition != Disposition::SameEntryDuplicate {
+                    self.same_entry.insert((
+                        compiled.account,
+                        compiled.instrument,
+                        contract.duration_micros,
+                    ));
+                    if *disposition != Disposition::DuplicateLogic {
+                        self.logic_seen.insert((
+                            compiled.account,
+                            compiled.instrument,
+                            strategy.logic.clone(),
+                        ));
+                    }
                 }
                 if admitted {
                     let (Some(command), Some(reservation)) = (command, reservation) else {
@@ -3633,9 +3702,6 @@ impl Engine {
                             "an admitted signal names its command and reservation".to_string()
                         );
                     };
-                    if self.obligations.contains_key(command) {
-                        return Err(format!("{command} is already open"));
-                    }
                     if *command != format!("{}/{close_time_micros}", compiled.id)
                         || *reservation != contract.reservation()?.rescale(scale)?
                     {

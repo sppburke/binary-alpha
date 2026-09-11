@@ -529,6 +529,42 @@ fn readiness(field: Field) -> &'static str {
     }
 }
 
+/// The text values an output reads while it is not ready or its input is unavailable, per
+/// field group; they complement `readiness`.
+fn unready(field: Field) -> &'static [&'static str] {
+    use Field as F;
+    match field {
+        F::CompressionState
+        | F::DirectionalState
+        | F::MarketStructureBias
+        | F::RegimeTrendState
+        | F::RegimeVolatilityState
+        | F::RegimeStructureState
+        | F::RegimeQualityState
+        | F::RegimeDirectionalBias => &["unknown"],
+        F::MarketStructureSequence => &["unknown", "warming_up"],
+        F::RangeVsRecentBucket | F::BodyVsRecentBucket | F::TickVolumeVsRecentBucket => {
+            &["unknown_warmup"]
+        }
+        F::EmaSlopeState(_) | F::CloseVsEmaState(_) | F::Ema20Ema50AlignmentState => &["not_ready"],
+        F::TickPathPressureBucket
+        | F::TickPathShapeBucket
+        | F::TickPathTerminalPressureBucket
+        | F::TickPathFailedPressureDirection
+        | F::TickPathEfficiencyBucket
+        | F::TickPathReversalBucket => &["insufficient_tick_path"],
+        _ => &[],
+    }
+}
+
+/// The readiness of one output: the boolean outputs that must be true and the text values
+/// that mean not ready.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Readiness {
+    pub flags: Vec<String>,
+    pub unready: Vec<String>,
+}
+
 fn def(
     name: impl Into<String>,
     field: Field,
@@ -1928,20 +1964,20 @@ impl FeaturePlan {
         crate::hex(&hasher.finalize())
     }
 
-    /// The boolean outputs that declare when `output` is ready where readiness is separate
-    /// from the value: `is_ema{p}_ready` for every moving-average period the output requires,
-    /// and `tick_path_ready` for the tick-path buckets that read `insufficient_tick_path`
-    /// until then. Readiness outputs themselves, and outputs whose unavailability is their own
-    /// value, have none.
-    pub fn readiness_of(&self, output: &str) -> Vec<String> {
+    /// When `output` is ready, as the feature owner declares it: the boolean outputs that must
+    /// be true where readiness is separate from the value (`is_ema{p}_ready` for every
+    /// moving-average period the output requires, `tick_path_ready` for the tick-path buckets),
+    /// and the text values that read as not ready or unavailable. Readiness outputs
+    /// themselves, and outputs whose unavailability is their own absence, declare neither.
+    pub fn readiness_of(&self, output: &str) -> Readiness {
         use Field as F;
         let Some(definition) = catalog(&self.settings)
             .into_iter()
             .find(|definition| definition.name == output)
         else {
-            return Vec::new();
+            return Readiness::default();
         };
-        match definition.field {
+        let flags = match definition.field {
             F::TickPathPressureBucket
             | F::TickPathShapeBucket
             | F::TickPathTerminalPressureBucket
@@ -1956,6 +1992,13 @@ impl FeaturePlan {
                     Req::Period(period) => Some(field_name(F::EmaReady(*period))),
                     _ => None,
                 })
+                .collect(),
+        };
+        Readiness {
+            flags,
+            unready: unready(definition.field)
+                .iter()
+                .map(|value| value.to_string())
                 .collect(),
         }
     }
