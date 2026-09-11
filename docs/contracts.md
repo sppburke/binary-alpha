@@ -872,7 +872,8 @@ slot), `duplicate_logic` (repeated signal logic per account, instrument, and ent
 deduplication is enabled), `repair_blocked`, `no_quote`, `stale_feature` (decision time minus
 logical close time beyond the maximum; equality passes), `stale_quote` (decision time minus the
 quote's provider time beyond the maximum), `gap_at_entry` (the inter-arrival into the quote tick
-exceeds the contract's maximum tick gap), `account_paused`, `account_blocked`, `quote_rejected`
+exceeds the contract's maximum tick gap; a repeated tick at the same time keeps that
+inter-arrival), `account_paused`, `account_blocked`, `quote_rejected`
 (the envelope), `capacity_strategy`, `capacity_duration`, `capacity_instrument`,
 `capacity_account`, `capacity_total` (the prospective count may equal a maximum), `insufficient_cash`,
 `unresolved_loss_account`, `unresolved_loss_total`, `conversion_unavailable`, or `admitted`; the
@@ -893,9 +894,11 @@ not-sent, and possibly-sent transitions are permitted only from a sent or acknow
 rejected or proven not-sent command releases its reservation and capacity without debit. A
 possibly sent command keeps its full reservation, blocks new entries for its account, and waits
 for reconciliation; nothing is retried and no acceptance is taken for it. An account's block is
-the set of commands awaiting reconciliation (possibly sent, or settled with a discrepancy or
-deficit); each reconciliation removes only its own command, and entries stay blocked while any
-remains. Settled equity is native cash plus the paid basis of open
+the set of commands awaiting reconciliation, each with its reason (possibly sent, or settled
+with a discrepancy or deficit at the booked cashflow); each reconciliation removes only its own
+command, and entries stay blocked while any remains. A settled discrepancy is lifted only by a
+reconciliation stating the same settlement, because no corrective posting exists; a
+contradicting resolution is a reconciliation failure. Settled equity is native cash plus the paid basis of open
 contracts; completed profit is the credit minus the paid basis.
 
 ### Settlement
@@ -912,8 +915,9 @@ before an engine was restored. A tick more than `max_tick_gap_micros` after that
 later settlement tick, or an exhausted input window leaves the obligation `unresolved` with its
 reason, evidence, and path so far; it keeps its paid basis, capacity, and exposure until an authoritative
 settlement or reconciliation. Every settlement credits the actual `gross_return - terminal_fee`,
-releases the remaining reservation and capacity once, and records the path; an authoritative
-settlement's price is observed in the path at its provider time. A confirmed cashflow that
+releases the remaining reservation and capacity once, and records the path; a tick too late to
+settle is not path evidence, and an authoritative settlement's path is the path recorded so far
+(the same in a restored engine) followed by its own price at its provider time. A confirmed cashflow that
 contradicts the frozen terms is a `discrepancy`; a net terminal debit beyond the remaining
 reservation is a `deficit`; either blocks the account pending reconciliation without fabricating
 the configured amount. A reconciliation resolves an open command as not sent, accepted (posting

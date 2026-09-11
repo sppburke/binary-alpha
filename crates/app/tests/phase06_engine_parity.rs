@@ -1312,6 +1312,50 @@ fn continuity_is_the_obligation_s_own_evidence() {
         };
         assert_eq!(*reason, UnresolvedReason::Gap);
     }
+    // A tick too late to settle is not path evidence, and an authoritative settlement's path is
+    // the path recorded so far plus the settlement price at its own time.
+    let mut live = Live::new(definition(|_| {}));
+    live.simulate(10, vec![tick(10, 500), row(0, 10, 10, true)]);
+    let events = live.simulate(26, vec![tick(26, 600)]);
+    let EventKind::Unresolved {
+        reason,
+        path: Some(path),
+        ..
+    } = &events[0].kind
+    else {
+        panic!("{events:?}")
+    };
+    assert_eq!(*reason, UnresolvedReason::LateSettlement);
+    assert_eq!(path.max_favorable_units, 0, "the late tick is not evidence");
+    let events = live.step(
+        27,
+        vec![Observation::Settlement {
+            command: "b1/10".into(),
+            source: EventSource {
+                id: "broker:late-settle".into(),
+                provider_time_micros: 20,
+                available_at_micros: 27,
+                simulated: false,
+            },
+            outcome: Outcome::Win,
+            gross_return: decimal("1.92"),
+            terminal_fee: decimal("0"),
+            settlement_price_units: 510,
+        }],
+    );
+    let EventKind::Settled { path, .. } = &events[0].kind else {
+        panic!("{events:?}")
+    };
+    assert_eq!(
+        (
+            path.final_move_units,
+            path.max_favorable_units,
+            path.max_favorable_time_micros,
+            path.first_favorable_time_micros
+        ),
+        (10, 10, 20, Some(20))
+    );
+    live.assert_restorable();
     // Ticks at or before the entry time, delivered late, are continuity evidence but not path
     // evidence.
     let mut live = Live::new(definition(|_| {}));
@@ -1405,8 +1449,9 @@ fn freshness_bounds_are_exact() {
     );
     live.simulate(10, vec![tick(10, 500)]);
     assert_eq!(
-        dispositions(&live.simulate(71, vec![tick(71, 500), row(0, 70, 71, true)])),
-        [Disposition::GapAtEntry]
+        dispositions(&live.simulate(71, vec![tick(71, 500), tick(71, 500), row(0, 70, 71, true)])),
+        [Disposition::GapAtEntry],
+        "a repeated tick at the same time keeps the gap into that time"
     );
     assert_eq!(
         dispositions(&live.simulate(131, vec![tick(131, 500), row(0, 130, 131, true)])),
@@ -1822,7 +1867,7 @@ fn the_exact_cashflow_counterexample_and_fees_post_exactly() {
         (
             account.reserved.to_string(),
             account.cash.to_string(),
-            account.blocked.iter().cloned().collect::<Vec<_>>()
+            account.blocked.keys().cloned().collect::<Vec<_>>()
         ),
         ("9.90".into(), "18.15".into(), vec![command.clone()])
     );
@@ -1950,11 +1995,34 @@ fn the_exact_cashflow_counterexample_and_fees_post_exactly() {
             0
         )
     );
-    assert!(live.account("a").blocked.contains(&command));
+    assert!(live.account("a").blocked.contains_key(&command));
     assert_eq!(
         dispositions(&live.simulate(31, vec![tick(31, 400), row(0, 31, 31, true)])),
         [Disposition::AccountBlocked]
     );
+    // A reconciliation contradicting the booked settlement, or proving it not sent, fails and
+    // keeps the block: no corrective posting exists.
+    for (what, resolution) in [
+        (
+            "another cashflow",
+            Resolution::Settled {
+                outcome: Outcome::Win,
+                gross_return: decimal("19"),
+                terminal_fee: decimal("0.20"),
+            },
+        ),
+        ("not sent", Resolution::NotSent),
+    ] {
+        let mut fresh = live.restored();
+        let error = fresh
+            .try_step(32, vec![reconciliation(&command, 32, resolution)])
+            .unwrap_err();
+        assert!(
+            error.contains("contradicts the settlement already booked"),
+            "{what}: {error}"
+        );
+        assert!(live.restored().account("a").blocked.contains_key(&command));
+    }
     // Tampered ledgers: the accepted record under the acknowledgement's source identity, an
     // acceptance available after its decision time, and an admission the definition's cash
     // cannot fund all fail restoration.
@@ -2054,7 +2122,7 @@ fn the_exact_cashflow_counterexample_and_fees_post_exactly() {
     assert_eq!(
         live.account("a")
             .blocked
-            .iter()
+            .keys()
             .cloned()
             .collect::<Vec<_>>(),
         [first.clone(), second.clone()]
@@ -2074,7 +2142,7 @@ fn the_exact_cashflow_counterexample_and_fees_post_exactly() {
     assert_eq!(
         live.account("a")
             .blocked
-            .iter()
+            .keys()
             .cloned()
             .collect::<Vec<_>>(),
         std::slice::from_ref(&first)

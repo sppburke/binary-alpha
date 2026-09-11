@@ -1760,10 +1760,25 @@ pub struct AccountState {
     pub open: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub paused_until_micros: Option<i64>,
-    /// The commands whose reconciliation the account waits for: possibly sent, or settled with
-    /// a discrepancy or deficit. New entries are blocked while any remains.
-    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
-    pub blocked: BTreeSet<String>,
+    /// The commands whose reconciliation the account waits for, with why: possibly sent, or
+    /// settled with a discrepancy or deficit at the booked cashflow. New entries are blocked
+    /// while any remains.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub blocked: BTreeMap<String, Block>,
+}
+
+/// Why an account waits for a command's reconciliation.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(tag = "reason", rename_all = "snake_case")]
+pub enum Block {
+    PossiblySent,
+    /// The terminal cashflow booked at settlement; only a reconciliation that states the same
+    /// settlement lifts the block, since no corrective posting exists.
+    Settled {
+        outcome: Outcome,
+        gross_return: Decimal,
+        terminal_fee: Decimal,
+    },
 }
 
 impl AccountState {
@@ -2279,7 +2294,7 @@ impl Engine {
                     max_drawdown: zero,
                     open: 0,
                     paused_until_micros: None,
-                    blocked: BTreeSet::new(),
+                    blocked: BTreeMap::new(),
                 })
             })
             .collect::<Result<Vec<_>, String>>()?;
@@ -2598,11 +2613,9 @@ impl Engine {
                     settlement_price_units,
                 } => {
                     self.require(&command, ObligationState::Accepted)?;
-                    let settlement_time_micros = source.provider_time_micros;
                     self.settle(
                         &command,
                         source,
-                        settlement_time_micros,
                         settlement_price_units,
                         outcome,
                         gross_return,
@@ -2718,7 +2731,14 @@ impl Engine {
         state.tick = Some(TickState {
             provider_time_micros: time,
             price_units,
-            gap_micros: previous.map(|previous| time - previous.provider_time_micros),
+            // A repeated tick at the same time keeps the gap into that time.
+            gap_micros: previous.and_then(|previous| {
+                if time == previous.provider_time_micros {
+                    previous.gap_micros
+                } else {
+                    Some(time - previous.provider_time_micros)
+                }
+            }),
         });
         let tracked = std::mem::take(&mut state.tracked);
         let mut kept = Vec::with_capacity(tracked.len());
@@ -2782,16 +2802,8 @@ impl Engine {
             )?;
             return Ok(false);
         }
-        let move_units = signed_move(entry_price, price_units, direction)
-            .map_err(|reason| format!("{command}: {reason}"))?;
-        path.observe(time, move_units);
-        let obligation = self.obligations.get_mut(command).expect("present");
-        obligation.path = Some(path);
-        obligation.continuity_micros = Some(time);
-        if time < due {
-            return Ok(true);
-        }
-        if time - due > settlement.max_settlement_delay_micros {
+        // A tick too late to settle is not path evidence either.
+        if time >= due && time - due > settlement.max_settlement_delay_micros {
             self.emit(
                 self.now,
                 EventKind::Unresolved {
@@ -2807,6 +2819,15 @@ impl Engine {
                 },
             )?;
             return Ok(false);
+        }
+        let move_units = signed_move(entry_price, price_units, direction)
+            .map_err(|reason| format!("{command}: {reason}"))?;
+        path.observe(time, move_units);
+        let obligation = self.obligations.get_mut(command).expect("present");
+        obligation.path = Some(path);
+        obligation.continuity_micros = Some(time);
+        if time < due {
+            return Ok(true);
         }
         let outcome = match price_units.cmp(&entry_price) {
             Ordering::Equal => Outcome::Tie,
@@ -2824,7 +2845,6 @@ impl Engine {
         self.settle(
             command,
             source,
-            time,
             price_units,
             outcome,
             cashflow.gross_return,
@@ -2881,7 +2901,6 @@ impl Engine {
         entry_price_units: i64,
         price_time_micros: i64,
     ) -> Result<(), String> {
-        self.require_unaccepted(&command)?;
         let (debit, reservation, due_time_micros) =
             self.acceptance_postings(&command, entry_time_micros)?;
         self.emit(
@@ -2956,13 +2975,13 @@ impl Engine {
         &mut self,
         command: &str,
         source: EventSource,
-        settlement_time_micros: i64,
         settlement_price_units: i64,
         outcome: Outcome,
         gross_return: Decimal,
         terminal_fee: Decimal,
         observe_price: bool,
     ) -> Result<(), String> {
+        let settlement_time_micros = source.provider_time_micros;
         let (contract, _, account) = self.terms(command)?;
         let direction = contract.direction;
         let postings = self.settlement_postings(command, outcome, gross_return, terminal_fee)?;
@@ -2972,6 +2991,8 @@ impl Engine {
             return Err(format!("{command} has no entry to settle against"));
         };
         if observe_price {
+            // The authoritative path is the path recorded so far (ledger state, so a restored
+            // engine holds the same) followed by the settlement price itself.
             path.observe(
                 settlement_time_micros,
                 signed_move(entry_price, settlement_price_units, direction)
@@ -3105,7 +3126,7 @@ impl Engine {
     fn blocked_by(&self, command: &str) -> Option<usize> {
         self.accounts
             .iter()
-            .position(|account| account.blocked.contains(command))
+            .position(|account| account.blocked.contains_key(command))
     }
 
     /// The postings of reconciling `command`: those of its resolution while it is open, or
@@ -3122,6 +3143,32 @@ impl Engine {
         let account = self.blocked_by(command).ok_or_else(|| {
             format!("{command} is neither an open obligation nor a settled discrepancy")
         })?;
+        // A settled discrepancy has booked its cashflow; only the same settlement lifts the
+        // block, because no corrective posting exists.
+        let matches = match (&self.accounts[account].blocked[command], resolution) {
+            (
+                Block::Settled {
+                    outcome,
+                    gross_return,
+                    terminal_fee,
+                },
+                Resolution::Settled {
+                    outcome: stated,
+                    gross_return: stated_return,
+                    terminal_fee: stated_fee,
+                },
+            ) => {
+                outcome == stated
+                    && gross_return.compare(*stated_return)? == Ordering::Equal
+                    && terminal_fee.compare(*stated_fee)? == Ordering::Equal
+            }
+            _ => false,
+        };
+        if !matches {
+            return Err(format!(
+                "{command} reconciliation contradicts the settlement already booked; reconciliation failed"
+            ));
+        }
         let zero = Decimal::zero(self.accounts[account].scale);
         Ok((
             ReconciliationPostings {
@@ -3827,7 +3874,7 @@ impl Engine {
                 let split = obligation.split.clone();
                 self.accounts[self.bindings[binding].account]
                     .blocked
-                    .insert(command.clone());
+                    .insert(command.clone(), Block::PossiblySent);
                 let key = self.keys(binding, split.as_deref());
                 for group in self.groups(&key) {
                     group.unresolved += 1;
@@ -3873,7 +3920,14 @@ impl Engine {
                 let account = self.bindings[self.obligations[command].binding].account;
                 self.apply_closure(command, *credit, Some((*outcome, *profit)))?;
                 if *discrepancy || deficit.is_some() {
-                    self.accounts[account].blocked.insert(command.clone());
+                    self.accounts[account].blocked.insert(
+                        command.clone(),
+                        Block::Settled {
+                            outcome: *outcome,
+                            gross_return: *gross_return,
+                            terminal_fee: *terminal_fee,
+                        },
+                    );
                 }
             }
             EventKind::Unresolved {
