@@ -2736,6 +2736,9 @@ fn quote_envelopes_pauses_conversion_and_projections_are_exact() {
     );
     assert_eq!(paused.account("a").paused_until_micros, None);
     paused.assert_restorable();
+    let cut = paused.lines[..paused.lines.len() - 1].to_vec();
+    let error = Engine::restore(cut.into_iter().map(Ok)).err().unwrap();
+    assert!(error.contains("ends while rate"), "{error}");
     assert!(
         live.simulate(100, vec![tick(100, 500)]).is_empty(),
         "the rate's provider time is not its availability"

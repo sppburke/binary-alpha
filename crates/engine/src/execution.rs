@@ -290,7 +290,10 @@ impl Threshold {
     /// The exact text hashed into identities.
     fn canonical(&self) -> String {
         match self {
-            Self::Text(text) => format!("text:{text}"),
+            Self::Text(text) => format!(
+                "text:{}",
+                serde_json::to_string(text).expect("a string serializes")
+            ),
             Self::Number(value) => format!("number:{value:?}"),
             Self::Bool(value) => format!("bool:{value}"),
         }
@@ -2417,6 +2420,14 @@ impl Engine {
                 "the ledger ends while account `{}` has an expired pause",
                 account.id
             ));
+        }
+        // After the definition, generation stops only after a step or the run's end, when every
+        // rate available by the clock has been observed.
+        if engine.sequence > 1
+            && let Some(next) = engine.rates.get(engine.next_rate)
+            && next.available_at_micros <= engine.now
+        {
+            return Err(format!("the ledger ends while rate `{}` is due", next.id));
         }
         Ok(engine)
     }
@@ -4579,5 +4590,23 @@ mod tests {
             Threshold::Number(60.0),
             "an integer literal is a number"
         );
+        // A text threshold is escaped, so a line break inside it cannot spell a second condition.
+        let one = StrategySpec {
+            id: "one".into(),
+            conditions: vec![condition(
+                "x",
+                Threshold::Text("1\n30s/15s y eq text:1".into()),
+            )],
+            ..a.clone()
+        };
+        let two = StrategySpec {
+            id: "two".into(),
+            conditions: vec![
+                condition("x", Threshold::Text("1".into())),
+                condition("y", Threshold::Text("1".into())),
+            ],
+            ..a.clone()
+        };
+        assert_ne!(signal_logic_identity(&one), signal_logic_identity(&two));
     }
 }
