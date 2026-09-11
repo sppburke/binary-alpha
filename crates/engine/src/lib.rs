@@ -7,6 +7,7 @@ pub mod config;
 pub mod dataset;
 pub mod features;
 pub mod market;
+pub mod outcomes;
 pub mod stream;
 
 /// Lowercase hexadecimal rendering of a digest or checksum.

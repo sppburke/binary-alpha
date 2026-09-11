@@ -1,7 +1,8 @@
 //! `binary-alpha data verify`: re-read one published generation from its ready manifest and
 //! store objects alone, and reconstruct what the manifest asserts. A dataset manifest has no
-//! top-level `kind`; a stream manifest carries `kind = "instrument_stream"`, and a feature
-//! generation `kind = "feature_generation"`.
+//! top-level `kind`; a stream manifest carries `kind = "instrument_stream"`, a feature
+//! generation `kind = "feature_generation"`, and an outcome generation
+//! `kind = "outcome_generation"`.
 
 use std::fs::{self, File};
 use std::path::PathBuf;
@@ -13,6 +14,7 @@ use binary_alpha_engine::dataset::{
 };
 use binary_alpha_engine::features::FEATURE_MANIFEST_KIND;
 use binary_alpha_engine::market::format_event_time_micros;
+use binary_alpha_engine::outcomes::OUTCOME_MANIFEST_KIND;
 use binary_alpha_engine::stream::{
     InstrumentProfile, PROFILE_OBJECT_PATH, STREAM_MANIFEST_KIND, StreamManifest, StreamSummary,
 };
@@ -31,6 +33,9 @@ pub fn run(uri: &str) -> Result<String, String> {
         Some(STREAM_MANIFEST_KIND) => verify_stream(uri, &store, &manifest_key, &bytes),
         Some(FEATURE_MANIFEST_KIND) => {
             crate::features::verify_feature(uri, &store, &manifest_key, &bytes)
+        }
+        Some(OUTCOME_MANIFEST_KIND) => {
+            crate::outcomes::verify_outcome(uri, &store, &manifest_key, &bytes)
         }
         Some(kind) => Err(format!("{uri}: unsupported manifest kind `{kind}`")),
     }

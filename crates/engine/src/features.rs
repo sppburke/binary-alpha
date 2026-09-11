@@ -24,7 +24,7 @@ use crate::config::{
     StructureSettings,
 };
 use crate::dataset::{DatasetRole, ObjectRecord, ObjectRole, manifest_key, validate_objects};
-use crate::market::{BrokerId, PriceScale, ProviderSymbol, parse_price_units};
+use crate::market::{BrokerId, InstrumentId, PriceScale, ProviderSymbol, parse_price_units};
 use crate::stream::{
     Candle, Flags, InstrumentProfile, InstrumentStream, Observation, Rejection, Source,
     StreamManifest, interval_open,
@@ -5011,6 +5011,16 @@ impl FeatureManifest {
             return Err(format!(
                 "unsupported manifest schema_version {}, expected {FEATURE_SCHEMA_VERSION}",
                 manifest.schema_version
+            ));
+        }
+        let instrument = InstrumentId {
+            broker: manifest.broker.clone(),
+            provider_symbol: manifest.provider_symbol.clone(),
+        };
+        if manifest.instrument != instrument.to_string() {
+            return Err(format!(
+                "instrument `{}` is not `{instrument}`",
+                manifest.instrument
             ));
         }
         if manifest.generation

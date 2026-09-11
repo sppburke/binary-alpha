@@ -31,6 +31,8 @@ pub struct Config {
     pub instruments: Vec<Instrument>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub features: Option<Features>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outcomes: Option<Outcomes>,
 }
 
 impl Config {
@@ -83,6 +85,11 @@ impl Config {
                     .validate()
                     .map_err(|reason| format!("features.instruments[{index}].{reason}"))?;
             }
+        }
+        if let Some(outcomes) = &self.outcomes {
+            outcomes
+                .validate()
+                .map_err(|reason| format!("outcomes.{reason}"))?;
         }
         let Some(import) = &self.import else {
             return Ok(());
@@ -870,6 +877,36 @@ impl Encodings {
     }
 }
 
+/// The outcome build consumed only by `outcomes build`: the declared role, the Phase 02 tick
+/// generation and the Phase 04 feature generation computed from it, the expiries, and the label
+/// thresholds in the units their names declare.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct Outcomes {
+    pub role: DatasetRole,
+    pub tick_manifest: ManifestUri,
+    pub feature_manifest: ManifestUri,
+    pub expiry_seconds: Vec<u32>,
+    pub max_entry_delay_ms: u64,
+    pub max_settlement_delay_ms: u64,
+    pub max_tick_gap_ms: u64,
+    pub true_jump_max_gap_ms: u64,
+    /// Positive decimal basis points such as `"5"` or `"2.5"`, compared exactly.
+    pub true_jump_basis_points: String,
+    pub frozen_min_ticks: u32,
+    pub frozen_min_ms: u64,
+}
+
+impl Outcomes {
+    /// The rules a single field's deserializer cannot see; an error names the field.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.role == DatasetRole::Holdout {
+            return Err("role: holdout data never enters an outcome build".to_string());
+        }
+        crate::outcomes::OutcomeRule::resolve(self).map(drop)
+    }
+}
+
 /// One configured instrument: its neutral identity, provider mapping, currencies, native
 /// granularity, price scale, candle streams, and the enabled quality checks. A check is enabled
 /// by the presence of its table; ordering, causality, interval boundaries, finite values, and
@@ -1640,5 +1677,124 @@ mod instrument_tests {
                 .to_string()
                 .contains("instruments[1].provider_symbol")
         );
+    }
+}
+
+#[cfg(test)]
+mod outcome_tests {
+    use super::*;
+
+    const HEAD: &str = "schema_version = 1\nrun_mode = \"research\"\n\n[storage]\nhistorical_data_dir = \"h\"\npublication_uri = \"file:///p\"\n";
+    const TICK: &str = "file:///p/manifests/1111111111111111111111111111111111111111111111111111111111111111/ready.json";
+    const FEATURE: &str = "gs://bucket/prefix/manifests/2222222222222222222222222222222222222222222222222222222222222222/ready.json";
+    const TABLE: &str = "role = \"development\"\ntick_manifest = \"TICK\"\nfeature_manifest = \"FEATURE\"\nexpiry_seconds = [30, 31, 300]\nmax_entry_delay_ms = 2000\nmax_settlement_delay_ms = 2000\nmax_tick_gap_ms = 2000\ntrue_jump_max_gap_ms = 2000\ntrue_jump_basis_points = \"5\"\nfrozen_min_ticks = 10\nfrozen_min_ms = 5000\n";
+
+    fn table(edit: impl Fn(&str) -> String) -> String {
+        format!(
+            "{HEAD}\n[outcomes]\n{}",
+            edit(&TABLE.replace("TICK", TICK).replace("FEATURE", FEATURE))
+        )
+    }
+
+    #[test]
+    fn outcomes_round_trip_through_the_canonical_form() {
+        let source = table(str::to_string);
+        let config = Config::parse(&source).unwrap();
+        assert_eq!(config.canonical_toml(), source);
+        assert_eq!(Config::parse(&config.canonical_toml()).unwrap(), config);
+        let outcomes = config.outcomes.as_ref().unwrap();
+        assert_eq!(outcomes.expiry_seconds, [30, 31, 300]);
+        assert_eq!(outcomes.tick_manifest.generation(), "1".repeat(64));
+        assert_eq!(outcomes.feature_manifest.to_string(), FEATURE);
+        assert_eq!(
+            Config::parse(HEAD).unwrap().content_hash(),
+            "v3:sha256:d7be0fdf6fb030fdfaa543417aad386f84bdb7e06ff06a61ae5646ca8e7c1256",
+            "a document that omits `outcomes` keeps the identity the previous checkout gave it"
+        );
+        for text in ["2.5", "0.000000000000000001", "99999999999"] {
+            let source = table(|body| {
+                body.replace(
+                    "true_jump_basis_points = \"5\"",
+                    &format!("true_jump_basis_points = \"{text}\""),
+                )
+            });
+            Config::parse(&source).unwrap();
+        }
+    }
+
+    #[test]
+    fn outcome_rules_reject_with_the_field_name() {
+        let cases = [
+            (
+                "role = \"development\"",
+                "role = \"holdout\"",
+                "outcomes.role",
+            ),
+            ("[30, 31, 300]", "[]", "outcomes.expiry_seconds"),
+            ("[30, 31, 300]", "[0, 30]", "outcomes.expiry_seconds"),
+            ("[30, 31, 300]", "[30, 30]", "outcomes.expiry_seconds"),
+            ("[30, 31, 300]", "[31, 30]", "outcomes.expiry_seconds"),
+            (
+                "frozen_min_ticks = 10",
+                "frozen_min_ticks = 0",
+                "outcomes.frozen_min_ticks",
+            ),
+            (
+                "frozen_min_ms = 5000",
+                "frozen_min_ms = 0",
+                "outcomes.frozen_min_ms",
+            ),
+            (
+                "max_entry_delay_ms = 2000",
+                "max_entry_delay_ms = 18446744073709551615",
+                "outcomes.max_entry_delay_ms",
+            ),
+            (
+                "frozen_min_ms = 5000",
+                "frozen_min_ms = 9223372036854775808",
+                "outcomes.frozen_min_ms",
+            ),
+            (
+                "true_jump_basis_points = \"5\"",
+                "true_jump_basis_points = \"0\"",
+                "outcomes.true_jump_basis_points",
+            ),
+            (
+                "true_jump_basis_points = \"5\"",
+                "true_jump_basis_points = \"-1\"",
+                "outcomes.true_jump_basis_points",
+            ),
+            (
+                "true_jump_basis_points = \"5\"",
+                "true_jump_basis_points = \"5e0\"",
+                "outcomes.true_jump_basis_points",
+            ),
+            (
+                "true_jump_basis_points = \"5\"",
+                "true_jump_basis_points = \"2.0000000000000000001\"",
+                "outcomes.true_jump_basis_points",
+            ),
+            (
+                "true_jump_basis_points = \"5\"",
+                "true_jump_basis_points = 5",
+                "true_jump_basis_points",
+            ),
+            (
+                "tick_manifest = ",
+                "tick_manifest = \"file:///p/objects/x\"\nz = ",
+                "tick_manifest",
+            ),
+            ("frozen_min_ms = 5000\n", "", "frozen_min_ms"),
+            (
+                "frozen_min_ms = 5000\n",
+                "frozen_min_ms = 5000\nsecret = \"x\"\n",
+                "secret",
+            ),
+        ];
+        for (from, to, field) in cases {
+            let source = table(|body| body.replace(from, to));
+            let error = Config::parse(&source).unwrap_err().to_string();
+            assert!(error.contains(field), "{from} -> {to}: {error}");
+        }
     }
 }

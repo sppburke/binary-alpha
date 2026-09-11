@@ -1,10 +1,12 @@
 //! The `binary-alpha` executable: configuration validation, historical-data import, instrument
-//! audit, feature builds, verification, and the external adapters those commands need.
+//! audit, feature builds, outcome builds, verification, and the external adapters those commands
+//! need.
 
 mod archive;
 mod audit;
 mod features;
 mod import;
+mod outcomes;
 mod parallel;
 mod store;
 mod verify;
@@ -45,6 +47,23 @@ enum Command {
     Features {
         #[command(subcommand)]
         command: FeaturesCommand,
+    },
+    /// Build future-only binary-expiry outcomes from published feature generations.
+    #[command(disable_help_subcommand = true)]
+    Outcomes {
+        #[command(subcommand)]
+        command: OutcomesCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum OutcomesCommand {
+    /// Label every decision row of the configured feature generation against its tick
+    /// generation and publish the outcome generation.
+    Build {
+        /// Path of the TOML configuration document with the `outcomes` table.
+        #[arg(long)]
+        config: PathBuf,
     },
 }
 
@@ -112,6 +131,9 @@ fn main() -> ExitCode {
         Command::Features {
             command: FeaturesCommand::Build { config },
         } => features::run(&config, &mut std::io::stdout().lock()),
+        Command::Outcomes {
+            command: OutcomesCommand::Build { config },
+        } => outcomes::run(&config, &mut std::io::stdout().lock()),
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,

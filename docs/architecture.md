@@ -27,6 +27,11 @@ input and profile manifest URIs ──▶ app: bind roles and identity, resolve 
    ──▶ app: temporary tables, one-column encoder fit and apply ──▶ engine: frozen plan, identities
    ──▶ app: plan, rows, events, encoded rows, feature manifest through the same store
    ──▶ app: reconstruct from the manifest ──▶ standard output
+
+tick and feature manifest URIs ──▶ app: bind roles and identities, load the ticks, read the row clocks
+   ──▶ engine: fold quality flags, label every decision row and expiry ──▶ app: little-endian
+   arrays and matrices, outcome manifest through the same store ──▶ app: reconstruct from the
+   manifest ──▶ standard output
 ```
 
 `binary-alpha config validate --config PATH` reads the document; the engine parses it into typed
@@ -46,6 +51,10 @@ plans": the engine owns the compiled output table, the frozen plan, the per-stre
 over the same instrument stream, the events, and the encoder; the application binds the input and
 profile generations, streams records through the engine into temporary tables, fits and applies
 encodings one column at a time, and publishes the feature generation through the same store.
+`binary-alpha outcomes build --config PATH` is the future-only label path described in section
+"Outcomes": the engine owns the label rule, the reader, and the outcome manifest; the application
+binds the tick and feature generations, loads the ticks and the rows' reference clocks, writes
+the arrays and matrices, and publishes the outcome generation through the same store.
 
 ## Data flow owned by later phases
 
@@ -54,7 +63,7 @@ names the issue that implements it; nothing on this list exists in the current c
 
 ```
 historical import (#3) ──┐
-                         ├─▶ instrument stream and candles (#4) ─▶ features and regimes (#5, this checkout) ─▶ outcomes (#6)
+                         ├─▶ instrument stream and candles (#4) ─▶ features and regimes (#5) ─▶ outcomes (#6, this checkout)
 live feed (#11) ─────────┘                                                                            │
                                                                                                       ▼
 artifacts: Google Cloud Storage, Supabase references (#3)  ◀── strategy, replay, settlement, accounting, risk (#7)
@@ -77,7 +86,8 @@ live runtime and cutover (#13) ─▶ execution ─▶ broker adapter (#11)
 | Feeding a published generation through its stream and publishing candle objects and profiles | `binary-alpha-app`, modules `audit` and `archive` | this checkout ([#4](https://github.com/sppburke/binary-alpha/issues/4)) |
 | Compiled feature outputs, frozen feature plans, per-stream feature state and events, the encoder, feature manifests | `binary-alpha-engine`, module `features` | this checkout ([#5](https://github.com/sppburke/binary-alpha/issues/5)) |
 | Binding input and profile generations, temporary tables, column-wise fitting and encoding, feature publication and reconstruction | `binary-alpha-app`, modules `features` and `archive` | this checkout ([#5](https://github.com/sppburke/binary-alpha/issues/5)) |
-| Future-only binary-expiry outcomes | `binary-alpha-engine` | [#6](https://github.com/sppburke/binary-alpha/issues/6) |
+| The future-only label rule, the outcome reader, outcome identities and manifests | `binary-alpha-engine`, module `outcomes` | this checkout ([#6](https://github.com/sppburke/binary-alpha/issues/6)) |
+| Binding tick and feature generations, the little-endian outcome objects, outcome publication and reconstruction | `binary-alpha-app`, module `outcomes` | this checkout ([#6](https://github.com/sppburke/binary-alpha/issues/6)) |
 | Strategy intent, chronological execution, settlement, accounting, risk | `binary-alpha-engine` | [#7](https://github.com/sppburke/binary-alpha/issues/7) |
 | Device kernels behind a reviewed safe boundary | a new accelerator package, only when the unsafe boundary is real | [#8](https://github.com/sppburke/binary-alpha/issues/8) |
 | Candidate search, evaluation, repair, portfolio, risk tuning | `binary-alpha-engine` with thin application entry points | [#9](https://github.com/sppburke/binary-alpha/issues/9), [#10](https://github.com/sppburke/binary-alpha/issues/10) |
