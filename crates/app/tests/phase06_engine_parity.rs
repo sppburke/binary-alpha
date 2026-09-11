@@ -84,9 +84,9 @@ fn feature_entry(input: &Path, profile: &Path) -> String {
 /// The replay table of the deterministic fixture: two ten-second bindings on the fifteen-second
 /// stream, each also requiring the five-second stream's latest candle to agree, with the
 /// explicit reference-style economics on one funded account.
-fn replay_table(tick: &Path, feature: &Path, plan_identity: &str, extra: &str) -> String {
+fn replay_table(tick: &Path, feature: &Path, plan_identity: &str) -> String {
     format!(
-        "\n[replay]\nrole = \"development\"\ndecision_start = \"2026-01-05T00:00:00Z\"\ndecision_end = \"2026-01-05T00:20:00Z\"\ninputs = [{{ tick_manifest = \"{}\", feature_manifest = \"{}\" }}]\nsplits = [{{ name = \"early\", start = \"2026-01-05T00:00:00Z\", end = \"2026-01-05T00:10:00Z\" }}, {{ name = \"late\", start = \"2026-01-05T00:10:00Z\", end = \"2026-01-05T00:20:00Z\" }}]\naccounts = [{{ id = \"sim\", broker = \"pocket_option\", currency = \"fixture_unit\", scale = 2, initial_cash = \"1000\" }}]\nreporting_currency = \"fixture_unit\"\nreporting_scale = 2\nmax_rate_age_micros = 0\n{extra}\n[[replay.strategies]]\nid = \"up\"\nplan_identity = \"{plan_identity}\"\nbase_stream = {{ duration_seconds = 15, offset_seconds = 5 }}\nconditions = [{{ stream = {{ duration_seconds = 15, offset_seconds = 5 }}, output = \"candle_direction\", comparator = \"eq\", threshold = \"up\" }}, {{ stream = {{ duration_seconds = 5, offset_seconds = 0 }}, output = \"candle_direction\", comparator = \"ne\", threshold = \"flat\" }}]\n\n[[replay.strategies]]\nid = \"down\"\nplan_identity = \"{plan_identity}\"\nbase_stream = {{ duration_seconds = 15, offset_seconds = 5 }}\nconditions = [{{ stream = {{ duration_seconds = 15, offset_seconds = 5 }}, output = \"candle_direction\", comparator = \"eq\", threshold = \"down\" }}, {{ stream = {{ duration_seconds = 5, offset_seconds = 0 }}, output = \"candle_direction\", comparator = \"ne\", threshold = \"flat\" }}]\n\n[[replay.contracts]]\nid = \"buy_10s\"\ndirection = \"buy\"\nduration_micros = 10000000\ncurrency = \"fixture_unit\"\nstake = \"1\"\nquoted_cost = \"1\"\nentry_fee = \"0\"\nwin = {{ gross_return = \"1.92\", terminal_fee = \"0\" }}\nloss = {{ gross_return = \"0\", terminal_fee = \"0\" }}\ntie = {{ gross_return = \"1\", terminal_fee = \"0\" }}\nsettlement = {{ rule = \"price_at_due_v1\", max_settlement_delay_micros = 60000000, max_tick_gap_micros = 60000000 }}\n\n[[replay.contracts]]\nid = \"sell_10s\"\ndirection = \"sell\"\nduration_micros = 10000000\ncurrency = \"fixture_unit\"\nstake = \"1\"\nquoted_cost = \"1\"\nentry_fee = \"0\"\nwin = {{ gross_return = \"1.92\", terminal_fee = \"0\" }}\nloss = {{ gross_return = \"0\", terminal_fee = \"0\" }}\ntie = {{ gross_return = \"1\", terminal_fee = \"0\" }}\nsettlement = {{ rule = \"price_at_due_v1\", max_settlement_delay_micros = 60000000, max_tick_gap_micros = 60000000 }}\n\n[[replay.risk_policies]]\nid = \"one_each\"\nmax_open_per_strategy = 1\nmax_open_total = 50000\nsame_entry = \"all\"\ndeduplicate_signal_logic = false\nmax_feature_age_micros = 60000000\nmax_quote_age_micros = 0\n\n[[replay.bindings]]\nid = \"buy_on_up\"\nstrategy = \"up\"\naccount = \"sim\"\ninstrument = \"pocket_option:AEDCNY_otc\"\ncontract = \"buy_10s\"\nrisk_policy = \"one_each\"\nenvelope = {{ max_purchase_cost = \"1\", max_entry_fee = \"0\", max_win_terminal_fee = \"0\", max_loss_terminal_fee = \"0\", max_tie_terminal_fee = \"0\", min_winning_net_return = \"0.92\", settlement_rule = \"price_at_due_v1\" }}\n\n[[replay.bindings]]\nid = \"sell_on_down\"\nstrategy = \"down\"\naccount = \"sim\"\ninstrument = \"pocket_option:AEDCNY_otc\"\ncontract = \"sell_10s\"\nrisk_policy = \"one_each\"\nenvelope = {{ max_purchase_cost = \"1\", max_entry_fee = \"0\", max_win_terminal_fee = \"0\", max_loss_terminal_fee = \"0\", max_tie_terminal_fee = \"0\", min_winning_net_return = \"0.92\", settlement_rule = \"price_at_due_v1\" }}\n",
+        "\n[replay]\nrole = \"development\"\ndecision_start = \"2026-01-05T00:00:00Z\"\ndecision_end = \"2026-01-05T00:20:00Z\"\ninputs = [{{ tick_manifest = \"{}\", feature_manifest = \"{}\" }}]\nsplits = [{{ name = \"early\", start = \"2026-01-05T00:00:00Z\", end = \"2026-01-05T00:10:00Z\" }}, {{ name = \"late\", start = \"2026-01-05T00:10:00Z\", end = \"2026-01-05T00:20:00Z\" }}]\naccounts = [{{ id = \"sim\", broker = \"pocket_option\", currency = \"fixture_unit\", scale = 2, initial_cash = \"1000\" }}]\nreporting_currency = \"fixture_unit\"\nreporting_scale = 2\nmax_rate_age_micros = 0\n\n[[replay.strategies]]\nid = \"up\"\nplan_identity = \"{plan_identity}\"\nbase_stream = {{ duration_seconds = 15, offset_seconds = 5 }}\nconditions = [{{ stream = {{ duration_seconds = 15, offset_seconds = 5 }}, output = \"candle_direction\", comparator = \"eq\", threshold = \"up\" }}, {{ stream = {{ duration_seconds = 5, offset_seconds = 0 }}, output = \"candle_direction\", comparator = \"ne\", threshold = \"flat\" }}]\n\n[[replay.strategies]]\nid = \"down\"\nplan_identity = \"{plan_identity}\"\nbase_stream = {{ duration_seconds = 15, offset_seconds = 5 }}\nconditions = [{{ stream = {{ duration_seconds = 15, offset_seconds = 5 }}, output = \"candle_direction\", comparator = \"eq\", threshold = \"down\" }}, {{ stream = {{ duration_seconds = 5, offset_seconds = 0 }}, output = \"candle_direction\", comparator = \"ne\", threshold = \"flat\" }}]\n\n[[replay.contracts]]\nid = \"buy_10s\"\ndirection = \"buy\"\nduration_micros = 10000000\ncurrency = \"fixture_unit\"\nstake = \"1\"\nquoted_cost = \"1\"\nentry_fee = \"0\"\nwin = {{ gross_return = \"1.92\", terminal_fee = \"0\" }}\nloss = {{ gross_return = \"0\", terminal_fee = \"0\" }}\ntie = {{ gross_return = \"1\", terminal_fee = \"0\" }}\nsettlement = {{ rule = \"price_at_due_v1\", max_settlement_delay_micros = 60000000, max_tick_gap_micros = 60000000 }}\n\n[[replay.contracts]]\nid = \"sell_10s\"\ndirection = \"sell\"\nduration_micros = 10000000\ncurrency = \"fixture_unit\"\nstake = \"1\"\nquoted_cost = \"1\"\nentry_fee = \"0\"\nwin = {{ gross_return = \"1.92\", terminal_fee = \"0\" }}\nloss = {{ gross_return = \"0\", terminal_fee = \"0\" }}\ntie = {{ gross_return = \"1\", terminal_fee = \"0\" }}\nsettlement = {{ rule = \"price_at_due_v1\", max_settlement_delay_micros = 60000000, max_tick_gap_micros = 60000000 }}\n\n[[replay.risk_policies]]\nid = \"one_each\"\nmax_open_per_strategy = 1\nmax_open_total = 50000\nsame_entry = \"all\"\ndeduplicate_signal_logic = false\nmax_feature_age_micros = 60000000\nmax_quote_age_micros = 0\n\n[[replay.bindings]]\nid = \"buy_on_up\"\nstrategy = \"up\"\naccount = \"sim\"\ninstrument = \"pocket_option:AEDCNY_otc\"\ncontract = \"buy_10s\"\nrisk_policy = \"one_each\"\nenvelope = {{ max_purchase_cost = \"1\", max_entry_fee = \"0\", max_win_terminal_fee = \"0\", max_loss_terminal_fee = \"0\", max_tie_terminal_fee = \"0\", min_winning_net_return = \"0.92\", settlement_rule = \"price_at_due_v1\" }}\n\n[[replay.bindings]]\nid = \"sell_on_down\"\nstrategy = \"down\"\naccount = \"sim\"\ninstrument = \"pocket_option:AEDCNY_otc\"\ncontract = \"sell_10s\"\nrisk_policy = \"one_each\"\nenvelope = {{ max_purchase_cost = \"1\", max_entry_fee = \"0\", max_win_terminal_fee = \"0\", max_loss_terminal_fee = \"0\", max_tie_terminal_fee = \"0\", min_winning_net_return = \"0.92\", settlement_rule = \"price_at_due_v1\" }}\n",
         manifest_uri(tick),
         manifest_uri(feature)
     )
@@ -185,7 +185,7 @@ fn replay_publishes_reconstructs_and_reuses() {
     let plan_identity = feature_manifest.plan_identity.clone();
     let config_path = scratch.config(
         "replay.toml",
-        &replay_table(&tick, &feature, &plan_identity, ""),
+        &replay_table(&tick, &feature, &plan_identity),
     );
     let config = Config::parse(&fs::read_to_string(&config_path).unwrap()).unwrap();
 
@@ -475,7 +475,7 @@ fn replay_publishes_reconstructs_and_reuses() {
     assert_eq!(again[1], lines[1]);
     let other = scratch.config(
         "replay2.toml",
-        &replay_table(&tick, &feature, &plan_identity, "")
+        &replay_table(&tick, &feature, &plan_identity)
             .replace("max_open_per_strategy = 1", "max_open_per_strategy = 2"),
     );
     assert_ne!(generation(&replay(&other).unwrap()[0]), replay_generation);
@@ -496,7 +496,7 @@ fn replay_publishes_reconstructs_and_reuses() {
     ] {
         let path = scratch.config(
             "replay3.toml",
-            &replay_table(&tick, &feature, &plan_identity, "").replacen(from, to, 1),
+            &replay_table(&tick, &feature, &plan_identity).replacen(from, to, 1),
         );
         let error = replay(&path).unwrap_err();
         assert!(error.contains(expected), "{error}");
@@ -1919,6 +1919,29 @@ fn the_exact_cashflow_counterexample_and_fees_post_exactly() {
         )
     );
     live.assert_restorable();
+    // A command left unresolved by the window's end and then reported possibly sent stays one
+    // unresolved obligation; its not-sent reconciliation leaves none.
+    let mut exhausted = Live::new(fractional());
+    let command = Live::command(&exhausted.step(10, vec![tick(10, 500), row(0, 10, 10, true)]));
+    assert_eq!(kinds(&exhausted.finish()), ["unresolved"]);
+    let mut exhausted = exhausted.restored();
+    exhausted.step(
+        11,
+        vec![Observation::PossiblySent {
+            command: command.clone(),
+            source: source("adapter:lost-late", 11),
+        }],
+    );
+    assert_eq!(exhausted.engine.summary().portfolio.unresolved, 1);
+    exhausted.step(12, vec![reconciliation(&command, 12, Resolution::NotSent)]);
+    assert_eq!(
+        (
+            exhausted.engine.summary().portfolio.unresolved,
+            exhausted.engine.summary().portfolio.open
+        ),
+        (0, 0)
+    );
+    exhausted.assert_restorable();
     // A known rejection releases without debit; an acknowledgement posts nothing and still
     // permits acceptance; an actual cashflow contradicting the frozen terms is recorded as a
     // discrepancy, and a deficit beyond the remaining reservation is stated, and both block the
@@ -2340,6 +2363,33 @@ fn quote_envelopes_pauses_conversion_and_projections_are_exact() {
     assert_eq!(live.account("a").epoch_peak.to_string(), "-2.00");
     assert_eq!(live.account("a").paused_until_micros, None);
     live.assert_restorable();
+    // An expired pause must end before any other record at or after its deadline: a ledger
+    // that omits the end fails at the record that follows it.
+    let without_end: Vec<Vec<u8>> = live
+        .lines
+        .iter()
+        .filter(|line| !line.windows(13).any(|w| w == b"\"pause_ended\""))
+        .enumerate()
+        .map(|(sequence, line)| {
+            let text = String::from_utf8(line.clone()).unwrap();
+            let (_, rest) = text.split_once(',').unwrap();
+            format!("{{\"sequence\":{sequence},{rest}").into_bytes()
+        })
+        .collect();
+    let error = Engine::restore(without_end.into_iter().map(Ok))
+        .err()
+        .unwrap();
+    assert!(error.contains("end record is required"), "{error}");
+    // A ledger cut right before a required pause start fails at its end.
+    let start = live
+        .lines
+        .iter()
+        .position(|line| line.windows(15).any(|w| w == b"\"pause_started\""))
+        .unwrap();
+    let error = Engine::restore(live.lines[..start].iter().cloned().map(Ok))
+        .err()
+        .unwrap();
+    assert!(error.contains("still requires its pause record"), "{error}");
     // The pause record is checked against the account's drawdown and policy on application: a
     // shortened deadline fails, and a ledger that omits the pause and its end fails at the
     // record after the settlement that made the pause due.
@@ -2615,6 +2665,30 @@ fn quote_envelopes_pauses_conversion_and_projections_are_exact() {
         &["r1".to_string()],
         "the admission records the rate it used"
     );
+    // An aggregate the reporting projection cannot hold is an unavailable observation; the
+    // native settlement it follows is recorded and restorable.
+    let half = "850705917302346158658436518579420528.63";
+    let mut vast = Live::new(definition(|replay| {
+        replay.accounts[0].initial_cash = decimal(half);
+        replay.accounts.push(AccountSpec {
+            id: "z".into(),
+            broker: "b".to_string().try_into().unwrap(),
+            currency: "u".to_string().try_into().unwrap(),
+            scale: 2,
+            initial_cash: decimal(half),
+        });
+    }));
+    assert_eq!(vast.engine.summary().reporting.observations, 1);
+    vast.simulate(10, vec![tick(10, 500), row(0, 10, 10, true)]);
+    let events = vast.simulate(20, vec![tick(20, 600)]);
+    assert_eq!(kinds(&events), ["settled"]);
+    let reporting = vast.engine.summary().reporting.clone();
+    assert_eq!(
+        (reporting.unavailable_observations, reporting.settled_equity),
+        (1, None)
+    );
+    assert_eq!(vast.account("a").completed_profit.to_string(), "0.92");
+    vast.assert_restorable();
     // A zero entry price still settles and records exact movement; only the normalized
     // excursion is absent with its reason.
     let mut live = Live::new(definition(|_| {}));

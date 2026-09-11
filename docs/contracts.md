@@ -936,8 +936,9 @@ entry no earlier than the command's dispatch and no later than the decision, a s
 time is its source's provider time and no earlier than the entry, every posting is recomputed from the obligation and the frozen
 terms, and a pause must state the account's exact epoch drawdown at or beyond its threshold with
 the deadline the policy's duration gives and must directly follow the settlement or
-reconciliation that made it due, so a record that disagrees or a ledger that omits it fails at
-generation and at restoration alike. An external event's payload
+reconciliation that made it due, an expired pause must end before any other record at or after
+its deadline, and a ledger cannot end with a pause still due, so a record that disagrees or a
+ledger that omits one fails at generation and at restoration alike. An external event's payload
 is its transition fields and its source's provider time, availability, and simulation flag: the
 same identity with the exact payload is a no-op, before and after restoration; the same identity
 with another payload, including an equal amount written at another scale, fails; a ledger that
@@ -960,9 +961,10 @@ before the market observations of the step that reaches it, and at the end of th
 rates available by `decision_end`; an expired pause ends when a rate observation advances the
 clock past its deadline; so every valuation between market observations is recorded and a rate
 change is visible without an account posting), and after every record that changes an
-account: an admitted signal, an acceptance, a release, a settlement, or a reconciliation. Missing or stale rates leave that observation
-unavailable and make the total unresolved-loss limit unavailable, which blocks admissions that
-need it; native history is never substituted, while native cash, account pause, and confirmed
+account: an admitted signal, an acceptance, a release, a settlement, or a reconciliation. Missing or stale rates, or an aggregate the reporting scale cannot
+hold, leave that observation unavailable (and missing or stale rates make the total
+unresolved-loss limit unavailable, which blocks admissions that need it); native history is
+never substituted and the native record the observation follows stands, while native cash, account pause, and confirmed
 native settlement never depend on conversion. The path of a contract
 is tracked in integer price units as `(current - entry) × direction` including the settlement tick:
 final move, maximum favorable and adverse excursion with their earliest times (starting at the

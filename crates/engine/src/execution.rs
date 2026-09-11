@@ -2395,7 +2395,14 @@ impl Engine {
                 }
             }
         }
-        engine.ok_or_else(|| "the ledger is empty".to_string())
+        let engine = engine.ok_or_else(|| "the ledger is empty".to_string())?;
+        if let Some(pending) = engine.pause_pending {
+            return Err(format!(
+                "the ledger ends while account `{}` still requires its pause record",
+                engine.accounts[pending].id
+            ));
+        }
+        Ok(engine)
     }
 
     pub fn definition(&self) -> &RunDefinition {
@@ -2839,15 +2846,13 @@ impl Engine {
             )?;
             return Ok(false);
         }
-        self.obligations
-            .get_mut(command)
-            .expect("present")
-            .continuity_micros = Some(time);
         if time < due {
             let move_units = signed_move(entry_price, price_units, direction)
                 .map_err(|reason| format!("{command}: {reason}"))?;
             path.observe(time, move_units);
-            self.obligations.get_mut(command).expect("present").path = Some(path);
+            let obligation = self.obligations.get_mut(command).expect("present");
+            obligation.path = Some(path);
+            obligation.continuity_micros = Some(time);
             return Ok(true);
         }
         let outcome = match price_units.cmp(&entry_price) {
@@ -3008,8 +3013,7 @@ impl Engine {
         let (contract, _, account) = self.terms(command)?;
         let direction = contract.direction;
         let postings = self.settlement_postings(command, outcome, gross_return, terminal_fee)?;
-        let obligation = self.obligations.get_mut(command).expect("present");
-        let Some(entry_price) = obligation.entry_price_units else {
+        let Some(entry_price) = self.obligations[command].entry_price_units else {
             return Err(format!("{command} has no entry to settle against"));
         };
         path.observe(
@@ -3017,7 +3021,6 @@ impl Engine {
             signed_move(entry_price, settlement_price_units, direction)
                 .map_err(|reason| format!("{command}: {reason}"))?,
         );
-        obligation.path = Some(path);
         self.emit(
             self.now,
             EventKind::Settled {
@@ -3519,12 +3522,26 @@ impl Engine {
                 self.accounts[pending].id
             ));
         }
+        let expired = |account: &AccountState| {
+            account
+                .paused_until_micros
+                .is_some_and(|until| until <= time_micros)
+        };
+        if let Some(account) = self.accounts.iter().find(|account| expired(account))
+            && !matches!(&event.kind, EventKind::PauseEnded { account: ended } if self.accounts.iter().any(|account| account.id == *ended && expired(account)))
+        {
+            return Err(format!(
+                "account `{}` has an expired pause; its end record is required before {}",
+                account.id,
+                format_event_time_micros(time_micros)
+            ));
+        }
         self.apply(&event)?;
         if let Some((key, payload)) = external {
             self.externals.insert(key, payload);
         }
         if event.kind.observes_portfolio() {
-            self.observe_portfolio(time_micros)?;
+            self.observe_portfolio(time_micros);
         }
         self.sequence += 1;
         self.summary.events = self.sequence;
@@ -3889,15 +3906,18 @@ impl Engine {
                 self.require_unaccepted(command)?;
                 let obligation = self.open_obligation(command)?;
                 obligation.state = ObligationState::PossiblySent;
+                let newly_unresolved = obligation.unresolved.is_none();
                 obligation.unresolved = Some(UnresolvedReason::PossiblySent);
                 let binding = obligation.binding;
                 let split = obligation.split.clone();
                 self.accounts[self.bindings[binding].account]
                     .blocked
                     .insert(command.clone(), Block::PossiblySent);
-                let key = self.keys(binding, split.as_deref());
-                for group in self.groups(&key) {
-                    group.unresolved += 1;
+                if newly_unresolved {
+                    let key = self.keys(binding, split.as_deref());
+                    for group in self.groups(&key) {
+                        group.unresolved += 1;
+                    }
                 }
             }
             EventKind::Settled {
@@ -4090,55 +4110,62 @@ impl Engine {
     /// Projects converted settled equity and unresolved loss into the reporting currency at one
     /// account-changing record; an unavailable rate leaves the observation unavailable, never
     /// native history.
-    fn observe_portfolio(&mut self, at: i64) -> Result<(), String> {
+    fn observe_portfolio(&mut self, at: i64) {
         let replay = &self.definition.replay;
         let scale = replay.reporting_scale;
-        let mut equity = Decimal::zero(scale);
-        let mut loss = Decimal::zero(scale);
-        let mut used = Vec::new();
-        for account in &self.accounts {
-            let convert = |amount: Decimal| {
-                convert(
-                    amount,
-                    &account.currency,
-                    &replay.reporting_currency,
-                    scale,
-                    at,
-                    replay.max_rate_age_micros,
-                    &self.rates,
-                )
+        let reporting = &self.summary.reporting;
+        // A projection that cannot be made (a missing or stale rate, or an aggregate the
+        // reporting scale cannot hold) is unavailable; the native records it follows stand.
+        let observed = (|| -> Result<(Decimal, Decimal, Vec<String>, Decimal, Decimal), String> {
+            let mut equity = Decimal::zero(scale);
+            let mut loss = Decimal::zero(scale);
+            let mut used = Vec::new();
+            for account in &self.accounts {
+                let convert = |amount: Decimal| {
+                    convert(
+                        amount,
+                        &account.currency,
+                        &replay.reporting_currency,
+                        scale,
+                        at,
+                        replay.max_rate_age_micros,
+                        &self.rates,
+                    )
+                };
+                let converted_equity = convert(account.settled_equity()?)?;
+                let converted_loss = convert(account.unresolved_loss)?;
+                equity = equity.checked_add(converted_equity.amount)?;
+                loss = loss.checked_add(converted_loss.amount)?;
+                used.extend(converted_equity.rate);
+                used.extend(converted_loss.rate);
+            }
+            let peak = match reporting.peak_equity {
+                Some(peak) => peak.max(equity)?,
+                None => equity,
             };
-            let (Ok(converted_equity), Ok(converted_loss)) = (
-                convert(account.settled_equity()?),
-                convert(account.unresolved_loss),
-            ) else {
-                let reporting = &mut self.summary.reporting;
+            let drawdown = peak.checked_sub(equity)?;
+            let drawdown = match reporting.max_drawdown {
+                Some(current) => current.max(drawdown)?,
+                None => drawdown,
+            };
+            Ok((equity, loss, used, peak, drawdown))
+        })();
+        let reporting = &mut self.summary.reporting;
+        match observed {
+            Ok((equity, loss, used, peak, drawdown)) => {
+                reporting.observations += 1;
+                reporting.settled_equity = Some(equity);
+                reporting.unresolved_loss = Some(loss);
+                reporting.used_rates.extend(used);
+                reporting.peak_equity = Some(peak);
+                reporting.max_drawdown = Some(drawdown);
+            }
+            Err(_) => {
                 reporting.unavailable_observations += 1;
                 reporting.settled_equity = None;
                 reporting.unresolved_loss = None;
-                return Ok(());
-            };
-            equity = equity.checked_add(converted_equity.amount)?;
-            loss = loss.checked_add(converted_loss.amount)?;
-            used.extend(converted_equity.rate);
-            used.extend(converted_loss.rate);
+            }
         }
-        let reporting = &mut self.summary.reporting;
-        reporting.observations += 1;
-        reporting.settled_equity = Some(equity);
-        reporting.unresolved_loss = Some(loss);
-        reporting.used_rates.extend(used);
-        let peak = match reporting.peak_equity {
-            Some(peak) => peak.max(equity)?,
-            None => equity,
-        };
-        let drawdown = peak.checked_sub(equity)?;
-        reporting.peak_equity = Some(peak);
-        reporting.max_drawdown = Some(match reporting.max_drawdown {
-            Some(current) => current.max(drawdown)?,
-            None => drawdown,
-        });
-        Ok(())
     }
 }
 
