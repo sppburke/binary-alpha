@@ -949,6 +949,7 @@ pub fn validate(replay: &Replay) -> Result<(), String> {
             ));
         }
         for (name, value) in [
+            ("stake", contract.stake),
             ("quoted_cost", contract.quoted_cost),
             ("entry_fee", contract.entry_fee),
             ("win.gross_return", contract.win.gross_return),
@@ -1813,6 +1814,8 @@ struct Obligation {
     paid_basis: Decimal,
     worst_loss: Decimal,
     split: Option<String>,
+    /// The decision time the command was dispatched at.
+    sent_micros: i64,
     entry_time_micros: Option<i64>,
     entry_price_units: Option<i64>,
     due_time_micros: Option<i64>,
@@ -2562,7 +2565,6 @@ impl Engine {
                     installed.push((instrument, stream));
                 }
                 Observation::Acknowledged { command, source } => {
-                    self.require_unaccepted(&command)?;
                     self.emit(time, EventKind::Acknowledged { command, source })?;
                 }
                 Observation::Accepted {
@@ -2585,7 +2587,6 @@ impl Engine {
                     self.observe_release(command, source, false)?;
                 }
                 Observation::PossiblySent { command, source } => {
-                    self.require_unaccepted(&command)?;
                     self.emit(time, EventKind::PossiblySent { command, source })?;
                 }
                 Observation::Settlement {
@@ -3523,10 +3524,15 @@ impl Engine {
         debit: Decimal,
         reservation: Decimal,
     ) -> Result<(), String> {
-        if price_time_micros > entry_time_micros || entry_time_micros > self.now {
+        let sent = self.open_obligation(command)?.sent_micros;
+        if price_time_micros > entry_time_micros
+            || entry_time_micros < sent
+            || entry_time_micros > self.now
+        {
             return Err(format!(
-                "{command} acceptance clocks are inconsistent: quote {}, entry {}, decision {}",
+                "{command} acceptance clocks are inconsistent: quote {}, dispatch {}, entry {}, decision {}",
                 format_event_time_micros(price_time_micros),
+                format_event_time_micros(sent),
                 format_event_time_micros(entry_time_micros),
                 format_event_time_micros(self.now)
             ));
@@ -3708,8 +3714,12 @@ impl Engine {
                         format_event_time_micros(*close_time_micros)
                     ));
                 }
-                if slot.is_none() {
+                // Selection precedes deduplication: a deduplicated candidate keeps the
+                // selection slot it already passed.
+                if *disposition != Disposition::SameEntryDuplicate {
                     self.same_entry.insert(entry_key);
+                }
+                if slot.is_none() {
                     self.logic_seen.insert(logic_key);
                 }
                 if admitted {
@@ -3747,6 +3757,7 @@ impl Engine {
                             entry_time_micros: None,
                             entry_price_units: None,
                             due_time_micros: None,
+                            sent_micros: time,
                             unresolved: None,
                             path: None,
                             continuity_micros: None,
@@ -3824,6 +3835,8 @@ impl Engine {
             }
             EventKind::Settled {
                 command,
+                source,
+                settlement_time_micros,
                 outcome,
                 gross_return,
                 terminal_fee,
@@ -3835,6 +3848,13 @@ impl Engine {
                 ..
             } => {
                 self.require(command, ObligationState::Accepted)?;
+                if *settlement_time_micros != source.provider_time_micros
+                    || Some(*settlement_time_micros) < self.obligations[command].entry_time_micros
+                {
+                    return Err(format!(
+                        "{command} settlement time disagrees with its source and entry"
+                    ));
+                }
                 let postings =
                     self.settlement_postings(command, *outcome, *gross_return, *terminal_fee)?;
                 if postings

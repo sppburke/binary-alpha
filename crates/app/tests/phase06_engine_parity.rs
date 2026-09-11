@@ -1355,6 +1355,7 @@ fn continuity_is_the_obligation_s_own_evidence() {
     for (what, entry, price_time) in [
         ("quote after entry", 30, 31),
         ("entry after decision", 32, 30),
+        ("entry before dispatch", 29, 29),
     ] {
         let mut fresh = Live::new(definition(|_| {}));
         let command = Live::command(&fresh.step(30, vec![tick(30, 500), row(0, 30, 30, true)]));
@@ -1507,6 +1508,50 @@ fn selection_deduplication_and_repair_keep_their_slots() {
             "{error}"
         );
     }
+    // Selection precedes deduplication: under both policies a deduplicated candidate keeps
+    // the selection slot it passed, so a later candidate of another logic at the same duration
+    // is a same-entry duplicate, before and after restoration from the prefix.
+    let mut live = Live::new(definition(|replay| {
+        replay.risk_policies[0].same_entry = SameEntry::First;
+        replay.risk_policies[0].deduplicate_signal_logic = true;
+        let mut longer = replay.contracts[0].clone();
+        longer.id = "d".into();
+        longer.duration_micros = 20;
+        replay.contracts.push(longer);
+        let same_logic = strategy(replay, "t", stream(5, 0));
+        replay.strategies.push(same_logic);
+        let mut other_logic = strategy(replay, "u", stream(5, 0));
+        other_logic.conditions = vec![condition(
+            stream(15, 5),
+            "other",
+            Comparator::Eq,
+            Threshold::Bool(true),
+        )];
+        replay.strategies.push(other_logic);
+        let mut second = binding(replay, "b2", "t");
+        second.contract = "d".into();
+        replay.bindings.push(second);
+        let mut third = binding(replay, "b3", "u");
+        third.contract = "d".into();
+        replay.bindings.push(third);
+    }));
+    let batch = || vec![tick(10, 500), row(0, 10, 10, true), row(1, 10, 10, true)];
+    let events = live.simulate(10, batch());
+    assert_eq!(
+        dispositions(&events),
+        [
+            Disposition::Admitted,
+            Disposition::DuplicateLogic,
+            Disposition::SameEntryDuplicate
+        ]
+    );
+    assert_eq!(live.balances("a").5, 1);
+    let after_second = live.lines.len() - events.len() + 2;
+    let mut restored = Live::from_lines(live.lines[..after_second].to_vec());
+    assert_eq!(
+        dispositions(&restored.simulate(10, batch())),
+        [Disposition::SameEntryDuplicate]
+    );
     // A repair-blocked first candidate claims the slot at each instant.
     let mut live = Live::new(two(SameEntry::First, false, repair));
     for time in [10, 20] {
@@ -1937,6 +1982,12 @@ fn the_exact_cashflow_counterexample_and_fees_post_exactly() {
             "\"known_at_micros\":10,",
             "\"known_at_micros\":11,",
             "clocks its decision could not have seen",
+        ),
+        (
+            "a settlement dated after its source",
+            "\"settlement_time_micros\":30,",
+            "\"settlement_time_micros\":31,",
+            "settlement time disagrees",
         ),
         (
             "a signal under another logic identity",
@@ -2644,6 +2695,10 @@ fn definitions_reject_mismatched_plans_columns_and_negative_cash_and_accept_many
     rejected(
         |replay| replay.accounts[0].initial_cash = decimal("-1"),
         "initial_cash",
+    );
+    rejected(
+        |replay| replay.contracts[0].stake = decimal("0.001"),
+        "stake 0.001 loses precision",
     );
     // Five conditions over distinct columns and comparators: one failing condition, and only
     // that one, blocks the conjunction.
