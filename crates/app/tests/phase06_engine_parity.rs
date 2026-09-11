@@ -1182,6 +1182,43 @@ fn settlement_availability_and_duplicate_events_are_explicit() {
         }
     }
     live.assert_restorable();
+    // A settled reconciliation's evidence is no earlier than the entry, or than the dispatch
+    // when no acceptance was proved, at application and at restoration alike.
+    let settled = Resolution::Settled {
+        outcome: Outcome::Win,
+        gross_return: decimal("1.92"),
+        terminal_fee: decimal("0"),
+    };
+    let mut accepted = Live::new(definition(|_| {}));
+    let command = Live::command(&accepted.simulate(10, vec![tick(10, 500), row(0, 10, 10, true)]));
+    let error = accepted
+        .try_step(20, vec![reconciliation(&command, 9, settled.clone())])
+        .unwrap_err();
+    assert!(error.contains("precedes its entry or dispatch"), "{error}");
+    let mut dispatched = Live::new(definition(|_| {}));
+    dispatched.step(10, vec![tick(10, 500), row(0, 10, 10, true)]);
+    let error = dispatched
+        .try_step(20, vec![reconciliation(&command, 9, settled.clone())])
+        .unwrap_err();
+    assert!(error.contains("precedes its entry or dispatch"), "{error}");
+    let mut valid = Live::new(definition(|_| {}));
+    valid.simulate(10, vec![tick(10, 500), row(0, 10, 10, true)]);
+    assert_eq!(
+        kinds(&valid.step(20, vec![reconciliation(&command, 20, settled)])),
+        ["reconciled"]
+    );
+    let error = Engine::restore(
+        tampered(
+            &valid.lines,
+            "\"provider_time_micros\":20,\"available_at_micros\":20",
+            "\"provider_time_micros\":9,\"available_at_micros\":20",
+        )
+        .into_iter()
+        .map(Ok),
+    )
+    .err()
+    .unwrap();
+    assert!(error.contains("precedes its entry or dispatch"), "{error}");
 }
 
 #[test]
@@ -2432,8 +2469,8 @@ fn quote_envelopes_pauses_conversion_and_projections_are_exact() {
         .unwrap();
     assert!(error.contains("still requires its pause record"), "{error}");
     // The pause record is checked against the account's drawdown and policy on application: a
-    // shortened deadline fails, and a ledger that omits the pause and its end fails at the
-    // record after the settlement that made the pause due.
+    // shortened deadline fails, a record postponed past the closure that made it due fails, and
+    // a ledger that omits the pause and its end fails at the record after that closure.
     let error = Engine::restore(
         tampered(&live.lines, "\"until_micros\":120,", "\"until_micros\":21,")
             .into_iter()
@@ -2442,6 +2479,22 @@ fn quote_envelopes_pauses_conversion_and_projections_are_exact() {
     .err()
     .unwrap();
     assert!(error.contains("pause disagrees"), "{error}");
+    let postponed = tampered(
+        &tampered(
+            &live.lines[..=start],
+            "\"time_micros\":20,\"kind\":\"pause_started\"",
+            "\"time_micros\":25,\"kind\":\"pause_started\"",
+        ),
+        "\"until_micros\":120,",
+        "\"until_micros\":125,",
+    );
+    let error = Engine::restore(postponed.into_iter().map(Ok))
+        .err()
+        .unwrap();
+    assert!(
+        error.contains("pause record is required next at"),
+        "{error}"
+    );
     let without_pause = without(&live.lines, |kind| {
         matches!(
             kind,

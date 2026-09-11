@@ -2066,7 +2066,7 @@ pub struct Engine {
     /// restoration is not decided twice.
     decided: Vec<Option<i64>>,
     /// The account whose closure just made its pause due; the next record must start it.
-    pause_pending: Option<usize>,
+    pause_pending: Option<(usize, i64)>,
     summary: Summary,
     events: Vec<FinancialEvent>,
     /// Set by a failed step: the engine's state is no longer known to match its ledger.
@@ -2396,7 +2396,7 @@ impl Engine {
             }
         }
         let engine = engine.ok_or_else(|| "the ledger is empty".to_string())?;
-        if let Some(pending) = engine.pause_pending {
+        if let Some((pending, _)) = engine.pause_pending {
             return Err(format!(
                 "the ledger ends while account `{}` still requires its pause record",
                 engine.accounts[pending].id
@@ -3524,12 +3524,13 @@ impl Engine {
         {
             return Err(format!("external event `{key}` is already applied"));
         }
-        if let Some(pending) = self.pause_pending
-            && !matches!(&event.kind, EventKind::PauseStarted { account, .. } if *account == self.accounts[pending].id)
+        if let Some((pending, due_micros)) = self.pause_pending
+            && !matches!(&event.kind, EventKind::PauseStarted { account, .. } if *account == self.accounts[pending].id && time_micros == due_micros)
         {
             return Err(format!(
-                "account `{}` reached its pause threshold; its pause record is required next",
-                self.accounts[pending].id
+                "account `{}` reached its pause threshold; its pause record is required next at {}",
+                self.accounts[pending].id,
+                format_event_time_micros(due_micros)
             ));
         }
         let expired = |account: &AccountState| {
@@ -3689,7 +3690,7 @@ impl Engine {
             && self.accounts[account_index].paused_until_micros.is_none()
             && self.pause_due(account_index)?
         {
-            self.pause_pending = Some(account_index);
+            self.pause_pending = Some((account_index, self.now));
         }
         self.open_delta(binding, -1);
         let key = self.keys(binding, obligation.split.as_deref());
@@ -4006,12 +4007,12 @@ impl Engine {
             }
             EventKind::Reconciled {
                 command,
+                source,
                 resolution,
                 release,
                 debit,
                 credit,
                 profit,
-                ..
             } => {
                 let (postings, account) = self.reconciliation_of(command, resolution)?;
                 if postings
@@ -4049,6 +4050,16 @@ impl Engine {
                             )?;
                         }
                         Resolution::Settled { outcome, .. } => {
+                            let obligation = &self.obligations[command];
+                            if source.provider_time_micros
+                                < obligation
+                                    .entry_time_micros
+                                    .unwrap_or(obligation.sent_micros)
+                            {
+                                return Err(format!(
+                                    "{command} settlement evidence precedes its entry or dispatch"
+                                ));
+                            }
                             let profit = profit.expect("checked against the postings");
                             let cash = &mut self.accounts[account].cash;
                             *cash = cash.checked_sub(*debit)?;

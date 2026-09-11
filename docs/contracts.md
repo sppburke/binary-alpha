@@ -933,10 +933,10 @@ freshness bounds with a quote), the state-based admission checks run again on an
 drawdown has reached its pause threshold counts as paused, so an omitted pause fails at the
 admission it would have blocked), an acceptance's quote time is no later than its entry and the
 entry no earlier than the command's dispatch and no later than the decision, a settlement's
-time is its source's provider time and no earlier than the entry, every posting is recomputed from the obligation and the frozen
+time is its source's provider time and no earlier than the entry, a settled reconciliation's evidence is no earlier than the entry or, without a proved acceptance, the dispatch, every posting is recomputed from the obligation and the frozen
 terms, and a pause must state the account's exact epoch drawdown at or beyond its threshold with
-the deadline the policy's duration gives and must directly follow the settlement or
-reconciliation that made it due, an expired pause must end before any other record at or after
+the deadline the policy's duration gives and must directly follow, at the same decision time, the
+settlement or reconciliation that made it due, an expired pause must end before any other record at or after
 its deadline, and a ledger cannot end with a pause still due or expired, so a record that
 disagrees or a ledger that omits one fails at generation and at restoration alike. An external event's payload
 is its transition fields and its source's provider time, availability, and simulation flag: the
