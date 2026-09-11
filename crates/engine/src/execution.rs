@@ -1282,9 +1282,16 @@ pub enum Observation {
 }
 
 /// The external identity of an event: its command and source identity, and the payload text
-/// that must repeat exactly for a redelivery to be a no-op.
+/// (the transition's fields and the source's clocks and simulation flag) that must repeat
+/// exactly for a redelivery to be a no-op.
 fn external_identity(command: &str, source: &EventSource, payload: String) -> (String, String) {
-    (format!("{command}\n{}", source.id), payload)
+    (
+        format!("{command}\n{}", source.id),
+        format!(
+            "{payload} {} {} {}",
+            source.provider_time_micros, source.available_at_micros, source.simulated
+        ),
+    )
 }
 
 impl Observation {
@@ -1556,7 +1563,7 @@ pub enum EventKind {
         path: Option<PathMetrics>,
     },
     /// An authoritative reconciliation resolved an open command, or lifted the block a settled
-    /// discrepancy left; `account_blocked` is the block that remains on its account afterwards.
+    /// discrepancy left on its account.
     Reconciled {
         command: String,
         source: EventSource,
@@ -1566,9 +1573,10 @@ pub enum EventKind {
         credit: Decimal,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         profit: Option<Decimal>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        account_blocked: Option<String>,
     },
+    /// A supplied conversion rate became available: the portfolio projection is observed so a
+    /// rate change is visible without an account posting.
+    RateAvailable { rate: String },
     /// An account pause began at the epoch drawdown.
     PauseStarted {
         account: String,
@@ -1641,14 +1649,29 @@ impl EventKind {
         }
     }
 
-    /// Whether the record changes an account's postings, so the portfolio is observed.
-    fn changes_accounts(&self) -> bool {
+    /// The external source a record carries.
+    fn source(&self) -> Option<&EventSource> {
+        match self {
+            Self::Acknowledged { source, .. }
+            | Self::Accepted { source, .. }
+            | Self::Released { source, .. }
+            | Self::PossiblySent { source, .. }
+            | Self::Settled { source, .. }
+            | Self::Reconciled { source, .. } => Some(source),
+            _ => None,
+        }
+    }
+
+    /// Whether the record changes an account's postings or a rate, so the portfolio is
+    /// observed.
+    fn observes_portfolio(&self) -> bool {
         match self {
             Self::RunDefinition { .. }
             | Self::Accepted { .. }
             | Self::Released { .. }
             | Self::Settled { .. }
-            | Self::Reconciled { .. } => true,
+            | Self::Reconciled { .. }
+            | Self::RateAvailable { .. } => true,
             Self::Signal { disposition, .. } => *disposition == Disposition::Admitted,
             _ => false,
         }
@@ -1741,8 +1764,10 @@ pub struct AccountState {
     pub open: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub paused_until_micros: Option<i64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub blocked: Option<String>,
+    /// The commands whose reconciliation the account waits for: possibly sent, or settled with
+    /// a discrepancy or deficit. New entries are blocked while any remains.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub blocked: BTreeSet<String>,
 }
 
 impl AccountState {
@@ -1990,7 +2015,9 @@ pub struct Engine {
     decision_start: i64,
     decision_end: i64,
     splits: Vec<(String, i64, i64)>,
+    /// Supplied rates in availability order; `next_rate` is the first not yet observed.
     rates: Vec<Rate>,
+    next_rate: usize,
     strategies: Vec<CompiledStrategy>,
     bindings: Vec<CompiledBinding>,
     /// Binding indices per instrument and base stream, in configured order.
@@ -2011,6 +2038,8 @@ pub struct Engine {
     logic_seen: HashSet<(usize, usize, String)>,
     summary: Summary,
     events: Vec<FinancialEvent>,
+    /// Set by a failed step: the engine's state is no longer known to match its ledger.
+    failed: bool,
 }
 
 impl Engine {
@@ -2044,7 +2073,7 @@ impl Engine {
                 ))
             })
             .collect::<Result<Vec<_>, String>>()?;
-        let rates = replay
+        let mut rates = replay
             .rates
             .iter()
             .flatten()
@@ -2059,6 +2088,7 @@ impl Engine {
                 })
             })
             .collect::<Result<Vec<_>, String>>()?;
+        rates.sort_by(|a, b| (a.available_at_micros, &a.id).cmp(&(b.available_at_micros, &b.id)));
         // Strategies bind through their plan identity to exactly one instrument input.
         let mut strategies = Vec::with_capacity(replay.strategies.len());
         for (index, strategy) in replay.strategies.iter().enumerate() {
@@ -2218,7 +2248,7 @@ impl Engine {
                     max_drawdown: zero,
                     open: 0,
                     paused_until_micros: None,
-                    blocked: None,
+                    blocked: BTreeSet::new(),
                 })
             })
             .collect::<Result<Vec<_>, String>>()?;
@@ -2244,6 +2274,7 @@ impl Engine {
             decision_end,
             splits,
             rates,
+            next_rate: 0,
             strategies,
             bindings,
             by_base,
@@ -2262,6 +2293,7 @@ impl Engine {
             logic_seen: HashSet::new(),
             summary,
             events: Vec::new(),
+            failed: false,
             definition,
         };
         let definition = Box::new(engine.definition.clone());
@@ -2407,8 +2439,23 @@ impl Engine {
     // ------------------------------------------------------------------------------------------
 
     /// Applies every observation available at `time` in source order, then evaluates the base
-    /// rows installed by them at decision time `time`. Times never decrease.
+    /// rows installed by them at decision time `time`. Times never decrease. A failed step
+    /// leaves the engine unusable: its state may hold observations the ledger does not, so the
+    /// caller restores from the ledger instead of retrying.
     pub fn step(&mut self, time: i64, observations: Vec<Observation>) -> Result<(), String> {
+        if self.failed {
+            return Err(
+                "the engine failed an earlier step; restore it from its ledger".to_string(),
+            );
+        }
+        let result = self.apply_step(time, observations);
+        if result.is_err() {
+            self.failed = true;
+        }
+        result
+    }
+
+    fn apply_step(&mut self, time: i64, observations: Vec<Observation>) -> Result<(), String> {
         if time < self.now {
             return Err(format!(
                 "observations at {} arrive after the engine reached {}",
@@ -2422,6 +2469,12 @@ impl Engine {
         }
         self.now = time;
         self.advance_pauses()?;
+        while let Some(rate) = self.rates.get(self.next_rate)
+            && rate.available_at_micros <= time
+        {
+            let rate = rate.id.clone();
+            self.emit(time, EventKind::RateAvailable { rate })?;
+        }
         let mut installed: Vec<(usize, usize)> = Vec::new();
         for observation in observations {
             if let Some(source) = observation.source()
@@ -2673,13 +2726,16 @@ impl Engine {
             &self.definition.replay.contracts[self.bindings[obligation.binding].contract];
         let settlement = contract.settlement;
         let direction = contract.direction;
+        // Ticks at or before the entry are not path evidence.
+        if time <= entry_time {
+            return Ok(true);
+        }
         // A gap into this tick that intersects the contract window is not settlement evidence;
-        // the obligation stays open with the path observed before the gap.
-        if let Some(previous) = previous
-            && previous.provider_time_micros < due
-            && time > entry_time
-            && time - previous.provider_time_micros > settlement.max_tick_gap_micros
-        {
+        // the obligation stays open with the path observed before the gap. Without a known
+        // previous tick (an engine restored after the acceptance) continuity is measured from
+        // the entry, never assumed.
+        let previous_time = previous.map_or(entry_time, |previous| previous.provider_time_micros);
+        if previous_time < due && time - previous_time > settlement.max_tick_gap_micros {
             self.emit(
                 self.now,
                 EventKind::Unresolved {
@@ -2687,8 +2743,8 @@ impl Engine {
                     reason: UnresolvedReason::Gap,
                     evidence: format!(
                         "a gap of {} microseconds from {} to {} exceeds {} inside the contract window",
-                        time - previous.provider_time_micros,
-                        format_event_time_micros(previous.provider_time_micros),
+                        time - previous_time,
+                        format_event_time_micros(previous_time),
                         format_event_time_micros(time),
                         settlement.max_tick_gap_micros
                     ),
@@ -2880,17 +2936,11 @@ impl Engine {
         let direction = contract.direction;
         let postings = self.settlement_postings(command, outcome, gross_return, terminal_fee)?;
         let obligation = self.obligations.get_mut(command).expect("present");
-        let mut path = obligation.path.unwrap_or_else(|| {
-            PathMetrics::new(
-                obligation
-                    .entry_time_micros
-                    .unwrap_or(settlement_time_micros),
-            )
-        });
+        let (Some(mut path), Some(entry_price)) = (obligation.path, obligation.entry_price_units)
+        else {
+            return Err(format!("{command} has no entry to settle against"));
+        };
         if observe_price {
-            let entry_price = obligation
-                .entry_price_units
-                .unwrap_or(settlement_price_units);
             path.observe(
                 settlement_time_micros,
                 signed_move(entry_price, settlement_price_units, direction)
@@ -2973,14 +3023,18 @@ impl Engine {
             Resolution::Accepted { .. } if accepted => {
                 return Err(format!("{command} is already accepted"));
             }
-            Resolution::Accepted { .. } => ReconciliationPostings {
-                release: obligation
-                    .reservation
-                    .checked_sub(contract.terminal_reserve()?.rescale(scale)?)?,
-                debit: purchase,
-                credit: zero,
-                profit: None,
-            },
+            Resolution::Accepted {
+                entry_time_micros, ..
+            } => {
+                let (debit, reservation, _) =
+                    self.acceptance_postings(command, *entry_time_micros)?;
+                ReconciliationPostings {
+                    release: obligation.reservation.checked_sub(reservation)?,
+                    debit,
+                    credit: zero,
+                    profit: None,
+                }
+            }
             Resolution::Settled {
                 gross_return,
                 terminal_fee,
@@ -3002,35 +3056,38 @@ impl Engine {
         })
     }
 
-    /// The account a settled discrepancy left blocked on `command`, when the command is no
-    /// longer open.
+    /// The account a settled discrepancy or deficit left blocked on `command`, when the
+    /// command is no longer open.
     fn blocked_by(&self, command: &str) -> Option<usize> {
-        let prefix = format!("{command} ");
-        self.accounts.iter().position(|account| {
-            account
-                .blocked
-                .as_deref()
-                .is_some_and(|b| b.starts_with(&prefix))
-        })
+        self.accounts
+            .iter()
+            .position(|account| account.blocked.contains(command))
     }
 
-    /// The block that remains on an account after `command` is reconciled: another possibly
-    /// sent obligation, or a settled discrepancy of another command.
-    fn remaining_block(&self, account: usize, command: &str) -> Option<String> {
-        self.obligations
-            .iter()
-            .find(|(other, obligation)| {
-                **other != command
-                    && self.bindings[obligation.binding].account == account
-                    && obligation.state == ObligationState::PossiblySent
-            })
-            .map(|(other, _)| format!("{other} possibly sent; reconciliation required"))
-            .or_else(|| {
-                self.accounts[account]
-                    .blocked
-                    .clone()
-                    .filter(|reason| !reason.starts_with(&format!("{command} ")))
-            })
+    /// The postings of reconciling `command`: those of its resolution while it is open, or
+    /// nothing when only a settled discrepancy's block remains.
+    fn reconciliation_of(
+        &self,
+        command: &str,
+        resolution: &Resolution,
+    ) -> Result<(ReconciliationPostings, usize), String> {
+        if let Some(obligation) = self.obligations.get(command) {
+            let account = self.bindings[obligation.binding].account;
+            return Ok((self.reconciliation_postings(command, resolution)?, account));
+        }
+        let account = self.blocked_by(command).ok_or_else(|| {
+            format!("{command} is neither an open obligation nor a settled discrepancy")
+        })?;
+        let zero = Decimal::zero(self.accounts[account].scale);
+        Ok((
+            ReconciliationPostings {
+                release: zero,
+                debit: zero,
+                credit: zero,
+                profit: None,
+            },
+            account,
+        ))
     }
 
     fn observe_reconciliation(
@@ -3039,30 +3096,11 @@ impl Engine {
         source: EventSource,
         resolution: Resolution,
     ) -> Result<(), String> {
-        let (postings, account, binding) = match self.obligations.get(&command) {
-            Some(obligation) => (
-                self.reconciliation_postings(&command, &resolution)?,
-                self.bindings[obligation.binding].account,
-                Some(obligation.binding),
-            ),
-            None => {
-                let account = self.blocked_by(&command).ok_or_else(|| {
-                    format!("{command} is neither an open obligation nor a settled discrepancy")
-                })?;
-                let zero = Decimal::zero(self.accounts[account].scale);
-                (
-                    ReconciliationPostings {
-                        release: zero,
-                        debit: zero,
-                        credit: zero,
-                        profit: None,
-                    },
-                    account,
-                    None,
-                )
-            }
-        };
-        let account_blocked = self.remaining_block(account, &command);
+        let (postings, account) = self.reconciliation_of(&command, &resolution)?;
+        let binding = self
+            .obligations
+            .get(&command)
+            .map(|obligation| obligation.binding);
         self.emit(
             self.now,
             EventKind::Reconciled {
@@ -3073,7 +3111,6 @@ impl Engine {
                 debit: postings.debit,
                 credit: postings.credit,
                 profit: postings.profit,
-                account_blocked,
             },
         )?;
         match binding {
@@ -3202,9 +3239,8 @@ impl Engine {
     }
 
     /// The remaining admission checks in order: quote presence and freshness, entry continuity,
-    /// account pause and block, the envelope, every capacity scope, cash, and unresolved-loss
-    /// limits. Equality with a bound or a maximum is permitted. Returns the disposition and the
-    /// rate identities any conversion used.
+    /// then the state-based checks of `financial_admission`. Equality with a bound or a maximum
+    /// is permitted. Returns the disposition and the rate identities any conversion used.
     fn admit(
         &self,
         binding_index: usize,
@@ -3214,7 +3250,6 @@ impl Engine {
         let binding = &self.bindings[binding_index];
         let contract = &self.definition.replay.contracts[binding.contract];
         let policy = &self.definition.replay.risk_policies[binding.policy];
-        let account = &self.accounts[binding.account];
         let blocked = |disposition| Ok((disposition, Vec::new()));
         let Some(quote) = self.instruments[binding.instrument].tick else {
             return blocked(Disposition::NoQuote);
@@ -3231,10 +3266,27 @@ impl Engine {
         {
             return blocked(Disposition::GapAtEntry);
         }
+        self.financial_admission(binding_index, reservation)
+    }
+
+    /// The state-based admission checks, in order: account pause and block, the envelope, every
+    /// capacity scope, cash, and unresolved-loss limits. Generation runs them after the quote
+    /// checks; restoration runs them again on every admitted signal record, so an admission the
+    /// restored state cannot fund or hold is an illegal transition.
+    fn financial_admission(
+        &self,
+        binding_index: usize,
+        reservation: Decimal,
+    ) -> Result<(Disposition, Vec<String>), String> {
+        let binding = &self.bindings[binding_index];
+        let contract = &self.definition.replay.contracts[binding.contract];
+        let policy = &self.definition.replay.risk_policies[binding.policy];
+        let account = &self.accounts[binding.account];
+        let blocked = |disposition| Ok((disposition, Vec::new()));
         if account.paused_until_micros.is_some() {
             return blocked(Disposition::AccountPaused);
         }
-        if account.blocked.is_some() {
+        if !account.blocked.is_empty() {
             return blocked(Disposition::AccountBlocked);
         }
         if !self.definition.replay.bindings[binding_index]
@@ -3324,11 +3376,27 @@ impl Engine {
             time_micros,
             kind,
         };
+        if let Some(source) = event.kind.source()
+            && (source.provider_time_micros > source.available_at_micros
+                || source.available_at_micros > time_micros)
+        {
+            return Err(format!(
+                "external event `{}` is not available at {}",
+                source.id,
+                format_event_time_micros(time_micros)
+            ));
+        }
+        let external = event.kind.external();
+        if let Some((key, _)) = &external
+            && self.externals.contains_key(key)
+        {
+            return Err(format!("external event `{key}` is already applied"));
+        }
         self.apply(&event)?;
-        if let Some((key, payload)) = event.kind.external() {
+        if let Some((key, payload)) = external {
             self.externals.insert(key, payload);
         }
-        if event.kind.changes_accounts() {
+        if event.kind.observes_portfolio() {
             self.observe_portfolio(time_micros)?;
         }
         self.sequence += 1;
@@ -3379,6 +3447,87 @@ impl Engine {
             .ok_or_else(|| format!("{command} is not an open obligation"))
     }
 
+    /// Applies an acceptance: the obligation moves to accepted with its entry, the purchase is
+    /// debited once, only `reservation` (the terminal reserve) stays reserved, and the
+    /// instrument's ticks start driving it. A reconciled acceptance of a possibly sent command
+    /// also ends its unresolved state.
+    fn apply_acceptance(
+        &mut self,
+        command: &str,
+        entry_time_micros: i64,
+        entry_price_units: i64,
+        due_time_micros: i64,
+        debit: Decimal,
+        reservation: Decimal,
+    ) -> Result<(), String> {
+        let obligation = self.open_obligation(command)?;
+        let binding = obligation.binding;
+        let release = obligation.reservation.checked_sub(reservation)?;
+        let unresolved = obligation.unresolved.take().is_some();
+        obligation.state = ObligationState::Accepted;
+        obligation.reservation = reservation;
+        obligation.paid_basis = debit;
+        obligation.entry_time_micros = Some(entry_time_micros);
+        obligation.entry_price_units = Some(entry_price_units);
+        obligation.due_time_micros = Some(due_time_micros);
+        obligation.path = Some(PathMetrics::new(entry_time_micros));
+        let split = obligation.split.clone();
+        let account = &mut self.accounts[self.bindings[binding].account];
+        account.reserved = account.reserved.checked_sub(release)?;
+        account.cash = account.cash.checked_sub(debit)?;
+        account.paid_basis = account.paid_basis.checked_add(debit)?;
+        let instrument = self.bindings[binding].instrument;
+        self.instruments[instrument]
+            .tracked
+            .push(command.to_string());
+        let key = self.keys(binding, split.as_deref());
+        for group in self.groups(&key) {
+            group.accepted += 1;
+            if unresolved {
+                group.unresolved -= 1;
+            }
+        }
+        Ok(())
+    }
+
+    /// Applies a closure: the obligation leaves the books, its remaining reservation, paid
+    /// basis, worst loss, and capacity are released, `credit` is posted to cash, and a settled
+    /// contract completes its outcome and profit; otherwise the command was released.
+    fn apply_closure(
+        &mut self,
+        command: &str,
+        credit: Decimal,
+        settled: Option<(Outcome, Decimal)>,
+    ) -> Result<(), String> {
+        let obligation = self
+            .obligations
+            .remove(command)
+            .ok_or_else(|| format!("{command} is not an open obligation"))?;
+        let binding = obligation.binding;
+        let account = &mut self.accounts[self.bindings[binding].account];
+        let currency = account.currency.clone();
+        account.reserved = account.reserved.checked_sub(obligation.reservation)?;
+        account.paid_basis = account.paid_basis.checked_sub(obligation.paid_basis)?;
+        account.unresolved_loss = account.unresolved_loss.checked_sub(obligation.worst_loss)?;
+        account.cash = account.cash.checked_add(credit)?;
+        if let Some((_, profit)) = settled {
+            account.complete(profit)?;
+        }
+        self.open_delta(binding, -1);
+        let key = self.keys(binding, obligation.split.as_deref());
+        for group in self.groups(&key) {
+            group.close(obligation.unresolved.is_some());
+            match settled {
+                Some((outcome, profit)) => {
+                    group.outcome(outcome);
+                    group.add_profit(&currency, profit)?;
+                }
+                None => group.released += 1,
+            }
+        }
+        Ok(())
+    }
+
     fn apply(&mut self, event: &FinancialEvent) -> Result<(), String> {
         if event.sequence != self.sequence {
             return Err(format!(
@@ -3397,6 +3546,7 @@ impl Engine {
                 disposition,
                 command,
                 reservation,
+                rates,
                 split,
                 close_time_micros,
                 ..
@@ -3423,6 +3573,12 @@ impl Engine {
                     {
                         return Err(format!(
                             "{command} is not the command and reservation of its signal"
+                        ));
+                    }
+                    let (admissible, used) = self.financial_admission(index, *reservation)?;
+                    if admissible != Disposition::Admitted || used != *rates {
+                        return Err(format!(
+                            "{command} is not admissible at this state: {admissible}"
                         ));
                     }
                     let worst = contract.worst_loss()?.rescale(scale)?;
@@ -3473,60 +3629,30 @@ impl Engine {
                 ..
             } => {
                 self.require_unaccepted(command)?;
-                let (expected_debit, expected_reservation, expected_due) =
-                    self.acceptance_postings(command, *entry_time_micros)?;
-                if *debit != expected_debit
-                    || *reservation != expected_reservation
-                    || *due_time_micros != expected_due
+                if (*debit, *reservation, *due_time_micros)
+                    != self.acceptance_postings(command, *entry_time_micros)?
                 {
                     return Err(format!(
                         "{command} acceptance postings disagree with its contract"
                     ));
                 }
-                let obligation = self.open_obligation(command)?;
-                let binding = obligation.binding;
-                let released = obligation.reservation;
-                obligation.state = ObligationState::Accepted;
-                obligation.reservation = *reservation;
-                obligation.paid_basis = *debit;
-                obligation.entry_time_micros = Some(*entry_time_micros);
-                obligation.entry_price_units = Some(*entry_price_units);
-                obligation.due_time_micros = Some(*due_time_micros);
-                obligation.path = Some(PathMetrics::new(*entry_time_micros));
-                let split = obligation.split.clone();
-                let account = &mut self.accounts[self.bindings[binding].account];
-                account.reserved = account
-                    .reserved
-                    .checked_sub(released)?
-                    .checked_add(*reservation)?;
-                account.cash = account.cash.checked_sub(*debit)?;
-                account.paid_basis = account.paid_basis.checked_add(*debit)?;
-                let instrument = self.bindings[binding].instrument;
-                self.instruments[instrument].tracked.push(command.clone());
-                let key = self.keys(binding, split.as_deref());
-                for group in self.groups(&key) {
-                    group.accepted += 1;
-                }
+                self.apply_acceptance(
+                    command,
+                    *entry_time_micros,
+                    *entry_price_units,
+                    *due_time_micros,
+                    *debit,
+                    *reservation,
+                )?;
             }
             EventKind::Released {
                 command, release, ..
             } => {
                 self.require_unaccepted(command)?;
-                let obligation = self.obligations.remove(command).expect("present");
-                if obligation.reservation != *release {
+                if self.obligations[command].reservation != *release {
                     return Err(format!("{command} cannot release {release}"));
                 }
-                let binding = obligation.binding;
-                let account = &mut self.accounts[self.bindings[binding].account];
-                account.reserved = account.reserved.checked_sub(*release)?;
-                account.unresolved_loss =
-                    account.unresolved_loss.checked_sub(obligation.worst_loss)?;
-                self.open_delta(binding, -1);
-                let key = self.keys(binding, obligation.split.as_deref());
-                for group in self.groups(&key) {
-                    group.released += 1;
-                    group.close(obligation.unresolved.is_some());
-                }
+                self.apply_closure(command, Decimal::zero(release.scale()), None)?;
             }
             EventKind::PossiblySent { command, .. } => {
                 self.require_unaccepted(command)?;
@@ -3535,8 +3661,9 @@ impl Engine {
                 obligation.unresolved = Some(UnresolvedReason::PossiblySent);
                 let binding = obligation.binding;
                 let split = obligation.split.clone();
-                self.accounts[self.bindings[binding].account].blocked =
-                    Some(format!("{command} possibly sent; reconciliation required"));
+                self.accounts[self.bindings[binding].account]
+                    .blocked
+                    .insert(command.clone());
                 let key = self.keys(binding, split.as_deref());
                 for group in self.groups(&key) {
                     group.unresolved += 1;
@@ -3570,27 +3697,10 @@ impl Engine {
                         "{command} settlement postings disagree with its obligation and terms"
                     ));
                 }
-                let obligation = self.obligations.remove(command).expect("present");
-                let binding = obligation.binding;
-                let account = &mut self.accounts[self.bindings[binding].account];
-                let currency = account.currency.clone();
-                account.reserved = account.reserved.checked_sub(*release)?;
-                account.paid_basis = account.paid_basis.checked_sub(obligation.paid_basis)?;
-                account.unresolved_loss =
-                    account.unresolved_loss.checked_sub(obligation.worst_loss)?;
-                account.cash = account.cash.checked_add(*credit)?;
-                account.complete(*profit)?;
+                let account = self.bindings[self.obligations[command].binding].account;
+                self.apply_closure(command, *credit, Some((*outcome, *profit)))?;
                 if *discrepancy || deficit.is_some() {
-                    account.blocked = Some(format!(
-                        "{command} settled with a cashflow contradicting its frozen terms; reconciliation required"
-                    ));
-                }
-                self.open_delta(binding, -1);
-                let key = self.keys(binding, obligation.split.as_deref());
-                for group in self.groups(&key) {
-                    group.close(obligation.unresolved.is_some());
-                    group.outcome(*outcome);
-                    group.add_profit(&currency, *profit)?;
+                    self.accounts[account].blocked.insert(command.clone());
                 }
             }
             EventKind::Unresolved {
@@ -3623,110 +3733,63 @@ impl Engine {
                 debit,
                 credit,
                 profit,
-                account_blocked,
                 ..
             } => {
-                let posted = ReconciliationPostings {
-                    release: *release,
-                    debit: *debit,
-                    credit: *credit,
-                    profit: *profit,
-                };
-                let Some(obligation) = self.obligations.get(command).cloned() else {
-                    let account = self.blocked_by(command).ok_or_else(|| {
-                        format!("{command} is neither an open obligation nor a settled discrepancy")
-                    })?;
-                    let zero = Decimal::zero(self.accounts[account].scale);
-                    if posted.release != zero
-                        || posted.debit != zero
-                        || posted.credit != zero
-                        || posted.profit.is_some()
-                        || *account_blocked != self.remaining_block(account, command)
-                    {
-                        return Err(format!(
-                            "{command} reconciliation postings disagree with the settled discrepancy"
-                        ));
-                    }
-                    self.accounts[account].blocked = account_blocked.clone();
-                    return Ok(());
-                };
-                if posted != self.reconciliation_postings(command, resolution)? {
+                let (postings, account) = self.reconciliation_of(command, resolution)?;
+                if postings
+                    != (ReconciliationPostings {
+                        release: *release,
+                        debit: *debit,
+                        credit: *credit,
+                        profit: *profit,
+                    })
+                {
                     return Err(format!(
                         "{command} reconciliation postings disagree with its resolution"
                     ));
                 }
-                let binding = obligation.binding;
-                let account_index = self.bindings[binding].account;
-                if *account_blocked != self.remaining_block(account_index, command) {
+                if self.obligations.contains_key(command) {
+                    match resolution {
+                        Resolution::NotSent => {
+                            self.apply_closure(command, Decimal::zero(credit.scale()), None)?;
+                        }
+                        Resolution::Accepted {
+                            entry_time_micros,
+                            entry_price_units,
+                            ..
+                        } => {
+                            let (_, reservation, due_time_micros) =
+                                self.acceptance_postings(command, *entry_time_micros)?;
+                            self.apply_acceptance(
+                                command,
+                                *entry_time_micros,
+                                *entry_price_units,
+                                due_time_micros,
+                                *debit,
+                                reservation,
+                            )?;
+                        }
+                        Resolution::Settled { outcome, .. } => {
+                            let profit = profit.expect("checked against the postings");
+                            let cash = &mut self.accounts[account].cash;
+                            *cash = cash.checked_sub(*debit)?;
+                            self.apply_closure(command, *credit, Some((*outcome, profit)))?;
+                        }
+                    }
+                }
+                self.accounts[account].blocked.remove(command);
+            }
+            EventKind::RateAvailable { rate } => {
+                let next = self.rates.get(self.next_rate);
+                if next.is_none_or(|next| {
+                    next.id != *rate || next.available_at_micros > event.time_micros
+                }) {
                     return Err(format!(
-                        "{command} reconciliation names a block the account does not carry"
+                        "rate `{rate}` is not the next available rate at {}",
+                        format_event_time_micros(event.time_micros)
                     ));
                 }
-                let unresolved = obligation.unresolved.is_some();
-                let key = self.keys(binding, obligation.split.as_deref());
-                let account = &mut self.accounts[account_index];
-                let currency = account.currency.clone();
-                account.reserved = account.reserved.checked_sub(*release)?;
-                account.cash = account.cash.checked_sub(*debit)?.checked_add(*credit)?;
-                match resolution {
-                    Resolution::NotSent => {
-                        account.unresolved_loss =
-                            account.unresolved_loss.checked_sub(obligation.worst_loss)?;
-                        self.obligations.remove(command);
-                        self.open_delta(binding, -1);
-                        for group in self.groups(&key) {
-                            group.released += 1;
-                            group.close(unresolved);
-                        }
-                    }
-                    Resolution::Accepted {
-                        entry_time_micros,
-                        entry_price_units,
-                        ..
-                    } => {
-                        account.paid_basis = account.paid_basis.checked_add(*debit)?;
-                        let duration = self.definition.replay.contracts
-                            [self.bindings[binding].contract]
-                            .duration_micros;
-                        let restored = self.open_obligation(command)?;
-                        restored.state = ObligationState::Accepted;
-                        restored.reservation = restored.reservation.checked_sub(*release)?;
-                        restored.paid_basis = *debit;
-                        restored.entry_time_micros = Some(*entry_time_micros);
-                        restored.entry_price_units = Some(*entry_price_units);
-                        restored.due_time_micros = Some(
-                            entry_time_micros
-                                .checked_add(duration)
-                                .ok_or("the due time overflows microseconds")?,
-                        );
-                        restored.unresolved = None;
-                        restored.path = Some(PathMetrics::new(*entry_time_micros));
-                        let instrument = self.bindings[binding].instrument;
-                        self.instruments[instrument].tracked.push(command.clone());
-                        for group in self.groups(&key) {
-                            group.accepted += 1;
-                            if unresolved {
-                                group.unresolved -= 1;
-                            }
-                        }
-                    }
-                    Resolution::Settled { outcome, .. } => {
-                        let profit = profit.expect("checked against the postings");
-                        account.paid_basis =
-                            account.paid_basis.checked_sub(obligation.paid_basis)?;
-                        account.unresolved_loss =
-                            account.unresolved_loss.checked_sub(obligation.worst_loss)?;
-                        account.complete(profit)?;
-                        self.obligations.remove(command);
-                        self.open_delta(binding, -1);
-                        for group in self.groups(&key) {
-                            group.close(unresolved);
-                            group.outcome(*outcome);
-                            group.add_profit(&currency, profit)?;
-                        }
-                    }
-                }
-                self.accounts[account_index].blocked = account_blocked.clone();
+                self.next_rate += 1;
             }
             EventKind::PauseStarted {
                 account,

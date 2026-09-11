@@ -849,7 +849,9 @@ under `price_at_due_v1`; an unresolved obligation is no longer driven by ticks. 
 one latest available row per stream: a row must close strictly later than the installed row, an
 identical redelivery is a no-op, an older or conflicting row fails, and two rows of one stream at
 one availability time fail. It evaluates each newly installed base row once, traversing installed
-base streams in frozen-plan order and their bindings in configured order. A
+base streams in frozen-plan order and their bindings in configured order. A failed step ends the
+engine: its state may hold observations the ledger does not, so every later step is refused and
+the adapter restores a fresh engine from the ledger instead of retrying. A
 condition fails when its stream has no row, when that row closes after the base row, or when the
 value is unavailable; the engine never searches backward. A matching signal is always a ledger
 record with one disposition, decided in this order: `same_entry_duplicate` (`first` selection
@@ -878,7 +880,10 @@ acknowledgement records the broker's receipt and posts nothing. Acceptance, reje
 not-sent, and possibly-sent transitions are permitted only from a sent or acknowledged command. A
 rejected or proven not-sent command releases its reservation and capacity without debit. A
 possibly sent command keeps its full reservation, blocks new entries for its account, and waits
-for reconciliation; nothing is retried and no acceptance is taken for it. Settled equity is native cash plus the paid basis of open
+for reconciliation; nothing is retried and no acceptance is taken for it. An account's block is
+the set of commands awaiting reconciliation (possibly sent, or settled with a discrepancy or
+deficit); each reconciliation removes only its own command, and entries stay blocked while any
+remains. Settled equity is native cash plus the paid basis of open
 contracts; completed profit is the credit minus the paid basis.
 
 ### Settlement
@@ -887,10 +892,12 @@ Under `price_at_due_v1` the configured simulation accepts an admitted command at
 with the current available quote as entry price, preserving the quote tick's provider time; the due
 time is the entry time plus the contract duration. The first observed tick at or after the due time
 settles when its delay is at most `max_settlement_delay_micros`; the outcome compares the
-settlement price with the entry price for the contract direction, an equal price is a tie. A gap
-into a tick larger than `max_tick_gap_micros` whose interval intersects `[entry, due)`, a later
-settlement tick, or an exhausted input window leaves the obligation `unresolved` with its reason,
-evidence, and path so far; it keeps its paid basis, capacity, and exposure until an authoritative
+settlement price with the entry price for the contract direction, an equal price is a tie. Ticks
+at or before the entry time are not path or settlement evidence. A gap into a tick larger than
+`max_tick_gap_micros` whose interval intersects `[entry, due)`, a later settlement tick, or an
+exhausted input window leaves the obligation `unresolved` with its reason, evidence, and path so
+far; an engine restored after an acceptance knows no tick after the entry, so it measures the gap
+from the entry time and never assumes continuity; it keeps its paid basis, capacity, and exposure until an authoritative
 settlement or reconciliation. Every settlement credits the actual `gross_return - terminal_fee`,
 releases the remaining reservation and capacity once, and records the path; an authoritative
 settlement's price is observed in the path at its provider time. A confirmed cashflow that
@@ -899,11 +906,15 @@ reservation is a `deficit`; either blocks the account pending reconciliation wit
 the configured amount. A reconciliation resolves an open command as not sent, accepted (posting
 the purchase and keeping the terminal reserve), or settled with its actual cashflow, or lifts with
 zero postings the block a settled discrepancy left, and records the block that remains on the
-account. Every acceptance, settlement, and reconciliation posting is recomputed from the
-obligation and the frozen terms when the record is applied, so a posting that disagrees fails at
-generation and at restoration alike. An external event with the same identity and exact payload
-is a no-op, before and after restoration; the same identity with another payload, including an
-equal amount written at another scale, fails.
+account. Every admission, acceptance, settlement, and reconciliation record is checked when it is
+applied: the state-based admission checks run again on an admitted signal, and every posting is
+recomputed from the obligation and the frozen terms, so an admission the state cannot fund or a
+posting that disagrees fails at generation and at restoration alike. An external event's payload
+is its transition fields and its source's provider time, availability, and simulation flag: the
+same identity with the exact payload is a no-op, before and after restoration; the same identity
+with another payload, including an equal amount written at another scale, fails; a ledger that
+applies one external identity twice, or a record whose source is available after its decision
+time, fails.
 
 ### Pause, conversion, and projections
 
@@ -916,8 +927,9 @@ source and reporting currency at a decision time, the latest supplied rate whose
 availability times are no later than the decision and whose provider age is at most
 `max_rate_age_micros`, multiplies once with checked arithmetic, and rejects lost precision;
 same-currency amounts only rescale. The reporting-currency projection is observed at the run
-definition and after every record that changes an account: an admitted signal, an acceptance, a
-release, a settlement, or a reconciliation. Missing or stale rates leave that observation
+definition, at each supplied rate's availability (a `rate_available` record, so a rate change is
+visible without an account posting), and after every record that changes an account: an admitted
+signal, an acceptance, a release, a settlement, or a reconciliation. Missing or stale rates leave that observation
 unavailable and make the total unresolved-loss limit unavailable, which blocks admissions that
 need it; native history is never substituted, while native cash, account pause, and confirmed
 native settlement never depend on conversion. The path of a contract
@@ -933,8 +945,8 @@ price.
 The ledger is one canonical compact JSON record per line in `ledger/events.jsonl`, each carrying a
 contiguous `sequence` from zero, the decision `time_micros`, and a tagged `kind`: the
 `run_definition` (the complete resolved run) first, then `signal`, `acknowledged`, `accepted`,
-`released`, `possibly_sent`, `settled`, `unresolved`, `reconciled`, `pause_started`, and
-`pause_ended` records
+`released`, `possibly_sent`, `settled`, `unresolved`, `reconciled`, `rate_available`,
+`pause_started`, and `pause_ended` records
 with their exact postings and provenance (`source` identity, provider and availability times, and
 whether it is a configured simulation). Tick and feature data are referenced inputs, never copied.
 Restoration applies every record through the same function that generated it: a missing

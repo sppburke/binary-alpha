@@ -768,6 +768,23 @@ fn reconciliation(command: &str, time: i64, resolution: Resolution) -> Observati
     }
 }
 
+/// The ledger lines with `from` replaced by `to` in exactly one line.
+fn tampered(lines: &[Vec<u8>], from: &str, to: &str) -> Vec<Vec<u8>> {
+    let mut changed = 0;
+    let lines = lines
+        .iter()
+        .map(|line| {
+            let text = String::from_utf8(line.clone()).unwrap();
+            if text.contains(from) {
+                changed += 1;
+            }
+            text.replacen(from, to, 1).into_bytes()
+        })
+        .collect();
+    assert_eq!(changed, 1, "{from}");
+    lines
+}
+
 /// A live-adapter harness: every generated record is kept as ledger lines so the run can be
 /// restored and compared at any point.
 struct Live {
@@ -905,6 +922,7 @@ fn kinds(events: &[FinancialEvent]) -> Vec<&'static str> {
             EventKind::Settled { .. } => "settled",
             EventKind::Unresolved { .. } => "unresolved",
             EventKind::Reconciled { .. } => "reconciled",
+            EventKind::RateAvailable { .. } => "rate_available",
             EventKind::PauseStarted { .. } => "pause_started",
             EventKind::PauseEnded { .. } => "pause_ended",
         })
@@ -1081,7 +1099,9 @@ fn settlement_availability_and_duplicate_events_are_explicit() {
         source.available_at_micros = 103;
     }
     assert!(
-        live.try_step(102, vec![delayed.clone()]).is_err(),
+        live.restored()
+            .try_step(102, vec![delayed.clone()])
+            .is_err(),
         "not yet available"
     );
     let events = live.step(103, vec![delayed.clone(), row(0, 100, 103, true)]);
@@ -1101,7 +1121,7 @@ fn settlement_availability_and_duplicate_events_are_explicit() {
         *outcome = Outcome::Loss;
     }
     for observation in [rescaled, conflicting] {
-        for engine in [&mut live, &mut restored] {
+        for mut engine in [live.restored(), restored.restored()] {
             assert!(
                 engine
                     .try_step(104, vec![observation.clone()])
@@ -1149,38 +1169,112 @@ fn alignment_follows_the_latest_row_of_the_other_stream() {
 }
 
 #[test]
-fn rows_are_monotonic_and_redelivered_rows_are_no_ops() {
+fn rows_are_monotonic_and_a_failed_step_ends_the_engine() {
     let mut live = Live::new(definition(|_| {}));
     live.simulate(10, vec![tick(10, 500), row(0, 10, 10, true)]);
     assert!(
         live.step(11, vec![row(0, 10, 10, true)]).is_empty(),
         "the identical row again installs and evaluates nothing"
     );
-    for (what, observation) in [
-        ("an older row", row(0, 9, 11, true)),
-        ("a conflicting row at the same close", row(0, 10, 11, false)),
-    ] {
-        let error = live.try_step(11, vec![observation]).unwrap_err();
+    // A refused delivery may leave state the ledger does not hold, so the engine refuses every
+    // later step; an engine restored from its ledger holds only the applied records and
+    // continues. Rows are inputs, not ledger state, so each probe starts from the same steps.
+    let fresh = || {
+        let mut fresh = Live::new(definition(|_| {}));
+        fresh.simulate(10, vec![tick(10, 500), row(0, 10, 10, true)]);
+        fresh
+    };
+    let refused: [(&str, Vec<Observation>, &str); 4] = [
+        (
+            "an older row",
+            vec![row(0, 9, 12, true)],
+            "arrives after the row closing at",
+        ),
+        (
+            "a conflicting row at the same close",
+            vec![row(0, 10, 12, false)],
+            "arrives after the row closing at",
+        ),
+        (
+            "two rows of one stream at one time",
+            vec![row(0, 11, 12, true), row(0, 12, 12, true)],
+            "two rows of stream 0",
+        ),
+        (
+            "a row known after the step time",
+            vec![row(0, 12, 13, true)],
+            "not available",
+        ),
+    ];
+    for (what, observations, expected) in refused {
+        let mut failed = fresh();
+        let error = failed.try_step(12, observations).unwrap_err();
+        assert!(error.contains(expected), "{what}: {error}");
         assert!(
-            error.contains("arrives after the row closing at"),
-            "{what}: {error}"
+            failed
+                .try_step(13, vec![tick(13, 500)])
+                .unwrap_err()
+                .contains("restore it from its ledger"),
+            "{what}: the failed engine refuses to continue"
         );
+        assert!(failed.restored().step(13, vec![tick(13, 500)]).is_empty());
     }
-    let error = live
-        .try_step(12, vec![row(0, 11, 12, true), row(0, 12, 12, true)])
-        .unwrap_err();
-    assert!(error.contains("two rows of stream 0"), "{error}");
-    assert!(
-        live.try_step(12, vec![row(0, 12, 13, true)])
-            .unwrap_err()
-            .contains("not available"),
-        "a row known after the step time"
-    );
-    // Failed deliveries leave the installed rows and the engine state unchanged: the open
-    // contract still settles at its due tick and the next row is evaluated.
     let events = live.simulate(20, vec![tick(20, 500), row(0, 20, 20, true)]);
     assert_eq!(kinds(&events), ["settled", "signal", "accepted"]);
     live.assert_restorable();
+}
+
+#[test]
+fn a_restored_engine_measures_continuity_from_the_entry() {
+    // With a maximum gap of five and ticks at 10, 14, and 18, the uninterrupted engine settles
+    // at 21; an engine restored right after the acceptance knows no tick after the entry, so
+    // the same tick is a gap from the entry: the obligation stays unresolved with its cash and
+    // capacity retained, and no settlement is manufactured.
+    let mut live = Live::new(definition(|replay| {
+        replay.contracts[0].settlement.max_tick_gap_micros = 5;
+    }));
+    live.simulate(10, vec![tick(10, 500), row(0, 10, 10, true)]);
+    let mut restored = live.restored();
+    live.simulate(14, vec![tick(14, 510)]);
+    live.simulate(18, vec![tick(18, 520)]);
+    assert_eq!(kinds(&live.simulate(21, vec![tick(21, 530)])), ["settled"]);
+    let events = restored.simulate(21, vec![tick(21, 530)]);
+    let EventKind::Unresolved {
+        reason, evidence, ..
+    } = &events[0].kind
+    else {
+        panic!("{events:?}")
+    };
+    assert_eq!(*reason, UnresolvedReason::Gap);
+    assert!(
+        evidence.contains("from 1970-01-01T00:00:00.000010Z"),
+        "{evidence}"
+    );
+    assert_eq!(
+        restored.balances("a"),
+        (
+            "999.00".into(),
+            "0.00".into(),
+            "1.00".into(),
+            "1.00".into(),
+            "0.00".into(),
+            1
+        )
+    );
+    restored.assert_restorable();
+    // Ticks at or before the entry time, delivered late, are not path evidence.
+    let mut live = Live::new(definition(|_| {}));
+    live.simulate(103, vec![tick(100, 500), row(0, 100, 103, true)]);
+    assert!(live.step(104, vec![tick(101, 520)]).is_empty());
+    let events = live.simulate(113, vec![tick(113, 500)]);
+    let EventKind::Settled { outcome, path, .. } = &events[0].kind else {
+        unreachable!()
+    };
+    assert_eq!(*outcome, Outcome::Tie);
+    assert_eq!(
+        (path.max_favorable_units, path.first_favorable_time_micros),
+        (0, None)
+    );
 }
 
 #[test]
@@ -1528,15 +1622,16 @@ fn the_exact_cashflow_counterexample_and_fees_post_exactly() {
         (
             account.reserved.to_string(),
             account.cash.to_string(),
-            account.blocked.is_some()
+            account.blocked.iter().cloned().collect::<Vec<_>>()
         ),
-        ("9.90".into(), "18.15".into(), true)
+        ("9.90".into(), "18.15".into(), vec![command.clone()])
     );
     assert_eq!(
         dispositions(&live.simulate(72, vec![tick(72, 500), row(0, 72, 72, true)])),
         [Disposition::AccountBlocked]
     );
     let error = live
+        .restored()
         .try_step(
             72,
             vec![Observation::Accepted {
@@ -1553,18 +1648,11 @@ fn the_exact_cashflow_counterexample_and_fees_post_exactly() {
         "a possibly sent command resolves only through reconciliation: {error}"
     );
     let events = live.step(73, vec![reconciliation(&command, 73, Resolution::NotSent)]);
-    let EventKind::Reconciled {
-        release,
-        account_blocked,
-        ..
-    } = &events[0].kind
-    else {
+    let EventKind::Reconciled { release, .. } = &events[0].kind else {
         unreachable!()
     };
-    assert_eq!(
-        (release.to_string(), account_blocked.clone()),
-        ("9.90".into(), None)
-    );
+    assert_eq!(release.to_string(), "9.90");
+    assert!(live.account("a").blocked.is_empty());
     assert_eq!(
         live.balances("a"),
         (
@@ -1662,11 +1750,39 @@ fn the_exact_cashflow_counterexample_and_fees_post_exactly() {
             0
         )
     );
-    assert!(live.account("a").blocked.is_some());
+    assert!(live.account("a").blocked.contains(&command));
     assert_eq!(
         dispositions(&live.simulate(31, vec![tick(31, 400), row(0, 31, 31, true)])),
         [Disposition::AccountBlocked]
     );
+    // Tampered ledgers: the accepted record under the acknowledgement's source identity, an
+    // acceptance available after its decision time, and an admission the definition's cash
+    // cannot fund all fail restoration.
+    for (what, from, to, expected) in [
+        (
+            "repeated identity",
+            "\"broker:accept\"",
+            "\"broker:ack\"",
+            "already applied",
+        ),
+        (
+            "future availability",
+            "\"available_at_micros\":22,",
+            "\"available_at_micros\":23,",
+            "not available",
+        ),
+        (
+            "unfunded admission",
+            "\"initial_cash\":\"19\"",
+            "\"initial_cash\":\"9\"",
+            "not admissible",
+        ),
+    ] {
+        let error = Engine::restore(tampered(&live.lines, from, to).into_iter().map(Ok))
+            .err()
+            .unwrap();
+        assert!(error.contains(expected), "{what}: {error}");
+    }
     let events = live.step(
         32,
         vec![reconciliation(
@@ -1684,7 +1800,6 @@ fn the_exact_cashflow_counterexample_and_fees_post_exactly() {
         debit,
         credit,
         profit,
-        account_blocked,
         ..
     } = &events[0].kind
     else {
@@ -1695,14 +1810,78 @@ fn the_exact_cashflow_counterexample_and_fees_post_exactly() {
             release.to_string(),
             debit.to_string(),
             credit.to_string(),
-            *profit,
-            account_blocked.clone()
+            *profit
         ),
-        ("0.00".into(), "0.00".into(), "0.00".into(), None, None),
+        ("0.00".into(), "0.00".into(), "0.00".into(), None),
         "reconciling a settled discrepancy posts nothing and lifts the block"
     );
     assert_eq!(live.cash(), "8.90");
-    assert!(live.account("a").blocked.is_none());
+    assert!(live.account("a").blocked.is_empty());
+    live.assert_restorable();
+    // Blocks are kept per command: two discrepant settlements block until each is reconciled.
+    let mut definition = fractional();
+    definition.replay.risk_policies[0].max_open_per_strategy = Some(5);
+    definition.replay.accounts[0].initial_cash = decimal("40");
+    let mut live = Live::new(definition);
+    let first = Live::command(&live.simulate(10, vec![tick(10, 500), row(0, 10, 10, true)]));
+    let second = Live::command(&live.simulate(11, vec![tick(11, 500), row(0, 11, 11, true)]));
+    live.step(
+        15,
+        vec![settlement(&first, 15, Outcome::Win, "18", "0.20", 600)],
+    );
+    live.step(
+        16,
+        vec![settlement(&second, 16, Outcome::Win, "18", "0.20", 600)],
+    );
+    assert_eq!(
+        live.account("a")
+            .blocked
+            .iter()
+            .cloned()
+            .collect::<Vec<_>>(),
+        [first.clone(), second.clone()]
+    );
+    live.step(
+        17,
+        vec![reconciliation(
+            &second,
+            17,
+            Resolution::Settled {
+                outcome: Outcome::Win,
+                gross_return: decimal("18"),
+                terminal_fee: decimal("0.20"),
+            },
+        )],
+    );
+    assert_eq!(
+        live.account("a")
+            .blocked
+            .iter()
+            .cloned()
+            .collect::<Vec<_>>(),
+        std::slice::from_ref(&first)
+    );
+    assert_eq!(
+        dispositions(&live.simulate(18, vec![tick(18, 600), row(0, 18, 18, true)])),
+        [Disposition::AccountBlocked]
+    );
+    live.step(
+        19,
+        vec![reconciliation(
+            &first,
+            19,
+            Resolution::Settled {
+                outcome: Outcome::Win,
+                gross_return: decimal("18"),
+                terminal_fee: decimal("0.20"),
+            },
+        )],
+    );
+    assert!(live.account("a").blocked.is_empty());
+    assert_eq!(
+        dispositions(&live.simulate(20, vec![tick(20, 600), row(0, 20, 20, true)])),
+        [Disposition::Admitted]
+    );
     live.assert_restorable();
     // Reconciliation of a sent command as accepted posts the purchase and keeps the terminal
     // reserve; the obligation then settles on ticks like any accepted contract. Reconciliation
@@ -1943,8 +2122,16 @@ fn quote_envelopes_pauses_conversion_and_projections_are_exact() {
         (0, 1, None),
         "the definition record is observed without a rate"
     );
+    assert!(
+        live.simulate(100, vec![tick(100, 500)]).is_empty(),
+        "the rate's provider time is not its availability"
+    );
     let events = live.simulate(103, vec![tick(103, 500), row(0, 103, 103, true)]);
-    assert_eq!(kinds(&events), ["signal", "accepted"]);
+    assert_eq!(
+        kinds(&events),
+        ["rate_available", "signal", "accepted"],
+        "a rate becoming available is observed before any decision at that time"
+    );
     let reporting = live.engine.summary().reporting.clone();
     assert_eq!(
         (
@@ -1955,7 +2142,7 @@ fn quote_envelopes_pauses_conversion_and_projections_are_exact() {
             reporting.used_rates.iter().cloned().collect::<Vec<_>>()
         ),
         (
-            2,
+            3,
             Some("3500.00".into()),
             Some("3500.00".into()),
             Some("0.00".into()),
@@ -1971,7 +2158,7 @@ fn quote_envelopes_pauses_conversion_and_projections_are_exact() {
             reporting.unavailable_observations,
             reporting.settled_equity
         ),
-        (2, 2, None),
+        (3, 2, None),
         "a stale rate leaves the settlement's observation unavailable, never native history"
     );
     live.assert_restorable();
@@ -1982,7 +2169,7 @@ fn quote_envelopes_pauses_conversion_and_projections_are_exact() {
     );
     let events = live.simulate(103, vec![tick(103, 500), row(0, 103, 103, true)]);
     assert_eq!(dispositions(&events), [Disposition::Admitted]);
-    let EventKind::Signal { rates, .. } = &events[0].kind else {
+    let EventKind::Signal { rates, .. } = &events[1].kind else {
         unreachable!()
     };
     assert_eq!(
@@ -2338,6 +2525,53 @@ struct TargetSettlement {
     price: i64,
     outcome: Outcome,
     path: PathMetrics,
+}
+
+/// The retained evidence of the governed comparison: every classified divergence and every
+/// legacy-rounding correction, one tab-separated line each, in a file named by the replay
+/// generation and the code revision it was produced at.
+struct Evidence {
+    writer: std::io::BufWriter<fs::File>,
+    path: PathBuf,
+    retained: u64,
+    classes: BTreeMap<&'static str, u64>,
+    examples: BTreeMap<&'static str, String>,
+}
+
+impl Evidence {
+    fn create(manifest: &ReplayManifest) -> Self {
+        use std::io::Write;
+        let path = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!(
+            "phase06_reference_divergences_{}_{}.tsv",
+            &manifest.generation[..16],
+            manifest.code_revision
+        ));
+        let mut writer = std::io::BufWriter::new(fs::File::create(&path).unwrap());
+        writeln!(writer, "signal_number\tclass\tcitation").unwrap();
+        Self {
+            writer,
+            path,
+            retained: 0,
+            classes: BTreeMap::new(),
+            examples: BTreeMap::new(),
+        }
+    }
+
+    fn retain(&mut self, number: u64, class: &str, citation: &str) {
+        use std::io::Write;
+        writeln!(self.writer, "{number}\t{class}\t{citation}").unwrap();
+        self.retained += 1;
+    }
+
+    /// Counts one signal's disposition class, retaining every class that is not a match.
+    fn classify(&mut self, number: u64, class: &'static str, citation: String) -> &'static str {
+        *self.classes.entry(class).or_default() += 1;
+        if !class.starts_with("matched_") {
+            self.retain(number, class, &citation);
+        }
+        self.examples.entry(class).or_insert(citation);
+        class
+    }
 }
 
 /// Reference rows keyed by signal number, each kept as one unit-separated line.
@@ -2887,13 +3121,7 @@ fn governed_reference_parity() {
         .map(|candidate| (candidate.candidate_id.as_str(), candidate))
         .collect();
     let scale8 = PriceScale::try_from(8).unwrap();
-    let divergences_path =
-        Path::new(env!("CARGO_TARGET_TMPDIR")).join("phase06_reference_divergences.tsv");
-    let mut divergences = std::io::BufWriter::new(fs::File::create(&divergences_path).unwrap());
-    writeln!(divergences, "signal_number\tclass\tcitation").unwrap();
-    let mut retained = 0u64;
-    let mut classes: BTreeMap<&str, u64> = BTreeMap::new();
-    let mut examples: BTreeMap<&str, String> = BTreeMap::new();
+    let mut evidence = Evidence::create(&manifest);
     let mut divergent_commands: std::collections::HashSet<String> =
         std::collections::HashSet::new();
     // Per candidate: the reference's last opened trade (signal number, the time it closed) and
@@ -2913,15 +3141,6 @@ fn governed_reference_parity() {
         ("losses", 0),
         ("ties", 0),
     ]);
-    let mut classify = |number: u64, class: &'static str, citation: String| {
-        *classes.entry(class).or_default() += 1;
-        if !class.starts_with("matched_") {
-            writeln!(divergences, "{number}\t{class}\t{citation}").unwrap();
-            retained += 1;
-        }
-        examples.entry(class).or_insert(citation);
-        class
-    };
     let time_pair =
         |reference: &str, target: i64| (micros(reference).to_string(), target.to_string());
     let price_pair = |reference: &str, target_units: i64| {
@@ -3052,19 +3271,19 @@ fn governed_reference_parity() {
             (true, _, Disposition::Admitted) => {
                 let command = target.command.as_ref().unwrap();
                 if let Some((_, gap_end)) = gap {
-                    let (reason, evidence) = unresolved.get(command).unwrap_or_else(|| panic!("signal {number}: the reference invalidated this trade but the target settled or kept it"));
+                    let (reason, retained) = unresolved.get(command).unwrap_or_else(|| panic!("signal {number}: the reference invalidated this trade but the target settled or kept it"));
                     assert_eq!(*reason, UnresolvedReason::Gap);
                     assert!(
-                        evidence.contains(&format_event_time_micros(gap_end)),
-                        "signal {number}: {evidence}"
+                        retained.contains(&format_event_time_micros(gap_end)),
+                        "signal {number}: {retained}"
                     );
                     divergent_commands.insert(command.clone());
                     last_divergence.insert(candidate.candidate_id.as_str(), number);
-                    classify(
+                    evidence.classify(
                         number,
                         "retained_unresolved_settlement_evidence",
                         citation(&format!(
-                            "the reference removed the trade at its gap; the target retains {command}: {evidence}"
+                            "the reference removed the trade at its gap; the target retains {command}: {retained}"
                         )),
                     )
                 } else {
@@ -3073,14 +3292,14 @@ fn governed_reference_parity() {
                             || accepted.contains_key(command) && !unresolved.contains_key(command),
                         "signal {number}: the target left {command} unresolved where the reference settled"
                     );
-                    classify(number, "matched_admitted", citation("both admitted"))
+                    evidence.classify(number, "matched_admitted", citation("both admitted"))
                 }
             }
             (false, "[\"max_open_trades_per_strategy\"]", Disposition::CapacityStrategy) => {
                 *reference_counts
                     .get_mut("blocked_by_strategy_capacity")
                     .unwrap() += 1;
-                classify(
+                evidence.classify(
                     number,
                     "matched_capacity",
                     citation("both blocked by strategy capacity"),
@@ -3097,7 +3316,7 @@ fn governed_reference_parity() {
                     times[index] - times[index - 1] > 60_000_000,
                     "signal {number}: the gap into the trigger tick"
                 );
-                classify(
+                evidence.classify(
                     number,
                     "matched_gap_at_entry",
                     citation(&format!(
@@ -3116,7 +3335,7 @@ fn governed_reference_parity() {
                     target.available_before
                 );
                 last_divergence.insert(candidate.candidate_id.as_str(), number);
-                classify(
+                evidence.classify(
                     number,
                     "insufficient_cash",
                     citation(&format!(
@@ -3134,7 +3353,7 @@ fn governed_reference_parity() {
                     "signal {number}: the slot holder {held_by} is not a classified divergence"
                 );
                 last_divergence.insert(candidate.candidate_id.as_str(), number);
-                classify(
+                evidence.classify(
                     number,
                     if retained {
                         "capacity_held_by_retained_unresolved"
@@ -3167,7 +3386,7 @@ fn governed_reference_parity() {
                     "signal {number}: the target also opened the reference's holding trade"
                 );
                 divergent_commands.insert(target.command.clone().unwrap());
-                classify(
+                evidence.classify(
                     number,
                     "admitted_after_divergence",
                     citation(&format!(
@@ -3303,6 +3522,13 @@ fn governed_reference_parity() {
                         text(exact_text)
                     } else {
                         path_source_rounding += 1;
+                        evidence.retain(
+                            number,
+                            "legacy_rounding_value",
+                            &format!(
+                                "{name}: reference {reference}, exact {exact_text}, legacy floating rule {legacy_value:.10} from {units} units at entry {entry_units}"
+                            ),
+                        );
                         text(format!("{legacy_value:.10}"))
                     }
                 }
@@ -3323,6 +3549,16 @@ fn governed_reference_parity() {
                             "signal {number}: {name} names an equal extremum"
                         );
                         path_time_source_rounding += 1;
+                        evidence.retain(
+                            number,
+                            "legacy_rounding_time",
+                            &format!(
+                                "{name}: reference {reference}, exact {}, legacy floating rule {}; both name price {}",
+                                format_event_time_micros(exact_time),
+                                format_event_time_micros(legacy_time),
+                                prices[times.partition_point(|&t| t < exact_time)]
+                            ),
+                        );
                         time_pair(reference, legacy_time)
                     }
                 }
@@ -3375,7 +3611,7 @@ fn governed_reference_parity() {
             }
         }
     }
-    divergences.flush().unwrap();
+    evidence.writer.flush().unwrap();
     assert_eq!(rows_seen, fixture.rows["signals"]);
     for name in [
         "opened",
@@ -3395,7 +3631,10 @@ fn governed_reference_parity() {
         compared_outcomes,
         fixture.totals["settled"].as_u64().unwrap()
     );
-    assert_eq!(classes.values().sum::<u64>(), fixture.rows["signals"]);
+    assert_eq!(
+        evidence.classes.values().sum::<u64>(),
+        fixture.rows["signals"]
+    );
     let net = Decimal::parse("0.92")
         .unwrap()
         .checked_mul(Decimal::parse(&reference_counts["wins"].to_string()).unwrap())
@@ -3411,12 +3650,13 @@ fn governed_reference_parity() {
         "compared {rows_seen} reference signals in {:.1} s: {compared_fields} shared fields, {compared_outcomes} settled outcomes and {compared_paths} paths agree; {path_source_rounding} path values and {path_time_source_rounding} extremum times reproduce only through the legacy floating rounding",
         started.elapsed().as_secs_f64()
     );
-    for (class, count) in &classes {
-        println!("  {class}: {count} (first: {})", examples[class]);
+    for (class, count) in &evidence.classes {
+        println!("  {class}: {count} (first: {})", evidence.examples[class]);
     }
     println!(
-        "retained {retained} divergence citations at {}",
-        divergences_path.display()
+        "retained {} divergence and rounding citations at {}",
+        evidence.retained,
+        evidence.path.display()
     );
 
     // The target's actual funded results, the reference's historical diagnostics, and the run

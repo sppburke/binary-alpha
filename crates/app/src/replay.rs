@@ -13,24 +13,21 @@ use std::path::Path;
 use std::time::Instant;
 
 use binary_alpha_engine::config::{Config, Replay, RunMode};
-use binary_alpha_engine::dataset::{
-    Capability, DatasetRole, GenerationManifest, ObjectRecord, ObjectRole, PriceRepresentation,
-    manifest_key,
-};
+use binary_alpha_engine::dataset::{ObjectRecord, ObjectRole, manifest_key};
 use binary_alpha_engine::execution::{
     ColumnSpec, EVENTS_OBJECT_PATH, Engine, EventKind, EventSource, FinancialEvent,
     HISTORICAL_AVAILABILITY, InstrumentBinding, Observation, REPLAY_MANIFEST_KIND,
     REPLAY_SCHEMA_VERSION, ReplayManifest, RunDefinition, SUMMARY_OBJECT_PATH, StreamColumns,
     Summary, replay_generation_id,
 };
-use binary_alpha_engine::features::{FeatureManifest, FeaturePlan, StreamPlan, Value};
-use binary_alpha_engine::market::{PriceScale, parse_event_time_micros};
+use binary_alpha_engine::features::{FeaturePlan, StreamPlan, Value};
+use binary_alpha_engine::market::parse_event_time_micros;
 use binary_alpha_engine::outcomes::{OUTCOME_MANIFEST_KIND, OutcomeManifest};
 
 use crate::archive::TableReader;
 use crate::features::{self, ROWS_MESSAGE};
 use crate::import::{self, CODE_REVISION};
-use crate::outcomes::{Temporary, load_ticks};
+use crate::outcomes::{Bound, Temporary, bind_inputs, load_ticks};
 use crate::store::{self, ObjectIdentity, Put, Store};
 use crate::verify;
 
@@ -45,105 +42,45 @@ pub fn run(config_path: &Path, out: &mut dyn Write) -> Result<(), String> {
             config.run_mode
         ));
     }
-    let settings = config
-        .replay
-        .as_ref()
-        .ok_or("replay: the table is required")?;
     let base = config_path.parent().unwrap_or(Path::new("."));
     let historical_dir = base.join(config.storage.historical_data_dir.as_path());
     fs::create_dir_all(&historical_dir)
         .map_err(|error| format!("cannot create {}: {error}", historical_dir.display()))?;
     let local = Store::filesystem(&historical_dir);
     let destination = Store::open(&config.storage.publication_uri)?;
-    let line = replay(settings, &config, &local, &destination)
-        .map_err(|reason| format!("replay: {reason}"))?;
+    let line =
+        replay(&config, &local, &destination).map_err(|reason| format!("replay: {reason}"))?;
     writeln!(out, "{line}")
         .and_then(|()| out.flush())
         .map_err(|error| format!("cannot write the report: {error}"))
 }
 
-/// One instrument's bound inputs, resolved from permitted manifest metadata before any child
-/// object other than the feature plan is read.
+/// One instrument's bound inputs and its frozen binding.
 struct BoundInstrument {
-    tick: GenerationManifest,
-    tick_store: Store,
-    scale: PriceScale,
-    feature: FeatureManifest,
-    feature_store: Store,
-    plan: FeaturePlan,
+    inputs: Bound,
     binding: InstrumentBinding,
 }
 
-/// Reads and checks one input's ready manifests and plan. A declared role, a holdout
-/// generation, a source without ticks, a feature generation of another role, instrument, or
-/// tick generation, an outcome generation of other inputs, and decision times outside the
-/// declared window are refused on the manifest bytes alone.
+/// Binds one input through the shared tick and feature binder, then refuses an outcome
+/// generation of other inputs and decision times outside the declared window on the manifest
+/// bytes alone.
 fn bind_instrument(settings: &Replay, index: usize) -> Result<BoundInstrument, String> {
     let input = &settings.inputs[index];
     let field = |name: &str| format!("inputs[{index}].{name}");
-    let uri = input.tick_manifest.to_string();
-    let (tick_store, tick_key) = verify::open(&uri)?;
-    let mut bytes = Vec::new();
-    tick_store.read_to(&tick_key, None, &mut bytes)?;
-    if let Some(kind) = verify::manifest_kind(&bytes)? {
-        return Err(format!(
-            "{}: {uri} is a `{kind}` manifest, not a dataset ready manifest",
-            field("tick_manifest")
-        ));
-    }
-    let tick = GenerationManifest::from_json(&bytes)
-        .map_err(|error| format!("{}: {uri}: {error}", field("tick_manifest")))?;
-    if tick.key() != tick_key {
-        return Err(format!(
-            "{}: {uri} holds the manifest of generation {}",
-            field("tick_manifest"),
-            tick.generation
-        ));
-    }
-    if tick.role == DatasetRole::Holdout {
-        return Err(format!(
-            "{}: holdout data never enters a replay",
-            field("tick_manifest")
-        ));
-    }
-    if tick.role != settings.role {
-        return Err(format!(
-            "role: declared `{}`, but generation {} is `{}`",
-            settings.role, tick.generation, tick.role
-        ));
-    }
-    tick.require(Capability::Ticks)
-        .map_err(|error| format!("{}: {error}", field("tick_manifest")))?;
-    let PriceRepresentation::IntegerUnits { scale } = tick.price_representation else {
-        unreachable!("a validated tick generation carries integer units at microsecond times")
-    };
-    let (feature_store, feature) = features::feature_manifest(
-        &field("feature_manifest"),
-        &input.feature_manifest.to_string(),
+    let inputs = bind_inputs(
+        &field,
+        settings.role,
+        &input.tick_manifest,
+        &input.feature_manifest,
+        "a replay",
     )?;
-    if feature.input_generation != tick.generation {
-        return Err(format!(
-            "{}: feature generation {} was computed from tick generation {}, not {}",
-            field("feature_manifest"),
-            feature.generation,
-            feature.input_generation,
-            tick.generation
-        ));
-    }
-    if feature.role != tick.role
-        || feature.broker != tick.broker
-        || feature.provider_symbol != tick.provider_symbol
-    {
-        return Err(format!(
-            "{}: feature generation {} describes {} `{}`, not {} `{}`",
-            field("feature_manifest"),
-            feature.generation,
-            feature.instrument,
-            feature.role,
-            tick.instrument,
-            tick.role
-        ));
-    }
+    let Bound {
+        tick,
+        scale,
+        feature,
+        plan,
+        ..
+    } = &inputs;
     let start = parse_event_time_micros(&settings.decision_start)?;
     let end = parse_event_time_micros(&settings.decision_end)?;
     for summary in &feature.streams {
@@ -162,15 +99,6 @@ fn bind_instrument(settings: &Replay, index: usize) -> Result<BoundInstrument, S
                 ));
             }
         }
-    }
-    let plan = features::fitted_plan(&field("feature_manifest"), &feature_store, &feature)?;
-    if plan.price_scale != scale {
-        return Err(format!(
-            "{}: the plan carries price scale {}, but the ticks carry {}",
-            field("feature_manifest"),
-            plan.price_scale.digits(),
-            scale.digits()
-        ));
     }
     let outcome_generation = match &input.outcome_manifest {
         None => None,
@@ -221,17 +149,9 @@ fn bind_instrument(settings: &Replay, index: usize) -> Result<BoundInstrument, S
         plan_identity: plan_identity.clone(),
         raw_identity: plan.raw_identity.clone(),
         outcome_generation,
-        streams: stream_columns(settings, &plan, &plan_identity)?,
+        streams: stream_columns(settings, plan, &plan_identity)?,
     };
-    Ok(BoundInstrument {
-        tick,
-        tick_store,
-        scale,
-        feature,
-        feature_store,
-        plan,
-        binding,
-    })
+    Ok(BoundInstrument { inputs, binding })
 }
 
 /// The streams and columns the strategies frozen on `plan` name, in frozen-plan order: every
@@ -352,25 +272,27 @@ struct RowCursor {
 impl RowCursor {
     fn open(bound: &BoundInstrument, stream: &StreamColumns) -> Result<Self, String> {
         let plan_stream = bound
+            .inputs
             .plan
             .stream(stream.stream)
             .expect("bound streams are plan streams");
         let path = &plan_stream.object_paths()[0];
         let object = bound
+            .inputs
             .feature
             .objects
             .iter()
             .find(|object| object.path == *path)
             .expect("a validated feature manifest lists every stream's rows");
-        let (_, local) = verify::fetch(&bound.feature_store, object, true)?;
+        let (_, local) = verify::fetch(&bound.inputs.feature_store, object, true)?;
         let local = local.expect("decoded objects have a local path");
-        let location = bound.feature_store.uri(&object.key);
+        let location = bound.inputs.feature_store.uri(&object.key);
         let reader = TableReader::open(&local.path, ROWS_MESSAGE)
             .map_err(|reason| format!("{location}: {reason}"))?;
         let expected: Vec<(String, String)> = features::table_metadata(
-            &bound.plan,
+            &bound.inputs.plan,
             plan_stream,
-            ("raw_identity", &bound.plan.raw_identity),
+            ("raw_identity", &bound.inputs.plan.raw_identity),
         )
         .into_iter()
         .map(|(key, value)| (key.to_string(), value))
@@ -558,13 +480,13 @@ fn simulate(
 }
 
 /// The typed replay every caller uses: bind, simulate, publish, and reconstruct one replay
-/// generation, returning its report and reconstruction lines.
-pub fn replay(
-    settings: &Replay,
-    config: &Config,
-    local: &Store,
-    destination: &Store,
-) -> Result<String, String> {
+/// generation of the configuration's `replay` table, returning its report and reconstruction
+/// lines.
+pub fn replay(config: &Config, local: &Store, destination: &Store) -> Result<String, String> {
+    let settings = config
+        .replay
+        .as_ref()
+        .ok_or("replay: the table is required")?;
     let loading = Instant::now();
     let bound = (0..settings.inputs.len())
         .map(|index| bind_instrument(settings, index))
@@ -581,8 +503,11 @@ pub fn replay(
     let key = manifest_key(&generation);
     let mut inputs = Vec::with_capacity(bound.len());
     for instrument in &bound {
-        let (times, prices) =
-            load_ticks(&instrument.tick_store, &instrument.tick, instrument.scale)?;
+        let (times, prices) = load_ticks(
+            &instrument.inputs.tick_store,
+            &instrument.inputs.tick,
+            instrument.inputs.scale,
+        )?;
         let cursors = instrument
             .binding
             .streams
@@ -606,6 +531,7 @@ pub fn replay(
     for (index, (instrument, input)) in bound.iter().zip(&inputs).enumerate() {
         for (cursor, stream) in input.cursors.iter().zip(&instrument.binding.streams) {
             let summary = instrument
+                .inputs
                 .feature
                 .streams
                 .iter()
