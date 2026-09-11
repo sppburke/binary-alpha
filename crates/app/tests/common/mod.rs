@@ -1,17 +1,22 @@
 //! Fixture writers and command helpers shared by the application's integration tests.
 #![allow(dead_code)]
 
+use std::borrow::Cow;
 use std::fs::{self, File};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::sync::Arc;
 
+use binary_alpha_engine::dataset::GenerationManifest;
+use binary_alpha_engine::market::Tick;
 use parquet::basic::{Compression, ZstdLevel};
 use parquet::column::writer::ColumnWriter;
 use parquet::data_type::ByteArray;
 use parquet::file::metadata::KeyValue;
 use parquet::file::properties::WriterProperties;
+use parquet::file::reader::{FileReader, SerializedFileReader};
 use parquet::file::writer::SerializedFileWriter;
+use parquet::record::{Field, RowAccessor};
 use parquet::schema::parser::parse_message_type;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -437,4 +442,155 @@ pub fn generation(line: &str) -> String {
         .next()
         .unwrap()
         .to_string()
+}
+
+/// A streaming reader of a legacy comma-separated reference file: the header, then one row at
+/// a time. A field may be quoted with double quotes, inside which a doubled quote is one quote
+/// and a comma is literal; no field spans a line. Every row must have the header's width.
+pub struct LegacyCsv {
+    pub header: Vec<String>,
+    pub path: PathBuf,
+    lines: std::io::Lines<std::io::BufReader<File>>,
+}
+
+impl LegacyCsv {
+    pub fn open(path: &Path) -> Self {
+        use std::io::BufRead;
+        let mut lines =
+            std::io::BufReader::with_capacity(1 << 20, File::open(path).unwrap()).lines();
+        let header = split_csv(&lines.next().unwrap().unwrap());
+        Self {
+            header,
+            path: path.to_path_buf(),
+            lines,
+        }
+    }
+
+    pub fn next_row(&mut self) -> Option<Vec<String>> {
+        let row = split_csv(&self.lines.next()?.unwrap());
+        assert_eq!(
+            row.len(),
+            self.header.len(),
+            "{}: ragged row",
+            self.path.display()
+        );
+        Some(row)
+    }
+
+    /// The position of a header field.
+    pub fn column(&self, name: &str) -> usize {
+        self.header
+            .iter()
+            .position(|column| column == name)
+            .unwrap_or_else(|| panic!("{}: no column {name}", self.path.display()))
+    }
+}
+
+/// Splits one line into fields, honoring double-quoted fields with doubled quotes.
+pub fn split_csv(line: &str) -> Vec<String> {
+    let mut fields = Vec::new();
+    let mut field = String::new();
+    let mut quoted = false;
+    let mut chars = line.chars().peekable();
+    while let Some(character) = chars.next() {
+        match (quoted, character) {
+            (true, '"') if chars.peek() == Some(&'"') => {
+                chars.next();
+                field.push('"');
+            }
+            (true, '"') => quoted = false,
+            (false, '"') if field.is_empty() => quoted = true,
+            (false, ',') => fields.push(std::mem::take(&mut field)),
+            (_, character) => field.push(character),
+        }
+    }
+    assert!(!quoted, "unterminated quoted field in {line:?}");
+    fields.push(field);
+    fields
+}
+
+/// One published table: its column names and every row.
+pub type Table = (
+    Vec<String>,
+    Vec<Vec<Option<binary_alpha_engine::features::Value>>>,
+);
+
+/// Streams a published table's column names and rows through the generic row API,
+/// independently of the application's readers.
+pub fn table_rows(
+    path: &Path,
+) -> (
+    Vec<String>,
+    impl Iterator<Item = Vec<Option<binary_alpha_engine::features::Value>>> + use<>,
+) {
+    use binary_alpha_engine::features::Value;
+    let reader = SerializedFileReader::new(File::open(path).unwrap()).unwrap();
+    let names: Vec<String> = reader
+        .metadata()
+        .file_metadata()
+        .schema_descr()
+        .columns()
+        .iter()
+        .map(|column| column.name().to_string())
+        .collect();
+    let rows = reader.into_iter().map(|row| {
+        row.unwrap()
+            .get_column_iter()
+            .map(|(_, field)| match field {
+                Field::Null => None,
+                Field::Long(value) => Some(Value::Int(*value)),
+                Field::Short(value) => Some(Value::Int(i64::from(*value))),
+                Field::Int(value) => Some(Value::Int(i64::from(*value))),
+                Field::Double(value) => Some(Value::Float(*value)),
+                Field::Bool(value) => Some(Value::Bool(*value)),
+                Field::Str(value) => Some(Value::Text(Cow::Owned(value.clone()))),
+                Field::TimestampMicros(value) => Some(Value::Time(*value)),
+                other => panic!("unexpected field {other:?}"),
+            })
+            .collect()
+    });
+    (names, rows)
+}
+
+/// Decodes a whole little-endian array object.
+pub fn read_le<T, const N: usize>(path: &Path, decode: fn([u8; N]) -> T) -> Vec<T> {
+    let bytes = std::fs::read(path).unwrap();
+    let (chunks, remainder) = bytes.as_chunks::<N>();
+    assert!(
+        remainder.is_empty(),
+        "{}: {} trailing bytes do not form an element",
+        path.display(),
+        remainder.len()
+    );
+    chunks.iter().map(|chunk| decode(*chunk)).collect()
+}
+
+/// Reads a whole published table.
+pub fn read_table(path: &Path) -> Table {
+    let (names, rows) = table_rows(path);
+    (names, rows.collect())
+}
+
+/// Every normalized tick of a published dataset generation, through the generic row API.
+pub fn read_normalized_ticks(store: &Path, dataset: &GenerationManifest) -> Vec<Tick> {
+    let path = store.join(
+        &dataset
+            .objects
+            .iter()
+            .find(|object| object.path == "normalized/ticks.parquet")
+            .unwrap()
+            .key,
+    );
+    let reader = SerializedFileReader::new(File::open(path).unwrap()).unwrap();
+    reader
+        .get_row_iter(None)
+        .unwrap()
+        .map(|row| {
+            let row = row.unwrap();
+            Tick {
+                event_time_micros: row.get_timestamp_micros(0).unwrap(),
+                price_units: row.get_long(1).unwrap(),
+            }
+        })
+        .collect()
 }

@@ -73,6 +73,22 @@ generation computed from another tick generation are refused before any row is r
 outcome generation with the same `data verify` command, which recomputes every label from the
 published ticks and reference times.
 
+Replay: declare the `[replay]` table (the role and decision window, the tick, feature, and
+optional outcome ready manifests per instrument, the funded accounts, strategies, ordered
+bindings, contract templates, risk policies, and the reporting-currency contract; see
+[docs/contracts.md](contracts.md), section "Execution"), then run
+`binary-alpha replay --config PATH`. The command reads every generation from the stores their
+manifests name, verifies every object as it reads it, feeds ticks and feature rows through the
+engine in availability order with the configured simulated acceptances, retains the ledger and
+summary in the historical-data folder, publishes them to `storage.publication_uri`, restores the
+generation from the published ledger, and publishes and mirrors the manifest last. It is resumable
+and idempotent the same way import is. A declared holdout role, a holdout or bar generation, a
+feature generation of another tick generation or instrument, an outcome generation of other
+inputs, decision times outside the declared window, a strategy naming an output its frozen plan
+does not compile, and conflicting shared policies are refused before any tick is read. Verify a
+replay generation with the same `data verify` command, which restores the ledger record by record.
+Historical replay performs no broker, live, paper, or production action and needs no operator task.
+
 Rollout to Google Cloud Storage: discover and reuse existing projects, buckets, identities, and
 regions first; create nothing in a region whose name begins `us-west`; provision the bucket and a
 least-privilege identity that can read and create objects but not create or delete buckets, outside
@@ -87,7 +103,7 @@ service, runner, and secret.
 ## Rollback
 
 A repository change rolls back by reverting its merge commit. Published dataset, stream, feature,
-and outcome generations are
+outcome, and replay generations are
 immutable and are never deleted by rollback; the retained historical-data folder and the original
 source files stay intact, and a consumer selects the prior generation by its identity. Schema, broker, and other production state do not exist at this phase; the
 phase that creates any of them records its own cause-specific verification and rollback before it

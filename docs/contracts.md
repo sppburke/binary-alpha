@@ -757,3 +757,263 @@ dimensions, reads the tick arrays (under the tick sequence rules) and every stre
 times back, recomputes every entry index, settlement index, and reason under the manifest's
 rule, compares them with the stored arrays, and writes
 `verified INSTRUMENT ROLE generation GENERATION rows R cells C objects K bytes B`.
+
+## Execution
+
+The engine module `execution` is the sole owner of strategy evaluation, chronological admission,
+settlement, accounting, and risk. Historical replay, research, and live adapters hand it
+observations in availability order and it returns canonical `FinancialEvent` records; applying
+those records back through the same event-application function restores every financial state and
+summary projection. `binary-alpha replay --config PATH` binds governed historical inputs, runs the
+configured simulation through the engine, and publishes the ledger as an `engine_replay`
+generation that `data verify` restores. Reports are projections of the ledger, never decision
+owners; outcome labels are diagnostics that authorize no admission, settlement, refund, or
+capacity release.
+
+### Exact arithmetic
+
+Money is a checked signed 128-bit coefficient at a decimal scale of 0 through 18, parsed through
+the shared decimal boundary from plain decimal text such as `"9.50"`. Identity compares the
+normalized value; postings keep the declared account scale; rescaling, addition, subtraction, and
+multiplication are checked and reject overflow or any lost precision. No rounding or binary
+floating point touches purchase, cash, payout, fee, conversion, or risk values; feature and model
+arithmetic remains validated floating point. Cross-currency arithmetic happens only through the
+conversion function.
+
+### Configuration
+
+The optional `replay` table declares, in canonical order: `role` (`development` or
+`evaluation`; `holdout` is rejected before any manifest is read), the nonempty half-open decision
+interval `decision_start` and `decision_end`, `reporting_currency`, `reporting_scale` (0 through
+18), `max_rate_age_micros` (non-negative), then the arrays `inputs` (one `tick_manifest`,
+`feature_manifest`, and optional `outcome_manifest` per instrument; list order resolves equal-time
+ties), optional `splits` (unique names over nonoverlapping half-open intervals inside the decision
+window), `accounts` (unique `id`, `broker`, `currency`, `scale`, non-negative `initial_cash`
+representable at the scale), `strategies` (unique `id`, `plan_identity`, `base_stream`, a nonempty
+`conditions` conjunction, and an optional `repair` conjunction; each condition names its `stream`,
+`output`, `comparator` among `eq`, `ne`, `lt`, `le`, `gt`, `ge`, and a typed `threshold`: text and
+booleans compare only with `eq` and `ne`, numbers must be finite), `bindings` (ordered; unique
+`id`, references to a strategy, account, `BROKER:PROVIDER_SYMBOL` instrument at the account's
+broker, contract in the account's currency, and risk policy, plus the frozen `envelope`),
+`contracts` (unique `id`, `direction`, positive `duration_micros`, `currency`, positive `stake`
+and `quoted_cost`, non-negative `entry_fee`, exhaustive `win`, `loss`, and `tie` cashflows of
+non-negative `gross_return` and `terminal_fee`, and `settlement` with `rule = "price_at_due_v1"`,
+`max_settlement_delay_micros`, and `max_tick_gap_micros`), `risk_policies` (unique `id`; optional
+positive `max_open_per_strategy`, `max_open_per_duration`, `max_open_per_instrument`,
+`max_open_per_account`, and `max_open_total`, where absence is no limit; `same_entry` as `all` or
+`first`; `deduplicate_signal_logic`; non-negative `max_feature_age_micros` and
+`max_quote_age_micros`; optional positive `max_unresolved_loss_per_account` and
+`max_unresolved_loss_total`; optional `pause` with positive `drawdown` and `duration_micros`), and
+optional `rates` (unique `id`, distinct `source_currency` and `reporting_currency`, `provider`,
+`provider_time`, `available_at` no earlier than the provider time, positive `rate` in
+reporting-currency units per source unit). Every contract amount, loss limit, and pause threshold
+must be representable at the scale of each account it binds to. Two bindings sharing an account,
+instrument, contract duration, same-entry key, or deduplication key must declare that scope's
+policy identically, including absent versus configured limits; two bindings of one deployment
+strategy on one account are rejected. Omitting the table preserves every existing configuration
+identity. The command requires `run_mode = "research"`.
+
+### Identities and records
+
+The signal-logic identity is SHA-256 over `binary-alpha signal logic v1`, the plan identity, the
+base stream, and the conditions in canonical order with exact duplicates removed (a text threshold
+as an escaped JSON string, so no value can spell a second condition); it excludes
+contract direction, duration, and economics. The deployment-strategy identity is SHA-256 over
+`binary-alpha deployment strategy v1`, the signal logic, direction, duration, currency, and the
+envelope's JSON with every amount normalized, so equal money values written at different scales
+share one identity. Quotes belong to events. The envelope states the maximum purchase cost, entry fee,
+and each outcome's terminal fee, the minimum winning net return
+(`gross_payout - quoted_cost - entry_fee - win_terminal_fee`), and the settlement rule a quote must
+declare; a quote at equal terms passes.
+
+### Binding
+
+Each input's tick manifest must be a dataset ready manifest providing ticks in integer price
+units at the declared role; its feature manifest must be a feature generation computed from that
+tick generation for the same instrument and role whose fitted plan carries the ticks' price scale
+and whose every stream's first and last decision times lie inside the decision window; an
+optional outcome manifest must label exactly those two generations. A strategy binds through its
+plan identity to exactly one input; every condition names a compiled output or fitted encoding of
+a plan stream with a threshold of the output's kind (an encoding compares its label text). The
+feature owner's readiness of a value is resolved from the frozen plan: its readiness flags
+(`is_ema{p}_ready` for the moving-average family, `tick_path_ready` for the tick-path buckets)
+are read beside it, and its declared not-ready text values (`not_ready`, `unknown_warmup`,
+`insufficient_tick_path`, `warming_up`, and the state outputs' `unknown`) are recorded with it;
+a value whose flag is not true or that reads a not-ready value fails its condition before any
+comparison. An optional outcome
+manifest must label the bound tick and feature generations and the plan's raw rows. The resolved
+run definition records, per instrument, the identities and only the streams and columns the
+strategies read, in frozen-plan order; the adapter reads exactly those columns. Historical
+source files carry no local receipts, so availability follows provider order and the definition
+tags `availability = "provider_order_simulation"`.
+
+### Decisions
+
+Observations at one availability time apply in source order before any decision at that time:
+ticks, then feature rows in frozen-plan order, then external acknowledgements, acceptances,
+rejections, settlements, and reconciliations; an expired account pause ends first. A tick updates
+the paths of every accepted obligation of its instrument in acceptance order and settles those due
+under `price_at_due_v1`; an unresolved obligation is no longer driven by ticks. The engine keeps
+one latest available row per stream: a row must close strictly later than the installed row, an
+identical redelivery is a no-op, an older or conflicting row fails, and two rows of one stream at
+one availability time fail. It evaluates each newly installed base row once, traversing installed
+base streams in frozen-plan order and their bindings in configured order. A failed step ends the
+engine: its state may hold observations the ledger does not, so every later step is refused and
+the adapter restores a fresh engine from the ledger instead of retrying. A
+condition fails when its stream has no row, when that row closes after the base row, when the
+value is unavailable, or when a readiness flag of the value is not true; the engine never searches
+backward. A signal is decided once per binding and base close time, and the selection and
+deduplication slots of an instant are claimed by its signal records and consulted only at that
+instant: a row redelivered to a restored engine, whose row state is not ledger state, is
+installed but never decided again, a candidate the uninterrupted engine refused a slot is
+refused it again, and a record whose disposition disagrees with the occupied slots fails. A matching signal is always a ledger
+record with one disposition, decided in this order: `same_entry_duplicate` (`first` selection
+per account, instrument, contract duration, and entry event; a blocked first candidate keeps the
+slot), `duplicate_logic` (repeated signal logic per account, instrument, and entry event when
+deduplication is enabled), `repair_blocked`, `no_quote`, `stale_feature` (decision time minus
+logical close time beyond the maximum; equality passes), `stale_quote` (decision time minus the
+quote's provider time beyond the maximum), `gap_at_entry` (the inter-arrival into the quote tick
+exceeds the contract's maximum tick gap; a repeated tick at the same time keeps that
+inter-arrival), `account_paused`, `account_blocked`, `quote_rejected`
+(the envelope), `capacity_strategy`, `capacity_duration`, `capacity_instrument`,
+`capacity_account`, `capacity_total` (the prospective count may equal a maximum), `insufficient_cash`,
+`unresolved_loss_account`, `unresolved_loss_total`, `conversion_unavailable`, or `admitted`; the
+record names the rate identities a total unresolved-loss conversion used. No signal is evaluated before `decision_start` or at or after `decision_end`; ticks and confirmations
+after `decision_end` still settle existing obligations. Split labels follow the decision time and
+stay with the obligation through settlement.
+
+### Cash, reservations, and exposure
+
+With `A = quoted_cost + entry_fee` and `F = max(0, max over outcomes of terminal_fee -
+gross_return)`, an admitted signal reserves `A + F`, requires native cash minus unpaid
+reservations to cover it, and sends the command `BINDING/CLOSE_TIME_MICROS`. Acceptance debits `A`
+exactly once, keeps `A` as paid basis, and reserves only `F`. The worst unresolved loss of an open
+obligation is `max(0, A + max over outcomes of terminal_fee - gross_return)`; capacity counts and
+unresolved exposure include every sent, acknowledged, accepted, and possibly sent obligation. An
+acknowledgement records the broker's receipt and posts nothing. Acceptance, rejection, proven
+not-sent, and possibly-sent transitions are permitted only from a sent or acknowledged command. A
+rejected or proven not-sent command releases its reservation and capacity without debit. A
+possibly sent command keeps its full reservation, blocks new entries for its account, and waits
+for reconciliation; nothing is retried and no acceptance is taken for it. An account's block is
+the set of commands awaiting reconciliation, each with its reason (possibly sent, or settled
+with a discrepancy or deficit at the booked cashflow); each reconciliation removes only its own
+command, and entries stay blocked while any remains. A settled discrepancy is lifted only by a
+reconciliation stating the same settlement, because no corrective posting exists; a
+contradicting resolution is a reconciliation failure. Settled equity is native cash plus the paid basis of open
+contracts; completed profit is the credit minus the paid basis.
+
+### Settlement
+
+Under `price_at_due_v1` the configured simulation accepts an admitted command at the decision time
+with the current available quote as entry price, preserving the quote tick's provider time; the due
+time is the entry time plus the contract duration. The first observed tick at or after the due time
+settles when its delay is at most `max_settlement_delay_micros`; the outcome compares the
+settlement price with the entry price for the contract direction, an equal price is a tie. Ticks
+at or before the entry time are continuity evidence but not path or settlement evidence.
+Continuity is the obligation's own evidence: the quote tick recorded at acceptance and every
+tick it observed since, never ticks the instrument saw while the command was unaccepted or
+before an engine was restored. A tick more than `max_tick_gap_micros` after that evidence, a
+later settlement tick, or an exhausted input window leaves the obligation `unresolved` with its
+reason, evidence, and path so far; it keeps its paid basis, capacity, and exposure until an authoritative
+settlement or reconciliation. Every settlement credits the actual `gross_return - terminal_fee`,
+releases the remaining reservation and capacity once, and records the path; a tick too late to
+settle is not path evidence, and an authoritative settlement's path is the path the ledger last
+recorded for the obligation (empty at acceptance, then its unresolved record; the same in a
+restored engine) followed by its own price at its provider time. A tick at a time already seen
+must repeat its price; another price at the same time fails. A confirmed cashflow that
+contradicts the frozen terms is a `discrepancy`; a net terminal debit beyond the remaining
+reservation is a `deficit`; either blocks the account pending reconciliation without fabricating
+the configured amount. A reconciliation resolves an open command as not sent, accepted (posting
+the purchase and keeping the terminal reserve), or settled with its actual cashflow, or lifts with
+zero postings the block a settled discrepancy left, and records the block that remains on the
+account. Every signal, acceptance, settlement, reconciliation, and pause record is checked when it
+is applied: a signal must name its binding's instrument, base stream, identities, and split, its
+clocks must be ones its decision could have seen (close no later than known, known and quote no
+later than the decision, the decision inside the window, and an admitted signal within both
+freshness bounds with a quote), the state-based admission checks run again on an admitted signal (an account whose
+drawdown has reached its pause threshold counts as paused, so an omitted pause fails at the
+admission it would have blocked), an acceptance's quote time is no later than its entry and the
+entry no earlier than the command's dispatch and no later than the decision, a settlement's
+time is its source's provider time and no earlier than the entry, a settled reconciliation's evidence, including one lifting a settled discrepancy's block, is no earlier than the entry or, without a proved acceptance, the dispatch, every posting is recomputed from the obligation and the frozen
+terms, and a pause must state the account's exact epoch drawdown at or beyond its threshold with
+the deadline the policy's duration gives and must directly follow, at the same decision time, the
+settlement or reconciliation that made it due, an expired pause must end before any other record at or after
+its deadline, and a ledger cannot end with a pause still due or expired or, after the definition,
+with a supplied rate due, so a record that
+disagrees or a ledger that omits one fails at generation and at restoration alike. An external event's payload
+is its transition fields and its source's provider time, availability, and simulation flag: the
+same identity with the exact payload is a no-op, before and after restoration; the same identity
+with another payload, including an equal amount written at another scale, fails; a ledger that
+applies one external identity twice, or a record whose source is available after its decision
+time, fails.
+
+### Pause, conversion, and projections
+
+Completed profit and its epoch peak start at zero; the epoch drawdown is the peak minus completed
+profit. After a settlement, a configured pause starts when the drawdown reaches the threshold and
+ends at that decision time plus the duration; settlements continue while paused and do not extend
+it; at or after the deadline the pause ends and the epoch peak resets to the current completed
+profit, while the lifetime peak and maximum drawdown stay separate. Conversion selects, for a
+source and reporting currency at a decision time, the latest supplied rate whose provider and
+availability times are no later than the decision and whose provider age is at most
+`max_rate_age_micros`, multiplies once with checked arithmetic, and rejects lost precision;
+same-currency amounts only rescale. The reporting-currency projection is observed at the run
+definition, at each supplied rate's own availability time (a `rate_available` record emitted
+before the market observations of the step that reaches it, and at the end of the run for the
+rates available by `decision_end`; an expired pause ends when a rate observation advances the
+clock past its deadline; a rate record is at its availability or at the first later record time
+and precedes every other record at that time, at generation and at restoration alike; so every
+valuation between market observations is recorded and a rate change is visible without an
+account posting), and after every record that changes an
+account: an admitted signal, an acceptance, a release, a settlement, or a reconciliation. Missing or stale rates, or an aggregate the reporting scale cannot
+hold, leave that observation unavailable (and missing or stale rates make the total
+unresolved-loss limit unavailable, which blocks admissions that need it); native history is
+never substituted and the native record the observation follows stands, while native cash, account pause, and confirmed
+native settlement never depend on conversion. The path of a contract
+is tracked in integer price units as `(current - entry) × direction` including the settlement tick:
+final move, maximum favorable and adverse excursion with their earliest times (starting at the
+entry time), first favorable and adverse times, and ordering flags that require both times in
+strict order. The nonfinancial projection `move / |entry| × 10000` renders ten decimal places with
+round-to-nearest, ties-to-even, and is absent with its zero-denominator reason at a zero entry
+price.
+
+### Ledger, summary, and replay generations
+
+The ledger is one canonical compact JSON record per line in `ledger/events.jsonl`, each carrying a
+contiguous `sequence` from zero, the decision `time_micros`, and a tagged `kind`: the
+`run_definition` (the complete resolved run) first, then `signal`, `acknowledged`, `accepted`,
+`released`, `possibly_sent`, `settled`, `unresolved`, `reconciled`, `rate_available`,
+`pause_started`, and `pause_ended` records
+with their exact postings and provenance (`source` identity, provider and availability times, and
+whether it is a configured simulation). Tick and feature data are referenced inputs, never copied.
+Restoration applies every record through the same function that generated it: a missing
+predecessor, an illegal transition, a posting disagreeing with its obligation, or altered bytes
+fails. `summary.json` is the projection restored from the ledger: the accounts' final states, the
+signal dispositions, outcome counts, open and unresolved obligations, and completed profit by
+currency grouped by portfolio, binding, contract duration, instrument, and declared split (a grouped
+total beyond the representable range is unavailable), and the reporting-currency settled equity,
+unresolved loss, peak, maximum drawdown, and used rate identities. The final-state
+identity is SHA-256 over `binary-alpha engine state v1` and the JSON of the accounts, open
+obligations, capacity, and sequence; the summary identity is SHA-256 over
+`binary-alpha engine summary v1` and the summary bytes.
+
+A replay generation's identity is SHA-256 over `binary-alpha engine replay v1`, the configuration
+hash, and each instrument's identity, tick generation, feature generation, plan identity, and
+outcome generation, one per line. Its objects, both role `normalized` under the content-addressed
+create-once rules of dataset generations, are the ledger and the summary. The ready manifest at
+`manifests/GENERATION/ready.json`, published last and mirrored, records `kind` (`engine_replay`),
+`schema_version` (`1`), `generation`, `role`, `config_hash`, `code_revision`, `availability`,
+`decision_start`, `decision_end`, `instruments`, `events`, `final_state_identity`,
+`summary_identity`, and `objects`; a manifest whose `generation` is not the identity of its
+`config_hash` and `instruments` is rejected. The command writes
+`replay ROLE generation GENERATION instruments N events E signals S accepted A settled T unresolved U objects 2 reused R`
+followed by `[load S simulate S publish S]` or `(already published)`, then the reconstruction line.
+Before the manifest becomes ready it reconstructs the generation from the published objects under
+the manifest bytes; an identical completed identity is reused and a conflict fails without
+overwrite. `data verify` on a replay generation asserts both objects' bytes and hashes, restores
+the ledger through the engine, compares the restored event count, definition, final-state identity,
+and summary identity with the manifest and the restored summary bytes with the published summary,
+and writes
+`verified ROLE generation GENERATION events E signals S accepted A settled T unresolved U objects 2 bytes B`.
+Restoring the ledger alone proves the financial state; input replay through the command proves
+that signals and paths were derived from the inputs.

@@ -10,7 +10,7 @@ use std::io::{BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-use binary_alpha_engine::config::{Config, Outcomes, RunMode};
+use binary_alpha_engine::config::{Config, ManifestUri, Outcomes, RunMode};
 use binary_alpha_engine::dataset::{
     Capability, DatasetRole, GenerationManifest, ObjectRecord, ObjectRole, PriceRepresentation,
     TimeUnit, manifest_key,
@@ -68,64 +68,73 @@ pub fn run(config_path: &Path, out: &mut dyn Write) -> Result<(), String> {
         .map_err(|error| format!("cannot write the report: {error}"))
 }
 
-/// The bound inputs of one build, resolved from permitted manifest metadata before any child
-/// object other than the feature plan is read.
-struct Bound {
-    tick: GenerationManifest,
-    tick_store: Store,
-    scale: PriceScale,
-    feature: FeatureManifest,
-    feature_store: Store,
-    plan: FeaturePlan,
+/// The bound tick and feature inputs of one build, resolved from permitted manifest metadata
+/// before any child object other than the feature plan is read.
+pub(crate) struct Bound {
+    pub(crate) tick: GenerationManifest,
+    pub(crate) tick_store: Store,
+    pub(crate) scale: PriceScale,
+    pub(crate) feature: FeatureManifest,
+    pub(crate) feature_store: Store,
+    pub(crate) plan: FeaturePlan,
 }
 
-/// Reads and checks both ready manifests, then the feature plan. A declared role, a holdout
-/// generation, a source without ticks, and a feature generation of another role, instrument,
-/// or tick generation are refused on the manifest bytes alone.
-fn bind(settings: &Outcomes) -> Result<Bound, String> {
-    let uri = settings.tick_manifest.to_string();
+/// Reads and checks a tick ready manifest and its feature generation, then the feature plan,
+/// for a build of `role`; `field` names the input in errors and `what` names the build. A
+/// declared role, a holdout generation, a source without ticks, and a feature generation of
+/// another role, instrument, or tick generation are refused on the manifest bytes alone.
+pub(crate) fn bind_inputs(
+    field: &dyn Fn(&str) -> String,
+    role: DatasetRole,
+    tick_manifest: &ManifestUri,
+    feature_manifest: &ManifestUri,
+    what: &str,
+) -> Result<Bound, String> {
+    let uri = tick_manifest.to_string();
     let (tick_store, tick_key) = verify::open(&uri)?;
     let mut bytes = Vec::new();
     tick_store.read_to(&tick_key, None, &mut bytes)?;
     if let Some(kind) = verify::manifest_kind(&bytes)? {
         return Err(format!(
-            "tick_manifest: {uri} is a `{kind}` manifest, not a dataset ready manifest"
+            "{}: {uri} is a `{kind}` manifest, not a dataset ready manifest",
+            field("tick_manifest")
         ));
     }
     let tick = GenerationManifest::from_json(&bytes)
-        .map_err(|error| format!("tick_manifest: {uri}: {error}"))?;
+        .map_err(|error| format!("{}: {uri}: {error}", field("tick_manifest")))?;
     if tick.key() != tick_key {
         return Err(format!(
-            "tick_manifest: {uri} holds the manifest of generation {}",
+            "{}: {uri} holds the manifest of generation {}",
+            field("tick_manifest"),
             tick.generation
         ));
     }
     if tick.role == DatasetRole::Holdout {
-        return Err("tick_manifest: holdout data never enters an outcome build".to_string());
-    }
-    if tick.role != settings.role {
         return Err(format!(
-            "role: declared `{}`, but generation {} is `{}`",
-            settings.role, tick.generation, tick.role
+            "{}: holdout data never enters {what}",
+            field("tick_manifest")
+        ));
+    }
+    if tick.role != role {
+        return Err(format!(
+            "role: declared `{role}`, but generation {} is `{}`",
+            tick.generation, tick.role
         ));
     }
     tick.require(Capability::Ticks)
-        .map_err(|error| format!("tick_manifest: {error}"))?;
-    if u32::try_from(tick.row_count).is_err() {
-        return Err(format!(
-            "tick_manifest: {} ticks cannot be indexed below the missing index",
-            tick.row_count
-        ));
-    }
+        .map_err(|error| format!("{}: {error}", field("tick_manifest")))?;
     let PriceRepresentation::IntegerUnits { scale } = tick.price_representation else {
         unreachable!("a validated tick generation carries integer units at microsecond times")
     };
     let (feature_store, feature) =
-        features::feature_manifest("feature_manifest", &settings.feature_manifest.to_string())?;
+        features::feature_manifest(&field("feature_manifest"), &feature_manifest.to_string())?;
     if feature.input_generation != tick.generation {
         return Err(format!(
-            "feature_manifest: feature generation {} was computed from tick generation {}, not {}",
-            feature.generation, feature.input_generation, tick.generation
+            "{}: feature generation {} was computed from tick generation {}, not {}",
+            field("feature_manifest"),
+            feature.generation,
+            feature.input_generation,
+            tick.generation
         ));
     }
     if feature.role != tick.role
@@ -133,17 +142,23 @@ fn bind(settings: &Outcomes) -> Result<Bound, String> {
         || feature.provider_symbol != tick.provider_symbol
     {
         return Err(format!(
-            "feature_manifest: feature generation {} describes {} `{}`, not {} `{}`",
-            feature.generation, feature.instrument, feature.role, tick.instrument, tick.role
+            "{}: feature generation {} describes {} `{}`, not {} `{}`",
+            field("feature_manifest"),
+            feature.generation,
+            feature.instrument,
+            feature.role,
+            tick.instrument,
+            tick.role
         ));
     }
     // The plan is the only child object read before the rows; it describes the manifest's
-    // instrument and streams, so the build may zip the streams, and it must carry the ticks'
+    // instrument and streams, so a build may zip the streams, and it must carry the ticks'
     // price scale.
-    let plan = features::fitted_plan("feature_manifest", &feature_store, &feature)?;
+    let plan = features::fitted_plan(&field("feature_manifest"), &feature_store, &feature)?;
     if plan.price_scale != scale {
         return Err(format!(
-            "feature_manifest: the plan carries price scale {}, but the ticks carry {}",
+            "{}: the plan carries price scale {}, but the ticks carry {}",
+            field("feature_manifest"),
             plan.price_scale.digits(),
             scale.digits()
         ));
@@ -158,28 +173,50 @@ fn bind(settings: &Outcomes) -> Result<Bound, String> {
     })
 }
 
-/// Every tick of the bound generation, in order, through the Phase 02 readers.
-fn load_ticks(bound: &Bound) -> Result<(Vec<i64>, Vec<i64>), String> {
-    let count =
-        usize::try_from(bound.tick.row_count).expect("the binder bounded the count below u32::MAX");
-    let (mut times, mut prices) = (Vec::with_capacity(count), Vec::with_capacity(count));
-    feed_generation(
-        &bound.tick_store,
-        &bound.tick,
-        bound.scale,
-        &mut |observation| {
-            if let Observation::Tick(tick) = observation {
-                times.push(tick.event_time_micros);
-                prices.push(tick.price_units);
-            }
-            Ok(())
-        },
+/// The bound inputs of an outcome build, whose ticks must be indexable below the missing
+/// index.
+fn bind(settings: &Outcomes) -> Result<Bound, String> {
+    let bound = bind_inputs(
+        &|name| name.to_string(),
+        settings.role,
+        &settings.tick_manifest,
+        &settings.feature_manifest,
+        "an outcome build",
     )?;
-    if times.len() as u64 != bound.tick.row_count {
+    if u32::try_from(bound.tick.row_count).is_err() {
+        return Err(format!(
+            "tick_manifest: {} ticks cannot be indexed below the missing index",
+            bound.tick.row_count
+        ));
+    }
+    Ok(bound)
+}
+
+/// Every tick of one generation, in order, through the Phase 02 readers.
+pub(crate) fn load_ticks(
+    store: &Store,
+    manifest: &GenerationManifest,
+    scale: PriceScale,
+) -> Result<(Vec<i64>, Vec<i64>), String> {
+    let count = usize::try_from(manifest.row_count).map_err(|_| {
+        format!(
+            "tick_manifest: {} ticks cannot be loaded",
+            manifest.row_count
+        )
+    })?;
+    let (mut times, mut prices) = (Vec::with_capacity(count), Vec::with_capacity(count));
+    feed_generation(store, manifest, scale, &mut |observation| {
+        if let Observation::Tick(tick) = observation {
+            times.push(tick.event_time_micros);
+            prices.push(tick.price_units);
+        }
+        Ok(())
+    })?;
+    if times.len() as u64 != manifest.row_count {
         return Err(format!(
             "tick_manifest: observed {} ticks, but the manifest records {} rows; nothing was published",
             times.len(),
-            bound.tick.row_count
+            manifest.row_count
         ));
     }
     Ok((times, prices))
@@ -298,13 +335,13 @@ fn label_chunks(
 }
 
 /// One temporary object written in order and closed before it is identified.
-struct Temporary {
+pub(crate) struct Temporary {
     path: PathBuf,
     writer: BufWriter<File>,
 }
 
 impl Temporary {
-    fn create(local: &Store, name: &str) -> Result<Self, String> {
+    pub(crate) fn create(local: &Store, name: &str) -> Result<Self, String> {
         let path = import::temporary_path(local, name)?;
         let file = File::create(&path)
             .map_err(|error| format!("cannot create {}: {error}", path.display()))?;
@@ -314,13 +351,13 @@ impl Temporary {
         })
     }
 
-    fn write(&mut self, bytes: &[u8]) -> Result<(), String> {
+    pub(crate) fn write(&mut self, bytes: &[u8]) -> Result<(), String> {
         self.writer
             .write_all(bytes)
             .map_err(|error| format!("cannot write {}: {error}", self.path.display()))
     }
 
-    fn finish(self) -> Result<PathBuf, String> {
+    pub(crate) fn finish(self) -> Result<PathBuf, String> {
         self.writer
             .into_inner()
             .map_err(|error| error.to_string())
@@ -344,7 +381,7 @@ fn build(
 
     // Load the ticks, fold their quality flags, and write the shared arrays.
     let loading = Instant::now();
-    let (times, prices) = load_ticks(&bound)?;
+    let (times, prices) = load_ticks(&bound.tick_store, &bound.tick, bound.scale)?;
     let builder = OutcomeBuilder::new(rule, times, prices)
         .map_err(|reason| format!("tick_manifest: {reason}"))?;
     let mut paths = vec![

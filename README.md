@@ -11,7 +11,9 @@ The configuration vocabulary freezes four run modes: `research`, `replay`, `pape
 [docs/contracts.md](docs/contracts.md)). The current checkout validates configuration documents,
 imports existing historical data into immutable published generations, audits each published
 generation through its configured instrument stream into a profile and finalized causal candles,
-and verifies both kinds of generation; it executes no mode. Browser-driven operation, click execution, and any live, paper, certification, deployment,
+builds feature and future-only outcome generations, replays governed historical inputs through the
+one execution engine into a reconstructable financial ledger, and verifies every kind of
+generation; it executes no live, paper, or broker mode. Browser-driven operation, click execution, and any live, paper, certification, deployment,
 or production action without its own authorization are unsupported.
 
 ## Build and entry points
@@ -26,6 +28,7 @@ cargo run --release --locked -p binary-alpha-app -- data audit --config PATH --m
 cargo run --release --locked -p binary-alpha-app -- data verify --manifest URI
 cargo run --release --locked -p binary-alpha-app -- features build --config PATH
 cargo run --release --locked -p binary-alpha-app -- outcomes build --config PATH
+cargo run --release --locked -p binary-alpha-app -- replay --config PATH
 ```
 
 `binary-alpha config validate --config PATH` prints the content hash and the canonical document to
@@ -40,8 +43,10 @@ publishes its profile, one candle object per configured stream, and a stream man
 `[[features.instruments]]` entry over a published stream generation and publishes the plan, rows,
 events, and encoded rows as a feature generation; `binary-alpha outcomes build --config PATH`
 labels every decision row of the `[outcomes]` feature generation against its tick generation and
-publishes the future-only outcome generation; `binary-alpha data verify --manifest URI`
-re-reads one generation of any kind from its manifest and objects alone. All five are documented in
+publishes the future-only outcome generation; `binary-alpha replay --config PATH` feeds the
+`[replay]` inputs through the engine with the configured simulation and publishes the ledger and
+summary as a replay generation; `binary-alpha data verify --manifest URI`
+re-reads one generation of any kind from its manifest and objects alone. All six are documented in
 [docs/contracts.md](docs/contracts.md) and [docs/operations.md](docs/operations.md). The example
 configuration retains data in the repository-local `historical_data/` folder, which Git ignores,
 and declares one instrument. The governed-fixture proof of the instrument stream is
@@ -51,7 +56,10 @@ legacy parity files; the feature-engine proof is
 `BINARY_ALPHA_TEST_CONFIG=PATH cargo test --locked -p binary-alpha-app --test phase04_feature_engine -- --ignored --nocapture`,
 where `PATH` names the research configuration and the reference root; the outcome proof is
 `BINARY_ALPHA_TEST_CONFIG=PATH cargo test --locked -p binary-alpha-app --test phase05_future_outcomes -- --ignored --nocapture`
-with the same document shape.
+with the same document shape; the engine proof is
+`BINARY_ALPHA_TEST_CONFIG=PATH cargo test --locked -p binary-alpha-app --test phase06_engine_parity -- --ignored --nocapture`
+with the same document shape, comparing every reference disposition, outcome, and path with the
+frozen candidate mapping.
 Verification runs `cargo fmt --all --check`,
 `cargo clippy --workspace --all-targets --all-features --locked -- -D warnings`,
 `cargo test --workspace --all-features --locked`, and `cargo build --workspace --locked`; the
@@ -62,8 +70,8 @@ workflow in `.github/workflows/ci.yml` runs the same commands plus the validatio
 
 | Path | Owns |
 | --- | --- |
-| `crates/engine` | Package `binary-alpha-engine`: configuration validation and identity, immutable tick and bar records, dataset roles and capabilities, generation identity, ready manifests, and the instrument stream with its profile, candles, and stream manifest. No files, network, cloud, broker, command-line, or device calls. |
-| `crates/app` | Package `binary-alpha-app`: the `binary-alpha` executable, configuration loading, historical-data import, instrument audit, verification, Parquet input and output, the filesystem and Google Cloud Storage artifact stores, and all other external adapters. |
+| `crates/engine` | Package `binary-alpha-engine`: configuration validation and identity, immutable tick and bar records, dataset roles and capabilities, generation identity, ready manifests, the instrument stream with its profile, candles, and stream manifest, the feature engine and frozen plans, future-only outcome labels, and the execution engine with exact money, its ledger, and its summaries. No files, network, cloud, broker, command-line, or device calls. |
+| `crates/app` | Package `binary-alpha-app`: the `binary-alpha` executable, configuration loading, historical-data import, instrument audit, feature and outcome builds, replay, verification, Parquet input and output, the filesystem and Google Cloud Storage artifact stores, and all other external adapters. |
 | `configs/example.toml` | The checked-in example configuration; it contains only implemented fields, one instrument, and no credentials. |
 | `docs/` | [architecture](docs/architecture.md), [contracts](docs/contracts.md), [migration map](docs/migration-map.md), and [operations](docs/operations.md). |
 
