@@ -554,13 +554,15 @@ pub fn table_rows(
 
 /// Decodes a whole little-endian array object.
 pub fn read_le<T, const N: usize>(path: &Path, decode: fn([u8; N]) -> T) -> Vec<T> {
-    std::fs::read(path)
-        .unwrap()
-        .as_chunks::<N>()
-        .0
-        .iter()
-        .map(|chunk| decode(*chunk))
-        .collect()
+    let bytes = std::fs::read(path).unwrap();
+    let (chunks, remainder) = bytes.as_chunks::<N>();
+    assert!(
+        remainder.is_empty(),
+        "{}: {} trailing bytes do not form an element",
+        path.display(),
+        remainder.len()
+    );
+    chunks.iter().map(|chunk| decode(*chunk)).collect()
 }
 
 /// Reads a whole published table.

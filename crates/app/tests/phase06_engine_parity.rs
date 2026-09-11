@@ -1448,6 +1448,15 @@ fn freshness_bounds_are_exact() {
         [Disposition::NoQuote]
     );
     live.simulate(10, vec![tick(10, 500)]);
+    let mut conflicting = Live::new(fresh(1000, 1000));
+    conflicting.simulate(10, vec![tick(10, 500)]);
+    assert!(
+        conflicting
+            .try_step(11, vec![tick(10, 400), row(0, 11, 11, true)])
+            .unwrap_err()
+            .contains("conflicting tick"),
+        "another price at the same time is refused before any admission"
+    );
     assert_eq!(
         dispositions(&live.simulate(71, vec![tick(71, 500), tick(71, 500), row(0, 70, 71, true)])),
         [Disposition::GapAtEntry],
@@ -2021,7 +2030,7 @@ fn the_exact_cashflow_counterexample_and_fees_post_exactly() {
             error.contains("contradicts the settlement already booked"),
             "{what}: {error}"
         );
-        assert!(live.restored().account("a").blocked.contains_key(&command));
+        assert_eq!(fresh.account("a"), live.account("a"));
     }
     // Tampered ledgers: the accepted record under the acknowledgement's source identity, an
     // acceptance available after its decision time, and an admission the definition's cash
@@ -2723,6 +2732,47 @@ fn restored_engines_continue_byte_identically() {
         "one retained and one new obligation"
     );
     assert_eq!(live.engine.summary().portfolio.unresolved, 1);
+    // An authoritative settlement's path is the ledger-recorded path (empty right after the
+    // acceptance) plus its own price, so an engine restored before any record captured the
+    // ticks it saw settles byte for byte like the uninterrupted one.
+    let mut live = Live::new(definition(|_| {}));
+    live.simulate(10, vec![tick(10, 500), row(0, 10, 10, true)]);
+    assert!(live.simulate(15, vec![tick(15, 600)]).is_empty());
+    let mut restored = live.restored();
+    let authoritative = || {
+        vec![Observation::Settlement {
+            command: "b1/10".into(),
+            source: EventSource {
+                id: "broker:settle-early".into(),
+                provider_time_micros: 20,
+                available_at_micros: 21,
+                simulated: false,
+            },
+            outcome: Outcome::Win,
+            gross_return: decimal("1.92"),
+            terminal_fee: decimal("0"),
+            settlement_price_units: 510,
+        }]
+    };
+    let expected = live.step(21, authoritative());
+    let actual = restored.step(21, authoritative());
+    assert_eq!(
+        actual
+            .iter()
+            .map(FinancialEvent::to_line)
+            .collect::<Vec<_>>(),
+        expected
+            .iter()
+            .map(FinancialEvent::to_line)
+            .collect::<Vec<_>>()
+    );
+    let EventKind::Settled { path, .. } = &expected[0].kind else {
+        unreachable!()
+    };
+    assert_eq!(
+        (path.max_favorable_units, path.max_favorable_time_micros),
+        (10, 20)
+    );
     // A row already decided, redelivered to a restored engine whose row cursors are empty, is
     // installed but never decided twice: the completed command is not dispatched again.
     let mut completed = Live::new(definition(|_| {}));
@@ -3372,6 +3422,13 @@ fn governed_reference_parity() {
         "manifests/{}/ready.json",
         bound.outcome_generation.as_deref().unwrap()
     ));
+    let (outcome_lines, _, _) =
+        timed(&["data", "verify", "--manifest", &manifest_uri(&outcome_path)]);
+    assert!(
+        outcome_lines[0].starts_with("verified "),
+        "the outcome generation's objects carry their recorded fingerprints: {}",
+        outcome_lines[0]
+    );
     let outcome = OutcomeManifest::from_json(&fs::read(&outcome_path).unwrap()).unwrap();
     let object = |path: &str| {
         store.join(

@@ -1837,6 +1837,11 @@ struct Obligation {
     unresolved: Option<UnresolvedReason>,
     #[serde(skip)]
     path: Option<PathMetrics>,
+    /// The path the ledger last recorded for the obligation (empty at acceptance, then its
+    /// unresolved record), the base of an authoritative settlement's path in the live and the
+    /// restored engine alike.
+    #[serde(skip)]
+    recorded_path: Option<PathMetrics>,
     /// The latest tick time the obligation has continuity evidence from: the quote tick at
     /// acceptance, then every tick it observed. Not ledger state, so a restored engine starts
     /// again from the quote tick.
@@ -2613,6 +2618,9 @@ impl Engine {
                     settlement_price_units,
                 } => {
                     self.require(&command, ObligationState::Accepted)?;
+                    let recorded = self.obligations[&command]
+                        .recorded_path
+                        .ok_or_else(|| format!("{command} has no recorded path"))?;
                     self.settle(
                         &command,
                         source,
@@ -2620,7 +2628,7 @@ impl Engine {
                         outcome,
                         gross_return,
                         terminal_fee,
-                        true,
+                        recorded,
                     )?;
                 }
                 Observation::Reconciliation {
@@ -2728,6 +2736,17 @@ impl Engine {
                 format_event_time_micros(previous.provider_time_micros)
             ));
         }
+        if let Some(previous) = previous
+            && time == previous.provider_time_micros
+            && price_units != previous.price_units
+        {
+            return Err(format!(
+                "conflicting tick at {}: {} after {}",
+                format_event_time_micros(time),
+                price_units,
+                previous.price_units
+            ));
+        }
         state.tick = Some(TickState {
             provider_time_micros: time,
             price_units,
@@ -2820,13 +2839,15 @@ impl Engine {
             )?;
             return Ok(false);
         }
-        let move_units = signed_move(entry_price, price_units, direction)
-            .map_err(|reason| format!("{command}: {reason}"))?;
-        path.observe(time, move_units);
-        let obligation = self.obligations.get_mut(command).expect("present");
-        obligation.path = Some(path);
-        obligation.continuity_micros = Some(time);
+        self.obligations
+            .get_mut(command)
+            .expect("present")
+            .continuity_micros = Some(time);
         if time < due {
+            let move_units = signed_move(entry_price, price_units, direction)
+                .map_err(|reason| format!("{command}: {reason}"))?;
+            path.observe(time, move_units);
+            self.obligations.get_mut(command).expect("present").path = Some(path);
             return Ok(true);
         }
         let outcome = match price_units.cmp(&entry_price) {
@@ -2849,7 +2870,7 @@ impl Engine {
             outcome,
             cashflow.gross_return,
             cashflow.terminal_fee,
-            false,
+            path,
         )?;
         Ok(false)
     }
@@ -2968,9 +2989,11 @@ impl Engine {
         })
     }
 
-    /// Emits the settlement record of an accepted obligation; an authoritative terminal price is
-    /// observed in the path once. A configured pause may follow.
     #[allow(clippy::too_many_arguments)]
+    /// Emits the settlement record of an accepted obligation: `path` is the evidence base
+    /// (the ticks observed so far for the rule's own settlement, the ledger-recorded path for
+    /// an authoritative one) and the settlement price is observed onto it at its provider
+    /// time. A configured pause may follow.
     fn settle(
         &mut self,
         command: &str,
@@ -2979,27 +3002,22 @@ impl Engine {
         outcome: Outcome,
         gross_return: Decimal,
         terminal_fee: Decimal,
-        observe_price: bool,
+        mut path: PathMetrics,
     ) -> Result<(), String> {
         let settlement_time_micros = source.provider_time_micros;
         let (contract, _, account) = self.terms(command)?;
         let direction = contract.direction;
         let postings = self.settlement_postings(command, outcome, gross_return, terminal_fee)?;
         let obligation = self.obligations.get_mut(command).expect("present");
-        let (Some(mut path), Some(entry_price)) = (obligation.path, obligation.entry_price_units)
-        else {
+        let Some(entry_price) = obligation.entry_price_units else {
             return Err(format!("{command} has no entry to settle against"));
         };
-        if observe_price {
-            // The authoritative path is the path recorded so far (ledger state, so a restored
-            // engine holds the same) followed by the settlement price itself.
-            path.observe(
-                settlement_time_micros,
-                signed_move(entry_price, settlement_price_units, direction)
-                    .map_err(|reason| format!("{command}: {reason}"))?,
-            );
-            obligation.path = Some(path);
-        }
+        path.observe(
+            settlement_time_micros,
+            signed_move(entry_price, settlement_price_units, direction)
+                .map_err(|reason| format!("{command}: {reason}"))?,
+        );
+        obligation.path = Some(path);
         self.emit(
             self.now,
             EventKind::Settled {
@@ -3595,6 +3613,7 @@ impl Engine {
         obligation.entry_price_units = Some(entry_price_units);
         obligation.due_time_micros = Some(due_time_micros);
         obligation.path = Some(PathMetrics::new(entry_time_micros));
+        obligation.recorded_path = obligation.path;
         obligation.continuity_micros = Some(price_time_micros);
         let split = obligation.split.clone();
         let account = &mut self.accounts[self.bindings[binding].account];
@@ -3807,6 +3826,7 @@ impl Engine {
                             sent_micros: time,
                             unresolved: None,
                             path: None,
+                            recorded_path: None,
                             continuity_micros: None,
                         },
                     );
@@ -3942,6 +3962,7 @@ impl Engine {
                 }
                 obligation.unresolved = Some(*reason);
                 obligation.path = *path;
+                obligation.recorded_path = *path;
                 let binding = obligation.binding;
                 let split = obligation.split.clone();
                 let instrument = self.bindings[binding].instrument;

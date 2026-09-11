@@ -916,8 +916,10 @@ later settlement tick, or an exhausted input window leaves the obligation `unres
 reason, evidence, and path so far; it keeps its paid basis, capacity, and exposure until an authoritative
 settlement or reconciliation. Every settlement credits the actual `gross_return - terminal_fee`,
 releases the remaining reservation and capacity once, and records the path; a tick too late to
-settle is not path evidence, and an authoritative settlement's path is the path recorded so far
-(the same in a restored engine) followed by its own price at its provider time. A confirmed cashflow that
+settle is not path evidence, and an authoritative settlement's path is the path the ledger last
+recorded for the obligation (empty at acceptance, then its unresolved record; the same in a
+restored engine) followed by its own price at its provider time. A tick at a time already seen
+must repeat its price; another price at the same time fails. A confirmed cashflow that
 contradicts the frozen terms is a `discrepancy`; a net terminal debit beyond the remaining
 reservation is a `deficit`; either blocks the account pending reconciliation without fabricating
 the configured amount. A reconciliation resolves an open command as not sent, accepted (posting
