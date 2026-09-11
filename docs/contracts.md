@@ -937,8 +937,8 @@ time is its source's provider time and no earlier than the entry, every posting 
 terms, and a pause must state the account's exact epoch drawdown at or beyond its threshold with
 the deadline the policy's duration gives and must directly follow the settlement or
 reconciliation that made it due, an expired pause must end before any other record at or after
-its deadline, and a ledger cannot end with a pause still due, so a record that disagrees or a
-ledger that omits one fails at generation and at restoration alike. An external event's payload
+its deadline, and a ledger cannot end with a pause still due or expired, so a record that
+disagrees or a ledger that omits one fails at generation and at restoration alike. An external event's payload
 is its transition fields and its source's provider time, availability, and simulation flag: the
 same identity with the exact payload is a no-op, before and after restoration; the same identity
 with another payload, including an equal amount written at another scale, fails; a ledger that
@@ -985,9 +985,10 @@ whether it is a configured simulation). Tick and feature data are referenced inp
 Restoration applies every record through the same function that generated it: a missing
 predecessor, an illegal transition, a posting disagreeing with its obligation, or altered bytes
 fails. `summary.json` is the projection restored from the ledger: the accounts' final states, the
-signal dispositions, outcome counts, open and unresolved obligations, and completed profit grouped
-by portfolio, binding, contract duration, instrument, and declared split, and the reporting-currency
-settled equity, unresolved loss, peak, maximum drawdown, and used rate identities. The final-state
+signal dispositions, outcome counts, open and unresolved obligations, and completed profit by
+currency grouped by portfolio, binding, contract duration, instrument, and declared split (a grouped
+total beyond the representable range is unavailable), and the reporting-currency settled equity,
+unresolved loss, peak, maximum drawdown, and used rate identities. The final-state
 identity is SHA-256 over `binary-alpha engine state v1` and the JSON of the accounts, open
 obligations, capacity, and sequence; the summary identity is SHA-256 over
 `binary-alpha engine summary v1` and the summary bytes.

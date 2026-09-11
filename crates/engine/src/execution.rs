@@ -1868,7 +1868,8 @@ struct ReconciliationPostings {
     profit: Option<Decimal>,
 }
 
-/// Signal dispositions, outcomes, open obligations, and completed profit of one group.
+/// Signal dispositions, outcomes, open obligations, and completed profit by currency of one
+/// group; a currency's profit is unavailable once its total exceeds the representable range.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
 pub struct Group {
     pub signals: u64,
@@ -1881,17 +1882,16 @@ pub struct Group {
     pub ties: u64,
     pub unresolved: u64,
     pub open: u64,
-    pub profit: BTreeMap<String, Decimal>,
+    pub profit: BTreeMap<String, Option<Decimal>>,
 }
 
 impl Group {
-    fn add_profit(&mut self, currency: &Currency, profit: Decimal) -> Result<(), String> {
+    fn add_profit(&mut self, currency: &Currency, profit: Decimal) {
         let entry = self
             .profit
             .entry(currency.to_string())
-            .or_insert_with(|| Decimal::zero(profit.scale()));
-        *entry = entry.checked_add(profit)?;
-        Ok(())
+            .or_insert_with(|| Some(Decimal::zero(profit.scale())));
+        *entry = entry.and_then(|total| total.checked_add(profit).ok());
     }
 
     fn close(&mut self, unresolved: bool) {
@@ -2400,6 +2400,16 @@ impl Engine {
             return Err(format!(
                 "the ledger ends while account `{}` still requires its pause record",
                 engine.accounts[pending].id
+            ));
+        }
+        if let Some(account) = engine.accounts.iter().find(|account| {
+            account
+                .paused_until_micros
+                .is_some_and(|until| until <= engine.now)
+        }) {
+            return Err(format!(
+                "the ledger ends while account `{}` has an expired pause",
+                account.id
             ));
         }
         Ok(engine)
@@ -3527,8 +3537,8 @@ impl Engine {
                 .paused_until_micros
                 .is_some_and(|until| until <= time_micros)
         };
-        if let Some(account) = self.accounts.iter().find(|account| expired(account))
-            && !matches!(&event.kind, EventKind::PauseEnded { account: ended } if self.accounts.iter().any(|account| account.id == *ended && expired(account)))
+        if !matches!(event.kind, EventKind::PauseEnded { .. })
+            && let Some(account) = self.accounts.iter().find(|account| expired(account))
         {
             return Err(format!(
                 "account `{}` has an expired pause; its end record is required before {}",
@@ -3688,7 +3698,7 @@ impl Engine {
             match settled {
                 Some((outcome, profit)) => {
                     group.outcome(outcome);
-                    group.add_profit(&currency, profit)?;
+                    group.add_profit(&currency, profit);
                 }
                 None => group.released += 1,
             }

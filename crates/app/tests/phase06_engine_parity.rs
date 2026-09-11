@@ -123,6 +123,22 @@ fn events(lines: &[Vec<u8>]) -> Vec<FinancialEvent> {
         .collect()
 }
 
+/// The ledger without the records `omit` selects, renumbered.
+fn without(lines: &[Vec<u8>], omit: impl Fn(&EventKind) -> bool) -> Vec<Vec<u8>> {
+    events(lines)
+        .into_iter()
+        .filter(|event| !omit(&event.kind))
+        .enumerate()
+        .map(|(sequence, event)| {
+            FinancialEvent {
+                sequence: sequence as u64,
+                ..event
+            }
+            .to_line()
+        })
+        .collect()
+}
+
 fn decimal(text: &str) -> Decimal {
     Decimal::parse(text).unwrap()
 }
@@ -2365,21 +2381,46 @@ fn quote_envelopes_pauses_conversion_and_projections_are_exact() {
     live.assert_restorable();
     // An expired pause must end before any other record at or after its deadline: a ledger
     // that omits the end fails at the record that follows it.
-    let without_end: Vec<Vec<u8>> = live
-        .lines
-        .iter()
-        .filter(|line| !line.windows(13).any(|w| w == b"\"pause_ended\""))
-        .enumerate()
-        .map(|(sequence, line)| {
-            let text = String::from_utf8(line.clone()).unwrap();
-            let (_, rest) = text.split_once(',').unwrap();
-            format!("{{\"sequence\":{sequence},{rest}").into_bytes()
-        })
-        .collect();
+    let without_end = without(&live.lines, |kind| {
+        matches!(kind, EventKind::PauseEnded { .. })
+    });
     let error = Engine::restore(without_end.into_iter().map(Ok))
         .err()
         .unwrap();
     assert!(error.contains("end record is required"), "{error}");
+    // Two pauses expiring together end in account order; a ledger cut after the first end still
+    // holds an expired pause and fails at its end.
+    let mut paired = Live::new(definition(|replay| {
+        replay.risk_policies[0].pause = Some(Pause {
+            drawdown: decimal("1"),
+            duration_micros: 100,
+        });
+        replay.accounts.push(AccountSpec {
+            id: "z".into(),
+            broker: "b".to_string().try_into().unwrap(),
+            currency: "u".to_string().try_into().unwrap(),
+            scale: 2,
+            initial_cash: decimal("1000"),
+        });
+        let second = strategy(replay, "t", stream(5, 0));
+        replay.strategies.push(second);
+        let mut second = binding(replay, "b2", "t");
+        second.account = "z".into();
+        replay.bindings.push(second);
+    }));
+    paired.simulate(10, vec![tick(10, 500), row(0, 10, 10, true)]);
+    assert_eq!(
+        kinds(&paired.simulate(20, vec![tick(20, 400)])),
+        ["settled", "pause_started", "settled", "pause_started"]
+    );
+    assert_eq!(
+        kinds(&paired.simulate(120, vec![tick(120, 400)])),
+        ["pause_ended", "pause_ended"]
+    );
+    paired.assert_restorable();
+    let cut = paired.lines[..paired.lines.len() - 1].to_vec();
+    let error = Engine::restore(cut.into_iter().map(Ok)).err().unwrap();
+    assert!(error.contains("has an expired pause"), "{error}");
     // A ledger cut right before a required pause start fails at its end.
     let start = live
         .lines
@@ -2401,20 +2442,12 @@ fn quote_envelopes_pauses_conversion_and_projections_are_exact() {
     .err()
     .unwrap();
     assert!(error.contains("pause disagrees"), "{error}");
-    let without_pause: Vec<Vec<u8>> = live
-        .lines
-        .iter()
-        .filter(|line| {
-            !line.windows(15).any(|w| w == b"\"pause_started\"")
-                && !line.windows(13).any(|w| w == b"\"pause_ended\"")
-        })
-        .enumerate()
-        .map(|(sequence, line)| {
-            let text = String::from_utf8(line.clone()).unwrap();
-            let (_, rest) = text.split_once(',').unwrap();
-            format!("{{\"sequence\":{sequence},{rest}").into_bytes()
-        })
-        .collect();
+    let without_pause = without(&live.lines, |kind| {
+        matches!(
+            kind,
+            EventKind::PauseStarted { .. } | EventKind::PauseEnded { .. }
+        )
+    });
     let error = Engine::restore(without_pause.into_iter().map(Ok))
         .err()
         .unwrap();
@@ -2443,17 +2476,9 @@ fn quote_envelopes_pauses_conversion_and_projections_are_exact() {
         recovering.account("a").completed_profit.to_string(),
         "-0.08"
     );
-    let without_pause: Vec<Vec<u8>> = recovering
-        .lines
-        .iter()
-        .filter(|line| !line.windows(15).any(|w| w == b"\"pause_started\""))
-        .enumerate()
-        .map(|(sequence, line)| {
-            let text = String::from_utf8(line.clone()).unwrap();
-            let (_, rest) = text.split_once(',').unwrap();
-            format!("{{\"sequence\":{sequence},{rest}").into_bytes()
-        })
-        .collect();
+    let without_pause = without(&recovering.lines, |kind| {
+        matches!(kind, EventKind::PauseStarted { .. })
+    });
     let error = Engine::restore(without_pause.into_iter().map(Ok))
         .err()
         .unwrap();
@@ -2689,6 +2714,44 @@ fn quote_envelopes_pauses_conversion_and_projections_are_exact() {
     );
     assert_eq!(vast.account("a").completed_profit.to_string(), "0.92");
     vast.assert_restorable();
+    // A grouped profit the currency's range cannot hold is unavailable; every native settlement
+    // and account stands. Two wins of (i128::MAX - 1) / 2 + 1 each exceed i128::MAX together.
+    let mut grouped = Live::new(definition(|replay| {
+        replay.reporting_scale = 0;
+        replay.accounts[0].scale = 0;
+        replay.accounts[0].initial_cash = decimal("2");
+        replay.accounts.push(AccountSpec {
+            id: "z".into(),
+            broker: "b".to_string().try_into().unwrap(),
+            currency: "u".to_string().try_into().unwrap(),
+            scale: 0,
+            initial_cash: decimal("2"),
+        });
+        replay.contracts[0].win.gross_return = decimal("85070591730234615865843651857942052865");
+        replay.bindings[0].envelope.min_winning_net_return = decimal("1");
+        let second = strategy(replay, "t", stream(5, 0));
+        replay.strategies.push(second);
+        let mut second = binding(replay, "b2", "t");
+        second.account = "z".into();
+        replay.bindings.push(second);
+    }));
+    grouped.simulate(10, vec![tick(10, 500), row(0, 10, 10, true)]);
+    let events = grouped.simulate(20, vec![tick(20, 600)]);
+    assert_eq!(kinds(&events), ["settled", "settled"]);
+    let summary = grouped.engine.summary().clone();
+    assert_eq!(summary.portfolio.profit.get("u"), Some(&None));
+    assert_eq!(
+        summary.strategies["b2"].profit["u"].map(|profit| profit.to_string()),
+        Some("85070591730234615865843651857942052864".into())
+    );
+    assert_eq!(
+        (grouped.cash(), grouped.account("z").cash.to_string()),
+        (
+            "85070591730234615865843651857942052866".into(),
+            "85070591730234615865843651857942052866".into()
+        )
+    );
+    grouped.assert_restorable();
     // A zero entry price still settles and records exact movement; only the normalized
     // excursion is absent with its reason.
     let mut live = Live::new(definition(|_| {}));
