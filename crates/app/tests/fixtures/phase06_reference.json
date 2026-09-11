@@ -1,0 +1,783 @@
+{
+  "legacy_revision": "b509964cd1c40180e9d98b0e55a95699b0abe9ed",
+  "source_sha256": "c8df903de5e9f31b8ba93f32aeb8f9262178cd61deaeabfba697f1f6a1a16816",
+  "source_rows": 10028294,
+  "receipt": {
+    "sha256": "f0c8f4f09b21379bac7d6c3954911b2bb44ac5fa83a7cfcd5a1a9dc6de5292dc",
+    "source_revision": "c581d444a0ac1a3af8afce9851b5f1854b074650",
+    "run_revision": "b757b8244d865feb2b393434cb19787fb1cd835b",
+    "elapsed_seconds": 1515.372467,
+    "feature_engine_seconds": 1512.826
+  },
+  "reference_files": [
+    {
+      "path": "parity_cpu_run_v2/summary.json",
+      "sha256": "40a8302ec352b8cb6d66a90874d3838dd46d6cb75171588c3edd78fae0cdd7de"
+    },
+    {
+      "path": "parity_cpu_run_v2/run_manifest.json",
+      "sha256": "ae6d37b3659ebad04bcc26112203e9338e0b16ae534760fc230aab5cb21cd3bc"
+    },
+    {
+      "path": "parity_cpu_run_v2/experiment.json",
+      "sha256": "052609870f0264ba73103cdb116a9925a15e516aab61a3cf17e822e15f714915"
+    },
+    {
+      "path": "parity_cpu_run_v2/signals.csv",
+      "sha256": "95167a7f429821929462229dc0cc4f6cc49ebe348b4d0d46d378f8bf0fcdb3cc"
+    },
+    {
+      "path": "parity_cpu_run_v2/trades.csv",
+      "sha256": "2de87fd80b12da702db64ae6505853b54f0ee00e2e580e5ab05f80f60f162642"
+    },
+    {
+      "path": "parity_cpu_run_v2/invalid_trades.csv",
+      "sha256": "485c0076685858d3b11af6d299a3930f3b290ef061258436cc0eb449c640806a"
+    },
+    {
+      "path": "parity_search_local_v2/candidates.csv",
+      "sha256": "4fd159920f3444aa8f41952abb5d583bc99796943e4c69d6110152968fc40539"
+    }
+  ],
+  "rows": {
+    "signals": 225844,
+    "trades": 141464,
+    "invalid_trades": 232,
+    "candidates": 24
+  },
+  "run": {
+    "starting_amount": "1000",
+    "stake": "1",
+    "payout_percent": "92",
+    "expiries": [
+      60,
+      90
+    ],
+    "max_open_trades_per_strategy": 1,
+    "max_open_trades_per_expiry": 50000,
+    "max_open_trades_total": 50000,
+    "allow_same_expiry_same_entry_signals": true,
+    "dedupe_signal_logic": false,
+    "max_valid_tick_gap_ms": 60000,
+    "pool_drawdown_pause_units": "0",
+    "candle_set": "30s_offset15s",
+    "development_start_utc": "2026-03-22T00:00:00.000Z",
+    "gate_validation_start_utc": "2026-04-22T00:00:00.000Z",
+    "holdout_start_utc": "2026-05-26T00:00:00.000Z"
+  },
+  "totals": {
+    "raw_signals": 225844,
+    "blocked": 84148,
+    "blocked_by_strategy_capacity": 84140,
+    "blocked_by_entry_gap": 8,
+    "opened": 141696,
+    "settled": 141464,
+    "wins": 70684,
+    "losses": 70310,
+    "ties": 470,
+    "invalidated": 232,
+    "net_units": "-5280.72"
+  },
+  "candidates": [
+    {
+      "rank": 1,
+      "candidate_id": "parity_local_v2_00001_062dac27c3_30s_offset15s_60s_sell",
+      "candle_set": "30s_offset15s",
+      "expiry_seconds": 60,
+      "direction": "SELL",
+      "output": "regime_trend_state",
+      "value": "compression",
+      "strategy": "regime_trend_state_compression"
+    },
+    {
+      "rank": 2,
+      "candidate_id": "parity_local_v2_00002_78f7af013a_30s_offset15s_90s_sell",
+      "candle_set": "30s_offset15s",
+      "expiry_seconds": 90,
+      "direction": "SELL",
+      "output": "regime_trend_state",
+      "value": "compression",
+      "strategy": "regime_trend_state_compression"
+    },
+    {
+      "rank": 3,
+      "candidate_id": "parity_local_v2_00003_40e43d8d96_30s_offset15s_90s_sell",
+      "candle_set": "30s_offset15s",
+      "expiry_seconds": 90,
+      "direction": "SELL",
+      "output": "wick_profile",
+      "value": "long_wicks_both",
+      "strategy": "wick_profile_long_wicks_both"
+    },
+    {
+      "rank": 4,
+      "candidate_id": "parity_local_v2_00004_8610d7225b_30s_offset15s_60s_sell",
+      "candle_set": "30s_offset15s",
+      "expiry_seconds": 60,
+      "direction": "SELL",
+      "output": "wick_profile",
+      "value": "long_wicks_both",
+      "strategy": "wick_profile_long_wicks_both"
+    },
+    {
+      "rank": 5,
+      "candidate_id": "parity_local_v2_00005_41d0f9c5eb_30s_offset15s_90s_buy",
+      "candle_set": "30s_offset15s",
+      "expiry_seconds": 90,
+      "direction": "BUY",
+      "output": "candle_direction",
+      "value": "flat",
+      "strategy": "candle_direction_flat"
+    },
+    {
+      "rank": 6,
+      "candidate_id": "parity_local_v2_00006_94ffbcd3e7_30s_offset15s_60s_buy",
+      "candle_set": "30s_offset15s",
+      "expiry_seconds": 60,
+      "direction": "BUY",
+      "output": "candle_direction",
+      "value": "flat",
+      "strategy": "candle_direction_flat"
+    },
+    {
+      "rank": 7,
+      "candidate_id": "parity_local_v2_00007_25de4cd820_30s_offset15s_60s_sell",
+      "candle_set": "30s_offset15s",
+      "expiry_seconds": 60,
+      "direction": "SELL",
+      "output": "candle_direction",
+      "value": "flat",
+      "strategy": "candle_direction_flat"
+    },
+    {
+      "rank": 8,
+      "candidate_id": "parity_local_v2_00008_7e80803ccd_30s_offset15s_90s_buy",
+      "candle_set": "30s_offset15s",
+      "expiry_seconds": 90,
+      "direction": "BUY",
+      "output": "regime_trend_state",
+      "value": "compression",
+      "strategy": "regime_trend_state_compression"
+    },
+    {
+      "rank": 9,
+      "candidate_id": "parity_local_v2_00009_12e8176619_30s_offset15s_90s_sell",
+      "candle_set": "30s_offset15s",
+      "expiry_seconds": 90,
+      "direction": "SELL",
+      "output": "candle_direction",
+      "value": "flat",
+      "strategy": "candle_direction_flat"
+    },
+    {
+      "rank": 10,
+      "candidate_id": "parity_local_v2_00010_3144f7b9ad_30s_offset15s_90s_sell",
+      "candle_set": "30s_offset15s",
+      "expiry_seconds": 90,
+      "direction": "SELL",
+      "output": "range_bps_bucket",
+      "value": "small",
+      "strategy": "range_bps_bucket_small"
+    },
+    {
+      "rank": 11,
+      "candidate_id": "parity_local_v2_00011_31231818fa_30s_offset15s_60s_buy",
+      "candle_set": "30s_offset15s",
+      "expiry_seconds": 60,
+      "direction": "BUY",
+      "output": "regime_trend_state",
+      "value": "compression",
+      "strategy": "regime_trend_state_compression"
+    },
+    {
+      "rank": 12,
+      "candidate_id": "parity_local_v2_00012_54e4ad1cdd_30s_offset15s_90s_buy",
+      "candle_set": "30s_offset15s",
+      "expiry_seconds": 90,
+      "direction": "BUY",
+      "output": "wick_profile",
+      "value": "long_wicks_both",
+      "strategy": "wick_profile_long_wicks_both"
+    },
+    {
+      "rank": 13,
+      "candidate_id": "parity_local_v2_00013_aa1de73860_30s_offset15s_60s_buy",
+      "candle_set": "30s_offset15s",
+      "expiry_seconds": 60,
+      "direction": "BUY",
+      "output": "wick_profile",
+      "value": "long_wicks_both",
+      "strategy": "wick_profile_long_wicks_both"
+    },
+    {
+      "rank": 14,
+      "candidate_id": "parity_local_v2_00014_3f57e4006e_30s_offset15s_60s_sell",
+      "candle_set": "30s_offset15s",
+      "expiry_seconds": 60,
+      "direction": "SELL",
+      "output": "range_bps_bucket",
+      "value": "small",
+      "strategy": "range_bps_bucket_small"
+    },
+    {
+      "rank": 15,
+      "candidate_id": "parity_local_v2_00015_6287a3ebcd_30s_offset15s_60s_buy",
+      "candle_set": "30s_offset15s",
+      "expiry_seconds": 60,
+      "direction": "BUY",
+      "output": "range_bps_bucket",
+      "value": "small",
+      "strategy": "range_bps_bucket_small"
+    },
+    {
+      "rank": 16,
+      "candidate_id": "parity_local_v2_00016_feac2c4f7d_30s_offset15s_90s_sell",
+      "candle_set": "30s_offset15s",
+      "expiry_seconds": 90,
+      "direction": "SELL",
+      "output": "regime_trend_state",
+      "value": "trend_down",
+      "strategy": "regime_trend_state_trend_down"
+    },
+    {
+      "rank": 17,
+      "candidate_id": "parity_local_v2_00017_645ef3ed93_30s_offset15s_90s_sell",
+      "candle_set": "30s_offset15s",
+      "expiry_seconds": 90,
+      "direction": "SELL",
+      "output": "regime_trend_state",
+      "value": "trend_up",
+      "strategy": "regime_trend_state_trend_up"
+    },
+    {
+      "rank": 18,
+      "candidate_id": "parity_local_v2_00018_7b3c29a420_30s_offset15s_90s_buy",
+      "candle_set": "30s_offset15s",
+      "expiry_seconds": 90,
+      "direction": "BUY",
+      "output": "range_bps_bucket",
+      "value": "small",
+      "strategy": "range_bps_bucket_small"
+    },
+    {
+      "rank": 19,
+      "candidate_id": "parity_local_v2_00019_f2e769ab80_30s_offset15s_90s_sell",
+      "candle_set": "30s_offset15s",
+      "expiry_seconds": 90,
+      "direction": "SELL",
+      "output": "wick_profile",
+      "value": "clean_body",
+      "strategy": "wick_profile_clean_body"
+    },
+    {
+      "rank": 20,
+      "candidate_id": "parity_local_v2_00020_5342585500_30s_offset15s_90s_buy",
+      "candle_set": "30s_offset15s",
+      "expiry_seconds": 90,
+      "direction": "BUY",
+      "output": "regime_directional_bias",
+      "value": "two_sided_or_no_bias",
+      "strategy": "regime_directional_bias_two_sided_or_no_bias"
+    },
+    {
+      "rank": 21,
+      "candidate_id": "parity_local_v2_00021_3636312dcc_30s_offset15s_90s_sell",
+      "candle_set": "30s_offset15s",
+      "expiry_seconds": 90,
+      "direction": "SELL",
+      "output": "wick_profile",
+      "value": "upper_rejection",
+      "strategy": "wick_profile_upper_rejection"
+    },
+    {
+      "rank": 22,
+      "candidate_id": "parity_local_v2_00022_5d33e060c6_30s_offset15s_90s_sell",
+      "candle_set": "30s_offset15s",
+      "expiry_seconds": 90,
+      "direction": "SELL",
+      "output": "range_bps_bucket",
+      "value": "large",
+      "strategy": "range_bps_bucket_large"
+    },
+    {
+      "rank": 23,
+      "candidate_id": "parity_local_v2_00023_6d21048f3b_30s_offset15s_90s_sell",
+      "candle_set": "30s_offset15s",
+      "expiry_seconds": 90,
+      "direction": "SELL",
+      "output": "regime_directional_bias",
+      "value": "two_sided_or_no_bias",
+      "strategy": "regime_directional_bias_two_sided_or_no_bias"
+    },
+    {
+      "rank": 24,
+      "candidate_id": "parity_local_v2_00024_1dca154068_30s_offset15s_60s_sell",
+      "candle_set": "30s_offset15s",
+      "expiry_seconds": 60,
+      "direction": "SELL",
+      "output": "wick_profile",
+      "value": "upper_rejection",
+      "strategy": "wick_profile_upper_rejection"
+    }
+  ],
+  "fields": {
+    "signals": {
+      "signal_number": {
+        "class": "derived",
+        "from": "reference identity retained as the comparison key"
+      },
+      "phase": {
+        "class": "derived",
+        "from": "literal live"
+      },
+      "candidate_id": {
+        "class": "shared",
+        "target": "binding"
+      },
+      "candle_set": {
+        "class": "shared",
+        "target": "stream"
+      },
+      "expiry_seconds": {
+        "class": "shared",
+        "target": "contract duration"
+      },
+      "direction": {
+        "class": "shared",
+        "target": "contract direction"
+      },
+      "row_decision_time_utc": {
+        "class": "shared",
+        "target": "signal close_time_micros"
+      },
+      "entry_tick_time_utc": {
+        "class": "shared",
+        "target": "signal known_at_micros"
+      },
+      "entry_hour_utc": {
+        "class": "derived",
+        "from": "display of the entry tick time"
+      },
+      "entry_hour_local": {
+        "class": "derived",
+        "from": "display of the entry tick time in the legacy local zone"
+      },
+      "entry_session_utc": {
+        "class": "derived",
+        "from": "display of the entry tick time"
+      },
+      "entry_session_local": {
+        "class": "derived",
+        "from": "display of the entry tick time in the legacy local zone"
+      },
+      "split_label": {
+        "class": "shared",
+        "target": "signal split"
+      },
+      "gate_split_label": {
+        "class": "derived",
+        "from": "equals split_label"
+      },
+      "walk_forward_fold": {
+        "class": "derived",
+        "from": "seven-day fold of the entry time"
+      },
+      "regime_trend_state": {
+        "class": "shared",
+        "target": "feature row"
+      },
+      "regime_volatility_state": {
+        "class": "shared",
+        "target": "feature row"
+      },
+      "regime_structure_state": {
+        "class": "shared",
+        "target": "feature row"
+      },
+      "regime_transition_state": {
+        "class": "shared",
+        "target": "feature row"
+      },
+      "regime_quality_state": {
+        "class": "shared",
+        "target": "feature row"
+      },
+      "regime_directional_bias": {
+        "class": "shared",
+        "target": "feature row"
+      },
+      "regime_v1": {
+        "class": "derived",
+        "from": "pipe join of the five regime states"
+      },
+      "is_regime_clean": {
+        "class": "derived",
+        "from": "quality_state == clean"
+      },
+      "is_regime_trending": {
+        "class": "derived",
+        "from": "trend_state in trend_up or trend_down"
+      },
+      "is_regime_ranging": {
+        "class": "derived",
+        "from": "trend_state == range"
+      },
+      "is_regime_transition": {
+        "class": "derived",
+        "from": "transition_state != none"
+      },
+      "regime_no_lookahead_check_pass": {
+        "class": "derived",
+        "from": "constant 1; the target evaluates only rows already known"
+      },
+      "entry_price": {
+        "class": "shared",
+        "target": "signal quote_price_units and outcome entry price"
+      },
+      "opened_trade": {
+        "class": "shared",
+        "target": "signal disposition (classified)"
+      },
+      "block_reasons": {
+        "class": "shared",
+        "target": "signal disposition (classified)"
+      },
+      "open_trades_for_expiry_before_signal": {
+        "class": "diagnostic",
+        "note": "legacy capacity snapshot"
+      },
+      "open_trades_total_before_signal": {
+        "class": "diagnostic",
+        "note": "legacy capacity snapshot"
+      },
+      "open_same_direction_before_signal": {
+        "class": "diagnostic",
+        "note": "legacy capacity snapshot"
+      },
+      "open_same_candidate_before_signal": {
+        "class": "diagnostic",
+        "note": "legacy capacity snapshot"
+      },
+      "open_same_logic_before_signal": {
+        "class": "diagnostic",
+        "note": "legacy capacity snapshot"
+      },
+      "validity_block_reason": {
+        "class": "shared",
+        "target": "signal disposition gap_at_entry or stale_feature"
+      },
+      "entry_tick_gap_ms": {
+        "class": "diagnostic",
+        "note": "legacy entry-gap evidence behind validity_block_reason"
+      },
+      "entry_tick_gap_start_time_utc": {
+        "class": "diagnostic",
+        "note": "legacy entry-gap evidence"
+      },
+      "entry_tick_gap_end_time_utc": {
+        "class": "diagnostic",
+        "note": "legacy entry-gap evidence"
+      },
+      "predicate": {
+        "class": "shared",
+        "target": "strategy conditions through the frozen candidate mapping"
+      }
+    },
+    "trades": {
+      "signal_number": {
+        "class": "derived",
+        "from": "reference identity retained as the comparison key"
+      },
+      "candidate_id": {
+        "class": "shared",
+        "target": "binding"
+      },
+      "candle_set": {
+        "class": "shared",
+        "target": "stream"
+      },
+      "expiry_seconds": {
+        "class": "shared",
+        "target": "contract duration"
+      },
+      "direction": {
+        "class": "shared",
+        "target": "contract direction"
+      },
+      "row_decision_time_utc": {
+        "class": "shared",
+        "target": "signal close_time_micros"
+      },
+      "entry_time_utc": {
+        "class": "shared",
+        "target": "outcome entry tick time and accepted entry_time_micros"
+      },
+      "entry_hour_utc": {
+        "class": "derived",
+        "from": "display of the entry tick time"
+      },
+      "entry_hour_local": {
+        "class": "derived",
+        "from": "display of the entry tick time in the legacy local zone"
+      },
+      "entry_session_utc": {
+        "class": "derived",
+        "from": "display of the entry tick time"
+      },
+      "entry_session_local": {
+        "class": "derived",
+        "from": "display of the entry tick time in the legacy local zone"
+      },
+      "split_label": {
+        "class": "shared",
+        "target": "signal split"
+      },
+      "gate_split_label": {
+        "class": "derived",
+        "from": "equals split_label"
+      },
+      "walk_forward_fold": {
+        "class": "derived",
+        "from": "seven-day fold of the entry time"
+      },
+      "regime_trend_state": {
+        "class": "shared",
+        "target": "feature row"
+      },
+      "regime_volatility_state": {
+        "class": "shared",
+        "target": "feature row"
+      },
+      "regime_structure_state": {
+        "class": "shared",
+        "target": "feature row"
+      },
+      "regime_transition_state": {
+        "class": "shared",
+        "target": "feature row"
+      },
+      "regime_quality_state": {
+        "class": "shared",
+        "target": "feature row"
+      },
+      "regime_directional_bias": {
+        "class": "shared",
+        "target": "feature row"
+      },
+      "regime_v1": {
+        "class": "derived",
+        "from": "pipe join of the five regime states"
+      },
+      "is_regime_clean": {
+        "class": "derived",
+        "from": "quality_state == clean"
+      },
+      "is_regime_trending": {
+        "class": "derived",
+        "from": "trend_state in trend_up or trend_down"
+      },
+      "is_regime_ranging": {
+        "class": "derived",
+        "from": "trend_state == range"
+      },
+      "is_regime_transition": {
+        "class": "derived",
+        "from": "transition_state != none"
+      },
+      "regime_no_lookahead_check_pass": {
+        "class": "derived",
+        "from": "constant 1; the target evaluates only rows already known"
+      },
+      "entry_price": {
+        "class": "shared",
+        "target": "signal quote_price_units and outcome entry price"
+      },
+      "due_time_utc": {
+        "class": "shared",
+        "target": "outcome due time and accepted due_time_micros"
+      },
+      "settlement_tick_time_utc": {
+        "class": "shared",
+        "target": "outcome settlement tick time and settled settlement_time_micros"
+      },
+      "settlement_price": {
+        "class": "shared",
+        "target": "outcome settlement price and settled settlement_price_units"
+      },
+      "outcome": {
+        "class": "shared",
+        "target": "outcome cell result by direction and settled outcome"
+      },
+      "net_units": {
+        "class": "diagnostic",
+        "note": "legacy unit economics without funded admission"
+      },
+      "payout_percent": {
+        "class": "diagnostic",
+        "note": "legacy remembered global payout"
+      },
+      "final_directional_move_bps": {
+        "class": "shared",
+        "target": "path projection"
+      },
+      "max_favorable_excursion_bps": {
+        "class": "shared",
+        "target": "path projection"
+      },
+      "max_adverse_excursion_bps": {
+        "class": "shared",
+        "target": "path projection"
+      },
+      "mfe_time_utc": {
+        "class": "shared",
+        "target": "path projection"
+      },
+      "mae_time_utc": {
+        "class": "shared",
+        "target": "path projection"
+      },
+      "first_favorable_time_utc": {
+        "class": "shared",
+        "target": "path projection"
+      },
+      "first_adverse_time_utc": {
+        "class": "shared",
+        "target": "path projection"
+      },
+      "favorable_before_adverse": {
+        "class": "shared",
+        "target": "path projection"
+      },
+      "adverse_before_favorable": {
+        "class": "shared",
+        "target": "path projection"
+      },
+      "predicate": {
+        "class": "shared",
+        "target": "strategy conditions through the frozen candidate mapping"
+      }
+    },
+    "invalid_trades": {
+      "signal_number": {
+        "class": "derived",
+        "from": "reference identity retained as the comparison key"
+      },
+      "candidate_id": {
+        "class": "shared",
+        "target": "binding"
+      },
+      "candle_set": {
+        "class": "shared",
+        "target": "stream"
+      },
+      "expiry_seconds": {
+        "class": "shared",
+        "target": "contract duration"
+      },
+      "direction": {
+        "class": "shared",
+        "target": "contract direction"
+      },
+      "row_decision_time_utc": {
+        "class": "shared",
+        "target": "signal close_time_micros"
+      },
+      "entry_time_utc": {
+        "class": "shared",
+        "target": "outcome entry tick time and accepted entry_time_micros"
+      },
+      "split_label": {
+        "class": "shared",
+        "target": "signal split"
+      },
+      "gate_split_label": {
+        "class": "derived",
+        "from": "equals split_label"
+      },
+      "walk_forward_fold": {
+        "class": "derived",
+        "from": "seven-day fold of the entry time"
+      },
+      "regime_trend_state": {
+        "class": "derived",
+        "from": "omitted by the legacy invalid-record writer; always empty"
+      },
+      "regime_volatility_state": {
+        "class": "derived",
+        "from": "omitted by the legacy invalid-record writer; always empty"
+      },
+      "regime_structure_state": {
+        "class": "derived",
+        "from": "omitted by the legacy invalid-record writer; always empty"
+      },
+      "regime_transition_state": {
+        "class": "derived",
+        "from": "omitted by the legacy invalid-record writer; always empty"
+      },
+      "regime_quality_state": {
+        "class": "derived",
+        "from": "omitted by the legacy invalid-record writer; always empty"
+      },
+      "regime_directional_bias": {
+        "class": "derived",
+        "from": "omitted by the legacy invalid-record writer; always empty"
+      },
+      "regime_v1": {
+        "class": "derived",
+        "from": "omitted by the legacy invalid-record writer; always empty"
+      },
+      "is_regime_clean": {
+        "class": "derived",
+        "from": "omitted by the legacy invalid-record writer; always empty"
+      },
+      "is_regime_trending": {
+        "class": "derived",
+        "from": "omitted by the legacy invalid-record writer; always empty"
+      },
+      "is_regime_ranging": {
+        "class": "derived",
+        "from": "omitted by the legacy invalid-record writer; always empty"
+      },
+      "is_regime_transition": {
+        "class": "derived",
+        "from": "omitted by the legacy invalid-record writer; always empty"
+      },
+      "regime_no_lookahead_check_pass": {
+        "class": "derived",
+        "from": "omitted by the legacy invalid-record writer; always empty"
+      },
+      "entry_price": {
+        "class": "shared",
+        "target": "signal quote_price_units and outcome entry price"
+      },
+      "due_time_utc": {
+        "class": "shared",
+        "target": "outcome due time and accepted due_time_micros"
+      },
+      "invalidated_time_utc": {
+        "class": "shared",
+        "target": "gap end tick time and unresolved gap evidence"
+      },
+      "invalid_reason": {
+        "class": "shared",
+        "target": "outcome internal_gap or stale_settlement reason and unresolved gap"
+      },
+      "gap_start_time_utc": {
+        "class": "shared",
+        "target": "gap transition in the tick arrays"
+      },
+      "gap_end_time_utc": {
+        "class": "shared",
+        "target": "gap transition in the tick arrays"
+      },
+      "gap_ms": {
+        "class": "shared",
+        "target": "gap transition in the tick arrays"
+      },
+      "predicate": {
+        "class": "shared",
+        "target": "strategy conditions through the frozen candidate mapping"
+      }
+    }
+  }
+}

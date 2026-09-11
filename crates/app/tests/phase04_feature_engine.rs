@@ -22,7 +22,7 @@ use binary_alpha_engine::market::{Tick, format_event_time_micros};
 use binary_alpha_engine::stream::{Observation, Source, StreamManifest};
 use common::*;
 use parquet::file::reader::{FileReader, SerializedFileReader};
-use parquet::record::{Field, RowAccessor};
+use parquet::record::Field;
 
 /// The report lines of a successful build, or the diagnostic of a failed one.
 fn build(config: &Path) -> Result<Vec<String>, String> {
@@ -132,44 +132,7 @@ fn feature_entry(role: &str, input: &Path, profile: &Path, settings: &str) -> St
     )
 }
 
-/// Every row of a published table through the generic row API, as engine values.
-fn read_table(path: &Path) -> Table {
-    let reader = SerializedFileReader::new(fs::File::open(path).unwrap()).unwrap();
-    let names: Vec<String> = reader
-        .metadata()
-        .file_metadata()
-        .schema_descr()
-        .columns()
-        .iter()
-        .map(|column| column.name().to_string())
-        .collect();
-    let rows = reader
-        .get_row_iter(None)
-        .unwrap()
-        .map(|row| {
-            row.unwrap()
-                .get_column_iter()
-                .map(|(_, field)| match field {
-                    Field::Null => None,
-                    Field::Long(value) => Some(Value::Int(*value)),
-                    Field::Short(value) => Some(Value::Int(i64::from(*value))),
-                    Field::Int(value) => Some(Value::Int(i64::from(*value))),
-                    Field::Double(value) => Some(Value::Float(*value)),
-                    Field::Bool(value) => Some(Value::Bool(*value)),
-                    Field::Str(value) => Some(Value::Text(Cow::Owned(value.clone()))),
-                    Field::TimestampMicros(value) => Some(Value::Time(*value)),
-                    other => panic!("unexpected field {other:?}"),
-                })
-                .collect()
-        })
-        .collect();
-    (names, rows)
-}
-
 /// The published feature generation at `manifest`: manifest, plan, and every stream's tables.
-/// One published table: its column names and every row.
-type Table = (Vec<String>, Vec<Vec<Option<Value>>>);
-
 struct PublishedFeatures {
     manifest: FeatureManifest,
     plan: FeaturePlan,
@@ -227,29 +190,6 @@ fn feature_manifests(scratch: &Scratch, store: &str) -> Vec<PathBuf> {
             fs::read_to_string(path)
                 .unwrap()
                 .starts_with("{\n  \"kind\": \"feature_generation\"")
-        })
-        .collect()
-}
-
-fn read_normalized_ticks(store: &Path, dataset: &GenerationManifest) -> Vec<Tick> {
-    let path = store.join(
-        &dataset
-            .objects
-            .iter()
-            .find(|object| object.path == "normalized/ticks.parquet")
-            .unwrap()
-            .key,
-    );
-    let reader = SerializedFileReader::new(fs::File::open(path).unwrap()).unwrap();
-    reader
-        .get_row_iter(None)
-        .unwrap()
-        .map(|row| {
-            let row = row.unwrap();
-            Tick {
-                event_time_micros: row.get_timestamp_micros(0).unwrap(),
-                price_units: row.get_long(1).unwrap(),
-            }
         })
         .collect()
 }
@@ -1827,44 +1767,6 @@ fn sequence_event_projection(stream: &ReferenceStream) -> Vec<(&'static str, Pro
 }
 
 /// A streaming reader of one legacy CSV: the header and one split row at a time.
-struct LegacyCsv {
-    header: Vec<String>,
-    lines: std::io::Lines<std::io::BufReader<fs::File>>,
-    path: PathBuf,
-}
-
-impl LegacyCsv {
-    fn open(path: &Path) -> Self {
-        use std::io::BufRead;
-        let mut lines =
-            std::io::BufReader::with_capacity(1 << 20, fs::File::open(path).unwrap()).lines();
-        let header: Vec<String> = lines
-            .next()
-            .unwrap()
-            .unwrap()
-            .split(',')
-            .map(str::to_string)
-            .collect();
-        Self {
-            header,
-            lines,
-            path: path.to_path_buf(),
-        }
-    }
-
-    fn next_row(&mut self) -> Option<Vec<String>> {
-        let line = self.lines.next()?.unwrap();
-        let row: Vec<String> = line.split(',').map(str::to_string).collect();
-        assert_eq!(
-            row.len(),
-            self.header.len(),
-            "{}: ragged row",
-            self.path.display()
-        );
-        Some(row)
-    }
-}
-
 /// Streams the rows of a published table through the row API.
 fn table_rows(
     path: &Path,

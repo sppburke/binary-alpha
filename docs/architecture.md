@@ -32,6 +32,11 @@ tick and feature manifest URIs ──▶ app: bind roles and identities, load th
    ──▶ engine: fold quality flags, label every decision row and expiry ──▶ app: little-endian
    arrays and matrices, outcome manifest through the same store ──▶ app: reconstruct from the
    manifest ──▶ standard output
+
+tick, feature, and outcome manifest URIs ──▶ app: bind identities, resolve the run definition,
+   merge ticks and rows by availability ──▶ engine: evaluate, admit, reserve, settle, account, risk
+   ──▶ app: simulated acceptances, ledger and summary through the same store ──▶ app: restore the
+   ledger through the engine ──▶ standard output
 ```
 
 `binary-alpha config validate --config PATH` reads the document; the engine parses it into typed
@@ -55,6 +60,11 @@ encodings one column at a time, and publishes the feature generation through the
 "Outcomes": the engine owns the label rule, the reader, and the outcome manifest; the application
 binds the tick and feature generations, loads the ticks and the rows' reference clocks, writes
 the arrays and matrices, and publishes the outcome generation through the same store.
+`binary-alpha replay --config PATH` is the execution path described in section "Execution": the
+engine owns the exact money, the records, every decision and posting, the ledger, its restoration,
+and the summary; the application binds the inputs, feeds ticks and feature rows in availability
+order with the configured simulated acceptances, and publishes the replay generation through the
+same store after restoring it.
 
 ## Data flow owned by later phases
 
@@ -63,10 +73,10 @@ names the issue that implements it; nothing on this list exists in the current c
 
 ```
 historical import (#3) ──┐
-                         ├─▶ instrument stream and candles (#4) ─▶ features and regimes (#5) ─▶ outcomes (#6, this checkout)
+                         ├─▶ instrument stream and candles (#4) ─▶ features and regimes (#5) ─▶ outcomes (#6)
 live feed (#11) ─────────┘                                                                            │
                                                                                                       ▼
-artifacts: Google Cloud Storage, Supabase references (#3)  ◀── strategy, replay, settlement, accounting, risk (#7)
+artifacts: Google Cloud Storage, Supabase references (#3)  ◀── strategy, replay, settlement, accounting, risk (#7, this checkout)
                                                                      ▲                     │
 accelerator with central-processor reference (#8) ─▶ candidate search and evaluation (#9)  │
                                                      repair, portfolio, risk tuning (#10)  │
@@ -88,7 +98,8 @@ live runtime and cutover (#13) ─▶ execution ─▶ broker adapter (#11)
 | Binding input and profile generations, temporary tables, column-wise fitting and encoding, feature publication and reconstruction | `binary-alpha-app`, modules `features` and `archive` | this checkout ([#5](https://github.com/sppburke/binary-alpha/issues/5)) |
 | The future-only label rule, the outcome reader, outcome identities and manifests | `binary-alpha-engine`, module `outcomes` | this checkout ([#6](https://github.com/sppburke/binary-alpha/issues/6)) |
 | Binding tick and feature generations, the little-endian outcome objects, outcome publication and reconstruction | `binary-alpha-app`, module `outcomes` | this checkout ([#6](https://github.com/sppburke/binary-alpha/issues/6)) |
-| Strategy intent, chronological execution, settlement, accounting, risk | `binary-alpha-engine` | [#7](https://github.com/sppburke/binary-alpha/issues/7) |
+| Exact money, strategy and deployment records, chronological admission, settlement, accounting, risk, the ledger and its restoration, summaries | `binary-alpha-engine`, module `execution` | this checkout ([#7](https://github.com/sppburke/binary-alpha/issues/7)) |
+| Binding replay inputs, the availability merge, the historical simulation, replay publication and reconstruction | `binary-alpha-app`, module `replay` | this checkout ([#7](https://github.com/sppburke/binary-alpha/issues/7)) |
 | Device kernels behind a reviewed safe boundary | a new accelerator package, only when the unsafe boundary is real | [#8](https://github.com/sppburke/binary-alpha/issues/8) |
 | Candidate search, evaluation, repair, portfolio, risk tuning | `binary-alpha-engine` with thin application entry points | [#9](https://github.com/sppburke/binary-alpha/issues/9), [#10](https://github.com/sppburke/binary-alpha/issues/10) |
 | Broker contracts and adapters, secrets resolution | `binary-alpha-app` | [#11](https://github.com/sppburke/binary-alpha/issues/11) |

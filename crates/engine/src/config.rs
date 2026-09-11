@@ -10,6 +10,10 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use sha2::{Digest, Sha256};
 
 use crate::dataset::{DatasetRole, NativeGranularity};
+use crate::execution::{
+    AccountSpec, ContractTerms, DeploymentBinding, RateEvent, ReplayInput, RiskPolicy, Split,
+    StrategySpec,
+};
 use crate::market::{BrokerId, Currency, InstrumentId, PriceScale, ProviderSymbol};
 
 /// Domain separator hashed before the canonical document; changing it or the canonical form
@@ -33,6 +37,8 @@ pub struct Config {
     pub features: Option<Features>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub outcomes: Option<Outcomes>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replay: Option<Replay>,
 }
 
 impl Config {
@@ -90,6 +96,11 @@ impl Config {
             outcomes
                 .validate()
                 .map_err(|reason| format!("outcomes.{reason}"))?;
+        }
+        if let Some(replay) = &self.replay {
+            replay
+                .validate()
+                .map_err(|reason| format!("replay.{reason}"))?;
         }
         let Some(import) = &self.import else {
             return Ok(());
@@ -904,6 +915,39 @@ impl Outcomes {
             return Err("role: holdout data never enters an outcome build".to_string());
         }
         crate::outcomes::OutcomeRule::resolve(self).map(drop)
+    }
+}
+
+/// The historical replay consumed only by `binary-alpha replay`: the declared role and half-open
+/// decision window, the verified inputs per instrument in tie-breaking order, optional reporting
+/// splits, the funded accounts, the strategies, the ordered deployment bindings, the contract
+/// templates, the risk policies, and the exact currency-aggregation contract. The engine module
+/// owns every record and every rule.
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct Replay {
+    pub role: DatasetRole,
+    pub decision_start: String,
+    pub decision_end: String,
+    pub inputs: Vec<ReplayInput>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub splits: Option<Vec<Split>>,
+    pub accounts: Vec<AccountSpec>,
+    pub strategies: Vec<StrategySpec>,
+    pub bindings: Vec<DeploymentBinding>,
+    pub contracts: Vec<ContractTerms>,
+    pub risk_policies: Vec<RiskPolicy>,
+    pub reporting_currency: Currency,
+    pub reporting_scale: u8,
+    pub max_rate_age_micros: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rates: Option<Vec<RateEvent>>,
+}
+
+impl Replay {
+    /// The rules a single field's deserializer cannot see; an error names the field.
+    pub fn validate(&self) -> Result<(), String> {
+        crate::execution::validate(self)
     }
 }
 
@@ -1796,5 +1840,219 @@ mod outcome_tests {
             let error = Config::parse(&source).unwrap_err().to_string();
             assert!(error.contains(field), "{from} -> {to}: {error}");
         }
+    }
+}
+
+#[cfg(test)]
+mod replay_tests {
+    use super::*;
+
+    const HEAD: &str = "schema_version = 1\nrun_mode = \"research\"\n\n[storage]\nhistorical_data_dir = \"h\"\npublication_uri = \"file:///p\"\n";
+    const TICK: &str = "file:///p/manifests/1111111111111111111111111111111111111111111111111111111111111111/ready.json";
+    const FEATURE: &str = "file:///p/manifests/2222222222222222222222222222222222222222222222222222222222222222/ready.json";
+    /// The canonical rendering: scalars, then each list as an array of tables.
+    const TABLE: &str = "role = \"development\"\ndecision_start = \"2026-01-05T00:00:00Z\"\ndecision_end = \"2026-01-06T00:00:00Z\"\nreporting_currency = \"unit\"\nreporting_scale = 2\nmax_rate_age_micros = 0\n\n[[replay.inputs]]\ntick_manifest = \"TICK\"\nfeature_manifest = \"FEATURE\"\n\n[[replay.splits]]\nname = \"a\"\nstart = \"2026-01-05T00:00:00Z\"\nend = \"2026-01-05T12:00:00Z\"\n\n[[replay.splits]]\nname = \"b\"\nstart = \"2026-01-05T12:00:00Z\"\nend = \"2026-01-06T00:00:00Z\"\n\n[[replay.accounts]]\nid = \"acct\"\nbroker = \"pocket_option\"\ncurrency = \"unit\"\nscale = 2\ninitial_cash = \"1000\"\n\n[[replay.strategies]]\nid = \"s\"\nplan_identity = \"plan\"\n\n[replay.strategies.base_stream]\nduration_seconds = 30\noffset_seconds = 15\n\n[[replay.strategies.conditions]]\noutput = \"wick_profile\"\ncomparator = \"eq\"\nthreshold = \"clean_body\"\n\n[replay.strategies.conditions.stream]\nduration_seconds = 30\noffset_seconds = 15\n\n[[replay.bindings]]\nid = \"b\"\nstrategy = \"s\"\naccount = \"acct\"\ninstrument = \"pocket_option:AEDCNY_otc\"\ncontract = \"c\"\nrisk_policy = \"p\"\n\n[replay.bindings.envelope]\nmax_purchase_cost = \"1\"\nmax_entry_fee = \"0\"\nmax_win_terminal_fee = \"0\"\nmax_loss_terminal_fee = \"0\"\nmax_tie_terminal_fee = \"0\"\nmin_winning_net_return = \"0.92\"\nsettlement_rule = \"price_at_due_v1\"\n\n[[replay.contracts]]\nid = \"c\"\ndirection = \"sell\"\nduration_micros = 60000000\ncurrency = \"unit\"\nstake = \"1\"\nquoted_cost = \"1\"\nentry_fee = \"0\"\n\n[replay.contracts.win]\ngross_return = \"1.92\"\nterminal_fee = \"0\"\n\n[replay.contracts.loss]\ngross_return = \"0\"\nterminal_fee = \"0\"\n\n[replay.contracts.tie]\ngross_return = \"1\"\nterminal_fee = \"0\"\n\n[replay.contracts.settlement]\nrule = \"price_at_due_v1\"\nmax_settlement_delay_micros = 60000000\nmax_tick_gap_micros = 60000000\n\n[[replay.risk_policies]]\nid = \"p\"\nmax_open_per_strategy = 1\nsame_entry = \"all\"\ndeduplicate_signal_logic = false\nmax_feature_age_micros = 60000000\nmax_quote_age_micros = 0\n";
+
+    fn table(edit: impl Fn(&str) -> String) -> String {
+        format!(
+            "{HEAD}\n[replay]\n{}",
+            edit(&TABLE.replace("TICK", TICK).replace("FEATURE", FEATURE))
+        )
+    }
+
+    #[test]
+    fn replays_round_trip_through_the_canonical_form() {
+        let source = table(str::to_string);
+        let config = Config::parse(&source).unwrap();
+        assert_eq!(config.canonical_toml(), source);
+        assert_eq!(Config::parse(&config.canonical_toml()).unwrap(), config);
+        let replay = config.replay.as_ref().unwrap();
+        assert_eq!(replay.inputs[0].tick_manifest.generation(), "1".repeat(64));
+        assert_eq!(replay.bindings[0].contract, "c");
+        assert_eq!(
+            Config::parse(HEAD).unwrap().content_hash(),
+            "v3:sha256:d7be0fdf6fb030fdfaa543417aad386f84bdb7e06ff06a61ae5646ca8e7c1256",
+            "a document that omits `replay` keeps the identity the previous checkout gave it"
+        );
+        let numeric = table(|body| {
+            body.replace(
+                "output = \"wick_profile\"\ncomparator = \"eq\"\nthreshold = \"clean_body\"",
+                "output = \"close_units\"\ncomparator = \"ge\"\nthreshold = 1.5",
+            )
+        });
+        assert!(Config::parse(&numeric).is_ok());
+    }
+
+    #[test]
+    fn replay_rules_reject_with_the_field_name() {
+        let cases = [
+            (
+                "role = \"development\"",
+                "role = \"holdout\"",
+                "replay.role",
+            ),
+            (
+                "decision_end = \"2026-01-06T00:00:00Z\"",
+                "decision_end = \"2026-01-05T00:00:00Z\"",
+                "replay.decision_end",
+            ),
+            (
+                "name = \"b\"\nstart = \"2026-01-05T12:00:00Z\"",
+                "name = \"b\"\nstart = \"2026-01-05T11:00:00Z\"",
+                "replay.splits[1].name",
+            ),
+            (
+                "end = \"2026-01-06T00:00:00Z\"\n\n[[replay.accounts]]",
+                "end = \"2026-01-07T00:00:00Z\"\n\n[[replay.accounts]]",
+                "replay.splits[1].start",
+            ),
+            (
+                "initial_cash = \"1000\"",
+                "initial_cash = \"-1\"",
+                "replay.accounts[0].initial_cash",
+            ),
+            (
+                "initial_cash = \"1000\"",
+                "initial_cash = \"0.001\"",
+                "replay.accounts[0].initial_cash",
+            ),
+            (
+                "\nscale = 2\n",
+                "\nscale = 19\n",
+                "replay.accounts[0].scale",
+            ),
+            (
+                "comparator = \"eq\"\nthreshold = \"clean_body\"",
+                "comparator = \"lt\"\nthreshold = \"clean_body\"",
+                "replay.strategies[0].conditions[0].comparator",
+            ),
+            (
+                "comparator = \"eq\"\nthreshold = \"clean_body\"",
+                "comparator = \"eq\"\nthreshold = nan",
+                "replay.strategies[0].conditions[0].threshold",
+            ),
+            (
+                "duration_micros = 60000000",
+                "duration_micros = 0",
+                "replay.contracts[0].duration_micros",
+            ),
+            (
+                "stake = \"1\"",
+                "stake = \"0\"",
+                "replay.contracts[0].stake",
+            ),
+            (
+                "\nentry_fee = \"0\"",
+                "\nentry_fee = \"-0.1\"",
+                "replay.contracts[0].entry_fee",
+            ),
+            (
+                "quoted_cost = \"1\"",
+                "quoted_cost = \"0.001\"",
+                "replay.bindings[0].contract",
+            ),
+            (
+                "max_open_per_strategy = 1",
+                "max_open_per_strategy = 0",
+                "replay.risk_policies[0].max_open_per_strategy",
+            ),
+            (
+                "max_feature_age_micros = 60000000",
+                "max_feature_age_micros = -1",
+                "replay.risk_policies[0].max_feature_age_micros",
+            ),
+            (
+                "max_quote_age_micros = 0\n",
+                "max_quote_age_micros = 0\npause = { drawdown = \"0\", duration_micros = 1 }\n",
+                "replay.risk_policies[0].pause.drawdown",
+            ),
+            (
+                "strategy = \"s\"",
+                "strategy = \"t\"",
+                "replay.bindings[0].strategy",
+            ),
+            (
+                "instrument = \"pocket_option:AEDCNY_otc\"",
+                "instrument = \"deriv:AEDCNY_otc\"",
+                "replay.bindings[0].instrument",
+            ),
+            (
+                "instrument = \"pocket_option:AEDCNY_otc\"",
+                "instrument = \"AEDCNY_otc\"",
+                "replay.bindings[0].instrument",
+            ),
+            (
+                "currency = \"unit\"\nstake",
+                "currency = \"other\"\nstake",
+                "replay.bindings[0].contract",
+            ),
+            (
+                "reporting_scale = 2",
+                "reporting_scale = 19",
+                "replay.reporting_scale",
+            ),
+            (
+                "max_rate_age_micros = 0",
+                "max_rate_age_micros = -1",
+                "replay.max_rate_age_micros",
+            ),
+            (
+                "max_rate_age_micros = 0\n",
+                "max_rate_age_micros = 0\nrates = [{ id = \"r\", source_currency = \"unit\", reporting_currency = \"unit\", provider = \"x\", provider_time = \"2026-01-05T00:00:00Z\", available_at = \"2026-01-05T00:00:00Z\", rate = \"1\" }]\n",
+                "replay.rates[0].source_currency",
+            ),
+            (
+                "max_quote_age_micros = 0\n",
+                "max_quote_age_micros = 0\nretry = true\n",
+                "retry",
+            ),
+        ];
+        for (from, to, key) in cases {
+            let source = table(|body| body.replacen(from, to, 1));
+            assert_ne!(source, table(str::to_string), "{from}: the edit applies");
+            let error = match Config::parse(&source) {
+                Ok(_) => panic!("{to}: accepted"),
+                Err(error) => error.to_string(),
+            };
+            assert!(error.contains(key), "{to}: {error}");
+        }
+        let empty = table(|body| {
+            body.replacen("plan_identity = \"plan\"\n", "plan_identity = \"plan\"\nconditions = []\n", 1)
+                .replacen(
+                    "\n[[replay.strategies.conditions]]\noutput = \"wick_profile\"\ncomparator = \"eq\"\nthreshold = \"clean_body\"\n\n[replay.strategies.conditions.stream]\nduration_seconds = 30\noffset_seconds = 15\n",
+                    "",
+                    1,
+                )
+        });
+        let error = Config::parse(&empty).unwrap_err().to_string();
+        assert!(error.contains("replay.strategies[0].conditions"), "{error}");
+    }
+
+    #[test]
+    fn shared_policies_and_duplicate_deployments_reject() {
+        let second_policy = "\n[[replay.risk_policies]]\nid = \"q\"\nmax_open_per_strategy = 1\nmax_open_total = 5\nsame_entry = \"all\"\ndeduplicate_signal_logic = false\nmax_feature_age_micros = 60000000\nmax_quote_age_micros = 0\n";
+        let second_binding = |policy: &str, envelope: &str| {
+            format!(
+                "\n[[replay.bindings]]\nid = \"b2\"\nstrategy = \"s\"\naccount = \"acct\"\ninstrument = \"pocket_option:AEDCNY_otc\"\ncontract = \"c\"\nrisk_policy = \"{policy}\"\nenvelope = {{ max_purchase_cost = \"{envelope}\", max_entry_fee = \"0\", max_win_terminal_fee = \"0\", max_loss_terminal_fee = \"0\", max_tie_terminal_fee = \"0\", min_winning_net_return = \"0.92\", settlement_rule = \"price_at_due_v1\" }}\n"
+            )
+        };
+        let conflicting = format!(
+            "{}{second_policy}{}",
+            table(str::to_string),
+            second_binding("q", "2")
+        );
+        let error = Config::parse(&conflicting).unwrap_err().to_string();
+        assert!(
+            error.contains("replay.bindings[1].risk_policy") && error.contains("max_open_total"),
+            "{error}"
+        );
+        let duplicate = format!("{}{}", table(str::to_string), second_binding("p", "1"));
+        let error = Config::parse(&duplicate).unwrap_err().to_string();
+        assert!(error.contains("replay.bindings[1].id"), "{error}");
+        let distinct = format!("{}{}", table(str::to_string), second_binding("p", "2"));
+        assert!(
+            Config::parse(&distinct).is_ok(),
+            "another envelope is another deployment strategy"
+        );
     }
 }

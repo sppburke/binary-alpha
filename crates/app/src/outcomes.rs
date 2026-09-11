@@ -298,13 +298,13 @@ fn label_chunks(
 }
 
 /// One temporary object written in order and closed before it is identified.
-struct Temporary {
+pub(crate) struct Temporary {
     path: PathBuf,
     writer: BufWriter<File>,
 }
 
 impl Temporary {
-    fn create(local: &Store, name: &str) -> Result<Self, String> {
+    pub(crate) fn create(local: &Store, name: &str) -> Result<Self, String> {
         let path = import::temporary_path(local, name)?;
         let file = File::create(&path)
             .map_err(|error| format!("cannot create {}: {error}", path.display()))?;
@@ -314,13 +314,13 @@ impl Temporary {
         })
     }
 
-    fn write(&mut self, bytes: &[u8]) -> Result<(), String> {
+    pub(crate) fn write(&mut self, bytes: &[u8]) -> Result<(), String> {
         self.writer
             .write_all(bytes)
             .map_err(|error| format!("cannot write {}: {error}", self.path.display()))
     }
 
-    fn finish(self) -> Result<PathBuf, String> {
+    pub(crate) fn finish(self) -> Result<PathBuf, String> {
         self.writer
             .into_inner()
             .map_err(|error| error.to_string())
