@@ -26,13 +26,11 @@ use binary_alpha_engine::execution::{
 use binary_alpha_engine::features::{FeatureManifest, FeaturePlan, StreamPlan, Value};
 use binary_alpha_engine::market::{PriceScale, parse_event_time_micros};
 use binary_alpha_engine::outcomes::{OUTCOME_MANIFEST_KIND, OutcomeManifest};
-use binary_alpha_engine::stream::Observation as StreamObservation;
 
 use crate::archive::TableReader;
-use crate::audit::feed_generation;
 use crate::features::{self, ROWS_MESSAGE};
 use crate::import::{self, CODE_REVISION};
-use crate::outcomes::Temporary;
+use crate::outcomes::{Temporary, load_ticks};
 use crate::store::{self, ObjectIdentity, Put, Store};
 use crate::verify;
 
@@ -335,32 +333,6 @@ fn column_spec(stream: &StreamPlan, name: &str) -> Option<ColumnSpec> {
     })
 }
 
-/// Every tick of one bound generation, in order, through the Phase 02 readers.
-fn load_ticks(bound: &BoundInstrument) -> Result<(Vec<i64>, Vec<i64>), String> {
-    let count = usize::try_from(bound.tick.row_count).map_err(|_| "too many ticks")?;
-    let (mut times, mut prices) = (Vec::with_capacity(count), Vec::with_capacity(count));
-    feed_generation(
-        &bound.tick_store,
-        &bound.tick,
-        bound.scale,
-        &mut |observation| {
-            if let StreamObservation::Tick(tick) = observation {
-                times.push(tick.event_time_micros);
-                prices.push(tick.price_units);
-            }
-            Ok(())
-        },
-    )?;
-    if times.len() as u64 != bound.tick.row_count {
-        return Err(format!(
-            "tick_manifest: observed {} ticks, but the manifest records {} rows; nothing was published",
-            times.len(),
-            bound.tick.row_count
-        ));
-    }
-    Ok((times, prices))
-}
-
 /// The rows of one stream's published table, one row group at a time, with only the clocks and
 /// the bound columns held in memory.
 struct RowCursor {
@@ -605,11 +577,12 @@ pub fn replay(
         replay: settings.clone(),
         instruments: bound.iter().map(|bound| bound.binding.clone()).collect(),
     };
-    let generation = replay_generation_id(&definition);
+    let generation = replay_generation_id(&definition.config_hash, &definition.instruments);
     let key = manifest_key(&generation);
     let mut inputs = Vec::with_capacity(bound.len());
     for instrument in &bound {
-        let (times, prices) = load_ticks(instrument)?;
+        let (times, prices) =
+            load_ticks(&instrument.tick_store, &instrument.tick, instrument.scale)?;
         let cursors = instrument
             .binding
             .streams

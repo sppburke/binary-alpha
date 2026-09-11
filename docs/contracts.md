@@ -819,7 +819,8 @@ The signal-logic identity is SHA-256 over `binary-alpha signal logic v1`, the pl
 base stream, and the conditions in canonical order with exact duplicates removed; it excludes
 contract direction, duration, and economics. The deployment-strategy identity is SHA-256 over
 `binary-alpha deployment strategy v1`, the signal logic, direction, duration, currency, and the
-envelope's JSON. Quotes belong to events. The envelope states the maximum purchase cost, entry fee,
+envelope's JSON with every amount normalized, so equal money values written at different scales
+share one identity. Quotes belong to events. The envelope states the maximum purchase cost, entry fee,
 and each outcome's terminal fee, the minimum winning net return
 (`gross_payout - quoted_cost - entry_fee - win_terminal_fee`), and the settlement rule a quote must
 declare; a quote at equal terms passes.
@@ -841,11 +842,14 @@ tags `availability = "provider_order_simulation"`.
 ### Decisions
 
 Observations at one availability time apply in source order before any decision at that time:
-ticks, then feature rows in frozen-plan order, then external acknowledgements, settlements, and
-reconciliations; an expired account pause ends first. A tick updates the paths of every accepted
-obligation of its instrument in acceptance order and settles those due under `price_at_due_v1`.
-The engine keeps one latest available row per stream and evaluates each installed base row once,
-traversing emitted base streams in frozen-plan order and their bindings in configured order. A
+ticks, then feature rows in frozen-plan order, then external acknowledgements, acceptances,
+rejections, settlements, and reconciliations; an expired account pause ends first. A tick updates
+the paths of every accepted obligation of its instrument in acceptance order and settles those due
+under `price_at_due_v1`; an unresolved obligation is no longer driven by ticks. The engine keeps
+one latest available row per stream: a row must close strictly later than the installed row, an
+identical redelivery is a no-op, an older or conflicting row fails, and two rows of one stream at
+one availability time fail. It evaluates each newly installed base row once, traversing installed
+base streams in frozen-plan order and their bindings in configured order. A
 condition fails when its stream has no row, when that row closes after the base row, or when the
 value is unavailable; the engine never searches backward. A matching signal is always a ledger
 record with one disposition, decided in this order: `same_entry_duplicate` (`first` selection
@@ -857,8 +861,8 @@ quote's provider time beyond the maximum), `gap_at_entry` (the inter-arrival int
 exceeds the contract's maximum tick gap), `account_paused`, `account_blocked`, `quote_rejected`
 (the envelope), `capacity_strategy`, `capacity_duration`, `capacity_instrument`,
 `capacity_account`, `capacity_total` (the prospective count may equal a maximum), `insufficient_cash`,
-`unresolved_loss_account`, `unresolved_loss_total`, `conversion_unavailable`, or `admitted`. No
-signal is evaluated before `decision_start` or at or after `decision_end`; ticks and confirmations
+`unresolved_loss_account`, `unresolved_loss_total`, `conversion_unavailable`, or `admitted`; the
+record names the rate identities a total unresolved-loss conversion used. No signal is evaluated before `decision_start` or at or after `decision_end`; ticks and confirmations
 after `decision_end` still settle existing obligations. Split labels follow the decision time and
 stay with the obligation through settlement.
 
@@ -869,10 +873,12 @@ gross_return)`, an admitted signal reserves `A + F`, requires native cash minus 
 reservations to cover it, and sends the command `BINDING/CLOSE_TIME_MICROS`. Acceptance debits `A`
 exactly once, keeps `A` as paid basis, and reserves only `F`. The worst unresolved loss of an open
 obligation is `max(0, A + max over outcomes of terminal_fee - gross_return)`; capacity counts and
-unresolved exposure include every sent, accepted, and possibly sent obligation. A rejected or
-proven not-sent command releases its reservation and capacity without debit. A possibly sent
-command keeps its full reservation, blocks new entries for its account, and waits for
-reconciliation; nothing is retried. Settled equity is native cash plus the paid basis of open
+unresolved exposure include every sent, acknowledged, accepted, and possibly sent obligation. An
+acknowledgement records the broker's receipt and posts nothing. Acceptance, rejection, proven
+not-sent, and possibly-sent transitions are permitted only from a sent or acknowledged command. A
+rejected or proven not-sent command releases its reservation and capacity without debit. A
+possibly sent command keeps its full reservation, blocks new entries for its account, and waits
+for reconciliation; nothing is retried and no acceptance is taken for it. Settled equity is native cash plus the paid basis of open
 contracts; completed profit is the credit minus the paid basis.
 
 ### Settlement
@@ -886,12 +892,18 @@ into a tick larger than `max_tick_gap_micros` whose interval intersects `[entry,
 settlement tick, or an exhausted input window leaves the obligation `unresolved` with its reason,
 evidence, and path so far; it keeps its paid basis, capacity, and exposure until an authoritative
 settlement or reconciliation. Every settlement credits the actual `gross_return - terminal_fee`,
-releases the remaining reservation and capacity once, and records the path. A confirmed cashflow
-that contradicts the frozen terms is a `discrepancy`; a net terminal debit beyond the remaining
+releases the remaining reservation and capacity once, and records the path; an authoritative
+settlement's price is observed in the path at its provider time. A confirmed cashflow that
+contradicts the frozen terms is a `discrepancy`; a net terminal debit beyond the remaining
 reservation is a `deficit`; either blocks the account pending reconciliation without fabricating
-the configured amount. A reconciliation resolves an open command as not sent, accepted, or settled
-with its actual cashflow and records the block that remains on the account. An external event with
-the same identity and payload is a no-op; the same identity with another payload fails.
+the configured amount. A reconciliation resolves an open command as not sent, accepted (posting
+the purchase and keeping the terminal reserve), or settled with its actual cashflow, or lifts with
+zero postings the block a settled discrepancy left, and records the block that remains on the
+account. Every acceptance, settlement, and reconciliation posting is recomputed from the
+obligation and the frozen terms when the record is applied, so a posting that disagrees fails at
+generation and at restoration alike. An external event with the same identity and exact payload
+is a no-op, before and after restoration; the same identity with another payload, including an
+equal amount written at another scale, fails.
 
 ### Pause, conversion, and projections
 
@@ -903,9 +915,12 @@ profit, while the lifetime peak and maximum drawdown stay separate. Conversion s
 source and reporting currency at a decision time, the latest supplied rate whose provider and
 availability times are no later than the decision and whose provider age is at most
 `max_rate_age_micros`, multiplies once with checked arithmetic, and rejects lost precision;
-same-currency amounts only rescale. Missing or stale rates make the reporting aggregates and the
-total unresolved-loss limit unavailable, which blocks admissions that need them, while native cash,
-account pause, and confirmed native settlement never depend on conversion. The path of a contract
+same-currency amounts only rescale. The reporting-currency projection is observed at the run
+definition and after every record that changes an account: an admitted signal, an acceptance, a
+release, a settlement, or a reconciliation. Missing or stale rates leave that observation
+unavailable and make the total unresolved-loss limit unavailable, which blocks admissions that
+need it; native history is never substituted, while native cash, account pause, and confirmed
+native settlement never depend on conversion. The path of a contract
 is tracked in integer price units as `(current - entry) × direction` including the settlement tick:
 final move, maximum favorable and adverse excursion with their earliest times (starting at the
 entry time), first favorable and adverse times, and ordering flags that require both times in
@@ -917,8 +932,9 @@ price.
 
 The ledger is one canonical compact JSON record per line in `ledger/events.jsonl`, each carrying a
 contiguous `sequence` from zero, the decision `time_micros`, and a tagged `kind`: the
-`run_definition` (the complete resolved run) first, then `signal`, `accepted`, `released`,
-`possibly_sent`, `settled`, `unresolved`, `reconciled`, `pause_started`, and `pause_ended` records
+`run_definition` (the complete resolved run) first, then `signal`, `acknowledged`, `accepted`,
+`released`, `possibly_sent`, `settled`, `unresolved`, `reconciled`, `pause_started`, and
+`pause_ended` records
 with their exact postings and provenance (`source` identity, provider and availability times, and
 whether it is a configured simulation). Tick and feature data are referenced inputs, never copied.
 Restoration applies every record through the same function that generated it: a missing
@@ -938,7 +954,8 @@ create-once rules of dataset generations, are the ledger and the summary. The re
 `manifests/GENERATION/ready.json`, published last and mirrored, records `kind` (`engine_replay`),
 `schema_version` (`1`), `generation`, `role`, `config_hash`, `code_revision`, `availability`,
 `decision_start`, `decision_end`, `instruments`, `events`, `final_state_identity`,
-`summary_identity`, and `objects`. The command writes
+`summary_identity`, and `objects`; a manifest whose `generation` is not the identity of its
+`config_hash` and `instruments` is rejected. The command writes
 `replay ROLE generation GENERATION instruments N events E signals S accepted A settled T unresolved U objects 2 reused R`
 followed by `[load S simulate S publish S]` or `(already published)`, then the reconstruction line.
 Before the manifest becomes ready it reconstructs the generation from the published objects under

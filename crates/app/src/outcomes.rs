@@ -158,28 +158,31 @@ fn bind(settings: &Outcomes) -> Result<Bound, String> {
     })
 }
 
-/// Every tick of the bound generation, in order, through the Phase 02 readers.
-fn load_ticks(bound: &Bound) -> Result<(Vec<i64>, Vec<i64>), String> {
-    let count =
-        usize::try_from(bound.tick.row_count).expect("the binder bounded the count below u32::MAX");
+/// Every tick of one generation, in order, through the Phase 02 readers.
+pub(crate) fn load_ticks(
+    store: &Store,
+    manifest: &GenerationManifest,
+    scale: PriceScale,
+) -> Result<(Vec<i64>, Vec<i64>), String> {
+    let count = usize::try_from(manifest.row_count).map_err(|_| {
+        format!(
+            "tick_manifest: {} ticks cannot be loaded",
+            manifest.row_count
+        )
+    })?;
     let (mut times, mut prices) = (Vec::with_capacity(count), Vec::with_capacity(count));
-    feed_generation(
-        &bound.tick_store,
-        &bound.tick,
-        bound.scale,
-        &mut |observation| {
-            if let Observation::Tick(tick) = observation {
-                times.push(tick.event_time_micros);
-                prices.push(tick.price_units);
-            }
-            Ok(())
-        },
-    )?;
-    if times.len() as u64 != bound.tick.row_count {
+    feed_generation(store, manifest, scale, &mut |observation| {
+        if let Observation::Tick(tick) = observation {
+            times.push(tick.event_time_micros);
+            prices.push(tick.price_units);
+        }
+        Ok(())
+    })?;
+    if times.len() as u64 != manifest.row_count {
         return Err(format!(
             "tick_manifest: observed {} ticks, but the manifest records {} rows; nothing was published",
             times.len(),
-            bound.tick.row_count
+            manifest.row_count
         ));
     }
     Ok((times, prices))
@@ -344,7 +347,7 @@ fn build(
 
     // Load the ticks, fold their quality flags, and write the shared arrays.
     let loading = Instant::now();
-    let (times, prices) = load_ticks(&bound)?;
+    let (times, prices) = load_ticks(&bound.tick_store, &bound.tick, bound.scale)?;
     let builder = OutcomeBuilder::new(rule, times, prices)
         .map_err(|reason| format!("tick_manifest: {reason}"))?;
     let mut paths = vec![

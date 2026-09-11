@@ -8,16 +8,20 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use binary_alpha_engine::config::{Config, StreamKey};
+use std::collections::HashMap;
+
+use binary_alpha_engine::config::{Config, Replay, StreamKey};
 use binary_alpha_engine::dataset::GenerationManifest;
 use binary_alpha_engine::execution::{
-    ColumnSpec, Decimal, Disposition, EVENTS_OBJECT_PATH, Engine, EventKind, EventSource,
-    FinancialEvent, HISTORICAL_AVAILABILITY, InstrumentBinding, Observation, Outcome,
-    REPLAY_SCHEMA_VERSION, ReplayManifest, Resolution, RunDefinition, SUMMARY_OBJECT_PATH,
-    StreamColumns, Summary, UnresolvedReason, basis_points_text,
+    AccountSpec, AccountState, Cashflow, ColumnSpec, Comparator, Condition, ContractTerms, Decimal,
+    DeploymentBinding, Direction, Disposition, EVENTS_OBJECT_PATH, Engine, Envelope, EventKind,
+    EventSource, FinancialEvent, HISTORICAL_AVAILABILITY, InstrumentBinding, Observation, Outcome,
+    PathMetrics, Pause, REPLAY_SCHEMA_VERSION, RateEvent, ReplayInput, ReplayManifest, Resolution,
+    RiskPolicy, RunDefinition, SUMMARY_OBJECT_PATH, SameEntry, SettlementRule, StrategySpec,
+    StreamColumns, Summary, Threshold, UnresolvedReason, basis_points_text,
 };
 use binary_alpha_engine::features::{FeatureManifest, Kind, Value};
-use binary_alpha_engine::market::format_event_time_micros;
+use binary_alpha_engine::market::{Currency, format_event_time_micros};
 use common::*;
 
 /// The rows of one stream: close time, availability, and the bound column values.
@@ -583,7 +587,7 @@ fn live_adapter(
 }
 
 // ---------------------------------------------------------------------------------------------
-// Integrated financial scenarios through the engine's public surface
+// Financial scenario suite over the engine's observation interface
 // ---------------------------------------------------------------------------------------------
 
 const BASE: &str = "\n[replay]\nrole = \"development\"\ndecision_start = \"1970-01-01T00:00:00Z\"\ndecision_end = \"1970-01-01T01:00:00Z\"\ninputs = [{ tick_manifest = \"file:///p/manifests/1111111111111111111111111111111111111111111111111111111111111111/ready.json\", feature_manifest = \"file:///p/manifests/2222222222222222222222222222222222222222222222222222222222222222/ready.json\" }]\naccounts = [{ id = \"a\", broker = \"b\", currency = \"u\", scale = 2, initial_cash = \"1000\" }]\nreporting_currency = \"u\"\nreporting_scale = 2\nmax_rate_age_micros = 5\n\n[[replay.strategies]]\nid = \"s\"\nplan_identity = \"plan\"\nbase_stream = { duration_seconds = 5, offset_seconds = 0 }\nconditions = [{ stream = { duration_seconds = 5, offset_seconds = 0 }, output = \"signal\", comparator = \"eq\", threshold = true }]\n\n[[replay.contracts]]\nid = \"c\"\ndirection = \"buy\"\nduration_micros = 10\ncurrency = \"u\"\nstake = \"1\"\nquoted_cost = \"1\"\nentry_fee = \"0\"\nwin = { gross_return = \"1.92\", terminal_fee = \"0\" }\nloss = { gross_return = \"0\", terminal_fee = \"0\" }\ntie = { gross_return = \"1\", terminal_fee = \"0\" }\nsettlement = { rule = \"price_at_due_v1\", max_settlement_delay_micros = 5, max_tick_gap_micros = 60 }\n\n[[replay.risk_policies]]\nid = \"p\"\nmax_open_per_strategy = 1\nsame_entry = \"all\"\ndeduplicate_signal_logic = false\nmax_feature_age_micros = 1000\nmax_quote_age_micros = 1000\n\n[[replay.bindings]]\nid = \"b1\"\nstrategy = \"s\"\naccount = \"a\"\ninstrument = \"b:X\"\ncontract = \"c\"\nrisk_policy = \"p\"\nenvelope = { max_purchase_cost = \"1\", max_entry_fee = \"0\", max_win_terminal_fee = \"0\", max_loss_terminal_fee = \"0\", max_tie_terminal_fee = \"0\", min_winning_net_return = \"0.92\", settlement_rule = \"price_at_due_v1\" }\n";
@@ -597,64 +601,135 @@ fn stream(duration_seconds: u32, offset_seconds: u32) -> StreamKey {
     }
 }
 
-/// A definition over one instrument with a boolean `signal` column on two streams, from the base
-/// table edited by `edit`, bound to the plan `plan`.
-fn definition(edit: impl FnOnce(String) -> String) -> RunDefinition {
-    let source = format!("{HEAD}{}", edit(BASE.to_string()));
-    let config = Config::parse(&source).unwrap_or_else(|error| panic!("{source}\n{error}"));
-    let columns = || {
-        vec![ColumnSpec {
-            name: "signal".into(),
-            source: "signal".into(),
-            kind: Kind::Bool,
-            encoding: None,
-        }]
+fn condition(
+    key: StreamKey,
+    output: &str,
+    comparator: Comparator,
+    threshold: Threshold,
+) -> Condition {
+    Condition {
+        stream: key,
+        output: output.to_string(),
+        comparator,
+        threshold,
+    }
+}
+
+/// The bound instrument `BROKER:SYMBOL` with a boolean `signal` column on stream 5s/0s and the
+/// columns `signal`, `other`, and `count` on stream 15s/5s.
+fn instrument(id: &str, generation: char, plan: &str) -> InstrumentBinding {
+    let column = |name: &str, kind: Kind| ColumnSpec {
+        name: name.to_string(),
+        source: name.to_string(),
+        kind,
+        encoding: None,
     };
+    let (broker, symbol) = id.split_once(':').unwrap();
+    InstrumentBinding {
+        instrument: id.to_string(),
+        broker: broker.to_string().try_into().unwrap(),
+        provider_symbol: symbol.to_string().try_into().unwrap(),
+        price_scale: 2,
+        tick_generation: generation.to_string().repeat(64),
+        feature_generation: "2".repeat(64),
+        plan_identity: plan.to_string(),
+        raw_identity: "raw".into(),
+        outcome_generation: None,
+        streams: vec![
+            StreamColumns {
+                stream: stream(5, 0),
+                columns: vec![column("signal", Kind::Bool)],
+            },
+            StreamColumns {
+                stream: stream(15, 5),
+                columns: vec![
+                    column("signal", Kind::Bool),
+                    column("other", Kind::Bool),
+                    column("count", Kind::Int),
+                ],
+            },
+        ],
+    }
+}
+
+/// The base run: one instrument `b:X` bound to plan `plan`, account `a` (currency `u`, scale 2,
+/// cash 1000), strategy `s` on stream 5s/0s requiring `signal == true`, contract `c` (buy, ten
+/// microseconds, cost 1, win 1.92, tie 1, no fees), policy `p` (one open per strategy), and
+/// binding `b1`; `edit` changes the typed records before the engine compiles them.
+fn definition(edit: impl FnOnce(&mut Replay)) -> RunDefinition {
+    let config = Config::parse(&format!("{HEAD}{BASE}")).unwrap();
+    let mut replay = config.replay.unwrap();
+    edit(&mut replay);
     RunDefinition {
         schema_version: REPLAY_SCHEMA_VERSION,
         config_hash: "hash".into(),
         code_revision: "revision".into(),
         availability: "test_live".into(),
-        replay: config.replay.unwrap(),
-        instruments: vec![InstrumentBinding {
-            instrument: "b:X".into(),
-            broker: "b".to_string().try_into().unwrap(),
-            provider_symbol: "X".to_string().try_into().unwrap(),
-            price_scale: 2,
-            tick_generation: "1".repeat(64),
-            feature_generation: "2".repeat(64),
-            plan_identity: "plan".into(),
-            raw_identity: "raw".into(),
-            outcome_generation: None,
-            streams: vec![
-                StreamColumns {
-                    stream: stream(5, 0),
-                    columns: columns(),
-                },
-                StreamColumns {
-                    stream: stream(15, 5),
-                    columns: columns(),
-                },
-            ],
-        }],
+        replay,
+        instruments: vec![instrument("b:X", '1', "plan")],
+    }
+}
+
+/// A second strategy `id` on `base` requiring that stream's `signal`, frozen on the same plan.
+fn strategy(replay: &Replay, id: &str, base: StreamKey) -> StrategySpec {
+    StrategySpec {
+        id: id.to_string(),
+        plan_identity: replay.strategies[0].plan_identity.clone(),
+        base_stream: base,
+        conditions: vec![condition(
+            base,
+            "signal",
+            Comparator::Eq,
+            Threshold::Bool(true),
+        )],
+        repair: Vec::new(),
+    }
+}
+
+/// A second binding `id` of strategy `strategy` with the first binding's account, contract,
+/// policy, and envelope.
+fn binding(replay: &Replay, id: &str, strategy: &str) -> DeploymentBinding {
+    DeploymentBinding {
+        id: id.to_string(),
+        strategy: strategy.to_string(),
+        ..replay.bindings[0].clone()
     }
 }
 
 fn tick(time: i64, price: i64) -> Observation {
+    tick_of(0, time, price)
+}
+
+fn tick_of(instrument: usize, time: i64, price: i64) -> Observation {
     Observation::Tick {
-        instrument: 0,
+        instrument,
         provider_time_micros: time,
         price_units: price,
     }
 }
 
+/// A row of `stream` with `signal`; the second stream's `other` is true and its `count` four.
 fn row(stream: usize, close: i64, known: i64, signal: bool) -> Observation {
+    let mut values = vec![Some(Value::Bool(signal))];
+    if stream == 1 {
+        values.extend([Some(Value::Bool(true)), Some(Value::Int(4))]);
+    }
+    row_of(0, stream, close, known, values)
+}
+
+fn row_of(
+    instrument: usize,
+    stream: usize,
+    close: i64,
+    known: i64,
+    values: Vec<Option<Value>>,
+) -> Observation {
     Observation::Row {
-        instrument: 0,
+        instrument,
         stream,
         close_time_micros: close,
         known_at_micros: known,
-        values: vec![Some(Value::Bool(signal))],
+        values,
     }
 }
 
@@ -664,6 +739,32 @@ fn source(id: &str, time: i64) -> EventSource {
         provider_time_micros: time,
         available_at_micros: time,
         simulated: false,
+    }
+}
+
+fn settlement(
+    command: &str,
+    time: i64,
+    outcome: Outcome,
+    gross: &str,
+    fee: &str,
+    price: i64,
+) -> Observation {
+    Observation::Settlement {
+        command: command.to_string(),
+        source: source(&format!("broker:settle:{command}:{time}"), time),
+        outcome,
+        gross_return: decimal(gross),
+        terminal_fee: decimal(fee),
+        settlement_price_units: price,
+    }
+}
+
+fn reconciliation(command: &str, time: i64, resolution: Resolution) -> Observation {
+    Observation::Reconciliation {
+        command: command.to_string(),
+        source: source(&format!("broker:reconcile:{command}:{time}"), time),
+        resolution,
     }
 }
 
@@ -682,11 +783,19 @@ impl Live {
     }
 
     fn step(&mut self, time: i64, observations: Vec<Observation>) -> Vec<FinancialEvent> {
-        self.engine.step(time, observations).unwrap();
+        self.try_step(time, observations).unwrap()
+    }
+
+    fn try_step(
+        &mut self,
+        time: i64,
+        observations: Vec<Observation>,
+    ) -> Result<Vec<FinancialEvent>, String> {
+        self.engine.step(time, observations)?;
         let events = self.engine.drain();
         self.lines
             .extend(events.iter().map(FinancialEvent::to_line));
-        events
+        Ok(events)
     }
 
     /// One step plus the historical simulation's acceptance echo for every admitted signal.
@@ -716,11 +825,25 @@ impl Live {
         events
     }
 
+    /// The command of the one admitted signal in `events`.
+    fn command(events: &[FinancialEvent]) -> String {
+        events
+            .iter()
+            .find_map(|event| match &event.kind {
+                EventKind::Signal {
+                    command: Some(command),
+                    ..
+                } => Some(command.clone()),
+                _ => None,
+            })
+            .unwrap()
+    }
+
     fn cash(&self) -> String {
         self.engine.accounts()[0].cash.to_string()
     }
 
-    fn account(&self, id: &str) -> &binary_alpha_engine::execution::AccountState {
+    fn account(&self, id: &str) -> &AccountState {
         self.engine
             .accounts()
             .iter()
@@ -728,11 +851,34 @@ impl Live {
             .unwrap()
     }
 
-    /// Restores the ledger so far and asserts it reproduces the live engine.
-    fn assert_restorable(&self) {
+    /// The account's cash, reserved, paid basis, unresolved loss, completed profit, and open
+    /// count, as text.
+    fn balances(&self, id: &str) -> (String, String, String, String, String, u32) {
+        let account = self.account(id);
+        (
+            account.cash.to_string(),
+            account.reserved.to_string(),
+            account.paid_basis.to_string(),
+            account.unresolved_loss.to_string(),
+            account.completed_profit.to_string(),
+            account.open,
+        )
+    }
+
+    /// Restores the ledger so far into a second harness and asserts it reproduces this one.
+    fn restored(&self) -> Live {
         let restored = Engine::restore(self.lines.iter().cloned().map(Ok)).unwrap();
+        assert_eq!(restored.sequence(), self.engine.sequence());
         assert_eq!(restored.state_identity(), self.engine.state_identity());
         assert_eq!(restored.summary(), self.engine.summary());
+        Live {
+            engine: restored,
+            lines: self.lines.clone(),
+        }
+    }
+
+    fn assert_restorable(&self) {
+        self.restored();
     }
 }
 
@@ -752,6 +898,7 @@ fn kinds(events: &[FinancialEvent]) -> Vec<&'static str> {
         .map(|event| match &event.kind {
             EventKind::RunDefinition { .. } => "definition",
             EventKind::Signal { .. } => "signal",
+            EventKind::Acknowledged { .. } => "acknowledged",
             EventKind::Accepted { .. } => "accepted",
             EventKind::Released { .. } => "released",
             EventKind::PossiblySent { .. } => "possibly_sent",
@@ -768,7 +915,7 @@ fn kinds(events: &[FinancialEvent]) -> Vec<&'static str> {
 fn causality_settlement_and_gaps_follow_availability() {
     // A price tick at 100 available only at 103 admits at decision 103 with duration ten:
     // entry 103, due 113, and the quote keeps its provider time.
-    let mut live = Live::new(definition(|base| base));
+    let mut live = Live::new(definition(|_| {}));
     let events = live.simulate(103, vec![tick(100, 500), row(0, 100, 103, true)]);
     assert_eq!(kinds(&events), ["signal", "accepted"]);
     let EventKind::Accepted {
@@ -838,15 +985,16 @@ fn causality_settlement_and_gaps_follow_availability() {
         path.final_move_units, -1,
         "the gap tick is not path evidence"
     );
-    let account = live.account("a").clone();
     assert_eq!(
+        live.balances("a"),
         (
-            account.open,
-            account.paid_basis.to_string(),
-            account.unresolved_loss.to_string(),
-            account.cash.to_string()
-        ),
-        (1, "1.00".into(), "1.00".into(), "999.92".into())
+            "999.92".into(),
+            "0.00".into(),
+            "1.00".into(),
+            "1.00".into(),
+            "0.92".into(),
+            1
+        )
     );
     let events = live.simulate(200, vec![tick(200, 531), row(0, 195, 200, true)]);
     assert_eq!(
@@ -856,24 +1004,31 @@ fn causality_settlement_and_gaps_follow_availability() {
     );
     let events = live.step(
         210,
-        vec![Observation::Settlement {
-            command: "b1/110".into(),
-            source: source("broker:1", 205),
-            outcome: Outcome::Loss,
-            gross_return: decimal("0"),
-            terminal_fee: decimal("0"),
-            settlement_price_units: 400,
-        }],
+        vec![settlement("b1/110", 205, Outcome::Loss, "0", "0", 400)],
     );
     assert_eq!(kinds(&events), ["settled"]);
-    let account = live.account("a").clone();
+    let EventKind::Settled { path, .. } = &events[0].kind else {
+        unreachable!()
+    };
     assert_eq!(
         (
-            account.open,
-            account.cash.to_string(),
-            account.completed_profit.to_string()
+            path.final_move_units,
+            path.max_adverse_units,
+            path.max_adverse_time_micros
         ),
-        (0, "999.92".into(), "-0.08".into())
+        (-120, 120, 205),
+        "the authoritative settlement price is observed in the path"
+    );
+    assert_eq!(
+        live.balances("a"),
+        (
+            "999.92".into(),
+            "0.00".into(),
+            "0.00".into(),
+            "0.00".into(),
+            "-0.08".into(),
+            0
+        )
     );
     // A later frozen run of equal prices cannot change an earlier settlement.
     let events = live.simulate(211, vec![tick(211, 531)]);
@@ -915,54 +1070,58 @@ fn causality_settlement_and_gaps_follow_availability() {
 #[test]
 fn settlement_availability_and_duplicate_events_are_explicit() {
     // A settlement with provider time 100 known at 103 cannot free capacity at decision 100.
-    let mut live = Live::new(definition(|base| {
-        base.replace("duration_micros = 10", "duration_micros = 1000")
+    let mut live = Live::new(definition(|replay| {
+        replay.contracts[0].duration_micros = 1000
     }));
     live.simulate(50, vec![tick(50, 500), row(0, 45, 50, true)]);
-    let settlement = Observation::Settlement {
-        command: "b1/45".into(),
-        source: source("broker:settle", 100),
-        outcome: Outcome::Win,
-        gross_return: decimal("1.92"),
-        terminal_fee: decimal("0"),
-        settlement_price_units: 510,
-    };
+    let mut delayed = settlement("b1/45", 100, Outcome::Win, "1.92", "0", 510);
     let events = live.simulate(100, vec![tick(100, 510), row(0, 95, 100, true)]);
     assert_eq!(dispositions(&events), [Disposition::CapacityStrategy]);
-    let mut delayed = settlement;
     if let Observation::Settlement { source, .. } = &mut delayed {
         source.available_at_micros = 103;
     }
     assert!(
-        live.engine.step(102, vec![delayed.clone()]).is_err(),
+        live.try_step(102, vec![delayed.clone()]).is_err(),
         "not yet available"
     );
     let events = live.step(103, vec![delayed.clone(), row(0, 100, 103, true)]);
     assert_eq!(kinds(&events), ["settled", "signal"]);
     assert_eq!(dispositions(&events), [Disposition::Admitted]);
-    // The same external identity and payload again is a no-op; a conflicting payload fails.
-    let events = live.step(104, vec![delayed.clone()]);
-    assert!(events.is_empty());
+    // The same external identity and payload again is a no-op, before and after restoration; a
+    // payload that differs at all, even an equal amount written with another scale, fails.
+    assert!(live.step(104, vec![delayed.clone()]).is_empty());
+    let mut restored = live.restored();
+    assert!(restored.step(104, vec![delayed.clone()]).is_empty());
+    let mut rescaled = delayed.clone();
+    if let Observation::Settlement { gross_return, .. } = &mut rescaled {
+        *gross_return = decimal("1.920");
+    }
     let mut conflicting = delayed;
     if let Observation::Settlement { outcome, .. } = &mut conflicting {
         *outcome = Outcome::Loss;
     }
-    assert!(
-        live.engine
-            .step(104, vec![conflicting])
-            .unwrap_err()
-            .contains("reconciliation failed")
-    );
+    for observation in [rescaled, conflicting] {
+        for engine in [&mut live, &mut restored] {
+            assert!(
+                engine
+                    .try_step(104, vec![observation.clone()])
+                    .unwrap_err()
+                    .contains("reconciliation failed")
+            );
+        }
+    }
     live.assert_restorable();
 }
 
 #[test]
 fn alignment_follows_the_latest_row_of_the_other_stream() {
-    let definition = definition(|base| {
-        base.replace(
-            "conditions = [{ stream = { duration_seconds = 5, offset_seconds = 0 }, output = \"signal\", comparator = \"eq\", threshold = true }]",
-            "conditions = [{ stream = { duration_seconds = 5, offset_seconds = 0 }, output = \"signal\", comparator = \"eq\", threshold = true }, { stream = { duration_seconds = 15, offset_seconds = 5 }, output = \"signal\", comparator = \"eq\", threshold = true }]",
-        )
+    let definition = definition(|replay| {
+        replay.strategies[0].conditions.push(condition(
+            stream(15, 5),
+            "signal",
+            Comparator::Eq,
+            Threshold::Bool(true),
+        ));
     });
     // The other stream's latest row must exist and must not close after the base row; the
     // engine never searches backward for an older acceptable row.
@@ -990,13 +1149,46 @@ fn alignment_follows_the_latest_row_of_the_other_stream() {
 }
 
 #[test]
+fn rows_are_monotonic_and_redelivered_rows_are_no_ops() {
+    let mut live = Live::new(definition(|_| {}));
+    live.simulate(10, vec![tick(10, 500), row(0, 10, 10, true)]);
+    assert!(
+        live.step(11, vec![row(0, 10, 10, true)]).is_empty(),
+        "the identical row again installs and evaluates nothing"
+    );
+    for (what, observation) in [
+        ("an older row", row(0, 9, 11, true)),
+        ("a conflicting row at the same close", row(0, 10, 11, false)),
+    ] {
+        let error = live.try_step(11, vec![observation]).unwrap_err();
+        assert!(
+            error.contains("arrives after the row closing at"),
+            "{what}: {error}"
+        );
+    }
+    let error = live
+        .try_step(12, vec![row(0, 11, 12, true), row(0, 12, 12, true)])
+        .unwrap_err();
+    assert!(error.contains("two rows of stream 0"), "{error}");
+    assert!(
+        live.try_step(12, vec![row(0, 12, 13, true)])
+            .unwrap_err()
+            .contains("not available"),
+        "a row known after the step time"
+    );
+    // Failed deliveries leave the installed rows and the engine state unchanged: the open
+    // contract still settles at its due tick and the next row is evaluated.
+    let events = live.simulate(20, vec![tick(20, 500), row(0, 20, 20, true)]);
+    assert_eq!(kinds(&events), ["settled", "signal", "accepted"]);
+    live.assert_restorable();
+}
+
+#[test]
 fn freshness_bounds_are_exact() {
     let fresh = |feature: i64, quote: i64| {
-        definition(|base| {
-            base.replace(
-                "max_feature_age_micros = 1000\nmax_quote_age_micros = 1000",
-                &format!("max_feature_age_micros = {feature}\nmax_quote_age_micros = {quote}"),
-            )
+        definition(|replay| {
+            replay.risk_policies[0].max_feature_age_micros = feature;
+            replay.risk_policies[0].max_quote_age_micros = quote;
         })
     };
     for (feature, quote, expected) in [
@@ -1033,12 +1225,16 @@ fn freshness_bounds_are_exact() {
 
 #[test]
 fn selection_deduplication_and_repair_keep_their_slots() {
-    let two = |same_entry: &str, dedup: bool, repair: &str| {
-        definition(|base| {
-            base.replace("same_entry = \"all\"", &format!("same_entry = \"{same_entry}\""))
-                .replace("deduplicate_signal_logic = false", &format!("deduplicate_signal_logic = {dedup}"))
-                .replace("threshold = true }]\n", &format!("threshold = true }}]\n{repair}\n[[replay.strategies]]\nid = \"t\"\nplan_identity = \"plan\"\nbase_stream = {{ duration_seconds = 5, offset_seconds = 0 }}\nconditions = [{{ stream = {{ duration_seconds = 5, offset_seconds = 0 }}, output = \"signal\", comparator = \"eq\", threshold = true }}]\n"))
-                + "\n[[replay.bindings]]\nid = \"b2\"\nstrategy = \"t\"\naccount = \"a\"\ninstrument = \"b:X\"\ncontract = \"c\"\nrisk_policy = \"p\"\nenvelope = { max_purchase_cost = \"2\", max_entry_fee = \"0\", max_win_terminal_fee = \"0\", max_loss_terminal_fee = \"0\", max_tie_terminal_fee = \"0\", min_winning_net_return = \"0.92\", settlement_rule = \"price_at_due_v1\" }\n"
+    let two = |same_entry: SameEntry, deduplicate: bool, repair: Vec<Condition>| {
+        definition(|replay| {
+            replay.risk_policies[0].same_entry = same_entry;
+            replay.risk_policies[0].deduplicate_signal_logic = deduplicate;
+            replay.strategies[0].repair = repair;
+            let second = strategy(replay, "t", stream(5, 0));
+            replay.strategies.push(second);
+            let mut second = binding(replay, "b2", "t");
+            second.envelope.max_purchase_cost = decimal("2");
+            replay.bindings.push(second);
         })
     };
     let entry = |live: &mut Live| {
@@ -1048,42 +1244,54 @@ fn selection_deduplication_and_repair_keep_their_slots() {
         ))
     };
     assert_eq!(
-        entry(&mut Live::new(two("all", false, ""))),
+        entry(&mut Live::new(two(SameEntry::All, false, Vec::new()))),
         [Disposition::Admitted, Disposition::Admitted]
     );
     assert_eq!(
-        entry(&mut Live::new(two("first", false, ""))),
+        entry(&mut Live::new(two(SameEntry::First, false, Vec::new()))),
         [Disposition::Admitted, Disposition::SameEntryDuplicate]
     );
     assert_eq!(
-        entry(&mut Live::new(two("all", true, ""))),
+        entry(&mut Live::new(two(SameEntry::All, true, Vec::new()))),
         [Disposition::Admitted, Disposition::DuplicateLogic],
         "the same frozen logic at one entry event"
     );
     // A repair-blocked first match keeps its selection slot; the second matching candidate does
-    // not replace it.
-    let repair = "repair = [{ stream = { duration_seconds = 15, offset_seconds = 5 }, output = \"signal\", comparator = \"eq\", threshold = false }]\n";
+    // not replace it. Repair conditions are not signal logic: both strategies share one logic
+    // identity, so the second binding needs its own envelope to be a distinct deployment.
+    let repair = vec![condition(
+        stream(15, 5),
+        "other",
+        Comparator::Eq,
+        Threshold::Bool(false),
+    )];
     assert_eq!(
-        entry(&mut Live::new(two("first", false, repair))),
+        entry(&mut Live::new(two(SameEntry::First, false, repair.clone()))),
         [Disposition::RepairBlocked, Disposition::SameEntryDuplicate]
     );
     assert_eq!(
-        entry(&mut Live::new(two("all", false, repair))),
+        entry(&mut Live::new(two(SameEntry::All, false, repair))),
         [Disposition::RepairBlocked, Disposition::Admitted]
     );
 }
 
 #[test]
 fn every_capacity_scope_cash_and_loss_limits_bind_with_equality_allowed() {
-    let second = "\n[[replay.strategies]]\nid = \"t\"\nplan_identity = \"plan\"\nbase_stream = { duration_seconds = 15, offset_seconds = 5 }\nconditions = [{ stream = { duration_seconds = 15, offset_seconds = 5 }, output = \"signal\", comparator = \"eq\", threshold = true }]\n\n[[replay.bindings]]\nid = \"b2\"\nstrategy = \"t\"\naccount = \"a\"\ninstrument = \"b:X\"\ncontract = \"c\"\nrisk_policy = \"p\"\nenvelope = { max_purchase_cost = \"1\", max_entry_fee = \"0\", max_win_terminal_fee = \"0\", max_loss_terminal_fee = \"0\", max_tie_terminal_fee = \"0\", min_winning_net_return = \"0.92\", settlement_rule = \"price_at_due_v1\" }\n";
-    let policy = |limits: &str| {
-        definition(|base| {
-            base.replace("max_open_per_strategy = 1\n", &format!("{limits}\n")) + second
+    let policy = |limit: fn(&mut RiskPolicy)| {
+        definition(|replay| {
+            replay.risk_policies[0].max_open_per_strategy = None;
+            limit(&mut replay.risk_policies[0]);
+            let second = strategy(replay, "t", stream(15, 5));
+            replay.strategies.push(second);
+            let second = binding(replay, "b2", "t");
+            replay.bindings.push(second);
         })
     };
-    for (limits, expected) in [
+    type Limit = (&'static str, fn(&mut RiskPolicy), [Disposition; 3]);
+    let limits: [Limit; 6] = [
         (
-            "max_open_per_strategy = 1",
+            "strategy",
+            |p| p.max_open_per_strategy = Some(1),
             [
                 Disposition::Admitted,
                 Disposition::Admitted,
@@ -1091,7 +1299,8 @@ fn every_capacity_scope_cash_and_loss_limits_bind_with_equality_allowed() {
             ],
         ),
         (
-            "max_open_per_duration = 1",
+            "duration",
+            |p| p.max_open_per_duration = Some(1),
             [
                 Disposition::Admitted,
                 Disposition::CapacityDuration,
@@ -1099,7 +1308,8 @@ fn every_capacity_scope_cash_and_loss_limits_bind_with_equality_allowed() {
             ],
         ),
         (
-            "max_open_per_instrument = 1",
+            "instrument",
+            |p| p.max_open_per_instrument = Some(1),
             [
                 Disposition::Admitted,
                 Disposition::CapacityInstrument,
@@ -1107,7 +1317,8 @@ fn every_capacity_scope_cash_and_loss_limits_bind_with_equality_allowed() {
             ],
         ),
         (
-            "max_open_per_account = 1",
+            "account",
+            |p| p.max_open_per_account = Some(1),
             [
                 Disposition::Admitted,
                 Disposition::CapacityAccount,
@@ -1115,7 +1326,8 @@ fn every_capacity_scope_cash_and_loss_limits_bind_with_equality_allowed() {
             ],
         ),
         (
-            "max_open_total = 1",
+            "total 1",
+            |p| p.max_open_total = Some(1),
             [
                 Disposition::Admitted,
                 Disposition::CapacityTotal,
@@ -1123,15 +1335,17 @@ fn every_capacity_scope_cash_and_loss_limits_bind_with_equality_allowed() {
             ],
         ),
         (
-            "max_open_total = 2",
+            "total 2",
+            |p| p.max_open_total = Some(2),
             [
                 Disposition::Admitted,
                 Disposition::Admitted,
                 Disposition::CapacityTotal,
             ],
         ),
-    ] {
-        let mut live = Live::new(policy(limits));
+    ];
+    for (name, limit, expected) in limits {
+        let mut live = Live::new(policy(limit));
         let mut seen = dispositions(&live.simulate(
             10,
             vec![tick(10, 500), row(0, 10, 10, true), row(1, 10, 10, true)],
@@ -1139,7 +1353,7 @@ fn every_capacity_scope_cash_and_loss_limits_bind_with_equality_allowed() {
         seen.extend(dispositions(
             &live.simulate(12, vec![tick(12, 500), row(0, 12, 12, true)]),
         ));
-        assert_eq!(seen, expected, "{limits}");
+        assert_eq!(seen, expected, "{name}");
     }
     // Cash: admission needs native cash minus unpaid reservations to cover `A + F`; equality is
     // allowed, one cent less is not, and zero cash blocks a positive purchase.
@@ -1148,9 +1362,9 @@ fn every_capacity_scope_cash_and_loss_limits_bind_with_equality_allowed() {
         ("1.99", Disposition::InsufficientCash),
         ("0", Disposition::InsufficientCash),
     ] {
-        let mut live = Live::new(policy("max_open_per_strategy = 5").tap(|definition| {
-            definition.replay.accounts[0].initial_cash = decimal(cash);
-        }));
+        let mut definition = policy(|p| p.max_open_per_strategy = Some(5));
+        definition.replay.accounts[0].initial_cash = decimal(cash);
+        let mut live = Live::new(definition);
         live.simulate(10, vec![tick(10, 500), row(0, 10, 10, true)]);
         assert_eq!(
             dispositions(&live.simulate(12, vec![tick(12, 500), row(0, 12, 12, true)])),
@@ -1163,9 +1377,9 @@ fn every_capacity_scope_cash_and_loss_limits_bind_with_equality_allowed() {
         ("2", Disposition::Admitted),
         ("1.99", Disposition::UnresolvedLossAccount),
     ] {
-        let mut live = Live::new(policy(&format!(
-            "max_open_per_strategy = 5\nmax_unresolved_loss_per_account = \"{limit}\""
-        )));
+        let mut definition = policy(|p| p.max_open_per_strategy = Some(5));
+        definition.replay.risk_policies[0].max_unresolved_loss_per_account = Some(decimal(limit));
+        let mut live = Live::new(definition);
         live.simulate(10, vec![tick(10, 500), row(0, 10, 10, true)]);
         assert_eq!(
             dispositions(&live.simulate(12, vec![tick(12, 500), row(0, 12, 12, true)])),
@@ -1174,9 +1388,9 @@ fn every_capacity_scope_cash_and_loss_limits_bind_with_equality_allowed() {
         );
     }
     // A stake-one account cannot fund losses beyond its available cash.
-    let mut live = Live::new(policy("max_open_per_strategy = 5").tap(|definition| {
-        definition.replay.accounts[0].initial_cash = decimal("2");
-    }));
+    let mut definition = policy(|p| p.max_open_per_strategy = Some(5));
+    definition.replay.accounts[0].initial_cash = decimal("2");
+    let mut live = Live::new(definition);
     live.simulate(10, vec![tick(10, 500), row(0, 10, 10, true)]);
     live.simulate(11, vec![tick(11, 500), row(0, 11, 11, true)]);
     live.simulate(21, vec![tick(21, 400)]);
@@ -1188,25 +1402,41 @@ fn every_capacity_scope_cash_and_loss_limits_bind_with_equality_allowed() {
     live.assert_restorable();
 }
 
-trait Tap: Sized {
-    fn tap(mut self, edit: impl FnOnce(&mut Self)) -> Self {
-        edit(&mut self);
-        self
-    }
+/// The exact counterexample: stake 10, cost 9.50, entry fee 0.10, win 19 less 0.20, loss fee
+/// 0.30, tie 9.50 less 0.05, in an account holding 19.
+fn fractional() -> RunDefinition {
+    definition(|replay| {
+        let contract = &mut replay.contracts[0];
+        contract.stake = decimal("10");
+        contract.quoted_cost = decimal("9.50");
+        contract.entry_fee = decimal("0.10");
+        contract.win = Cashflow {
+            gross_return: decimal("19"),
+            terminal_fee: decimal("0.20"),
+        };
+        contract.loss = Cashflow {
+            gross_return: decimal("0"),
+            terminal_fee: decimal("0.30"),
+        };
+        contract.tie = Cashflow {
+            gross_return: decimal("9.50"),
+            terminal_fee: decimal("0.05"),
+        };
+        replay.bindings[0].envelope = Envelope {
+            max_purchase_cost: decimal("9.5"),
+            max_entry_fee: decimal("0.1"),
+            max_win_terminal_fee: decimal("0.2"),
+            max_loss_terminal_fee: decimal("0.3"),
+            max_tie_terminal_fee: decimal("0.05"),
+            min_winning_net_return: decimal("9.2"),
+            settlement_rule: SettlementRule::PriceAtDueV1,
+        };
+        replay.accounts[0].initial_cash = decimal("19");
+    })
 }
-
-impl Tap for RunDefinition {}
 
 #[test]
 fn the_exact_cashflow_counterexample_and_fees_post_exactly() {
-    let fractional = || {
-        definition(|base| {
-            base.replace("stake = \"1\"\nquoted_cost = \"1\"\nentry_fee = \"0\"\nwin = { gross_return = \"1.92\", terminal_fee = \"0\" }\nloss = { gross_return = \"0\", terminal_fee = \"0\" }\ntie = { gross_return = \"1\", terminal_fee = \"0\" }",
-                "stake = \"10\"\nquoted_cost = \"9.50\"\nentry_fee = \"0.10\"\nwin = { gross_return = \"19\", terminal_fee = \"0.20\" }\nloss = { gross_return = \"0\", terminal_fee = \"0.30\" }\ntie = { gross_return = \"9.50\", terminal_fee = \"0.05\" }")
-                .replace("max_purchase_cost = \"1\", max_entry_fee = \"0\", max_win_terminal_fee = \"0\", max_loss_terminal_fee = \"0\", max_tie_terminal_fee = \"0\", min_winning_net_return = \"0.92\"", "max_purchase_cost = \"9.5\", max_entry_fee = \"0.1\", max_win_terminal_fee = \"0.2\", max_loss_terminal_fee = \"0.3\", max_tie_terminal_fee = \"0.05\", min_winning_net_return = \"9.2\"")
-                .replace("initial_cash = \"1000\"", "initial_cash = \"19\"")
-        })
-    };
     let mut live = Live::new(fractional());
     let events = live.simulate(10, vec![tick(10, 500), row(0, 10, 10, true)]);
     let EventKind::Signal { reservation, .. } = &events[0].kind else {
@@ -1227,14 +1457,16 @@ fn the_exact_cashflow_counterexample_and_fees_post_exactly() {
         (debit.to_string(), reservation.to_string()),
         ("9.60".into(), "0.30".into())
     );
-    let account = live.account("a").clone();
     assert_eq!(
+        live.balances("a"),
         (
-            account.cash.to_string(),
-            account.reserved.to_string(),
-            account.unresolved_loss.to_string()
-        ),
-        ("9.40".into(), "0.30".into(), "9.90".into())
+            "9.40".into(),
+            "0.30".into(),
+            "9.60".into(),
+            "9.90".into(),
+            "0.00".into(),
+            1
+        )
     );
     let events = live.simulate(20, vec![tick(20, 600)]);
     let EventKind::Settled {
@@ -1283,15 +1515,7 @@ fn the_exact_cashflow_counterexample_and_fees_post_exactly() {
     assert_eq!(live.cash(), "18.15");
     // A possibly sent reservation of 9.90 cannot fund another purchase: the cash is reserved and
     // the account blocks until reconciliation; a proven not-sent reconciliation releases it.
-    let events = live.step(70, vec![tick(70, 500), row(0, 70, 70, true)]);
-    let EventKind::Signal {
-        command: Some(command),
-        ..
-    } = &events[0].kind
-    else {
-        unreachable!()
-    };
-    let command = command.clone();
+    let command = Live::command(&live.step(70, vec![tick(70, 500), row(0, 70, 70, true)]));
     live.step(
         71,
         vec![Observation::PossiblySent {
@@ -1312,94 +1536,291 @@ fn the_exact_cashflow_counterexample_and_fees_post_exactly() {
         dispositions(&live.simulate(72, vec![tick(72, 500), row(0, 72, 72, true)])),
         [Disposition::AccountBlocked]
     );
-    live.step(
-        73,
-        vec![Observation::Reconciliation {
-            command,
-            source: source("broker:reconcile", 73),
-            resolution: Resolution::NotSent,
-        }],
+    let error = live
+        .try_step(
+            72,
+            vec![Observation::Accepted {
+                command: command.clone(),
+                source: source("broker:late", 72),
+                entry_time_micros: 70,
+                entry_price_units: 500,
+                price_time_micros: 70,
+            }],
+        )
+        .unwrap_err();
+    assert!(
+        error.contains("not sent or acknowledged"),
+        "a possibly sent command resolves only through reconciliation: {error}"
     );
-    let account = live.account("a").clone();
-    assert_eq!(
-        (
-            account.reserved.to_string(),
-            account.cash.to_string(),
-            account.blocked,
-            account.open
-        ),
-        ("0.00".into(), "18.15".into(), None, 0)
-    );
-    live.assert_restorable();
-    // A known rejection releases without debit; an actual cashflow contradicting the frozen
-    // terms is recorded as a discrepancy and blocks the account.
-    let mut live = Live::new(fractional());
-    let events = live.step(10, vec![tick(10, 500), row(0, 10, 10, true)]);
-    let EventKind::Signal {
-        command: Some(command),
+    let events = live.step(73, vec![reconciliation(&command, 73, Resolution::NotSent)]);
+    let EventKind::Reconciled {
+        release,
+        account_blocked,
         ..
     } = &events[0].kind
     else {
         unreachable!()
     };
+    assert_eq!(
+        (release.to_string(), account_blocked.clone()),
+        ("9.90".into(), None)
+    );
+    assert_eq!(
+        live.balances("a"),
+        (
+            "18.15".into(),
+            "0.00".into(),
+            "0.00".into(),
+            "0.00".into(),
+            "-0.85".into(),
+            0
+        )
+    );
+    live.assert_restorable();
+    // A known rejection releases without debit; an acknowledgement posts nothing and still
+    // permits acceptance; an actual cashflow contradicting the frozen terms is recorded as a
+    // discrepancy, and a deficit beyond the remaining reservation is stated, and both block the
+    // account until the settled command is reconciled.
+    let mut live = Live::new(fractional());
+    let command = Live::command(&live.step(10, vec![tick(10, 500), row(0, 10, 10, true)]));
     let events = live.step(
         11,
         vec![Observation::Rejected {
-            command: command.clone(),
+            command,
             source: source("broker:reject", 11),
         }],
     );
     assert_eq!(kinds(&events), ["released"]);
     assert_eq!(
+        live.balances("a"),
         (
-            live.cash(),
-            live.account("a").reserved.to_string(),
-            live.account("a").open
-        ),
-        ("19.00".into(), "0.00".into(), 0)
+            "19.00".into(),
+            "0.00".into(),
+            "0.00".into(),
+            "0.00".into(),
+            "0.00".into(),
+            0
+        )
     );
-    live.simulate(20, vec![tick(20, 500), row(0, 20, 20, true)]);
+    let command = Live::command(&live.step(20, vec![tick(20, 500), row(0, 20, 20, true)]));
+    let events = live.step(
+        21,
+        vec![Observation::Acknowledged {
+            command: command.clone(),
+            source: source("broker:ack", 21),
+        }],
+    );
+    assert_eq!(kinds(&events), ["acknowledged"]);
+    assert_eq!(
+        live.balances("a").1,
+        "9.90",
+        "an acknowledgement posts nothing"
+    );
+    let events = live.step(
+        22,
+        vec![Observation::Accepted {
+            command: command.clone(),
+            source: source("broker:accept", 22),
+            entry_time_micros: 22,
+            entry_price_units: 500,
+            price_time_micros: 20,
+        }],
+    );
+    assert_eq!(kinds(&events), ["accepted"]);
     let events = live.step(
         30,
-        vec![Observation::Settlement {
-            command: "b1/20".into(),
-            source: source("broker:settle", 30),
-            outcome: Outcome::Win,
-            gross_return: decimal("18"),
-            terminal_fee: decimal("0.20"),
-            settlement_price_units: 600,
-        }],
+        vec![settlement(&command, 30, Outcome::Loss, "0", "0.50", 400)],
     );
     let EventKind::Settled {
         discrepancy,
         credit,
+        deficit,
+        profit,
         ..
     } = &events[0].kind
     else {
         unreachable!()
     };
-    assert!(*discrepancy);
     assert_eq!(
-        credit.to_string(),
-        "17.80",
+        (
+            *discrepancy,
+            credit.to_string(),
+            deficit.map(|d| d.to_string()),
+            profit.to_string()
+        ),
+        (true, "-0.50".into(), Some("0.20".into()), "-10.10".into()),
         "the actual cashflow is recorded, never the configured amount"
+    );
+    assert_eq!(
+        live.balances("a"),
+        (
+            "8.90".into(),
+            "0.00".into(),
+            "0.00".into(),
+            "0.00".into(),
+            "-10.10".into(),
+            0
+        )
     );
     assert!(live.account("a").blocked.is_some());
     assert_eq!(
-        dispositions(&live.simulate(31, vec![tick(31, 600), row(0, 31, 31, true)])),
+        dispositions(&live.simulate(31, vec![tick(31, 400), row(0, 31, 31, true)])),
         [Disposition::AccountBlocked]
     );
+    let events = live.step(
+        32,
+        vec![reconciliation(
+            &command,
+            32,
+            Resolution::Settled {
+                outcome: Outcome::Loss,
+                gross_return: decimal("0"),
+                terminal_fee: decimal("0.50"),
+            },
+        )],
+    );
+    let EventKind::Reconciled {
+        release,
+        debit,
+        credit,
+        profit,
+        account_blocked,
+        ..
+    } = &events[0].kind
+    else {
+        unreachable!()
+    };
+    assert_eq!(
+        (
+            release.to_string(),
+            debit.to_string(),
+            credit.to_string(),
+            *profit,
+            account_blocked.clone()
+        ),
+        ("0.00".into(), "0.00".into(), "0.00".into(), None, None),
+        "reconciling a settled discrepancy posts nothing and lifts the block"
+    );
+    assert_eq!(live.cash(), "8.90");
+    assert!(live.account("a").blocked.is_none());
+    live.assert_restorable();
+    // Reconciliation of a sent command as accepted posts the purchase and keeps the terminal
+    // reserve; the obligation then settles on ticks like any accepted contract. Reconciliation
+    // as settled posts the purchase and the actual cashflow at once.
+    let mut live = Live::new(fractional());
+    let command = Live::command(&live.step(10, vec![tick(10, 500), row(0, 10, 10, true)]));
+    let events = live.step(
+        11,
+        vec![reconciliation(
+            &command,
+            11,
+            Resolution::Accepted {
+                entry_time_micros: 10,
+                entry_price_units: 500,
+                price_time_micros: 10,
+            },
+        )],
+    );
+    let EventKind::Reconciled {
+        release,
+        debit,
+        credit,
+        profit,
+        ..
+    } = &events[0].kind
+    else {
+        unreachable!()
+    };
+    assert_eq!(
+        (
+            release.to_string(),
+            debit.to_string(),
+            credit.to_string(),
+            *profit
+        ),
+        ("9.60".into(), "9.60".into(), "0.00".into(), None)
+    );
+    assert_eq!(
+        live.balances("a"),
+        (
+            "9.40".into(),
+            "0.30".into(),
+            "9.60".into(),
+            "9.90".into(),
+            "0.00".into(),
+            1
+        )
+    );
+    let events = live.simulate(20, vec![tick(20, 600)]);
+    assert_eq!(kinds(&events), ["settled"]);
+    assert_eq!(
+        live.balances("a"),
+        (
+            "28.20".into(),
+            "0.00".into(),
+            "0.00".into(),
+            "0.00".into(),
+            "9.20".into(),
+            0
+        )
+    );
+    let command = Live::command(&live.step(30, vec![tick(30, 600), row(0, 30, 30, true)]));
+    let events = live.step(
+        31,
+        vec![reconciliation(
+            &command,
+            31,
+            Resolution::Settled {
+                outcome: Outcome::Win,
+                gross_return: decimal("19"),
+                terminal_fee: decimal("0.20"),
+            },
+        )],
+    );
+    let EventKind::Reconciled {
+        release,
+        debit,
+        credit,
+        profit,
+        ..
+    } = &events[0].kind
+    else {
+        unreachable!()
+    };
+    assert_eq!(
+        (
+            release.to_string(),
+            debit.to_string(),
+            credit.to_string(),
+            *profit
+        ),
+        (
+            "9.90".into(),
+            "9.60".into(),
+            "18.80".into(),
+            Some(decimal("9.20"))
+        )
+    );
+    assert_eq!(
+        live.balances("a"),
+        (
+            "37.40".into(),
+            "0.00".into(),
+            "0.00".into(),
+            "0.00".into(),
+            "18.40".into(),
+            0
+        )
+    );
+    assert_eq!(live.engine.summary().portfolio.wins, 2);
     live.assert_restorable();
 }
 
 #[test]
 fn quote_envelopes_pauses_conversion_and_projections_are_exact() {
     // Worse terms than the envelope are rejected at admission; equal terms pass.
-    let mut live = Live::new(definition(|base| {
-        base.replace(
-            "min_winning_net_return = \"0.92\"",
-            "min_winning_net_return = \"0.93\"",
-        )
+    let mut live = Live::new(definition(|replay| {
+        replay.bindings[0].envelope.min_winning_net_return = decimal("0.93");
     }));
     assert_eq!(
         dispositions(&live.simulate(10, vec![tick(10, 500), row(0, 10, 10, true)])),
@@ -1407,13 +1828,13 @@ fn quote_envelopes_pauses_conversion_and_projections_are_exact() {
     );
     // A drawdown pause starts when the epoch drawdown reaches the threshold, blocks new entries,
     // continues settlements, and resumes at its deadline with the epoch peak reset.
-    let mut live = Live::new(definition(|base| {
-        base.replace(
-            "max_quote_age_micros = 1000",
-            "max_quote_age_micros = 1000\npause = { drawdown = \"1\", duration_micros = 100 }",
-        )
-        .replace("max_open_per_strategy = 1", "max_open_per_strategy = 5")
-        .replace("max_tick_gap_micros = 60", "max_tick_gap_micros = 1000")
+    let mut live = Live::new(definition(|replay| {
+        replay.risk_policies[0].pause = Some(Pause {
+            drawdown: decimal("1"),
+            duration_micros: 100,
+        });
+        replay.risk_policies[0].max_open_per_strategy = Some(5);
+        replay.contracts[0].settlement.max_tick_gap_micros = 1000;
     }));
     live.simulate(10, vec![tick(10, 500), row(0, 10, 10, true)]);
     live.simulate(11, vec![tick(11, 500), row(0, 11, 11, true)]);
@@ -1447,15 +1868,18 @@ fn quote_envelopes_pauses_conversion_and_projections_are_exact() {
     live.assert_restorable();
     // Conversion: exact same-currency rescaling, and a supplied rate only when its provider and
     // availability times are no later than the decision and its provider age is within bound.
-    let rates = "rates = [{ id = \"r1\", source_currency = \"v\", reporting_currency = \"u\", provider = \"fx\", provider_time = \"1970-01-01T00:00:00.000100Z\", available_at = \"1970-01-01T00:00:00.000103Z\", rate = \"2.5\" }]\n";
-    let mut live = Live::new(definition(|base| {
-        base.replace(
-            "max_rate_age_micros = 5\n",
-            &format!("max_rate_age_micros = 5\n{rates}"),
-        )
-    }));
-    let v: binary_alpha_engine::market::Currency = "v".to_string().try_into().unwrap();
-    let u: binary_alpha_engine::market::Currency = "u".to_string().try_into().unwrap();
+    let v: Currency = "v".to_string().try_into().unwrap();
+    let u: Currency = "u".to_string().try_into().unwrap();
+    let rate = RateEvent {
+        id: "r1".into(),
+        source_currency: v.clone(),
+        reporting_currency: u.clone(),
+        provider: "fx".into(),
+        provider_time: "1970-01-01T00:00:00.000100Z".into(),
+        available_at: "1970-01-01T00:00:00.000103Z".into(),
+        rate: decimal("2.5"),
+    };
+    let mut live = Live::new(definition(|replay| replay.rates = Some(vec![rate.clone()])));
     live.simulate(100, vec![tick(100, 500)]);
     assert_eq!(
         live.engine
@@ -1492,18 +1916,83 @@ fn quote_envelopes_pauses_conversion_and_projections_are_exact() {
             .contains("no v to u rate"),
         "stale beyond the maximum age"
     );
-    // A total unresolved-loss limit needing an unavailable rate blocks admission explicitly.
-    let mut live = Live::new(definition(|base| {
-        base.replace("accounts = [{ id = \"a\", broker = \"b\", currency = \"u\", scale = 2, initial_cash = \"1000\" }]", "accounts = [{ id = \"a\", broker = \"b\", currency = \"u\", scale = 2, initial_cash = \"1000\" }, { id = \"z\", broker = \"b\", currency = \"v\", scale = 2, initial_cash = \"1000\" }]")
-            .replace("max_quote_age_micros = 1000", "max_quote_age_micros = 1000\nmax_unresolved_loss_total = \"100\"")
-    }));
+    // A foreign-currency account: the portfolio projection is observed at the start and after
+    // every account-changing record; without a usable rate the observation is unavailable, and
+    // a total unresolved-loss limit needing that rate blocks admission explicitly.
+    let foreign = |limit: Option<Decimal>| {
+        definition(|replay| {
+            replay.rates = Some(vec![rate.clone()]);
+            replay.accounts.push(AccountSpec {
+                id: "z".into(),
+                broker: "b".to_string().try_into().unwrap(),
+                currency: v.clone(),
+                scale: 2,
+                initial_cash: decimal("1000"),
+            });
+            replay.risk_policies[0].max_unresolved_loss_total = limit;
+        })
+    };
+    let mut live = Live::new(foreign(None));
+    let reporting = live.engine.summary().reporting.clone();
     assert_eq!(
-        dispositions(&live.simulate(10, vec![tick(10, 500), row(0, 10, 10, true)])),
+        (
+            reporting.observations,
+            reporting.unavailable_observations,
+            reporting.settled_equity
+        ),
+        (0, 1, None),
+        "the definition record is observed without a rate"
+    );
+    let events = live.simulate(103, vec![tick(103, 500), row(0, 103, 103, true)]);
+    assert_eq!(kinds(&events), ["signal", "accepted"]);
+    let reporting = live.engine.summary().reporting.clone();
+    assert_eq!(
+        (
+            reporting.observations,
+            reporting.settled_equity.map(|e| e.to_string()),
+            reporting.peak_equity.map(|e| e.to_string()),
+            reporting.max_drawdown.map(|e| e.to_string()),
+            reporting.used_rates.iter().cloned().collect::<Vec<_>>()
+        ),
+        (
+            2,
+            Some("3500.00".into()),
+            Some("3500.00".into()),
+            Some("0.00".into()),
+            vec!["r1".to_string()]
+        )
+    );
+    let events = live.simulate(113, vec![tick(113, 400)]);
+    assert_eq!(kinds(&events), ["settled"]);
+    let reporting = live.engine.summary().reporting.clone();
+    assert_eq!(
+        (
+            reporting.observations,
+            reporting.unavailable_observations,
+            reporting.settled_equity
+        ),
+        (2, 2, None),
+        "a stale rate leaves the settlement's observation unavailable, never native history"
+    );
+    live.assert_restorable();
+    let mut live = Live::new(foreign(Some(decimal("100"))));
+    assert_eq!(
+        dispositions(&live.simulate(50, vec![tick(50, 500), row(0, 50, 50, true)])),
         [Disposition::ConversionUnavailable]
+    );
+    let events = live.simulate(103, vec![tick(103, 500), row(0, 103, 103, true)]);
+    assert_eq!(dispositions(&events), [Disposition::Admitted]);
+    let EventKind::Signal { rates, .. } = &events[0].kind else {
+        unreachable!()
+    };
+    assert_eq!(
+        rates,
+        &["r1".to_string()],
+        "the admission records the rate it used"
     );
     // A zero entry price still settles and records exact movement; only the normalized
     // excursion is absent with its reason.
-    let mut live = Live::new(definition(|base| base));
+    let mut live = Live::new(definition(|_| {}));
     live.simulate(10, vec![tick(10, 0), row(0, 10, 10, true)]);
     let events = live.simulate(20, vec![tick(20, 7)]);
     let EventKind::Settled { outcome, path, .. } = &events[0].kind else {
@@ -1522,56 +2011,166 @@ fn quote_envelopes_pauses_conversion_and_projections_are_exact() {
 }
 
 #[test]
+fn two_instruments_and_the_decision_window_are_independent() {
+    let mut definition = definition(|replay| {
+        replay.inputs.push(ReplayInput {
+            tick_manifest: "file:///p/manifests/3333333333333333333333333333333333333333333333333333333333333333/ready.json".parse().unwrap(),
+            feature_manifest: replay.inputs[0].feature_manifest.clone(),
+            outcome_manifest: None,
+        });
+        let mut second = strategy(replay, "t", stream(5, 0));
+        second.plan_identity = "plan2".into();
+        replay.strategies.push(second);
+        let mut second = binding(replay, "b2", "t");
+        second.instrument = "b:Y".into();
+        replay.bindings.push(second);
+        replay.decision_end = "1970-01-01T00:00:00.000100Z".into();
+    });
+    definition.instruments.push(instrument("b:Y", '3', "plan2"));
+    let mut live = Live::new(definition);
+    // Quotes are per instrument: the second instrument's tick is no quote for the first.
+    let events = live.simulate(
+        10,
+        vec![
+            tick_of(1, 10, 900),
+            row(0, 10, 10, true),
+            row_of(1, 0, 10, 10, vec![Some(Value::Bool(true))]),
+        ],
+    );
+    assert_eq!(
+        dispositions(&events),
+        [Disposition::NoQuote, Disposition::Admitted]
+    );
+    assert_eq!(live.balances("a").5, 1);
+    // The first instrument's ticks do not drive the second instrument's obligation.
+    assert!(live.simulate(20, vec![tick(20, 500)]).is_empty());
+    let events = live.simulate(21, vec![tick_of(1, 21, 950)]);
+    assert_eq!(kinds(&events), ["settled"]);
+    assert_eq!(live.account("a").completed_profit.to_string(), "0.92");
+    // Rows at or after the decision end produce no signal.
+    assert_eq!(
+        dispositions(&live.simulate(70, vec![tick(70, 500), row(0, 70, 70, true)])),
+        [Disposition::Admitted]
+    );
+    let events = live.simulate(100, vec![tick(100, 500), row(0, 100, 100, true)]);
+    assert_eq!(
+        kinds(&events),
+        ["unresolved"],
+        "the late tick, and no signal at the window end"
+    );
+    live.assert_restorable();
+}
+
+#[test]
+fn restored_engines_continue_byte_identically() {
+    let mut live = Live::new(definition(|replay| {
+        replay.risk_policies[0].max_open_per_strategy = Some(3)
+    }));
+    live.simulate(10, vec![tick(10, 500), row(0, 10, 10, true)]);
+    live.simulate(11, vec![tick(11, 501), row(0, 11, 11, true)]);
+    let events = live.simulate(80, vec![tick(80, 505)]);
+    assert_eq!(kinds(&events), ["unresolved", "unresolved"]);
+    let mut restored = live.restored();
+    // The same later observations: the retained obligations are not driven by ticks, the
+    // authoritative settlement resolves one, and every record matches byte for byte.
+    let later: Vec<(i64, Vec<Observation>)> = vec![
+        (90, vec![tick(90, 600), row(0, 90, 90, true)]),
+        (100, vec![tick(100, 610)]),
+        (
+            110,
+            vec![settlement("b1/10", 105, Outcome::Win, "1.92", "0", 610)],
+        ),
+        (111, vec![tick(111, 610), row(0, 111, 111, true)]),
+    ];
+    for (time, observations) in later {
+        let expected = live.simulate(time, observations.clone());
+        let actual = restored.simulate(time, observations);
+        assert_eq!(
+            actual
+                .iter()
+                .map(FinancialEvent::to_line)
+                .collect::<Vec<_>>(),
+            expected
+                .iter()
+                .map(FinancialEvent::to_line)
+                .collect::<Vec<_>>()
+        );
+    }
+    assert_eq!(live.lines, restored.lines);
+    assert_eq!(
+        live.engine.state_identity(),
+        restored.engine.state_identity()
+    );
+    assert_eq!(
+        live.balances("a").5,
+        2,
+        "one retained and one new obligation"
+    );
+    assert_eq!(live.engine.summary().portfolio.unresolved, 1);
+}
+
+#[test]
 fn definitions_reject_mismatched_plans_columns_and_negative_cash_and_accept_many_conditions() {
-    let error = Engine::new(
-        definition(|base| base)
-            .tap(|definition| definition.replay.strategies[0].plan_identity = "other".into()),
-    )
-    .err()
-    .unwrap();
-    assert!(
-        error.contains("no replay input carries frozen plan"),
-        "{error}"
+    let rejected = |edit: fn(&mut Replay), expected: &str| {
+        let error = Engine::new(definition(edit)).err().unwrap();
+        assert!(error.contains(expected), "{error}");
+    };
+    rejected(
+        |replay| replay.strategies[0].plan_identity = "other".into(),
+        "no replay input carries frozen plan",
     );
-    let error = Engine::new(definition(|base| {
-        base.replace("output = \"signal\"", "output = \"missing\"")
-    }))
-    .err()
-    .unwrap();
-    assert!(
-        error.contains("not a compiled output or fitted encoding"),
-        "{error}"
+    rejected(
+        |replay| replay.strategies[0].conditions[0].output = "missing".into(),
+        "not a compiled output or fitted encoding",
     );
-    let error = Engine::new(definition(|base| {
-        base.replace("threshold = true", "threshold = \"yes\"")
-    }))
-    .err()
-    .unwrap();
-    assert!(error.contains("threshold type does not match"), "{error}");
-    let error = Engine::new(
-        definition(|base| base)
-            .tap(|definition| definition.replay.accounts[0].initial_cash = decimal("-1")),
-    )
-    .err()
-    .unwrap();
-    assert!(error.contains("initial_cash"), "{error}");
-    let five = ", ".to_string() + &(0..4).map(|_| "{ stream = { duration_seconds = 15, offset_seconds = 5 }, output = \"signal\", comparator = \"eq\", threshold = true }").collect::<Vec<_>>().join(", ");
-    let mut live = Live::new(definition(|base| {
-        base.replace(
-            "threshold = true }]",
-            &format!("threshold = true }}{five}]"),
-        )
+    rejected(
+        |replay| replay.strategies[0].conditions[0].threshold = Threshold::Text("yes".into()),
+        "threshold type does not match",
+    );
+    rejected(
+        |replay| replay.accounts[0].initial_cash = decimal("-1"),
+        "initial_cash",
+    );
+    // Five conditions over distinct columns and comparators: one failing condition, and only
+    // that one, blocks the conjunction.
+    let mut live = Live::new(definition(|replay| {
+        let other = stream(15, 5);
+        replay.strategies[0].conditions.extend([
+            condition(other, "signal", Comparator::Eq, Threshold::Bool(true)),
+            condition(other, "other", Comparator::Ne, Threshold::Bool(false)),
+            condition(other, "count", Comparator::Ge, Threshold::Number(4.0)),
+            condition(other, "count", Comparator::Lt, Threshold::Number(6.0)),
+        ]);
     }));
     live.simulate(9, vec![row(1, 9, 9, true)]);
     assert_eq!(
         dispositions(&live.simulate(10, vec![tick(10, 500), row(0, 10, 10, true)])),
         [Disposition::Admitted]
     );
-    assert!(live.simulate(15, vec![row(1, 15, 15, false)]).is_empty());
+    let count = |close: i64, count: i64| {
+        row_of(
+            0,
+            1,
+            close,
+            close,
+            vec![
+                Some(Value::Bool(true)),
+                Some(Value::Bool(true)),
+                Some(Value::Int(count)),
+            ],
+        )
+    };
+    live.simulate(15, vec![count(15, 6)]);
     assert!(
         live.simulate(16, vec![tick(16, 500), row(0, 16, 16, true)])
             .is_empty(),
-        "one false condition among five fails the conjunction"
+        "only the fifth condition fails"
+    );
+    live.simulate(25, vec![count(25, 5)]);
+    assert_eq!(
+        dispositions(&live.simulate(26, vec![tick(26, 500), row(0, 26, 26, true)])),
+        [Disposition::CapacityStrategy],
+        "all five hold again"
     );
 }
 
@@ -1721,12 +2320,14 @@ fn exact_path(
 
 /// One target signal record with the state the ledger held when it was decided.
 struct TargetSignal {
+    stream: StreamKey,
     disposition: Disposition,
     known_at: i64,
     quote: i64,
     split: Option<String>,
     command: Option<String>,
-    cash_before: Decimal,
+    /// Native cash less unpaid reservations before this signal.
+    available_before: Decimal,
     /// The command holding the binding's strategy slot at decision time, and whether it was
     /// unresolved then.
     holder: Option<(String, bool)>,
@@ -1736,7 +2337,18 @@ struct TargetSettlement {
     time: i64,
     price: i64,
     outcome: Outcome,
-    path: binary_alpha_engine::execution::PathMetrics,
+    path: PathMetrics,
+}
+
+/// Reference rows keyed by signal number, each kept as one unit-separated line.
+fn index_rows(csv: &mut LegacyCsv) -> HashMap<u64, String> {
+    let signal_column = csv.column("signal_number");
+    let mut rows = HashMap::new();
+    while let Some(row) = csv.next_row() {
+        let number = row[signal_column].parse().unwrap();
+        assert!(rows.insert(number, row.join("\u{1f}")).is_none());
+    }
+    rows
 }
 
 #[test]
@@ -1747,7 +2359,7 @@ fn governed_reference_parity() {
         InvalidReason, OutcomeBuilder, OutcomeManifest, TICK_PRICE_OBJECT_PATH,
         TICK_TIME_OBJECT_PATH, stream_object_paths,
     };
-    use std::collections::HashMap;
+    use std::io::Write;
 
     let config_path = std::env::var("BINARY_ALPHA_TEST_CONFIG")
         .expect("BINARY_ALPHA_TEST_CONFIG names the governed test configuration");
@@ -1763,7 +2375,7 @@ fn governed_reference_parity() {
     let root = &governed.reference_root;
 
     // Every allowlisted reference file carries exactly its recorded byte fingerprint, and the
-    // files have the recorded rows and header widths.
+    // files have the recorded rows and header widths, every header field classified.
     let started = std::time::Instant::now();
     for file in &fixture.reference_files {
         let path = root.join(&file.path);
@@ -1783,9 +2395,14 @@ fn governed_reference_parity() {
         let mapping = &fixture.fields[name];
         let header = LegacyCsv::open(&root.join(format!("parity_cpu_run_v2/{name}.csv"))).header;
         for column in &header {
+            let class = mapping
+                .get(column)
+                .unwrap_or_else(|| panic!("{name}: field {column} has no mapping"))["class"]
+                .as_str()
+                .unwrap();
             assert!(
-                mapping.contains_key(column),
-                "{name}: field {column} has no mapping"
+                matches!(class, "shared" | "derived" | "diagnostic"),
+                "{name}: field {column} has class {class}"
             );
         }
         assert_eq!(
@@ -1866,6 +2483,7 @@ fn governed_reference_parity() {
     );
     assert_eq!(settings.bindings.len(), fixture.candidates.len());
     let run = &fixture.run;
+    let mut contract_of: HashMap<&str, &ContractTerms> = HashMap::new();
     for (binding, candidate) in settings.bindings.iter().zip(&fixture.candidates) {
         assert_eq!(binding.id, candidate.candidate_id);
         assert_eq!(binding.strategy, candidate.strategy);
@@ -1877,11 +2495,16 @@ fn governed_reference_parity() {
         assert_eq!(strategy.base_stream, stream(30, 15));
         assert_eq!(strategy.conditions.len(), 1);
         assert_eq!(strategy.conditions[0].output, candidate.output);
+        assert_eq!(
+            strategy.conditions[0].threshold,
+            Threshold::Text(candidate.value.clone())
+        );
         let contract = settings
             .contracts
             .iter()
             .find(|c| c.id == binding.contract)
             .unwrap();
+        contract_of.insert(&binding.id, contract);
         assert_eq!(
             contract.duration_micros,
             i64::from(candidate.expiry_seconds) * 1_000_000
@@ -1917,7 +2540,7 @@ fn governed_reference_parity() {
             policy.max_open_total,
             run["max_open_trades_total"].as_u64().map(|v| v as u32)
         );
-        assert_eq!(policy.same_entry.to_string(), "all");
+        assert_eq!(policy.same_entry, SameEntry::All);
         assert!(!policy.deduplicate_signal_logic && policy.pause.is_none());
     }
     assert_eq!(
@@ -1990,10 +2613,14 @@ fn governed_reference_parity() {
                 .key,
         )
     };
-    let times = read_le(&object(TICK_TIME_OBJECT_PATH), i64::from_le_bytes);
-    let prices = read_le(&object(TICK_PRICE_OBJECT_PATH), i64::from_le_bytes);
+    let builder = OutcomeBuilder::new(
+        outcome.rule.clone(),
+        read_le(&object(TICK_TIME_OBJECT_PATH), i64::from_le_bytes),
+        read_le(&object(TICK_PRICE_OBJECT_PATH), i64::from_le_bytes),
+    )
+    .unwrap();
+    let (times, prices) = (builder.times(), builder.prices());
     assert_eq!(times.len() as u64, fixture.source_rows);
-    let builder = OutcomeBuilder::new(outcome.rule.clone(), times.clone(), prices.clone()).unwrap();
     let expiries = &outcome.rule.expiry_seconds;
     assert_eq!(
         expiries,
@@ -2085,14 +2712,16 @@ fn governed_reference_parity() {
     };
     assert_eq!(regimes.len(), references.len());
 
-    // The target ledger, indexed by signal identity and command, with the cash and the
-    // strategy-slot holder at each decision.
+    // The target ledger, indexed by signal identity and command, with the available cash and
+    // the strategy-slot holder at each decision.
     let ledger = ledger_lines(&object_path(&store, &manifest, EVENTS_OBJECT_PATH));
     let mut signals: HashMap<(String, i64), TargetSignal> = HashMap::new();
     let mut accepted: HashMap<String, (i64, i64, i64)> = HashMap::new();
     let mut settled: HashMap<String, TargetSettlement> = HashMap::new();
     let mut unresolved: HashMap<String, (UnresolvedReason, String)> = HashMap::new();
     let mut cash = settings.accounts[0].initial_cash.rescale(2).unwrap();
+    let mut reserved = Decimal::zero(2);
+    let mut reservation_of: HashMap<String, Decimal> = HashMap::new();
     let mut holder: HashMap<String, (String, bool)> = HashMap::new();
     let mut binding_of: HashMap<String, String> = HashMap::new();
     let started = std::time::Instant::now();
@@ -2102,15 +2731,21 @@ fn governed_reference_parity() {
             EventKind::RunDefinition { .. } => {}
             EventKind::Signal {
                 binding,
+                stream,
                 close_time_micros,
                 known_at_micros,
                 disposition,
                 quote_price_units,
                 split,
                 command,
+                reservation,
                 ..
             } => {
+                let available_before = cash.checked_sub(reserved).unwrap();
                 if let Some(command) = &command {
+                    let reservation = reservation.unwrap();
+                    reserved = reserved.checked_add(reservation).unwrap();
+                    reservation_of.insert(command.clone(), reservation);
                     holder.insert(binding.clone(), (command.clone(), false));
                     binding_of.insert(command.clone(), binding.clone());
                 }
@@ -2124,12 +2759,13 @@ fn governed_reference_parity() {
                         .insert(
                             (binding, close_time_micros),
                             TargetSignal {
+                                stream,
                                 disposition,
                                 known_at: known_at_micros,
                                 quote: quote_price_units.unwrap(),
                                 split,
                                 command,
-                                cash_before: cash,
+                                available_before,
                                 holder: slot
                             }
                         )
@@ -2142,9 +2778,15 @@ fn governed_reference_parity() {
                 entry_price_units,
                 due_time_micros,
                 debit,
+                reservation,
                 ..
             } => {
                 cash = cash.checked_sub(debit).unwrap();
+                reserved = reserved
+                    .checked_sub(reservation_of[&command])
+                    .unwrap()
+                    .checked_add(reservation)
+                    .unwrap();
                 accepted.insert(
                     command,
                     (entry_time_micros, entry_price_units, due_time_micros),
@@ -2156,10 +2798,12 @@ fn governed_reference_parity() {
                 settlement_price_units,
                 outcome,
                 credit,
+                release,
                 path,
                 ..
             } => {
                 cash = cash.checked_add(credit).unwrap();
+                reserved = reserved.checked_sub(release).unwrap();
                 holder.remove(&binding_of[&command]);
                 settled.insert(
                     command,
@@ -2201,73 +2845,11 @@ fn governed_reference_parity() {
     // Reference trades and invalidations joined by signal number.
     let started = std::time::Instant::now();
     let mut trades = LegacyCsv::open(&root.join("parity_cpu_run_v2/trades.csv"));
-    let trade_columns: Vec<usize> = [
-        "entry_time_utc",
-        "due_time_utc",
-        "settlement_tick_time_utc",
-        "settlement_price",
-        "outcome",
-        "net_units",
-        "final_directional_move_bps",
-        "max_favorable_excursion_bps",
-        "max_adverse_excursion_bps",
-        "mfe_time_utc",
-        "mae_time_utc",
-        "first_favorable_time_utc",
-        "first_adverse_time_utc",
-        "favorable_before_adverse",
-        "adverse_before_favorable",
-        "split_label",
-    ]
-    .iter()
-    .map(|name| trades.column(name))
-    .collect();
-    let signal_column = trades.column("signal_number");
-    let mut trade_rows: HashMap<u64, Vec<String>> = HashMap::new();
-    while let Some(row) = trades.next_row() {
-        let number = row[signal_column].parse().unwrap();
-        assert!(
-            trade_rows
-                .insert(
-                    number,
-                    trade_columns
-                        .iter()
-                        .map(|&index| row[index].clone())
-                        .collect()
-                )
-                .is_none()
-        );
-    }
+    let trades_header = trades.header.clone();
+    let trade_rows = index_rows(&mut trades);
     let mut invalid = LegacyCsv::open(&root.join("parity_cpu_run_v2/invalid_trades.csv"));
-    let invalid_columns: Vec<usize> = [
-        "entry_time_utc",
-        "due_time_utc",
-        "invalidated_time_utc",
-        "invalid_reason",
-        "gap_start_time_utc",
-        "gap_end_time_utc",
-        "gap_ms",
-        "split_label",
-    ]
-    .iter()
-    .map(|name| invalid.column(name))
-    .collect();
-    let signal_column = invalid.column("signal_number");
-    let mut invalid_rows: HashMap<u64, Vec<String>> = HashMap::new();
-    while let Some(row) = invalid.next_row() {
-        let number = row[signal_column].parse().unwrap();
-        assert!(
-            invalid_rows
-                .insert(
-                    number,
-                    invalid_columns
-                        .iter()
-                        .map(|&index| row[index].clone())
-                        .collect()
-                )
-                .is_none()
-        );
-    }
+    let invalid_header = invalid.header.clone();
+    let invalid_rows = index_rows(&mut invalid);
     assert_eq!(
         (trade_rows.len() as u64, invalid_rows.len() as u64),
         (
@@ -2285,56 +2867,44 @@ fn governed_reference_parity() {
         started.elapsed().as_secs_f64()
     );
 
-    // Every reference signal: identity, shared evaluation fields, historical diagnostics, path
-    // projections, and the classified disposition.
+    // Every reference signal: the classified disposition citing the first differing transition,
+    // then every field the fixture declares shared, compared by header name across the three
+    // reference files. Every divergence is retained with its citation.
     let started = std::time::Instant::now();
     let mut signals_csv = LegacyCsv::open(&root.join("parity_cpu_run_v2/signals.csv"));
+    let signals_header = signals_csv.header.clone();
     let column = |name: &str| signals_csv.column(name);
-    let (
-        c_number,
-        c_candidate,
-        c_candle_set,
-        c_expiry,
-        c_direction,
-        c_decision,
-        c_entry_tick,
-        c_split,
-        c_entry_price,
-        c_opened,
-        c_block,
-        c_validity,
-        c_predicate,
-    ) = (
+    let (c_number, c_candidate, c_decision, c_opened, c_block) = (
         column("signal_number"),
         column("candidate_id"),
-        column("candle_set"),
-        column("expiry_seconds"),
-        column("direction"),
         column("row_decision_time_utc"),
-        column("entry_tick_time_utc"),
-        column("split_label"),
-        column("entry_price"),
         column("opened_trade"),
         column("block_reasons"),
-        column("validity_block_reason"),
-        column("predicate"),
     );
-    let c_regimes: Vec<usize> = regime_names.iter().map(|name| column(name)).collect();
     let by_candidate: HashMap<&str, &Candidate> = fixture
         .candidates
         .iter()
         .map(|candidate| (candidate.candidate_id.as_str(), candidate))
         .collect();
     let scale8 = PriceScale::try_from(8).unwrap();
+    let divergences_path =
+        Path::new(env!("CARGO_TARGET_TMPDIR")).join("phase06_reference_divergences.tsv");
+    let mut divergences = std::io::BufWriter::new(fs::File::create(&divergences_path).unwrap());
+    writeln!(divergences, "signal_number\tclass\tcitation").unwrap();
+    let mut retained = 0u64;
     let mut classes: BTreeMap<&str, u64> = BTreeMap::new();
     let mut examples: BTreeMap<&str, String> = BTreeMap::new();
     let mut divergent_commands: std::collections::HashSet<String> =
         std::collections::HashSet::new();
+    // Per candidate: the reference's last opened trade (signal number, the time it closed) and
+    // the target's last divergence.
+    let mut reference_holder: HashMap<&str, (u64, i64, i64)> = HashMap::new();
     let mut last_divergence: HashMap<&str, u64> = HashMap::new();
     let mut path_source_rounding = 0u64;
     let mut path_time_source_rounding = 0u64;
     let mut compared_paths = 0u64;
     let mut compared_outcomes = 0u64;
+    let mut compared_fields = 0u64;
     let mut reference_counts = BTreeMap::from([
         ("opened", 0u64),
         ("blocked_by_strategy_capacity", 0),
@@ -2343,32 +2913,30 @@ fn governed_reference_parity() {
         ("losses", 0),
         ("ties", 0),
     ]);
-    let mut classify = |class: &'static str, citation: String| {
+    let mut classify = |number: u64, class: &'static str, citation: String| {
         *classes.entry(class).or_default() += 1;
+        if !class.starts_with("matched_") {
+            writeln!(divergences, "{number}\t{class}\t{citation}").unwrap();
+            retained += 1;
+        }
         examples.entry(class).or_insert(citation);
+        class
     };
+    let time_pair =
+        |reference: &str, target: i64| (micros(reference).to_string(), target.to_string());
+    let price_pair = |reference: &str, target_units: i64| {
+        (
+            parse_price_units(reference, scale8).unwrap().to_string(),
+            (target_units * 100).to_string(),
+        )
+    };
+    let optional_time = |text: &str| (!text.is_empty()).then(|| micros(text));
     let mut rows_seen = 0u64;
     while let Some(row) = signals_csv.next_row() {
         rows_seen += 1;
         let number: u64 = row[c_number].parse().unwrap();
         let candidate = by_candidate[row[c_candidate].as_str()];
-        assert_eq!(
-            (
-                row[c_candle_set].as_str(),
-                row[c_expiry].parse::<u32>().unwrap(),
-                row[c_direction].as_str()
-            ),
-            (
-                candidate.candle_set.as_str(),
-                candidate.expiry_seconds,
-                candidate.direction.as_str()
-            ),
-            "signal {number}"
-        );
-        assert_eq!(
-            row[c_predicate],
-            format!("{} == '{}'", candidate.output, candidate.value)
-        );
+        let contract = contract_of[candidate.candidate_id.as_str()];
         let close = micros(&row[c_decision]);
         let target = signals
             .get(&(candidate.candidate_id.clone(), close))
@@ -2379,28 +2947,6 @@ fn governed_reference_parity() {
                 )
             });
         let row_index = row_of[&close];
-        // Shared evaluation fields: the trigger tick, its price, the split, and the regimes.
-        assert_eq!(
-            target.known_at,
-            micros(&row[c_entry_tick]),
-            "signal {number}: entry tick"
-        );
-        assert_eq!(
-            target.quote * 100,
-            parse_price_units(&row[c_entry_price], scale8).unwrap(),
-            "signal {number}: entry price"
-        );
-        assert_eq!(
-            target.split.as_deref(),
-            Some(row[c_split].as_str()),
-            "signal {number}: split"
-        );
-        for (index, name) in regime_names.iter().enumerate() {
-            assert_eq!(
-                regimes[&close][index], row[c_regimes[index]],
-                "signal {number}: {name}"
-            );
-        }
         // Historical diagnostics from the outcome labels for this row and expiry.
         let expiry_column = expiries
             .iter()
@@ -2419,15 +2965,21 @@ fn governed_reference_parity() {
             entry.event_time_micros, target.known_at,
             "signal {number}: the label entry tick is the trigger tick"
         );
-        let sell = candidate.direction == "SELL";
+        let sell = contract.direction == Direction::Sell;
         let reference_opened = row[c_opened] == "1";
         let reference_block = row[c_block].as_str();
-        let trade = trade_rows.get(&number);
-        let invalidated = invalid_rows.get(&number);
+        let trade: Option<Vec<&str>> = trade_rows
+            .get(&number)
+            .map(|line| line.split('\u{1f}').collect());
+        let invalidated: Option<Vec<&str>> = invalid_rows
+            .get(&number)
+            .map(|line| line.split('\u{1f}').collect());
         if reference_opened {
             *reference_counts.get_mut("opened").unwrap() += 1;
         }
-        if let Some(trade) = trade {
+        // The reference's settled trade: the label agrees, and the exact integer path and the
+        // legacy floating path over the same window.
+        let reference_trade = trade.as_ref().map(|_| {
             compared_outcomes += 1;
             let settlement = cell.settlement.unwrap();
             assert_eq!(
@@ -2435,157 +2987,39 @@ fn governed_reference_parity() {
                 InvalidReason::Valid,
                 "signal {number}: the settled reference trade is a valid label"
             );
-            assert_eq!(
-                micros(&trade[0]),
-                entry.event_time_micros,
-                "signal {number}: entry time"
-            );
-            assert_eq!(
-                micros(&trade[1]),
-                cell.due_time_micros.unwrap(),
-                "signal {number}: due time"
-            );
-            assert_eq!(
-                micros(&trade[2]),
-                settlement.event_time_micros,
-                "signal {number}: settlement tick"
-            );
-            assert_eq!(
-                settlement.price_units * 100,
-                parse_price_units(&trade[3], scale8).unwrap(),
-                "signal {number}: settlement price"
-            );
-            let expected = match (cell.outcome.unwrap(), sell) {
+            let outcome = match (cell.outcome.unwrap(), sell) {
                 (binary_alpha_engine::outcomes::Outcome::Tie, _) => "tie",
                 (binary_alpha_engine::outcomes::Outcome::BuyWin, false)
                 | (binary_alpha_engine::outcomes::Outcome::SellWin, true) => "win",
                 _ => "loss",
             };
-            assert_eq!(trade[4], expected, "signal {number}: outcome");
             *reference_counts
-                .get_mut(match expected {
+                .get_mut(match outcome {
                     "win" => "wins",
                     "loss" => "losses",
                     _ => "ties",
                 })
                 .unwrap() += 1;
-            assert_eq!(trade[15], row[c_split]);
-            // Path projections: the exact integer path, or the legacy floating rounding.
             let exact = exact_path(
-                &times,
-                &prices,
+                times,
+                prices,
                 entry.index as usize,
                 settlement.index as usize,
                 sell,
             );
             let legacy = legacy_path(
-                &times,
-                &prices,
+                times,
+                prices,
                 entry.index as usize,
                 settlement.index as usize,
                 sell,
             );
-            let entry_units = prices[entry.index as usize];
-            for (name, reference, exact_text, legacy_value) in [
-                (
-                    "final_directional_move_bps",
-                    &trade[6],
-                    basis_points_text(exact.final_move_units, entry_units).unwrap(),
-                    legacy.final_move,
-                ),
-                (
-                    "max_favorable_excursion_bps",
-                    &trade[7],
-                    basis_points_text(exact.max_favorable_units, entry_units).unwrap(),
-                    legacy.mfe,
-                ),
-                (
-                    "max_adverse_excursion_bps",
-                    &trade[8],
-                    basis_points_text(exact.max_adverse_units, entry_units).unwrap(),
-                    legacy.mae,
-                ),
-            ] {
-                if exact_text == *reference {
-                    continue;
-                }
-                assert_eq!(
-                    format!("{legacy_value:.10}"),
-                    *reference,
-                    "signal {number}: {name} differs from the exact projection and the legacy rounding does not reproduce it"
-                );
-                path_source_rounding += 1;
-            }
-            for (name, reference, exact_time, legacy_time) in [
-                (
-                    "mfe_time_utc",
-                    &trade[9],
-                    exact.max_favorable_time_micros,
-                    legacy.mfe_time,
-                ),
-                (
-                    "mae_time_utc",
-                    &trade[10],
-                    exact.max_adverse_time_micros,
-                    legacy.mae_time,
-                ),
-            ] {
-                let reference = micros(reference);
-                if reference == exact_time {
-                    continue;
-                }
-                assert_eq!(
-                    legacy_time, reference,
-                    "signal {number}: {name} differs and the legacy rounded comparison does not reproduce it"
-                );
-                assert_eq!(
-                    prices[times.partition_point(|&t| t < reference)],
-                    prices[times.partition_point(|&t| t < exact_time)],
-                    "signal {number}: {name} names an equal extremum"
-                );
-                path_time_source_rounding += 1;
-            }
-            let optional = |text: &str| (!text.is_empty()).then(|| micros(text));
-            assert_eq!(
-                exact.first_favorable_time_micros,
-                optional(&trade[11]),
-                "signal {number}: first favorable"
-            );
-            assert_eq!(
-                exact.first_adverse_time_micros,
-                optional(&trade[12]),
-                "signal {number}: first adverse"
-            );
-            assert_eq!(
-                (
-                    exact.favorable_before_adverse,
-                    exact.adverse_before_favorable
-                ),
-                (trade[13] == "1", trade[14] == "1"),
-                "signal {number}: ordering flags"
-            );
             compared_paths += 1;
-            // The target's own settlement of the same contract agrees exactly.
-            if let Some(command) = &target.command
-                && let Some(target_settlement) = settled.get(command)
-            {
-                assert_eq!(
-                    (target_settlement.time, target_settlement.price),
-                    (settlement.event_time_micros, settlement.price_units),
-                    "signal {number}: target settlement"
-                );
-                assert_eq!(
-                    target_settlement.outcome.to_string(),
-                    expected,
-                    "signal {number}: target outcome"
-                );
-                assert_eq!(
-                    target_settlement.path, exact,
-                    "signal {number}: target path"
-                );
-            }
-        }
-        if let Some(invalidated) = invalidated {
+            (settlement, outcome, exact, legacy)
+        });
+        // The reference's invalidated trade: a gap transition in the tick arrays inside the
+        // contract window, and a gap or stale-settlement label.
+        let gap = invalidated.as_ref().map(|invalidated| {
             assert!(
                 matches!(
                     cell.reason,
@@ -2594,26 +3028,19 @@ fn governed_reference_parity() {
                 "signal {number}: the invalidated trade's label reason is {}",
                 cell.reason
             );
-            assert_eq!(micros(&invalidated[0]), entry.event_time_micros);
-            assert_eq!(micros(&invalidated[1]), cell.due_time_micros.unwrap());
-            assert_eq!(invalidated[3], "expiry_window_crossed_tick_gap");
-            let (gap_start, gap_end) = (micros(&invalidated[4]), micros(&invalidated[5]));
+            let gap_end = micros(
+                invalidated[invalid_header
+                    .iter()
+                    .position(|h| h == "gap_end_time_utc")
+                    .unwrap()],
+            );
             let gap_end_index = times.partition_point(|&t| t < gap_end);
-            assert_eq!(
-                (times[gap_end_index - 1], times[gap_end_index]),
-                (gap_start, gap_end),
-                "signal {number}: the gap is a tick transition"
-            );
-            assert_eq!(
-                (gap_end - gap_start) / 1000,
-                invalidated[6].parse::<i64>().unwrap()
-            );
+            let gap_start = times[gap_end_index - 1];
             assert!(
                 entry.event_time_micros <= gap_start && gap_start < cell.due_time_micros.unwrap()
             );
-            assert_eq!(micros(&invalidated[2]), gap_end);
-            assert_eq!(invalidated[7], row[c_split]);
-        }
+            (gap_start, gap_end)
+        });
         // Dispositions, classified with the first differing transition cited.
         let citation = |what: &str| {
             format!(
@@ -2621,31 +3048,32 @@ fn governed_reference_parity() {
                 candidate.candidate_id, row[c_decision]
             )
         };
-        match (reference_opened, reference_block, target.disposition) {
+        let class = match (reference_opened, reference_block, target.disposition) {
             (true, _, Disposition::Admitted) => {
                 let command = target.command.as_ref().unwrap();
-                if let Some(invalidated) = invalidated {
+                if let Some((_, gap_end)) = gap {
                     let (reason, evidence) = unresolved.get(command).unwrap_or_else(|| panic!("signal {number}: the reference invalidated this trade but the target settled or kept it"));
                     assert_eq!(*reason, UnresolvedReason::Gap);
                     assert!(
-                        evidence.contains(&format_event_time_micros(micros(&invalidated[5]))),
+                        evidence.contains(&format_event_time_micros(gap_end)),
                         "signal {number}: {evidence}"
                     );
                     divergent_commands.insert(command.clone());
                     last_divergence.insert(candidate.candidate_id.as_str(), number);
                     classify(
+                        number,
                         "retained_unresolved_settlement_evidence",
                         citation(&format!(
                             "the reference removed the trade at its gap; the target retains {command}: {evidence}"
                         )),
-                    );
+                    )
                 } else {
                     assert!(
                         settled.contains_key(command)
                             || accepted.contains_key(command) && !unresolved.contains_key(command),
                         "signal {number}: the target left {command} unresolved where the reference settled"
                     );
-                    classify("matched_admitted", citation("both admitted"));
+                    classify(number, "matched_admitted", citation("both admitted"))
                 }
             }
             (false, "[\"max_open_trades_per_strategy\"]", Disposition::CapacityStrategy) => {
@@ -2653,9 +3081,10 @@ fn governed_reference_parity() {
                     .get_mut("blocked_by_strategy_capacity")
                     .unwrap() += 1;
                 classify(
+                    number,
                     "matched_capacity",
                     citation("both blocked by strategy capacity"),
-                );
+                )
             }
             (
                 false,
@@ -2663,36 +3092,38 @@ fn governed_reference_parity() {
                 Disposition::GapAtEntry | Disposition::StaleFeature,
             ) => {
                 *reference_counts.get_mut("blocked_by_entry_gap").unwrap() += 1;
-                assert_eq!(row[c_validity], "invalid_recent_tick_gap");
                 let index = entry.index as usize;
                 assert!(
                     times[index] - times[index - 1] > 60_000_000,
                     "signal {number}: the gap into the trigger tick"
                 );
                 classify(
+                    number,
                     "matched_gap_at_entry",
                     citation(&format!(
                         "gap of {} microseconds into the trigger tick; target {}",
                         times[index] - times[index - 1],
                         target.disposition
                     )),
-                );
+                )
             }
             (true, _, Disposition::InsufficientCash) => {
+                let reservation = contract.reservation().unwrap().rescale(2).unwrap();
                 assert!(
-                    target.cash_before.compare(decimal("1.00")).unwrap()
+                    target.available_before.compare(reservation).unwrap()
                         == std::cmp::Ordering::Less,
-                    "signal {number}: cash {}",
-                    target.cash_before
+                    "signal {number}: available {}",
+                    target.available_before
                 );
                 last_divergence.insert(candidate.candidate_id.as_str(), number);
                 classify(
+                    number,
                     "insufficient_cash",
                     citation(&format!(
-                        "native cash {} cannot fund the reservation 1.00",
-                        target.cash_before
+                        "available cash {} (native cash less unpaid reservations) cannot fund the reservation {reservation}",
+                        target.available_before
                     )),
-                );
+                )
             }
             (true, _, Disposition::CapacityStrategy) => {
                 let (held_by, retained) = target.holder.clone().unwrap_or_else(|| {
@@ -2704,6 +3135,7 @@ fn governed_reference_parity() {
                 );
                 last_divergence.insert(candidate.candidate_id.as_str(), number);
                 classify(
+                    number,
                     if retained {
                         "capacity_held_by_retained_unresolved"
                     } else {
@@ -2712,41 +3144,250 @@ fn governed_reference_parity() {
                     citation(&format!(
                         "the strategy slot is held by {held_by}, first differing transition of this binding"
                     )),
-                );
+                )
             }
             (false, "[\"max_open_trades_per_strategy\"]", Disposition::Admitted) => {
                 *reference_counts
                     .get_mut("blocked_by_strategy_capacity")
                     .unwrap() += 1;
                 let earlier = last_divergence.get(candidate.candidate_id.as_str()).copied().unwrap_or_else(|| panic!("signal {number}: admitted where the reference was capacity blocked without an earlier divergence"));
+                let (holder_number, holder_decision, holder_close) = *reference_holder
+                    .get(candidate.candidate_id.as_str())
+                    .unwrap_or_else(|| panic!("signal {number}: the reference was capacity blocked without an opened trade of this candidate"));
+                assert!(
+                    holder_close > target.known_at,
+                    "signal {number}: the reference's last trade of this candidate (signal {holder_number}) closed at {} before the trigger tick",
+                    format_event_time_micros(holder_close)
+                );
+                let holder_disposition =
+                    signals[&(candidate.candidate_id.clone(), holder_decision)].disposition;
+                assert_ne!(
+                    holder_disposition,
+                    Disposition::Admitted,
+                    "signal {number}: the target also opened the reference's holding trade"
+                );
                 divergent_commands.insert(target.command.clone().unwrap());
                 classify(
+                    number,
                     "admitted_after_divergence",
                     citation(&format!(
-                        "the reference slot was held by a trade the target lacks since signal {earlier}"
+                        "the reference slot is held by its trade of signal {holder_number}, open until {}, which the target did not open (first differing transition of this binding: signal {earlier})",
+                        format_event_time_micros(holder_close)
                     )),
-                );
+                )
             }
             (opened, block, disposition) => panic!(
                 "signal {number}: unclassified difference: reference opened {opened} block {block}, target {disposition}"
             ),
+        };
+        if reference_opened {
+            let closed = match (&reference_trade, gap) {
+                (Some((settlement, ..)), None) => settlement.event_time_micros,
+                (None, Some((_, gap_end))) => gap_end,
+                _ => {
+                    panic!("signal {number}: an opened reference signal is settled or invalidated")
+                }
+            };
+            reference_holder.insert(candidate.candidate_id.as_str(), (number, close, closed));
+        }
+        let opened_class = matches!(
+            class,
+            "matched_admitted"
+                | "insufficient_cash"
+                | "capacity_held_by_retained_unresolved"
+                | "capacity_held_after_divergence"
+                | "retained_unresolved_settlement_evidence"
+        );
+        // The shared fields of every reference file this signal appears in.
+        let mut field = |file: &str, name: &str, reference: &str| -> (String, String) {
+            let text = |target: String| (reference.to_string(), target);
+            match name {
+                "candidate_id" => text(candidate.candidate_id.clone()),
+                "candle_set" => text(format!(
+                    "{}s_offset{}s",
+                    target.stream.duration_seconds, target.stream.offset_seconds
+                )),
+                "expiry_seconds" => text((contract.duration_micros / 1_000_000).to_string()),
+                "direction" => text(contract.direction.to_string().to_uppercase()),
+                "row_decision_time_utc" => time_pair(reference, close),
+                "entry_tick_time_utc" => time_pair(reference, target.known_at),
+                "entry_time_utc" => {
+                    if let Some(command) = &target.command
+                        && let Some((entry_time, entry_price, _)) = accepted.get(command)
+                    {
+                        assert_eq!(
+                            (*entry_time, *entry_price),
+                            (target.known_at, target.quote),
+                            "signal {number}: accepted entry"
+                        );
+                    }
+                    time_pair(reference, entry.event_time_micros)
+                }
+                "split_label" => text(target.split.clone().unwrap_or_default()),
+                "entry_price" => price_pair(reference, target.quote),
+                "predicate" => text(format!("{} == '{}'", candidate.output, candidate.value)),
+                "opened_trade" => text(if opened_class { "1" } else { "0" }.into()),
+                "block_reasons" => text(
+                    match class {
+                        "matched_capacity" | "admitted_after_divergence" => {
+                            "[\"max_open_trades_per_strategy\"]"
+                        }
+                        "matched_gap_at_entry" => "[\"invalid_recent_tick_gap\"]",
+                        _ => "[]",
+                    }
+                    .into(),
+                ),
+                "validity_block_reason" => text(
+                    if class == "matched_gap_at_entry" {
+                        "invalid_recent_tick_gap"
+                    } else {
+                        ""
+                    }
+                    .into(),
+                ),
+                _ if regime_names.contains(&name) => {
+                    let index = regime_names.iter().position(|n| *n == name).unwrap();
+                    text(regimes[&close][index].clone())
+                }
+                "due_time_utc" => {
+                    if let Some(command) = &target.command
+                        && let Some((_, _, due)) = accepted.get(command)
+                    {
+                        assert_eq!(
+                            *due,
+                            cell.due_time_micros.unwrap(),
+                            "signal {number}: accepted due time"
+                        );
+                    }
+                    time_pair(reference, cell.due_time_micros.unwrap())
+                }
+                "settlement_tick_time_utc" | "settlement_price" | "outcome" => {
+                    let (label, outcome, exact, _) = reference_trade.as_ref().unwrap();
+                    if let Some(command) = &target.command
+                        && let Some(target_settlement) = settled.get(command)
+                    {
+                        assert_eq!(
+                            (
+                                target_settlement.time,
+                                target_settlement.price,
+                                target_settlement.outcome.to_string(),
+                                target_settlement.path
+                            ),
+                            (
+                                label.event_time_micros,
+                                label.price_units,
+                                (*outcome).to_string(),
+                                *exact
+                            ),
+                            "signal {number}: the target's own settlement of the same contract"
+                        );
+                    }
+                    match name {
+                        "settlement_tick_time_utc" => time_pair(reference, label.event_time_micros),
+                        "settlement_price" => price_pair(reference, label.price_units),
+                        _ => text((*outcome).to_string()),
+                    }
+                }
+                "final_directional_move_bps"
+                | "max_favorable_excursion_bps"
+                | "max_adverse_excursion_bps" => {
+                    let (_, _, exact, legacy) = reference_trade.as_ref().unwrap();
+                    let entry_units = prices[entry.index as usize];
+                    let (units, legacy_value) = match name {
+                        "final_directional_move_bps" => (exact.final_move_units, legacy.final_move),
+                        "max_favorable_excursion_bps" => (exact.max_favorable_units, legacy.mfe),
+                        _ => (exact.max_adverse_units, legacy.mae),
+                    };
+                    let exact_text = basis_points_text(units, entry_units).unwrap();
+                    if exact_text == reference {
+                        text(exact_text)
+                    } else {
+                        path_source_rounding += 1;
+                        text(format!("{legacy_value:.10}"))
+                    }
+                }
+                "mfe_time_utc" | "mae_time_utc" => {
+                    let (_, _, exact, legacy) = reference_trade.as_ref().unwrap();
+                    let (exact_time, legacy_time) = if name == "mfe_time_utc" {
+                        (exact.max_favorable_time_micros, legacy.mfe_time)
+                    } else {
+                        (exact.max_adverse_time_micros, legacy.mae_time)
+                    };
+                    let reference_time = micros(reference);
+                    if reference_time == exact_time {
+                        time_pair(reference, exact_time)
+                    } else {
+                        assert_eq!(
+                            prices[times.partition_point(|&t| t < reference_time)],
+                            prices[times.partition_point(|&t| t < exact_time)],
+                            "signal {number}: {name} names an equal extremum"
+                        );
+                        path_time_source_rounding += 1;
+                        time_pair(reference, legacy_time)
+                    }
+                }
+                "first_favorable_time_utc" | "first_adverse_time_utc" => {
+                    let (_, _, exact, _) = reference_trade.as_ref().unwrap();
+                    let target_time = if name == "first_favorable_time_utc" {
+                        exact.first_favorable_time_micros
+                    } else {
+                        exact.first_adverse_time_micros
+                    };
+                    (
+                        format!("{:?}", optional_time(reference)),
+                        format!("{target_time:?}"),
+                    )
+                }
+                "favorable_before_adverse" | "adverse_before_favorable" => {
+                    let (_, _, exact, _) = reference_trade.as_ref().unwrap();
+                    let flag = if name == "favorable_before_adverse" {
+                        exact.favorable_before_adverse
+                    } else {
+                        exact.adverse_before_favorable
+                    };
+                    text(if flag { "1" } else { "0" }.into())
+                }
+                "invalidated_time_utc" => time_pair(reference, gap.unwrap().1),
+                "invalid_reason" => text("expiry_window_crossed_tick_gap".into()),
+                "gap_start_time_utc" => time_pair(reference, gap.unwrap().0),
+                "gap_end_time_utc" => time_pair(reference, gap.unwrap().1),
+                "gap_ms" => {
+                    let (start, end) = gap.unwrap();
+                    text(((end - start) / 1000).to_string())
+                }
+                other => panic!("{file}: shared field {other} has no comparison"),
+            }
+        };
+        let signal_fields: Vec<&str> = row.iter().map(String::as_str).collect();
+        for (file, header, fields) in [
+            ("signals", &signals_header, Some(&signal_fields)),
+            ("trades", &trades_header, trade.as_ref()),
+            ("invalid_trades", &invalid_header, invalidated.as_ref()),
+        ] {
+            let Some(fields) = fields else { continue };
+            for (name, reference) in header.iter().zip(fields) {
+                if fixture.fields[file][name]["class"] != "shared" {
+                    continue;
+                }
+                let (expected, actual) = field(file, name, reference);
+                assert_eq!(expected, actual, "signal {number}: {file}.{name}");
+                compared_fields += 1;
+            }
         }
     }
+    divergences.flush().unwrap();
     assert_eq!(rows_seen, fixture.rows["signals"]);
-    for (name, expected) in [
-        ("opened", "opened"),
-        (
-            "blocked_by_strategy_capacity",
-            "blocked_by_strategy_capacity",
-        ),
-        ("blocked_by_entry_gap", "blocked_by_entry_gap"),
-        ("wins", "wins"),
-        ("losses", "losses"),
-        ("ties", "ties"),
+    for name in [
+        "opened",
+        "blocked_by_strategy_capacity",
+        "blocked_by_entry_gap",
+        "wins",
+        "losses",
+        "ties",
     ] {
         assert_eq!(
             reference_counts[name],
-            fixture.totals[expected].as_u64().unwrap(),
+            fixture.totals[name].as_u64().unwrap(),
             "{name}"
         );
     }
@@ -2767,12 +3408,16 @@ fn governed_reference_parity() {
         "exact unit arithmetic of the reference dispositions"
     );
     println!(
-        "compared {rows_seen} reference signals in {:.1} s: {compared_outcomes} settled outcomes and {compared_paths} paths agree; {path_source_rounding} path values and {path_time_source_rounding} extremum times reproduce only through the legacy floating rounding",
+        "compared {rows_seen} reference signals in {:.1} s: {compared_fields} shared fields, {compared_outcomes} settled outcomes and {compared_paths} paths agree; {path_source_rounding} path values and {path_time_source_rounding} extremum times reproduce only through the legacy floating rounding",
         started.elapsed().as_secs_f64()
     );
     for (class, count) in &classes {
         println!("  {class}: {count} (first: {})", examples[class]);
     }
+    println!(
+        "retained {retained} divergence citations at {}",
+        divergences_path.display()
+    );
 
     // The target's actual funded results, the reference's historical diagnostics, and the run
     // evidence, side by side.
