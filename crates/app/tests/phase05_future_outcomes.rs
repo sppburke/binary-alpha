@@ -155,16 +155,6 @@ fn build(config: &Path) -> Result<Vec<String>, String> {
     command(&["outcomes", "build", "--config", config.to_str().unwrap()])
 }
 
-fn read_le<T, const N: usize>(path: &Path, decode: fn([u8; N]) -> T) -> Vec<T> {
-    fs::read(path)
-        .unwrap()
-        .as_chunks::<N>()
-        .0
-        .iter()
-        .map(|chunk| decode(*chunk))
-        .collect()
-}
-
 fn object_path(
     store: &Path,
     objects: &[binary_alpha_engine::dataset::ObjectRecord],

@@ -1928,6 +1928,38 @@ impl FeaturePlan {
         crate::hex(&hasher.finalize())
     }
 
+    /// The boolean outputs that declare when `output` is ready where readiness is separate
+    /// from the value: `is_ema{p}_ready` for every moving-average period the output requires,
+    /// and `tick_path_ready` for the tick-path buckets that read `insufficient_tick_path`
+    /// until then. Readiness outputs themselves, and outputs whose unavailability is their own
+    /// value, have none.
+    pub fn readiness_of(&self, output: &str) -> Vec<String> {
+        use Field as F;
+        let Some(definition) = catalog(&self.settings)
+            .into_iter()
+            .find(|definition| definition.name == output)
+        else {
+            return Vec::new();
+        };
+        match definition.field {
+            F::TickPathPressureBucket
+            | F::TickPathShapeBucket
+            | F::TickPathTerminalPressureBucket
+            | F::TickPathFailedPressureDirection
+            | F::TickPathEfficiencyBucket
+            | F::TickPathReversalBucket => vec![field_name(F::TickPathReady)],
+            F::EmaReady(_) => Vec::new(),
+            _ => definition
+                .requires
+                .iter()
+                .filter_map(|requirement| match requirement {
+                    Req::Period(period) => Some(field_name(F::EmaReady(*period))),
+                    _ => None,
+                })
+                .collect(),
+        }
+    }
+
     pub fn stream(&self, key: StreamKey) -> Option<&StreamPlan> {
         self.streams.iter().find(|stream| stream.key() == key)
     }

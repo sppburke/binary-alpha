@@ -616,13 +616,15 @@ fn condition(
 }
 
 /// The bound instrument `BROKER:SYMBOL` with a boolean `signal` column on stream 5s/0s and the
-/// columns `signal`, `other`, and `count` on stream 15s/5s.
+/// columns `signal`, `other`, `count`, and `count_ready` (the readiness flag of `count`) on
+/// stream 15s/5s.
 fn instrument(id: &str, generation: char, plan: &str) -> InstrumentBinding {
     let column = |name: &str, kind: Kind| ColumnSpec {
         name: name.to_string(),
         source: name.to_string(),
         kind,
         encoding: None,
+        readiness: Vec::new(),
     };
     let (broker, symbol) = id.split_once(':').unwrap();
     InstrumentBinding {
@@ -645,7 +647,11 @@ fn instrument(id: &str, generation: char, plan: &str) -> InstrumentBinding {
                 columns: vec![
                     column("signal", Kind::Bool),
                     column("other", Kind::Bool),
-                    column("count", Kind::Int),
+                    ColumnSpec {
+                        readiness: vec!["count_ready".into()],
+                        ..column("count", Kind::Int)
+                    },
+                    column("count_ready", Kind::Bool),
                 ],
             },
         ],
@@ -708,11 +714,16 @@ fn tick_of(instrument: usize, time: i64, price: i64) -> Observation {
     }
 }
 
-/// A row of `stream` with `signal`; the second stream's `other` is true and its `count` four.
+/// A row of `stream` with `signal`; the second stream's `other` is true and its `count` a ready
+/// four.
 fn row(stream: usize, close: i64, known: i64, signal: bool) -> Observation {
     let mut values = vec![Some(Value::Bool(signal))];
     if stream == 1 {
-        values.extend([Some(Value::Bool(true)), Some(Value::Int(4))]);
+        values.extend([
+            Some(Value::Bool(true)),
+            Some(Value::Int(4)),
+            Some(Value::Bool(true)),
+        ]);
     }
     row_of(0, stream, close, known, values)
 }
@@ -854,6 +865,16 @@ impl Live {
                 _ => None,
             })
             .unwrap()
+    }
+
+    /// Ends the run: unresolved marks for open obligations, then the rates due by the decision
+    /// end.
+    fn finish(&mut self) -> Vec<FinancialEvent> {
+        self.engine.finish().unwrap();
+        let events = self.engine.drain();
+        self.lines
+            .extend(events.iter().map(FinancialEvent::to_line));
+        events
     }
 
     fn cash(&self) -> String {
@@ -2109,7 +2130,7 @@ fn quote_envelopes_pauses_conversion_and_projections_are_exact() {
     live.assert_restorable();
     // The pause record is checked against the account's drawdown and policy on application: a
     // shortened deadline fails, and a ledger that omits the pause and its end fails at the
-    // admission the pause would have blocked.
+    // record after the settlement that made the pause due.
     let error = Engine::restore(
         tampered(&live.lines, "\"until_micros\":120,", "\"until_micros\":21,")
             .into_iter()
@@ -2135,7 +2156,46 @@ fn quote_envelopes_pauses_conversion_and_projections_are_exact() {
     let error = Engine::restore(without_pause.into_iter().map(Ok))
         .err()
         .unwrap();
-    assert!(error.contains("not admissible"), "{error}");
+    assert!(error.contains("pause record is required next"), "{error}");
+    // A pause omitted before a win that recovers the drawdown below the threshold fails the
+    // same way, so no later admission can slip through the recovered drawdown.
+    let mut recovering = Live::new(definition(|replay| {
+        replay.risk_policies[0].pause = Some(Pause {
+            drawdown: decimal("1"),
+            duration_micros: 100,
+        });
+        replay.risk_policies[0].max_open_per_strategy = Some(5);
+        replay.contracts[0].settlement.max_tick_gap_micros = 1000;
+    }));
+    recovering.simulate(10, vec![tick(10, 500), row(0, 10, 10, true)]);
+    recovering.simulate(11, vec![tick(11, 500), row(0, 11, 11, true)]);
+    assert_eq!(
+        kinds(&recovering.simulate(20, vec![tick(20, 400)])),
+        ["settled", "pause_started"]
+    );
+    assert_eq!(
+        kinds(&recovering.simulate(21, vec![tick(21, 600)])),
+        ["settled"]
+    );
+    assert_eq!(
+        recovering.account("a").completed_profit.to_string(),
+        "-0.08"
+    );
+    let without_pause: Vec<Vec<u8>> = recovering
+        .lines
+        .iter()
+        .filter(|line| !line.windows(15).any(|w| w == b"\"pause_started\""))
+        .enumerate()
+        .map(|(sequence, line)| {
+            let text = String::from_utf8(line.clone()).unwrap();
+            let (_, rest) = text.split_once(',').unwrap();
+            format!("{{\"sequence\":{sequence},{rest}").into_bytes()
+        })
+        .collect();
+    let error = Engine::restore(without_pause.into_iter().map(Ok))
+        .err()
+        .unwrap();
+    assert!(error.contains("pause record is required next"), "{error}");
     // Conversion: exact same-currency rescaling, and a supplied rate only when its provider and
     // availability times are no later than the decision and its provider age is within bound.
     let v: Currency = "v".to_string().try_into().unwrap();
@@ -2223,6 +2283,7 @@ fn quote_envelopes_pauses_conversion_and_projections_are_exact() {
         rate: decimal("1"),
         ..rate.clone()
     });
+    let two_rates_definition = two_rates.clone();
     let mut between = Live::new(two_rates);
     let events = between.simulate(110, vec![tick(110, 500)]);
     assert_eq!(kinds(&events), ["rate_available", "rate_available"]);
@@ -2244,6 +2305,23 @@ fn quote_envelopes_pauses_conversion_and_projections_are_exact() {
         )
     );
     between.assert_restorable();
+    let mut tail = Live::new(two_rates_definition);
+    tail.simulate(100, vec![tick(100, 500)]);
+    let events = tail.finish();
+    assert_eq!(
+        events.iter().map(|e| e.time_micros).collect::<Vec<_>>(),
+        [103, 106],
+        "rates after the last market observation are observed by the decision end"
+    );
+    assert_eq!(
+        tail.engine
+            .summary()
+            .reporting
+            .max_drawdown
+            .map(|d| d.to_string()),
+        Some("1500.00".into())
+    );
+    tail.assert_restorable();
     assert!(
         live.simulate(100, vec![tick(100, 500)]).is_empty(),
         "the rate's provider time is not its availability"
@@ -2416,6 +2494,23 @@ fn restored_engines_continue_byte_identically() {
         "one retained and one new obligation"
     );
     assert_eq!(live.engine.summary().portfolio.unresolved, 1);
+    // A row already decided, redelivered to a restored engine whose row cursors are empty, is
+    // installed but never decided twice: the completed command is not dispatched again.
+    let mut completed = Live::new(definition(|_| {}));
+    completed.simulate(10, vec![tick(10, 500), row(0, 10, 10, true)]);
+    assert_eq!(
+        kinds(&completed.simulate(20, vec![tick(20, 520)])),
+        ["settled"]
+    );
+    let mut restored = completed.restored();
+    for engine in [&mut completed, &mut restored] {
+        assert!(
+            engine
+                .simulate(21, vec![tick(21, 520), row(0, 10, 10, true)])
+                .is_empty()
+        );
+        assert_eq!(engine.balances("a").5, 0);
+    }
 }
 
 #[test]
@@ -2456,7 +2551,7 @@ fn definitions_reject_mismatched_plans_columns_and_negative_cash_and_accept_many
         dispositions(&live.simulate(10, vec![tick(10, 500), row(0, 10, 10, true)])),
         [Disposition::Admitted]
     );
-    let count = |close: i64, count: i64| {
+    let count = |close: i64, count: i64, ready: bool| {
         row_of(
             0,
             1,
@@ -2466,19 +2561,25 @@ fn definitions_reject_mismatched_plans_columns_and_negative_cash_and_accept_many
                 Some(Value::Bool(true)),
                 Some(Value::Bool(true)),
                 Some(Value::Int(count)),
+                Some(Value::Bool(ready)),
             ],
         )
     };
-    live.simulate(15, vec![count(15, 6)]);
+    live.simulate(15, vec![count(15, 6, true)]);
     assert!(
         live.simulate(16, vec![tick(16, 500), row(0, 16, 16, true)])
             .is_empty(),
         "only the fifth condition fails"
     );
-    live.simulate(25, vec![count(25, 5)]);
+    live.simulate(20, vec![count(20, 5, false)]);
+    assert!(
+        dispositions(&live.simulate(21, vec![tick(21, 500), row(0, 21, 21, true)])).is_empty(),
+        "a value whose readiness flag is false is not ready, whatever it reads"
+    );
+    live.simulate(25, vec![count(25, 5, true)]);
     assert_eq!(
         dispositions(&live.simulate(26, vec![tick(26, 500), row(0, 26, 26, true)])),
-        [Disposition::CapacityStrategy],
+        [Disposition::Admitted],
         "all five hold again"
     );
 }
@@ -2537,16 +2638,6 @@ struct Candidate {
     strategy: String,
 }
 
-fn read_le<T, const N: usize>(path: &Path, decode: fn([u8; N]) -> T) -> Vec<T> {
-    fs::read(path)
-        .unwrap()
-        .as_chunks::<N>()
-        .0
-        .iter()
-        .map(|chunk| decode(*chunk))
-        .collect()
-}
-
 fn micros(text: &str) -> i64 {
     binary_alpha_engine::market::parse_event_time_micros(text).unwrap()
 }
@@ -2559,8 +2650,6 @@ struct LegacyPath {
     mae: f64,
     mfe_time: i64,
     mae_time: i64,
-    first_favorable: Option<i64>,
-    first_adverse: Option<i64>,
 }
 
 fn round10(value: f64) -> f64 {
@@ -2581,8 +2670,6 @@ fn legacy_path(
         mae: 0.0,
         mfe_time: times[entry],
         mae_time: times[entry],
-        first_favorable: None,
-        first_adverse: None,
     };
     for index in entry + 1..=settlement {
         let raw = if entry_price <= 0.0 {
@@ -2592,12 +2679,6 @@ fn legacy_path(
         };
         let movement = if sell { -raw } else { raw };
         path.final_move = round10(movement);
-        if movement > 0.0 && path.first_favorable.is_none() {
-            path.first_favorable = Some(times[index]);
-        }
-        if movement < 0.0 && path.first_adverse.is_none() {
-            path.first_adverse = Some(times[index]);
-        }
         if movement > path.mfe {
             path.mfe = round10(movement);
             path.mfe_time = times[index];
@@ -2913,9 +2994,22 @@ fn governed_reference_parity() {
         assert_eq!(
             (
                 binding.envelope.max_purchase_cost.to_string(),
-                binding.envelope.min_winning_net_return.to_string()
+                binding.envelope.max_entry_fee.to_string(),
+                binding.envelope.max_win_terminal_fee.to_string(),
+                binding.envelope.max_loss_terminal_fee.to_string(),
+                binding.envelope.max_tie_terminal_fee.to_string(),
+                binding.envelope.min_winning_net_return.to_string(),
+                binding.envelope.settlement_rule
             ),
-            ("1".into(), "0.92".into())
+            (
+                "1".into(),
+                "0".into(),
+                "0".into(),
+                "0".into(),
+                "0".into(),
+                "0.92".into(),
+                SettlementRule::PriceAtDueV1
+            )
         );
         let policy = settings
             .risk_policies
@@ -2949,11 +3043,13 @@ fn governed_reference_parity() {
     );
     assert_eq!(
         (
+            settings.accounts[0].currency.as_str(),
             settings.reporting_currency.as_str(),
+            settings.reporting_scale,
             settings.rates.is_none()
         ),
-        (settings.accounts[0].currency.as_str(), true),
-        "same-currency reporting, no supplied rates"
+        ("fixture_unit", "fixture_unit", 2, true),
+        "the fixture unit at scale two for the account and the reporting projection, no supplied rates"
     );
     let store = match &config.storage.publication_uri {
         binary_alpha_engine::config::PublicationUri::Filesystem(path) => path.clone(),

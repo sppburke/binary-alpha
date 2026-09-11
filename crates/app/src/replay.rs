@@ -124,15 +124,18 @@ fn bind_instrument(settings: &Replay, index: usize) -> Result<BoundInstrument, S
             }
             if outcome.tick_generation != tick.generation
                 || outcome.feature_generation != feature.generation
+                || outcome.raw_identity != plan.raw_identity
             {
                 return Err(format!(
-                    "{}: outcome generation {} labels tick generation {} and feature generation {}, not this input's {} and {}",
+                    "{}: outcome generation {} labels tick generation {}, feature generation {}, and raw rows {}, not this input's {}, {}, and {}",
                     field("outcome_manifest"),
                     outcome.generation,
                     outcome.tick_generation,
                     outcome.feature_generation,
+                    outcome.raw_identity,
                     tick.generation,
-                    feature.generation
+                    feature.generation,
+                    plan.raw_identity
                 ));
             }
             Some(outcome.generation)
@@ -201,11 +204,8 @@ fn stream_columns(
                 {
                     continue;
                 }
-                let spec = column_spec(
-                    plan.stream(condition.stream).expect("bound"),
-                    &condition.output,
-                )
-                .ok_or_else(|| {
+                let plan_stream = plan.stream(condition.stream).expect("bound");
+                let mut spec = column_spec(plan_stream, &condition.output).ok_or_else(|| {
                     format!(
                         "{}: `{}` is not a compiled output or fitted encoding of stream {}",
                         field("output"),
@@ -213,6 +213,26 @@ fn stream_columns(
                         condition.stream
                     )
                 })?;
+                // The feature owner's readiness flags of the value are read beside it.
+                spec.readiness = plan.readiness_of(&spec.source);
+                for flag in spec.readiness.clone() {
+                    if streams[stream]
+                        .columns
+                        .iter()
+                        .any(|column| column.name == flag)
+                    {
+                        continue;
+                    }
+                    let flag = column_spec(plan_stream, &flag).ok_or_else(|| {
+                        format!(
+                            "{}: readiness flag `{flag}` of `{}` is not an output of stream {}",
+                            field("output"),
+                            condition.output,
+                            condition.stream
+                        )
+                    })?;
+                    streams[stream].columns.push(flag);
+                }
                 streams[stream].columns.push(spec);
             }
         }
@@ -235,6 +255,7 @@ fn column_spec(stream: &StreamPlan, name: &str) -> Option<ColumnSpec> {
             source: name.to_string(),
             kind: output.kind,
             encoding: None,
+            readiness: Vec::new(),
         });
     }
     let encoding = stream
@@ -250,6 +271,7 @@ fn column_spec(stream: &StreamPlan, name: &str) -> Option<ColumnSpec> {
         source: encoding.input.clone(),
         kind: input.kind,
         encoding: Some(encoding.clone()),
+        readiness: Vec::new(),
     })
 }
 

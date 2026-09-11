@@ -834,8 +834,12 @@ and whose every stream's first and last decision times lie inside the decision w
 optional outcome manifest must label exactly those two generations. A strategy binds through its
 plan identity to exactly one input; every condition names a compiled output or fitted encoding of
 a plan stream with a threshold of the output's kind (an encoding compares its label text). The
-resolved run definition records, per instrument, the identities and only the streams and columns
-the strategies read, in frozen-plan order; the adapter reads exactly those columns. Historical
+feature owner's readiness flags of a value (`is_ema{p}_ready` for the moving-average family,
+`tick_path_ready` for the tick-path buckets) are resolved from the frozen plan and read beside
+it; a value whose flag is not true is not ready and fails its condition. An optional outcome
+manifest must label the bound tick and feature generations and the plan's raw rows. The resolved
+run definition records, per instrument, the identities and only the streams and columns the
+strategies read, in frozen-plan order; the adapter reads exactly those columns. Historical
 source files carry no local receipts, so availability follows provider order and the definition
 tags `availability = "provider_order_simulation"`.
 
@@ -852,8 +856,10 @@ one availability time fail. It evaluates each newly installed base row once, tra
 base streams in frozen-plan order and their bindings in configured order. A failed step ends the
 engine: its state may hold observations the ledger does not, so every later step is refused and
 the adapter restores a fresh engine from the ledger instead of retrying. A
-condition fails when its stream has no row, when that row closes after the base row, or when the
-value is unavailable; the engine never searches backward. A matching signal is always a ledger
+condition fails when its stream has no row, when that row closes after the base row, when the
+value is unavailable, or when a readiness flag of the value is not true; the engine never searches
+backward. A signal is decided once per binding and base close time: a row redelivered to a
+restored engine, whose row state is not ledger state, is installed but never decided again. A matching signal is always a ledger
 record with one disposition, decided in this order: `same_entry_duplicate` (`first` selection
 per account, instrument, contract duration, and entry event; a blocked first candidate keeps the
 slot), `duplicate_logic` (repeated signal logic per account, instrument, and entry event when
@@ -913,8 +919,9 @@ drawdown has reached its pause threshold counts as paused, so an omitted pause f
 admission it would have blocked), an acceptance's quote time is no later than its entry and the
 entry no later than the decision, every posting is recomputed from the obligation and the frozen
 terms, and a pause must state the account's exact epoch drawdown at or beyond its threshold with
-the deadline the policy's duration gives, so a record that disagrees fails at generation and at
-restoration alike. An external event's payload
+the deadline the policy's duration gives and must directly follow the settlement or
+reconciliation that made it due, so a record that disagrees or a ledger that omits it fails at
+generation and at restoration alike. An external event's payload
 is its transition fields and its source's provider time, availability, and simulation flag: the
 same identity with the exact payload is a no-op, before and after restoration; the same identity
 with another payload, including an equal amount written at another scale, fails; a ledger that
@@ -933,10 +940,10 @@ availability times are no later than the decision and whose provider age is at m
 `max_rate_age_micros`, multiplies once with checked arithmetic, and rejects lost precision;
 same-currency amounts only rescale. The reporting-currency projection is observed at the run
 definition, at each supplied rate's own availability time (a `rate_available` record emitted
-before the market observations of the step that reaches it, so every valuation between market
-observations is recorded and a rate change is visible without an account posting), and after
-every record that changes an account: an admitted signal, an acceptance, a release, a settlement,
-or a reconciliation. Missing or stale rates leave that observation
+before the market observations of the step that reaches it, and at the end of the run for the
+rates available by `decision_end`, so every valuation between market observations is recorded
+and a rate change is visible without an account posting), and after every record that changes an
+account: an admitted signal, an acceptance, a release, a settlement, or a reconciliation. Missing or stale rates leave that observation
 unavailable and make the total unresolved-loss limit unavailable, which blocks admissions that
 need it; native history is never substituted, while native cash, account pause, and confirmed
 native settlement never depend on conversion. The path of a contract

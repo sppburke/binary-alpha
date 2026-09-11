@@ -1124,6 +1124,9 @@ pub struct ColumnSpec {
     pub kind: Kind,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub encoding: Option<FittedEncoding>,
+    /// The boolean columns of the same stream that must be true for the value to be ready.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub readiness: Vec<String>,
 }
 
 /// The columns one stream must supply, in the order a row's values are indexed.
@@ -1686,6 +1689,8 @@ impl FinancialEvent {
 struct CompiledCondition {
     stream: usize,
     column: usize,
+    /// Readiness flag columns of the stream; a false or unavailable flag fails the condition.
+    readiness: Vec<usize>,
     comparator: Comparator,
     threshold: Threshold,
 }
@@ -2028,6 +2033,11 @@ pub struct Engine {
     now: i64,
     same_entry: HashSet<(usize, usize, i64)>,
     logic_seen: HashSet<(usize, usize, String)>,
+    /// Every signal decided, by binding and base close time, so a row redelivered after
+    /// restoration is not decided twice.
+    decided: HashSet<(usize, i64)>,
+    /// The account whose closure just made its pause due; the next record must start it.
+    pause_pending: Option<usize>,
     summary: Summary,
     events: Vec<FinancialEvent>,
     /// Set by a failed step: the engine's state is no longer known to match its ledger.
@@ -2147,9 +2157,29 @@ impl Engine {
                                 condition.output
                             ));
                         }
+                        let readiness = spec
+                            .readiness
+                            .iter()
+                            .map(|flag| {
+                                columns
+                                    .iter()
+                                    .position(|column| {
+                                        column.name == *flag && column.kind == Kind::Bool
+                                    })
+                                    .ok_or_else(|| {
+                                        format!(
+                                            "{}: readiness flag `{flag}` of `{}` is not a boolean column of stream {}",
+                                            field("output"),
+                                            condition.output,
+                                            condition.stream
+                                        )
+                                    })
+                            })
+                            .collect::<Result<Vec<_>, String>>()?;
                         Ok(CompiledCondition {
                             stream,
                             column,
+                            readiness,
                             comparator: condition.comparator,
                             threshold: condition.threshold.clone(),
                         })
@@ -2283,6 +2313,8 @@ impl Engine {
             now: decision_start,
             same_entry: HashSet::new(),
             logic_seen: HashSet::new(),
+            decided: HashSet::new(),
+            pause_pending: None,
             summary,
             events: Vec::new(),
             failed: false,
@@ -2458,19 +2490,7 @@ impl Engine {
             self.same_entry.clear();
             self.logic_seen.clear();
         }
-        // Each rate that became available since the last step is observed at its own
-        // availability time, so every valuation between market observations is recorded.
-        while let Some(rate) = self.rates.get(self.next_rate)
-            && rate.available_at_micros <= time
-        {
-            let at = rate
-                .available_at_micros
-                .max(self.decision_start)
-                .max(self.now);
-            let rate = rate.id.clone();
-            self.now = at;
-            self.emit(at, EventKind::RateAvailable { rate })?;
-        }
+        self.observe_rates(time)?;
         self.now = time;
         self.advance_pauses()?;
         let mut installed: Vec<(usize, usize)> = Vec::new();
@@ -2606,8 +2626,25 @@ impl Engine {
         Ok(())
     }
 
+    /// Observes each rate available by `until` at its own availability time, so every valuation
+    /// between market observations is recorded.
+    fn observe_rates(&mut self, until: i64) -> Result<(), String> {
+        while let Some(rate) = self.rates.get(self.next_rate)
+            && rate.available_at_micros <= until
+        {
+            let at = rate
+                .available_at_micros
+                .max(self.decision_start)
+                .max(self.now);
+            let rate = rate.id.clone();
+            self.now = at;
+            self.emit(at, EventKind::RateAvailable { rate })?;
+        }
+        Ok(())
+    }
+
     /// Marks every obligation still open after the last permitted observation as unresolved
-    /// with its path so far.
+    /// with its path so far, then observes the rates available by the decision end.
     pub fn finish(&mut self) -> Result<(), String> {
         let commands: Vec<String> = self
             .obligations
@@ -2630,7 +2667,7 @@ impl Engine {
                 },
             )?;
         }
-        Ok(())
+        self.observe_rates(self.decision_end)
     }
 
     fn advance_pauses(&mut self) -> Result<(), String> {
@@ -3119,13 +3156,20 @@ impl Engine {
     // ------------------------------------------------------------------------------------------
 
     /// Whether one condition holds against the instrument's latest rows for a base row closing at
-    /// `base_close`: a required latest row that is missing, that closes after the base row, or
-    /// whose value is unavailable fails the condition.
+    /// `base_close`: a required latest row that is missing, that closes after the base row,
+    /// whose value is unavailable, or whose readiness flags are not all true fails the condition.
     fn holds(&self, instrument: usize, base_close: i64, condition: &CompiledCondition) -> bool {
         let Some(row) = &self.instruments[instrument].rows[condition.stream] else {
             return false;
         };
         if row.close_time_micros > base_close {
+            return false;
+        }
+        if condition
+            .readiness
+            .iter()
+            .any(|flag| row.values[*flag] != Some(Value::Bool(true)))
+        {
             return false;
         }
         let Some(value) = &row.values[condition.column] else {
@@ -3175,6 +3219,9 @@ impl Engine {
             return Ok(());
         };
         let (close, known_at) = (row.close_time_micros, row.known_at_micros);
+        if self.decided.contains(&(binding_index, close)) {
+            return Ok(());
+        }
         if !strategy
             .conditions
             .iter()
@@ -3387,6 +3434,14 @@ impl Engine {
         {
             return Err(format!("external event `{key}` is already applied"));
         }
+        if let Some(pending) = self.pause_pending
+            && !matches!(&event.kind, EventKind::PauseStarted { account, .. } if *account == self.accounts[pending].id)
+        {
+            return Err(format!(
+                "account `{}` reached its pause threshold; its pause record is required next",
+                self.accounts[pending].id
+            ));
+        }
         self.apply(&event)?;
         if let Some((key, payload)) = external {
             self.externals.insert(key, payload);
@@ -3519,6 +3574,13 @@ impl Engine {
         if let Some((_, profit)) = settled {
             account.complete(profit)?;
         }
+        let account_index = self.bindings[binding].account;
+        if settled.is_some()
+            && self.accounts[account_index].paused_until_micros.is_none()
+            && self.pause_due(account_index)?
+        {
+            self.pause_pending = Some(account_index);
+        }
         self.open_delta(binding, -1);
         let key = self.keys(binding, obligation.split.as_deref());
         for group in self.groups(&key) {
@@ -3535,12 +3597,6 @@ impl Engine {
     }
 
     fn apply(&mut self, event: &FinancialEvent) -> Result<(), String> {
-        if event.sequence != self.sequence {
-            return Err(format!(
-                "record {} applied out of sequence at {}",
-                event.sequence, self.sequence
-            ));
-        }
         match &event.kind {
             EventKind::RunDefinition { definition } => {
                 if event.sequence != 0 || **definition != self.definition {
@@ -3565,6 +3621,12 @@ impl Engine {
                 let contract = &self.definition.replay.contracts[compiled.contract];
                 let scale = self.accounts[compiled.account].scale;
                 let admitted = *disposition == Disposition::Admitted;
+                if !self.decided.insert((index, *close_time_micros)) {
+                    return Err(format!(
+                        "binding `{binding}` already decided its signal at {}",
+                        format_event_time_micros(*close_time_micros)
+                    ));
+                }
                 if admitted {
                     let (Some(command), Some(reservation)) = (command, reservation) else {
                         return Err(
@@ -3827,6 +3889,7 @@ impl Engine {
                     ));
                 }
                 self.accounts[index].paused_until_micros = Some(*until_micros);
+                self.pause_pending = None;
             }
             EventKind::PauseEnded { account } => {
                 let state = self

@@ -552,6 +552,17 @@ pub fn table_rows(
     (names, rows)
 }
 
+/// Decodes a whole little-endian array object.
+pub fn read_le<T, const N: usize>(path: &Path, decode: fn([u8; N]) -> T) -> Vec<T> {
+    std::fs::read(path)
+        .unwrap()
+        .as_chunks::<N>()
+        .0
+        .iter()
+        .map(|chunk| decode(*chunk))
+        .collect()
+}
+
 /// Reads a whole published table.
 pub fn read_table(path: &Path) -> Table {
     let (names, rows) = table_rows(path);
