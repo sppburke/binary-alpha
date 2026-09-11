@@ -862,9 +862,10 @@ the adapter restores a fresh engine from the ledger instead of retrying. A
 condition fails when its stream has no row, when that row closes after the base row, when the
 value is unavailable, or when a readiness flag of the value is not true; the engine never searches
 backward. A signal is decided once per binding and base close time, and the selection and
-deduplication slots of an instant are rebuilt from the signal records: a row redelivered to a
-restored engine, whose row state is not ledger state, is installed but never decided again, and
-a candidate the uninterrupted engine refused a slot is refused it again. A matching signal is always a ledger
+deduplication slots of an instant are claimed by its signal records and consulted only at that
+instant: a row redelivered to a restored engine, whose row state is not ledger state, is
+installed but never decided again, a candidate the uninterrupted engine refused a slot is
+refused it again, and a record whose disposition disagrees with the occupied slots fails. A matching signal is always a ledger
 record with one disposition, decided in this order: `same_entry_duplicate` (`first` selection
 per account, instrument, contract duration, and entry event; a blocked first candidate keeps the
 slot), `duplicate_logic` (repeated signal logic per account, instrument, and entry event when

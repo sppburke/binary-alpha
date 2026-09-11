@@ -1694,8 +1694,6 @@ struct CompiledCondition {
     column: usize,
     /// Readiness flag columns of the stream; a false or unavailable flag fails the condition.
     readiness: Vec<usize>,
-    /// Text values that mean not ready; they fail the condition before any comparison.
-    unready: Vec<String>,
     comparator: Comparator,
     threshold: Threshold,
 }
@@ -2188,7 +2186,6 @@ impl Engine {
                             stream,
                             column,
                             readiness,
-                            unready: spec.unready.clone(),
                             comparator: condition.comparator,
                             threshold: condition.threshold.clone(),
                         })
@@ -3182,16 +3179,13 @@ impl Engine {
         let Some(value) = &row.values[condition.column] else {
             return false;
         };
+        let spec = &self.definition.instruments[instrument].streams[condition.stream].columns
+            [condition.column];
         if let Value::Text(text) = value
-            && condition
-                .unready
-                .iter()
-                .any(|unready| unready == text.as_ref())
+            && spec.unready.iter().any(|unready| unready == text.as_ref())
         {
             return false;
         }
-        let spec = &self.definition.instruments[instrument].streams[condition.stream].columns
-            [condition.column];
         let label: Option<Cow<'_, str>> = spec
             .encoding
             .as_ref()
@@ -3259,19 +3253,21 @@ impl Engine {
         let stream =
             self.definition.instruments[binding.instrument].streams[strategy.base_stream].stream;
         let logic_identity = strategy.logic.clone();
-        let (disposition, rates) = if first_only && self.same_entry.contains(&same_entry) {
-            (Disposition::SameEntryDuplicate, Vec::new())
-        } else if deduplicate && self.logic_seen.contains(&logic) {
-            (Disposition::DuplicateLogic, Vec::new())
-        } else if !self.strategies[binding.strategy]
-            .repair
-            .iter()
-            .all(|condition| self.holds(binding.instrument, close, condition))
-        {
-            (Disposition::RepairBlocked, Vec::new())
-        } else {
-            self.admit(binding_index, close, reservation)?
-        };
+        let slots_live = self.slot_time == self.now;
+        let (disposition, rates) =
+            if first_only && slots_live && self.same_entry.contains(&same_entry) {
+                (Disposition::SameEntryDuplicate, Vec::new())
+            } else if deduplicate && slots_live && self.logic_seen.contains(&logic) {
+                (Disposition::DuplicateLogic, Vec::new())
+            } else if !self.strategies[binding.strategy]
+                .repair
+                .iter()
+                .all(|condition| self.holds(binding.instrument, close, condition))
+            {
+                (Disposition::RepairBlocked, Vec::new())
+            } else {
+                self.admit(binding_index, close, reservation)?
+            };
         let admitted = disposition == Disposition::Admitted;
         let quote = self.instruments[binding.instrument].tick;
         let event = EventKind::Signal {
@@ -3682,19 +3678,39 @@ impl Engine {
                     self.logic_seen.clear();
                     self.slot_time = time;
                 }
-                if *disposition != Disposition::SameEntryDuplicate {
-                    self.same_entry.insert((
-                        compiled.account,
-                        compiled.instrument,
-                        contract.duration_micros,
+                let entry_key = (
+                    compiled.account,
+                    compiled.instrument,
+                    contract.duration_micros,
+                );
+                let logic_key = (
+                    compiled.account,
+                    compiled.instrument,
+                    strategy.logic.clone(),
+                );
+                let slot = if policy.same_entry == SameEntry::First
+                    && self.same_entry.contains(&entry_key)
+                {
+                    Some(Disposition::SameEntryDuplicate)
+                } else if policy.deduplicate_signal_logic && self.logic_seen.contains(&logic_key) {
+                    Some(Disposition::DuplicateLogic)
+                } else {
+                    None
+                };
+                let recorded = matches!(
+                    disposition,
+                    Disposition::SameEntryDuplicate | Disposition::DuplicateLogic
+                )
+                .then_some(*disposition);
+                if slot != recorded {
+                    return Err(format!(
+                        "the signal of `{binding}` at {} disagrees with the selection and deduplication slots of its instant",
+                        format_event_time_micros(*close_time_micros)
                     ));
-                    if *disposition != Disposition::DuplicateLogic {
-                        self.logic_seen.insert((
-                            compiled.account,
-                            compiled.instrument,
-                            strategy.logic.clone(),
-                        ));
-                    }
+                }
+                if slot.is_none() {
+                    self.same_entry.insert(entry_key);
+                    self.logic_seen.insert(logic_key);
                 }
                 if admitted {
                     let (Some(command), Some(reservation)) = (command, reservation) else {

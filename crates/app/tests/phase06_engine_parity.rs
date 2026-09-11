@@ -1464,20 +1464,63 @@ fn selection_deduplication_and_repair_keep_their_slots() {
         entry(&mut Live::new(two(SameEntry::All, false, repair.clone()))),
         [Disposition::RepairBlocked, Disposition::Admitted]
     );
-    // The slots are ledger state: an engine restored between the two decisions of one instant
-    // and given the batch again skips the decided first candidate and still refuses the second
-    // its slot, exactly as the uninterrupted engine did.
+    // The slots belong to one instant and are ledger state: the next instant starts with free
+    // slots (after the first contract settles), an engine restored between the two decisions
+    // of one instant and given the batch again skips the decided first candidate and still
+    // refuses the second its slot, and a ledger that admits the second candidate over an
+    // occupied slot fails restoration.
     for (same_entry, deduplicate, expected) in [
         (SameEntry::First, false, Disposition::SameEntryDuplicate),
         (SameEntry::All, true, Disposition::DuplicateLogic),
     ] {
         let mut live = Live::new(two(same_entry, deduplicate, Vec::new()));
-        let batch = || vec![tick(10, 500), row(0, 10, 10, true), row(1, 10, 10, true)];
-        let events = live.simulate(10, batch());
+        let batch = |time: i64| {
+            vec![
+                tick(time, 500),
+                row(0, time, time, true),
+                row(1, time, time, true),
+            ]
+        };
+        let events = live.simulate(10, batch(10));
         assert_eq!(dispositions(&events), [Disposition::Admitted, expected]);
         let first_decision = live.lines.len() - events.len() + 1;
+        assert_eq!(
+            dispositions(&live.simulate(20, batch(20))),
+            [Disposition::Admitted, expected],
+            "the previous instant's slots do not bind"
+        );
         let mut restored = Live::from_lines(live.lines[..first_decision].to_vec());
-        assert_eq!(dispositions(&restored.simulate(10, batch())), [expected]);
+        assert_eq!(dispositions(&restored.simulate(10, batch(10))), [expected]);
+        let error = Engine::restore(
+            tampered(
+                &live.lines[..first_decision + 1],
+                &format!("\"disposition\":\"{expected}\""),
+                "\"disposition\":\"admitted\",\"command\":\"b2/10\",\"reservation\":\"1.00\"",
+            )
+            .into_iter()
+            .map(Ok),
+        )
+        .err()
+        .unwrap();
+        assert!(
+            error.contains("selection and deduplication slots"),
+            "{error}"
+        );
+    }
+    // A repair-blocked first candidate claims the slot at each instant.
+    let mut live = Live::new(two(SameEntry::First, false, repair));
+    for time in [10, 20] {
+        assert_eq!(
+            dispositions(&live.simulate(
+                time,
+                vec![
+                    tick(time, 500),
+                    row(0, time, time, true),
+                    row(1, time, time, true)
+                ]
+            )),
+            [Disposition::RepairBlocked, Disposition::SameEntryDuplicate]
+        );
     }
 }
 
