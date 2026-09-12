@@ -16,7 +16,7 @@ pub mod search;
 
 use std::time::{Duration, Instant};
 
-/// Kernel symbols and byte-preserved source text in module build order.
+/// Kernel symbols and retained source text in module build order (see kernels/SOURCES.md).
 pub const KERNEL_SOURCES: [(&str, &str); 13] = [
     (
         "score_bucket_plans_cap1",

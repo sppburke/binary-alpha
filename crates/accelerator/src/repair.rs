@@ -25,9 +25,6 @@ impl Policies<'_> {
             ));
         }
         let events = self.entry_ms.len();
-        if events > i32::MAX as usize {
-            return Err(format!("{k}: entry_ms count exceeds i32"));
-        }
         for (name, len) in [
             ("settlement_ms", self.settlement_ms.len()),
             ("close_ms", self.close_ms.len()),
@@ -51,11 +48,15 @@ impl Policies<'_> {
             ));
         }
         let mut previous = 0;
-        for &offset in self.candidate_offsets {
+        for (index, &offset) in self.candidate_offsets.iter().enumerate() {
             if offset < previous || offset as u64 > events as u64 {
                 return Err(format!(
                     "{k}: candidate_offsets must be monotone and within entry_ms"
                 ));
+            }
+            // Each policy's counters are int; the aggregate event table uses i64 offsets.
+            if index > 0 && offset - previous > i64::from(i32::MAX) {
+                return Err(format!("{k}: per-candidate event count exceeds i32"));
             }
             previous = offset;
         }

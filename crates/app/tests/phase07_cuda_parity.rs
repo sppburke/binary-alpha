@@ -447,20 +447,20 @@ fn outputs<T>(case: &Case, measured: Measured<T>, decode: impl FnOnce(T) -> Buff
 /// Dispatch exactly the public operation ABI; CPU and device share these inputs.
 fn run(backend: &Backend, case: &Case) -> KernelRun {
     let b = &case.inputs;
+    let (condition_feature, condition_bucket, candidate_offsets) = if b.contains_key("feature1") {
+        legacy_conditions(b)
+    } else {
+        (Vec::new(), Vec::new(), Vec::new())
+    };
     match case.symbol.as_str() {
         "score_bucket_plans_cap1" => outputs(
             case,
             search::score_bucket_plans_cap1(
                 backend,
                 b["feature_codes"].i16s(),
-                b["feature1"].i32s(),
-                b["bucket1"].i16s(),
-                b["feature2"].i32s(),
-                b["bucket2"].i16s(),
-                b["feature3"].i32s(),
-                b["bucket3"].i16s(),
-                b["feature4"].i32s(),
-                b["bucket4"].i16s(),
+                &condition_feature,
+                &condition_bucket,
+                &candidate_offsets,
                 b["split_mask"].u8s(),
                 b["ordered_rows"].i64s(),
                 b["decision_time_ms"].i64s(),
@@ -485,14 +485,9 @@ fn run(backend: &Backend, case: &Case) -> KernelRun {
             search::score_bucket_plans_cap1_dual(
                 backend,
                 b["feature_codes"].i16s(),
-                b["feature1"].i32s(),
-                b["bucket1"].i16s(),
-                b["feature2"].i32s(),
-                b["bucket2"].i16s(),
-                b["feature3"].i32s(),
-                b["bucket3"].i16s(),
-                b["feature4"].i32s(),
-                b["bucket4"].i16s(),
+                &condition_feature,
+                &condition_bucket,
+                &candidate_offsets,
                 b["split_mask"].u8s(),
                 b["ordered_rows"].i64s(),
                 b["decision_time_ms"].i64s(),
@@ -521,14 +516,9 @@ fn run(backend: &Backend, case: &Case) -> KernelRun {
             search::score_bucket_plans_cap1_basic(
                 backend,
                 b["feature_codes"].i16s(),
-                b["feature1"].i32s(),
-                b["bucket1"].i16s(),
-                b["feature2"].i32s(),
-                b["bucket2"].i16s(),
-                b["feature3"].i32s(),
-                b["bucket3"].i16s(),
-                b["feature4"].i32s(),
-                b["bucket4"].i16s(),
+                &condition_feature,
+                &condition_bucket,
+                &candidate_offsets,
                 b["split_mask"].u8s(),
                 b["ordered_rows"].i64s(),
                 b["decision_time_ms"].i64s(),
@@ -551,14 +541,9 @@ fn run(backend: &Backend, case: &Case) -> KernelRun {
             search::score_bucket_plans_cap1_basic_dual(
                 backend,
                 b["feature_codes"].i16s(),
-                b["feature1"].i32s(),
-                b["bucket1"].i16s(),
-                b["feature2"].i32s(),
-                b["bucket2"].i16s(),
-                b["feature3"].i32s(),
-                b["bucket3"].i16s(),
-                b["feature4"].i32s(),
-                b["bucket4"].i16s(),
+                &condition_feature,
+                &condition_bucket,
+                &candidate_offsets,
                 b["split_mask"].u8s(),
                 b["ordered_rows"].i64s(),
                 b["decision_time_ms"].i64s(),
@@ -585,14 +570,9 @@ fn run(backend: &Backend, case: &Case) -> KernelRun {
             search::score_bucket_plans_cap1_sparse(
                 backend,
                 b["feature_codes"].i16s(),
-                b["feature1"].i32s(),
-                b["bucket1"].i16s(),
-                b["feature2"].i32s(),
-                b["bucket2"].i16s(),
-                b["feature3"].i32s(),
-                b["bucket3"].i16s(),
-                b["feature4"].i32s(),
-                b["bucket4"].i16s(),
+                &condition_feature,
+                &condition_bucket,
+                &candidate_offsets,
                 b["candidate_driver_key"].i32s(),
                 b["key_chrono_offsets"].i32s(),
                 b["key_chrono_rows"].i32s(),
@@ -618,14 +598,9 @@ fn run(backend: &Backend, case: &Case) -> KernelRun {
             search::score_bucket_plans_cap1_basic_sparse(
                 backend,
                 b["feature_codes"].i16s(),
-                b["feature1"].i32s(),
-                b["bucket1"].i16s(),
-                b["feature2"].i32s(),
-                b["bucket2"].i16s(),
-                b["feature3"].i32s(),
-                b["bucket3"].i16s(),
-                b["feature4"].i32s(),
-                b["bucket4"].i16s(),
+                &condition_feature,
+                &condition_bucket,
+                &candidate_offsets,
                 b["candidate_driver_key"].i32s(),
                 b["key_chrono_offsets"].i32s(),
                 b["key_chrono_rows"].i32s(),
@@ -650,14 +625,9 @@ fn run(backend: &Backend, case: &Case) -> KernelRun {
             search::score_bucket_plans_cap1_sparse_dual(
                 backend,
                 b["feature_codes"].i16s(),
-                b["feature1"].i32s(),
-                b["bucket1"].i16s(),
-                b["feature2"].i32s(),
-                b["bucket2"].i16s(),
-                b["feature3"].i32s(),
-                b["bucket3"].i16s(),
-                b["feature4"].i32s(),
-                b["bucket4"].i16s(),
+                &condition_feature,
+                &condition_bucket,
+                &candidate_offsets,
                 b["candidate_driver_key"].i32s(),
                 b["key_chrono_offsets"].i32s(),
                 b["key_chrono_rows"].i32s(),
@@ -687,14 +657,9 @@ fn run(backend: &Backend, case: &Case) -> KernelRun {
             search::score_bucket_plans_cap1_basic_sparse_dual(
                 backend,
                 b["feature_codes"].i16s(),
-                b["feature1"].i32s(),
-                b["bucket1"].i16s(),
-                b["feature2"].i32s(),
-                b["bucket2"].i16s(),
-                b["feature3"].i32s(),
-                b["bucket3"].i16s(),
-                b["feature4"].i32s(),
-                b["bucket4"].i16s(),
+                &condition_feature,
+                &condition_bucket,
+                &candidate_offsets,
                 b["candidate_driver_key"].i32s(),
                 b["key_chrono_offsets"].i32s(),
                 b["key_chrono_rows"].i32s(),
@@ -723,14 +688,9 @@ fn run(backend: &Backend, case: &Case) -> KernelRun {
             search::reconstruct_signal_masks_cap1(
                 backend,
                 b["feature_codes"].i16s(),
-                b["feature1"].i32s(),
-                b["bucket1"].i16s(),
-                b["feature2"].i32s(),
-                b["bucket2"].i16s(),
-                b["feature3"].i32s(),
-                b["bucket3"].i16s(),
-                b["feature4"].i32s(),
-                b["bucket4"].i16s(),
+                &condition_feature,
+                &condition_bucket,
+                &candidate_offsets,
                 b["split_mask"].u8s(),
                 b["ordered_rows"].i64s(),
                 b["decision_time_ms"].i64s(),
@@ -874,7 +834,13 @@ fn run_resident(
     case: &Case,
 ) -> KernelRun {
     let b = &case.inputs;
-    let candidates = slots(b);
+    let (condition_feature, condition_bucket, candidate_offsets) = legacy_conditions(b);
+    let candidates = search::CandidateConditions {
+        condition_feature: &condition_feature,
+        condition_bucket: &condition_bucket,
+        candidate_offsets: &candidate_offsets,
+        candidate_count: b["candidate_count"].i32s()[0],
+    };
     match case.symbol.as_str() {
         "score_bucket_plans_cap1" => outputs(
             case,
@@ -1446,24 +1412,54 @@ fn literal_legacy_parity() {
     );
 }
 
-#[cfg(feature = "cuda")]
-fn slots(b: &Buffers) -> search::CandidateSlots<'_> {
-    search::CandidateSlots {
-        features: [
-            b["feature1"].i32s(),
-            b["feature2"].i32s(),
-            b["feature3"].i32s(),
-            b["feature4"].i32s(),
-        ],
-        buckets: [
-            b["bucket1"].i16s(),
-            b["bucket2"].i16s(),
-            b["bucket3"].i16s(),
-            b["bucket4"].i16s(),
-        ],
-        candidate_count: b["candidate_count"].i32s()[0],
+/// Read the immutable fixture ABI without changing its recorded buffers or identity.
+/// Slot order is preserved; only -1 features are unused, regardless of their bucket.
+fn legacy_conditions(b: &Buffers) -> (Vec<i32>, Vec<i16>, Vec<i32>) {
+    let count = usize::try_from(b["candidate_count"].i32s()[0]).unwrap();
+    let features = ["feature1", "feature2", "feature3", "feature4"].map(|key| b[key].i32s());
+    let buckets = ["bucket1", "bucket2", "bucket3", "bucket4"].map(|key| b[key].i16s());
+    for slot in 0..4 {
+        assert_eq!(features[slot].len(), count);
+        assert_eq!(buckets[slot].len(), count);
     }
+    let (mut condition_feature, mut condition_bucket, mut offsets) =
+        (Vec::new(), Vec::new(), vec![0]);
+    for candidate in 0..count {
+        assert!(features[0][candidate] >= 0);
+        for slot in 0..4 {
+            let feature = features[slot][candidate];
+            assert!(feature >= -1);
+            if feature != -1 {
+                condition_feature.push(feature);
+                condition_bucket.push(buckets[slot][candidate]);
+            }
+        }
+        offsets.push(i32::try_from(condition_feature.len()).unwrap());
+    }
+    (condition_feature, condition_bucket, offsets)
 }
+#[test]
+fn legacy_adapter_preserves_slot_order_and_ignores_unused_buckets() {
+    let mut b = Buffers::new();
+    b.insert("candidate_count".into(), Buffer::from(vec![2_i32]));
+    for (slot, features, buckets) in [
+        (1, [2, 0], [-1, 7]),
+        (2, [-1, 3], [32767, 4]),
+        (3, [1, -1], [6, 5]),
+        (4, [-1, 2], [-99, 9]),
+    ] {
+        b.insert(format!("feature{slot}"), Buffer::from(features.to_vec()));
+        b.insert(
+            format!("bucket{slot}"),
+            Buffer::from(buckets.map(|b| b as i16).to_vec()),
+        );
+    }
+    assert_eq!(
+        legacy_conditions(&b),
+        (vec![2, 1, 0, 3, 2], vec![-1, 6, 7, 4, 9], vec![0, 2, 5])
+    );
+}
+
 #[cfg(feature = "cuda")]
 fn sparse(b: &Buffers) -> search::SparseIndex<'_> {
     search::SparseIndex {

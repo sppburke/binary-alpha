@@ -2,14 +2,9 @@
         extern "C" __global__
         void score_bucket_plans_cap1_basic_sparse(
             const short* feature_codes,
-            const int* feature1,
-            const short* bucket1,
-            const int* feature2,
-            const short* bucket2,
-            const int* feature3,
-            const short* bucket3,
-            const int* feature4,
-            const short* bucket4,
+            const int* condition_feature,
+            const short* condition_bucket,
+            const int* candidate_offsets,
             const int* candidate_driver_key,
             const int* key_chrono_offsets,
             const int* key_chrono_rows,
@@ -32,14 +27,8 @@
                 return;
             }
 
-            const int f1 = feature1[candidate_index];
-            const int f2 = feature2[candidate_index];
-            const int f3 = feature3[candidate_index];
-            const int f4 = feature4[candidate_index];
-            const short b1 = bucket1[candidate_index];
-            const short b2 = bucket2[candidate_index];
-            const short b3 = bucket3[candidate_index];
-            const short b4 = bucket4[candidate_index];
+            const int condition_begin = candidate_offsets[candidate_index];
+            const int condition_end = candidate_offsets[candidate_index + 1];
             const int driver_key = candidate_driver_key[candidate_index];
             long long active_due = -9223372036854775807LL;
             long long total = 0;
@@ -60,16 +49,16 @@
                 if (split_scope == 0) {
                     continue;
                 }
-                if (feature_codes[((long long)f1) * row_count + row_index] != b1) {
-                    continue;
+                bool matches = true;
+                for (int condition = condition_begin; condition < condition_end; ++condition) {
+                    const int feature = condition_feature[condition];
+                    const short bucket = condition_bucket[condition];
+                    if (feature_codes[((long long)feature) * row_count + row_index] != bucket) {
+                        matches = false;
+                        break;
+                    }
                 }
-                if (f2 >= 0 && feature_codes[((long long)f2) * row_count + row_index] != b2) {
-                    continue;
-                }
-                if (f3 >= 0 && feature_codes[((long long)f3) * row_count + row_index] != b3) {
-                    continue;
-                }
-                if (f4 >= 0 && feature_codes[((long long)f4) * row_count + row_index] != b4) {
+                if (!matches) {
                     continue;
                 }
 

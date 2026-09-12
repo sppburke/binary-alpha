@@ -1,7 +1,7 @@
-//! Four-slot feature equality, chronological capacity-one scoring, and signal reconstruction.
+//! Variable-length feature equality, chronological capacity-one scoring, and signal reconstruction.
 //!
-//! Feature codes are feature-major `[feature][row]`. Optional slots (2–4) with a
-//! negative feature index ignore their bucket. Split scope 2 warms capacity without
+//! Feature codes are feature-major `[feature][row]`. Candidate offsets delimit
+//! nonempty conjunctions of feature/code equality conditions. Split scope 2 warms capacity without
 //! scoring; other nonzero scopes score. Full rows contain 21 i64 values, basic rows
 //! their first eight; slot 10 stores the exact bits of the f64 squared-drawdown sum.
 //! Times, producer flags, and row order are preserved, never inferred or reordered.
@@ -44,18 +44,20 @@ pub struct SearchBuffers<'a> {
     pub tie: &'a [u8],
 }
 
-/// Original four separate feature and bucket arrays, in slot order.
+/// Flattened equality conditions; candidate `c` owns offsets `[c]..[c + 1]`.
 #[derive(Clone, Copy)]
-pub struct CandidateSlots<'a> {
-    /// Feature indices `[slot][candidate]`; slot one must be active.
-    pub features: [&'a [i32]; 4],
-    /// Equality codes `[slot][candidate]`; inactive slots ignore their code.
-    pub buckets: [&'a [i16]; 4],
+pub struct CandidateConditions<'a> {
+    /// Encoded feature index for each condition.
+    pub condition_feature: &'a [i32],
+    /// Fitted-encoding equality code for each condition.
+    pub condition_bucket: &'a [i16],
+    /// Strictly increasing offsets, from zero to the condition count.
+    pub candidate_offsets: &'a [i32],
     /// Candidate count, also the launch item count.
     pub candidate_count: i32,
 }
 
-/// Sparse chronological driver lists; every visited row rechecks all active slots.
+/// Sparse chronological driver lists; every visited row rechecks every condition.
 #[derive(Clone, Copy)]
 pub struct SparseIndex<'a> {
     /// Driver key per candidate, or a negative value for no driver.
@@ -80,7 +82,7 @@ pub(crate) struct Request<'a> {
     pub kind: usize,
     pub buffers: SearchBuffers<'a>,
     pub split_mask: &'a [u8],
-    pub candidates: CandidateSlots<'a>,
+    pub candidates: CandidateConditions<'a>,
     pub sparse: Option<SparseIndex<'a>>,
     pub expiry_ms: i64,
     pub direction_code: i32,
@@ -133,26 +135,31 @@ impl Request<'_> {
                 length(k, name, len, rows)?;
             }
         }
-        for slot in 0..4 {
-            length(
-                k,
-                &format!("feature{}", slot + 1),
-                self.candidates.features[slot].len(),
-                candidates,
-            )?;
-            length(
-                k,
-                &format!("bucket{}", slot + 1),
-                self.candidates.buckets[slot].len(),
-                candidates,
-            )?;
-            for &feature in self.candidates.features[slot] {
-                if (slot == 0 && feature < 0) || (feature >= 0 && feature as usize >= features) {
-                    return Err(format!(
-                        "{k}: feature{} index {feature} outside feature_count {features}",
-                        slot + 1
-                    ));
-                }
+        let c = self.candidates;
+        let conditions = c.condition_feature.len();
+        if conditions > i32::MAX as usize {
+            return Err(format!("{k}: condition count exceeds i32"));
+        }
+        length(k, "condition_bucket", c.condition_bucket.len(), conditions)?;
+        length(
+            k,
+            "candidate_offsets",
+            c.candidate_offsets.len(),
+            candidates + 1,
+        )?;
+        if c.candidate_offsets[0] != 0
+            || c.candidate_offsets[candidates] as i64 != conditions as i64
+            || c.candidate_offsets.windows(2).any(|w| w[0] >= w[1])
+        {
+            return Err(format!(
+                "{k}: candidate_offsets must increase from zero to the condition count with at least one condition per candidate"
+            ));
+        }
+        for &feature in c.condition_feature {
+            if feature < 0 || feature as usize >= features {
+                return Err(format!(
+                    "{k}: condition_feature index {feature} outside feature_count {features}"
+                ));
             }
         }
         if let Some(sparse) = self.sparse {
@@ -215,12 +222,11 @@ impl Request<'_> {
     }
 
     fn matches(&self, candidate: usize, row: usize) -> bool {
-        (0..4).all(|slot| {
-            let feature = self.candidates.features[slot][candidate];
-            feature < 0
-                || self.buffers.feature_codes
-                    [feature as usize * self.buffers.row_count as usize + row]
-                    == self.candidates.buckets[slot][candidate]
+        let c = self.candidates;
+        (c.candidate_offsets[candidate]..c.candidate_offsets[candidate + 1]).all(|condition| {
+            let feature = c.condition_feature[condition as usize];
+            self.buffers.feature_codes[feature as usize * self.buffers.row_count as usize + row]
+                == c.condition_bucket[condition as usize]
         })
     }
 
@@ -566,15 +572,14 @@ fn inferred_features(
     kernel: &str,
     codes: &[i16],
     rows: i32,
-    slots: [&[i32]; 4],
+    condition_feature: &[i32],
 ) -> Result<i32, String> {
     let rows = count(kernel, "row_count", rows)?;
     // With no rows the ABI carries no feature shape. No code is dereferenced; retain
-    // the minimum shape consistent with the active slots for the empty operation.
+    // the minimum shape consistent with the conditions for the empty operation.
     let features = codes.len().checked_div(rows).unwrap_or_else(|| {
-        (slots
+        (condition_feature
             .iter()
-            .flat_map(|slot| slot.iter())
             .copied()
             .max()
             .unwrap_or(-1)
@@ -590,14 +595,9 @@ fn inferred_features(
 pub fn score_bucket_plans_cap1(
     backend: &Backend,
     feature_codes: &[i16],
-    feature1: &[i32],
-    bucket1: &[i16],
-    feature2: &[i32],
-    bucket2: &[i16],
-    feature3: &[i32],
-    bucket3: &[i16],
-    feature4: &[i32],
-    bucket4: &[i16],
+    condition_feature: &[i32],
+    condition_bucket: &[i16],
+    candidate_offsets: &[i32],
     split_mask: &[u8],
     ordered_rows: &[i64],
     decision_time_ms: &[i64],
@@ -630,9 +630,10 @@ pub fn score_bucket_plans_cap1(
             tie,
         },
         split_mask,
-        candidates: CandidateSlots {
-            features: [feature1, feature2, feature3, feature4],
-            buckets: [bucket1, bucket2, bucket3, bucket4],
+        candidates: CandidateConditions {
+            condition_feature,
+            condition_bucket,
+            candidate_offsets,
             candidate_count,
         },
         sparse: None,
@@ -657,14 +658,9 @@ pub fn score_bucket_plans_cap1(
 pub fn score_bucket_plans_cap1_dual(
     backend: &Backend,
     feature_codes: &[i16],
-    feature1: &[i32],
-    bucket1: &[i16],
-    feature2: &[i32],
-    bucket2: &[i16],
-    feature3: &[i32],
-    bucket3: &[i16],
-    feature4: &[i32],
-    bucket4: &[i16],
+    condition_feature: &[i32],
+    condition_bucket: &[i16],
+    candidate_offsets: &[i32],
     split_mask: &[u8],
     ordered_rows: &[i64],
     decision_time_ms: &[i64],
@@ -696,9 +692,10 @@ pub fn score_bucket_plans_cap1_dual(
             tie,
         },
         split_mask,
-        candidates: CandidateSlots {
-            features: [feature1, feature2, feature3, feature4],
-            buckets: [bucket1, bucket2, bucket3, bucket4],
+        candidates: CandidateConditions {
+            condition_feature,
+            condition_bucket,
+            candidate_offsets,
             candidate_count,
         },
         sparse: None,
@@ -720,14 +717,9 @@ pub fn score_bucket_plans_cap1_dual(
 pub fn score_bucket_plans_cap1_basic(
     backend: &Backend,
     feature_codes: &[i16],
-    feature1: &[i32],
-    bucket1: &[i16],
-    feature2: &[i32],
-    bucket2: &[i16],
-    feature3: &[i32],
-    bucket3: &[i16],
-    feature4: &[i32],
-    bucket4: &[i16],
+    condition_feature: &[i32],
+    condition_bucket: &[i16],
+    candidate_offsets: &[i32],
     split_mask: &[u8],
     ordered_rows: &[i64],
     decision_time_ms: &[i64],
@@ -746,7 +738,7 @@ pub fn score_bucket_plans_cap1_basic(
         "score_bucket_plans_cap1_basic",
         feature_codes,
         row_count,
-        [feature1, feature2, feature3, feature4],
+        condition_feature,
     )?;
     let input = Request {
         kind: 2,
@@ -764,9 +756,10 @@ pub fn score_bucket_plans_cap1_basic(
             tie,
         },
         split_mask,
-        candidates: CandidateSlots {
-            features: [feature1, feature2, feature3, feature4],
-            buckets: [bucket1, bucket2, bucket3, bucket4],
+        candidates: CandidateConditions {
+            condition_feature,
+            condition_bucket,
+            candidate_offsets,
             candidate_count,
         },
         sparse: None,
@@ -791,14 +784,9 @@ pub fn score_bucket_plans_cap1_basic(
 pub fn score_bucket_plans_cap1_basic_dual(
     backend: &Backend,
     feature_codes: &[i16],
-    feature1: &[i32],
-    bucket1: &[i16],
-    feature2: &[i32],
-    bucket2: &[i16],
-    feature3: &[i32],
-    bucket3: &[i16],
-    feature4: &[i32],
-    bucket4: &[i16],
+    condition_feature: &[i32],
+    condition_bucket: &[i16],
+    candidate_offsets: &[i32],
     split_mask: &[u8],
     ordered_rows: &[i64],
     decision_time_ms: &[i64],
@@ -816,7 +804,7 @@ pub fn score_bucket_plans_cap1_basic_dual(
         "score_bucket_plans_cap1_basic_dual",
         feature_codes,
         row_count,
-        [feature1, feature2, feature3, feature4],
+        condition_feature,
     )?;
     let input = Request {
         kind: 3,
@@ -834,9 +822,10 @@ pub fn score_bucket_plans_cap1_basic_dual(
             tie,
         },
         split_mask,
-        candidates: CandidateSlots {
-            features: [feature1, feature2, feature3, feature4],
-            buckets: [bucket1, bucket2, bucket3, bucket4],
+        candidates: CandidateConditions {
+            condition_feature,
+            condition_bucket,
+            candidate_offsets,
             candidate_count,
         },
         sparse: None,
@@ -858,14 +847,9 @@ pub fn score_bucket_plans_cap1_basic_dual(
 pub fn score_bucket_plans_cap1_sparse(
     backend: &Backend,
     feature_codes: &[i16],
-    feature1: &[i32],
-    bucket1: &[i16],
-    feature2: &[i32],
-    bucket2: &[i16],
-    feature3: &[i32],
-    bucket3: &[i16],
-    feature4: &[i32],
-    bucket4: &[i16],
+    condition_feature: &[i32],
+    condition_bucket: &[i16],
+    candidate_offsets: &[i32],
     candidate_driver_key: &[i32],
     key_chrono_offsets: &[i32],
     key_chrono_rows: &[i32],
@@ -887,7 +871,7 @@ pub fn score_bucket_plans_cap1_sparse(
         "score_bucket_plans_cap1_sparse",
         feature_codes,
         row_count,
-        [feature1, feature2, feature3, feature4],
+        condition_feature,
     )?;
     let input = Request {
         kind: 4,
@@ -905,9 +889,10 @@ pub fn score_bucket_plans_cap1_sparse(
             tie,
         },
         split_mask,
-        candidates: CandidateSlots {
-            features: [feature1, feature2, feature3, feature4],
-            buckets: [bucket1, bucket2, bucket3, bucket4],
+        candidates: CandidateConditions {
+            condition_feature,
+            condition_bucket,
+            candidate_offsets,
             candidate_count,
         },
         sparse: Some(SparseIndex {
@@ -936,14 +921,9 @@ pub fn score_bucket_plans_cap1_sparse(
 pub fn score_bucket_plans_cap1_basic_sparse(
     backend: &Backend,
     feature_codes: &[i16],
-    feature1: &[i32],
-    bucket1: &[i16],
-    feature2: &[i32],
-    bucket2: &[i16],
-    feature3: &[i32],
-    bucket3: &[i16],
-    feature4: &[i32],
-    bucket4: &[i16],
+    condition_feature: &[i32],
+    condition_bucket: &[i16],
+    candidate_offsets: &[i32],
     candidate_driver_key: &[i32],
     key_chrono_offsets: &[i32],
     key_chrono_rows: &[i32],
@@ -964,7 +944,7 @@ pub fn score_bucket_plans_cap1_basic_sparse(
         "score_bucket_plans_cap1_basic_sparse",
         feature_codes,
         row_count,
-        [feature1, feature2, feature3, feature4],
+        condition_feature,
     )?;
     let input = Request {
         kind: 5,
@@ -982,9 +962,10 @@ pub fn score_bucket_plans_cap1_basic_sparse(
             tie,
         },
         split_mask,
-        candidates: CandidateSlots {
-            features: [feature1, feature2, feature3, feature4],
-            buckets: [bucket1, bucket2, bucket3, bucket4],
+        candidates: CandidateConditions {
+            condition_feature,
+            condition_bucket,
+            candidate_offsets,
             candidate_count,
         },
         sparse: Some(SparseIndex {
@@ -1013,14 +994,9 @@ pub fn score_bucket_plans_cap1_basic_sparse(
 pub fn score_bucket_plans_cap1_sparse_dual(
     backend: &Backend,
     feature_codes: &[i16],
-    feature1: &[i32],
-    bucket1: &[i16],
-    feature2: &[i32],
-    bucket2: &[i16],
-    feature3: &[i32],
-    bucket3: &[i16],
-    feature4: &[i32],
-    bucket4: &[i16],
+    condition_feature: &[i32],
+    condition_bucket: &[i16],
+    candidate_offsets: &[i32],
     candidate_driver_key: &[i32],
     key_chrono_offsets: &[i32],
     key_chrono_rows: &[i32],
@@ -1041,7 +1017,7 @@ pub fn score_bucket_plans_cap1_sparse_dual(
         "score_bucket_plans_cap1_sparse_dual",
         feature_codes,
         row_count,
-        [feature1, feature2, feature3, feature4],
+        condition_feature,
     )?;
     let input = Request {
         kind: 6,
@@ -1059,9 +1035,10 @@ pub fn score_bucket_plans_cap1_sparse_dual(
             tie,
         },
         split_mask,
-        candidates: CandidateSlots {
-            features: [feature1, feature2, feature3, feature4],
-            buckets: [bucket1, bucket2, bucket3, bucket4],
+        candidates: CandidateConditions {
+            condition_feature,
+            condition_bucket,
+            candidate_offsets,
             candidate_count,
         },
         sparse: Some(SparseIndex {
@@ -1087,14 +1064,9 @@ pub fn score_bucket_plans_cap1_sparse_dual(
 pub fn score_bucket_plans_cap1_basic_sparse_dual(
     backend: &Backend,
     feature_codes: &[i16],
-    feature1: &[i32],
-    bucket1: &[i16],
-    feature2: &[i32],
-    bucket2: &[i16],
-    feature3: &[i32],
-    bucket3: &[i16],
-    feature4: &[i32],
-    bucket4: &[i16],
+    condition_feature: &[i32],
+    condition_bucket: &[i16],
+    candidate_offsets: &[i32],
     candidate_driver_key: &[i32],
     key_chrono_offsets: &[i32],
     key_chrono_rows: &[i32],
@@ -1114,7 +1086,7 @@ pub fn score_bucket_plans_cap1_basic_sparse_dual(
         "score_bucket_plans_cap1_basic_sparse_dual",
         feature_codes,
         row_count,
-        [feature1, feature2, feature3, feature4],
+        condition_feature,
     )?;
     let input = Request {
         kind: 7,
@@ -1132,9 +1104,10 @@ pub fn score_bucket_plans_cap1_basic_sparse_dual(
             tie,
         },
         split_mask,
-        candidates: CandidateSlots {
-            features: [feature1, feature2, feature3, feature4],
-            buckets: [bucket1, bucket2, bucket3, bucket4],
+        candidates: CandidateConditions {
+            condition_feature,
+            condition_bucket,
+            candidate_offsets,
             candidate_count,
         },
         sparse: Some(SparseIndex {
@@ -1160,14 +1133,9 @@ pub fn score_bucket_plans_cap1_basic_sparse_dual(
 pub fn reconstruct_signal_masks_cap1(
     backend: &Backend,
     feature_codes: &[i16],
-    feature1: &[i32],
-    bucket1: &[i16],
-    feature2: &[i32],
-    bucket2: &[i16],
-    feature3: &[i32],
-    bucket3: &[i16],
-    feature4: &[i32],
-    bucket4: &[i16],
+    condition_feature: &[i32],
+    condition_bucket: &[i16],
+    candidate_offsets: &[i32],
     split_mask: &[u8],
     ordered_rows: &[i64],
     decision_time_ms: &[i64],
@@ -1180,7 +1148,7 @@ pub fn reconstruct_signal_masks_cap1(
         "reconstruct_signal_masks_cap1",
         feature_codes,
         row_count,
-        [feature1, feature2, feature3, feature4],
+        condition_feature,
     )?;
     let input = Request {
         kind: 8,
@@ -1198,9 +1166,10 @@ pub fn reconstruct_signal_masks_cap1(
             tie: &[],
         },
         split_mask,
-        candidates: CandidateSlots {
-            features: [feature1, feature2, feature3, feature4],
-            buckets: [bucket1, bucket2, bucket3, bucket4],
+        candidates: CandidateConditions {
+            condition_feature,
+            condition_bucket,
+            candidate_offsets,
             candidate_count,
         },
         sparse: None,
@@ -1215,4 +1184,237 @@ pub fn reconstruct_signal_masks_cap1(
         Backend::Cuda(device) => device.reconstruct(input)?,
     };
     Ok(result)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // All settled rows win buy and lose sell. This lets the independent evaluator
+    // derive every path metric from the admitted rows in closed form, without Path.
+    fn independent(
+        b: SearchBuffers<'_>,
+        mask: &[u8],
+        conditions: &[(usize, i16)],
+    ) -> (Vec<u8>, Vec<u8>, [i64; 21], [i64; 21]) {
+        let rows = b.row_count as usize;
+        let membership: Vec<u8> = (0..rows)
+            .map(|row| {
+                u8::from(
+                    conditions
+                        .iter()
+                        .all(|&(feature, bucket)| b.feature_codes[feature * rows + row] == bucket),
+                )
+            })
+            .collect();
+        let mut admitted = vec![0; rows];
+        let mut reserved_until = None;
+        let mut total = 0;
+        let mut settled = Vec::new();
+        for &row in b.ordered_rows {
+            let row = row as usize;
+            if membership[row] == 0 || mask[row] == 0 {
+                continue;
+            }
+            if mask[row] != 2 {
+                total += 1;
+            }
+            if b.release_time_ms[row] <= 0
+                || reserved_until.is_some_and(|due| due > b.decision_time_ms[row])
+            {
+                continue;
+            }
+            reserved_until = Some(b.release_time_ms[row]);
+            if mask[row] != 2 {
+                admitted[row] = 1;
+                if b.valid[row] != 0 {
+                    settled.push(row);
+                }
+            }
+        }
+        let n = settled.len() as i64;
+        let mut buy = [0; 21];
+        buy[..8].copy_from_slice(&[total, n, 0, 0, total - n, total, 0, 92 * n]);
+        buy[16] = n;
+        buy[17] = 92 * 92 * n;
+        let mut sell = [0; 21];
+        sell[..10].copy_from_slice(&[total, 0, n, 0, total - n, 0, total, -100 * n, 100 * n, n]);
+        sell[10] = ((10_000 * n * (n + 1) * (2 * n + 1) / 6) as f64).to_bits() as i64;
+        sell[11] = n;
+        sell[12] = n;
+        sell[16] = n;
+        sell[17] = 10_000 * n;
+        sell[18] = 10_000 * n;
+        if let (Some(&first), Some(&last)) = (settled.first(), settled.last()) {
+            sell[19] = b.settlement_time_ms[last] - b.settlement_time_ms[first];
+            sell[20] = b.settlement_time_ms[last] - b.decision_time_ms[first];
+        }
+        assert!(n > 0 && n < 20); // No complete rolling window in this fixture.
+        (membership, admitted, buy, sell)
+    }
+
+    fn wide_conditions(backend: &Backend) {
+        for multiframe in [false, true] {
+            // Eight columns, each with a distinct failing row beyond the first four
+            // conditions. Other-stream columns are prepared by latest-row alignment.
+            let entry: Vec<i64> = (0..32).map(|row| 1000 + row * 10).collect();
+            let codes: Vec<i16> = (0..8)
+                .flat_map(|feature| {
+                    let stride = if multiframe && feature >= 4 { 30 } else { 10 };
+                    let source: Vec<_> = (0..32)
+                        .map(|row| {
+                            (
+                                1000 + row * stride,
+                                if row == feature { -1 } else { feature as i16 },
+                            )
+                        })
+                        .collect();
+                    entry
+                        .iter()
+                        .map(move |time| source.iter().rfind(|(at, _)| at <= time).unwrap().1)
+                })
+                .collect();
+            let ordered: Vec<i64> = (0..32).collect();
+            let release: Vec<i64> = entry
+                .iter()
+                .enumerate()
+                .map(|(r, t)| if r == 27 { 0 } else { t + 20 })
+                .collect();
+            let settlement: Vec<i64> = entry.iter().map(|t| t + 20).collect();
+            let valid: Vec<u8> = (0..32).map(|r| u8::from(r != 28)).collect();
+            let split: Vec<u8> = (0..32)
+                .map(|r| {
+                    if r < 2 {
+                        2
+                    } else if r == 30 {
+                        0
+                    } else {
+                        1
+                    }
+                })
+                .collect();
+            let b = SearchBuffers {
+                feature_codes: &codes,
+                feature_count: 8,
+                row_count: 32,
+                ordered_rows: &ordered,
+                decision_time_ms: &entry,
+                release_time_ms: &release,
+                settlement_time_ms: &settlement,
+                valid: &valid,
+                buy_win: &[1; 32],
+                sell_win: &[0; 32],
+                tie: &[0; 32],
+            };
+            // Pack different lengths together so candidate offsets cannot be mistaken
+            // for a common stride. The expected evaluator uses separate condition lists.
+            let conditions: Vec<Vec<(usize, i16)>> = [5, 8]
+                .into_iter()
+                .map(|n| (0..n).map(|f| (f, f as i16)).collect())
+                .collect();
+            let features: Vec<i32> = conditions
+                .iter()
+                .flatten()
+                .map(|&(f, _)| f as i32)
+                .collect();
+            let buckets: Vec<i16> = conditions.iter().flatten().map(|&(_, b)| b).collect();
+            let expected: Vec<_> = conditions
+                .iter()
+                .map(|c| independent(b, &split, c))
+                .collect();
+            let pre: Vec<u8> = expected.iter().flat_map(|e| e.0.iter().copied()).collect();
+            let post: Vec<u8> = expected.iter().flat_map(|e| e.1.iter().copied()).collect();
+            assert_ne!(pre[..32], pre[32..]);
+            assert_ne!(pre, post);
+            let mut input = Request {
+                kind: 8,
+                buffers: b,
+                split_mask: &split,
+                candidates: CandidateConditions {
+                    condition_feature: &features,
+                    condition_bucket: &buckets,
+                    candidate_offsets: &[0, 5, 13],
+                    candidate_count: 2,
+                },
+                sparse: None,
+                expiry_ms: 20,
+                direction_code: 1,
+                payout_basis: 92,
+            };
+            let reconstruct = |request: Request<'_>| {
+                request.validate().unwrap();
+                let cpu = request.reconstruct();
+                #[cfg(feature = "cuda")]
+                if let Backend::Cuda(device) = backend {
+                    assert_eq!(device.reconstruct(request).unwrap().output, cpu);
+                }
+                cpu
+            };
+            assert_eq!(reconstruct(input), post);
+            // Neutral admission isolates equality membership before capacity and folds.
+            assert_eq!(
+                reconstruct(Request {
+                    buffers: SearchBuffers {
+                        release_time_ms: &entry,
+                        ..b
+                    },
+                    split_mask: &[1; 32],
+                    ..input
+                }),
+                pre
+            );
+            let sparse_rows: Vec<i32> = (0..32).collect();
+            for kind in 0..8 {
+                input.kind = kind;
+                input.sparse = (kind >= 4).then_some(SparseIndex {
+                    candidate_driver_key: &[0, 0],
+                    key_chrono_offsets: &[0, 32],
+                    key_chrono_rows: &sparse_rows,
+                });
+                for direction in [1, -1] {
+                    input.direction_code = direction;
+                    input.validate().unwrap();
+                    let output = input.reference();
+                    let expected_buy: Vec<i64> = expected
+                        .iter()
+                        .flat_map(|e| {
+                            let row = if input.dual() || direction == 1 {
+                                &e.2
+                            } else {
+                                &e.3
+                            };
+                            row[..input.width()].iter().copied()
+                        })
+                        .collect();
+                    assert_eq!(
+                        output.buy_output, expected_buy,
+                        "kind {kind}, direction {direction}, multiframe {multiframe}"
+                    );
+                    if input.dual() {
+                        let expected_sell: Vec<i64> = expected
+                            .iter()
+                            .flat_map(|e| e.3[..input.width()].iter().copied())
+                            .collect();
+                        assert_eq!(output.sell_output, expected_sell);
+                    }
+                    #[cfg(feature = "cuda")]
+                    if let Backend::Cuda(device) = backend {
+                        assert_eq!(device.score(input).unwrap().output, output);
+                    }
+                }
+            }
+        }
+        let _ = backend;
+    }
+
+    #[test]
+    fn five_and_eight_conditions_match_independent_evaluator() {
+        wide_conditions(&Backend::Cpu);
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn five_and_eight_device_conditions_match_independent_evaluator() {
+        wide_conditions(&Backend::cuda(0).expect("required CUDA device 0"));
+    }
 }

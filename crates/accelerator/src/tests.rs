@@ -385,12 +385,7 @@ fn search_literals(backend: &Backend) {
                 &codes,
                 &[0],
                 &[0],
-                &[-1],
-                &[-1],
-                &[-1],
-                &[-1],
-                &[-1],
-                &[-1],
+                &[0, 1],
                 &case.split,
                 &ordered,
                 &case.entry,
@@ -420,12 +415,7 @@ fn search_literals(backend: &Backend) {
             &codes,
             &[0],
             &[0],
-            &[-1],
-            &[-1],
-            &[-1],
-            &[-1],
-            &[-1],
-            &[-1],
+            &[0, 1],
             &case.split,
             &ordered,
             &case.entry,
@@ -459,12 +449,7 @@ fn search_literals(backend: &Backend) {
                 &codes,
                 &[0],
                 &[0],
-                &[-1],
-                &[-1],
-                &[-1],
-                &[-1],
-                &[-1],
-                &[-1],
+                &[0, 1],
                 &case.split,
                 &ordered,
                 &case.entry,
@@ -492,12 +477,7 @@ fn search_literals(backend: &Backend) {
             &codes,
             &[0],
             &[0],
-            &[-1],
-            &[-1],
-            &[-1],
-            &[-1],
-            &[-1],
-            &[-1],
+            &[0, 1],
             &case.split,
             &ordered,
             &case.entry,
@@ -529,12 +509,7 @@ fn search_literals(backend: &Backend) {
                 &codes,
                 &[0],
                 &[0],
-                &[-1],
-                &[-1],
-                &[-1],
-                &[-1],
-                &[-1],
-                &[-1],
+                &[0, 1],
                 &[0],
                 &offsets,
                 &sparse_rows,
@@ -566,12 +541,7 @@ fn search_literals(backend: &Backend) {
                 &codes,
                 &[0],
                 &[0],
-                &[-1],
-                &[-1],
-                &[-1],
-                &[-1],
-                &[-1],
-                &[-1],
+                &[0, 1],
                 &[0],
                 &offsets,
                 &sparse_rows,
@@ -601,12 +571,7 @@ fn search_literals(backend: &Backend) {
             &codes,
             &[0],
             &[0],
-            &[-1],
-            &[-1],
-            &[-1],
-            &[-1],
-            &[-1],
-            &[-1],
+            &[0, 1],
             &[0],
             &offsets,
             &sparse_rows,
@@ -640,12 +605,7 @@ fn search_literals(backend: &Backend) {
             &codes,
             &[0],
             &[0],
-            &[-1],
-            &[-1],
-            &[-1],
-            &[-1],
-            &[-1],
-            &[-1],
+            &[0, 1],
             &[0],
             &offsets,
             &sparse_rows,
@@ -678,12 +638,7 @@ fn search_literals(backend: &Backend) {
             &codes,
             &[0],
             &[0],
-            &[-1],
-            &[-1],
-            &[-1],
-            &[-1],
-            &[-1],
-            &[-1],
+            &[0, 1],
             &case.split,
             &ordered,
             &case.entry,
@@ -965,9 +920,10 @@ fn validation_precedes_backend_dispatch() {
         kind: 0,
         buffers,
         split_mask: &[1],
-        candidates: CandidateSlots {
-            features: [&[0], &[-1], &[-1], &[-1]],
-            buckets: [&[0]; 4],
+        candidates: CandidateConditions {
+            condition_feature: &[0],
+            condition_bucket: &[0],
+            candidate_offsets: &[0, 1],
             candidate_count: 1,
         },
         sparse: None,
@@ -977,18 +933,46 @@ fn validation_precedes_backend_dispatch() {
     };
     input.validate().unwrap();
     let mut bad = input;
-    bad.candidates.features[0] = &[-1];
+    bad.candidates.condition_feature = &[-1];
     assert!(
         bad.validate()
             .unwrap_err()
-            .contains("score_bucket_plans_cap1: feature1")
+            .contains("score_bucket_plans_cap1: condition_feature")
     );
     bad = input;
-    bad.candidates.features[3] = &[1];
-    assert!(bad.validate().unwrap_err().contains("feature4"));
+    bad.candidates.condition_feature = &[1];
+    assert!(bad.validate().unwrap_err().contains("condition_feature"));
     bad = input;
-    bad.candidates.buckets[2] = &[];
-    assert!(bad.validate().unwrap_err().contains("bucket3"));
+    bad.candidates.condition_bucket = &[];
+    assert!(bad.validate().unwrap_err().contains("condition_bucket"));
+    for offsets in [
+        &[][..],
+        &[0][..],
+        &[1, 1][..],
+        &[0, 0][..],
+        &[0, 2][..],
+        &[0, -1][..],
+    ] {
+        bad = input;
+        bad.candidates.candidate_offsets = offsets;
+        assert!(bad.validate().unwrap_err().contains("candidate_offsets"));
+    }
+    bad = input;
+    bad.candidates = CandidateConditions {
+        condition_feature: &[0, 0],
+        condition_bucket: &[0, 0],
+        candidate_offsets: &[0, 2, 1, 2],
+        candidate_count: 3,
+    };
+    assert!(bad.validate().unwrap_err().contains("candidate_offsets"));
+    // Zero candidates have a terminal zero; a candidate may never own zero conditions.
+    bad.candidates = CandidateConditions {
+        condition_feature: &[],
+        condition_bucket: &[],
+        candidate_offsets: &[0],
+        candidate_count: 0,
+    };
+    bad.validate().unwrap();
     bad = input;
     bad.buffers.ordered_rows = &[1];
     assert!(bad.validate().unwrap_err().contains("ordered_rows"));
@@ -1040,9 +1024,10 @@ fn resident_literals(device: &crate::cuda::Device) {
             .unwrap();
         // 2-byte codes, four 8-byte arrays, four flag bytes, and two split bytes.
         assert_eq!(resident.timings.allocated_bytes, rows as usize * 40);
-        let slots = CandidateSlots {
-            features: [&[0], &[-1], &[-1], &[-1]],
-            buckets: [&[0], &[-1], &[-1], &[-1]],
+        let conditions = CandidateConditions {
+            condition_feature: &[0],
+            condition_bucket: &[0],
+            candidate_offsets: &[0, 1],
             candidate_count: 1,
         };
         let sparse = SparseIndex {
@@ -1052,26 +1037,32 @@ fn resident_literals(device: &crate::cuda::Device) {
         };
         for (direction, expected) in [(1, &case.expected_buy), (-1, &case.expected_sell)] {
             let result = resident
-                .score_bucket_plans_cap1(slots, 0, case.expiry_ms, direction, case.payout)
+                .score_bucket_plans_cap1(conditions, 0, case.expiry_ms, direction, case.payout)
                 .unwrap();
             assert!(result.timings.allocated_bytes >= resident.timings.allocated_bytes);
             assert_eq!(result.output, expected[..21]);
         }
         let result = resident
-            .score_bucket_plans_cap1_dual(slots, 0, case.expiry_ms, case.payout)
+            .score_bucket_plans_cap1_dual(conditions, 0, case.expiry_ms, case.payout)
             .unwrap();
         assert!(result.timings.allocated_bytes >= resident.timings.allocated_bytes);
         assert_eq!(result.output.buy_output, case.expected_buy[..21]);
         assert_eq!(result.output.sell_output, case.expected_sell[..21]);
         for (direction, expected) in [(1, &case.expected_buy), (-1, &case.expected_sell)] {
             let result = resident
-                .score_bucket_plans_cap1_basic(slots, 0, case.expiry_ms, direction, case.payout)
+                .score_bucket_plans_cap1_basic(
+                    conditions,
+                    0,
+                    case.expiry_ms,
+                    direction,
+                    case.payout,
+                )
                 .unwrap();
             assert!(result.timings.allocated_bytes >= resident.timings.allocated_bytes);
             assert_eq!(result.output, expected[..8]);
         }
         let result = resident
-            .score_bucket_plans_cap1_basic_dual(slots, 0, case.expiry_ms, case.payout)
+            .score_bucket_plans_cap1_basic_dual(conditions, 0, case.expiry_ms, case.payout)
             .unwrap();
         assert!(result.timings.allocated_bytes >= resident.timings.allocated_bytes);
         assert_eq!(result.output.buy_output, case.expected_buy[..8]);
@@ -1079,7 +1070,7 @@ fn resident_literals(device: &crate::cuda::Device) {
         for (direction, expected) in [(1, &case.expected_buy), (-1, &case.expected_sell)] {
             let result = resident
                 .score_bucket_plans_cap1_sparse(
-                    slots,
+                    conditions,
                     0,
                     sparse,
                     case.expiry_ms,
@@ -1093,7 +1084,7 @@ fn resident_literals(device: &crate::cuda::Device) {
         for (direction, expected) in [(1, &case.expected_buy), (-1, &case.expected_sell)] {
             let result = resident
                 .score_bucket_plans_cap1_basic_sparse(
-                    slots,
+                    conditions,
                     0,
                     sparse,
                     case.expiry_ms,
@@ -1105,14 +1096,14 @@ fn resident_literals(device: &crate::cuda::Device) {
             assert_eq!(result.output, expected[..8]);
         }
         let result = resident
-            .score_bucket_plans_cap1_sparse_dual(slots, 0, sparse, case.expiry_ms, case.payout)
+            .score_bucket_plans_cap1_sparse_dual(conditions, 0, sparse, case.expiry_ms, case.payout)
             .unwrap();
         assert!(result.timings.allocated_bytes >= resident.timings.allocated_bytes);
         assert_eq!(result.output.buy_output, case.expected_buy[..21]);
         assert_eq!(result.output.sell_output, case.expected_sell[..21]);
         let result = resident
             .score_bucket_plans_cap1_basic_sparse_dual(
-                slots,
+                conditions,
                 0,
                 sparse,
                 case.expiry_ms,
@@ -1123,13 +1114,13 @@ fn resident_literals(device: &crate::cuda::Device) {
         assert_eq!(result.output.buy_output, case.expected_buy[..8]);
         assert_eq!(result.output.sell_output, case.expected_sell[..8]);
         let result = resident
-            .reconstruct_signal_masks_cap1(slots, 0, case.expiry_ms)
+            .reconstruct_signal_masks_cap1(conditions, 0, case.expiry_ms)
             .unwrap();
         assert!(result.timings.allocated_bytes >= resident.timings.allocated_bytes);
         assert_eq!(result.output, case.mask);
         assert_eq!(
             resident
-                .reconstruct_signal_masks_cap1(slots, 1, case.expiry_ms)
+                .reconstruct_signal_masks_cap1(conditions, 1, case.expiry_ms)
                 .unwrap()
                 .output,
             excluded
@@ -1138,29 +1129,19 @@ fn resident_literals(device: &crate::cuda::Device) {
 }
 
 fn boundary_literals(backend: &Backend) {
-    // All four slots are active, and 129 candidates require two 128-thread blocks.
+    // Four conditions are active, and 129 candidates require two 128-thread blocks.
     // Row two fails only the fourth slot. Chronology is deliberately not row order.
-    let feature1 = vec![0; 129];
-    let feature2 = vec![1; 129];
-    let feature3 = vec![2; 129];
-    let feature4 = vec![3; 129];
-    let bucket1 = vec![0; 129];
-    let bucket2 = vec![1; 129];
-    let bucket3 = vec![2; 129];
-    let bucket4 = vec![3; 129];
+    let condition_feature = [0, 1, 2, 3].repeat(129);
+    let condition_bucket = [0, 1, 2, 3].repeat(129);
+    let candidate_offsets = (0..=129).map(|c| c * 4).collect::<Vec<_>>();
     let codes = [0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 9, 3];
     let run = |b: &Backend| {
         reconstruct_signal_masks_cap1(
             b,
             &codes,
-            &feature1,
-            &bucket1,
-            &feature2,
-            &bucket2,
-            &feature3,
-            &bucket3,
-            &feature4,
-            &bucket4,
+            &condition_feature,
+            &condition_bucket,
+            &candidate_offsets,
             &[1; 4],
             &[3, 1, 0, 2],
             &[3, 2, 4, 1],
@@ -1174,20 +1155,14 @@ fn boundary_literals(backend: &Backend) {
     };
     assert_eq!(run(backend), [1, 1, 0, 1].repeat(129));
     assert_eq!(run(backend), run(&Backend::Cpu));
-    // An inactive feature ignores even a non-sentinel bucket code. An active
-    // bucket -1 is a real equality comparison against the missing-code value.
+    // Bucket -1 is a real equality comparison against the missing-code value.
     assert_eq!(
         reconstruct_signal_masks_cap1(
             backend,
             &[-1, 0],
             &[0],
             &[-1],
-            &[-1],
-            &[32767],
-            &[-1],
-            &[5],
-            &[-1],
-            &[3],
+            &[0, 1],
             &[1, 1],
             &[0, 1],
             &[1, 2],
@@ -1207,12 +1182,7 @@ fn boundary_literals(backend: &Backend) {
         &[0],
         &[0],
         &[0],
-        &[-1],
-        &[-1],
-        &[-1],
-        &[-1],
-        &[-1],
-        &[-1],
+        &[0, 1],
         &[1],
         &[0],
         &[1],
@@ -1234,12 +1204,7 @@ fn boundary_literals(backend: &Backend) {
         &[0],
         &[0],
         &[0],
-        &[-1],
-        &[-1],
-        &[-1],
-        &[-1],
-        &[-1],
-        &[-1],
+        &[0, 1],
         &[1],
         &[0],
         &[1],

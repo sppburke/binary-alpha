@@ -1,7 +1,7 @@
 //! A single context, default stream, and ahead-of-time module per device.
 //! Safe typed buffers own all allocations; only validated kernel launches are unsafe.
 
-use crate::search::{CandidateSlots, DualScores, Request, SearchBuffers, SparseIndex};
+use crate::search::{CandidateConditions, DualScores, Request, SearchBuffers, SparseIndex};
 use crate::{KERNEL_SOURCES, MODULE_CUBIN, Measured, Timings};
 use cudarc::driver::{
     CudaContext, CudaFunction, CudaModule, CudaSlice, CudaStream, DeviceRepr, LaunchConfig,
@@ -544,9 +544,10 @@ impl Device {
                 kind: 0,
                 buffers,
                 split_mask,
-                candidates: CandidateSlots {
-                    features: [&[]; 4],
-                    buckets: [&[]; 4],
+                candidates: CandidateConditions {
+                    condition_feature: &[],
+                    condition_bucket: &[],
+                    candidate_offsets: &[0],
                     candidate_count: 0,
                 },
                 sparse: None,
@@ -598,16 +599,16 @@ impl Device {
         Ok(Measured { output, timings })
     }
 
+    // The public search operation validates once before entering this upload/launch path.
     pub(crate) fn score(&self, input: Request<'_>) -> Result<Measured<DualScores>, String> {
-        input.validate()?;
         let shared = self.shared(input.buffers, &[input.split_mask], input.kernel())?;
         let mut result = self.score_resident(input, &shared.output, 0)?;
         result.timings.upload += shared.timings.upload;
         Ok(result)
     }
 
+    // The public reconstruction operation validates once before upload.
     pub(crate) fn reconstruct(&self, input: Request<'_>) -> Result<Measured<Vec<u8>>, String> {
-        input.validate()?;
         let shared = self.shared(input.buffers, &[input.split_mask], input.kernel())?;
         let mut result = self.reconstruct_resident(input, &shared.output, 0)?;
         result.timings.upload += shared.timings.upload;
@@ -622,18 +623,15 @@ impl Device {
         shared: &Shared,
         split: usize,
     ) -> Result<Measured<DualScores>, String> {
-        input.validate()?;
         let k = input.kernel();
         self.sync(k, "before upload")?;
         let start = Instant::now();
-        let feature1 = self.upload(k, "feature1", input.candidates.features[0])?;
-        let bucket1 = self.upload(k, "bucket1", input.candidates.buckets[0])?;
-        let feature2 = self.upload(k, "feature2", input.candidates.features[1])?;
-        let bucket2 = self.upload(k, "bucket2", input.candidates.buckets[1])?;
-        let feature3 = self.upload(k, "feature3", input.candidates.features[2])?;
-        let bucket3 = self.upload(k, "bucket3", input.candidates.buckets[2])?;
-        let feature4 = self.upload(k, "feature4", input.candidates.features[3])?;
-        let bucket4 = self.upload(k, "bucket4", input.candidates.buckets[3])?;
+        let condition_feature =
+            self.upload(k, "condition_feature", input.candidates.condition_feature)?;
+        let condition_bucket =
+            self.upload(k, "condition_bucket", input.candidates.condition_bucket)?;
+        let candidate_offsets =
+            self.upload(k, "candidate_offsets", input.candidates.candidate_offsets)?;
         let sparse = input
             .sparse
             .map(|index| -> Result<_, String> {
@@ -651,14 +649,9 @@ impl Device {
         self.sync(k, "upload")?;
         let upload = start.elapsed();
         let allocated_bytes = shared.bytes()
-            + feature1.num_bytes()
-            + bucket1.num_bytes()
-            + feature2.num_bytes()
-            + bucket2.num_bytes()
-            + feature3.num_bytes()
-            + bucket3.num_bytes()
-            + feature4.num_bytes()
-            + bucket4.num_bytes()
+            + condition_feature.num_bytes()
+            + condition_bucket.num_bytes()
+            + candidate_offsets.num_bytes()
             + buy_output.num_bytes()
             + sell_output.num_bytes()
             + sparse.as_ref().map_or(0, |(keys, offsets, rows)| {
@@ -667,17 +660,12 @@ impl Device {
         let start = Instant::now();
         if input.candidates.candidate_count > 0 {
             let mut builder = self.stream.launch_builder(&self.functions[input.kind]);
+            builder.arg(&shared.feature_codes);
+            builder.arg(&condition_feature);
+            builder.arg(&condition_bucket);
+            builder.arg(&candidate_offsets);
             match input.kind {
                 0 => {
-                    builder.arg(&shared.feature_codes);
-                    builder.arg(&feature1);
-                    builder.arg(&bucket1);
-                    builder.arg(&feature2);
-                    builder.arg(&bucket2);
-                    builder.arg(&feature3);
-                    builder.arg(&bucket3);
-                    builder.arg(&feature4);
-                    builder.arg(&bucket4);
                     builder.arg(&shared.split_masks[split]);
                     builder.arg(&shared.ordered_rows);
                     builder.arg(&shared.decision_time_ms);
@@ -696,15 +684,6 @@ impl Device {
                     builder.arg(&input.payout_basis);
                 }
                 1 => {
-                    builder.arg(&shared.feature_codes);
-                    builder.arg(&feature1);
-                    builder.arg(&bucket1);
-                    builder.arg(&feature2);
-                    builder.arg(&bucket2);
-                    builder.arg(&feature3);
-                    builder.arg(&bucket3);
-                    builder.arg(&feature4);
-                    builder.arg(&bucket4);
                     builder.arg(&shared.split_masks[split]);
                     builder.arg(&shared.ordered_rows);
                     builder.arg(&shared.decision_time_ms);
@@ -723,15 +702,6 @@ impl Device {
                     builder.arg(&input.payout_basis);
                 }
                 2 => {
-                    builder.arg(&shared.feature_codes);
-                    builder.arg(&feature1);
-                    builder.arg(&bucket1);
-                    builder.arg(&feature2);
-                    builder.arg(&bucket2);
-                    builder.arg(&feature3);
-                    builder.arg(&bucket3);
-                    builder.arg(&feature4);
-                    builder.arg(&bucket4);
                     builder.arg(&shared.split_masks[split]);
                     builder.arg(&shared.ordered_rows);
                     builder.arg(&shared.decision_time_ms);
@@ -748,15 +718,6 @@ impl Device {
                     builder.arg(&input.payout_basis);
                 }
                 3 => {
-                    builder.arg(&shared.feature_codes);
-                    builder.arg(&feature1);
-                    builder.arg(&bucket1);
-                    builder.arg(&feature2);
-                    builder.arg(&bucket2);
-                    builder.arg(&feature3);
-                    builder.arg(&bucket3);
-                    builder.arg(&feature4);
-                    builder.arg(&bucket4);
                     builder.arg(&shared.split_masks[split]);
                     builder.arg(&shared.ordered_rows);
                     builder.arg(&shared.decision_time_ms);
@@ -775,15 +736,6 @@ impl Device {
                 4 => {
                     let (candidate_driver_key, key_chrono_offsets, key_chrono_rows) =
                         sparse.as_ref().expect("sparse request validated");
-                    builder.arg(&shared.feature_codes);
-                    builder.arg(&feature1);
-                    builder.arg(&bucket1);
-                    builder.arg(&feature2);
-                    builder.arg(&bucket2);
-                    builder.arg(&feature3);
-                    builder.arg(&bucket3);
-                    builder.arg(&feature4);
-                    builder.arg(&bucket4);
                     builder.arg(candidate_driver_key);
                     builder.arg(key_chrono_offsets);
                     builder.arg(key_chrono_rows);
@@ -805,15 +757,6 @@ impl Device {
                 5 => {
                     let (candidate_driver_key, key_chrono_offsets, key_chrono_rows) =
                         sparse.as_ref().expect("sparse request validated");
-                    builder.arg(&shared.feature_codes);
-                    builder.arg(&feature1);
-                    builder.arg(&bucket1);
-                    builder.arg(&feature2);
-                    builder.arg(&bucket2);
-                    builder.arg(&feature3);
-                    builder.arg(&bucket3);
-                    builder.arg(&feature4);
-                    builder.arg(&bucket4);
                     builder.arg(candidate_driver_key);
                     builder.arg(key_chrono_offsets);
                     builder.arg(key_chrono_rows);
@@ -834,15 +777,6 @@ impl Device {
                 6 => {
                     let (candidate_driver_key, key_chrono_offsets, key_chrono_rows) =
                         sparse.as_ref().expect("sparse request validated");
-                    builder.arg(&shared.feature_codes);
-                    builder.arg(&feature1);
-                    builder.arg(&bucket1);
-                    builder.arg(&feature2);
-                    builder.arg(&bucket2);
-                    builder.arg(&feature3);
-                    builder.arg(&bucket3);
-                    builder.arg(&feature4);
-                    builder.arg(&bucket4);
                     builder.arg(candidate_driver_key);
                     builder.arg(key_chrono_offsets);
                     builder.arg(key_chrono_rows);
@@ -864,15 +798,6 @@ impl Device {
                 7 => {
                     let (candidate_driver_key, key_chrono_offsets, key_chrono_rows) =
                         sparse.as_ref().expect("sparse request validated");
-                    builder.arg(&shared.feature_codes);
-                    builder.arg(&feature1);
-                    builder.arg(&bucket1);
-                    builder.arg(&feature2);
-                    builder.arg(&bucket2);
-                    builder.arg(&feature3);
-                    builder.arg(&bucket3);
-                    builder.arg(&feature4);
-                    builder.arg(&bucket4);
                     builder.arg(candidate_driver_key);
                     builder.arg(key_chrono_offsets);
                     builder.arg(key_chrono_rows);
@@ -925,18 +850,15 @@ impl Device {
         shared: &Shared,
         split: usize,
     ) -> Result<Measured<Vec<u8>>, String> {
-        input.validate()?;
         let k = input.kernel();
         self.sync(k, "before upload")?;
         let start = Instant::now();
-        let feature1 = self.upload(k, "feature1", input.candidates.features[0])?;
-        let bucket1 = self.upload(k, "bucket1", input.candidates.buckets[0])?;
-        let feature2 = self.upload(k, "feature2", input.candidates.features[1])?;
-        let bucket2 = self.upload(k, "bucket2", input.candidates.buckets[1])?;
-        let feature3 = self.upload(k, "feature3", input.candidates.features[2])?;
-        let bucket3 = self.upload(k, "bucket3", input.candidates.buckets[2])?;
-        let feature4 = self.upload(k, "feature4", input.candidates.features[3])?;
-        let bucket4 = self.upload(k, "bucket4", input.candidates.buckets[3])?;
+        let condition_feature =
+            self.upload(k, "condition_feature", input.candidates.condition_feature)?;
+        let condition_bucket =
+            self.upload(k, "condition_bucket", input.candidates.condition_bucket)?;
+        let candidate_offsets =
+            self.upload(k, "candidate_offsets", input.candidates.candidate_offsets)?;
         let mut output = self.zeros::<u8>(
             k,
             "output",
@@ -945,27 +867,17 @@ impl Device {
         self.sync(k, "upload")?;
         let upload = start.elapsed();
         let allocated_bytes = shared.bytes()
-            + feature1.num_bytes()
-            + bucket1.num_bytes()
-            + feature2.num_bytes()
-            + bucket2.num_bytes()
-            + feature3.num_bytes()
-            + bucket3.num_bytes()
-            + feature4.num_bytes()
-            + bucket4.num_bytes()
+            + condition_feature.num_bytes()
+            + condition_bucket.num_bytes()
+            + candidate_offsets.num_bytes()
             + output.num_bytes();
         let start = Instant::now();
         if input.candidates.candidate_count > 0 {
             let mut builder = self.stream.launch_builder(&self.functions[input.kind]);
             builder.arg(&shared.feature_codes);
-            builder.arg(&feature1);
-            builder.arg(&bucket1);
-            builder.arg(&feature2);
-            builder.arg(&bucket2);
-            builder.arg(&feature3);
-            builder.arg(&bucket3);
-            builder.arg(&feature4);
-            builder.arg(&bucket4);
+            builder.arg(&condition_feature);
+            builder.arg(&condition_bucket);
+            builder.arg(&candidate_offsets);
             builder.arg(&shared.split_masks[split]);
             builder.arg(&shared.ordered_rows);
             builder.arg(&shared.decision_time_ms);
@@ -1001,7 +913,7 @@ impl ResidentSearch<'_> {
     /// Runs `score_bucket_plans_cap1` reusing the shared buffers and the selected resident split.
     pub fn score_bucket_plans_cap1(
         &self,
-        candidates: CandidateSlots<'_>,
+        candidates: CandidateConditions<'_>,
         split: usize,
         expiry_ms: i64,
         direction_code: i32,
@@ -1020,6 +932,7 @@ impl ResidentSearch<'_> {
             direction_code,
             payout_basis,
         };
+        input.validate()?;
         let result = self.device.score_resident(input, &self.shared, split)?;
         Ok(Measured {
             output: result.output.buy_output,
@@ -1029,7 +942,7 @@ impl ResidentSearch<'_> {
     /// Runs `score_bucket_plans_cap1_dual` reusing the shared buffers and the selected resident split.
     pub fn score_bucket_plans_cap1_dual(
         &self,
-        candidates: CandidateSlots<'_>,
+        candidates: CandidateConditions<'_>,
         split: usize,
         expiry_ms: i64,
         payout_basis: i64,
@@ -1047,13 +960,14 @@ impl ResidentSearch<'_> {
             direction_code: 1,
             payout_basis,
         };
+        input.validate()?;
         let result = self.device.score_resident(input, &self.shared, split)?;
         Ok(result)
     }
     /// Runs `score_bucket_plans_cap1_basic` reusing the shared buffers and the selected resident split.
     pub fn score_bucket_plans_cap1_basic(
         &self,
-        candidates: CandidateSlots<'_>,
+        candidates: CandidateConditions<'_>,
         split: usize,
         expiry_ms: i64,
         direction_code: i32,
@@ -1072,6 +986,7 @@ impl ResidentSearch<'_> {
             direction_code,
             payout_basis,
         };
+        input.validate()?;
         let result = self.device.score_resident(input, &self.shared, split)?;
         Ok(Measured {
             output: result.output.buy_output,
@@ -1081,7 +996,7 @@ impl ResidentSearch<'_> {
     /// Runs `score_bucket_plans_cap1_basic_dual` reusing the shared buffers and the selected resident split.
     pub fn score_bucket_plans_cap1_basic_dual(
         &self,
-        candidates: CandidateSlots<'_>,
+        candidates: CandidateConditions<'_>,
         split: usize,
         expiry_ms: i64,
         payout_basis: i64,
@@ -1099,13 +1014,14 @@ impl ResidentSearch<'_> {
             direction_code: 1,
             payout_basis,
         };
+        input.validate()?;
         let result = self.device.score_resident(input, &self.shared, split)?;
         Ok(result)
     }
     /// Runs `score_bucket_plans_cap1_sparse` reusing the shared buffers and the selected resident split.
     pub fn score_bucket_plans_cap1_sparse(
         &self,
-        candidates: CandidateSlots<'_>,
+        candidates: CandidateConditions<'_>,
         split: usize,
         sparse: SparseIndex<'_>,
         expiry_ms: i64,
@@ -1125,6 +1041,7 @@ impl ResidentSearch<'_> {
             direction_code,
             payout_basis,
         };
+        input.validate()?;
         let result = self.device.score_resident(input, &self.shared, split)?;
         Ok(Measured {
             output: result.output.buy_output,
@@ -1134,7 +1051,7 @@ impl ResidentSearch<'_> {
     /// Runs `score_bucket_plans_cap1_basic_sparse` reusing the shared buffers and the selected resident split.
     pub fn score_bucket_plans_cap1_basic_sparse(
         &self,
-        candidates: CandidateSlots<'_>,
+        candidates: CandidateConditions<'_>,
         split: usize,
         sparse: SparseIndex<'_>,
         expiry_ms: i64,
@@ -1154,6 +1071,7 @@ impl ResidentSearch<'_> {
             direction_code,
             payout_basis,
         };
+        input.validate()?;
         let result = self.device.score_resident(input, &self.shared, split)?;
         Ok(Measured {
             output: result.output.buy_output,
@@ -1163,7 +1081,7 @@ impl ResidentSearch<'_> {
     /// Runs `score_bucket_plans_cap1_sparse_dual` reusing the shared buffers and the selected resident split.
     pub fn score_bucket_plans_cap1_sparse_dual(
         &self,
-        candidates: CandidateSlots<'_>,
+        candidates: CandidateConditions<'_>,
         split: usize,
         sparse: SparseIndex<'_>,
         expiry_ms: i64,
@@ -1182,13 +1100,14 @@ impl ResidentSearch<'_> {
             direction_code: 1,
             payout_basis,
         };
+        input.validate()?;
         let result = self.device.score_resident(input, &self.shared, split)?;
         Ok(result)
     }
     /// Runs `score_bucket_plans_cap1_basic_sparse_dual` reusing the shared buffers and the selected resident split.
     pub fn score_bucket_plans_cap1_basic_sparse_dual(
         &self,
-        candidates: CandidateSlots<'_>,
+        candidates: CandidateConditions<'_>,
         split: usize,
         sparse: SparseIndex<'_>,
         expiry_ms: i64,
@@ -1209,13 +1128,14 @@ impl ResidentSearch<'_> {
             direction_code: 1,
             payout_basis,
         };
+        input.validate()?;
         let result = self.device.score_resident(input, &self.shared, split)?;
         Ok(result)
     }
     /// Runs `reconstruct_signal_masks_cap1` reusing the shared buffers and the selected resident split.
     pub fn reconstruct_signal_masks_cap1(
         &self,
-        candidates: CandidateSlots<'_>,
+        candidates: CandidateConditions<'_>,
         split: usize,
         expiry_ms: i64,
     ) -> Result<Measured<Vec<u8>>, String> {
@@ -1232,6 +1152,7 @@ impl ResidentSearch<'_> {
             direction_code: 1,
             payout_basis: 0,
         };
+        input.validate()?;
         let result = self
             .device
             .reconstruct_resident(input, &self.shared, split)?;

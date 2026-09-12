@@ -178,10 +178,23 @@ Section [outcomes](#outcomes) gives the fields of the `outcomes` table.
 
 The optional `accelerator` table declares `backend` (`cpu` or `cuda`) and rejects
 unknown fields. It follows `replay` in canonical order. Every application command
-loading a configuration rejects `cuda` when built without the `cuda` feature.
+loading a configuration rejects `cuda` when built without the `cuda` feature, with a diagnostic
+naming the missing feature. `cpu` selects the central-processor reference; `cuda` requests the
+ahead-of-time native module and fails clearly if the binary, driver, device, or module is unavailable
+or incompatible.
 There is no implicit device fallback. Omitting the section preserves the previous
 configuration hash. This offline selection does not change Engine execution;
 accelerator results have no production consumer in this phase.
+
+Device conditions are equality tests on fitted-encoding codes in a feature-major matrix. Flattened
+`condition_feature` and `condition_bucket` buffers and `candidate_offsets` delimit a nonempty,
+variable-length conjunction per candidate; there is no four-condition storage limit. The host
+prepares buffers from the published generations, applies the Engine's readiness and unready rules
+while encoding, and aligns other-stream columns to base rows by the Engine's latest-row rule.
+The kernels perform neither alignment nor non-equality comparisons. The central-processor
+reference reproduces each kernel's arithmetic and operation order exactly and is the raw-result
+oracle. The Engine is the final chronological and financial audit: device results never suppress,
+admit, or settle Engine observations.
 
 Every field is required and has no default, except that the `import` table, the `provenance`
 list, the `instruments` list, the `features` table, the `outcomes` table, the `accelerator`

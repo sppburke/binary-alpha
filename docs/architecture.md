@@ -1,7 +1,8 @@
 # Architecture
 
-Binary Alpha is one process built from one Cargo workspace with two packages. Dependencies point one
-way: `binary-alpha-app` depends on `binary-alpha-engine`; the engine depends on nothing in the
+Binary Alpha is one process built from one Cargo workspace with three packages. Dependencies point one
+way: `binary-alpha-app` depends on `binary-alpha-engine` and uses `binary-alpha-accelerator` for
+offline kernel proof; the accelerator depends on neither package. The engine depends on nothing in the
 application and makes no file, network, cloud, broker, command-line, or device call. Strategies and
 models emit typed intent; only execution communicates with a broker; mode adapters change
 capabilities and input or output, never core semantics.
@@ -69,7 +70,8 @@ same store after restoring it.
 ## Data flow owned by later phases
 
 The same single process grows along one causal path and one chronological path. Each stage below
-names the issue that implements it; nothing on this list exists in the current checkout.
+names its implementing issue. The existing ingestion, Engine, and accelerator owners supply the
+later consumers shown here.
 
 ```
 historical import (#3) ──┐
@@ -78,7 +80,7 @@ live feed (#11) ─────────┘                                  
                                                                                                       ▼
 artifacts: Google Cloud Storage, Supabase references (#3)  ◀── strategy, replay, settlement, accounting, risk (#7, this checkout)
                                                                      ▲                     │
-accelerator with central-processor reference (#8) ─▶ candidate search and evaluation (#9)  │
+accelerator with central-processor reference (#8, this checkout) ─▶ candidate search and evaluation (#9)  │
                                                      repair, portfolio, risk tuning (#10)  │
 research, optimization, certification (#12) ◀──────────────────────────────────────────────┘
 live runtime and cutover (#13) ─▶ execution ─▶ broker adapter (#11)
@@ -100,7 +102,7 @@ live runtime and cutover (#13) ─▶ execution ─▶ broker adapter (#11)
 | Binding tick and feature generations, the little-endian outcome objects, outcome publication and reconstruction | `binary-alpha-app`, module `outcomes` | this checkout ([#6](https://github.com/sppburke/binary-alpha/issues/6)) |
 | Exact money, strategy and deployment records, chronological admission, settlement, accounting, risk, the ledger and its restoration, summaries | `binary-alpha-engine`, module `execution` | this checkout ([#7](https://github.com/sppburke/binary-alpha/issues/7)) |
 | Binding replay inputs, the availability merge, the historical simulation, replay publication and reconstruction | `binary-alpha-app`, module `replay` | this checkout ([#7](https://github.com/sppburke/binary-alpha/issues/7)) |
-| Device kernels behind a reviewed safe boundary | a new accelerator package, only when the unsafe boundary is real | [#8](https://github.com/sppburke/binary-alpha/issues/8) |
+| Device kernels behind a reviewed safe boundary; central-processor reference as the raw-result oracle, Engine as the final chronological audit | `binary-alpha-accelerator` | this checkout ([#8](https://github.com/sppburke/binary-alpha/issues/8)) |
 | Candidate search, evaluation, repair, portfolio, risk tuning | `binary-alpha-engine` with thin application entry points | [#9](https://github.com/sppburke/binary-alpha/issues/9), [#10](https://github.com/sppburke/binary-alpha/issues/10) |
 | Broker contracts and adapters, secrets resolution | `binary-alpha-app` | [#11](https://github.com/sppburke/binary-alpha/issues/11) |
 | Research orchestration, holdout grants, certification | `binary-alpha-app` over engine stages | [#12](https://github.com/sppburke/binary-alpha/issues/12) |
