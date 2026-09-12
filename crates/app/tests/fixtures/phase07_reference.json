@@ -1,0 +1,2831 @@
+{
+  "capture_run_sha256": "3d56dec57f10db42b0907304c8c622d440ab72a0da47f860caf4673f38923284",
+  "kernel_source_sha256": {
+    "bootstrap_path_metrics": "08787ee13438ea5615b1716db1c2f300fbcd558de700f3e050d145164cf2b4a3",
+    "path_drawdown": "790b0e99a2bed348fdbb7c2c67bea71c7be26a1548b75232ad9b7340706b6a69",
+    "reconstruct_signal_masks_cap1": "738ff7b107e2d375af589626f6613fb9ae1a0d8af09f3187c7dc91418c6d167d",
+    "replay_capacity": "575e16c4c2a8a1b5a03aacbf0d5f8bc78aad2521118380e0deae924466a5a836",
+    "replay_policies": "a11103708b3d22a4a37a30bed51abfa3e418477981e7dc603fa8ff195f5f48d0",
+    "score_bucket_plans_cap1": "b7fbd0a8559fcef341c90a1c14f61a96b4bb817962cea78171d2ed5d45148da8",
+    "score_bucket_plans_cap1_basic": "7f539e03452794c0244c2bbe7a82223fcbcec9f7d1523e760cb8ca9365285038",
+    "score_bucket_plans_cap1_basic_dual": "d218f1ecc7419537398beab1fea189a7f862fcab92ec155e94726d1ad514456d",
+    "score_bucket_plans_cap1_basic_sparse": "9c1123fbf02d847bfaa1d09b12ca0a973e571c19a01ddbb22bf3df1e4e47d0cc",
+    "score_bucket_plans_cap1_basic_sparse_dual": "ac4d67f8d84c104bb24e8f96673de1782bf0e4b6a712078b7ee75a5ee982793b",
+    "score_bucket_plans_cap1_dual": "bd561563b1cf518afca112caa9a54f2dfa13e421fd2378c87726fd2629bd8b00",
+    "score_bucket_plans_cap1_sparse": "ee4353f52d96e81e0cd95c6e7c38cf9e91937448410bab8a42d6cc8901b3be3a",
+    "score_bucket_plans_cap1_sparse_dual": "18c3fcc4a5d59bb3a4c8ce4dea9fb660f06295e66697bdf11a6fa6e99f7523d0"
+  },
+  "reference_identity": "38f30a8c30d05b4cf03e9eecb13319638a8164c91d4410d2b5721dd36f857cc3",
+  "schema_version": 1,
+  "source_commit": "b509964cd1c40180e9d98b0e55a95699b0abe9ed",
+  "stage_summary": [
+    {
+      "input_bytes": 212,
+      "launches": [
+        {
+          "case": "TS-A-0",
+          "counts": {
+            "output/invalid": 0,
+            "output/losses": 2,
+            "output/signals": 4,
+            "output/ties": 0,
+            "output/wins": 2
+          },
+          "dimensions": {
+            "candidate_count": 1,
+            "direction_code": 1,
+            "expiry_ms": 30000,
+            "feature_count": 1,
+            "payout_basis": 92,
+            "row_count": 4
+          },
+          "symbol": "score_bucket_plans_cap1"
+        }
+      ],
+      "output_bytes": 168,
+      "stage": "TS-A-0"
+    },
+    {
+      "input_bytes": 251,
+      "launches": [
+        {
+          "case": "TS-B-0",
+          "counts": {
+            "output/invalid": 0,
+            "output/losses": 2,
+            "output/signals": 5,
+            "output/ties": 1,
+            "output/wins": 2
+          },
+          "dimensions": {
+            "candidate_count": 1,
+            "direction_code": 1,
+            "expiry_ms": 30000,
+            "feature_count": 1,
+            "payout_basis": 100,
+            "row_count": 5
+          },
+          "symbol": "score_bucket_plans_cap1"
+        }
+      ],
+      "output_bytes": 168,
+      "stage": "TS-B-0"
+    },
+    {
+      "input_bytes": 251,
+      "launches": [
+        {
+          "case": "TS-C-0",
+          "counts": {
+            "output/invalid": 0,
+            "output/losses": 2,
+            "output/signals": 5,
+            "output/ties": 0,
+            "output/wins": 3
+          },
+          "dimensions": {
+            "candidate_count": 1,
+            "direction_code": 1,
+            "expiry_ms": 30000,
+            "feature_count": 1,
+            "payout_basis": 92,
+            "row_count": 5
+          },
+          "symbol": "score_bucket_plans_cap1"
+        }
+      ],
+      "output_bytes": 168,
+      "stage": "TS-C-0"
+    },
+    {
+      "input_bytes": 251,
+      "launches": [
+        {
+          "case": "TS-C-1",
+          "counts": {
+            "output/invalid": 0,
+            "output/losses": 3,
+            "output/signals": 5,
+            "output/ties": 0,
+            "output/wins": 2
+          },
+          "dimensions": {
+            "candidate_count": 1,
+            "direction_code": -1,
+            "expiry_ms": 30000,
+            "feature_count": 1,
+            "payout_basis": 92,
+            "row_count": 5
+          },
+          "symbol": "score_bucket_plans_cap1"
+        }
+      ],
+      "output_bytes": 168,
+      "stage": "TS-C-1"
+    },
+    {
+      "input_bytes": 247,
+      "launches": [
+        {
+          "case": "TS-C-2",
+          "counts": {
+            "buy_output/invalid": 0,
+            "buy_output/losses": 2,
+            "buy_output/signals": 5,
+            "buy_output/ties": 0,
+            "buy_output/wins": 3,
+            "sell_output/invalid": 0,
+            "sell_output/losses": 3,
+            "sell_output/signals": 5,
+            "sell_output/ties": 0,
+            "sell_output/wins": 2
+          },
+          "dimensions": {
+            "candidate_count": 1,
+            "expiry_ms": 30000,
+            "feature_count": 1,
+            "payout_basis": 92,
+            "row_count": 5
+          },
+          "symbol": "score_bucket_plans_cap1_dual"
+        }
+      ],
+      "output_bytes": 336,
+      "stage": "TS-C-2"
+    },
+    {
+      "input_bytes": 243,
+      "launches": [
+        {
+          "case": "TS-C-3",
+          "counts": {
+            "output/invalid": 0,
+            "output/losses": 2,
+            "output/signals": 5,
+            "output/ties": 0,
+            "output/wins": 3
+          },
+          "dimensions": {
+            "candidate_count": 1,
+            "direction_code": 1,
+            "expiry_ms": 30000,
+            "feature_count": 1,
+            "payout_basis": 92,
+            "row_count": 5
+          },
+          "symbol": "score_bucket_plans_cap1_sparse"
+        }
+      ],
+      "output_bytes": 168,
+      "stage": "TS-C-3"
+    },
+    {
+      "input_bytes": 243,
+      "launches": [
+        {
+          "case": "TS-C-4",
+          "counts": {
+            "output/invalid": 0,
+            "output/losses": 3,
+            "output/signals": 5,
+            "output/ties": 0,
+            "output/wins": 2
+          },
+          "dimensions": {
+            "candidate_count": 1,
+            "direction_code": -1,
+            "expiry_ms": 30000,
+            "feature_count": 1,
+            "payout_basis": 92,
+            "row_count": 5
+          },
+          "symbol": "score_bucket_plans_cap1_sparse"
+        }
+      ],
+      "output_bytes": 168,
+      "stage": "TS-C-4"
+    },
+    {
+      "input_bytes": 239,
+      "launches": [
+        {
+          "case": "TS-C-5",
+          "counts": {
+            "buy_output/invalid": 0,
+            "buy_output/losses": 2,
+            "buy_output/signals": 5,
+            "buy_output/ties": 0,
+            "buy_output/wins": 3,
+            "sell_output/invalid": 0,
+            "sell_output/losses": 3,
+            "sell_output/signals": 5,
+            "sell_output/ties": 0,
+            "sell_output/wins": 2
+          },
+          "dimensions": {
+            "candidate_count": 1,
+            "expiry_ms": 30000,
+            "feature_count": 1,
+            "payout_basis": 92,
+            "row_count": 5
+          },
+          "symbol": "score_bucket_plans_cap1_sparse_dual"
+        }
+      ],
+      "output_bytes": 336,
+      "stage": "TS-C-5"
+    },
+    {
+      "input_bytes": 211,
+      "launches": [
+        {
+          "case": "TS-C-6",
+          "counts": {
+            "output/invalid": 0,
+            "output/losses": 2,
+            "output/signals": 5,
+            "output/ties": 0,
+            "output/wins": 3
+          },
+          "dimensions": {
+            "candidate_count": 1,
+            "direction_code": 1,
+            "expiry_ms": 30000,
+            "feature_count": 1,
+            "payout_basis": 92,
+            "row_count": 5
+          },
+          "symbol": "score_bucket_plans_cap1_basic"
+        }
+      ],
+      "output_bytes": 64,
+      "stage": "TS-C-6"
+    },
+    {
+      "input_bytes": 211,
+      "launches": [
+        {
+          "case": "TS-C-7",
+          "counts": {
+            "output/invalid": 0,
+            "output/losses": 3,
+            "output/signals": 5,
+            "output/ties": 0,
+            "output/wins": 2
+          },
+          "dimensions": {
+            "candidate_count": 1,
+            "direction_code": -1,
+            "expiry_ms": 30000,
+            "feature_count": 1,
+            "payout_basis": 92,
+            "row_count": 5
+          },
+          "symbol": "score_bucket_plans_cap1_basic"
+        }
+      ],
+      "output_bytes": 64,
+      "stage": "TS-C-7"
+    },
+    {
+      "input_bytes": 207,
+      "launches": [
+        {
+          "case": "TS-C-8",
+          "counts": {
+            "buy_output/invalid": 0,
+            "buy_output/losses": 2,
+            "buy_output/signals": 5,
+            "buy_output/ties": 0,
+            "buy_output/wins": 3,
+            "sell_output/invalid": 0,
+            "sell_output/losses": 3,
+            "sell_output/signals": 5,
+            "sell_output/ties": 0,
+            "sell_output/wins": 2
+          },
+          "dimensions": {
+            "candidate_count": 1,
+            "expiry_ms": 30000,
+            "feature_count": 1,
+            "payout_basis": 92,
+            "row_count": 5
+          },
+          "symbol": "score_bucket_plans_cap1_basic_dual"
+        }
+      ],
+      "output_bytes": 128,
+      "stage": "TS-C-8"
+    },
+    {
+      "input_bytes": 203,
+      "launches": [
+        {
+          "case": "TS-C-9",
+          "counts": {
+            "output/invalid": 0,
+            "output/losses": 2,
+            "output/signals": 5,
+            "output/ties": 0,
+            "output/wins": 3
+          },
+          "dimensions": {
+            "candidate_count": 1,
+            "direction_code": 1,
+            "expiry_ms": 30000,
+            "feature_count": 1,
+            "payout_basis": 92,
+            "row_count": 5
+          },
+          "symbol": "score_bucket_plans_cap1_basic_sparse"
+        }
+      ],
+      "output_bytes": 64,
+      "stage": "TS-C-9"
+    },
+    {
+      "input_bytes": 203,
+      "launches": [
+        {
+          "case": "TS-C-10",
+          "counts": {
+            "output/invalid": 0,
+            "output/losses": 3,
+            "output/signals": 5,
+            "output/ties": 0,
+            "output/wins": 2
+          },
+          "dimensions": {
+            "candidate_count": 1,
+            "direction_code": -1,
+            "expiry_ms": 30000,
+            "feature_count": 1,
+            "payout_basis": 92,
+            "row_count": 5
+          },
+          "symbol": "score_bucket_plans_cap1_basic_sparse"
+        }
+      ],
+      "output_bytes": 64,
+      "stage": "TS-C-10"
+    },
+    {
+      "input_bytes": 199,
+      "launches": [
+        {
+          "case": "TS-C-11",
+          "counts": {
+            "buy_output/invalid": 0,
+            "buy_output/losses": 2,
+            "buy_output/signals": 5,
+            "buy_output/ties": 0,
+            "buy_output/wins": 3,
+            "sell_output/invalid": 0,
+            "sell_output/losses": 3,
+            "sell_output/signals": 5,
+            "sell_output/ties": 0,
+            "sell_output/wins": 2
+          },
+          "dimensions": {
+            "candidate_count": 1,
+            "expiry_ms": 30000,
+            "feature_count": 1,
+            "payout_basis": 92,
+            "row_count": 5
+          },
+          "symbol": "score_bucket_plans_cap1_basic_sparse_dual"
+        }
+      ],
+      "output_bytes": 128,
+      "stage": "TS-C-11"
+    },
+    {
+      "input_bytes": 15712,
+      "launches": [
+        {
+          "case": "TS-D-0",
+          "counts": {
+            "buy_output/invalid": 335,
+            "buy_output/losses": 1695,
+            "buy_output/signals": 3823,
+            "buy_output/ties": 310,
+            "buy_output/wins": 1483,
+            "sell_output/invalid": 335,
+            "sell_output/losses": 1483,
+            "sell_output/signals": 3823,
+            "sell_output/ties": 310,
+            "sell_output/wins": 1695
+          },
+          "dimensions": {
+            "candidate_count": 256,
+            "expiry_ms": 30000,
+            "feature_count": 8,
+            "payout_basis": 92,
+            "row_count": 180
+          },
+          "symbol": "score_bucket_plans_cap1_dual"
+        }
+      ],
+      "output_bytes": 86016,
+      "stage": "TS-D-0"
+    },
+    {
+      "input_bytes": 290,
+      "launches": [
+        {
+          "case": "TS-E-0",
+          "counts": {
+            "output/invalid": 4,
+            "output/losses": 1,
+            "output/signals": 6,
+            "output/ties": 0,
+            "output/wins": 1
+          },
+          "dimensions": {
+            "candidate_count": 1,
+            "direction_code": 1,
+            "expiry_ms": 2000,
+            "feature_count": 1,
+            "payout_basis": 92,
+            "row_count": 6
+          },
+          "symbol": "score_bucket_plans_cap1"
+        }
+      ],
+      "output_bytes": 168,
+      "stage": "TS-E-0"
+    },
+    {
+      "input_bytes": 206,
+      "launches": [
+        {
+          "case": "TS-E-1",
+          "counts": {
+            "output/membership": 3
+          },
+          "dimensions": {
+            "candidate_count": 1,
+            "expiry_ms": 2000,
+            "feature_count": 1,
+            "row_count": 6
+          },
+          "symbol": "reconstruct_signal_masks_cap1"
+        }
+      ],
+      "output_bytes": 6,
+      "stage": "TS-E-1"
+    },
+    {
+      "input_bytes": 173,
+      "launches": [
+        {
+          "case": "TS-F-0",
+          "counts": {
+            "output/invalid": 1,
+            "output/losses": 0,
+            "output/signals": 2,
+            "output/ties": 0,
+            "output/wins": 1
+          },
+          "dimensions": {
+            "candidate_count": 1,
+            "direction_code": 1,
+            "expiry_ms": 2000,
+            "feature_count": 1,
+            "payout_basis": 92,
+            "row_count": 3
+          },
+          "symbol": "score_bucket_plans_cap1"
+        }
+      ],
+      "output_bytes": 168,
+      "stage": "TS-F-0"
+    },
+    {
+      "input_bytes": 149,
+      "launches": [
+        {
+          "case": "TS-F-1",
+          "counts": {
+            "output/invalid": 1,
+            "output/losses": 0,
+            "output/signals": 2,
+            "output/ties": 0,
+            "output/wins": 1
+          },
+          "dimensions": {
+            "candidate_count": 1,
+            "direction_code": 1,
+            "expiry_ms": 2000,
+            "feature_count": 1,
+            "payout_basis": 92,
+            "row_count": 3
+          },
+          "symbol": "score_bucket_plans_cap1_basic"
+        }
+      ],
+      "output_bytes": 64,
+      "stage": "TS-F-1"
+    },
+    {
+      "input_bytes": 125,
+      "launches": [
+        {
+          "case": "TS-F-2",
+          "counts": {
+            "output/membership": 1
+          },
+          "dimensions": {
+            "candidate_count": 1,
+            "expiry_ms": 2000,
+            "feature_count": 1,
+            "row_count": 3
+          },
+          "symbol": "reconstruct_signal_masks_cap1"
+        }
+      ],
+      "output_bytes": 3,
+      "stage": "TS-F-2"
+    },
+    {
+      "input_bytes": 1548,
+      "launches": [
+        {
+          "case": "TB-C-0",
+          "counts": {},
+          "dimensions": {
+            "rolling_horizon": 3,
+            "simulations": 32,
+            "trade_count": 6
+          },
+          "symbol": "bootstrap_path_metrics"
+        }
+      ],
+      "output_bytes": 768,
+      "stage": "TB-C-0"
+    },
+    {
+      "input_bytes": 172,
+      "launches": [
+        {
+          "case": "TB-extra-all-loss-0",
+          "counts": {},
+          "dimensions": {
+            "rolling_horizon": 2,
+            "simulations": 4,
+            "trade_count": 5
+          },
+          "symbol": "bootstrap_path_metrics"
+        }
+      ],
+      "output_bytes": 96,
+      "stage": "TB-extra-all-loss-0"
+    },
+    {
+      "input_bytes": 156,
+      "launches": [
+        {
+          "case": "TB-extra-all-win-0",
+          "counts": {},
+          "dimensions": {
+            "rolling_horizon": 3,
+            "simulations": 3,
+            "trade_count": 6
+          },
+          "symbol": "bootstrap_path_metrics"
+        }
+      ],
+      "output_bytes": 72,
+      "stage": "TB-extra-all-win-0"
+    },
+    {
+      "input_bytes": 162,
+      "launches": [
+        {
+          "case": "TR-A-0",
+          "counts": {
+            "out_longest_dd_trades": 0,
+            "out_longest_loss_streak": 0,
+            "out_losses": 0,
+            "out_opened": 2,
+            "out_settled": 2,
+            "out_ties": 0,
+            "out_wins": 2
+          },
+          "dimensions": {
+            "end_ms": 10000,
+            "payout_fp": 9200,
+            "policy_count": 1,
+            "start_ms": 0,
+            "word_count": 1
+          },
+          "symbol": "replay_policies"
+        }
+      ],
+      "output_bytes": 92,
+      "stage": "TR-A-0"
+    },
+    {
+      "input_bytes": 162,
+      "launches": [
+        {
+          "case": "TR-A-1",
+          "counts": {
+            "out_longest_dd_trades": 2,
+            "out_longest_loss_streak": 1,
+            "out_losses": 1,
+            "out_opened": 2,
+            "out_settled": 2,
+            "out_ties": 0,
+            "out_wins": 1
+          },
+          "dimensions": {
+            "end_ms": 10000,
+            "payout_fp": 9200,
+            "policy_count": 1,
+            "start_ms": 0,
+            "word_count": 1
+          },
+          "symbol": "replay_policies"
+        }
+      ],
+      "output_bytes": 92,
+      "stage": "TR-A-1"
+    },
+    {
+      "input_bytes": 420,
+      "launches": [
+        {
+          "case": "TR-extra-non-equivalences-0",
+          "counts": {
+            "out_longest_dd_trades": 5,
+            "out_longest_loss_streak": 2,
+            "out_losses": 3,
+            "out_opened": 9,
+            "out_settled": 8,
+            "out_ties": 0,
+            "out_wins": 5
+          },
+          "dimensions": {
+            "end_ms": 200000,
+            "payout_fp": 9200,
+            "policy_count": 2,
+            "start_ms": 0,
+            "word_count": 1
+          },
+          "symbol": "replay_policies"
+        }
+      ],
+      "output_bytes": 184,
+      "stage": "TR-extra-non-equivalences-0"
+    },
+    {
+      "input_bytes": 24,
+      "launches": [
+        {
+          "case": "TP-C-0",
+          "counts": {},
+          "dimensions": {
+            "observation_count": 2,
+            "portfolio_count": 2
+          },
+          "symbol": "path_drawdown"
+        }
+      ],
+      "output_bytes": 32,
+      "stage": "TP-C-0"
+    },
+    {
+      "input_bytes": 24,
+      "launches": [
+        {
+          "case": "TP-C-1",
+          "counts": {},
+          "dimensions": {
+            "observation_count": 2,
+            "portfolio_count": 2
+          },
+          "symbol": "path_drawdown"
+        }
+      ],
+      "output_bytes": 32,
+      "stage": "TP-C-1"
+    },
+    {
+      "input_bytes": 40,
+      "launches": [
+        {
+          "case": "TP-C-2",
+          "counts": {},
+          "dimensions": {
+            "observation_count": 4,
+            "portfolio_count": 2
+          },
+          "symbol": "path_drawdown"
+        }
+      ],
+      "output_bytes": 32,
+      "stage": "TP-C-2"
+    },
+    {
+      "input_bytes": 16,
+      "launches": [
+        {
+          "case": "TP-C-3",
+          "counts": {},
+          "dimensions": {
+            "observation_count": 2,
+            "portfolio_count": 1
+          },
+          "symbol": "path_drawdown"
+        }
+      ],
+      "output_bytes": 16,
+      "stage": "TP-C-3"
+    },
+    {
+      "input_bytes": 16,
+      "launches": [
+        {
+          "case": "TP-C-4",
+          "counts": {},
+          "dimensions": {
+            "observation_count": 2,
+            "portfolio_count": 1
+          },
+          "symbol": "path_drawdown"
+        }
+      ],
+      "output_bytes": 16,
+      "stage": "TP-C-4"
+    },
+    {
+      "input_bytes": 24,
+      "launches": [
+        {
+          "case": "TP-C-5",
+          "counts": {},
+          "dimensions": {
+            "observation_count": 4,
+            "portfolio_count": 1
+          },
+          "symbol": "path_drawdown"
+        }
+      ],
+      "output_bytes": 16,
+      "stage": "TP-C-5"
+    },
+    {
+      "input_bytes": 133,
+      "launches": [
+        {
+          "case": "TP-C-6",
+          "counts": {
+            "accepted/membership": 7
+          },
+          "dimensions": {
+            "candidate_count": 3,
+            "event_count": 4,
+            "max_expiry": 1,
+            "max_total": 1,
+            "portfolio_count": 3
+          },
+          "symbol": "replay_capacity"
+        }
+      ],
+      "output_bytes": 12,
+      "stage": "TP-C-6"
+    },
+    {
+      "input_bytes": 133,
+      "launches": [
+        {
+          "case": "TP-C-7",
+          "counts": {
+            "accepted/membership": 7
+          },
+          "dimensions": {
+            "candidate_count": 3,
+            "event_count": 4,
+            "max_expiry": 1,
+            "max_total": 1,
+            "portfolio_count": 3
+          },
+          "symbol": "replay_capacity"
+        }
+      ],
+      "output_bytes": 12,
+      "stage": "TP-C-7"
+    },
+    {
+      "input_bytes": 95935868,
+      "launches": [
+        {
+          "case": "governed-60-full-score_bucket_plans_cap1-1",
+          "counts": {
+            "output/invalid": 478,
+            "output/losses": 3657,
+            "output/signals": 7691,
+            "output/ties": 43,
+            "output/wins": 3513
+          },
+          "dimensions": {
+            "candidate_count": 4,
+            "direction_code": 1,
+            "expiry_ms": 60000,
+            "feature_count": 5,
+            "payout_basis": 92,
+            "row_count": 155116
+          },
+          "symbol": "score_bucket_plans_cap1"
+        },
+        {
+          "case": "governed-60-full-score_bucket_plans_cap1--1",
+          "counts": {
+            "output/invalid": 3622,
+            "output/losses": 12354,
+            "output/signals": 28721,
+            "output/ties": 113,
+            "output/wins": 12632
+          },
+          "dimensions": {
+            "candidate_count": 5,
+            "direction_code": -1,
+            "expiry_ms": 60000,
+            "feature_count": 5,
+            "payout_basis": 92,
+            "row_count": 155116
+          },
+          "symbol": "score_bucket_plans_cap1"
+        },
+        {
+          "case": "governed-60-full-score_bucket_plans_cap1_dual-0",
+          "counts": {
+            "buy_output/invalid": 4100,
+            "buy_output/losses": 16289,
+            "buy_output/signals": 36412,
+            "buy_output/ties": 156,
+            "buy_output/wins": 15867,
+            "sell_output/invalid": 4100,
+            "sell_output/losses": 15867,
+            "sell_output/signals": 36412,
+            "sell_output/ties": 156,
+            "sell_output/wins": 16289
+          },
+          "dimensions": {
+            "candidate_count": 9,
+            "direction_code": 0,
+            "expiry_ms": 60000,
+            "feature_count": 5,
+            "payout_basis": 92,
+            "row_count": 155116
+          },
+          "symbol": "score_bucket_plans_cap1_dual"
+        },
+        {
+          "case": "governed-60-full-score_bucket_plans_cap1_basic-1",
+          "counts": {
+            "output/invalid": 478,
+            "output/losses": 3657,
+            "output/signals": 7691,
+            "output/ties": 43,
+            "output/wins": 3513
+          },
+          "dimensions": {
+            "candidate_count": 4,
+            "direction_code": 1,
+            "expiry_ms": 60000,
+            "feature_count": 5,
+            "payout_basis": 92,
+            "row_count": 155116
+          },
+          "symbol": "score_bucket_plans_cap1_basic"
+        },
+        {
+          "case": "governed-60-full-score_bucket_plans_cap1_basic--1",
+          "counts": {
+            "output/invalid": 3622,
+            "output/losses": 12354,
+            "output/signals": 28721,
+            "output/ties": 113,
+            "output/wins": 12632
+          },
+          "dimensions": {
+            "candidate_count": 5,
+            "direction_code": -1,
+            "expiry_ms": 60000,
+            "feature_count": 5,
+            "payout_basis": 92,
+            "row_count": 155116
+          },
+          "symbol": "score_bucket_plans_cap1_basic"
+        },
+        {
+          "case": "governed-60-full-score_bucket_plans_cap1_basic_dual-0",
+          "counts": {
+            "buy_output/invalid": 4100,
+            "buy_output/losses": 16289,
+            "buy_output/signals": 36412,
+            "buy_output/ties": 156,
+            "buy_output/wins": 15867,
+            "sell_output/invalid": 4100,
+            "sell_output/losses": 15867,
+            "sell_output/signals": 36412,
+            "sell_output/ties": 156,
+            "sell_output/wins": 16289
+          },
+          "dimensions": {
+            "candidate_count": 9,
+            "direction_code": 0,
+            "expiry_ms": 60000,
+            "feature_count": 5,
+            "payout_basis": 92,
+            "row_count": 155116
+          },
+          "symbol": "score_bucket_plans_cap1_basic_dual"
+        },
+        {
+          "case": "governed-60-full-score_bucket_plans_cap1_sparse-1",
+          "counts": {
+            "output/invalid": 478,
+            "output/losses": 3657,
+            "output/signals": 7691,
+            "output/ties": 43,
+            "output/wins": 3513
+          },
+          "dimensions": {
+            "candidate_count": 4,
+            "direction_code": 1,
+            "expiry_ms": 60000,
+            "feature_count": 5,
+            "payout_basis": 92,
+            "row_count": 155116
+          },
+          "symbol": "score_bucket_plans_cap1_sparse"
+        },
+        {
+          "case": "governed-60-full-score_bucket_plans_cap1_sparse--1",
+          "counts": {
+            "output/invalid": 3622,
+            "output/losses": 12354,
+            "output/signals": 28721,
+            "output/ties": 113,
+            "output/wins": 12632
+          },
+          "dimensions": {
+            "candidate_count": 5,
+            "direction_code": -1,
+            "expiry_ms": 60000,
+            "feature_count": 5,
+            "payout_basis": 92,
+            "row_count": 155116
+          },
+          "symbol": "score_bucket_plans_cap1_sparse"
+        },
+        {
+          "case": "governed-60-full-score_bucket_plans_cap1_basic_sparse-1",
+          "counts": {
+            "output/invalid": 478,
+            "output/losses": 3657,
+            "output/signals": 7691,
+            "output/ties": 43,
+            "output/wins": 3513
+          },
+          "dimensions": {
+            "candidate_count": 4,
+            "direction_code": 1,
+            "expiry_ms": 60000,
+            "feature_count": 5,
+            "payout_basis": 92,
+            "row_count": 155116
+          },
+          "symbol": "score_bucket_plans_cap1_basic_sparse"
+        },
+        {
+          "case": "governed-60-full-score_bucket_plans_cap1_basic_sparse--1",
+          "counts": {
+            "output/invalid": 3622,
+            "output/losses": 12354,
+            "output/signals": 28721,
+            "output/ties": 113,
+            "output/wins": 12632
+          },
+          "dimensions": {
+            "candidate_count": 5,
+            "direction_code": -1,
+            "expiry_ms": 60000,
+            "feature_count": 5,
+            "payout_basis": 92,
+            "row_count": 155116
+          },
+          "symbol": "score_bucket_plans_cap1_basic_sparse"
+        },
+        {
+          "case": "governed-60-full-score_bucket_plans_cap1_sparse_dual-0",
+          "counts": {
+            "buy_output/invalid": 4100,
+            "buy_output/losses": 16289,
+            "buy_output/signals": 36412,
+            "buy_output/ties": 156,
+            "buy_output/wins": 15867,
+            "sell_output/invalid": 4100,
+            "sell_output/losses": 15867,
+            "sell_output/signals": 36412,
+            "sell_output/ties": 156,
+            "sell_output/wins": 16289
+          },
+          "dimensions": {
+            "candidate_count": 9,
+            "direction_code": 0,
+            "expiry_ms": 60000,
+            "feature_count": 5,
+            "payout_basis": 92,
+            "row_count": 155116
+          },
+          "symbol": "score_bucket_plans_cap1_sparse_dual"
+        },
+        {
+          "case": "governed-60-full-score_bucket_plans_cap1_basic_sparse_dual-0",
+          "counts": {
+            "buy_output/invalid": 4100,
+            "buy_output/losses": 16289,
+            "buy_output/signals": 36412,
+            "buy_output/ties": 156,
+            "buy_output/wins": 15867,
+            "sell_output/invalid": 4100,
+            "sell_output/losses": 15867,
+            "sell_output/signals": 36412,
+            "sell_output/ties": 156,
+            "sell_output/wins": 16289
+          },
+          "dimensions": {
+            "candidate_count": 9,
+            "direction_code": 0,
+            "expiry_ms": 60000,
+            "feature_count": 5,
+            "payout_basis": 92,
+            "row_count": 155116
+          },
+          "symbol": "score_bucket_plans_cap1_basic_sparse_dual"
+        },
+        {
+          "case": "governed-60-full-reconstruct_signal_masks_cap1-0",
+          "counts": {
+            "output/membership": 32348
+          },
+          "dimensions": {
+            "candidate_count": 9,
+            "direction_code": 0,
+            "expiry_ms": 60000,
+            "feature_count": 5,
+            "payout_basis": 92,
+            "row_count": 155116
+          },
+          "symbol": "reconstruct_signal_masks_cap1"
+        }
+      ],
+      "output_bytes": 1408572,
+      "stage": "governed-60-full-score_bucket_plans_cap1-1"
+    },
+    {
+      "input_bytes": 95935868,
+      "launches": [
+        {
+          "case": "governed-60-development-score_bucket_plans_cap1-1",
+          "counts": {
+            "output/invalid": 239,
+            "output/losses": 1789,
+            "output/signals": 3808,
+            "output/ties": 20,
+            "output/wins": 1760
+          },
+          "dimensions": {
+            "candidate_count": 4,
+            "direction_code": 1,
+            "expiry_ms": 60000,
+            "feature_count": 5,
+            "payout_basis": 92,
+            "row_count": 155116
+          },
+          "symbol": "score_bucket_plans_cap1"
+        },
+        {
+          "case": "governed-60-development-score_bucket_plans_cap1--1",
+          "counts": {
+            "output/invalid": 1883,
+            "output/losses": 6400,
+            "output/signals": 14840,
+            "output/ties": 57,
+            "output/wins": 6500
+          },
+          "dimensions": {
+            "candidate_count": 5,
+            "direction_code": -1,
+            "expiry_ms": 60000,
+            "feature_count": 5,
+            "payout_basis": 92,
+            "row_count": 155116
+          },
+          "symbol": "score_bucket_plans_cap1"
+        },
+        {
+          "case": "governed-60-development-score_bucket_plans_cap1_dual-0",
+          "counts": {
+            "buy_output/invalid": 2122,
+            "buy_output/losses": 8289,
+            "buy_output/signals": 18648,
+            "buy_output/ties": 77,
+            "buy_output/wins": 8160,
+            "sell_output/invalid": 2122,
+            "sell_output/losses": 8160,
+            "sell_output/signals": 18648,
+            "sell_output/ties": 77,
+            "sell_output/wins": 8289
+          },
+          "dimensions": {
+            "candidate_count": 9,
+            "direction_code": 0,
+            "expiry_ms": 60000,
+            "feature_count": 5,
+            "payout_basis": 92,
+            "row_count": 155116
+          },
+          "symbol": "score_bucket_plans_cap1_dual"
+        },
+        {
+          "case": "governed-60-development-score_bucket_plans_cap1_basic-1",
+          "counts": {
+            "output/invalid": 239,
+            "output/losses": 1789,
+            "output/signals": 3808,
+            "output/ties": 20,
+            "output/wins": 1760
+          },
+          "dimensions": {
+            "candidate_count": 4,
+            "direction_code": 1,
+            "expiry_ms": 60000,
+            "feature_count": 5,
+            "payout_basis": 92,
+            "row_count": 155116
+          },
+          "symbol": "score_bucket_plans_cap1_basic"
+        },
+        {
+          "case": "governed-60-development-score_bucket_plans_cap1_basic--1",
+          "counts": {
+            "output/invalid": 1883,
+            "output/losses": 6400,
+            "output/signals": 14840,
+            "output/ties": 57,
+            "output/wins": 6500
+          },
+          "dimensions": {
+            "candidate_count": 5,
+            "direction_code": -1,
+            "expiry_ms": 60000,
+            "feature_count": 5,
+            "payout_basis": 92,
+            "row_count": 155116
+          },
+          "symbol": "score_bucket_plans_cap1_basic"
+        },
+        {
+          "case": "governed-60-development-score_bucket_plans_cap1_basic_dual-0",
+          "counts": {
+            "buy_output/invalid": 2122,
+            "buy_output/losses": 8289,
+            "buy_output/signals": 18648,
+            "buy_output/ties": 77,
+            "buy_output/wins": 8160,
+            "sell_output/invalid": 2122,
+            "sell_output/losses": 8160,
+            "sell_output/signals": 18648,
+            "sell_output/ties": 77,
+            "sell_output/wins": 8289
+          },
+          "dimensions": {
+            "candidate_count": 9,
+            "direction_code": 0,
+            "expiry_ms": 60000,
+            "feature_count": 5,
+            "payout_basis": 92,
+            "row_count": 155116
+          },
+          "symbol": "score_bucket_plans_cap1_basic_dual"
+        },
+        {
+          "case": "governed-60-development-score_bucket_plans_cap1_sparse-1",
+          "counts": {
+            "output/invalid": 239,
+            "output/losses": 1789,
+            "output/signals": 3808,
+            "output/ties": 20,
+            "output/wins": 1760
+          },
+          "dimensions": {
+            "candidate_count": 4,
+            "direction_code": 1,
+            "expiry_ms": 60000,
+            "feature_count": 5,
+            "payout_basis": 92,
+            "row_count": 155116
+          },
+          "symbol": "score_bucket_plans_cap1_sparse"
+        },
+        {
+          "case": "governed-60-development-score_bucket_plans_cap1_sparse--1",
+          "counts": {
+            "output/invalid": 1883,
+            "output/losses": 6400,
+            "output/signals": 14840,
+            "output/ties": 57,
+            "output/wins": 6500
+          },
+          "dimensions": {
+            "candidate_count": 5,
+            "direction_code": -1,
+            "expiry_ms": 60000,
+            "feature_count": 5,
+            "payout_basis": 92,
+            "row_count": 155116
+          },
+          "symbol": "score_bucket_plans_cap1_sparse"
+        },
+        {
+          "case": "governed-60-development-score_bucket_plans_cap1_basic_sparse-1",
+          "counts": {
+            "output/invalid": 239,
+            "output/losses": 1789,
+            "output/signals": 3808,
+            "output/ties": 20,
+            "output/wins": 1760
+          },
+          "dimensions": {
+            "candidate_count": 4,
+            "direction_code": 1,
+            "expiry_ms": 60000,
+            "feature_count": 5,
+            "payout_basis": 92,
+            "row_count": 155116
+          },
+          "symbol": "score_bucket_plans_cap1_basic_sparse"
+        },
+        {
+          "case": "governed-60-development-score_bucket_plans_cap1_basic_sparse--1",
+          "counts": {
+            "output/invalid": 1883,
+            "output/losses": 6400,
+            "output/signals": 14840,
+            "output/ties": 57,
+            "output/wins": 6500
+          },
+          "dimensions": {
+            "candidate_count": 5,
+            "direction_code": -1,
+            "expiry_ms": 60000,
+            "feature_count": 5,
+            "payout_basis": 92,
+            "row_count": 155116
+          },
+          "symbol": "score_bucket_plans_cap1_basic_sparse"
+        },
+        {
+          "case": "governed-60-development-score_bucket_plans_cap1_sparse_dual-0",
+          "counts": {
+            "buy_output/invalid": 2122,
+            "buy_output/losses": 8289,
+            "buy_output/signals": 18648,
+            "buy_output/ties": 77,
+            "buy_output/wins": 8160,
+            "sell_output/invalid": 2122,
+            "sell_output/losses": 8160,
+            "sell_output/signals": 18648,
+            "sell_output/ties": 77,
+            "sell_output/wins": 8289
+          },
+          "dimensions": {
+            "candidate_count": 9,
+            "direction_code": 0,
+            "expiry_ms": 60000,
+            "feature_count": 5,
+            "payout_basis": 92,
+            "row_count": 155116
+          },
+          "symbol": "score_bucket_plans_cap1_sparse_dual"
+        },
+        {
+          "case": "governed-60-development-score_bucket_plans_cap1_basic_sparse_dual-0",
+          "counts": {
+            "buy_output/invalid": 2122,
+            "buy_output/losses": 8289,
+            "buy_output/signals": 18648,
+            "buy_output/ties": 77,
+            "buy_output/wins": 8160,
+            "sell_output/invalid": 2122,
+            "sell_output/losses": 8160,
+            "sell_output/signals": 18648,
+            "sell_output/ties": 77,
+            "sell_output/wins": 8289
+          },
+          "dimensions": {
+            "candidate_count": 9,
+            "direction_code": 0,
+            "expiry_ms": 60000,
+            "feature_count": 5,
+            "payout_basis": 92,
+            "row_count": 155116
+          },
+          "symbol": "score_bucket_plans_cap1_basic_sparse_dual"
+        },
+        {
+          "case": "governed-60-development-reconstruct_signal_masks_cap1-0",
+          "counts": {
+            "output/membership": 16548
+          },
+          "dimensions": {
+            "candidate_count": 9,
+            "direction_code": 0,
+            "expiry_ms": 60000,
+            "feature_count": 5,
+            "payout_basis": 92,
+            "row_count": 155116
+          },
+          "symbol": "reconstruct_signal_masks_cap1"
+        }
+      ],
+      "output_bytes": 1408572,
+      "stage": "governed-60-development-score_bucket_plans_cap1-1"
+    },
+    {
+      "input_bytes": 95935868,
+      "launches": [
+        {
+          "case": "governed-60-gate_validation-score_bucket_plans_cap1-1",
+          "counts": {
+            "output/invalid": 239,
+            "output/losses": 1868,
+            "output/signals": 3883,
+            "output/ties": 23,
+            "output/wins": 1753
+          },
+          "dimensions": {
+            "candidate_count": 4,
+            "direction_code": 1,
+            "expiry_ms": 60000,
+            "feature_count": 5,
+            "payout_basis": 92,
+            "row_count": 155116
+          },
+          "symbol": "score_bucket_plans_cap1"
+        },
+        {
+          "case": "governed-60-gate_validation-score_bucket_plans_cap1--1",
+          "counts": {
+            "output/invalid": 1739,
+            "output/losses": 5954,
+            "output/signals": 13881,
+            "output/ties": 56,
+            "output/wins": 6132
+          },
+          "dimensions": {
+            "candidate_count": 5,
+            "direction_code": -1,
+            "expiry_ms": 60000,
+            "feature_count": 5,
+            "payout_basis": 92,
+            "row_count": 155116
+          },
+          "symbol": "score_bucket_plans_cap1"
+        },
+        {
+          "case": "governed-60-gate_validation-score_bucket_plans_cap1_dual-0",
+          "counts": {
+            "buy_output/invalid": 1978,
+            "buy_output/losses": 8000,
+            "buy_output/signals": 17764,
+            "buy_output/ties": 79,
+            "buy_output/wins": 7707,
+            "sell_output/invalid": 1978,
+            "sell_output/losses": 7707,
+            "sell_output/signals": 17764,
+            "sell_output/ties": 79,
+            "sell_output/wins": 8000
+          },
+          "dimensions": {
+            "candidate_count": 9,
+            "direction_code": 0,
+            "expiry_ms": 60000,
+            "feature_count": 5,
+            "payout_basis": 92,
+            "row_count": 155116
+          },
+          "symbol": "score_bucket_plans_cap1_dual"
+        },
+        {
+          "case": "governed-60-gate_validation-score_bucket_plans_cap1_basic-1",
+          "counts": {
+            "output/invalid": 239,
+            "output/losses": 1868,
+            "output/signals": 3883,
+            "output/ties": 23,
+            "output/wins": 1753
+          },
+          "dimensions": {
+            "candidate_count": 4,
+            "direction_code": 1,
+            "expiry_ms": 60000,
+            "feature_count": 5,
+            "payout_basis": 92,
+            "row_count": 155116
+          },
+          "symbol": "score_bucket_plans_cap1_basic"
+        },
+        {
+          "case": "governed-60-gate_validation-score_bucket_plans_cap1_basic--1",
+          "counts": {
+            "output/invalid": 1739,
+            "output/losses": 5954,
+            "output/signals": 13881,
+            "output/ties": 56,
+            "output/wins": 6132
+          },
+          "dimensions": {
+            "candidate_count": 5,
+            "direction_code": -1,
+            "expiry_ms": 60000,
+            "feature_count": 5,
+            "payout_basis": 92,
+            "row_count": 155116
+          },
+          "symbol": "score_bucket_plans_cap1_basic"
+        },
+        {
+          "case": "governed-60-gate_validation-score_bucket_plans_cap1_basic_dual-0",
+          "counts": {
+            "buy_output/invalid": 1978,
+            "buy_output/losses": 8000,
+            "buy_output/signals": 17764,
+            "buy_output/ties": 79,
+            "buy_output/wins": 7707,
+            "sell_output/invalid": 1978,
+            "sell_output/losses": 7707,
+            "sell_output/signals": 17764,
+            "sell_output/ties": 79,
+            "sell_output/wins": 8000
+          },
+          "dimensions": {
+            "candidate_count": 9,
+            "direction_code": 0,
+            "expiry_ms": 60000,
+            "feature_count": 5,
+            "payout_basis": 92,
+            "row_count": 155116
+          },
+          "symbol": "score_bucket_plans_cap1_basic_dual"
+        },
+        {
+          "case": "governed-60-gate_validation-score_bucket_plans_cap1_sparse-1",
+          "counts": {
+            "output/invalid": 239,
+            "output/losses": 1868,
+            "output/signals": 3883,
+            "output/ties": 23,
+            "output/wins": 1753
+          },
+          "dimensions": {
+            "candidate_count": 4,
+            "direction_code": 1,
+            "expiry_ms": 60000,
+            "feature_count": 5,
+            "payout_basis": 92,
+            "row_count": 155116
+          },
+          "symbol": "score_bucket_plans_cap1_sparse"
+        },
+        {
+          "case": "governed-60-gate_validation-score_bucket_plans_cap1_sparse--1",
+          "counts": {
+            "output/invalid": 1739,
+            "output/losses": 5954,
+            "output/signals": 13881,
+            "output/ties": 56,
+            "output/wins": 6132
+          },
+          "dimensions": {
+            "candidate_count": 5,
+            "direction_code": -1,
+            "expiry_ms": 60000,
+            "feature_count": 5,
+            "payout_basis": 92,
+            "row_count": 155116
+          },
+          "symbol": "score_bucket_plans_cap1_sparse"
+        },
+        {
+          "case": "governed-60-gate_validation-score_bucket_plans_cap1_basic_sparse-1",
+          "counts": {
+            "output/invalid": 239,
+            "output/losses": 1868,
+            "output/signals": 3883,
+            "output/ties": 23,
+            "output/wins": 1753
+          },
+          "dimensions": {
+            "candidate_count": 4,
+            "direction_code": 1,
+            "expiry_ms": 60000,
+            "feature_count": 5,
+            "payout_basis": 92,
+            "row_count": 155116
+          },
+          "symbol": "score_bucket_plans_cap1_basic_sparse"
+        },
+        {
+          "case": "governed-60-gate_validation-score_bucket_plans_cap1_basic_sparse--1",
+          "counts": {
+            "output/invalid": 1739,
+            "output/losses": 5954,
+            "output/signals": 13881,
+            "output/ties": 56,
+            "output/wins": 6132
+          },
+          "dimensions": {
+            "candidate_count": 5,
+            "direction_code": -1,
+            "expiry_ms": 60000,
+            "feature_count": 5,
+            "payout_basis": 92,
+            "row_count": 155116
+          },
+          "symbol": "score_bucket_plans_cap1_basic_sparse"
+        },
+        {
+          "case": "governed-60-gate_validation-score_bucket_plans_cap1_sparse_dual-0",
+          "counts": {
+            "buy_output/invalid": 1978,
+            "buy_output/losses": 8000,
+            "buy_output/signals": 17764,
+            "buy_output/ties": 79,
+            "buy_output/wins": 7707,
+            "sell_output/invalid": 1978,
+            "sell_output/losses": 7707,
+            "sell_output/signals": 17764,
+            "sell_output/ties": 79,
+            "sell_output/wins": 8000
+          },
+          "dimensions": {
+            "candidate_count": 9,
+            "direction_code": 0,
+            "expiry_ms": 60000,
+            "feature_count": 5,
+            "payout_basis": 92,
+            "row_count": 155116
+          },
+          "symbol": "score_bucket_plans_cap1_sparse_dual"
+        },
+        {
+          "case": "governed-60-gate_validation-score_bucket_plans_cap1_basic_sparse_dual-0",
+          "counts": {
+            "buy_output/invalid": 1978,
+            "buy_output/losses": 8000,
+            "buy_output/signals": 17764,
+            "buy_output/ties": 79,
+            "buy_output/wins": 7707,
+            "sell_output/invalid": 1978,
+            "sell_output/losses": 7707,
+            "sell_output/signals": 17764,
+            "sell_output/ties": 79,
+            "sell_output/wins": 8000
+          },
+          "dimensions": {
+            "candidate_count": 9,
+            "direction_code": 0,
+            "expiry_ms": 60000,
+            "feature_count": 5,
+            "payout_basis": 92,
+            "row_count": 155116
+          },
+          "symbol": "score_bucket_plans_cap1_basic_sparse_dual"
+        },
+        {
+          "case": "governed-60-gate_validation-reconstruct_signal_masks_cap1-0",
+          "counts": {
+            "output/membership": 15800
+          },
+          "dimensions": {
+            "candidate_count": 9,
+            "direction_code": 0,
+            "expiry_ms": 60000,
+            "feature_count": 5,
+            "payout_basis": 92,
+            "row_count": 155116
+          },
+          "symbol": "reconstruct_signal_masks_cap1"
+        }
+      ],
+      "output_bytes": 1408572,
+      "stage": "governed-60-gate_validation-score_bucket_plans_cap1-1"
+    },
+    {
+      "input_bytes": 100932816,
+      "launches": [
+        {
+          "case": "governed-90-full-score_bucket_plans_cap1-1",
+          "counts": {
+            "output/invalid": 14297,
+            "output/losses": 9551,
+            "output/signals": 33365,
+            "output/ties": 59,
+            "output/wins": 9458
+          },
+          "dimensions": {
+            "candidate_count": 5,
+            "direction_code": 1,
+            "expiry_ms": 90000,
+            "feature_count": 5,
+            "payout_basis": 92,
+            "row_count": 155116
+          },
+          "symbol": "score_bucket_plans_cap1"
+        },
+        {
+          "case": "governed-90-full-score_bucket_plans_cap1--1",
+          "counts": {
+            "output/invalid": 65983,
+            "output/losses": 44748,
+            "output/signals": 156067,
+            "output/ties": 255,
+            "output/wins": 45081
+          },
+          "dimensions": {
+            "candidate_count": 10,
+            "direction_code": -1,
+            "expiry_ms": 90000,
+            "feature_count": 5,
+            "payout_basis": 92,
+            "row_count": 155116
+          },
+          "symbol": "score_bucket_plans_cap1"
+        },
+        {
+          "case": "governed-90-full-score_bucket_plans_cap1_dual-0",
+          "counts": {
+            "buy_output/invalid": 80280,
+            "buy_output/losses": 54632,
+            "buy_output/signals": 189432,
+            "buy_output/ties": 314,
+            "buy_output/wins": 54206,
+            "sell_output/invalid": 80280,
+            "sell_output/losses": 54206,
+            "sell_output/signals": 189432,
+            "sell_output/ties": 314,
+            "sell_output/wins": 54632
+          },
+          "dimensions": {
+            "candidate_count": 15,
+            "direction_code": 0,
+            "expiry_ms": 90000,
+            "feature_count": 5,
+            "payout_basis": 92,
+            "row_count": 155116
+          },
+          "symbol": "score_bucket_plans_cap1_dual"
+        },
+        {
+          "case": "governed-90-full-score_bucket_plans_cap1_basic-1",
+          "counts": {
+            "output/invalid": 14297,
+            "output/losses": 9551,
+            "output/signals": 33365,
+            "output/ties": 59,
+            "output/wins": 9458
+          },
+          "dimensions": {
+            "candidate_count": 5,
+            "direction_code": 1,
+            "expiry_ms": 90000,
+            "feature_count": 5,
+            "payout_basis": 92,
+            "row_count": 155116
+          },
+          "symbol": "score_bucket_plans_cap1_basic"
+        },
+        {
+          "case": "governed-90-full-score_bucket_plans_cap1_basic--1",
+          "counts": {
+            "output/invalid": 65983,
+            "output/losses": 44748,
+            "output/signals": 156067,
+            "output/ties": 255,
+            "output/wins": 45081
+          },
+          "dimensions": {
+            "candidate_count": 10,
+            "direction_code": -1,
+            "expiry_ms": 90000,
+            "feature_count": 5,
+            "payout_basis": 92,
+            "row_count": 155116
+          },
+          "symbol": "score_bucket_plans_cap1_basic"
+        },
+        {
+          "case": "governed-90-full-score_bucket_plans_cap1_basic_dual-0",
+          "counts": {
+            "buy_output/invalid": 80280,
+            "buy_output/losses": 54632,
+            "buy_output/signals": 189432,
+            "buy_output/ties": 314,
+            "buy_output/wins": 54206,
+            "sell_output/invalid": 80280,
+            "sell_output/losses": 54206,
+            "sell_output/signals": 189432,
+            "sell_output/ties": 314,
+            "sell_output/wins": 54632
+          },
+          "dimensions": {
+            "candidate_count": 15,
+            "direction_code": 0,
+            "expiry_ms": 90000,
+            "feature_count": 5,
+            "payout_basis": 92,
+            "row_count": 155116
+          },
+          "symbol": "score_bucket_plans_cap1_basic_dual"
+        },
+        {
+          "case": "governed-90-full-score_bucket_plans_cap1_sparse-1",
+          "counts": {
+            "output/invalid": 14297,
+            "output/losses": 9551,
+            "output/signals": 33365,
+            "output/ties": 59,
+            "output/wins": 9458
+          },
+          "dimensions": {
+            "candidate_count": 5,
+            "direction_code": 1,
+            "expiry_ms": 90000,
+            "feature_count": 5,
+            "payout_basis": 92,
+            "row_count": 155116
+          },
+          "symbol": "score_bucket_plans_cap1_sparse"
+        },
+        {
+          "case": "governed-90-full-score_bucket_plans_cap1_sparse--1",
+          "counts": {
+            "output/invalid": 65983,
+            "output/losses": 44748,
+            "output/signals": 156067,
+            "output/ties": 255,
+            "output/wins": 45081
+          },
+          "dimensions": {
+            "candidate_count": 10,
+            "direction_code": -1,
+            "expiry_ms": 90000,
+            "feature_count": 5,
+            "payout_basis": 92,
+            "row_count": 155116
+          },
+          "symbol": "score_bucket_plans_cap1_sparse"
+        },
+        {
+          "case": "governed-90-full-score_bucket_plans_cap1_basic_sparse-1",
+          "counts": {
+            "output/invalid": 14297,
+            "output/losses": 9551,
+            "output/signals": 33365,
+            "output/ties": 59,
+            "output/wins": 9458
+          },
+          "dimensions": {
+            "candidate_count": 5,
+            "direction_code": 1,
+            "expiry_ms": 90000,
+            "feature_count": 5,
+            "payout_basis": 92,
+            "row_count": 155116
+          },
+          "symbol": "score_bucket_plans_cap1_basic_sparse"
+        },
+        {
+          "case": "governed-90-full-score_bucket_plans_cap1_basic_sparse--1",
+          "counts": {
+            "output/invalid": 65983,
+            "output/losses": 44748,
+            "output/signals": 156067,
+            "output/ties": 255,
+            "output/wins": 45081
+          },
+          "dimensions": {
+            "candidate_count": 10,
+            "direction_code": -1,
+            "expiry_ms": 90000,
+            "feature_count": 5,
+            "payout_basis": 92,
+            "row_count": 155116
+          },
+          "symbol": "score_bucket_plans_cap1_basic_sparse"
+        },
+        {
+          "case": "governed-90-full-score_bucket_plans_cap1_sparse_dual-0",
+          "counts": {
+            "buy_output/invalid": 80280,
+            "buy_output/losses": 54632,
+            "buy_output/signals": 189432,
+            "buy_output/ties": 314,
+            "buy_output/wins": 54206,
+            "sell_output/invalid": 80280,
+            "sell_output/losses": 54206,
+            "sell_output/signals": 189432,
+            "sell_output/ties": 314,
+            "sell_output/wins": 54632
+          },
+          "dimensions": {
+            "candidate_count": 15,
+            "direction_code": 0,
+            "expiry_ms": 90000,
+            "feature_count": 5,
+            "payout_basis": 92,
+            "row_count": 155116
+          },
+          "symbol": "score_bucket_plans_cap1_sparse_dual"
+        },
+        {
+          "case": "governed-90-full-score_bucket_plans_cap1_basic_sparse_dual-0",
+          "counts": {
+            "buy_output/invalid": 80280,
+            "buy_output/losses": 54632,
+            "buy_output/signals": 189432,
+            "buy_output/ties": 314,
+            "buy_output/wins": 54206,
+            "sell_output/invalid": 80280,
+            "sell_output/losses": 54206,
+            "sell_output/signals": 189432,
+            "sell_output/ties": 314,
+            "sell_output/wins": 54632
+          },
+          "dimensions": {
+            "candidate_count": 15,
+            "direction_code": 0,
+            "expiry_ms": 90000,
+            "feature_count": 5,
+            "payout_basis": 92,
+            "row_count": 155116
+          },
+          "symbol": "score_bucket_plans_cap1_basic_sparse_dual"
+        },
+        {
+          "case": "governed-90-full-reconstruct_signal_masks_cap1-0",
+          "counts": {
+            "output/membership": 109348
+          },
+          "dimensions": {
+            "candidate_count": 15,
+            "direction_code": 0,
+            "expiry_ms": 90000,
+            "feature_count": 5,
+            "payout_basis": 92,
+            "row_count": 155116
+          },
+          "symbol": "reconstruct_signal_masks_cap1"
+        }
+      ],
+      "output_bytes": 2347620,
+      "stage": "governed-90-full-score_bucket_plans_cap1-1"
+    },
+    {
+      "input_bytes": 100932816,
+      "launches": [
+        {
+          "case": "governed-90-development-score_bucket_plans_cap1-1",
+          "counts": {
+            "output/invalid": 7429,
+            "output/losses": 4839,
+            "output/signals": 17155,
+            "output/ties": 29,
+            "output/wins": 4858
+          },
+          "dimensions": {
+            "candidate_count": 5,
+            "direction_code": 1,
+            "expiry_ms": 90000,
+            "feature_count": 5,
+            "payout_basis": 92,
+            "row_count": 155116
+          },
+          "symbol": "score_bucket_plans_cap1"
+        },
+        {
+          "case": "governed-90-development-score_bucket_plans_cap1--1",
+          "counts": {
+            "output/invalid": 34484,
+            "output/losses": 23306,
+            "output/signals": 81216,
+            "output/ties": 120,
+            "output/wins": 23306
+          },
+          "dimensions": {
+            "candidate_count": 10,
+            "direction_code": -1,
+            "expiry_ms": 90000,
+            "feature_count": 5,
+            "payout_basis": 92,
+            "row_count": 155116
+          },
+          "symbol": "score_bucket_plans_cap1"
+        },
+        {
+          "case": "governed-90-development-score_bucket_plans_cap1_dual-0",
+          "counts": {
+            "buy_output/invalid": 41913,
+            "buy_output/losses": 28145,
+            "buy_output/signals": 98371,
+            "buy_output/ties": 149,
+            "buy_output/wins": 28164,
+            "sell_output/invalid": 41913,
+            "sell_output/losses": 28164,
+            "sell_output/signals": 98371,
+            "sell_output/ties": 149,
+            "sell_output/wins": 28145
+          },
+          "dimensions": {
+            "candidate_count": 15,
+            "direction_code": 0,
+            "expiry_ms": 90000,
+            "feature_count": 5,
+            "payout_basis": 92,
+            "row_count": 155116
+          },
+          "symbol": "score_bucket_plans_cap1_dual"
+        },
+        {
+          "case": "governed-90-development-score_bucket_plans_cap1_basic-1",
+          "counts": {
+            "output/invalid": 7429,
+            "output/losses": 4839,
+            "output/signals": 17155,
+            "output/ties": 29,
+            "output/wins": 4858
+          },
+          "dimensions": {
+            "candidate_count": 5,
+            "direction_code": 1,
+            "expiry_ms": 90000,
+            "feature_count": 5,
+            "payout_basis": 92,
+            "row_count": 155116
+          },
+          "symbol": "score_bucket_plans_cap1_basic"
+        },
+        {
+          "case": "governed-90-development-score_bucket_plans_cap1_basic--1",
+          "counts": {
+            "output/invalid": 34484,
+            "output/losses": 23306,
+            "output/signals": 81216,
+            "output/ties": 120,
+            "output/wins": 23306
+          },
+          "dimensions": {
+            "candidate_count": 10,
+            "direction_code": -1,
+            "expiry_ms": 90000,
+            "feature_count": 5,
+            "payout_basis": 92,
+            "row_count": 155116
+          },
+          "symbol": "score_bucket_plans_cap1_basic"
+        },
+        {
+          "case": "governed-90-development-score_bucket_plans_cap1_basic_dual-0",
+          "counts": {
+            "buy_output/invalid": 41913,
+            "buy_output/losses": 28145,
+            "buy_output/signals": 98371,
+            "buy_output/ties": 149,
+            "buy_output/wins": 28164,
+            "sell_output/invalid": 41913,
+            "sell_output/losses": 28164,
+            "sell_output/signals": 98371,
+            "sell_output/ties": 149,
+            "sell_output/wins": 28145
+          },
+          "dimensions": {
+            "candidate_count": 15,
+            "direction_code": 0,
+            "expiry_ms": 90000,
+            "feature_count": 5,
+            "payout_basis": 92,
+            "row_count": 155116
+          },
+          "symbol": "score_bucket_plans_cap1_basic_dual"
+        },
+        {
+          "case": "governed-90-development-score_bucket_plans_cap1_sparse-1",
+          "counts": {
+            "output/invalid": 7429,
+            "output/losses": 4839,
+            "output/signals": 17155,
+            "output/ties": 29,
+            "output/wins": 4858
+          },
+          "dimensions": {
+            "candidate_count": 5,
+            "direction_code": 1,
+            "expiry_ms": 90000,
+            "feature_count": 5,
+            "payout_basis": 92,
+            "row_count": 155116
+          },
+          "symbol": "score_bucket_plans_cap1_sparse"
+        },
+        {
+          "case": "governed-90-development-score_bucket_plans_cap1_sparse--1",
+          "counts": {
+            "output/invalid": 34484,
+            "output/losses": 23306,
+            "output/signals": 81216,
+            "output/ties": 120,
+            "output/wins": 23306
+          },
+          "dimensions": {
+            "candidate_count": 10,
+            "direction_code": -1,
+            "expiry_ms": 90000,
+            "feature_count": 5,
+            "payout_basis": 92,
+            "row_count": 155116
+          },
+          "symbol": "score_bucket_plans_cap1_sparse"
+        },
+        {
+          "case": "governed-90-development-score_bucket_plans_cap1_basic_sparse-1",
+          "counts": {
+            "output/invalid": 7429,
+            "output/losses": 4839,
+            "output/signals": 17155,
+            "output/ties": 29,
+            "output/wins": 4858
+          },
+          "dimensions": {
+            "candidate_count": 5,
+            "direction_code": 1,
+            "expiry_ms": 90000,
+            "feature_count": 5,
+            "payout_basis": 92,
+            "row_count": 155116
+          },
+          "symbol": "score_bucket_plans_cap1_basic_sparse"
+        },
+        {
+          "case": "governed-90-development-score_bucket_plans_cap1_basic_sparse--1",
+          "counts": {
+            "output/invalid": 34484,
+            "output/losses": 23306,
+            "output/signals": 81216,
+            "output/ties": 120,
+            "output/wins": 23306
+          },
+          "dimensions": {
+            "candidate_count": 10,
+            "direction_code": -1,
+            "expiry_ms": 90000,
+            "feature_count": 5,
+            "payout_basis": 92,
+            "row_count": 155116
+          },
+          "symbol": "score_bucket_plans_cap1_basic_sparse"
+        },
+        {
+          "case": "governed-90-development-score_bucket_plans_cap1_sparse_dual-0",
+          "counts": {
+            "buy_output/invalid": 41913,
+            "buy_output/losses": 28145,
+            "buy_output/signals": 98371,
+            "buy_output/ties": 149,
+            "buy_output/wins": 28164,
+            "sell_output/invalid": 41913,
+            "sell_output/losses": 28164,
+            "sell_output/signals": 98371,
+            "sell_output/ties": 149,
+            "sell_output/wins": 28145
+          },
+          "dimensions": {
+            "candidate_count": 15,
+            "direction_code": 0,
+            "expiry_ms": 90000,
+            "feature_count": 5,
+            "payout_basis": 92,
+            "row_count": 155116
+          },
+          "symbol": "score_bucket_plans_cap1_sparse_dual"
+        },
+        {
+          "case": "governed-90-development-score_bucket_plans_cap1_basic_sparse_dual-0",
+          "counts": {
+            "buy_output/invalid": 41913,
+            "buy_output/losses": 28145,
+            "buy_output/signals": 98371,
+            "buy_output/ties": 149,
+            "buy_output/wins": 28164,
+            "sell_output/invalid": 41913,
+            "sell_output/losses": 28164,
+            "sell_output/signals": 98371,
+            "sell_output/ties": 149,
+            "sell_output/wins": 28145
+          },
+          "dimensions": {
+            "candidate_count": 15,
+            "direction_code": 0,
+            "expiry_ms": 90000,
+            "feature_count": 5,
+            "payout_basis": 92,
+            "row_count": 155116
+          },
+          "symbol": "score_bucket_plans_cap1_basic_sparse_dual"
+        },
+        {
+          "case": "governed-90-development-reconstruct_signal_masks_cap1-0",
+          "counts": {
+            "output/membership": 56556
+          },
+          "dimensions": {
+            "candidate_count": 15,
+            "direction_code": 0,
+            "expiry_ms": 90000,
+            "feature_count": 5,
+            "payout_basis": 92,
+            "row_count": 155116
+          },
+          "symbol": "reconstruct_signal_masks_cap1"
+        }
+      ],
+      "output_bytes": 2347620,
+      "stage": "governed-90-development-score_bucket_plans_cap1-1"
+    },
+    {
+      "input_bytes": 100932816,
+      "launches": [
+        {
+          "case": "governed-90-gate_validation-score_bucket_plans_cap1-1",
+          "counts": {
+            "output/invalid": 6868,
+            "output/losses": 4712,
+            "output/signals": 16210,
+            "output/ties": 30,
+            "output/wins": 4600
+          },
+          "dimensions": {
+            "candidate_count": 5,
+            "direction_code": 1,
+            "expiry_ms": 90000,
+            "feature_count": 5,
+            "payout_basis": 92,
+            "row_count": 155116
+          },
+          "symbol": "score_bucket_plans_cap1"
+        },
+        {
+          "case": "governed-90-gate_validation-score_bucket_plans_cap1--1",
+          "counts": {
+            "output/invalid": 31499,
+            "output/losses": 21442,
+            "output/signals": 74851,
+            "output/ties": 135,
+            "output/wins": 21775
+          },
+          "dimensions": {
+            "candidate_count": 10,
+            "direction_code": -1,
+            "expiry_ms": 90000,
+            "feature_count": 5,
+            "payout_basis": 92,
+            "row_count": 155116
+          },
+          "symbol": "score_bucket_plans_cap1"
+        },
+        {
+          "case": "governed-90-gate_validation-score_bucket_plans_cap1_dual-0",
+          "counts": {
+            "buy_output/invalid": 38367,
+            "buy_output/losses": 26487,
+            "buy_output/signals": 91061,
+            "buy_output/ties": 165,
+            "buy_output/wins": 26042,
+            "sell_output/invalid": 38367,
+            "sell_output/losses": 26042,
+            "sell_output/signals": 91061,
+            "sell_output/ties": 165,
+            "sell_output/wins": 26487
+          },
+          "dimensions": {
+            "candidate_count": 15,
+            "direction_code": 0,
+            "expiry_ms": 90000,
+            "feature_count": 5,
+            "payout_basis": 92,
+            "row_count": 155116
+          },
+          "symbol": "score_bucket_plans_cap1_dual"
+        },
+        {
+          "case": "governed-90-gate_validation-score_bucket_plans_cap1_basic-1",
+          "counts": {
+            "output/invalid": 6868,
+            "output/losses": 4712,
+            "output/signals": 16210,
+            "output/ties": 30,
+            "output/wins": 4600
+          },
+          "dimensions": {
+            "candidate_count": 5,
+            "direction_code": 1,
+            "expiry_ms": 90000,
+            "feature_count": 5,
+            "payout_basis": 92,
+            "row_count": 155116
+          },
+          "symbol": "score_bucket_plans_cap1_basic"
+        },
+        {
+          "case": "governed-90-gate_validation-score_bucket_plans_cap1_basic--1",
+          "counts": {
+            "output/invalid": 31499,
+            "output/losses": 21442,
+            "output/signals": 74851,
+            "output/ties": 135,
+            "output/wins": 21775
+          },
+          "dimensions": {
+            "candidate_count": 10,
+            "direction_code": -1,
+            "expiry_ms": 90000,
+            "feature_count": 5,
+            "payout_basis": 92,
+            "row_count": 155116
+          },
+          "symbol": "score_bucket_plans_cap1_basic"
+        },
+        {
+          "case": "governed-90-gate_validation-score_bucket_plans_cap1_basic_dual-0",
+          "counts": {
+            "buy_output/invalid": 38367,
+            "buy_output/losses": 26487,
+            "buy_output/signals": 91061,
+            "buy_output/ties": 165,
+            "buy_output/wins": 26042,
+            "sell_output/invalid": 38367,
+            "sell_output/losses": 26042,
+            "sell_output/signals": 91061,
+            "sell_output/ties": 165,
+            "sell_output/wins": 26487
+          },
+          "dimensions": {
+            "candidate_count": 15,
+            "direction_code": 0,
+            "expiry_ms": 90000,
+            "feature_count": 5,
+            "payout_basis": 92,
+            "row_count": 155116
+          },
+          "symbol": "score_bucket_plans_cap1_basic_dual"
+        },
+        {
+          "case": "governed-90-gate_validation-score_bucket_plans_cap1_sparse-1",
+          "counts": {
+            "output/invalid": 6868,
+            "output/losses": 4712,
+            "output/signals": 16210,
+            "output/ties": 30,
+            "output/wins": 4600
+          },
+          "dimensions": {
+            "candidate_count": 5,
+            "direction_code": 1,
+            "expiry_ms": 90000,
+            "feature_count": 5,
+            "payout_basis": 92,
+            "row_count": 155116
+          },
+          "symbol": "score_bucket_plans_cap1_sparse"
+        },
+        {
+          "case": "governed-90-gate_validation-score_bucket_plans_cap1_sparse--1",
+          "counts": {
+            "output/invalid": 31499,
+            "output/losses": 21442,
+            "output/signals": 74851,
+            "output/ties": 135,
+            "output/wins": 21775
+          },
+          "dimensions": {
+            "candidate_count": 10,
+            "direction_code": -1,
+            "expiry_ms": 90000,
+            "feature_count": 5,
+            "payout_basis": 92,
+            "row_count": 155116
+          },
+          "symbol": "score_bucket_plans_cap1_sparse"
+        },
+        {
+          "case": "governed-90-gate_validation-score_bucket_plans_cap1_basic_sparse-1",
+          "counts": {
+            "output/invalid": 6868,
+            "output/losses": 4712,
+            "output/signals": 16210,
+            "output/ties": 30,
+            "output/wins": 4600
+          },
+          "dimensions": {
+            "candidate_count": 5,
+            "direction_code": 1,
+            "expiry_ms": 90000,
+            "feature_count": 5,
+            "payout_basis": 92,
+            "row_count": 155116
+          },
+          "symbol": "score_bucket_plans_cap1_basic_sparse"
+        },
+        {
+          "case": "governed-90-gate_validation-score_bucket_plans_cap1_basic_sparse--1",
+          "counts": {
+            "output/invalid": 31499,
+            "output/losses": 21442,
+            "output/signals": 74851,
+            "output/ties": 135,
+            "output/wins": 21775
+          },
+          "dimensions": {
+            "candidate_count": 10,
+            "direction_code": -1,
+            "expiry_ms": 90000,
+            "feature_count": 5,
+            "payout_basis": 92,
+            "row_count": 155116
+          },
+          "symbol": "score_bucket_plans_cap1_basic_sparse"
+        },
+        {
+          "case": "governed-90-gate_validation-score_bucket_plans_cap1_sparse_dual-0",
+          "counts": {
+            "buy_output/invalid": 38367,
+            "buy_output/losses": 26487,
+            "buy_output/signals": 91061,
+            "buy_output/ties": 165,
+            "buy_output/wins": 26042,
+            "sell_output/invalid": 38367,
+            "sell_output/losses": 26042,
+            "sell_output/signals": 91061,
+            "sell_output/ties": 165,
+            "sell_output/wins": 26487
+          },
+          "dimensions": {
+            "candidate_count": 15,
+            "direction_code": 0,
+            "expiry_ms": 90000,
+            "feature_count": 5,
+            "payout_basis": 92,
+            "row_count": 155116
+          },
+          "symbol": "score_bucket_plans_cap1_sparse_dual"
+        },
+        {
+          "case": "governed-90-gate_validation-score_bucket_plans_cap1_basic_sparse_dual-0",
+          "counts": {
+            "buy_output/invalid": 38367,
+            "buy_output/losses": 26487,
+            "buy_output/signals": 91061,
+            "buy_output/ties": 165,
+            "buy_output/wins": 26042,
+            "sell_output/invalid": 38367,
+            "sell_output/losses": 26042,
+            "sell_output/signals": 91061,
+            "sell_output/ties": 165,
+            "sell_output/wins": 26487
+          },
+          "dimensions": {
+            "candidate_count": 15,
+            "direction_code": 0,
+            "expiry_ms": 90000,
+            "feature_count": 5,
+            "payout_basis": 92,
+            "row_count": 155116
+          },
+          "symbol": "score_bucket_plans_cap1_basic_sparse_dual"
+        },
+        {
+          "case": "governed-90-gate_validation-reconstruct_signal_masks_cap1-0",
+          "counts": {
+            "output/membership": 52792
+          },
+          "dimensions": {
+            "candidate_count": 15,
+            "direction_code": 0,
+            "expiry_ms": 90000,
+            "feature_count": 5,
+            "payout_basis": 92,
+            "row_count": 155116
+          },
+          "symbol": "reconstruct_signal_masks_cap1"
+        }
+      ],
+      "output_bytes": 2347620,
+      "stage": "governed-90-gate_validation-score_bucket_plans_cap1-1"
+    },
+    {
+      "input_bytes": 1180,
+      "launches": [
+        {
+          "case": "governed-bootstrap",
+          "counts": {},
+          "dimensions": {
+            "rolling_horizon": 3,
+            "simulations": 16,
+            "trade_count": 8
+          },
+          "symbol": "bootstrap_path_metrics"
+        }
+      ],
+      "output_bytes": 384,
+      "stage": "governed-bootstrap"
+    },
+    {
+      "input_bytes": 7679792,
+      "launches": [
+        {
+          "case": "governed-repair",
+          "counts": {
+            "out_longest_dd_trades": 353087,
+            "out_longest_loss_streak": 765,
+            "out_losses": 183511,
+            "out_opened": 369268,
+            "out_settled": 369268,
+            "out_ties": 1229,
+            "out_wins": 184528
+          },
+          "dimensions": {
+            "end_ms": 1779753600000,
+            "payout_fp": 9200,
+            "policy_count": 72,
+            "start_ms": 1774137600000,
+            "word_count": 1
+          },
+          "symbol": "replay_policies"
+        }
+      ],
+      "output_bytes": 6624,
+      "stage": "governed-repair"
+    },
+    {
+      "input_bytes": 17616108,
+      "launches": [
+        {
+          "case": "governed-capacity-1-1",
+          "counts": {
+            "accepted/membership": 39170
+          },
+          "dimensions": {
+            "candidate_count": 24,
+            "event_count": 225844,
+            "max_expiry": 1,
+            "max_total": 1,
+            "portfolio_count": 3
+          },
+          "symbol": "replay_capacity"
+        },
+        {
+          "case": "governed-capacity-4-2",
+          "counts": {
+            "accepted/membership": 98033
+          },
+          "dimensions": {
+            "candidate_count": 24,
+            "event_count": 225844,
+            "max_expiry": 2,
+            "max_total": 4,
+            "portfolio_count": 3
+          },
+          "symbol": "replay_capacity"
+        },
+        {
+          "case": "governed-capacity-64-32",
+          "counts": {
+            "accepted/membership": 144274
+          },
+          "dimensions": {
+            "candidate_count": 24,
+            "event_count": 225844,
+            "max_expiry": 32,
+            "max_total": 64,
+            "portfolio_count": 3
+          },
+          "symbol": "replay_capacity"
+        }
+      ],
+      "output_bytes": 2032596,
+      "stage": "governed-capacity-1-1"
+    },
+    {
+      "input_bytes": 1861400,
+      "launches": [
+        {
+          "case": "governed-drawdown",
+          "counts": {},
+          "dimensions": {
+            "observation_count": 155116,
+            "portfolio_count": 3
+          },
+          "symbol": "path_drawdown"
+        }
+      ],
+      "output_bytes": 48,
+      "stage": "governed-drawdown"
+    }
+  ],
+  "summary": {
+    "candidates": {
+      "parity_local_v2_00001_062dac27c3_30s_offset15s_60s_sell": {
+        "blocked_by_entry_gap": 0,
+        "blocked_by_strategy_capacity": 210,
+        "invalidated": 0,
+        "losses": 324,
+        "opened": 676,
+        "raw_signals": 886,
+        "settled": 676,
+        "ties": 4,
+        "wins": 348
+      },
+      "parity_local_v2_00002_78f7af013a_30s_offset15s_90s_sell": {
+        "blocked_by_entry_gap": 0,
+        "blocked_by_strategy_capacity": 257,
+        "invalidated": 1,
+        "losses": 320,
+        "opened": 629,
+        "raw_signals": 886,
+        "settled": 628,
+        "ties": 3,
+        "wins": 305
+      },
+      "parity_local_v2_00003_40e43d8d96_30s_offset15s_90s_sell": {
+        "blocked_by_entry_gap": 0,
+        "blocked_by_strategy_capacity": 11,
+        "invalidated": 2,
+        "losses": 361,
+        "opened": 753,
+        "raw_signals": 764,
+        "settled": 751,
+        "ties": 2,
+        "wins": 388
+      },
+      "parity_local_v2_00004_8610d7225b_30s_offset15s_60s_sell": {
+        "blocked_by_entry_gap": 0,
+        "blocked_by_strategy_capacity": 8,
+        "invalidated": 1,
+        "losses": 357,
+        "opened": 756,
+        "raw_signals": 764,
+        "settled": 755,
+        "ties": 3,
+        "wins": 395
+      },
+      "parity_local_v2_00005_41d0f9c5eb_30s_offset15s_90s_buy": {
+        "blocked_by_entry_gap": 0,
+        "blocked_by_strategy_capacity": 16,
+        "invalidated": 2,
+        "losses": 376,
+        "opened": 770,
+        "raw_signals": 786,
+        "settled": 768,
+        "ties": 2,
+        "wins": 390
+      },
+      "parity_local_v2_00006_94ffbcd3e7_30s_offset15s_60s_buy": {
+        "blocked_by_entry_gap": 0,
+        "blocked_by_strategy_capacity": 10,
+        "invalidated": 2,
+        "losses": 379,
+        "opened": 776,
+        "raw_signals": 786,
+        "settled": 774,
+        "ties": 7,
+        "wins": 388
+      },
+      "parity_local_v2_00007_25de4cd820_30s_offset15s_60s_sell": {
+        "blocked_by_entry_gap": 0,
+        "blocked_by_strategy_capacity": 10,
+        "invalidated": 2,
+        "losses": 388,
+        "opened": 776,
+        "raw_signals": 786,
+        "settled": 774,
+        "ties": 7,
+        "wins": 379
+      },
+      "parity_local_v2_00008_7e80803ccd_30s_offset15s_90s_buy": {
+        "blocked_by_entry_gap": 0,
+        "blocked_by_strategy_capacity": 257,
+        "invalidated": 1,
+        "losses": 305,
+        "opened": 629,
+        "raw_signals": 886,
+        "settled": 628,
+        "ties": 3,
+        "wins": 320
+      },
+      "parity_local_v2_00009_12e8176619_30s_offset15s_90s_sell": {
+        "blocked_by_entry_gap": 0,
+        "blocked_by_strategy_capacity": 16,
+        "invalidated": 2,
+        "losses": 390,
+        "opened": 770,
+        "raw_signals": 786,
+        "settled": 768,
+        "ties": 2,
+        "wins": 376
+      },
+      "parity_local_v2_00010_3144f7b9ad_30s_offset15s_90s_sell": {
+        "blocked_by_entry_gap": 0,
+        "blocked_by_strategy_capacity": 415,
+        "invalidated": 8,
+        "losses": 2355,
+        "opened": 4840,
+        "raw_signals": 5255,
+        "settled": 4832,
+        "ties": 16,
+        "wins": 2461
+      },
+      "parity_local_v2_00011_31231818fa_30s_offset15s_60s_buy": {
+        "blocked_by_entry_gap": 0,
+        "blocked_by_strategy_capacity": 210,
+        "invalidated": 0,
+        "losses": 348,
+        "opened": 676,
+        "raw_signals": 886,
+        "settled": 676,
+        "ties": 4,
+        "wins": 324
+      },
+      "parity_local_v2_00012_54e4ad1cdd_30s_offset15s_90s_buy": {
+        "blocked_by_entry_gap": 0,
+        "blocked_by_strategy_capacity": 11,
+        "invalidated": 2,
+        "losses": 388,
+        "opened": 753,
+        "raw_signals": 764,
+        "settled": 751,
+        "ties": 2,
+        "wins": 361
+      },
+      "parity_local_v2_00013_aa1de73860_30s_offset15s_60s_buy": {
+        "blocked_by_entry_gap": 0,
+        "blocked_by_strategy_capacity": 8,
+        "invalidated": 1,
+        "losses": 395,
+        "opened": 756,
+        "raw_signals": 764,
+        "settled": 755,
+        "ties": 3,
+        "wins": 357
+      },
+      "parity_local_v2_00014_3f57e4006e_30s_offset15s_60s_sell": {
+        "blocked_by_entry_gap": 0,
+        "blocked_by_strategy_capacity": 241,
+        "invalidated": 6,
+        "losses": 2444,
+        "opened": 5014,
+        "raw_signals": 5255,
+        "settled": 5008,
+        "ties": 29,
+        "wins": 2535
+      },
+      "parity_local_v2_00015_6287a3ebcd_30s_offset15s_60s_buy": {
+        "blocked_by_entry_gap": 0,
+        "blocked_by_strategy_capacity": 241,
+        "invalidated": 6,
+        "losses": 2535,
+        "opened": 5014,
+        "raw_signals": 5255,
+        "settled": 5008,
+        "ties": 29,
+        "wins": 2444
+      },
+      "parity_local_v2_00016_feac2c4f7d_30s_offset15s_90s_sell": {
+        "blocked_by_entry_gap": 0,
+        "blocked_by_strategy_capacity": 18515,
+        "invalidated": 26,
+        "losses": 6096,
+        "opened": 12275,
+        "raw_signals": 30790,
+        "settled": 12249,
+        "ties": 34,
+        "wins": 6119
+      },
+      "parity_local_v2_00017_645ef3ed93_30s_offset15s_90s_sell": {
+        "blocked_by_entry_gap": 1,
+        "blocked_by_strategy_capacity": 18439,
+        "invalidated": 10,
+        "losses": 6007,
+        "opened": 12188,
+        "raw_signals": 30628,
+        "settled": 12178,
+        "ties": 44,
+        "wins": 6127
+      },
+      "parity_local_v2_00018_7b3c29a420_30s_offset15s_90s_buy": {
+        "blocked_by_entry_gap": 0,
+        "blocked_by_strategy_capacity": 415,
+        "invalidated": 8,
+        "losses": 2461,
+        "opened": 4840,
+        "raw_signals": 5255,
+        "settled": 4832,
+        "ties": 16,
+        "wins": 2355
+      },
+      "parity_local_v2_00019_f2e769ab80_30s_offset15s_90s_sell": {
+        "blocked_by_entry_gap": 2,
+        "blocked_by_strategy_capacity": 4087,
+        "invalidated": 24,
+        "losses": 7256,
+        "opened": 14557,
+        "raw_signals": 18646,
+        "settled": 14533,
+        "ties": 34,
+        "wins": 7243
+      },
+      "parity_local_v2_00020_5342585500_30s_offset15s_90s_buy": {
+        "blocked_by_entry_gap": 2,
+        "blocked_by_strategy_capacity": 13557,
+        "invalidated": 26,
+        "losses": 6021,
+        "opened": 12115,
+        "raw_signals": 25674,
+        "settled": 12089,
+        "ties": 36,
+        "wins": 6032
+      },
+      "parity_local_v2_00021_3636312dcc_30s_offset15s_90s_sell": {
+        "blocked_by_entry_gap": 0,
+        "blocked_by_strategy_capacity": 5122,
+        "invalidated": 25,
+        "losses": 7920,
+        "opened": 15908,
+        "raw_signals": 21030,
+        "settled": 15883,
+        "ties": 34,
+        "wins": 7929
+      },
+      "parity_local_v2_00022_5d33e060c6_30s_offset15s_90s_sell": {
+        "blocked_by_entry_gap": 1,
+        "blocked_by_strategy_capacity": 5401,
+        "invalidated": 33,
+        "losses": 8011,
+        "opened": 16206,
+        "raw_signals": 21608,
+        "settled": 16173,
+        "ties": 50,
+        "wins": 8112
+      },
+      "parity_local_v2_00023_6d21048f3b_30s_offset15s_90s_sell": {
+        "blocked_by_entry_gap": 2,
+        "blocked_by_strategy_capacity": 13557,
+        "invalidated": 26,
+        "losses": 6032,
+        "opened": 12115,
+        "raw_signals": 25674,
+        "settled": 12089,
+        "ties": 36,
+        "wins": 6021
+      },
+      "parity_local_v2_00024_1dca154068_30s_offset15s_60s_sell": {
+        "blocked_by_entry_gap": 0,
+        "blocked_by_strategy_capacity": 3126,
+        "invalidated": 18,
+        "losses": 8841,
+        "opened": 17904,
+        "raw_signals": 21030,
+        "settled": 17886,
+        "ties": 70,
+        "wins": 8975
+      }
+    },
+    "funded_ledger": "equals Phase 06 governed replay a8c74e10502cbd02d4ec31f3b7bd5fcb94bc510ed3d2f19a7a6f6e79cc351cb7",
+    "totals": {
+      "blocked_by_entry_gap": 8,
+      "blocked_by_strategy_capacity": 84140,
+      "invalidated": 232,
+      "losses": 70310,
+      "opened": 141696,
+      "raw_signals": 225844,
+      "settled": 141464,
+      "ties": 470,
+      "wins": 70684
+    }
+  },
+  "target_commit": "151ba60f0c407af792ebbdda9e32f1638006e757"
+}
