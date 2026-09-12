@@ -1,0 +1,11 @@
+[package]
+name = "binary-alpha-accelerator"
+description = "Typed offline kernel contracts, central-processor references, and optional NVIDIA CUDA execution"
+version.workspace = true
+edition.workspace = true
+
+[features]
+cuda = ["dep:cudarc"]
+
+[dependencies]
+cudarc = { workspace = true, optional = true }

@@ -1,0 +1,1218 @@
+//! Four-slot feature equality, chronological capacity-one scoring, and signal reconstruction.
+//!
+//! Feature codes are feature-major `[feature][row]`. Optional slots (2–4) with a
+//! negative feature index ignore their bucket. Split scope 2 warms capacity without
+//! scoring; other nonzero scopes score. Full rows contain 21 i64 values, basic rows
+//! their first eight; slot 10 stores the exact bits of the f64 squared-drawdown sum.
+//! Times, producer flags, and row order are preserved, never inferred or reordered.
+//!
+//! Output columns: 0 total, 1 wins, 2 losses, 3 ties, 4 invalid, 5 buy signals,
+//! 6 sell signals, 7 net (payout per win, -100 per loss), 8 maximum drawdown,
+//! 9 longest loss streak, 10 squared drawdown f64 bits, 11 longest underwater
+//! trade span, 12 trade span paired with longest drawdown duration, 13–15 worst
+//! rolling 20/50/100 sums (zero before a complete window), 16 valid path count,
+//! 17 squared returns, 18 downside squares, 19 longest underwater milliseconds,
+//! 20 longest drawdown milliseconds. Reconstruction emits `[candidate][row]` u8
+//! admission flags, including admitted entries whose outcome is invalid.
+
+use crate::{Backend, Measured, count, length, product};
+
+/// Shared search-stage buffers, uploaded once by a resident CUDA workspace.
+#[derive(Clone, Copy)]
+pub struct SearchBuffers<'a> {
+    /// Feature-major `[feature_count][row_count]` equality codes.
+    pub feature_codes: &'a [i16],
+    /// Number of encoded feature vectors.
+    pub feature_count: i32,
+    /// Number of base rows.
+    pub row_count: i32,
+    /// Chronological row indices for dense scoring and reconstruction.
+    pub ordered_rows: &'a [i64],
+    /// Actual entry times, retaining the kernel ABI's historical argument name.
+    pub decision_time_ms: &'a [i64],
+    /// Actual capacity release times; nonpositive values cannot open.
+    pub release_time_ms: &'a [i64],
+    /// Settlement timestamps used only by full path metrics.
+    pub settlement_time_ms: &'a [i64],
+    /// Nonzero indicates a valid settled outcome.
+    pub valid: &'a [u8],
+    /// Buy-side win flag.
+    pub buy_win: &'a [u8],
+    /// Sell-side win flag.
+    pub sell_win: &'a [u8],
+    /// Tie flag (takes priority over either win flag).
+    pub tie: &'a [u8],
+}
+
+/// Original four separate feature and bucket arrays, in slot order.
+#[derive(Clone, Copy)]
+pub struct CandidateSlots<'a> {
+    /// Feature indices `[slot][candidate]`; slot one must be active.
+    pub features: [&'a [i32]; 4],
+    /// Equality codes `[slot][candidate]`; inactive slots ignore their code.
+    pub buckets: [&'a [i16]; 4],
+    /// Candidate count, also the launch item count.
+    pub candidate_count: i32,
+}
+
+/// Sparse chronological driver lists; every visited row rechecks all active slots.
+#[derive(Clone, Copy)]
+pub struct SparseIndex<'a> {
+    /// Driver key per candidate, or a negative value for no driver.
+    pub candidate_driver_key: &'a [i32],
+    /// Monotone offsets including the terminal offset into `key_chrono_rows`.
+    pub key_chrono_offsets: &'a [i32],
+    /// Concatenated chronological driver row lists.
+    pub key_chrono_rows: &'a [i32],
+}
+
+/// Two direction-specific output buffers, each `[candidate][21 or 8]`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DualScores {
+    /// Buy results, first in the dual kernel ABI.
+    pub buy_output: Vec<i64>,
+    /// Sell results, second in the dual kernel ABI.
+    pub sell_output: Vec<i64>,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct Request<'a> {
+    pub kind: usize,
+    pub buffers: SearchBuffers<'a>,
+    pub split_mask: &'a [u8],
+    pub candidates: CandidateSlots<'a>,
+    pub sparse: Option<SparseIndex<'a>>,
+    pub expiry_ms: i64,
+    pub direction_code: i32,
+    pub payout_basis: i64,
+}
+
+impl Request<'_> {
+    pub fn kernel(&self) -> &'static str {
+        crate::KERNEL_SOURCES[self.kind].0
+    }
+    pub fn full(&self) -> bool {
+        matches!(self.kind, 0 | 1 | 4 | 6)
+    }
+    pub fn dual(&self) -> bool {
+        matches!(self.kind, 1 | 3 | 6 | 7)
+    }
+    pub fn width(&self) -> usize {
+        if self.full() { 21 } else { 8 }
+    }
+
+    pub fn validate(&self) -> Result<(), String> {
+        let k = self.kernel();
+        let b = self.buffers;
+        let rows = count(k, "row_count", b.row_count)?;
+        let features = count(k, "feature_count", b.feature_count)?;
+        let candidates = count(k, "candidate_count", self.candidates.candidate_count)?;
+        length(
+            k,
+            "feature_codes",
+            b.feature_codes.len(),
+            product(k, "feature_codes", features, rows)?,
+        )?;
+        length(k, "split_mask", self.split_mask.len(), rows)?;
+        for (name, len) in [
+            ("decision_time_ms", b.decision_time_ms.len()),
+            ("release_time_ms", b.release_time_ms.len()),
+        ] {
+            length(k, name, len, rows)?;
+        }
+        if self.full() {
+            length(k, "settlement_time_ms", b.settlement_time_ms.len(), rows)?;
+        }
+        if self.kind != 8 {
+            for (name, len) in [
+                ("valid", b.valid.len()),
+                ("buy_win", b.buy_win.len()),
+                ("sell_win", b.sell_win.len()),
+                ("tie", b.tie.len()),
+            ] {
+                length(k, name, len, rows)?;
+            }
+        }
+        for slot in 0..4 {
+            length(
+                k,
+                &format!("feature{}", slot + 1),
+                self.candidates.features[slot].len(),
+                candidates,
+            )?;
+            length(
+                k,
+                &format!("bucket{}", slot + 1),
+                self.candidates.buckets[slot].len(),
+                candidates,
+            )?;
+            for &feature in self.candidates.features[slot] {
+                if (slot == 0 && feature < 0) || (feature >= 0 && feature as usize >= features) {
+                    return Err(format!(
+                        "{k}: feature{} index {feature} outside feature_count {features}",
+                        slot + 1
+                    ));
+                }
+            }
+        }
+        if let Some(sparse) = self.sparse {
+            length(
+                k,
+                "candidate_driver_key",
+                sparse.candidate_driver_key.len(),
+                candidates,
+            )?;
+            if sparse.key_chrono_offsets.is_empty() {
+                return Err(format!(
+                    "{k}: key_chrono_offsets requires a terminal offset"
+                ));
+            }
+            if sparse.key_chrono_rows.len() > i32::MAX as usize
+                || sparse.key_chrono_offsets.len() - 1 > i32::MAX as usize
+            {
+                return Err(format!(
+                    "{k}: key_chrono_rows/key_chrono_offsets count exceeds i32"
+                ));
+            }
+            let mut previous = 0;
+            for &offset in sparse.key_chrono_offsets {
+                if offset < previous || offset as usize > sparse.key_chrono_rows.len() {
+                    return Err(format!(
+                        "{k}: key_chrono_offsets must be monotone and within key_chrono_rows"
+                    ));
+                }
+                previous = offset;
+            }
+            for &key in sparse.candidate_driver_key {
+                if key >= 0 && key as usize >= sparse.key_chrono_offsets.len() - 1 {
+                    return Err(format!(
+                        "{k}: candidate_driver_key {key} outside key_chrono_offsets"
+                    ));
+                }
+            }
+            for &row in sparse.key_chrono_rows {
+                if row < 0 || row as usize >= rows {
+                    return Err(format!(
+                        "{k}: key_chrono_rows index {row} outside row_count"
+                    ));
+                }
+            }
+        } else {
+            length(k, "ordered_rows", b.ordered_rows.len(), rows)?;
+            for &row in b.ordered_rows {
+                if row < 0 || row as u64 >= rows as u64 {
+                    return Err(format!("{k}: ordered_rows index {row} outside row_count"));
+                }
+            }
+        }
+        product(
+            k,
+            "output",
+            candidates,
+            if self.kind == 8 { rows } else { self.width() },
+        )?;
+        Ok(())
+    }
+
+    fn matches(&self, candidate: usize, row: usize) -> bool {
+        (0..4).all(|slot| {
+            let feature = self.candidates.features[slot][candidate];
+            feature < 0
+                || self.buffers.feature_codes
+                    [feature as usize * self.buffers.row_count as usize + row]
+                    == self.candidates.buckets[slot][candidate]
+        })
+    }
+
+    fn rows(&self, candidate: usize, mut visit: impl FnMut(usize)) {
+        if let Some(sparse) = self.sparse {
+            let key = sparse.candidate_driver_key[candidate];
+            if key < 0 {
+                return;
+            }
+            let first = sparse.key_chrono_offsets[key as usize] as usize;
+            let last = sparse.key_chrono_offsets[key as usize + 1] as usize;
+            for &row in &sparse.key_chrono_rows[first..last] {
+                visit(row as usize);
+            }
+        } else {
+            for &row in self.buffers.ordered_rows {
+                visit(row as usize);
+            }
+        }
+    }
+
+    fn reference(&self) -> DualScores {
+        let _ = self.expiry_ms; // Unused by every preserved search kernel.
+        let mut result = DualScores {
+            buy_output: Vec::new(),
+            sell_output: Vec::new(),
+        };
+        for candidate in 0..self.candidates.candidate_count as usize {
+            let mut active_due = -9223372036854775807_i64;
+            let (mut total, mut invalid, mut ties) = (0_i64, 0_i64, 0_i64);
+            let mut buy = Path::new();
+            let mut sell = Path::new();
+            self.rows(candidate, |row| {
+                let scope = self.split_mask[row];
+                if scope == 0 || !self.matches(candidate, row) {
+                    return;
+                }
+                let decision = self.buffers.decision_time_ms[row];
+                let release = self.buffers.release_time_ms[row];
+                if scope == 2 {
+                    if active_due <= decision && release > 0 {
+                        active_due = release;
+                    }
+                    return;
+                }
+                total += 1;
+                if active_due > decision || release <= 0 {
+                    invalid += 1;
+                    return;
+                }
+                let mut buy_units = 0;
+                let mut sell_units = 0;
+                if self.buffers.valid[row] == 0 {
+                    invalid += 1;
+                } else if self.buffers.tie[row] != 0 {
+                    ties += 1;
+                } else if self.dual() {
+                    // Dual kernels give the buy flag priority even for the sell output.
+                    if self.buffers.buy_win[row] != 0 {
+                        buy.wins += 1;
+                        sell.losses += 1;
+                        buy_units = self.payout_basis;
+                        sell_units = -100;
+                    } else if self.buffers.sell_win[row] != 0 {
+                        sell.wins += 1;
+                        buy.losses += 1;
+                        sell_units = self.payout_basis;
+                        buy_units = -100;
+                    }
+                } else {
+                    let (win, loss) = if self.direction_code == 1 {
+                        (self.buffers.buy_win[row], self.buffers.sell_win[row])
+                    } else {
+                        (self.buffers.sell_win[row], self.buffers.buy_win[row])
+                    };
+                    if win != 0 {
+                        buy.wins += 1;
+                        buy_units = self.payout_basis;
+                    } else if loss != 0 {
+                        buy.losses += 1;
+                        buy_units = -100;
+                    }
+                }
+                if self.full() && self.buffers.valid[row] != 0 {
+                    buy.observe(buy_units, decision, self.buffers.settlement_time_ms[row]);
+                    if self.dual() {
+                        sell.observe(sell_units, decision, self.buffers.settlement_time_ms[row]);
+                    }
+                }
+                active_due = release;
+            });
+            let direction = if self.dual() { 1 } else { self.direction_code };
+            result.buy_output.extend_from_slice(
+                &buy.finish(total, ties, invalid, direction, self.payout_basis)[..self.width()],
+            );
+            if self.dual() {
+                result.sell_output.extend_from_slice(
+                    &sell.finish(total, ties, invalid, -1, self.payout_basis)[..self.width()],
+                );
+            }
+        }
+        result
+    }
+
+    fn reconstruct(&self) -> Vec<u8> {
+        let _ = self.expiry_ms; // Release buffers own actual admission timing.
+        let mut output =
+            vec![0; self.candidates.candidate_count as usize * self.buffers.row_count as usize];
+        for candidate in 0..self.candidates.candidate_count as usize {
+            let mut active_due = -9223372036854775807_i64;
+            self.rows(candidate, |row| {
+                let scope = self.split_mask[row];
+                if scope == 0 || !self.matches(candidate, row) {
+                    return;
+                }
+                let decision = self.buffers.decision_time_ms[row];
+                let release = self.buffers.release_time_ms[row];
+                if scope == 2 {
+                    if active_due <= decision && release > 0 {
+                        active_due = release;
+                    }
+                    return;
+                }
+                if active_due > decision || release <= 0 {
+                    return;
+                }
+                output[candidate * self.buffers.row_count as usize + row] = 1;
+                active_due = release;
+            });
+        }
+        output
+    }
+}
+
+struct Path {
+    wins: i64,
+    losses: i64,
+    equity: i64,
+    peak: i64,
+    max_drawdown: i64,
+    max_drawdown_trades: i64,
+    drawdown_square_sum: f64,
+    trade_square_sum: i64,
+    downside_square_sum: i64,
+    underwater_start_trade: i64,
+    underwater_start_ms: i64,
+    peak_trade_index: i64,
+    peak_decision_ms: i64,
+    final_settlement_ms: i64,
+    valid_trade_index: i64,
+    longest_underwater: i64,
+    longest_underwater_ms: i64,
+    current_losses: i64,
+    max_losses: i64,
+    max_drawdown_ms: i64,
+    rolling: [i64; 100],
+    rolling20: i64,
+    rolling50: i64,
+    rolling100: i64,
+    worst20: i64,
+    worst50: i64,
+    worst100: i64,
+}
+
+impl Path {
+    fn new() -> Self {
+        Self {
+            wins: 0,
+            losses: 0,
+            equity: 0,
+            peak: 0,
+            max_drawdown: 0,
+            max_drawdown_trades: 0,
+            drawdown_square_sum: 0.0,
+            trade_square_sum: 0,
+            downside_square_sum: 0,
+            underwater_start_trade: -1,
+            underwater_start_ms: -1,
+            peak_trade_index: 0,
+            peak_decision_ms: -1,
+            final_settlement_ms: -1,
+            valid_trade_index: 0,
+            longest_underwater: 0,
+            longest_underwater_ms: 0,
+            current_losses: 0,
+            max_losses: 0,
+            max_drawdown_ms: 0,
+            rolling: [0; 100],
+            rolling20: 0,
+            rolling50: 0,
+            rolling100: 0,
+            worst20: i64::MAX,
+            worst50: i64::MAX,
+            worst100: i64::MAX,
+        }
+    }
+
+    fn duration(&mut self, settlement: i64, terminal: bool) {
+        let trades = self.valid_trade_index - self.peak_trade_index;
+        let duration = settlement.wrapping_sub(self.peak_decision_ms);
+        if duration > self.max_drawdown_ms
+            || (duration == self.max_drawdown_ms && trades > self.max_drawdown_trades)
+        {
+            self.max_drawdown_ms = duration;
+            self.max_drawdown_trades = trades;
+        }
+        let underwater = self.valid_trade_index - self.underwater_start_trade + i64::from(terminal);
+        let underwater_ms = settlement.wrapping_sub(self.underwater_start_ms);
+        if underwater > self.longest_underwater {
+            self.longest_underwater = underwater;
+        }
+        if underwater_ms > self.longest_underwater_ms {
+            self.longest_underwater_ms = underwater_ms;
+        }
+    }
+
+    fn observe(&mut self, units: i64, decision: i64, settlement: i64) {
+        let ring_slot = (self.valid_trade_index % 100) as usize;
+        let replaced = self.rolling[ring_slot];
+        self.rolling[ring_slot] = units;
+        self.rolling100 = self.rolling100.wrapping_add(units.wrapping_sub(replaced));
+        self.rolling50 = self.rolling50.wrapping_add(units);
+        self.rolling20 = self.rolling20.wrapping_add(units);
+        if self.valid_trade_index >= 50 {
+            self.rolling50 = self
+                .rolling50
+                .wrapping_sub(self.rolling[((self.valid_trade_index - 50) % 100) as usize]);
+        }
+        if self.valid_trade_index >= 20 {
+            self.rolling20 = self
+                .rolling20
+                .wrapping_sub(self.rolling[((self.valid_trade_index - 20) % 100) as usize]);
+        }
+        if self.valid_trade_index >= 19 && self.rolling20 < self.worst20 {
+            self.worst20 = self.rolling20;
+        }
+        if self.valid_trade_index >= 49 && self.rolling50 < self.worst50 {
+            self.worst50 = self.rolling50;
+        }
+        if self.valid_trade_index >= 99 && self.rolling100 < self.worst100 {
+            self.worst100 = self.rolling100;
+        }
+        self.valid_trade_index += 1;
+        self.final_settlement_ms = settlement;
+        if self.peak_decision_ms < 0 {
+            self.peak_decision_ms = decision;
+        }
+        self.equity = self.equity.wrapping_add(units);
+        self.trade_square_sum = self
+            .trade_square_sum
+            .wrapping_add(units.wrapping_mul(units));
+        if units < 0 {
+            self.downside_square_sum = self
+                .downside_square_sum
+                .wrapping_add(units.wrapping_mul(units));
+        }
+        if units < 0 {
+            self.current_losses += 1;
+            if self.current_losses > self.max_losses {
+                self.max_losses = self.current_losses;
+            }
+        } else {
+            self.current_losses = 0;
+        }
+        if self.equity >= self.peak {
+            if self.underwater_start_trade >= 0 {
+                self.duration(settlement, false);
+            }
+            if self.equity > self.peak {
+                self.peak = self.equity;
+            }
+            self.peak_trade_index = self.valid_trade_index;
+            self.peak_decision_ms = settlement;
+            self.underwater_start_trade = -1;
+            self.underwater_start_ms = -1;
+        }
+        let drawdown = self.peak.wrapping_sub(self.equity);
+        // The kernel text is `sum += (double)d * (double)d`; nvcc's default contraction
+        // (`--fmad=true`) emits one fused multiply-add for it, so the reference fuses too.
+        self.drawdown_square_sum =
+            (drawdown as f64).mul_add(drawdown as f64, self.drawdown_square_sum);
+        if drawdown > self.max_drawdown {
+            self.max_drawdown = drawdown;
+        }
+        if drawdown > 0 && self.underwater_start_trade < 0 {
+            self.underwater_start_trade = self.valid_trade_index;
+            self.underwater_start_ms = settlement;
+        }
+    }
+
+    fn finish(
+        mut self,
+        total: i64,
+        ties: i64,
+        invalid: i64,
+        direction: i32,
+        payout: i64,
+    ) -> [i64; 21] {
+        if self.underwater_start_trade >= 0 && self.final_settlement_ms >= 0 {
+            self.duration(self.final_settlement_ms, true);
+        }
+        [
+            total,
+            self.wins,
+            self.losses,
+            ties,
+            invalid,
+            if direction == 1 { total } else { 0 },
+            if direction == -1 { total } else { 0 },
+            self.wins
+                .wrapping_mul(payout)
+                .wrapping_sub(self.losses.wrapping_mul(100)),
+            self.max_drawdown,
+            self.max_losses,
+            self.drawdown_square_sum.to_bits() as i64,
+            self.longest_underwater,
+            self.max_drawdown_trades,
+            if self.worst20 == i64::MAX {
+                0
+            } else {
+                self.worst20
+            },
+            if self.worst50 == i64::MAX {
+                0
+            } else {
+                self.worst50
+            },
+            if self.worst100 == i64::MAX {
+                0
+            } else {
+                self.worst100
+            },
+            self.valid_trade_index,
+            self.trade_square_sum,
+            self.downside_square_sum,
+            self.longest_underwater_ms,
+            self.max_drawdown_ms,
+        ]
+    }
+}
+
+fn inferred_features(
+    kernel: &str,
+    codes: &[i16],
+    rows: i32,
+    slots: [&[i32]; 4],
+) -> Result<i32, String> {
+    let rows = count(kernel, "row_count", rows)?;
+    // With no rows the ABI carries no feature shape. No code is dereferenced; retain
+    // the minimum shape consistent with the active slots for the empty operation.
+    let features = codes.len().checked_div(rows).unwrap_or_else(|| {
+        (slots
+            .iter()
+            .flat_map(|slot| slot.iter())
+            .copied()
+            .max()
+            .unwrap_or(-1)
+            .max(-1) as i64
+            + 1) as usize
+    });
+    i32::try_from(features)
+        .map_err(|_| format!("{kernel}: feature_codes feature count exceeds i32"))
+}
+
+/// Executes `score_bucket_plans_cap1`; input order and dtypes match the native kernel ABI.
+/// Output pointers become owned buffers. Validation runs for either backend.
+pub fn score_bucket_plans_cap1(
+    backend: &Backend,
+    feature_codes: &[i16],
+    feature1: &[i32],
+    bucket1: &[i16],
+    feature2: &[i32],
+    bucket2: &[i16],
+    feature3: &[i32],
+    bucket3: &[i16],
+    feature4: &[i32],
+    bucket4: &[i16],
+    split_mask: &[u8],
+    ordered_rows: &[i64],
+    decision_time_ms: &[i64],
+    release_time_ms: &[i64],
+    settlement_time_ms: &[i64],
+    valid: &[u8],
+    buy_win: &[u8],
+    sell_win: &[u8],
+    tie: &[u8],
+    candidate_count: i32,
+    row_count: i32,
+    feature_count: i32,
+    expiry_ms: i64,
+    direction_code: i32,
+    payout_basis: i64,
+) -> Result<Measured<Vec<i64>>, String> {
+    let input = Request {
+        kind: 0,
+        buffers: SearchBuffers {
+            feature_codes,
+            feature_count,
+            row_count,
+            ordered_rows,
+            decision_time_ms,
+            release_time_ms,
+            settlement_time_ms,
+            valid,
+            buy_win,
+            sell_win,
+            tie,
+        },
+        split_mask,
+        candidates: CandidateSlots {
+            features: [feature1, feature2, feature3, feature4],
+            buckets: [bucket1, bucket2, bucket3, bucket4],
+            candidate_count,
+        },
+        sparse: None,
+        expiry_ms,
+        direction_code,
+        payout_basis,
+    };
+    input.validate()?;
+    let result = match backend {
+        Backend::Cpu => crate::cpu(|| input.reference()),
+        #[cfg(feature = "cuda")]
+        Backend::Cuda(device) => device.score(input)?,
+    };
+    Ok(Measured {
+        output: result.output.buy_output,
+        timings: result.timings,
+    })
+}
+
+/// Executes `score_bucket_plans_cap1_dual`; input order and dtypes match the native kernel ABI.
+/// Output pointers become owned buffers. Validation runs for either backend.
+pub fn score_bucket_plans_cap1_dual(
+    backend: &Backend,
+    feature_codes: &[i16],
+    feature1: &[i32],
+    bucket1: &[i16],
+    feature2: &[i32],
+    bucket2: &[i16],
+    feature3: &[i32],
+    bucket3: &[i16],
+    feature4: &[i32],
+    bucket4: &[i16],
+    split_mask: &[u8],
+    ordered_rows: &[i64],
+    decision_time_ms: &[i64],
+    release_time_ms: &[i64],
+    settlement_time_ms: &[i64],
+    valid: &[u8],
+    buy_win: &[u8],
+    sell_win: &[u8],
+    tie: &[u8],
+    candidate_count: i32,
+    row_count: i32,
+    feature_count: i32,
+    expiry_ms: i64,
+    payout_basis: i64,
+) -> Result<Measured<DualScores>, String> {
+    let input = Request {
+        kind: 1,
+        buffers: SearchBuffers {
+            feature_codes,
+            feature_count,
+            row_count,
+            ordered_rows,
+            decision_time_ms,
+            release_time_ms,
+            settlement_time_ms,
+            valid,
+            buy_win,
+            sell_win,
+            tie,
+        },
+        split_mask,
+        candidates: CandidateSlots {
+            features: [feature1, feature2, feature3, feature4],
+            buckets: [bucket1, bucket2, bucket3, bucket4],
+            candidate_count,
+        },
+        sparse: None,
+        expiry_ms,
+        direction_code: 1,
+        payout_basis,
+    };
+    input.validate()?;
+    let result = match backend {
+        Backend::Cpu => crate::cpu(|| input.reference()),
+        #[cfg(feature = "cuda")]
+        Backend::Cuda(device) => device.score(input)?,
+    };
+    Ok(result)
+}
+
+/// Executes `score_bucket_plans_cap1_basic`; input order and dtypes match the native kernel ABI.
+/// Output pointers become owned buffers. Validation runs for either backend.
+pub fn score_bucket_plans_cap1_basic(
+    backend: &Backend,
+    feature_codes: &[i16],
+    feature1: &[i32],
+    bucket1: &[i16],
+    feature2: &[i32],
+    bucket2: &[i16],
+    feature3: &[i32],
+    bucket3: &[i16],
+    feature4: &[i32],
+    bucket4: &[i16],
+    split_mask: &[u8],
+    ordered_rows: &[i64],
+    decision_time_ms: &[i64],
+    release_time_ms: &[i64],
+    valid: &[u8],
+    buy_win: &[u8],
+    sell_win: &[u8],
+    tie: &[u8],
+    candidate_count: i32,
+    row_count: i32,
+    expiry_ms: i64,
+    direction_code: i32,
+    payout_basis: i64,
+) -> Result<Measured<Vec<i64>>, String> {
+    let feature_count = inferred_features(
+        "score_bucket_plans_cap1_basic",
+        feature_codes,
+        row_count,
+        [feature1, feature2, feature3, feature4],
+    )?;
+    let input = Request {
+        kind: 2,
+        buffers: SearchBuffers {
+            feature_codes,
+            feature_count,
+            row_count,
+            ordered_rows,
+            decision_time_ms,
+            release_time_ms,
+            settlement_time_ms: &[],
+            valid,
+            buy_win,
+            sell_win,
+            tie,
+        },
+        split_mask,
+        candidates: CandidateSlots {
+            features: [feature1, feature2, feature3, feature4],
+            buckets: [bucket1, bucket2, bucket3, bucket4],
+            candidate_count,
+        },
+        sparse: None,
+        expiry_ms,
+        direction_code,
+        payout_basis,
+    };
+    input.validate()?;
+    let result = match backend {
+        Backend::Cpu => crate::cpu(|| input.reference()),
+        #[cfg(feature = "cuda")]
+        Backend::Cuda(device) => device.score(input)?,
+    };
+    Ok(Measured {
+        output: result.output.buy_output,
+        timings: result.timings,
+    })
+}
+
+/// Executes `score_bucket_plans_cap1_basic_dual`; input order and dtypes match the native kernel ABI.
+/// Output pointers become owned buffers. Validation runs for either backend.
+pub fn score_bucket_plans_cap1_basic_dual(
+    backend: &Backend,
+    feature_codes: &[i16],
+    feature1: &[i32],
+    bucket1: &[i16],
+    feature2: &[i32],
+    bucket2: &[i16],
+    feature3: &[i32],
+    bucket3: &[i16],
+    feature4: &[i32],
+    bucket4: &[i16],
+    split_mask: &[u8],
+    ordered_rows: &[i64],
+    decision_time_ms: &[i64],
+    release_time_ms: &[i64],
+    valid: &[u8],
+    buy_win: &[u8],
+    sell_win: &[u8],
+    tie: &[u8],
+    candidate_count: i32,
+    row_count: i32,
+    expiry_ms: i64,
+    payout_basis: i64,
+) -> Result<Measured<DualScores>, String> {
+    let feature_count = inferred_features(
+        "score_bucket_plans_cap1_basic_dual",
+        feature_codes,
+        row_count,
+        [feature1, feature2, feature3, feature4],
+    )?;
+    let input = Request {
+        kind: 3,
+        buffers: SearchBuffers {
+            feature_codes,
+            feature_count,
+            row_count,
+            ordered_rows,
+            decision_time_ms,
+            release_time_ms,
+            settlement_time_ms: &[],
+            valid,
+            buy_win,
+            sell_win,
+            tie,
+        },
+        split_mask,
+        candidates: CandidateSlots {
+            features: [feature1, feature2, feature3, feature4],
+            buckets: [bucket1, bucket2, bucket3, bucket4],
+            candidate_count,
+        },
+        sparse: None,
+        expiry_ms,
+        direction_code: 1,
+        payout_basis,
+    };
+    input.validate()?;
+    let result = match backend {
+        Backend::Cpu => crate::cpu(|| input.reference()),
+        #[cfg(feature = "cuda")]
+        Backend::Cuda(device) => device.score(input)?,
+    };
+    Ok(result)
+}
+
+/// Executes `score_bucket_plans_cap1_sparse`; input order and dtypes match the native kernel ABI.
+/// Output pointers become owned buffers. Validation runs for either backend.
+pub fn score_bucket_plans_cap1_sparse(
+    backend: &Backend,
+    feature_codes: &[i16],
+    feature1: &[i32],
+    bucket1: &[i16],
+    feature2: &[i32],
+    bucket2: &[i16],
+    feature3: &[i32],
+    bucket3: &[i16],
+    feature4: &[i32],
+    bucket4: &[i16],
+    candidate_driver_key: &[i32],
+    key_chrono_offsets: &[i32],
+    key_chrono_rows: &[i32],
+    split_mask: &[u8],
+    decision_time_ms: &[i64],
+    release_time_ms: &[i64],
+    settlement_time_ms: &[i64],
+    valid: &[u8],
+    buy_win: &[u8],
+    sell_win: &[u8],
+    tie: &[u8],
+    candidate_count: i32,
+    row_count: i32,
+    expiry_ms: i64,
+    direction_code: i32,
+    payout_basis: i64,
+) -> Result<Measured<Vec<i64>>, String> {
+    let feature_count = inferred_features(
+        "score_bucket_plans_cap1_sparse",
+        feature_codes,
+        row_count,
+        [feature1, feature2, feature3, feature4],
+    )?;
+    let input = Request {
+        kind: 4,
+        buffers: SearchBuffers {
+            feature_codes,
+            feature_count,
+            row_count,
+            ordered_rows: &[],
+            decision_time_ms,
+            release_time_ms,
+            settlement_time_ms,
+            valid,
+            buy_win,
+            sell_win,
+            tie,
+        },
+        split_mask,
+        candidates: CandidateSlots {
+            features: [feature1, feature2, feature3, feature4],
+            buckets: [bucket1, bucket2, bucket3, bucket4],
+            candidate_count,
+        },
+        sparse: Some(SparseIndex {
+            candidate_driver_key,
+            key_chrono_offsets,
+            key_chrono_rows,
+        }),
+        expiry_ms,
+        direction_code,
+        payout_basis,
+    };
+    input.validate()?;
+    let result = match backend {
+        Backend::Cpu => crate::cpu(|| input.reference()),
+        #[cfg(feature = "cuda")]
+        Backend::Cuda(device) => device.score(input)?,
+    };
+    Ok(Measured {
+        output: result.output.buy_output,
+        timings: result.timings,
+    })
+}
+
+/// Executes `score_bucket_plans_cap1_basic_sparse`; input order and dtypes match the native kernel ABI.
+/// Output pointers become owned buffers. Validation runs for either backend.
+pub fn score_bucket_plans_cap1_basic_sparse(
+    backend: &Backend,
+    feature_codes: &[i16],
+    feature1: &[i32],
+    bucket1: &[i16],
+    feature2: &[i32],
+    bucket2: &[i16],
+    feature3: &[i32],
+    bucket3: &[i16],
+    feature4: &[i32],
+    bucket4: &[i16],
+    candidate_driver_key: &[i32],
+    key_chrono_offsets: &[i32],
+    key_chrono_rows: &[i32],
+    split_mask: &[u8],
+    decision_time_ms: &[i64],
+    release_time_ms: &[i64],
+    valid: &[u8],
+    buy_win: &[u8],
+    sell_win: &[u8],
+    tie: &[u8],
+    candidate_count: i32,
+    row_count: i32,
+    expiry_ms: i64,
+    direction_code: i32,
+    payout_basis: i64,
+) -> Result<Measured<Vec<i64>>, String> {
+    let feature_count = inferred_features(
+        "score_bucket_plans_cap1_basic_sparse",
+        feature_codes,
+        row_count,
+        [feature1, feature2, feature3, feature4],
+    )?;
+    let input = Request {
+        kind: 5,
+        buffers: SearchBuffers {
+            feature_codes,
+            feature_count,
+            row_count,
+            ordered_rows: &[],
+            decision_time_ms,
+            release_time_ms,
+            settlement_time_ms: &[],
+            valid,
+            buy_win,
+            sell_win,
+            tie,
+        },
+        split_mask,
+        candidates: CandidateSlots {
+            features: [feature1, feature2, feature3, feature4],
+            buckets: [bucket1, bucket2, bucket3, bucket4],
+            candidate_count,
+        },
+        sparse: Some(SparseIndex {
+            candidate_driver_key,
+            key_chrono_offsets,
+            key_chrono_rows,
+        }),
+        expiry_ms,
+        direction_code,
+        payout_basis,
+    };
+    input.validate()?;
+    let result = match backend {
+        Backend::Cpu => crate::cpu(|| input.reference()),
+        #[cfg(feature = "cuda")]
+        Backend::Cuda(device) => device.score(input)?,
+    };
+    Ok(Measured {
+        output: result.output.buy_output,
+        timings: result.timings,
+    })
+}
+
+/// Executes `score_bucket_plans_cap1_sparse_dual`; input order and dtypes match the native kernel ABI.
+/// Output pointers become owned buffers. Validation runs for either backend.
+pub fn score_bucket_plans_cap1_sparse_dual(
+    backend: &Backend,
+    feature_codes: &[i16],
+    feature1: &[i32],
+    bucket1: &[i16],
+    feature2: &[i32],
+    bucket2: &[i16],
+    feature3: &[i32],
+    bucket3: &[i16],
+    feature4: &[i32],
+    bucket4: &[i16],
+    candidate_driver_key: &[i32],
+    key_chrono_offsets: &[i32],
+    key_chrono_rows: &[i32],
+    split_mask: &[u8],
+    decision_time_ms: &[i64],
+    release_time_ms: &[i64],
+    settlement_time_ms: &[i64],
+    valid: &[u8],
+    buy_win: &[u8],
+    sell_win: &[u8],
+    tie: &[u8],
+    candidate_count: i32,
+    row_count: i32,
+    expiry_ms: i64,
+    payout_basis: i64,
+) -> Result<Measured<DualScores>, String> {
+    let feature_count = inferred_features(
+        "score_bucket_plans_cap1_sparse_dual",
+        feature_codes,
+        row_count,
+        [feature1, feature2, feature3, feature4],
+    )?;
+    let input = Request {
+        kind: 6,
+        buffers: SearchBuffers {
+            feature_codes,
+            feature_count,
+            row_count,
+            ordered_rows: &[],
+            decision_time_ms,
+            release_time_ms,
+            settlement_time_ms,
+            valid,
+            buy_win,
+            sell_win,
+            tie,
+        },
+        split_mask,
+        candidates: CandidateSlots {
+            features: [feature1, feature2, feature3, feature4],
+            buckets: [bucket1, bucket2, bucket3, bucket4],
+            candidate_count,
+        },
+        sparse: Some(SparseIndex {
+            candidate_driver_key,
+            key_chrono_offsets,
+            key_chrono_rows,
+        }),
+        expiry_ms,
+        direction_code: 1,
+        payout_basis,
+    };
+    input.validate()?;
+    let result = match backend {
+        Backend::Cpu => crate::cpu(|| input.reference()),
+        #[cfg(feature = "cuda")]
+        Backend::Cuda(device) => device.score(input)?,
+    };
+    Ok(result)
+}
+
+/// Executes `score_bucket_plans_cap1_basic_sparse_dual`; input order and dtypes match the native kernel ABI.
+/// Output pointers become owned buffers. Validation runs for either backend.
+pub fn score_bucket_plans_cap1_basic_sparse_dual(
+    backend: &Backend,
+    feature_codes: &[i16],
+    feature1: &[i32],
+    bucket1: &[i16],
+    feature2: &[i32],
+    bucket2: &[i16],
+    feature3: &[i32],
+    bucket3: &[i16],
+    feature4: &[i32],
+    bucket4: &[i16],
+    candidate_driver_key: &[i32],
+    key_chrono_offsets: &[i32],
+    key_chrono_rows: &[i32],
+    split_mask: &[u8],
+    decision_time_ms: &[i64],
+    release_time_ms: &[i64],
+    valid: &[u8],
+    buy_win: &[u8],
+    sell_win: &[u8],
+    tie: &[u8],
+    candidate_count: i32,
+    row_count: i32,
+    expiry_ms: i64,
+    payout_basis: i64,
+) -> Result<Measured<DualScores>, String> {
+    let feature_count = inferred_features(
+        "score_bucket_plans_cap1_basic_sparse_dual",
+        feature_codes,
+        row_count,
+        [feature1, feature2, feature3, feature4],
+    )?;
+    let input = Request {
+        kind: 7,
+        buffers: SearchBuffers {
+            feature_codes,
+            feature_count,
+            row_count,
+            ordered_rows: &[],
+            decision_time_ms,
+            release_time_ms,
+            settlement_time_ms: &[],
+            valid,
+            buy_win,
+            sell_win,
+            tie,
+        },
+        split_mask,
+        candidates: CandidateSlots {
+            features: [feature1, feature2, feature3, feature4],
+            buckets: [bucket1, bucket2, bucket3, bucket4],
+            candidate_count,
+        },
+        sparse: Some(SparseIndex {
+            candidate_driver_key,
+            key_chrono_offsets,
+            key_chrono_rows,
+        }),
+        expiry_ms,
+        direction_code: 1,
+        payout_basis,
+    };
+    input.validate()?;
+    let result = match backend {
+        Backend::Cpu => crate::cpu(|| input.reference()),
+        #[cfg(feature = "cuda")]
+        Backend::Cuda(device) => device.score(input)?,
+    };
+    Ok(result)
+}
+
+/// Executes `reconstruct_signal_masks_cap1`; input order and dtypes match the native kernel ABI.
+/// Output pointers become owned buffers. Validation runs for either backend.
+pub fn reconstruct_signal_masks_cap1(
+    backend: &Backend,
+    feature_codes: &[i16],
+    feature1: &[i32],
+    bucket1: &[i16],
+    feature2: &[i32],
+    bucket2: &[i16],
+    feature3: &[i32],
+    bucket3: &[i16],
+    feature4: &[i32],
+    bucket4: &[i16],
+    split_mask: &[u8],
+    ordered_rows: &[i64],
+    decision_time_ms: &[i64],
+    release_time_ms: &[i64],
+    candidate_count: i32,
+    row_count: i32,
+    expiry_ms: i64,
+) -> Result<Measured<Vec<u8>>, String> {
+    let feature_count = inferred_features(
+        "reconstruct_signal_masks_cap1",
+        feature_codes,
+        row_count,
+        [feature1, feature2, feature3, feature4],
+    )?;
+    let input = Request {
+        kind: 8,
+        buffers: SearchBuffers {
+            feature_codes,
+            feature_count,
+            row_count,
+            ordered_rows,
+            decision_time_ms,
+            release_time_ms,
+            settlement_time_ms: &[],
+            valid: &[],
+            buy_win: &[],
+            sell_win: &[],
+            tie: &[],
+        },
+        split_mask,
+        candidates: CandidateSlots {
+            features: [feature1, feature2, feature3, feature4],
+            buckets: [bucket1, bucket2, bucket3, bucket4],
+            candidate_count,
+        },
+        sparse: None,
+        expiry_ms,
+        direction_code: 1,
+        payout_basis: 0,
+    };
+    input.validate()?;
+    let result = match backend {
+        Backend::Cpu => crate::cpu(|| input.reconstruct()),
+        #[cfg(feature = "cuda")]
+        Backend::Cuda(device) => device.reconstruct(input)?,
+    };
+    Ok(result)
+}

@@ -8,7 +8,11 @@ edition.workspace = true
 name = "binary-alpha"
 path = "src/main.rs"
 
+[features]
+cuda = ["binary-alpha-accelerator/cuda"]
+
 [dependencies]
+binary-alpha-accelerator = { path = "../accelerator" }
 binary-alpha-engine = { path = "../engine" }
 clap.workspace = true
 google-cloud-storage.workspace = true

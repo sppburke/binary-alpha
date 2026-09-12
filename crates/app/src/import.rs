@@ -8,7 +8,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-use binary_alpha_engine::config::{Config, PublicationUri, Source, relative_path};
+use binary_alpha_engine::config::{PublicationUri, Source, relative_path};
 use binary_alpha_engine::dataset::{
     Capability, Coverage, DatasetRole, GenerationManifest, Input, IntervalContract,
     MANIFEST_SCHEMA_VERSION, NativeGranularity, ObjectRecord, ObjectRole, PriceRepresentation,
@@ -85,9 +85,7 @@ struct Dataset {
 /// Runs the import described by the configuration at `config_path`, writing one report line to
 /// `out` as each dataset is published.
 pub fn run(config_path: &Path, out: &mut dyn Write) -> Result<(), String> {
-    let text = fs::read_to_string(config_path)
-        .map_err(|error| format!("cannot read {}: {error}", config_path.display()))?;
-    let config = Config::parse(&text).map_err(|error| error.to_string())?;
+    let config = crate::load_config(config_path)?;
     let base = config_path.parent().unwrap_or(Path::new("."));
     let sources = config
         .import

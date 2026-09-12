@@ -39,6 +39,8 @@ pub struct Config {
     pub outcomes: Option<Outcomes>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub replay: Option<Replay>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub accelerator: Option<Accelerator>,
 }
 
 impl Config {
@@ -948,6 +950,22 @@ impl Replay {
     /// The rules a single field's deserializer cannot see; an error names the field.
     pub fn validate(&self) -> Result<(), String> {
         crate::execution::validate(self)
+    }
+}
+
+/// Explicit offline accelerator selection. Absence preserves existing configuration identity.
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct Accelerator {
+    /// The requested execution backend; application loading checks build availability.
+    pub backend: Backend,
+}
+
+crate::string_enum! {
+    /// Offline accelerator backend.
+    Backend "accelerator backend" {
+        Cpu => "cpu",
+        Cuda => "cuda",
     }
 }
 
@@ -2054,5 +2072,30 @@ mod replay_tests {
             Config::parse(&distinct).is_ok(),
             "another envelope is another deployment strategy"
         );
+    }
+}
+
+#[cfg(test)]
+mod accelerator_tests {
+    use super::*;
+
+    const HEAD: &str = "schema_version = 1\nrun_mode = \"research\"\n\n[storage]\nhistorical_data_dir = \"h\"\npublication_uri = \"file:///p\"\n";
+
+    #[test]
+    fn accelerators_round_trip_and_absence_preserves_the_previous_hash() {
+        for backend in ["cpu", "cuda"] {
+            let source = format!("{HEAD}\n[accelerator]\nbackend = \"{backend}\"\n");
+            let config = Config::parse(&source).unwrap();
+            assert_eq!(config.canonical_toml(), source);
+            assert_eq!(Config::parse(&config.canonical_toml()).unwrap(), config);
+        }
+        assert_eq!(
+            Config::parse(HEAD).unwrap().content_hash(),
+            "v3:sha256:d7be0fdf6fb030fdfaa543417aad386f84bdb7e06ff06a61ae5646ca8e7c1256",
+            "a document omitting accelerator keeps the previous identity"
+        );
+        for section in ["backend = \"automatic\"", "backend = \"cpu\"\nordinal = 0"] {
+            assert!(Config::parse(&format!("{HEAD}\n[accelerator]\n{section}\n")).is_err());
+        }
     }
 }

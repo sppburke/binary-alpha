@@ -112,6 +112,7 @@ and content hash; the application package owns reading it from a path.
 | `instruments` | array of tables | optional; consumed only by `data audit`, which requires the entry that maps the audited generation |
 | `features.instruments` | array of tables | optional; consumed only by `features build`, which requires at least one entry |
 | `outcomes` | table | optional; consumed only by `outcomes build`, which requires it |
+| `accelerator.backend` | string | optional section; explicit offline backend `cpu` or `cuda` |
 
 Every `import.sources` entry declares `kind`, `path` (a relative path resolves against the
 configuration file's directory), `broker`, and `role` (`development` or `evaluation`; `holdout` is
@@ -175,8 +176,16 @@ output. Section [feature plans](#feature-plans) gives the resolution rules.
 
 Section [outcomes](#outcomes) gives the fields of the `outcomes` table.
 
+The optional `accelerator` table declares `backend` (`cpu` or `cuda`) and rejects
+unknown fields. It follows `replay` in canonical order. Every application command
+loading a configuration rejects `cuda` when built without the `cuda` feature.
+There is no implicit device fallback. Omitting the section preserves the previous
+configuration hash. This offline selection does not change Engine execution;
+accelerator results have no production consumer in this phase.
+
 Every field is required and has no default, except that the `import` table, the `provenance`
-list, the `instruments` list, the `features` table, the `outcomes` table, and the optional
+list, the `instruments` list, the `features` table, the `outcomes` table, the `accelerator`
+table, and the optional
 instrument and feature fields named above may be absent. Any
 other field is rejected as unknown, so a raw secret value has no place to live. Validation opens
 no source or destination and mutates nothing.
