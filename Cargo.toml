@@ -1,12 +1,13 @@
 [workspace]
 resolver = "3"
-members = ["crates/engine", "crates/app"]
+members = ["crates/engine", "crates/app", "crates/accelerator"]
 
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
 
 [workspace.dependencies]
+cudarc = { version = "0.19.9", default-features = false, features = ["std", "driver", "dynamic-loading", "cuda-13000", "nvrtc"] }
 clap = { version = "4.6.6", default-features = false, features = ["std", "derive", "help", "usage", "error-context"] }
 google-cloud-storage = "1.18.0"
 parquet = { version = "59.3.0", default-features = false, features = ["snap", "zstd"] }

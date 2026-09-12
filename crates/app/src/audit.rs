@@ -7,7 +7,6 @@ use std::io::Write;
 use std::path::Path;
 use std::time::Instant;
 
-use binary_alpha_engine::config::Config;
 use binary_alpha_engine::dataset::{
     DatasetRole, GenerationManifest, ObjectRecord, ObjectRole, PriceRepresentation, SourceKind,
     manifest_key,
@@ -26,9 +25,7 @@ use crate::verify;
 /// Runs the audit of the generation whose ready manifest is at `uri` under the configuration at
 /// `config_path`, writing one report line to `out`.
 pub fn run(config_path: &Path, uri: &str, out: &mut dyn Write) -> Result<(), String> {
-    let text = fs::read_to_string(config_path)
-        .map_err(|error| format!("cannot read {}: {error}", config_path.display()))?;
-    let config = Config::parse(&text).map_err(|error| error.to_string())?;
+    let config = crate::load_config(config_path)?;
     let base = config_path.parent().unwrap_or(Path::new("."));
     let historical_dir = base.join(config.storage.historical_data_dir.as_path());
     let (source_store, source_key) = verify::open(uri)?;

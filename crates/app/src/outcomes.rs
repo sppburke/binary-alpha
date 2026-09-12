@@ -42,9 +42,7 @@ const CHUNK_ROWS: usize = 1 << 12;
 
 /// Runs the configured outcome build, writing its report and reconstruction lines to `out`.
 pub fn run(config_path: &Path, out: &mut dyn Write) -> Result<(), String> {
-    let text = fs::read_to_string(config_path)
-        .map_err(|error| format!("cannot read {}: {error}", config_path.display()))?;
-    let config = Config::parse(&text).map_err(|error| error.to_string())?;
+    let config = crate::load_config(config_path)?;
     if config.run_mode != RunMode::Research {
         return Err(format!(
             "run_mode: an outcome build is research, not `{}`",

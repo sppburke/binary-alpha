@@ -95,6 +95,24 @@ least-privilege identity that can read and create objects but not create or dele
 the application; then run the import above. Rollback reverts the application and configuration
 change; source files, the retained copy, and published generations stay intact.
 
+## Offline NVIDIA runner
+
+Issue [#8](https://github.com/sppburke/binary-alpha/issues/8) authorized the offline compiler setup
+and build-runner registration on the existing `quantum` machine. Runner
+`binary-alpha-cuda-quantum`, actions/runner `2.337.0`, was registered on 2026-09-11 to this repository
+only, outside the source checkout. This made no production or cloud change and did not change the
+driver. The normal runner process executes `.github/workflows/cuda.yml`; no service-manager or
+container setup is required. The pinned toolkit, driver compatibility, and required
+`BINARY_ALPHA_NVCC`, `BINARY_ALPHA_TEST_CONFIG`, and `BINARY_ALPHA_CUDA_REFERENCE` environment
+variables are recorded in [README.md](../README.md). Verify that this runner identity is online
+before dispatching the governed proof. The workflow reads the immutable attempt-2 reference and
+never recaptures expected results.
+
+Runner rollback stops and unregisters only `binary-alpha-cuda-quantum`; keep the existing driver
+and unrelated machine setup. Accelerator rollback selects the explicit central-processor backend
+and reverts the accelerator change while preserving completed evidence. Production operator tasks:
+none. Linked matching Sentry issues: none.
+
 ## Regions
 
 Create nothing in a region whose name begins `us-west`. This applies to every bucket, database,

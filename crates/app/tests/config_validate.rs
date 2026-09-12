@@ -163,3 +163,22 @@ fn invalid_documents_fail_with_field_specific_errors() {
         assert!(stderr.contains(message), "{name}: {stderr}");
     }
 }
+
+#[test]
+fn cuda_configuration_requires_the_build_feature() {
+    let output = validate(&fixture("accelerator_cuda.toml"));
+    assert_eq!(output.status.success(), cfg!(feature = "cuda"));
+    if cfg!(feature = "cuda") {
+        assert!(output.stderr.is_empty());
+        assert!(
+            String::from_utf8(output.stdout)
+                .unwrap()
+                .contains("[accelerator]")
+        );
+    } else {
+        assert_eq!(output.status.code(), Some(1));
+        assert!(output.stdout.is_empty());
+        assert!(String::from_utf8(output.stderr).unwrap().contains(
+            "accelerator.backend: `cuda` requested but this binary was built without the `cuda` feature"));
+    }
+}

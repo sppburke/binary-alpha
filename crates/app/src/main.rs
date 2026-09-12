@@ -153,12 +153,26 @@ fn main() -> ExitCode {
 }
 
 fn validate(path: &Path) -> Result<String, String> {
-    let source = std::fs::read_to_string(path)
-        .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
-    let config = Config::parse(&source).map_err(|error| error.to_string())?;
+    let config = load_config(path)?;
     Ok(format!(
         "# content-hash: {}\n{}",
         config.content_hash(),
         config.canonical_toml()
     ))
+}
+
+/// All configuration-path commands share parsing and build-capability checks.
+fn load_config(path: &Path) -> Result<Config, String> {
+    let source = std::fs::read_to_string(path)
+        .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
+    let config = Config::parse(&source).map_err(|error| error.to_string())?;
+    if !cfg!(feature = "cuda")
+        && config
+            .accelerator
+            .as_ref()
+            .is_some_and(|section| section.backend == binary_alpha_engine::config::Backend::Cuda)
+    {
+        return Err("accelerator.backend: `cuda` requested but this binary was built without the `cuda` feature".into());
+    }
+    Ok(config)
 }

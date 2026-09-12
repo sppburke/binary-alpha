@@ -1,8 +1,8 @@
 # Binary Alpha
 
 Binary Alpha is a Linux-first, configuration-driven binary-options research and execution system
-written in Rust. Its core is broker-, instrument-, strategy-, account-, and currency-neutral. Broker
-access uses only authorized application programming interfaces and WebSockets; no browser,
+written in Rust, with an optional NVIDIA CUDA accelerator for offline kernel operations. Its core
+is broker-, instrument-, strategy-, account-, and currency-neutral. Broker access uses only authorized application programming interfaces and WebSockets; no browser,
 Document Object Model, Chrome DevTools Protocol, profile, cookie, or click-execution path exists.
 
 ## Modes
@@ -13,14 +13,17 @@ imports existing historical data into immutable published generations, audits ea
 generation through its configured instrument stream into a profile and finalized causal candles,
 builds feature and future-only outcome generations, replays governed historical inputs through the
 one execution engine into a reconstructable financial ledger, and verifies every kind of
-generation; it executes no live, paper, or broker mode. Browser-driven operation, click execution, and any live, paper, certification, deployment,
-or production action without its own authorization are unsupported.
+generation. The accelerator supplies thirteen retained device kernels and their deterministic
+central-processor references; it has no production consumer. The checkout executes no live, paper,
+or broker mode. Browser-driven operation, click execution, and any live, paper, certification,
+deployment, or production action without its own authorization are unsupported.
 
 ## Build and entry points
 
 ```sh
 rustup toolchain install        # installs the toolchain pinned in rust-toolchain.toml with rustfmt and clippy
 cargo build --workspace --locked
+BINARY_ALPHA_NVCC=/home/sean/.local/cuda/13.4.1/bin/nvcc BINARY_ALPHA_HOST_COMPILER=/usr/bin/gcc cargo build --workspace --locked --features binary-alpha-app/cuda
 cargo run --locked -p binary-alpha-app -- --help
 cargo run --locked -p binary-alpha-app -- config validate --config configs/example.toml
 cargo run --release --locked -p binary-alpha-app -- data import --config PATH
@@ -29,6 +32,8 @@ cargo run --release --locked -p binary-alpha-app -- data verify --manifest URI
 cargo run --release --locked -p binary-alpha-app -- features build --config PATH
 cargo run --release --locked -p binary-alpha-app -- outcomes build --config PATH
 cargo run --release --locked -p binary-alpha-app -- replay --config PATH
+BINARY_ALPHA_TEST_CONFIG=PATH BINARY_ALPHA_CUDA_REFERENCE_OUTPUT=NEW_DIRECTORY cargo test --release --locked -p binary-alpha-app --features cuda --test phase07_cuda_parity capture_legacy_reference -- --exact --ignored --nocapture
+BINARY_ALPHA_TEST_CONFIG=PATH BINARY_ALPHA_CUDA_REFERENCE=MANIFEST cargo test --release --locked -p binary-alpha-app --features cuda --test phase07_cuda_parity governed_parity -- --exact --ignored --nocapture
 ```
 
 `binary-alpha config validate --config PATH` prints the content hash and the canonical document to
@@ -59,12 +64,29 @@ where `PATH` names the research configuration and the reference root; the outcom
 with the same document shape; the engine proof is
 `BINARY_ALPHA_TEST_CONFIG=PATH cargo test --locked -p binary-alpha-app --test phase06_engine_parity -- --ignored --nocapture`
 with the same document shape, comparing every reference disposition, outcome, and path with the
-frozen candidate mapping.
+frozen candidate mapping. The accelerator proof uses the same governed wrapper, with eight
+`legacy_sources: [{label, path}]` entries whose absolute paths resolve the pinned
+[fixture sources](crates/accelerator/kernels/SOURCES.md#fixture-provenance-labels), and the immutable
+manifest named by `BINARY_ALPHA_CUDA_REFERENCE`. The capture command creates a fresh reference and
+never replaces the acceptance reference captured at extraction commit `151ba60`; final parity
+reads that reference through the four-slot fixture adapter. Neither command opens holdout data.
 Verification runs `cargo fmt --all --check`,
-`cargo clippy --workspace --all-targets --all-features --locked -- -D warnings`,
-`cargo test --workspace --all-features --locked`, and `cargo build --workspace --locked`; the
-workflow in `.github/workflows/ci.yml` runs the same commands plus the validation of
-`configs/example.toml`.
+`cargo clippy --workspace --all-targets --locked -- -D warnings`,
+`cargo test --workspace --locked`, and `cargo build --workspace --locked`; the
+ordinary workflow in `.github/workflows/ci.yml` runs the default feature set and validates
+`configs/example.toml`. The separate `.github/workflows/cuda.yml` runs the CUDA-enabled locked
+build, static analysis, device tests, and governed parity on the registered NVIDIA runner.
+
+The repository-only runner `binary-alpha-cuda-quantum` uses actions/runner `2.337.0` on `quantum`
+with labels `self-hosted`, `linux`, `x64`, and `binary-alpha-cuda-quantum`. The workflow supplies
+`BINARY_ALPHA_NVCC=/home/sean/.local/cuda/13.4.1/bin/nvcc`,
+`BINARY_ALPHA_HOST_COMPILER=/usr/bin/gcc`,
+`BINARY_ALPHA_TEST_CONFIG=/mnt/data/issue-7-scratch/phase06_test_config.json`, and
+`BINARY_ALPHA_CUDA_REFERENCE=/mnt/data/binary-alpha-phase07-reference/attempt2/reference.json`.
+For manual runs, export the same variables in the runner process environment; the governed wrapper
+must resolve its existing development inputs and reference files. `BINARY_ALPHA_CUDA_ARCH` is
+optional and defaults to the proved `sm_120` target. The workflow never regenerates expectations.
+The authorized offline setup and runner rollback are recorded in [operations](docs/operations.md).
 
 ## Layout
 
@@ -72,6 +94,7 @@ workflow in `.github/workflows/ci.yml` runs the same commands plus the validatio
 | --- | --- |
 | `crates/engine` | Package `binary-alpha-engine`: configuration validation and identity, immutable tick and bar records, dataset roles and capabilities, generation identity, ready manifests, the instrument stream with its profile, candles, and stream manifest, the feature engine and frozen plans, future-only outcome labels, and the execution engine with exact money, its ledger, and its summaries. No files, network, cloud, broker, command-line, or device calls. |
 | `crates/app` | Package `binary-alpha-app`: the `binary-alpha` executable, configuration loading, historical-data import, instrument audit, feature and outcome builds, replay, verification, Parquet input and output, the filesystem and Google Cloud Storage artifact stores, and all other external adapters. |
+| `crates/accelerator` | Package `binary-alpha-accelerator`: the thirteen retained device kernels, the ahead-of-time CUDA build behind the `cuda` feature, the device host over cudarc, and the central-processor reference of every kernel. No engine or application dependency. |
 | `configs/example.toml` | The checked-in example configuration; it contains only implemented fields, one instrument, and no credentials. |
 | `docs/` | [architecture](docs/architecture.md), [contracts](docs/contracts.md), [migration map](docs/migration-map.md), and [operations](docs/operations.md). |
 
@@ -91,6 +114,22 @@ records the exact direct and transitive resolution. Builds and verification use 
 selections, never floating channels or automatic upgrades. The phase that adds a device toolchain
 pins it under the same policy. This policy changes compiler and library selections only, never pinned
 source revisions, dataset identities, broker schemas, or completed evidence.
+
+The device toolchain lookup on 2026-09-11 selected the newest stable CUDA toolkit redistributable,
+`13.4.1` (released 2026-09-09), with nvcc `13.4.59`, from the
+[NVIDIA redistributable index](https://developer.download.nvidia.com/compute/cuda/redist/), and
+host compiler gcc `13.3.0`. The CUDA workflow pins and verifies both nvcc `13.4.59`
+and gcc `13.3.0`; the build passes the exact `BINARY_ALPHA_HOST_COMPILER` path to
+nvcc with `-ccbin` and records both compiler versions in the embedded `module.json`.
+When the host path is unset, provenance records the default `gcc` version.
+The manifest and lockfile pin cudarc `0.19.9`, the newest stable release
+at that lookup, published 2026-08-11 on [crates.io](https://crates.io/crates/cudarc/0.19.9).
+The driver-API feature is `cuda-13000`: runner driver `580.173.02` exposes driver API `13.0`, and
+cudarc `0.19.9` has no `cuda-13040` feature. This compatibility exception selects the driver's
+interface independently of the compiler; the compiled `sm_120` native binaries were proved to
+load on that driver. cudarc uses `std`, `driver`, `dynamic-loading`, and `nvrtc` with default
+features disabled. The `nvrtc` feature exposes its safe precompiled-binary loader; runtime
+compilation is not used. Build flags retain `--std=c++11` without fast math.
 
 ## Roadmap
 
