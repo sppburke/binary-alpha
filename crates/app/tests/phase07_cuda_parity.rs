@@ -260,6 +260,129 @@ fn fixture() -> Value {
     )
 }
 
+/// Hash only explicitly configured source files; paths never enter manifests or receipts.
+fn legacy_sources(wrapper: &Value) -> Value {
+    let mut files = BTreeMap::new();
+    for source in wrapper["legacy_sources"]
+        .as_array()
+        .expect("legacy_sources array is required")
+    {
+        let label = source["label"].as_str().expect("source label is required");
+        let path = Path::new(source["path"].as_str().expect("source path is required"));
+        assert!(
+            path.is_absolute(),
+            "legacy source {label} requires an absolute path"
+        );
+        assert!(
+            files.insert(label, common::sha256(path)).is_none(),
+            "duplicate legacy source label {label}"
+        );
+    }
+    assert_eq!(
+        files.keys().copied().collect::<BTreeSet<_>>(),
+        BTreeSet::from([
+            "search_kernels",
+            "bootstrap_kernel",
+            "portfolio_kernels",
+            "repair_kernel",
+            "search_tests",
+            "bootstrap_tests",
+            "repair_tests",
+            "portfolio_tests",
+        ]),
+        "legacy source labels must match the pinned citation inventory"
+    );
+    json!(files)
+}
+
+/// The accepted extraction used path keys; only digest values bind the same source set.
+fn source_digest_set(sources: &Value) -> BTreeSet<&str> {
+    sources
+        .as_object()
+        .expect("legacy source digest map")
+        .values()
+        .map(|v| v.as_str().expect("legacy source SHA-256 string"))
+        .collect()
+}
+
+/// A later capture reports its relation to the accepted pin without replacing it.
+fn pin_reference(path: &Path, pin: &Value) {
+    use std::io::Write;
+    match std::fs::File::create_new(path) {
+        Ok(mut file) => {
+            file.write_all(&json_bytes(pin)).unwrap();
+            file.sync_all().unwrap();
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            let pinned = common::manifest_json(path);
+            println!(
+                "capture identity {} {} pinned identity {}; existing pin left untouched",
+                pin["reference_identity"].as_str().unwrap(),
+                if pin["reference_identity"] == pinned["reference_identity"] {
+                    "equals"
+                } else {
+                    "differs from"
+                },
+                pinned["reference_identity"].as_str().unwrap()
+            );
+        }
+        Err(error) => panic!("{}: {error}", path.display()),
+    }
+}
+fn json_bytes(v: &Value) -> Vec<u8> {
+    let mut bytes = serde_json::to_vec_pretty(v).unwrap();
+    bytes.push(b'\n');
+    bytes
+}
+
+#[test]
+fn source_provenance_and_capture_pin() {
+    let scratch = common::Scratch::new("phase07-provenance");
+    let mut entries = Vec::new();
+    for label in fixture()["legacy_source_digests"]
+        .as_object()
+        .unwrap()
+        .keys()
+    {
+        let path = scratch.path(label);
+        std::fs::write(&path, label).unwrap();
+        entries.push(json!({"label":label,"path":path}));
+    }
+    let sources = legacy_sources(&json!({"legacy_sources":entries}));
+    let mut old_keys = serde_json::Map::new();
+    for entry in &entries {
+        old_keys.insert(
+            entry["path"].as_str().unwrap().into(),
+            sources[entry["label"].as_str().unwrap()].clone(),
+        );
+    }
+    assert_eq!(
+        source_digest_set(&Value::Object(old_keys)),
+        source_digest_set(&sources)
+    );
+    assert!(
+        sources
+            .as_object()
+            .unwrap()
+            .keys()
+            .all(|label| !label.contains('/'))
+    );
+    std::fs::write(entries[0]["path"].as_str().unwrap(), "changed source").unwrap();
+    assert_ne!(
+        source_digest_set(&sources),
+        source_digest_set(&legacy_sources(&json!({"legacy_sources":entries})))
+    );
+
+    let path = scratch.path("pin.json");
+    let accepted = json!({"reference_identity":"accepted","kernel_source_sha256":"extraction"});
+    pin_reference(&path, &accepted);
+    let bytes = std::fs::read(&path).unwrap();
+    let later = json!({"reference_identity":"later","kernel_source_sha256":"flattened"});
+    pin_reference(&path, &later);
+    assert_eq!(std::fs::read(&path).unwrap(), bytes);
+    assert_eq!(common::manifest_json(&path), accepted);
+}
+
 /// Compact scalar arguments are JSON integers; their widths belong to the ABI.
 fn fixture_argument(name: &str, value: &Value) -> Buffer {
     if value.is_object() {
@@ -827,26 +950,18 @@ fn run(backend: &Backend, case: &Case) -> KernelRun {
     }
 }
 
-/// Launch on a resident workspace so all variants reuse the shared feature/outcome/mask buffers.
+/// Borrow one resident candidate chunk for every variant that uses its exact inputs.
 #[cfg(feature = "cuda")]
 fn run_resident(
-    workspace: &binary_alpha_accelerator::cuda::ResidentSearch<'_>,
+    chunk: &binary_alpha_accelerator::cuda::ResidentChunk<'_, '_>,
     case: &Case,
 ) -> KernelRun {
     let b = &case.inputs;
-    let (condition_feature, condition_bucket, candidate_offsets) = legacy_conditions(b);
-    let candidates = search::CandidateConditions {
-        condition_feature: &condition_feature,
-        condition_bucket: &condition_bucket,
-        candidate_offsets: &candidate_offsets,
-        candidate_count: b["candidate_count"].i32s()[0],
-    };
     match case.symbol.as_str() {
         "score_bucket_plans_cap1" => outputs(
             case,
-            workspace
+            chunk
                 .score_bucket_plans_cap1(
-                    candidates,
                     0,
                     b["expiry_ms"].i64s()[0],
                     b["direction_code"].i32s()[0],
@@ -857,9 +972,8 @@ fn run_resident(
         ),
         "score_bucket_plans_cap1_dual" => outputs(
             case,
-            workspace
+            chunk
                 .score_bucket_plans_cap1_dual(
-                    candidates,
                     0,
                     b["expiry_ms"].i64s()[0],
                     b["payout_basis"].i64s()[0],
@@ -874,9 +988,8 @@ fn run_resident(
         ),
         "score_bucket_plans_cap1_basic" => outputs(
             case,
-            workspace
+            chunk
                 .score_bucket_plans_cap1_basic(
-                    candidates,
                     0,
                     b["expiry_ms"].i64s()[0],
                     b["direction_code"].i32s()[0],
@@ -887,9 +1000,8 @@ fn run_resident(
         ),
         "score_bucket_plans_cap1_basic_dual" => outputs(
             case,
-            workspace
+            chunk
                 .score_bucket_plans_cap1_basic_dual(
-                    candidates,
                     0,
                     b["expiry_ms"].i64s()[0],
                     b["payout_basis"].i64s()[0],
@@ -904,11 +1016,9 @@ fn run_resident(
         ),
         "score_bucket_plans_cap1_sparse" => outputs(
             case,
-            workspace
+            chunk
                 .score_bucket_plans_cap1_sparse(
-                    candidates,
                     0,
-                    sparse(b),
                     b["expiry_ms"].i64s()[0],
                     b["direction_code"].i32s()[0],
                     b["payout_basis"].i64s()[0],
@@ -918,11 +1028,9 @@ fn run_resident(
         ),
         "score_bucket_plans_cap1_basic_sparse" => outputs(
             case,
-            workspace
+            chunk
                 .score_bucket_plans_cap1_basic_sparse(
-                    candidates,
                     0,
-                    sparse(b),
                     b["expiry_ms"].i64s()[0],
                     b["direction_code"].i32s()[0],
                     b["payout_basis"].i64s()[0],
@@ -932,11 +1040,9 @@ fn run_resident(
         ),
         "score_bucket_plans_cap1_sparse_dual" => outputs(
             case,
-            workspace
+            chunk
                 .score_bucket_plans_cap1_sparse_dual(
-                    candidates,
                     0,
-                    sparse(b),
                     b["expiry_ms"].i64s()[0],
                     b["payout_basis"].i64s()[0],
                 )
@@ -950,11 +1056,9 @@ fn run_resident(
         ),
         "score_bucket_plans_cap1_basic_sparse_dual" => outputs(
             case,
-            workspace
+            chunk
                 .score_bucket_plans_cap1_basic_sparse_dual(
-                    candidates,
                     0,
-                    sparse(b),
                     b["expiry_ms"].i64s()[0],
                     b["payout_basis"].i64s()[0],
                 )
@@ -968,8 +1072,8 @@ fn run_resident(
         ),
         "reconstruct_signal_masks_cap1" => outputs(
             case,
-            workspace
-                .reconstruct_signal_masks_cap1(candidates, 0, b["expiry_ms"].i64s()[0])
+            chunk
+                .reconstruct_signal_masks_cap1(0, b["expiry_ms"].i64s()[0])
                 .unwrap(),
             |v| BTreeMap::from([("output".into(), Buffer::from(v))]),
         ),
@@ -1167,7 +1271,11 @@ fn independent_expectations(f: &Value, cases: &[Case], results: &[Buffers]) {
                     &actual[field],
                     &expectation["expected"],
                     rule["places"].as_u64(),
-                    expectation["source"].as_str().unwrap(),
+                    &format!(
+                        "{}:{}",
+                        expectation["source"]["legacy_test"].as_str().unwrap(),
+                        expectation["source"]["lines"].as_str().unwrap()
+                    ),
                 );
             }
         }
@@ -1498,16 +1606,6 @@ mod governed {
         duration_seconds: 30,
         offset_seconds: 15,
     };
-    const SOURCE_FILES: [&str; 8] = [
-        "trex/strategy_searcher_gpu/cupy_engine.py",
-        "trex/strategy_searcher/backtest/stability.py",
-        "trex/portfolio_optimizer/cupy_engine.py",
-        "trex/strategy_repair/gpu_replay.py",
-        "trex/strategy_searcher_gpu/tests/test_backtester_metric_parity.py",
-        "trex/strategy_searcher_gpu/tests/test_bootstrap_stability.py",
-        "trex/tests/test_strategy_repair.py",
-        "trex/tests/test_portfolio_optimizer.py",
-    ];
 
     #[derive(Clone)]
     struct Candidate {
@@ -2875,34 +2973,6 @@ mod governed {
         file.sync_all().unwrap();
     }
 
-    /// A later capture reports its relation to the accepted pin without replacing it.
-    fn pin_reference(path: &Path, pin: &Value) {
-        match File::create_new(path) {
-            Ok(mut file) => {
-                file.write_all(&json_bytes(pin)).unwrap();
-                file.sync_all().unwrap();
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                let pinned = manifest_json(path);
-                println!(
-                    "capture identity {} {} pinned identity {}; existing pin left untouched",
-                    pin["reference_identity"].as_str().unwrap(),
-                    if pin["reference_identity"] == pinned["reference_identity"] {
-                        "equals"
-                    } else {
-                        "differs from"
-                    },
-                    pinned["reference_identity"].as_str().unwrap()
-                );
-            }
-            Err(error) => panic!("{}: {error}", path.display()),
-        }
-    }
-    fn json_bytes(v: &Value) -> Vec<u8> {
-        let mut bytes = serde_json::to_vec_pretty(v).unwrap();
-        bytes.push(b'\n');
-        bytes
-    }
     fn device_info(device: &Device) -> Value {
         let info = device.info();
         json!({"name":info.name,"compute_capability":info.compute_capability,"driver_version":info.driver_version,"module_build":serde_json::from_str::<Value>(MODULE_BUILD).unwrap(),"module_sha256":digest(MODULE_CUBIN)})
@@ -2937,30 +3007,24 @@ mod governed {
         );
     }
 
-    /// Hash the four source files and four tests at the pinned commit, verifying the
-    /// readable checkout bytes against `git show` without altering its Git state.
-    fn legacy_sources() -> Value {
-        let mut files = BTreeMap::new();
-        for path in SOURCE_FILES {
-            let pinned = Command::new("git")
-                .args([
-                    "-C",
-                    "/mnt/data/rexi3",
-                    "show",
-                    &format!("{LEGACY_COMMIT}:{path}"),
-                ])
-                .output()
-                .unwrap();
-            assert!(pinned.status.success());
-            let disk = fs::read(Path::new("/mnt/data/rexi3").join(path)).unwrap();
-            assert_eq!(
-                digest(&disk),
-                digest(&pinned.stdout),
-                "legacy checkout differs from pinned file {path}"
-            );
-            files.insert(path, digest(&disk));
+    #[derive(PartialEq, Eq)]
+    struct ChunkInputs<'a> {
+        features: Vec<i32>,
+        buckets: Vec<i16>,
+        offsets: Vec<i32>,
+        count: i32,
+        sparse: Option<search::SparseIndex<'a>>,
+    }
+
+    impl ChunkInputs<'_> {
+        fn candidates(&self) -> search::CandidateConditions<'_> {
+            search::CandidateConditions {
+                condition_feature: &self.features,
+                condition_bucket: &self.buckets,
+                candidate_offsets: &self.offsets,
+                candidate_count: self.count,
+            }
         }
-        json!(files)
     }
 
     /// Measure one warm-up plus five repetitions. Oracle comparisons and publication are
@@ -2987,17 +3051,57 @@ mod governed {
                 } else {
                     None
                 };
+            let mut chunk_inputs = Vec::new();
+            let mut case_chunks = Vec::new();
+            if resident.is_some() {
+                for case in cases {
+                    let (features, buckets, offsets) = legacy_conditions(&case.inputs);
+                    let input = ChunkInputs {
+                        features,
+                        buckets,
+                        offsets,
+                        count: case.inputs["candidate_count"].i32s()[0],
+                        sparse: case
+                            .inputs
+                            .contains_key("candidate_driver_key")
+                            .then(|| sparse(&case.inputs)),
+                    };
+                    let index = chunk_inputs
+                        .iter()
+                        .position(|c| c == &input)
+                        .unwrap_or_else(|| {
+                            chunk_inputs.push(input);
+                            chunk_inputs.len() - 1
+                        });
+                    case_chunks.push(index);
+                }
+            }
+            let chunks: Vec<_> = resident.as_ref().map_or_else(Vec::new, |workspace| {
+                chunk_inputs
+                    .iter()
+                    .map(|input| {
+                        workspace
+                            .upload_candidates(input.candidates(), input.sparse)
+                            .unwrap()
+                    })
+                    .collect()
+            });
+            let chunk_bytes: usize = chunks.iter().map(|c| c.timings.allocated_bytes).sum();
             let mut upload = resident
                 .as_ref()
-                .map_or(0.0, |r| r.timings.upload.as_secs_f64());
+                .map_or(0.0, |r| r.timings.upload.as_secs_f64())
+                + chunks
+                    .iter()
+                    .map(|c| c.timings.upload.as_secs_f64())
+                    .sum::<f64>();
             let mut execute = 0.0;
             let mut download = 0.0;
             let mut decode = 0.0;
             let mut allocated = 0;
             let mut outputs = Vec::new();
-            for case in cases {
-                let measured = if let Some(workspace) = &resident {
-                    run_resident(workspace, case)
+            for (index, case) in cases.iter().enumerate() {
+                let measured = if resident.is_some() {
+                    run_resident(&chunks[case_chunks[index]], case)
                 } else {
                     run(backend, case)
                 };
@@ -3005,11 +3109,20 @@ mod governed {
                 execute += measured.timings.execute.as_secs_f64();
                 download += measured.timings.download.as_secs_f64();
                 decode += measured.decode.as_secs_f64();
-                allocated = allocated.max(measured.timings.allocated_bytes);
+                // An operation includes its borrowed chunk and shared inputs. Other chunks
+                // remain live throughout this stage and must also count toward the peak.
+                let other_chunks = if resident.is_some() {
+                    chunk_bytes - chunks[case_chunks[index]].timings.allocated_bytes
+                } else {
+                    0
+                };
+                allocated = allocated.max(measured.timings.allocated_bytes + other_chunks);
                 outputs.push(measured.output);
             }
             let total = start.elapsed().as_secs_f64();
+            let chunk_count = chunks.len();
             let (free_after, _) = device.memory_info().unwrap();
+            drop(chunks);
             drop(resident);
             // All checks happen after the measured interval, including the warm-up checks.
             for (index, (case, output)) in cases.iter().zip(&outputs).enumerate() {
@@ -3034,7 +3147,7 @@ mod governed {
                     })
                     .collect();
             } else {
-                samples.push(json!({"upload_seconds":upload,"execute_seconds":execute,"download_seconds":download,"decode_seconds":decode,"total_seconds":total,"allocated_device_buffer_bytes":allocated,"driver_used_memory_delta_bytes":free_before as i128-free_after as i128,"driver_total_memory_bytes":total_memory}));
+                samples.push(json!({"upload_seconds":upload,"execute_seconds":execute,"download_seconds":download,"decode_seconds":decode,"total_seconds":total,"allocated_device_buffer_bytes":allocated,"resident_candidate_chunks":chunk_count,"resident_candidate_bytes":chunk_bytes,"driver_used_memory_delta_bytes":free_before as i128-free_after as i128,"driver_total_memory_bytes":total_memory}));
             }
         }
         let mut medians = serde_json::Map::new();
@@ -3051,7 +3164,7 @@ mod governed {
             values.sort_by(f64::total_cmp);
             medians.insert(name.into(), json!(values[2]));
         }
-        let receipt = json!({"stage":cases[0].id,"cases":cases.iter().map(|c|&c.id).collect::<Vec<_>>(),"warmups":1,"repetitions":5,"statistic":"median","synchronization":"included in upload, execute and download; execution ends after stream synchronization","allocated_bytes_semantics":"maximum simultaneous bytes reported by an operation, including resident shared inputs","driver_delta_semantics":"used memory after launches before workspace release minus before workspace allocation","medians":medians,"samples":samples,"test_process_peak_kb":in_process_peak_kb()});
+        let receipt = json!({"stage":cases[0].id,"cases":cases.iter().map(|c|&c.id).collect::<Vec<_>>(),"warmups":1,"repetitions":5,"statistic":"median","synchronization":"included in upload, execute and download; execution ends after stream synchronization","allocated_bytes_semantics":"maximum simultaneous bytes reported by an operation, including resident shared inputs and every live candidate chunk","driver_delta_semantics":"used memory after launches before workspace release minus before workspace allocation","medians":medians,"samples":samples,"test_process_peak_kb":in_process_peak_kb()});
         println!(
             "stage {} launches={} median total={:.6} s allocated={} bytes driver delta={} bytes",
             cases[0].id,
@@ -3118,9 +3231,18 @@ mod governed {
             manifest["kernel_source_sha256"],
             pin["kernel_source_sha256"]
         );
+        for &(symbol, expected) in LEGACY_KERNEL_DIGESTS {
+            assert_eq!(
+                manifest["kernel_source_sha256"][symbol], expected,
+                "acceptance reference must retain extraction kernel digests"
+            );
+        }
         assert_eq!(manifest["summary"], pin["summary"]);
         assert_eq!(manifest["stage_summary"], pin["stage_summary"]);
-        assert_eq!(
+        // The reference binds the data through the recorded buffers; the file digest is
+        // provenance. Neutral source labels changed the JSON without changing literal inputs.
+        println!(
+            "literal fixture SHA-256: recorded {}; current {}",
             manifest["literal_fixture_sha256"],
             sha256(
                 &Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -3266,7 +3388,7 @@ mod governed {
         json!({"stage":cases[0].id,"launches":launches,"input_bytes":cases.iter().flat_map(|c|c.inputs.values()).map(|b|b.bytes().len()).sum::<usize>(),"output_bytes":cases.iter().flat_map(|c|c.outputs.values()).map(|b|b.bytes().len()).sum::<usize>()})
     }
 
-    /// Capture at the extraction commit or replay the immutable typed reference at the
+    /// Capture a new measurement or replay the immutable extraction reference at the
     /// current clean commit. The two modes share preparation, device runs and ledger proof.
     pub(super) fn execute(capture: bool) {
         if cfg!(debug_assertions) {
@@ -3308,15 +3430,22 @@ mod governed {
         let environment = device_info(device);
         let f = fixture();
         let literals = literal_cases(&f);
-        if capture {
-            for &(symbol, expected) in LEGACY_KERNEL_DIGESTS {
-                assert_eq!(
-                    kernel_digests()[symbol],
-                    expected,
-                    "capture requires unchanged extracted kernels"
-                );
-            }
+        let wrapper = common::manifest_json(Path::new(
+            &std::env::var("BINARY_ALPHA_TEST_CONFIG").expect("governed wrapper is required"),
+        ));
+        let sources = legacy_sources(&wrapper);
+        assert_eq!(
+            f["legacy_source_digests"], sources,
+            "literal fixture source identities changed"
+        );
+        if let Some((manifest, _, _, _)) = &reference {
+            assert_eq!(
+                source_digest_set(&manifest["legacy_sources"]),
+                source_digest_set(&sources),
+                "reference legacy source identities changed"
+            );
         }
+        println!("current kernel SHA-256: {}", json!(kernel_digests()));
         let mut expected_stages: Vec<Vec<Case>> =
             literals.iter().cloned().map(|c| vec![c]).collect();
         expected_stages.extend(prepared.stages.clone());
@@ -3388,6 +3517,8 @@ mod governed {
         // Validate this metadata only at publication, after every correctness check.
         let revision = env!("BINARY_ALPHA_CODE_REVISION");
         let mut receipt = json!({"schema_version":1,"target_commit":revision,"source_commit":LEGACY_COMMIT,"device":environment,"stages":receipts,"replay":replay_receipt,"phase06_ledger":phase06_ledger,"test_process_peak_kb":in_process_peak_kb(),"whole_test_wall_seconds":started.elapsed().as_secs_f64(),"summary":summary,"stage_summary":stage_summary,"timing_comparison":"Rust extraction baseline; original CuPy host comparison is unavailable here","production_operator_tasks":"none","linked_matching_sentry_issues":"none"});
+        receipt["legacy_sources"] = sources.clone();
+        receipt["kernel_source_sha256"] = json!(kernel_digests());
         // The median of the five complete repetition totals, preserving stage boundaries.
         let mut path_times = [0_f64; 5];
         for stage in receipt["stages"].as_array().unwrap() {
@@ -3399,7 +3530,7 @@ mod governed {
         receipt["completed_path_median_seconds"] = json!(path_times[2]);
         if let Some(root) = output {
             let stages = write_cases(&root, &completed);
-            let manifest = json!({"schema_version":1,"source_commit":LEGACY_COMMIT,"target_commit":revision,"legacy_sources":legacy_sources(),"literal_fixture_sha256":sha256(&Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/phase07_legacy_cases.json")),"comparison_rules":COMPARISONS,"kernel_cases":symbol_cases(&completed),"kernel_source_sha256":kernel_digests(),"inputs":prepared.identities,"device":environment,"ledger":ledger_identity,"phase06_ledger":phase06_ledger,"summary":summary,"stage_summary":stage_summary,"stages":stages});
+            let manifest = json!({"schema_version":1,"source_commit":LEGACY_COMMIT,"target_commit":revision,"legacy_sources":sources,"literal_fixture_sha256":sha256(&Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/phase07_legacy_cases.json")),"comparison_rules":COMPARISONS,"kernel_cases":symbol_cases(&completed),"kernel_source_sha256":kernel_digests(),"inputs":prepared.identities,"device":environment,"ledger":ledger_identity,"phase06_ledger":phase06_ledger,"summary":summary,"stage_summary":stage_summary,"stages":stages});
             let bytes = json_bytes(&manifest);
             let identity = digest(&bytes);
             receipt["reference_identity"] = json!(identity);

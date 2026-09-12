@@ -1035,95 +1035,120 @@ fn resident_literals(device: &crate::cuda::Device) {
             key_chrono_offsets: &offsets,
             key_chrono_rows: &sparse_rows,
         };
+        let chunk = resident
+            .upload_candidates(conditions, Some(sparse))
+            .unwrap();
+        // One feature (4), bucket (2), two candidate offsets (8), one driver (4),
+        // two sparse offsets (8), and one sparse row index (4) per input row.
+        let candidate_bytes = 26 + rows as usize * 4;
+        assert_eq!(chunk.timings.allocated_bytes, candidate_bytes);
+        let input_bytes = resident.timings.allocated_bytes + candidate_bytes;
         for (direction, expected) in [(1, &case.expected_buy), (-1, &case.expected_sell)] {
-            let result = resident
-                .score_bucket_plans_cap1(conditions, 0, case.expiry_ms, direction, case.payout)
+            let result = chunk
+                .score_bucket_plans_cap1(0, case.expiry_ms, direction, case.payout)
                 .unwrap();
-            assert!(result.timings.allocated_bytes >= resident.timings.allocated_bytes);
+            assert_eq!(
+                result.timings.allocated_bytes,
+                input_bytes + result.output.len() * 8
+            );
             assert_eq!(result.output, expected[..21]);
         }
-        let result = resident
-            .score_bucket_plans_cap1_dual(conditions, 0, case.expiry_ms, case.payout)
+        let result = chunk
+            .score_bucket_plans_cap1_dual(0, case.expiry_ms, case.payout)
             .unwrap();
-        assert!(result.timings.allocated_bytes >= resident.timings.allocated_bytes);
+        assert_eq!(
+            result.timings.allocated_bytes,
+            input_bytes + (result.output.buy_output.len() + result.output.sell_output.len()) * 8
+        );
         assert_eq!(result.output.buy_output, case.expected_buy[..21]);
         assert_eq!(result.output.sell_output, case.expected_sell[..21]);
         for (direction, expected) in [(1, &case.expected_buy), (-1, &case.expected_sell)] {
-            let result = resident
-                .score_bucket_plans_cap1_basic(
-                    conditions,
-                    0,
-                    case.expiry_ms,
-                    direction,
-                    case.payout,
-                )
+            let result = chunk
+                .score_bucket_plans_cap1_basic(0, case.expiry_ms, direction, case.payout)
                 .unwrap();
-            assert!(result.timings.allocated_bytes >= resident.timings.allocated_bytes);
+            assert_eq!(
+                result.timings.allocated_bytes,
+                input_bytes + result.output.len() * 8
+            );
             assert_eq!(result.output, expected[..8]);
         }
-        let result = resident
-            .score_bucket_plans_cap1_basic_dual(conditions, 0, case.expiry_ms, case.payout)
+        let result = chunk
+            .score_bucket_plans_cap1_basic_dual(0, case.expiry_ms, case.payout)
             .unwrap();
-        assert!(result.timings.allocated_bytes >= resident.timings.allocated_bytes);
+        assert_eq!(
+            result.timings.allocated_bytes,
+            input_bytes + (result.output.buy_output.len() + result.output.sell_output.len()) * 8
+        );
         assert_eq!(result.output.buy_output, case.expected_buy[..8]);
         assert_eq!(result.output.sell_output, case.expected_sell[..8]);
         for (direction, expected) in [(1, &case.expected_buy), (-1, &case.expected_sell)] {
-            let result = resident
-                .score_bucket_plans_cap1_sparse(
-                    conditions,
-                    0,
-                    sparse,
-                    case.expiry_ms,
-                    direction,
-                    case.payout,
-                )
+            let result = chunk
+                .score_bucket_plans_cap1_sparse(0, case.expiry_ms, direction, case.payout)
                 .unwrap();
-            assert!(result.timings.allocated_bytes >= resident.timings.allocated_bytes);
+            assert_eq!(
+                result.timings.allocated_bytes,
+                input_bytes + result.output.len() * 8
+            );
             assert_eq!(result.output, expected[..21]);
         }
         for (direction, expected) in [(1, &case.expected_buy), (-1, &case.expected_sell)] {
-            let result = resident
-                .score_bucket_plans_cap1_basic_sparse(
-                    conditions,
-                    0,
-                    sparse,
-                    case.expiry_ms,
-                    direction,
-                    case.payout,
-                )
+            let result = chunk
+                .score_bucket_plans_cap1_basic_sparse(0, case.expiry_ms, direction, case.payout)
                 .unwrap();
-            assert!(result.timings.allocated_bytes >= resident.timings.allocated_bytes);
+            assert_eq!(
+                result.timings.allocated_bytes,
+                input_bytes + result.output.len() * 8
+            );
             assert_eq!(result.output, expected[..8]);
         }
-        let result = resident
-            .score_bucket_plans_cap1_sparse_dual(conditions, 0, sparse, case.expiry_ms, case.payout)
+        let result = chunk
+            .score_bucket_plans_cap1_sparse_dual(0, case.expiry_ms, case.payout)
             .unwrap();
-        assert!(result.timings.allocated_bytes >= resident.timings.allocated_bytes);
+        assert_eq!(
+            result.timings.allocated_bytes,
+            input_bytes + (result.output.buy_output.len() + result.output.sell_output.len()) * 8
+        );
         assert_eq!(result.output.buy_output, case.expected_buy[..21]);
         assert_eq!(result.output.sell_output, case.expected_sell[..21]);
-        let result = resident
-            .score_bucket_plans_cap1_basic_sparse_dual(
-                conditions,
-                0,
-                sparse,
-                case.expiry_ms,
-                case.payout,
-            )
+        let result = chunk
+            .score_bucket_plans_cap1_basic_sparse_dual(0, case.expiry_ms, case.payout)
             .unwrap();
-        assert!(result.timings.allocated_bytes >= resident.timings.allocated_bytes);
+        assert_eq!(
+            result.timings.allocated_bytes,
+            input_bytes + (result.output.buy_output.len() + result.output.sell_output.len()) * 8
+        );
         assert_eq!(result.output.buy_output, case.expected_buy[..8]);
         assert_eq!(result.output.sell_output, case.expected_sell[..8]);
-        let result = resident
-            .reconstruct_signal_masks_cap1(conditions, 0, case.expiry_ms)
+        let result = chunk
+            .reconstruct_signal_masks_cap1(0, case.expiry_ms)
             .unwrap();
-        assert!(result.timings.allocated_bytes >= resident.timings.allocated_bytes);
+        assert_eq!(
+            result.timings.allocated_bytes,
+            input_bytes + result.output.len()
+        );
         assert_eq!(result.output, case.mask);
         assert_eq!(
-            resident
-                .reconstruct_signal_masks_cap1(conditions, 1, case.expiry_ms)
+            chunk
+                .reconstruct_signal_masks_cap1(1, case.expiry_ms)
                 .unwrap()
                 .output,
             excluded
+        );
+        drop(chunk);
+        let dense = resident.upload_candidates(conditions, None).unwrap();
+        assert_eq!(dense.timings.allocated_bytes, 14);
+        assert!(
+            dense
+                .score_bucket_plans_cap1_sparse(0, case.expiry_ms, 1, case.payout)
+                .unwrap_err()
+                .contains("no sparse index")
+        );
+        assert_eq!(
+            dense
+                .reconstruct_signal_masks_cap1(0, case.expiry_ms)
+                .unwrap()
+                .output,
+            case.mask
         );
     }
 }

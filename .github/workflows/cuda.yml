@@ -10,12 +10,15 @@ jobs:
     runs-on: [self-hosted, linux, x64, binary-alpha-cuda-quantum]
     env:
       BINARY_ALPHA_NVCC: /home/sean/.local/cuda/13.4.1/bin/nvcc
+      BINARY_ALPHA_HOST_COMPILER: /usr/bin/gcc
     steps:
       - uses: actions/checkout@v7
       - name: Install the pinned toolchain with rustfmt and clippy
         run: rustup toolchain install
-      - name: Verify the pinned device compiler
-        run: '"$BINARY_ALPHA_NVCC" --version | grep -F "V13.4.59"'
+      - name: Verify the pinned device and host compilers
+        run: |
+          "$BINARY_ALPHA_NVCC" --version | grep -F "V13.4.59"
+          "$BINARY_ALPHA_HOST_COMPILER" --version | grep -F " 13.3.0"
       - run: cargo build --workspace --locked --features binary-alpha-app/cuda
       - run: cargo clippy --workspace --all-targets --locked --features binary-alpha-app/cuda -- -D warnings
       - run: cargo test --workspace --locked --features binary-alpha-app/cuda

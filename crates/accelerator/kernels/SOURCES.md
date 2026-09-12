@@ -44,3 +44,19 @@ retains slot order and drops unused `-1` features without changing the captured 
 | `score_bucket_plans_cap1_dual` | `3390c4bb3541143575dd3a0b8397a0fcba2b8eeaf9514aff9f697b0a178f630c` |
 | `score_bucket_plans_cap1_sparse` | `11a9833ac81f9660a2ad0a3c33df117834e8d45e9546a5fedac421c0dfc39c21` |
 | `score_bucket_plans_cap1_sparse_dual` | `1d82b571f7b7191371259da9fc1e1138f2e81caaca0f3d2b99cf14b18c1c128f` |
+
+## Fixture provenance labels
+
+The governed wrapper supplies local paths for these labels. Fixtures and reference
+manifests retain only labels and digests; this table binds each label to its pinned source.
+
+| Label | Pinned source |
+|---|---|
+| `search_kernels` | [source](https://github.com/oniram93/rexi3/blob/b509964cd1c40180e9d98b0e55a95699b0abe9ed/trex/strategy_searcher_gpu/cupy_engine.py) |
+| `bootstrap_kernel` | [source](https://github.com/oniram93/rexi3/blob/b509964cd1c40180e9d98b0e55a95699b0abe9ed/trex/strategy_searcher/backtest/stability.py) |
+| `portfolio_kernels` | [source](https://github.com/oniram93/rexi3/blob/b509964cd1c40180e9d98b0e55a95699b0abe9ed/trex/portfolio_optimizer/cupy_engine.py) |
+| `repair_kernel` | [source](https://github.com/oniram93/rexi3/blob/b509964cd1c40180e9d98b0e55a95699b0abe9ed/trex/strategy_repair/gpu_replay.py) |
+| `search_tests` | [source](https://github.com/oniram93/rexi3/blob/b509964cd1c40180e9d98b0e55a95699b0abe9ed/trex/strategy_searcher_gpu/tests/test_backtester_metric_parity.py) |
+| `bootstrap_tests` | [source](https://github.com/oniram93/rexi3/blob/b509964cd1c40180e9d98b0e55a95699b0abe9ed/trex/strategy_searcher_gpu/tests/test_bootstrap_stability.py) |
+| `repair_tests` | [source](https://github.com/oniram93/rexi3/blob/b509964cd1c40180e9d98b0e55a95699b0abe9ed/trex/tests/test_strategy_repair.py) |
+| `portfolio_tests` | [source](https://github.com/oniram93/rexi3/blob/b509964cd1c40180e9d98b0e55a95699b0abe9ed/trex/tests/test_portfolio_optimizer.py) |

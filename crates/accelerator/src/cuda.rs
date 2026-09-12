@@ -152,7 +152,7 @@ impl Device {
         &self,
         input: crate::bootstrap::Paths<'_>,
     ) -> Result<Measured<crate::bootstrap::Metrics>, String> {
-        input.validate()?;
+        // The public operation validates once before this private dispatch path.
         let k = "bootstrap_path_metrics";
         self.sync(k, "before upload")?;
         let start = Instant::now();
@@ -213,7 +213,7 @@ impl Device {
         &self,
         input: crate::portfolio::Capacity<'_>,
     ) -> Result<Measured<Vec<u8>>, String> {
-        input.validate()?;
+        // The public operation validates once before this private dispatch path.
         let k = "replay_capacity";
         self.sync(k, "before upload")?;
         let start = Instant::now();
@@ -284,7 +284,7 @@ impl Device {
         &self,
         input: crate::portfolio::Returns<'_>,
     ) -> Result<Measured<crate::portfolio::Drawdown>, String> {
-        input.validate()?;
+        // The public operation validates once before this private dispatch path.
         let k = "path_drawdown";
         self.sync(k, "before upload")?;
         let start = Instant::now();
@@ -337,7 +337,7 @@ impl Device {
         &self,
         input: crate::repair::Policies<'_>,
     ) -> Result<Measured<crate::repair::Replay>, String> {
-        input.validate()?;
+        // The public operation validates once before this private dispatch path.
         let k = "replay_policies";
         self.sync(k, "before upload")?;
         let start = Instant::now();
@@ -520,9 +520,38 @@ impl Shared {
     }
 }
 
+struct CandidateBuffers {
+    condition_feature: CudaSlice<i32>,
+    condition_bucket: CudaSlice<i16>,
+    candidate_offsets: CudaSlice<i32>,
+    sparse: Option<(CudaSlice<i32>, CudaSlice<i32>, CudaSlice<i32>)>,
+}
+
+impl CandidateBuffers {
+    fn bytes(&self) -> usize {
+        self.condition_feature.num_bytes()
+            + self.condition_bucket.num_bytes()
+            + self.candidate_offsets.num_bytes()
+            + self.sparse.as_ref().map_or(0, |(keys, offsets, rows)| {
+                keys.num_bytes() + offsets.num_bytes() + rows.num_bytes()
+            })
+    }
+}
+
+/// A candidate chunk tied to its workspace, borrowing immutable host inputs for validation.
+/// Scoring and reconstruction borrow these same device allocations for the chunk's lifetime.
+pub struct ResidentChunk<'stage, 'data> {
+    workspace: &'stage ResidentSearch<'data>,
+    candidates: CandidateConditions<'stage>,
+    sparse: Option<SparseIndex<'stage>>,
+    uploaded: CandidateBuffers,
+    /// One-time candidate allocation and upload cost; bytes exclude shared workspace inputs.
+    pub timings: Timings,
+}
+
 /// Shared encoded features, chronology, times, flags, and split masks kept on the device.
-/// Candidate chunks and outputs are allocated by each operation; `timings` records the
-/// one-time shared upload separately from the subsequent operation measurements.
+/// `upload_candidates` retains each candidate chunk for repeated scoring and reconstruction.
+/// `timings` records the one-time shared upload separately from chunk and operation costs.
 pub struct ResidentSearch<'a> {
     device: &'a Device,
     buffers: SearchBuffers<'a>,
@@ -599,19 +628,52 @@ impl Device {
         Ok(Measured { output, timings })
     }
 
+    fn candidate_buffers(
+        &self,
+        candidates: CandidateConditions<'_>,
+        sparse: Option<SparseIndex<'_>>,
+        k: &str,
+    ) -> Result<Measured<CandidateBuffers>, String> {
+        self.sync(k, "before candidate upload")?;
+        let start = Instant::now();
+        let output = CandidateBuffers {
+            condition_feature: self.upload(k, "condition_feature", candidates.condition_feature)?,
+            condition_bucket: self.upload(k, "condition_bucket", candidates.condition_bucket)?,
+            candidate_offsets: self.upload(k, "candidate_offsets", candidates.candidate_offsets)?,
+            sparse: sparse
+                .map(|index| -> Result<_, String> {
+                    Ok((
+                        self.upload(k, "candidate_driver_key", index.candidate_driver_key)?,
+                        self.upload(k, "key_chrono_offsets", index.key_chrono_offsets)?,
+                        self.upload(k, "key_chrono_rows", index.key_chrono_rows)?,
+                    ))
+                })
+                .transpose()?,
+        };
+        self.sync(k, "candidate upload")?;
+        let timings = Timings {
+            upload: start.elapsed(),
+            allocated_bytes: output.bytes(),
+            ..Timings::default()
+        };
+        Ok(Measured { output, timings })
+    }
+
     // The public search operation validates once before entering this upload/launch path.
     pub(crate) fn score(&self, input: Request<'_>) -> Result<Measured<DualScores>, String> {
         let shared = self.shared(input.buffers, &[input.split_mask], input.kernel())?;
-        let mut result = self.score_resident(input, &shared.output, 0)?;
-        result.timings.upload += shared.timings.upload;
+        let candidates = self.candidate_buffers(input.candidates, input.sparse, input.kernel())?;
+        let mut result = self.score_resident(input, &shared.output, &candidates.output, 0)?;
+        result.timings.upload += shared.timings.upload + candidates.timings.upload;
         Ok(result)
     }
 
     // The public reconstruction operation validates once before upload.
     pub(crate) fn reconstruct(&self, input: Request<'_>) -> Result<Measured<Vec<u8>>, String> {
         let shared = self.shared(input.buffers, &[input.split_mask], input.kernel())?;
-        let mut result = self.reconstruct_resident(input, &shared.output, 0)?;
-        result.timings.upload += shared.timings.upload;
+        let candidates = self.candidate_buffers(input.candidates, None, input.kernel())?;
+        let mut result = self.reconstruct_resident(input, &shared.output, &candidates.output, 0)?;
+        result.timings.upload += shared.timings.upload + candidates.timings.upload;
         Ok(result)
     }
 }
@@ -621,49 +683,28 @@ impl Device {
         &self,
         input: Request<'_>,
         shared: &Shared,
+        candidates: &CandidateBuffers,
         split: usize,
     ) -> Result<Measured<DualScores>, String> {
         let k = input.kernel();
         self.sync(k, "before upload")?;
         let start = Instant::now();
-        let condition_feature =
-            self.upload(k, "condition_feature", input.candidates.condition_feature)?;
-        let condition_bucket =
-            self.upload(k, "condition_bucket", input.candidates.condition_bucket)?;
-        let candidate_offsets =
-            self.upload(k, "candidate_offsets", input.candidates.candidate_offsets)?;
-        let sparse = input
-            .sparse
-            .map(|index| -> Result<_, String> {
-                Ok((
-                    self.upload(k, "candidate_driver_key", index.candidate_driver_key)?,
-                    self.upload(k, "key_chrono_offsets", index.key_chrono_offsets)?,
-                    self.upload(k, "key_chrono_rows", index.key_chrono_rows)?,
-                ))
-            })
-            .transpose()?;
+        let sparse = &candidates.sparse;
         let length = input.candidates.candidate_count as usize * input.width();
         let mut buy_output = self.zeros::<i64>(k, "buy_output/output", length)?;
         let mut sell_output =
             self.zeros::<i64>(k, "sell_output", if input.dual() { length } else { 0 })?;
         self.sync(k, "upload")?;
         let upload = start.elapsed();
-        let allocated_bytes = shared.bytes()
-            + condition_feature.num_bytes()
-            + condition_bucket.num_bytes()
-            + candidate_offsets.num_bytes()
-            + buy_output.num_bytes()
-            + sell_output.num_bytes()
-            + sparse.as_ref().map_or(0, |(keys, offsets, rows)| {
-                keys.num_bytes() + offsets.num_bytes() + rows.num_bytes()
-            });
+        let allocated_bytes =
+            shared.bytes() + candidates.bytes() + buy_output.num_bytes() + sell_output.num_bytes();
         let start = Instant::now();
         if input.candidates.candidate_count > 0 {
             let mut builder = self.stream.launch_builder(&self.functions[input.kind]);
             builder.arg(&shared.feature_codes);
-            builder.arg(&condition_feature);
-            builder.arg(&condition_bucket);
-            builder.arg(&candidate_offsets);
+            builder.arg(&candidates.condition_feature);
+            builder.arg(&candidates.condition_bucket);
+            builder.arg(&candidates.candidate_offsets);
             match input.kind {
                 0 => {
                     builder.arg(&shared.split_masks[split]);
@@ -848,17 +889,12 @@ impl Device {
         &self,
         input: Request<'_>,
         shared: &Shared,
+        candidates: &CandidateBuffers,
         split: usize,
     ) -> Result<Measured<Vec<u8>>, String> {
         let k = input.kernel();
         self.sync(k, "before upload")?;
         let start = Instant::now();
-        let condition_feature =
-            self.upload(k, "condition_feature", input.candidates.condition_feature)?;
-        let condition_bucket =
-            self.upload(k, "condition_bucket", input.candidates.condition_bucket)?;
-        let candidate_offsets =
-            self.upload(k, "candidate_offsets", input.candidates.candidate_offsets)?;
         let mut output = self.zeros::<u8>(
             k,
             "output",
@@ -866,18 +902,14 @@ impl Device {
         )?;
         self.sync(k, "upload")?;
         let upload = start.elapsed();
-        let allocated_bytes = shared.bytes()
-            + condition_feature.num_bytes()
-            + condition_bucket.num_bytes()
-            + candidate_offsets.num_bytes()
-            + output.num_bytes();
+        let allocated_bytes = shared.bytes() + candidates.bytes() + output.num_bytes();
         let start = Instant::now();
         if input.candidates.candidate_count > 0 {
             let mut builder = self.stream.launch_builder(&self.functions[input.kind]);
             builder.arg(&shared.feature_codes);
-            builder.arg(&condition_feature);
-            builder.arg(&condition_bucket);
-            builder.arg(&candidate_offsets);
+            builder.arg(&candidates.condition_feature);
+            builder.arg(&candidates.condition_bucket);
+            builder.arg(&candidates.candidate_offsets);
             builder.arg(&shared.split_masks[split]);
             builder.arg(&shared.ordered_rows);
             builder.arg(&shared.decision_time_ms);
@@ -909,253 +941,339 @@ impl Device {
     }
 }
 
-impl ResidentSearch<'_> {
-    /// Runs `score_bucket_plans_cap1` reusing the shared buffers and the selected resident split.
+impl<'data> ResidentSearch<'data> {
+    /// Uploads flattened conditions, buckets, offsets, and an optional sparse index once.
+    /// The returned chunk can score either direction, screen, and reconstruct repeatedly.
+    pub fn upload_candidates<'stage>(
+        &'stage self,
+        candidates: CandidateConditions<'stage>,
+        sparse: Option<SparseIndex<'stage>>,
+    ) -> Result<ResidentChunk<'stage, 'data>, String> {
+        let split_mask = *self
+            .split_masks
+            .first()
+            .ok_or("candidate upload requires a resident split")?;
+        Request {
+            kind: if sparse.is_some() { 4 } else { 0 },
+            buffers: self.buffers,
+            split_mask,
+            candidates,
+            sparse,
+            expiry_ms: 0,
+            direction_code: 1,
+            payout_basis: 0,
+        }
+        .validate()?;
+        let uploaded =
+            self.device
+                .candidate_buffers(candidates, sparse, "search candidate chunk")?;
+        Ok(ResidentChunk {
+            workspace: self,
+            candidates,
+            sparse,
+            uploaded: uploaded.output,
+            timings: uploaded.timings,
+        })
+    }
+}
+
+impl ResidentChunk<'_, '_> {
+    /// Runs `score_bucket_plans_cap1` borrowing this chunk and the selected resident split.
     pub fn score_bucket_plans_cap1(
         &self,
-        candidates: CandidateConditions<'_>,
         split: usize,
         expiry_ms: i64,
         direction_code: i32,
         payout_basis: i64,
     ) -> Result<Measured<Vec<i64>>, String> {
-        let split_mask = *self.split_masks.get(split).ok_or_else(|| {
+        let split_mask = *self.workspace.split_masks.get(split).ok_or_else(|| {
             format!("score_bucket_plans_cap1: split index {split} outside split_masks")
         })?;
         let input = Request {
             kind: 0,
-            buffers: self.buffers,
+            buffers: self.workspace.buffers,
             split_mask,
-            candidates,
+            candidates: self.candidates,
             sparse: None,
             expiry_ms,
             direction_code,
             payout_basis,
         };
         input.validate()?;
-        let result = self.device.score_resident(input, &self.shared, split)?;
+        let result = self.workspace.device.score_resident(
+            input,
+            &self.workspace.shared,
+            &self.uploaded,
+            split,
+        )?;
         Ok(Measured {
             output: result.output.buy_output,
             timings: result.timings,
         })
     }
-    /// Runs `score_bucket_plans_cap1_dual` reusing the shared buffers and the selected resident split.
+    /// Runs `score_bucket_plans_cap1_dual` borrowing this chunk and the selected resident split.
     pub fn score_bucket_plans_cap1_dual(
         &self,
-        candidates: CandidateConditions<'_>,
         split: usize,
         expiry_ms: i64,
         payout_basis: i64,
     ) -> Result<Measured<DualScores>, String> {
-        let split_mask = *self.split_masks.get(split).ok_or_else(|| {
+        let split_mask = *self.workspace.split_masks.get(split).ok_or_else(|| {
             format!("score_bucket_plans_cap1_dual: split index {split} outside split_masks")
         })?;
         let input = Request {
             kind: 1,
-            buffers: self.buffers,
+            buffers: self.workspace.buffers,
             split_mask,
-            candidates,
+            candidates: self.candidates,
             sparse: None,
             expiry_ms,
             direction_code: 1,
             payout_basis,
         };
         input.validate()?;
-        let result = self.device.score_resident(input, &self.shared, split)?;
+        let result = self.workspace.device.score_resident(
+            input,
+            &self.workspace.shared,
+            &self.uploaded,
+            split,
+        )?;
         Ok(result)
     }
-    /// Runs `score_bucket_plans_cap1_basic` reusing the shared buffers and the selected resident split.
+    /// Runs `score_bucket_plans_cap1_basic` borrowing this chunk and the selected resident split.
     pub fn score_bucket_plans_cap1_basic(
         &self,
-        candidates: CandidateConditions<'_>,
         split: usize,
         expiry_ms: i64,
         direction_code: i32,
         payout_basis: i64,
     ) -> Result<Measured<Vec<i64>>, String> {
-        let split_mask = *self.split_masks.get(split).ok_or_else(|| {
+        let split_mask = *self.workspace.split_masks.get(split).ok_or_else(|| {
             format!("score_bucket_plans_cap1_basic: split index {split} outside split_masks")
         })?;
         let input = Request {
             kind: 2,
-            buffers: self.buffers,
+            buffers: self.workspace.buffers,
             split_mask,
-            candidates,
+            candidates: self.candidates,
             sparse: None,
             expiry_ms,
             direction_code,
             payout_basis,
         };
         input.validate()?;
-        let result = self.device.score_resident(input, &self.shared, split)?;
+        let result = self.workspace.device.score_resident(
+            input,
+            &self.workspace.shared,
+            &self.uploaded,
+            split,
+        )?;
         Ok(Measured {
             output: result.output.buy_output,
             timings: result.timings,
         })
     }
-    /// Runs `score_bucket_plans_cap1_basic_dual` reusing the shared buffers and the selected resident split.
+    /// Runs `score_bucket_plans_cap1_basic_dual` borrowing this chunk and the selected resident split.
     pub fn score_bucket_plans_cap1_basic_dual(
         &self,
-        candidates: CandidateConditions<'_>,
         split: usize,
         expiry_ms: i64,
         payout_basis: i64,
     ) -> Result<Measured<DualScores>, String> {
-        let split_mask = *self.split_masks.get(split).ok_or_else(|| {
+        let split_mask = *self.workspace.split_masks.get(split).ok_or_else(|| {
             format!("score_bucket_plans_cap1_basic_dual: split index {split} outside split_masks")
         })?;
         let input = Request {
             kind: 3,
-            buffers: self.buffers,
+            buffers: self.workspace.buffers,
             split_mask,
-            candidates,
+            candidates: self.candidates,
             sparse: None,
             expiry_ms,
             direction_code: 1,
             payout_basis,
         };
         input.validate()?;
-        let result = self.device.score_resident(input, &self.shared, split)?;
+        let result = self.workspace.device.score_resident(
+            input,
+            &self.workspace.shared,
+            &self.uploaded,
+            split,
+        )?;
         Ok(result)
     }
-    /// Runs `score_bucket_plans_cap1_sparse` reusing the shared buffers and the selected resident split.
+    /// Runs `score_bucket_plans_cap1_sparse` borrowing this chunk and the selected resident split.
     pub fn score_bucket_plans_cap1_sparse(
         &self,
-        candidates: CandidateConditions<'_>,
         split: usize,
-        sparse: SparseIndex<'_>,
         expiry_ms: i64,
         direction_code: i32,
         payout_basis: i64,
     ) -> Result<Measured<Vec<i64>>, String> {
-        let split_mask = *self.split_masks.get(split).ok_or_else(|| {
+        let split_mask = *self.workspace.split_masks.get(split).ok_or_else(|| {
             format!("score_bucket_plans_cap1_sparse: split index {split} outside split_masks")
         })?;
         let input = Request {
             kind: 4,
-            buffers: self.buffers,
+            buffers: self.workspace.buffers,
             split_mask,
-            candidates,
-            sparse: Some(sparse),
+            candidates: self.candidates,
+            sparse: Some(self.sparse.ok_or_else(|| {
+                format!(
+                    "{}: resident chunk has no sparse index",
+                    crate::KERNEL_SOURCES[4].0
+                )
+            })?),
             expiry_ms,
             direction_code,
             payout_basis,
         };
         input.validate()?;
-        let result = self.device.score_resident(input, &self.shared, split)?;
+        let result = self.workspace.device.score_resident(
+            input,
+            &self.workspace.shared,
+            &self.uploaded,
+            split,
+        )?;
         Ok(Measured {
             output: result.output.buy_output,
             timings: result.timings,
         })
     }
-    /// Runs `score_bucket_plans_cap1_basic_sparse` reusing the shared buffers and the selected resident split.
+    /// Runs `score_bucket_plans_cap1_basic_sparse` borrowing this chunk and the selected resident split.
     pub fn score_bucket_plans_cap1_basic_sparse(
         &self,
-        candidates: CandidateConditions<'_>,
         split: usize,
-        sparse: SparseIndex<'_>,
         expiry_ms: i64,
         direction_code: i32,
         payout_basis: i64,
     ) -> Result<Measured<Vec<i64>>, String> {
-        let split_mask = *self.split_masks.get(split).ok_or_else(|| {
+        let split_mask = *self.workspace.split_masks.get(split).ok_or_else(|| {
             format!("score_bucket_plans_cap1_basic_sparse: split index {split} outside split_masks")
         })?;
         let input = Request {
             kind: 5,
-            buffers: self.buffers,
+            buffers: self.workspace.buffers,
             split_mask,
-            candidates,
-            sparse: Some(sparse),
+            candidates: self.candidates,
+            sparse: Some(self.sparse.ok_or_else(|| {
+                format!(
+                    "{}: resident chunk has no sparse index",
+                    crate::KERNEL_SOURCES[5].0
+                )
+            })?),
             expiry_ms,
             direction_code,
             payout_basis,
         };
         input.validate()?;
-        let result = self.device.score_resident(input, &self.shared, split)?;
+        let result = self.workspace.device.score_resident(
+            input,
+            &self.workspace.shared,
+            &self.uploaded,
+            split,
+        )?;
         Ok(Measured {
             output: result.output.buy_output,
             timings: result.timings,
         })
     }
-    /// Runs `score_bucket_plans_cap1_sparse_dual` reusing the shared buffers and the selected resident split.
+    /// Runs `score_bucket_plans_cap1_sparse_dual` borrowing this chunk and the selected resident split.
     pub fn score_bucket_plans_cap1_sparse_dual(
         &self,
-        candidates: CandidateConditions<'_>,
         split: usize,
-        sparse: SparseIndex<'_>,
         expiry_ms: i64,
         payout_basis: i64,
     ) -> Result<Measured<DualScores>, String> {
-        let split_mask = *self.split_masks.get(split).ok_or_else(|| {
+        let split_mask = *self.workspace.split_masks.get(split).ok_or_else(|| {
             format!("score_bucket_plans_cap1_sparse_dual: split index {split} outside split_masks")
         })?;
         let input = Request {
             kind: 6,
-            buffers: self.buffers,
+            buffers: self.workspace.buffers,
             split_mask,
-            candidates,
-            sparse: Some(sparse),
+            candidates: self.candidates,
+            sparse: Some(self.sparse.ok_or_else(|| {
+                format!(
+                    "{}: resident chunk has no sparse index",
+                    crate::KERNEL_SOURCES[6].0
+                )
+            })?),
             expiry_ms,
             direction_code: 1,
             payout_basis,
         };
         input.validate()?;
-        let result = self.device.score_resident(input, &self.shared, split)?;
+        let result = self.workspace.device.score_resident(
+            input,
+            &self.workspace.shared,
+            &self.uploaded,
+            split,
+        )?;
         Ok(result)
     }
-    /// Runs `score_bucket_plans_cap1_basic_sparse_dual` reusing the shared buffers and the selected resident split.
+    /// Runs `score_bucket_plans_cap1_basic_sparse_dual` borrowing this chunk and the selected resident split.
     pub fn score_bucket_plans_cap1_basic_sparse_dual(
         &self,
-        candidates: CandidateConditions<'_>,
         split: usize,
-        sparse: SparseIndex<'_>,
         expiry_ms: i64,
         payout_basis: i64,
     ) -> Result<Measured<DualScores>, String> {
-        let split_mask = *self.split_masks.get(split).ok_or_else(|| {
+        let split_mask = *self.workspace.split_masks.get(split).ok_or_else(|| {
             format!(
                 "score_bucket_plans_cap1_basic_sparse_dual: split index {split} outside split_masks"
             )
         })?;
         let input = Request {
             kind: 7,
-            buffers: self.buffers,
+            buffers: self.workspace.buffers,
             split_mask,
-            candidates,
-            sparse: Some(sparse),
+            candidates: self.candidates,
+            sparse: Some(self.sparse.ok_or_else(|| {
+                format!(
+                    "{}: resident chunk has no sparse index",
+                    crate::KERNEL_SOURCES[7].0
+                )
+            })?),
             expiry_ms,
             direction_code: 1,
             payout_basis,
         };
         input.validate()?;
-        let result = self.device.score_resident(input, &self.shared, split)?;
+        let result = self.workspace.device.score_resident(
+            input,
+            &self.workspace.shared,
+            &self.uploaded,
+            split,
+        )?;
         Ok(result)
     }
-    /// Runs `reconstruct_signal_masks_cap1` reusing the shared buffers and the selected resident split.
+    /// Runs `reconstruct_signal_masks_cap1` borrowing this chunk and the selected resident split.
     pub fn reconstruct_signal_masks_cap1(
         &self,
-        candidates: CandidateConditions<'_>,
         split: usize,
         expiry_ms: i64,
     ) -> Result<Measured<Vec<u8>>, String> {
-        let split_mask = *self.split_masks.get(split).ok_or_else(|| {
+        let split_mask = *self.workspace.split_masks.get(split).ok_or_else(|| {
             format!("reconstruct_signal_masks_cap1: split index {split} outside split_masks")
         })?;
         let input = Request {
             kind: 8,
-            buffers: self.buffers,
+            buffers: self.workspace.buffers,
             split_mask,
-            candidates,
+            candidates: self.candidates,
             sparse: None,
             expiry_ms,
             direction_code: 1,
             payout_basis: 0,
         };
         input.validate()?;
-        let result = self
-            .device
-            .reconstruct_resident(input, &self.shared, split)?;
+        let result = self.workspace.device.reconstruct_resident(
+            input,
+            &self.workspace.shared,
+            &self.uploaded,
+            split,
+        )?;
         Ok(result)
     }
 }

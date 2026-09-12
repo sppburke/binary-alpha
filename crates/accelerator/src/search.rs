@@ -58,7 +58,7 @@ pub struct CandidateConditions<'a> {
 }
 
 /// Sparse chronological driver lists; every visited row rechecks every condition.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub struct SparseIndex<'a> {
     /// Driver key per candidate, or a negative value for no driver.
     pub candidate_driver_key: &'a [i32],
