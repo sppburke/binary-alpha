@@ -26,4 +26,4 @@ jobs:
         run: cargo test --release --locked -p binary-alpha-app --features cuda --test phase07_cuda_parity governed_parity -- --exact --ignored --nocapture
         env:
           BINARY_ALPHA_TEST_CONFIG: /mnt/data/issue-7-scratch/phase06_test_config.json
-          BINARY_ALPHA_CUDA_REFERENCE: /mnt/data/binary-alpha-phase07-reference/attempt2/reference.json
+          BINARY_ALPHA_CUDA_REFERENCE: /mnt/data/binary-alpha-phase07-reference/attempt5/reference.json

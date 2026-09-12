@@ -82,7 +82,7 @@ with labels `self-hosted`, `linux`, `x64`, and `binary-alpha-cuda-quantum`. The 
 `BINARY_ALPHA_NVCC=/home/sean/.local/cuda/13.4.1/bin/nvcc`,
 `BINARY_ALPHA_HOST_COMPILER=/usr/bin/gcc`,
 `BINARY_ALPHA_TEST_CONFIG=/mnt/data/issue-7-scratch/phase06_test_config.json`, and
-`BINARY_ALPHA_CUDA_REFERENCE=/mnt/data/binary-alpha-phase07-reference/attempt2/reference.json`.
+`BINARY_ALPHA_CUDA_REFERENCE=/mnt/data/binary-alpha-phase07-reference/attempt5/reference.json`.
 For manual runs, export the same variables in the runner process environment; the governed wrapper
 must resolve its existing development inputs and reference files. `BINARY_ALPHA_CUDA_ARCH` is
 optional and defaults to the proved `sm_120` target. The workflow never regenerates expectations.

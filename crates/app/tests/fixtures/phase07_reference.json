@@ -1,5 +1,5 @@
 {
-  "capture_run_sha256": "3d56dec57f10db42b0907304c8c622d440ab72a0da47f860caf4673f38923284",
+  "capture_run_sha256": "3520fd1631417c0a983090050fba6321706f7ec79ac9ebb3360a157a39af90d7",
   "kernel_source_sha256": {
     "bootstrap_path_metrics": "08787ee13438ea5615b1716db1c2f300fbcd558de700f3e050d145164cf2b4a3",
     "path_drawdown": "790b0e99a2bed348fdbb7c2c67bea71c7be26a1548b75232ad9b7340706b6a69",
@@ -15,7 +15,7 @@
     "score_bucket_plans_cap1_sparse": "ee4353f52d96e81e0cd95c6e7c38cf9e91937448410bab8a42d6cc8901b3be3a",
     "score_bucket_plans_cap1_sparse_dual": "18c3fcc4a5d59bb3a4c8ce4dea9fb660f06295e66697bdf11a6fa6e99f7523d0"
   },
-  "reference_identity": "38f30a8c30d05b4cf03e9eecb13319638a8164c91d4410d2b5721dd36f857cc3",
+  "reference_identity": "4afb7a2efed6a6cdee1d817e8b30afb9921c506d370d265d622d14311c2bc17f",
   "schema_version": 1,
   "source_commit": "b509964cd1c40180e9d98b0e55a95699b0abe9ed",
   "stage_summary": [
