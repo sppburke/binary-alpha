@@ -1122,6 +1122,27 @@ fn expected_column(v: &Value) -> Vec<Value> {
         .collect()
 }
 
+/// Frozen search tolerances apply to both scalar and column expectations.
+fn search_rule(field: &str, absent: bool) -> Value {
+    // All-null columns record only assertIsNone, without a numerical rule.
+    if absent {
+        return json!("exact");
+    }
+    match field {
+        "net_units" | "max_drawdown_units" | "max_drawdown_hours" | "longest_underwater_hours" => {
+            json!({"places": 10})
+        }
+        "ulcer_index_units"
+        | "profit_factor"
+        | "sharpe_per_trade"
+        | "sortino_per_trade"
+        | "worst_rolling_20_units"
+        | "worst_rolling_50_units"
+        | "worst_rolling_100_units" => json!({"places": 9}),
+        _ => json!("exact"),
+    }
+}
+
 /// Check independent legacy expectations against newly computed results, not captured actuals.
 fn independent_expectations(f: &Value, cases: &[Case], results: &[Buffers]) {
     let result = |id: &str| &results[cases.iter().position(|c| c.id == id).unwrap()];
@@ -1149,23 +1170,7 @@ fn independent_expectations(f: &Value, cases: &[Case], results: &[Buffers]) {
                     .i64s();
                     let field = expectation["field"].as_str().unwrap();
                     let expected = expected_column(&expectation["expected"]);
-                    let places = match field {
-                        "net_units" | "max_drawdown_units" | "max_drawdown_hours" => Some(10),
-                        "ulcer_index_units"
-                        | "profit_factor"
-                        | "sharpe_per_trade"
-                        | "sortino_per_trade"
-                        | "worst_rolling_20_units"
-                        | "worst_rolling_50_units"
-                        | "worst_rolling_100_units" => Some(9),
-                        _ => None,
-                    };
-                    // All-null columns record only assertIsNone, without a numerical rule.
-                    let rule = if expected.iter().all(Value::is_null) {
-                        json!("exact")
-                    } else {
-                        places.map_or(json!("exact"), |n| json!({"places": n}))
-                    };
+                    let rule = search_rule(field, expected.iter().all(Value::is_null));
                     assert_eq!(expectation["rule"], rule, "comparison rules are frozen");
                     assert_eq!(rows.len(), expected.len() * 21);
                     for (i, expected) in expected.iter().enumerate() {
@@ -1187,7 +1192,11 @@ fn independent_expectations(f: &Value, cases: &[Case], results: &[Buffers]) {
             for expectation in c["expectations"].as_array().unwrap() {
                 let field = expectation["field"].as_str().unwrap();
                 let rule = &expectation["rule"];
-                assert!(rule == "exact" || rule["places"].is_u64());
+                assert_eq!(
+                    *rule,
+                    search_rule(field, expectation["expected"].is_null()),
+                    "comparison rules are frozen"
+                );
                 decimal_equal(
                     &actual[field],
                     &expectation["expected"],
@@ -1472,7 +1481,7 @@ mod governed {
     use binary_alpha_engine::dataset::{DatasetRole, GenerationManifest};
     use binary_alpha_engine::execution::{
         Comparator, Direction, EventKind, FinancialEvent, ReplayManifest, Threshold,
-        signal_logic_identity,
+        replay_generation_id, signal_logic_identity,
     };
     use binary_alpha_engine::features::{
         FeatureManifest, FeaturePlan, FittedEncoding, Kind, ProjectionKind, Value as FeatureValue,
@@ -1481,9 +1490,7 @@ mod governed {
         InvalidReason, Outcome, OutcomeBuilder, OutcomeManifest, TICK_PRICE_OBJECT_PATH,
         TICK_TIME_OBJECT_PATH, stream_object_paths,
     };
-    use common::{
-        LegacyCsv, Scratch, in_process_peak_kb, manifest_json, read_le, read_table, sha256, timed,
-    };
+    use common::{LegacyCsv, Scratch, in_process_peak_kb, manifest_json, read_le, sha256, timed};
     use sha2::{Digest, Sha256};
     use std::fs::{self, File};
     use std::io::{BufRead, Write};
@@ -1601,6 +1608,51 @@ mod governed {
         )
     }
 
+    /// Project the governed clocks, condition outputs and readiness flags before decoding.
+    fn read_columns(path: &Path, names: Vec<String>) -> common::Table {
+        use parquet::file::reader::{FileReader, SerializedFileReader};
+        use parquet::record::Field;
+        let reader = SerializedFileReader::new(File::open(path).unwrap()).unwrap();
+        let schema = reader
+            .metadata()
+            .file_metadata()
+            .schema_descr()
+            .root_schema();
+        let fields = names
+            .iter()
+            .map(|name| {
+                schema
+                    .get_fields()
+                    .iter()
+                    .find(|field| field.name() == name)
+                    .unwrap_or_else(|| panic!("feature column {name} absent"))
+                    .clone()
+            })
+            .collect();
+        let projection = parquet::schema::types::Type::group_type_builder(schema.name())
+            .with_fields(fields)
+            .build()
+            .unwrap();
+        let rows = reader
+            .get_row_iter(Some(projection))
+            .unwrap()
+            .map(|row| {
+                row.unwrap()
+                    .get_column_iter()
+                    .map(|(_, field)| match field {
+                        Field::Null => None,
+                        Field::Long(value) => Some(FeatureValue::Int(*value)),
+                        Field::TimestampMicros(value) => Some(FeatureValue::Time(*value)),
+                        Field::Bool(value) => Some(FeatureValue::Bool(*value)),
+                        Field::Str(value) => Some(FeatureValue::Text(value.clone().into())),
+                        other => panic!("unexpected governed field {other:?}"),
+                    })
+                    .collect()
+            })
+            .collect();
+        (names, rows)
+    }
+
     /// Read the exact bound generations and reproduce the legacy host's buffers through
     /// generic readers. This single preparation is used by both capture and comparison.
     fn prepare() -> Prepared {
@@ -1694,36 +1746,6 @@ mod governed {
             u32::from_le_bytes,
         );
         let reasons = fs::read(object(&outcome_json, store(&outcome_path), &paths[3])).unwrap();
-        let (names, rows) = read_table(&object(
-            &feature_json,
-            store(&feature_path),
-            "rows/30s_15s.parquet",
-        ));
-        let column = |name: &str| {
-            names
-                .iter()
-                .position(|n| n == name)
-                .unwrap_or_else(|| panic!("feature column {name} absent"))
-        };
-        let time_column = |name: &str| {
-            rows.iter()
-                .map(|r| match r[column(name)] {
-                    Some(FeatureValue::Time(t) | FeatureValue::Int(t)) => t,
-                    _ => panic!("{name} must be a timestamp"),
-                })
-                .collect::<Vec<_>>()
-        };
-        let close = time_column("close_time_micros");
-        assert_eq!(close, references);
-        // Unavailable rows remain excluded; the engine observes each available row once.
-        let known: Vec<Option<i64>> = rows
-            .iter()
-            .map(|r| match r[column("known_at_micros")] {
-                Some(FeatureValue::Time(t) | FeatureValue::Int(t)) => Some(t),
-                None => None,
-                _ => panic!("known_at must be a timestamp"),
-            })
-            .collect();
         let outputs: Vec<String> = settings
             .strategies
             .iter()
@@ -1761,6 +1783,43 @@ mod governed {
             })
             .collect::<BTreeSet<_>>()
             .into_iter()
+            .collect();
+        let mut wanted = BTreeSet::from([
+            "close_time_micros".to_string(),
+            "known_at_micros".to_string(),
+        ]);
+        for output in &outputs {
+            wanted.insert(output.clone());
+            wanted.extend(plan.readiness_of(output).flags);
+        }
+        let (names, rows) = read_columns(
+            &object(&feature_json, store(&feature_path), "rows/30s_15s.parquet"),
+            wanted.into_iter().collect(),
+        );
+        let column = |name: &str| {
+            names
+                .iter()
+                .position(|n| n == name)
+                .unwrap_or_else(|| panic!("feature column {name} absent"))
+        };
+        let time_column = |name: &str| {
+            rows.iter()
+                .map(|r| match r[column(name)] {
+                    Some(FeatureValue::Time(t) | FeatureValue::Int(t)) => t,
+                    _ => panic!("{name} must be a timestamp"),
+                })
+                .collect::<Vec<_>>()
+        };
+        let close = time_column("close_time_micros");
+        assert_eq!(close, references);
+        // Unavailable rows remain excluded; the engine observes each available row once.
+        let known: Vec<Option<i64>> = rows
+            .iter()
+            .map(|r| match r[column("known_at_micros")] {
+                Some(FeatureValue::Time(t) | FeatureValue::Int(t)) => Some(t),
+                None => None,
+                _ => panic!("known_at must be a timestamp"),
+            })
             .collect();
         let mut encoded = Vec::new();
         let mut encodings = Vec::new();
@@ -2499,7 +2558,6 @@ mod governed {
         let bytes = fs::read(&manifest_path).unwrap();
         let manifest = ReplayManifest::from_json(&bytes).unwrap();
         assert_eq!(manifest.config_hash, copied.content_hash());
-        assert_eq!(manifest.code_revision, env!("BINARY_ALPHA_CODE_REVISION"));
         assert_eq!(manifest.instruments.len(), 1);
         let bound = &manifest.instruments[0];
         assert_eq!(
@@ -2556,11 +2614,46 @@ mod governed {
         (manifest, signals, receipt)
     }
 
+    /// Phase 06 classified this funded ledger; require our verified replay to reproduce it.
+    fn phase06_ledger(config: &Config, replay: &ReplayManifest) -> Value {
+        // The storage-only configuration copy resolves the same instruments. Reuse its
+        // verified bindings rather than duplicate the application's private binding logic.
+        let config_hash = config.content_hash();
+        let generation = replay_generation_id(&config_hash, &replay.instruments);
+        let root = local(&config.storage.publication_uri.to_string());
+        let path = root.join(format!("manifests/{generation}/ready.json"));
+        let bytes = fs::read(&path).unwrap_or_else(|error| {
+            panic!(
+                "run the Phase 06 governed proof for this configuration first: {}: {error}",
+                path.display()
+            )
+        });
+        let classified = ReplayManifest::from_json(&bytes).unwrap();
+        assert_eq!(classified.role, DatasetRole::Development);
+        assert_eq!(classified.generation, generation);
+        assert_eq!(classified.config_hash, config_hash);
+        assert_eq!(classified.instruments, replay.instruments);
+        assert_eq!(
+            classified.events, replay.events,
+            "Phase 06 ledger event count"
+        );
+        assert_eq!(
+            classified.final_state_identity, replay.final_state_identity,
+            "funded ledger differs from the classified Phase 06 replay"
+        );
+        assert_eq!(
+            classified.summary_identity, replay.summary_identity,
+            "funded summary differs from the classified Phase 06 replay"
+        );
+        json!({"generation":generation,"config_hash":config_hash,"events":classified.events,"final_state_identity":classified.final_state_identity,"summary_identity":classified.summary_identity})
+    }
+
     /// Join historical rows by signal number; compare every candidate's membership and totals.
     fn connected(
         p: &Prepared,
         stages: &[Vec<Case>],
         ledger: &BTreeMap<String, BTreeSet<i64>>,
+        phase06_ledger: &Value,
     ) -> Value {
         let mut trades = LegacyCsv::open(&p.reference_root.join("parity_cpu_run_v2/trades.csv"));
         let mut settled = BTreeMap::new();
@@ -2776,7 +2869,7 @@ mod governed {
             );
         }
         println!("connected proof totals: {}", json!(totals));
-        json!({"candidates":counts,"totals":totals,"unclassified_differences":0})
+        json!({"candidates":counts,"totals":totals,"funded_ledger":format!("equals Phase 06 governed replay {}", phase06_ledger["generation"].as_str().unwrap())})
     }
 
     /// File publication is create-only, including receipts and the final manifest.
@@ -2784,6 +2877,30 @@ mod governed {
         let mut file = File::create_new(path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
         file.write_all(bytes).unwrap();
         file.sync_all().unwrap();
+    }
+
+    /// A later capture reports its relation to the accepted pin without replacing it.
+    fn pin_reference(path: &Path, pin: &Value) {
+        match File::create_new(path) {
+            Ok(mut file) => {
+                file.write_all(&json_bytes(pin)).unwrap();
+                file.sync_all().unwrap();
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                let pinned = manifest_json(path);
+                println!(
+                    "capture identity {} {} pinned identity {}; existing pin left untouched",
+                    pin["reference_identity"].as_str().unwrap(),
+                    if pin["reference_identity"] == pinned["reference_identity"] {
+                        "equals"
+                    } else {
+                        "differs from"
+                    },
+                    pinned["reference_identity"].as_str().unwrap()
+                );
+            }
+            Err(error) => panic!("{}: {error}", path.display()),
+        }
     }
     fn json_bytes(v: &Value) -> Vec<u8> {
         let mut bytes = serde_json::to_vec_pretty(v).unwrap();
@@ -2802,23 +2919,26 @@ mod governed {
     }
 
     /// Refuse stale build metadata as well as dirty or unidentifiable working trees.
-    fn clean_revision() -> String {
+    fn clean_revision(replay_revision: &str) {
         let git = |args: &[&str]| {
             let out = Command::new("git").args(args).output().unwrap();
             assert!(out.status.success());
             String::from_utf8(out.stdout).unwrap().trim().to_string()
         };
         let revision = git(&["rev-parse", "HEAD"]);
+        assert!(
+            git(&["status", "--porcelain"]).is_empty(),
+            "all correctness checks completed; capture/parity publication requires a clean committed tree; the primary must commit first"
+        );
         assert_eq!(
             revision,
             env!("BINARY_ALPHA_CODE_REVISION"),
-            "rebuild at the clean reviewed commit"
+            "all correctness checks completed; rebuild at the clean reviewed commit before publishing"
         );
-        assert!(
-            git(&["status", "--porcelain"]).is_empty(),
-            "capture/parity requires a clean committed tree; the primary must commit first"
+        assert_eq!(
+            replay_revision, revision,
+            "all correctness checks completed; replay build metadata must match the clean reviewed commit before publishing"
         );
-        revision
     }
 
     /// Hash the four source files and four tests at the pinned commit, verifying the
@@ -3156,13 +3276,16 @@ mod governed {
         if cfg!(debug_assertions) {
             panic!("capture/parity requires the optimized release profile");
         }
-        let revision = clean_revision();
         let started = Instant::now();
         let output = if capture {
             let path = PathBuf::from(
                 std::env::var("BINARY_ALPHA_CUDA_REFERENCE_OUTPUT")
                     .expect("capture output must name a new directory"),
             );
+            fs::create_dir_all(path.parent().expect("capture directory needs a parent"))
+                .unwrap_or_else(|e| {
+                    panic!("cannot create capture parents: {}: {e}", path.display())
+                });
             fs::create_dir(&path).unwrap_or_else(|e| {
                 panic!("capture directory must not exist: {}: {e}", path.display())
             });
@@ -3250,13 +3373,15 @@ mod governed {
             );
         }
         let (ledger, signals, replay_receipt) = replay(&prepared);
-        let summary = connected(&prepared, &completed, &signals);
+        let phase06_ledger = phase06_ledger(&prepared.config, &ledger);
+        let summary = connected(&prepared, &completed, &signals, &phase06_ledger);
         let ledger_identity = json!({"event_count":ledger.events,"final_state_identity":ledger.final_state_identity,"summary_identity":ledger.summary_identity});
         if let Some((manifest, _, _, _)) = &reference {
             assert_eq!(
                 manifest["ledger"], ledger_identity,
                 "canonical Engine replay identity changed"
             );
+            assert_eq!(manifest["phase06_ledger"], phase06_ledger);
             assert_eq!(manifest["summary"], summary);
         }
         let stage_summary: Vec<_> = completed.iter().map(|s| stage_summary(s)).collect();
@@ -3264,7 +3389,9 @@ mod governed {
         if let Some((manifest, _, _, _)) = &reference {
             assert_eq!(manifest["stage_summary"], json!(stage_summary));
         }
-        let mut receipt = json!({"schema_version":1,"target_commit":revision,"source_commit":LEGACY_COMMIT,"device":environment,"stages":receipts,"replay":replay_receipt,"test_process_peak_kb":in_process_peak_kb(),"whole_test_wall_seconds":started.elapsed().as_secs_f64(),"summary":summary,"stage_summary":stage_summary,"timing_comparison":"Rust extraction baseline; original CuPy host comparison is unavailable here","production_operator_tasks":"none","linked_matching_sentry_issues":"none"});
+        // Validate this metadata only at publication, after every correctness check.
+        let revision = env!("BINARY_ALPHA_CODE_REVISION");
+        let mut receipt = json!({"schema_version":1,"target_commit":revision,"source_commit":LEGACY_COMMIT,"device":environment,"stages":receipts,"replay":replay_receipt,"phase06_ledger":phase06_ledger,"test_process_peak_kb":in_process_peak_kb(),"whole_test_wall_seconds":started.elapsed().as_secs_f64(),"summary":summary,"stage_summary":stage_summary,"timing_comparison":"Rust extraction baseline; original CuPy host comparison is unavailable here","production_operator_tasks":"none","linked_matching_sentry_issues":"none"});
         // The median of the five complete repetition totals, preserving stage boundaries.
         let mut path_times = [0_f64; 5];
         for stage in receipt["stages"].as_array().unwrap() {
@@ -3276,18 +3403,19 @@ mod governed {
         receipt["completed_path_median_seconds"] = json!(path_times[2]);
         if let Some(root) = output {
             let stages = write_cases(&root, &completed);
-            let manifest = json!({"schema_version":1,"source_commit":LEGACY_COMMIT,"target_commit":revision,"legacy_sources":legacy_sources(),"literal_fixture_sha256":sha256(&Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/phase07_legacy_cases.json")),"comparison_rules":COMPARISONS,"kernel_cases":symbol_cases(&completed),"kernel_source_sha256":kernel_digests(),"inputs":prepared.identities,"device":environment,"ledger":ledger_identity,"summary":summary,"stage_summary":stage_summary,"stages":stages});
+            let manifest = json!({"schema_version":1,"source_commit":LEGACY_COMMIT,"target_commit":revision,"legacy_sources":legacy_sources(),"literal_fixture_sha256":sha256(&Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/phase07_legacy_cases.json")),"comparison_rules":COMPARISONS,"kernel_cases":symbol_cases(&completed),"kernel_source_sha256":kernel_digests(),"inputs":prepared.identities,"device":environment,"ledger":ledger_identity,"phase06_ledger":phase06_ledger,"summary":summary,"stage_summary":stage_summary,"stages":stages});
             let bytes = json_bytes(&manifest);
             let identity = digest(&bytes);
             receipt["reference_identity"] = json!(identity);
             let receipt_bytes = json_bytes(&receipt);
+            clean_revision(&ledger.code_revision);
             create(&root.join("capture-run.json"), &receipt_bytes);
             create(&root.join("reference.json"), &bytes);
             let pin = json!({"schema_version":1,"reference_identity":identity,"capture_run_sha256":digest(&receipt_bytes),"source_commit":LEGACY_COMMIT,"target_commit":revision,"summary":summary,"stage_summary":stage_summary,"kernel_source_sha256":kernel_digests()});
-            create(
+            pin_reference(
                 &Path::new(env!("CARGO_MANIFEST_DIR"))
                     .join("tests/fixtures/phase07_reference.json"),
-                &json_bytes(&pin),
+                &pin,
             );
             println!(
                 "reference identity {identity}\nreference {}\ncapture receipt SHA-256 {}",
@@ -3315,6 +3443,7 @@ mod governed {
             );
             let path = prepared.scratch.path("capture-run.json");
             let bytes = json_bytes(&receipt);
+            clean_revision(&ledger.code_revision);
             create(&path, &bytes);
             println!("run receipt {} SHA-256 {}", path.display(), digest(&bytes));
         }
