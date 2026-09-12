@@ -105,8 +105,8 @@ driver. The normal runner process executes `.github/workflows/cuda.yml`; no serv
 container setup is required. The pinned toolkit, driver compatibility, and required
 `BINARY_ALPHA_NVCC`, `BINARY_ALPHA_TEST_CONFIG`, and `BINARY_ALPHA_CUDA_REFERENCE` environment
 variables are recorded in [README.md](../README.md). Verify that this runner identity is online
-before dispatching the governed proof. The workflow reads the immutable attempt-2 reference and
-never recaptures expected results.
+before dispatching the governed proof. The workflow reads the immutable attempt-5 reference, a
+quiet-device capture at the extraction commit, and never recaptures expected results.
 
 Runner rollback stops and unregisters only `binary-alpha-cuda-quantum`; keep the existing driver
 and unrelated machine setup. Accelerator rollback selects the explicit central-processor backend
