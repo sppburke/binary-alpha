@@ -18,7 +18,9 @@ use binary_alpha_engine::dataset::{
 use binary_alpha_engine::execution::{Decimal, EventKind, FinancialEvent, Summary, Threshold};
 use binary_alpha_engine::features::{FeatureManifest, FeaturePlan, PLAN_OBJECT_PATH};
 use binary_alpha_engine::market::{InstrumentId, format_event_time_micros};
-use binary_alpha_engine::portfolio::{Selection, SelectionManifest, State};
+use binary_alpha_engine::portfolio::{
+    Selection, SelectionManifest, State, selection_generation_id,
+};
 use binary_alpha_engine::search::Family;
 use common::{Scratch, command, generation, import, verify, write_ticks};
 use serde_json::Value;
@@ -1305,6 +1307,16 @@ fn counting_grid_selects_verifies_and_resumes() {
     let error = verify(&manifest).unwrap_err();
     assert!(error.contains("is missing"), "{error}");
     fs::write(&ledger_path, &ledger_bytes).unwrap();
+    let rows_key = object_key(
+        &read_manifest(&scratch, &selection.folds[0].assessments[0].generation),
+        "rows/20s_0s.parquet",
+    );
+    let rows_path = scratch.path("published").join(&rows_key);
+    let rows_bytes = fs::read(&rows_path).unwrap();
+    fs::remove_file(&rows_path).unwrap();
+    let error = verify(&manifest).unwrap_err();
+    assert!(error.contains("is missing"), "{error}");
+    fs::write(&rows_path, &rows_bytes).unwrap();
     let mut forged: Value = serde_json::from_slice(&selection_bytes).unwrap();
     let index = selection.selected.unwrap();
     forged["choices"][index]["profit"] = Value::from("999.00");
@@ -1627,13 +1639,6 @@ fn interval_ordinals_follow_each_fold_fit() {
         BASE_MS + 6 * HOUR_MS,
         &assessed(LOSING),
     );
-    let late_evaluation = import_slice(
-        &scratch,
-        "eval_late",
-        "evaluation",
-        BASE_MS + 10 * HOUR_MS,
-        &assessed(PLANTED),
-    );
     let gates =
         "{ min_settled = 1, max_unresolved = 0, min_profit = \"-1000\", max_drawdown = \"1000\" }";
     let (direction_manifest, direction) =
@@ -1713,6 +1718,45 @@ fn interval_ordinals_follow_each_fold_fit() {
         lines[0]
     );
     assert_eq!(verify(&manifest).unwrap(), lines[1]);
+    // A recorded configuration whose fit declares another label limit, republished under the
+    // generation its own hash names, does not resolve to the recorded fits.
+    let published = SelectionManifest::from_json(&fs::read(&manifest).unwrap()).unwrap();
+    let mut forged: Value = serde_json::from_slice(
+        &fs::read(scratch.path("published").join(&published.objects[0].key)).unwrap(),
+    )
+    .unwrap();
+    forged["config"]["portfolio"]["folds"][0]["inputs"][0]["fit"]["encodings"]["max_labels"] =
+        Value::from(4);
+    let forged_config: binary_alpha_engine::config::Config =
+        serde_json::from_value(forged["config"].clone()).unwrap();
+    let forged_bytes = serde_json::to_vec_pretty(&forged).unwrap();
+    let sha = sha256_hex(&forged_bytes);
+    fs::write(
+        scratch.path(&format!("published/objects/{sha}")),
+        &forged_bytes,
+    )
+    .unwrap();
+    let mut forged_manifest = published.clone();
+    forged_manifest.config_hash = forged_config.content_hash();
+    forged_manifest.generation = selection_generation_id(
+        &forged_manifest.config_hash,
+        &forged_manifest.code_revision,
+        &forged_manifest.families,
+    );
+    forged_manifest.objects[0].key = format!("objects/{sha}");
+    forged_manifest.objects[0].sha256 = sha;
+    forged_manifest.objects[0].bytes = forged_bytes.len() as u64;
+    let forged_path = scratch.path(&format!(
+        "published/manifests/{}/ready.json",
+        forged_manifest.generation
+    ));
+    fs::create_dir_all(forged_path.parent().unwrap()).unwrap();
+    fs::write(&forged_path, forged_manifest.to_json()).unwrap();
+    let error = verify(&forged_path).unwrap_err();
+    assert!(
+        error.contains("does not resolve to the recorded plan before its fit"),
+        "{error}"
+    );
     let choice = &selection.choices[0];
     let assessment_rows = [assessed(PLANTED), assessed(SECOND)];
     let mut cuts = Vec::new();
@@ -1895,6 +1939,12 @@ fn interval_ordinals_follow_each_fold_fit() {
 
     // A final refit whose cuts collapse is terminal without a deployable selection; it does not
     // choose the next-ranked policy, and no outer evaluation is read.
+    // The evaluation manifest of this configuration does not exist: a failed refit never reads
+    // it.
+    let absent = scratch.path(&format!(
+        "published/manifests/{}/ready.json",
+        "0".repeat(64)
+    ));
     let refit_config = scratch.config(
         "portfolio_ordinals_refit.toml",
         &table(
@@ -1902,7 +1952,7 @@ fn interval_ordinals_follow_each_fold_fit() {
             BASE_MS + 8 * HOUR_MS,
             &fits[2],
             BASE_MS + 10 * HOUR_MS,
-            &late_evaluation,
+            &absent,
             32768,
             true,
         ),
@@ -2123,11 +2173,27 @@ fn later_role_evidence_and_ill_formed_inputs_are_refused_before_output() {
             && error.contains("begins less than the embargo after the cutoff"),
         "{error}"
     );
+    let overlapping = scratch.config(
+        "portfolio_overlapping.toml",
+        &format!(
+            "{}{}",
+            table(&family_manifest, &fold),
+            evaluation_toml(BASE_MS, &dev.tick)
+        ),
+    );
+    let error = optimize(&scratch, &overlapping).unwrap_err();
+    assert_eq!(snapshot(&scratch), before);
+    assert!(
+        error.contains("evaluation.decision_start")
+            && error.contains("begins less than the embargo after the cutoff"),
+        "{error}"
+    );
     let empty = scratch.config(
         "portfolio_empty.toml",
         &table(&family_manifest, "").replace("\nmembers = [", "\nfolds = []\nmembers = ["),
     );
-    let error = command(&["config", "validate", "--config", empty.to_str().unwrap()]).unwrap_err();
+    let error = optimize(&scratch, &empty).unwrap_err();
+    assert_eq!(snapshot(&scratch), before);
     assert!(
         error.contains("folds: at least one inner fit and assessment pair is required"),
         "{error}"
@@ -2197,8 +2263,16 @@ fn synchronized_and_separated_losses_differ_and_terminal_states_are_distinct() {
                     subset(&[deployment(0, 0, 0), deployment(0, 0, 0)]),
                     subset(&[deployment(0, 0, 0), deployment(1, 0, 0)])
                 ),
-                &format!("{}, {}", risk_policy("cap2", 2), risk_policy("cap1", 1)),
-                16
+                &format!(
+                    "{}, {}, {}",
+                    risk_policy("cap2", 2),
+                    risk_policy("cap1", 1),
+                    risk_policy("cap2", 2).replace("cap2", "loss").replace(
+                        "max_open_total = 2",
+                        "max_open_total = 2, max_unresolved_loss_total = \"1.50\""
+                    )
+                ),
+                24
             ),
             terms_a("A", "unit"),
             alternative("A2", "unit", "1", "0", "1.80", "1", "0.80", "0.01"),
@@ -2212,7 +2286,7 @@ fn synchronized_and_separated_losses_differ_and_terminal_states_are_distinct() {
     );
     let (lines, manifest, selection) = optimize(&scratch, &config).unwrap();
     assert!(
-        lines[0].contains(" declared 16 rejected 4 valid 12 "),
+        lines[0].contains(" declared 24 rejected 6 valid 18 "),
         "{}",
         lines[0]
     );
@@ -2241,6 +2315,11 @@ fn synchronized_and_separated_losses_differ_and_terminal_states_are_distinct() {
     assert_eq!(value(1, &[0, 0], 0), as_cents(separated));
     assert_eq!(value(0, &[0, 1], 1), as_cents(blocked));
     assert_eq!(value(1, &[0, 0], 1), as_cents(separated));
+    // A total unresolved-loss limit of 1.50 binds on the exact worst-loss reservation of 1.00
+    // per open contract: the synchronized second deployment is blocked, the separated pair is
+    // untouched.
+    assert_eq!(value(0, &[0, 1], 2), as_cents(blocked));
+    assert_eq!(value(1, &[0, 0], 2), as_cents(separated));
     let sync_selected = selection.selected.unwrap();
     let winner = &selection.choices[sync_selected];
     assert_eq!(
@@ -2266,7 +2345,7 @@ fn synchronized_and_separated_losses_differ_and_terminal_states_are_distinct() {
     );
     let (lines, manifest, selection) = optimize(&scratch, &infeasible).unwrap();
     assert!(
-        lines[0].contains(" valid 12 passing 0 state no_feasible_policy "),
+        lines[0].contains(" valid 18 passing 0 state no_feasible_policy "),
         "{}",
         lines[0]
     );

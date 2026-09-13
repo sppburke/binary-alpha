@@ -1286,10 +1286,10 @@ followed by `[bind S folds S refit S publish S]` or `(already published)`, then 
 line. An interruption preserves every completed replay and feature generation and publishes no
 selection; the rerun reuses them and recomputes the rest. `data verify` on a selection checks
 the recorded configuration's hash against the manifest, re-reads the families through the
-development-only reader, re-enumerates the choices, identities and structural rejections, re-reads
-every recorded fit, assessment, refit and outer feature generation and plan and re-resolves every
-configured fit through the feature owner against the recorded plan's raw identity and cutoff,
-restores every recorded replay through its verifier and checks its definition against the table
+development-only reader, re-enumerates the choices, identities and structural rejections,
+verifies every recorded fit, assessment, refit and outer feature generation through the feature
+verifier and re-resolves every configured fit through the feature owner against the recorded plan
+before its fit and against its cutoff, restores every recorded replay through its verifier and checks its definition against the table
 rebuilt for that choice and fold, recomputes every projection, gate, aggregate, rank, the frozen
 policy and its compilation under the refit plans, and the terminal state, and writes
 `verified portfolio generation GENERATION declared D rejected R valid V passing P state S objects 1 bytes B`.

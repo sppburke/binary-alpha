@@ -768,7 +768,8 @@ fn recorded_feature(
     input: &ManifestUri,
     frozen_from: Option<&str>,
 ) -> Result<(FeatureManifest, FeaturePlan), String> {
-    let location = store.uri(&manifest_key(&record.generation));
+    let key = manifest_key(&record.generation);
+    let location = store.uri(&key);
     let (feature_store, manifest) = features::feature_manifest(uri, &location)?;
     if manifest.role != role
         || manifest.instrument != record.instrument
@@ -784,6 +785,11 @@ fn recorded_feature(
             input.generation()
         ));
     }
+    // Every recorded feature generation restores through its own verifier: missing or altered
+    // referenced work cannot verify.
+    let mut bytes = Vec::new();
+    feature_store.read_to(&key, None, &mut bytes)?;
+    features::verify_feature(&location, &feature_store, &key, &bytes)?;
     let plan = features::fitted_plan(uri, &feature_store, &manifest)?;
     Ok((manifest, plan))
 }
@@ -824,8 +830,9 @@ fn recorded_input(
     ))
 }
 
-/// The configured fit entry resolves, through the feature owner, to the raw rows the recorded
-/// plan carries (its profile, input generation, and settings) and ends before its cutoff.
+/// The configured fit entry resolves, through the feature owner, to the recorded plan before
+/// its fit (profile, input generation, settings, definitions, label limit, outputs, and
+/// encodings) and ends before its cutoff.
 fn configured_fit(
     uri: &str,
     field: &str,
@@ -834,9 +841,9 @@ fn configured_fit(
     plan: &FeaturePlan,
 ) -> Result<(), String> {
     let resolved = bind_fit(field, entry, cutoff).map_err(|reason| format!("{uri}: {reason}"))?;
-    if resolved.raw_identity() != plan.raw_identity {
+    if *resolved.plan() != plan.unfitted() {
         return Err(format!(
-            "{uri}: {field} does not resolve to the recorded plan's profile, input, and settings"
+            "{uri}: {field} does not resolve to the recorded plan before its fit"
         ));
     }
     Ok(())

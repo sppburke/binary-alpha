@@ -388,10 +388,10 @@ impl Resolved {
         &self.bound.input
     }
 
-    /// The raw-row identity the resolved plan will carry: its profile, input, and settings,
-    /// before any fit.
-    pub(crate) fn raw_identity(&self) -> &str {
-        &self.plan.raw_identity
+    /// The resolved plan before any fit: its profile, input, settings, definitions, label
+    /// limit, and compiled outputs and encodings.
+    pub(crate) fn plan(&self) -> &FeaturePlan {
+        &self.plan
     }
 }
 

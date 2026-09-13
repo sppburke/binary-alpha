@@ -2175,6 +2175,22 @@ impl FeaturePlan {
     pub fn is_fitted(&self) -> bool {
         self.fit_windows.len() == self.streams.len()
     }
+
+    /// The plan as resolved before its development fit: no fit windows, no labels, and no
+    /// development-fitted edges, so a fitted plan compares with the plan its entry resolves.
+    pub fn unfitted(&self) -> Self {
+        let mut plan = self.clone();
+        plan.fit_windows.clear();
+        for stream in &mut plan.streams {
+            for encoding in &mut stream.encodings {
+                encoding.labels.clear();
+                if encoding.encoding == ProjectionKind::DevelopmentFifths {
+                    encoding.edges = None;
+                }
+            }
+        }
+        plan
+    }
 }
 
 /// Compiles one configured encoding against a stream's selected outputs. An encoding whose
