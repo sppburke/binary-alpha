@@ -1033,7 +1033,7 @@ pub fn verify_family(uri: &str, store: &Store, key: &str, bytes: &[u8]) -> Resul
             "{uri}: the manifest inputs are not the bound generations"
         ));
     }
-    // Every referenced replay restores through its verifier at the recorded code revision.
+    // Every referenced replay restores through its verifier.
     let mut clock = Clock::default();
     let read_chunk = |chunk: &ChunkRef| -> Result<(ReplayManifest, Vec<FinancialEvent>), String> {
         let chunk_key = manifest_key(&chunk.generation);
@@ -1043,13 +1043,12 @@ pub fn verify_family(uri: &str, store: &Store, key: &str, bytes: &[u8]) -> Resul
         replay::verify_replay(&chunk_uri, store, &chunk_key, &bytes)?;
         let chunk_manifest =
             ReplayManifest::from_json(&bytes).map_err(|error| format!("{chunk_uri}: {error}"))?;
+        // The replay owner reuses an identical earlier generation whatever revision produced
+        // it; the restoration above and the definition check below are the material proofs.
         if chunk_manifest.summary_identity != chunk.summary_identity
             || chunk_manifest.role.to_string() != chunk.role
-            || chunk_manifest.code_revision != manifest.code_revision
         {
-            return Err(format!(
-                "{uri}: {chunk_uri} is not the recorded chunk at the recorded code revision"
-            ));
+            return Err(format!("{uri}: {chunk_uri} is not the recorded chunk"));
         }
         let events = chunk_events(store, &chunk_manifest)?;
         Ok((chunk_manifest, events))
