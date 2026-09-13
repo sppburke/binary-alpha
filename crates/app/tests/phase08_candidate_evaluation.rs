@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 
 use binary_alpha_engine::execution::{Decimal, Summary};
 use binary_alpha_engine::market::format_event_time_micros;
-use binary_alpha_engine::search::{Family, FamilyManifest, StabilityOutcome};
+use binary_alpha_engine::search::{Family, FamilyManifest, StabilityOutcome, family_generation_id};
 use common::{Scratch, command, generation, import, read_table, verify, write_ticks};
 use serde_json::Value;
 
@@ -891,18 +891,52 @@ fn candidate_search_publishes_verifies_and_resumes() {
         error.contains("records 39 members but the family holds 40"),
         "{error}"
     );
-    // Forged provenance: an input identity that is not the bound generation.
-    let mut provenance: Value = serde_json::from_slice(&manifest_before).unwrap();
-    provenance["inputs"][0]["tick_generation"] = Value::from("0".repeat(64));
+    // Forged provenance: an input identity that is not the bound generation, republished at the
+    // key its recomputed generation names, fails against the bound state.
+    let mut forged_manifest = FamilyManifest::from_json(&manifest_before).unwrap();
+    forged_manifest.inputs[0].tick_generation = "0".repeat(64);
+    forged_manifest.generation = family_generation_id(
+        &forged_manifest.config_hash,
+        &forged_manifest.code_revision,
+        &forged_manifest.inputs,
+    );
+    let forged_path = scratch.path(&format!(
+        "published/manifests/{}/ready.json",
+        forged_manifest.generation
+    ));
+    fs::create_dir_all(forged_path.parent().unwrap()).unwrap();
+    fs::write(&forged_path, forged_manifest.to_json()).unwrap();
+    let error = verify(&forged_path).unwrap_err();
+    assert!(error.contains("not the bound generations"), "{error}");
+    // A screened member with a fabricated development group is not verified evidence.
+    let mut fabricated: Value = serde_json::from_slice(&family_bytes).unwrap();
+    let screened = fabricated["members"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .position(|m| m["screened"].is_string())
+        .unwrap();
+    fabricated["members"][screened]["development"] =
+        fabricated["members"][index]["development"].clone();
+    let fabricated = serde_json::to_vec_pretty(&fabricated).unwrap();
+    let sha = sha256_hex(&fabricated);
+    fs::write(
+        scratch.path(&format!("published/objects/{sha}")),
+        &fabricated,
+    )
+    .unwrap();
+    let mut manifest_json: Value = serde_json::from_slice(&manifest_before).unwrap();
+    manifest_json["objects"][0]["key"] = Value::from(format!("objects/{sha}"));
+    manifest_json["objects"][0]["sha256"] = Value::from(sha);
+    manifest_json["objects"][0]["bytes"] = Value::from(fabricated.len());
     fs::write(
         &manifest_path,
-        serde_json::to_vec_pretty(&provenance).unwrap(),
+        serde_json::to_vec_pretty(&manifest_json).unwrap(),
     )
     .unwrap();
     let error = verify(&manifest_path).unwrap_err();
     assert!(
-        error.contains("generation is not the identity")
-            || error.contains("not the bound generations"),
+        error.contains("is not replayed and resampled exactly as its status requires"),
         "{error}"
     );
     // A family whose chunks vanished cannot verify even though every recorded field is intact.
