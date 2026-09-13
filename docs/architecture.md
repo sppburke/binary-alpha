@@ -66,6 +66,13 @@ engine owns the exact money, the records, every decision and posting, the ledger
 and the summary; the application binds the inputs, feeds ticks and feature rows in availability
 order with the configured simulated acceptances, and publishes the replay generation through the
 same store after restoring it.
+`binary-alpha search --config PATH` is the candidate-search path described in section "Search":
+the engine owns enumeration, family identity, the model score and its adjustment, the sampler,
+the gates and the ranking; the application binds one development and one optional evaluation
+input, lowers every condition and replays every survivor through the replay owner, scores the
+family through the accelerator boundary, resamples settlement paths through the retained
+bootstrap primitive, and publishes the family generation through the same store after verifying
+it.
 
 ## Data flow owned by later phases
 
@@ -80,7 +87,7 @@ live feed (#11) ─────────┘                                  
                                                                                                       ▼
 artifacts: Google Cloud Storage, Supabase references (#3)  ◀── strategy, replay, settlement, accounting, risk (#7, this checkout)
                                                                      ▲                     │
-accelerator with central-processor reference (#8, this checkout) ─▶ candidate search and evaluation (#9)  │
+accelerator with central-processor reference (#8, this checkout) ─▶ candidate search and evaluation (#9, this checkout)  │
                                                      repair, portfolio, risk tuning (#10)  │
 research, optimization, certification (#12) ◀──────────────────────────────────────────────┘
 live runtime and cutover (#13) ─▶ execution ─▶ broker adapter (#11)
@@ -103,7 +110,9 @@ live runtime and cutover (#13) ─▶ execution ─▶ broker adapter (#11)
 | Exact money, strategy and deployment records, chronological admission, settlement, accounting, risk, the ledger and its restoration, summaries | `binary-alpha-engine`, module `execution` | this checkout ([#7](https://github.com/sppburke/binary-alpha/issues/7)) |
 | Binding replay inputs, the availability merge, the historical simulation, replay publication and reconstruction | `binary-alpha-app`, module `replay` | this checkout ([#7](https://github.com/sppburke/binary-alpha/issues/7)) |
 | Device kernels behind a reviewed safe boundary; central-processor reference as the raw-result oracle, Engine as the final chronological audit | `binary-alpha-accelerator` | this checkout ([#8](https://github.com/sppburke/binary-alpha/issues/8)) |
-| Candidate search, evaluation, repair, portfolio, risk tuning | `binary-alpha-engine` with thin application entry points | [#9](https://github.com/sppburke/binary-alpha/issues/9), [#10](https://github.com/sppburke/binary-alpha/issues/10) |
+| Candidate enumeration, family identity, the binomial model score and its adjustment, the stationary-block sampler, development gates and ranking, the family records | `binary-alpha-engine`, module `search` | this checkout ([#9](https://github.com/sppburke/binary-alpha/issues/9)) |
+| Binding search inputs, the lowering and chunk replays, device scoring, stability resampling, family publication and verification | `binary-alpha-app`, module `search` | this checkout ([#9](https://github.com/sppburke/binary-alpha/issues/9)) |
+| Repair, portfolio, risk tuning | `binary-alpha-engine` with thin application entry points | [#10](https://github.com/sppburke/binary-alpha/issues/10) |
 | Broker contracts and adapters, secrets resolution | `binary-alpha-app` | [#11](https://github.com/sppburke/binary-alpha/issues/11) |
 | Research orchestration, holdout grants, certification | `binary-alpha-app` over engine stages | [#12](https://github.com/sppburke/binary-alpha/issues/12) |
 | Live runtime, authorization, resumable cutover | `binary-alpha-app` | [#13](https://github.com/sppburke/binary-alpha/issues/13) |

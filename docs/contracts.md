@@ -113,6 +113,7 @@ and content hash; the application package owns reading it from a path.
 | `features.instruments` | array of tables | optional; consumed only by `features build`, which requires at least one entry |
 | `outcomes` | table | optional; consumed only by `outcomes build`, which requires it |
 | `accelerator.backend` | string | optional section; explicit offline backend `cpu` or `cuda` |
+| `search` | table | optional; consumed only by `search`, which requires it |
 
 Every `import.sources` entry declares `kind`, `path` (a relative path resolves against the
 configuration file's directory), `broker`, and `role` (`development` or `evaluation`; `holdout` is
@@ -1039,3 +1040,120 @@ and writes
 `verified ROLE generation GENERATION events E signals S accepted A settled T unresolved U objects 2 bytes B`.
 Restoring the ledger alone proves the financial state; input replay through the command proves
 that signals and paths were derived from the inputs.
+
+## Search
+
+The engine module `search` owns candidate enumeration, family identity, the model score and its
+adjustment, the stationary-block sampler, the development gates and the ranking; the application
+module `search` binds the inputs, runs the lowering and chunk replays through the replay owner,
+scores the family through the accelerator boundary, resamples settlement paths through the retained
+bootstrap primitive, and publishes the family. `binary-alpha search --config PATH` requires
+`run_mode = "research"`. The engine remains the only financial authority: device counts rank and,
+under heuristic scope, prune; they never settle or rank financially. Every score is a model-based
+diagnostic; nothing claims a controlled false-discovery rate, an interval guarantee, or positive
+expected return.
+
+### Configuration
+
+The optional `search` table declares, in canonical order: `scope` (`exhaustive` replays every
+member; `heuristic` requires `screen` and replays only members it keeps), `seed`, positive
+`chunk_size` and `max_candidates`, `min_conditions` and `max_conditions` with
+`1 <= min <= max <= distinct conditions`, non-negative `embargo_micros` at least every
+contract's `duration_micros + settlement.max_settlement_delay_micros`, `base_stream`,
+`development` and optional `evaluation` (each a `decision_start`, `decision_end`, exactly one
+`inputs` entry as in `replay`, and optional `splits`, none named `none`; the development input
+must name its `outcome_manifest`; `evaluation.decision_start - development.decision_end` must be
+at least the embargo), a nonempty `conditions` menu (each entry a `stream`, `output`,
+`comparator` and nonempty ordered `thresholds`), the `contracts` (existing contract terms with
+unique ids, no two agreeing in every field but their id, and every duration a whole number of
+seconds among the bound outcome generation's expiries), the `account` template (`broker`,
+`currency`, `scale`, `initial_cash`), one `risk_policy` (existing fields; `max_open_per_duration`,
+`max_open_per_instrument`, `max_open_total` and `max_unresolved_loss_total` must be absent because
+they span accounts), the `envelope`, the `gates` (`min_settled`, `max_unresolved`,
+`min_net_profit`), the optional `screen` (`max_adjusted_score` in `[0, 1]`, optional positive
+`top`), and `stability` (positive `block_length`, `simulations`, `rolling_horizon`). The
+synthesized replay tables are validated by the execution rules. Omitting the table preserves every
+existing configuration identity; the `accelerator` table selects the backend, `cpu` when absent.
+
+### Stages and identities
+
+The menu expands to distinct conditions in menu order. Candidates are every combination of
+`min_conditions..=max_conditions` conditions in increasing count then lexicographic index order,
+deduplicated by signal-logic identity (the first combination keeps it). A member is one candidate
+paired with one contract in configured order; members keep their zero-based global index
+`m{index}` everywhere. The family size is computed with checked arithmetic before any allocation.
+
+Lowering runs one development replay whose strategies are one single-condition strategy per
+distinct condition (`c{index}`), each on its own unfunded account with the first contract, the
+configured policy and envelope; each `signal` record marks a base row where that condition held.
+Every synthesized replay carries only the schema version, run mode, storage and its role's replay
+table (contracts in configured order, `max_rate_age_micros = 0`, no rates), so its generation is
+independent of backend and of the other role. The base rows are the base stream's reference rows
+of the bound outcome generation; for each contract duration the device rows are derived with the
+outcome reader's cell: a row without an entry tick is masked out, the decision clock is the entry
+tick time, `valid` is set only for `valid` cells, the outcome flags follow the cell, and the
+release clock is the settlement tick time when valid and the nominal due time otherwise. The
+basic dual kernel compares its clock arguments only, so they carry microsecond times unchanged
+under their retained `_ms` names; rows are ordered by decision time then index, the mask is one
+inside the development window, the equality bucket is one, `payout_basis` is zero, and columns
+zero to four (total, wins, losses, ties, invalid) are read.
+
+The statistic of a member applies when `W = winning_net() >= 0`,
+`L = purchase() + loss.terminal_fee - loss.gross_return > 0`, and the tie nets exactly zero,
+with `p0 = L / (W + L)` from the aligned coefficients; `W = 0` or zero decisive trials gives score
+one, and an inapplicable member records its reason. The score is the one-sided exact binomial
+upper tail on decisive counts summed in log space away from the mode; the adjusted value is the
+reverse cumulative minimum of `min(1, m * p / rank)` after sorting by score then member order
+over the applicable members. Heuristic scope screens members whose adjusted value exceeds
+`max_adjusted_score`, beyond the first `top` by adjusted value then order, and every inapplicable
+member; screened members are never replayed.
+
+Survivors are replayed in canonical chunks of `chunk_size`, one account, strategy and binding per
+member. A completed chunk generation is reused only after its own verifier restores it and its
+manifest records the same instruments, configuration hash and code revision. The development
+group of a member is its binding's summary group (a zero group when it never signalled); profit
+is the account-currency entry, zero when absent with no settlements, unavailable when the engine
+recorded no total. The gates pass when `settled >= min_settled`, `unresolved <= max_unresolved`
+and available profit `>= min_net_profit`; ranking is net profit descending, settled count
+descending, then member order. Evaluation replays the passing members with `role = "evaluation"`
+and the declared splits only after the development result is complete, and the shared ledger
+projection attributes every `accepted`, `released`, `settled` and `unresolved` record to its
+admitted `signal`'s binding and split (`none` outside every declared split). Stability draws
+`simulations` circular stationary-block index paths per passing member and role over its
+settlement profits in ledger order (sampler `stationary_block_sha256_v1`: SHA-256 over the domain
+`binary-alpha search sampler v1\n`, the little-endian 64-bit seed, the stratum
+`{logic identity}/{contract id}/{role}`, a zero byte and the little-endian 32-bit replicate, then a
+little-endian 64-bit counter from zero per digest whose four little-endian 64-bit words are
+consumed in order; a uniform draw below `m` rejects words at or above the largest multiple of
+`m`; the first index is uniform, and each later step restarts uniformly exactly when a uniform
+draw below `block_length` is zero, else advances circularly), evaluates them with the retained
+bootstrap primitive, and reports the median and 95th-percentile maximum drawdown, the
+95th-percentile longest underwater run (linear interpolation at `(simulations - 1) * q`) and the
+negative rolling-window share over `simulations * (N - rolling_horizon + 1)` windows; fewer than
+two settlements or a horizon beyond them is `unavailable` with its reason.
+
+### Family generations
+
+The family generation publishes one object, `family.json`: the resolved `search` table, the plan
+identity and base stream, the SHA-256 identity of the retained kernel sources, the sampler
+version, the applicable count, every member (conditions, contract, logic identity, raw counts,
+null, applicability, score, adjusted value, screen reason, development group, gate reason, rank,
+evaluation group, evaluation split groups, stability outcomes), and the lowering and chunk
+generation references with their summary identities; pretty-printed JSON in declared field order
+with one trailing newline, and identical on every backend. The ready manifest records `kind`
+(`search_family`), `schema_version` (`1`), `generation`, `config_hash`, `code_revision`, the
+ordered `inputs` (role, instrument, tick, feature, plan and outcome identities), `members`, and
+`objects`. The generation is SHA-256 over `binary-alpha search family v1\n`, the configuration
+hash and the code revision each followed by a newline, then one line per input
+(`role instrument tick feature plan outcome`, a dash for an absent outcome) followed by a newline.
+The command writes
+`search SCOPE generation GENERATION members M applicable A screened S replayed R passed P evaluated E objects 1`
+followed by the stage timings and peak resident memory or `(already published)`, then the
+verification line. `data verify` on a family generation validates the manifest and object,
+re-enumerates the members from the recorded table, restores every referenced replay through its
+verifier and checks its definition against the table synthesized for its recorded members,
+recomputes the raw counts through the central-processor kernel from the verified lowering records
+and the bound outcome objects, compares every group and split group with the verified summaries
+and the ledger projection, recomputes stability, applicability, scores, adjustments, screen
+decisions, gates and ranks, and writes
+`verified search generation GENERATION members M applicable A replayed R passed P objects 1 bytes B`.

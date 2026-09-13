@@ -140,7 +140,7 @@ compilation is not used. Build flags retain `--std=c++11` without fast math.
 5. [#6](https://github.com/sppburke/binary-alpha/issues/6) Phase 05 — Build future-only binary-expiry outcomes
 6. [#7](https://github.com/sppburke/binary-alpha/issues/7) Phase 06 — Build one deterministic strategy, replay, settlement, and risk engine
 7. [#8](https://github.com/sppburke/binary-alpha/issues/8) Phase 07 — Preserve and port every existing NVIDIA CUDA kernel behind Rust
-8. [#9](https://github.com/sppburke/binary-alpha/issues/9) Phase 08 — Build candidate search, chronological evaluation, false-discovery control, and stability analysis
+8. [#9](https://github.com/sppburke/binary-alpha/issues/9) Phase 08 — Build candidate search, chronological evaluation, model-based statistical scores, and stability analysis
 9. [#10](https://github.com/sppburke/binary-alpha/issues/10) Phase 09 — Unify repair, portfolio selection, and risk tuning
 10. [#11](https://github.com/sppburke/binary-alpha/issues/11) Phase 10 — Add broker-neutral direct WebSocket contracts and a Deriv adapter
 11. [#12](https://github.com/sppburke/binary-alpha/issues/12) Phase 11 — Deliver one-command research, optimization, and locked-holdout certification

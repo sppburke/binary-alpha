@@ -302,7 +302,7 @@ fn le_bytes<T: Copy, const N: usize>(values: &[T], encode: fn(T) -> [u8; N]) -> 
 }
 
 /// Decodes a little-endian array, rejecting a byte count that is not whole values.
-fn from_le_bytes<T, const N: usize>(
+pub(crate) fn from_le_bytes<T, const N: usize>(
     bytes: &[u8],
     decode: fn([u8; N]) -> T,
 ) -> Result<Vec<T>, String> {

@@ -1,6 +1,6 @@
 //! The `binary-alpha` executable: configuration validation, historical-data import, instrument
-//! audit, feature builds, outcome builds, engine replay, verification, and the external adapters
-//! those commands need.
+//! audit, feature builds, outcome builds, engine replay, candidate search, verification, and the
+//! external adapters those commands need.
 
 mod archive;
 mod audit;
@@ -9,6 +9,7 @@ mod import;
 mod outcomes;
 mod parallel;
 mod replay;
+mod search;
 mod store;
 mod verify;
 
@@ -58,6 +59,12 @@ enum Command {
     /// Replay governed historical inputs through the engine and publish its ledger.
     Replay {
         /// Path of the TOML configuration document with the `replay` table.
+        #[arg(long)]
+        config: PathBuf,
+    },
+    /// Enumerate, score, replay, evaluate, and resample one candidate family and publish it.
+    Search {
+        /// Path of the TOML configuration document with the `search` table.
         #[arg(long)]
         config: PathBuf,
     },
@@ -142,6 +149,7 @@ fn main() -> ExitCode {
             command: OutcomesCommand::Build { config },
         } => outcomes::run(&config, &mut std::io::stdout().lock()),
         Command::Replay { config } => replay::run(&config, &mut std::io::stdout().lock()),
+        Command::Search { config } => search::run(&config, &mut std::io::stdout().lock()),
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,

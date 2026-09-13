@@ -27,3 +27,7 @@ jobs:
         env:
           BINARY_ALPHA_TEST_CONFIG: /mnt/data/issue-7-scratch/phase06_test_config.json
           BINARY_ALPHA_CUDA_REFERENCE: /mnt/data/binary-alpha-phase07-reference/attempt5/reference.json
+      - name: Governed candidate evaluation
+        run: cargo test --release --locked -p binary-alpha-app --features cuda --test phase08_candidate_evaluation governed_candidate_evaluation -- --exact --ignored --nocapture
+        env:
+          BINARY_ALPHA_TEST_CONFIG: /mnt/data/issue-7-scratch/phase06_test_config.json

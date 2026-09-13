@@ -11,8 +11,8 @@ use sha2::{Digest, Sha256};
 
 use crate::dataset::{DatasetRole, NativeGranularity};
 use crate::execution::{
-    AccountSpec, ContractTerms, DeploymentBinding, RateEvent, ReplayInput, RiskPolicy, Split,
-    StrategySpec,
+    AccountSpec, Comparator, ContractTerms, Decimal, DeploymentBinding, Envelope, RateEvent,
+    ReplayInput, RiskPolicy, Split, StrategySpec, Threshold,
 };
 use crate::market::{BrokerId, Currency, InstrumentId, PriceScale, ProviderSymbol};
 
@@ -41,6 +41,8 @@ pub struct Config {
     pub replay: Option<Replay>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub accelerator: Option<Accelerator>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub search: Option<Search>,
 }
 
 impl Config {
@@ -103,6 +105,11 @@ impl Config {
             replay
                 .validate()
                 .map_err(|reason| format!("replay.{reason}"))?;
+        }
+        if let Some(search) = &self.search {
+            search
+                .validate()
+                .map_err(|reason| format!("search.{reason}"))?;
         }
         let Some(import) = &self.import else {
             return Ok(());
@@ -951,6 +958,98 @@ impl Replay {
     pub fn validate(&self) -> Result<(), String> {
         crate::execution::validate(self)
     }
+}
+
+/// The optional `search` table: one typed candidate search over a development input set and an
+/// optional evaluation input set. Omitting the table preserves every existing identity.
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct Search {
+    pub scope: Scope,
+    pub seed: u64,
+    pub chunk_size: u32,
+    pub max_candidates: u64,
+    pub min_conditions: u32,
+    pub max_conditions: u32,
+    pub embargo_micros: i64,
+    pub base_stream: StreamKey,
+    pub development: SearchWindow,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evaluation: Option<SearchWindow>,
+    pub conditions: Vec<SearchCondition>,
+    pub contracts: Vec<ContractTerms>,
+    pub account: SearchAccount,
+    pub risk_policy: RiskPolicy,
+    pub envelope: Envelope,
+    pub gates: crate::search::Gates,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub screen: Option<Screen>,
+    pub stability: StabilitySettings,
+}
+
+impl Search {
+    /// The rules a single field's deserializer cannot see; an error names the field.
+    pub fn validate(&self) -> Result<(), String> {
+        crate::search::validate(self)
+    }
+}
+
+crate::string_enum! {
+    /// Whether every structurally valid member is replayed, or the model score prunes first.
+    Scope "search scope" {
+        Exhaustive => "exhaustive",
+        Heuristic => "heuristic",
+    }
+}
+
+/// One role's decision window, bound inputs, and optional reporting splits.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SearchWindow {
+    pub decision_start: String,
+    pub decision_end: String,
+    pub inputs: Vec<ReplayInput>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub splits: Option<Vec<Split>>,
+}
+
+/// One menu entry: one output and comparator with its ordered thresholds.
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SearchCondition {
+    pub stream: StreamKey,
+    pub output: String,
+    pub comparator: Comparator,
+    pub thresholds: Vec<Threshold>,
+}
+
+/// The account every member is funded from, one account per member.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SearchAccount {
+    pub broker: BrokerId,
+    pub currency: Currency,
+    pub scale: u8,
+    pub initial_cash: Decimal,
+}
+
+/// Heuristic screening: members above the adjusted score, or beyond the first `top`, are
+/// eliminated before any engine replay.
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct Screen {
+    pub max_adjusted_score: f64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub top: Option<u32>,
+}
+
+/// The frozen stationary-block resampling settings.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct StabilitySettings {
+    pub block_length: u32,
+    pub simulations: u32,
+    pub rolling_horizon: u32,
 }
 
 /// Explicit offline accelerator selection. Absence preserves existing configuration identity.
@@ -2072,6 +2171,140 @@ mod replay_tests {
             Config::parse(&distinct).is_ok(),
             "another envelope is another deployment strategy"
         );
+    }
+}
+
+#[cfg(test)]
+mod search_tests {
+    use super::*;
+
+    const HEAD: &str = "schema_version = 1\nrun_mode = \"research\"\n\n[storage]\nhistorical_data_dir = \"h\"\npublication_uri = \"file:///p\"\n";
+    const TABLE: &str = "\n[search]\nscope = \"exhaustive\"\nseed = 7\nchunk_size = 8\nmax_candidates = 100\nmin_conditions = 1\nmax_conditions = 2\nembargo_micros = 3600000000\nbase_stream = { duration_seconds = 20, offset_seconds = 0 }\n\n[search.development]\ndecision_start = \"2026-01-05T00:00:20Z\"\ndecision_end = \"2026-01-05T00:21:40Z\"\ninputs = [{ tick_manifest = \"file:///p/manifests/1111111111111111111111111111111111111111111111111111111111111111/ready.json\", feature_manifest = \"file:///p/manifests/2222222222222222222222222222222222222222222222222222222222222222/ready.json\", outcome_manifest = \"file:///p/manifests/3333333333333333333333333333333333333333333333333333333333333333/ready.json\" }]\n\n[search.evaluation]\ndecision_start = \"2026-01-05T02:00:20Z\"\ndecision_end = \"2026-01-05T02:21:40Z\"\ninputs = [{ tick_manifest = \"file:///p/manifests/4444444444444444444444444444444444444444444444444444444444444444/ready.json\", feature_manifest = \"file:///p/manifests/5555555555555555555555555555555555555555555555555555555555555555/ready.json\" }]\nsplits = [{ name = \"a\", start = \"2026-01-05T02:00:20Z\", end = \"2026-01-05T02:11:00Z\" }, { name = \"b\", start = \"2026-01-05T02:11:00Z\", end = \"2026-01-05T02:21:40Z\" }]\n\n[[search.conditions]]\nstream = { duration_seconds = 20, offset_seconds = 0 }\noutput = \"candle_direction\"\ncomparator = \"eq\"\nthresholds = [\"up\", \"down\"]\n\n[[search.conditions]]\nstream = { duration_seconds = 20, offset_seconds = 0 }\noutput = \"range_bps\"\ncomparator = \"gt\"\nthresholds = [0.08]\n\n[[search.contracts]]\nid = \"buy\"\ndirection = \"buy\"\nduration_micros = 5000000\ncurrency = \"unit\"\nstake = \"1\"\nquoted_cost = \"1\"\nentry_fee = \"0\"\nwin = { gross_return = \"1.80\", terminal_fee = \"0\" }\nloss = { gross_return = \"0\", terminal_fee = \"0\" }\ntie = { gross_return = \"1\", terminal_fee = \"0\" }\nsettlement = { rule = \"price_at_due_v1\", max_settlement_delay_micros = 2000000, max_tick_gap_micros = 2000000 }\n\n[[search.contracts]]\nid = \"sell\"\ndirection = \"sell\"\nduration_micros = 5000000\ncurrency = \"unit\"\nstake = \"1\"\nquoted_cost = \"1\"\nentry_fee = \"0\"\nwin = { gross_return = \"1.80\", terminal_fee = \"0\" }\nloss = { gross_return = \"0\", terminal_fee = \"0\" }\ntie = { gross_return = \"1\", terminal_fee = \"0\" }\nsettlement = { rule = \"price_at_due_v1\", max_settlement_delay_micros = 2000000, max_tick_gap_micros = 2000000 }\n\n[search.account]\nbroker = \"pocket_option\"\ncurrency = \"unit\"\nscale = 2\ninitial_cash = \"1000\"\n\n[search.risk_policy]\nid = \"one\"\nmax_open_per_strategy = 1\nsame_entry = \"all\"\ndeduplicate_signal_logic = false\nmax_feature_age_micros = 60000000\nmax_quote_age_micros = 0\n\n[search.envelope]\nmax_purchase_cost = \"1\"\nmax_entry_fee = \"0\"\nmax_win_terminal_fee = \"0\"\nmax_loss_terminal_fee = \"0\"\nmax_tie_terminal_fee = \"0\"\nmin_winning_net_return = \"0.80\"\nsettlement_rule = \"price_at_due_v1\"\n\n[search.gates]\nmin_settled = 1\nmax_unresolved = 0\nmin_net_profit = \"0\"\n\n[search.stability]\nblock_length = 4\nsimulations = 64\nrolling_horizon = 4\n";
+
+    fn table(edit: impl Fn(&str) -> String) -> String {
+        format!("{HEAD}{}", edit(TABLE))
+    }
+
+    #[test]
+    fn searches_round_trip_through_the_canonical_form() {
+        let config = Config::parse(&table(|t| t.to_string())).unwrap();
+        let search = config.search.as_ref().unwrap();
+        assert_eq!(search.scope, Scope::Exhaustive);
+        assert_eq!(search.conditions.len(), 2);
+        assert_eq!(
+            search
+                .evaluation
+                .as_ref()
+                .unwrap()
+                .splits
+                .as_ref()
+                .unwrap()
+                .len(),
+            2
+        );
+        let canonical = config.canonical_toml();
+        let reparsed = Config::parse(&canonical).unwrap();
+        assert_eq!(reparsed, config);
+        assert_eq!(reparsed.canonical_toml(), canonical);
+        assert_ne!(
+            config.content_hash(),
+            Config::parse(HEAD).unwrap().content_hash(),
+            "the table changes the identity"
+        );
+        assert_eq!(
+            Config::parse(&table(|t| format!(
+                "{}\n[search.screen]\nmax_adjusted_score = 0.5\ntop = 3\n",
+                t.replace("scope = \"exhaustive\"", "scope = \"heuristic\"")
+            )))
+            .unwrap()
+            .search
+            .unwrap()
+            .screen
+            .unwrap()
+            .top,
+            Some(3)
+        );
+    }
+
+    #[test]
+    fn search_rules_reject_with_the_field_name() {
+        for (edit, expected) in [
+            (
+                "scope = \"heuristic\"",
+                "search.screen: heuristic scope requires the screen table",
+            ),
+            ("chunk_size = 0", "search.chunk_size: must be positive"),
+            (
+                "min_conditions = 3",
+                "search.min_conditions: 3 must be at least one and at most max_conditions 2",
+            ),
+            (
+                "max_conditions = 4",
+                "search.max_conditions: 4 exceeds the 3 distinct conditions of the menu",
+            ),
+            (
+                "max_candidates = 5",
+                "search.max_candidates: the menu enumerates 12 members, above the maximum 5",
+            ),
+            (
+                "embargo_micros = 6000000",
+                "search.embargo_micros: 6000000 is shorter than contracts[0]'s duration plus settlement delay 7000000",
+            ),
+            (
+                "max_quote_age_micros = 0",
+                "search.risk_policy.max_open_total: a cross-account scope would let members interact; leave it absent",
+            ),
+            (
+                "name = \"a\"",
+                "search.evaluation.splits: `none` names the undeclared split",
+            ),
+            (
+                "decision_start = \"2026-01-05T02:00:20Z\"",
+                "search.evaluation.decision_start: 2026-01-05T00:30:00Z begins less than the embargo after development.decision_end 2026-01-05T00:21:40Z",
+            ),
+            (
+                "id = \"sell\"\ndirection = \"sell\"",
+                "search.contracts[1]: repeats every term of contracts[0]; one hypothesis per contract",
+            ),
+            (
+                "rolling_horizon = 4",
+                "search.stability.rolling_horizon: must be positive",
+            ),
+        ] {
+            let edited = match edit {
+                "max_quote_age_micros = 0" => {
+                    table(|t| t.replace(edit, "max_quote_age_micros = 0\nmax_open_total = 5"))
+                }
+                "name = \"a\"" => table(|t| t.replace(edit, "name = \"none\"")),
+                "decision_start = \"2026-01-05T02:00:20Z\"" => table(|t| {
+                    t.replace(edit, "decision_start = \"2026-01-05T00:30:00Z\"")
+                        .replace(
+                            "name = \"a\", start = \"2026-01-05T02:00:20Z\"",
+                            "name = \"a\", start = \"2026-01-05T00:30:00Z\"",
+                        )
+                }),
+                "id = \"sell\"\ndirection = \"sell\"" => {
+                    table(|t| t.replace(edit, "id = \"sell\"\ndirection = \"buy\""))
+                }
+                "rolling_horizon = 4" => table(|t| t.replace(edit, "rolling_horizon = 0")),
+                _ => table(|t| {
+                    t.replace(
+                        match edit {
+                            "scope = \"heuristic\"" => "scope = \"exhaustive\"",
+                            "chunk_size = 0" => "chunk_size = 8",
+                            "min_conditions = 3" => "min_conditions = 1",
+                            "max_conditions = 4" => "max_conditions = 2",
+                            "max_candidates = 5" => "max_candidates = 100",
+                            "embargo_micros = 6000000" => "embargo_micros = 3600000000",
+                            other => other,
+                        },
+                        edit,
+                    )
+                }),
+            };
+            let error = Config::parse(&edited).unwrap_err().to_string();
+            assert!(error.contains(expected), "{edit}: {error}");
+        }
     }
 }
 
