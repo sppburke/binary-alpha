@@ -16,6 +16,7 @@ use binary_alpha_engine::execution::REPLAY_MANIFEST_KIND;
 use binary_alpha_engine::features::FEATURE_MANIFEST_KIND;
 use binary_alpha_engine::market::format_event_time_micros;
 use binary_alpha_engine::outcomes::OUTCOME_MANIFEST_KIND;
+use binary_alpha_engine::search::FAMILY_MANIFEST_KIND;
 use binary_alpha_engine::stream::{
     InstrumentProfile, PROFILE_OBJECT_PATH, STREAM_MANIFEST_KIND, StreamManifest, StreamSummary,
 };
@@ -40,6 +41,9 @@ pub fn run(uri: &str) -> Result<String, String> {
         }
         Some(REPLAY_MANIFEST_KIND) => {
             crate::replay::verify_replay(uri, &store, &manifest_key, &bytes)
+        }
+        Some(FAMILY_MANIFEST_KIND) => {
+            crate::search::verify_family(uri, &store, &manifest_key, &bytes)
         }
         Some(kind) => Err(format!("{uri}: unsupported manifest kind `{kind}`")),
     }

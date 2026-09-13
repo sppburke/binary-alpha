@@ -18,7 +18,7 @@ use binary_alpha_engine::execution::{
     ColumnSpec, EVENTS_OBJECT_PATH, Engine, EventKind, EventSource, FinancialEvent,
     HISTORICAL_AVAILABILITY, InstrumentBinding, Observation, REPLAY_MANIFEST_KIND,
     REPLAY_SCHEMA_VERSION, ReplayManifest, RunDefinition, SUMMARY_OBJECT_PATH, StreamColumns,
-    replay_generation_id,
+    Summary, replay_generation_id,
 };
 use binary_alpha_engine::features::{FeaturePlan, StreamPlan, Value};
 use binary_alpha_engine::market::parse_event_time_micros;
@@ -506,10 +506,30 @@ fn simulate(
     Ok(engine)
 }
 
+/// One published replay generation: its ready manifest, the published summary, and the report
+/// and reconstruction lines of the command.
+pub(crate) struct Published {
+    pub(crate) manifest: ReplayManifest,
+    pub(crate) summary: Summary,
+    pub(crate) report: String,
+}
+
 /// The typed replay every caller uses: bind, simulate, publish, and reconstruct one replay
 /// generation of the configuration's `replay` table, returning its report and reconstruction
 /// lines.
 pub fn replay(config: &Config, local: &Store, destination: &Store) -> Result<String, String> {
+    publish(config, local, destination, false).map(|published| published.report)
+}
+
+/// Binds, simulates, publishes, and reconstructs one replay generation. With `resume`, a
+/// generation whose ready manifest the destination already holds is read back instead of
+/// simulated again; the search stages reuse their completed chunks this way.
+pub(crate) fn publish(
+    config: &Config,
+    local: &Store,
+    destination: &Store,
+    resume: bool,
+) -> Result<Published, String> {
     let settings = config
         .replay
         .as_ref()
@@ -528,6 +548,47 @@ pub fn replay(config: &Config, local: &Store, destination: &Store) -> Result<Str
     };
     let generation = replay_generation_id(&definition.config_hash, &definition.instruments);
     let key = manifest_key(&generation);
+    if resume && destination.head(&key)?.is_some() {
+        let mut bytes = Vec::new();
+        destination.read_to(&key, None, &mut bytes)?;
+        let uri = destination.uri(&key);
+        let manifest =
+            ReplayManifest::from_json(&bytes).map_err(|error| format!("{uri}: {error}"))?;
+        if manifest.key() != key
+            || manifest.instruments != definition.instruments
+            || manifest.config_hash != definition.config_hash
+            || manifest.code_revision != definition.code_revision
+        {
+            return Err(format!(
+                "{uri} does not record this replay's generation, instruments, configuration, and code revision"
+            ));
+        }
+        // A completed generation is reused only after its own verifier restores it.
+        verify_replay(&uri, destination, &key, &bytes)?;
+        let summary_object = manifest
+            .objects
+            .iter()
+            .find(|object| object.path == SUMMARY_OBJECT_PATH)
+            .ok_or_else(|| format!("{uri} lists no `{SUMMARY_OBJECT_PATH}`"))?;
+        let mut bytes = Vec::new();
+        destination.read_to(&summary_object.key, summary_object.generation, &mut bytes)?;
+        let summary = Summary::from_json(&bytes).map_err(|error| format!("{uri}: {error}"))?;
+        if summary.identity() != manifest.summary_identity {
+            return Err(format!(
+                "{uri}: the published summary does not match the manifest"
+            ));
+        }
+        return Ok(Published {
+            report: format!(
+                "replay {} generation {generation} instruments {} events {} (already published)",
+                manifest.role,
+                manifest.instruments.len(),
+                manifest.events
+            ),
+            manifest,
+            summary,
+        });
+    }
     let mut inputs = Vec::with_capacity(bound.len());
     for instrument in &bound {
         let (times, prices) = load_ticks(
@@ -576,7 +637,7 @@ pub fn replay(config: &Config, local: &Store, destination: &Store) -> Result<Str
         }
     }
     let events_file = ledger.finish()?;
-    let summary = engine.summary();
+    let summary = engine.summary().clone();
     let mut summary_file = Temporary::create(local, &format!("replay-{generation}-summary"))?;
     summary_file.write(&summary.to_json())?;
     let files = [events_file, summary_file.finish()?];
@@ -678,7 +739,12 @@ pub fn replay(config: &Config, local: &Store, destination: &Store) -> Result<Str
             published.as_secs_f64()
         ),
     };
-    Ok(format!("{line}\n{verified}"))
+    let manifest = ReplayManifest::from_json(&committed).expect("the committed manifest parsed");
+    Ok(Published {
+        manifest,
+        summary,
+        report: format!("{line}\n{verified}"),
+    })
 }
 
 /// Verifies a replay generation: every object's bytes and hashes, the ledger restored record by

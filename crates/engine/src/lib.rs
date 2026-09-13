@@ -9,6 +9,7 @@ pub mod execution;
 pub mod features;
 pub mod market;
 pub mod outcomes;
+pub mod search;
 pub mod stream;
 
 /// Lowercase hexadecimal rendering of a digest or checksum.
