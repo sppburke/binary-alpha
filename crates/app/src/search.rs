@@ -1043,8 +1043,10 @@ pub fn verify_family(uri: &str, store: &Store, key: &str, bytes: &[u8]) -> Resul
         replay::verify_replay(&chunk_uri, store, &chunk_key, &bytes)?;
         let chunk_manifest =
             ReplayManifest::from_json(&bytes).map_err(|error| format!("{chunk_uri}: {error}"))?;
-        // The replay owner reuses an identical earlier generation whatever revision produced
-        // it; the restoration above and the definition check below are the material proofs.
+        // Reuse without simulation (the search's resume path) requires the recorded revision;
+        // a re-simulation under another revision that reproduces the identical generation is
+        // reused by the store, so verification restores every chunk and checks its definition
+        // regardless of the revision that first published it.
         if chunk_manifest.summary_identity != chunk.summary_identity
             || chunk_manifest.role.to_string() != chunk.role
         {
@@ -1199,6 +1201,7 @@ pub fn verify_family(uri: &str, store: &Store, key: &str, bytes: &[u8]) -> Resul
             _ => &[],
         };
         if replayed_development != member.screened.is_none()
+            || member.development.is_some() != replayed_development
             || replayed_evaluation != expect_evaluation
             || member.evaluation.is_some() != expect_evaluation
             || (!member.evaluation_splits.is_empty() && !expect_evaluation)

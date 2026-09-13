@@ -1061,7 +1061,7 @@ member; `heuristic` requires `screen` and replays only members it keeps), `seed`
 `1 <= min <= max <= distinct conditions`, non-negative `embargo_micros` at least every
 contract's `duration_micros + settlement.max_settlement_delay_micros`, `base_stream`,
 `development` and optional `evaluation` (each a `decision_start`, `decision_end`, exactly one
-`inputs` entry as in `replay`, and optional `splits`, none named `none`; the development input
+`inputs` entry as in `replay`, and optional `splits`, no evaluation split named `none`; the development input
 must name its `outcome_manifest`; `evaluation.decision_start - development.decision_end` must be
 at least the embargo), a nonempty `conditions` menu (each entry a `stream`, `output`,
 `comparator` and nonempty ordered `thresholds`), the `contracts` (existing contract terms with
