@@ -122,6 +122,27 @@ fn publish_role(
     rows: &[Row],
     frozen: Option<(&Path, &Path)>,
 ) -> Role {
+    publish_role_with(
+        scratch,
+        name,
+        role,
+        base_ms,
+        rows,
+        frozen,
+        "[\"candle_direction\", \"range_bps\"]",
+    )
+}
+
+/// `publish_role` with an explicit compiled-output list for a new development plan.
+fn publish_role_with(
+    scratch: &Scratch,
+    name: &str,
+    role: &str,
+    base_ms: i64,
+    rows: &[Row],
+    frozen: Option<(&Path, &Path)>,
+    outputs: &str,
+) -> Role {
     let lines = ticks(base_ms, rows);
     write_ticks(
         &scratch.path(&format!("sources/{name}/ticks.csv")),
@@ -168,9 +189,11 @@ fn publish_role(
         ),
     };
     let settings = if frozen.is_none() {
-        "streams = [{ duration_seconds = 20, offset_seconds = 0 }]\noutputs = [\"candle_direction\", \"range_bps\"]\n"
+        format!(
+            "streams = [{{ duration_seconds = 20, offset_seconds = 0 }}]\noutputs = {outputs}\n"
+        )
     } else {
-        ""
+        String::new()
     };
     let features = scratch.config(
         &format!("features_{name}.toml"),
@@ -459,6 +482,47 @@ fn candidate_search_publishes_verifies_and_resumes() {
         &recipe(true),
         Some((&profile, &planted.feature)),
     );
+    // An interrupted run: the evaluation input applies another development plan, so the search
+    // fails after the development chunks are published; the corrected run reuses every one of
+    // them and adds exactly one evaluation chunk and the family.
+    let other = publish_role_with(
+        &scratch,
+        "development_other",
+        "development",
+        BASE_DEV_MS,
+        &recipe(true),
+        None,
+        "[\"candle_direction\"]",
+    );
+    let fitted = publish_role(
+        &scratch,
+        "evaluation_fitted",
+        "evaluation",
+        BASE_EVAL_MS,
+        &recipe(true),
+        Some((&profile, &other.feature)),
+    );
+    let interrupted = SearchSpec {
+        development: &planted,
+        evaluation: Some(&fitted),
+        scope: "exhaustive",
+        screen: "",
+        horizon: 4,
+        extra_contracts: &format!(
+            "{}{}",
+            contract("fee_buy", "buy", "0.10", "1.10"),
+            contract("odd_tie_buy", "buy", "0", "0.95")
+        ),
+        policy_extra: "",
+        chunk_size: 8,
+    };
+    let wrong = scratch.config("search_interrupted.toml", &search_table(&interrupted));
+    let error = command(&["search", "--config", wrong.to_str().unwrap()]).unwrap_err();
+    assert!(
+        error.contains("does not apply the development plan"),
+        "{error}"
+    );
+    let after_interruption = scratch.manifests("published").len();
     let spec = SearchSpec {
         development: &planted,
         evaluation: Some(&evaluation),
@@ -481,6 +545,11 @@ fn candidate_search_publishes_verifies_and_resumes() {
         ),
         "{}",
         lines[0]
+    );
+    assert_eq!(
+        scratch.manifests("published").len(),
+        after_interruption + 2,
+        "the corrected run reuses the lowering and every development chunk"
     );
     let winners = [
         (member(&family, &["up", "range_gt"], "buy"), "buy"),
@@ -580,6 +649,11 @@ fn candidate_search_publishes_verifies_and_resumes() {
                 .unwrap()
         })
         .collect();
+    assert_eq!(
+        ranked,
+        [21, 24, 27, 28, 31, 33, 26, 30],
+        "ties keep member order"
+    );
     assert!(
         ranked[..6]
             .iter()
@@ -815,6 +889,40 @@ fn candidate_search_publishes_verifies_and_resumes() {
     let error = verify(&manifest_path).unwrap_err();
     assert!(
         error.contains("records 39 members but the family holds 40"),
+        "{error}"
+    );
+    // Forged provenance: an input identity that is not the bound generation.
+    let mut provenance: Value = serde_json::from_slice(&manifest_before).unwrap();
+    provenance["inputs"][0]["tick_generation"] = Value::from("0".repeat(64));
+    fs::write(
+        &manifest_path,
+        serde_json::to_vec_pretty(&provenance).unwrap(),
+    )
+    .unwrap();
+    let error = verify(&manifest_path).unwrap_err();
+    assert!(
+        error.contains("generation is not the identity")
+            || error.contains("not the bound generations"),
+        "{error}"
+    );
+    // A family whose chunks vanished cannot verify even though every recorded field is intact.
+    let mut missing: Value = serde_json::from_slice(&family_bytes).unwrap();
+    missing["chunks"] = Value::Array(Vec::new());
+    let missing = serde_json::to_vec_pretty(&missing).unwrap();
+    let sha = sha256_hex(&missing);
+    fs::write(scratch.path(&format!("published/objects/{sha}")), &missing).unwrap();
+    let mut manifest_json: Value = serde_json::from_slice(&manifest_before).unwrap();
+    manifest_json["objects"][0]["key"] = Value::from(format!("objects/{sha}"));
+    manifest_json["objects"][0]["sha256"] = Value::from(sha);
+    manifest_json["objects"][0]["bytes"] = Value::from(missing.len());
+    fs::write(
+        &manifest_path,
+        serde_json::to_vec_pretty(&manifest_json).unwrap(),
+    )
+    .unwrap();
+    let error = verify(&manifest_path).unwrap_err();
+    assert!(
+        error.contains("is not replayed and resampled exactly as its status requires"),
         "{error}"
     );
     fs::write(&manifest_path, &manifest_before).unwrap();

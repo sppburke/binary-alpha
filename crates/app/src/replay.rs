@@ -54,15 +54,15 @@ pub fn run(config_path: &Path, out: &mut dyn Write) -> Result<(), String> {
 }
 
 /// One instrument's bound inputs and its frozen binding.
-pub(crate) struct BoundInstrument {
-    pub(crate) inputs: Bound,
-    pub(crate) binding: InstrumentBinding,
+struct BoundInstrument {
+    inputs: Bound,
+    binding: InstrumentBinding,
 }
 
 /// Binds one input through the shared tick and feature binder, then refuses an outcome
 /// generation of other inputs and decision times outside the declared window on the manifest
 /// bytes alone.
-pub(crate) fn bind_instrument(settings: &Replay, index: usize) -> Result<BoundInstrument, String> {
+fn bind_instrument(settings: &Replay, index: usize) -> Result<BoundInstrument, String> {
     let input = &settings.inputs[index];
     let field = |name: &str| format!("inputs[{index}].{name}");
     let inputs = bind_inputs(

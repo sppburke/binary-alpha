@@ -65,9 +65,9 @@ pub fn validate(search: &Search) -> Result<(), String> {
     }
     for (index, contract) in search.contracts.iter().enumerate() {
         let same_terms = |other: &ContractTerms| {
-            let mut renamed = other.clone();
+            let mut renamed = normalized_terms(other);
             renamed.id = contract.id.clone();
-            renamed == *contract
+            renamed == normalized_terms(contract)
         };
         if let Some(earlier) = search.contracts[..index].iter().position(same_terms) {
             return Err(format!(
@@ -205,6 +205,24 @@ pub fn validate(search: &Search) -> Result<(), String> {
         .map_err(|reason| format!("evaluation.{reason}"))?;
     }
     Ok(())
+}
+
+/// The contract with every amount normalized, so equal money written at different scales
+/// compares equal.
+fn normalized_terms(contract: &ContractTerms) -> ContractTerms {
+    let cashflow = |cashflow: crate::execution::Cashflow| crate::execution::Cashflow {
+        gross_return: cashflow.gross_return.normalized(),
+        terminal_fee: cashflow.terminal_fee.normalized(),
+    };
+    ContractTerms {
+        stake: contract.stake.normalized(),
+        quoted_cost: contract.quoted_cost.normalized(),
+        entry_fee: contract.entry_fee.normalized(),
+        win: cashflow(contract.win),
+        loss: cashflow(contract.loss),
+        tie: cashflow(contract.tie),
+        ..contract.clone()
+    }
 }
 
 /// The development replay that lowers every distinct condition of the menu: one unfunded
@@ -820,19 +838,110 @@ pub fn gate(group: &Group, currency: &str, gates: &Gates) -> Result<(), String> 
     Ok(())
 }
 
-/// Orders passing members: net profit descending, settled count descending, then canonical
-/// identity (logic identity, contract) ascending.
-pub fn rank_order(a: (&Group, &str, &str), b: (&Group, &str, &str), currency: &str) -> Ordering {
-    let profit_of = |group: &Group| profit(group, currency);
-    match (profit_of(a.0), profit_of(b.0)) {
-        (Some(x), Some(y)) => y.compare(x).unwrap_or(Ordering::Equal),
-        (Some(_), None) => Ordering::Less,
-        (None, Some(_)) => Ordering::Greater,
-        (None, None) => Ordering::Equal,
+/// Scores every member from its raw counts and contract, adjusts over the applicable subset
+/// of the complete family, and applies the heuristic screen when one is configured. Returns
+/// the applicable count. Members are in canonical order, contracts cycling fastest.
+pub fn score(members: &mut [Member], contracts: &[ContractTerms], screen: Option<&Screen>) -> u64 {
+    for (index, member) in members.iter_mut().enumerate() {
+        let contract = &contracts[index % contracts.len()];
+        (
+            member.null,
+            member.inapplicable,
+            member.score,
+            member.adjusted,
+            member.screened,
+        ) = match null_rate(contract) {
+            Ok(null) => {
+                let score = upper_tail(
+                    member.raw.wins.max(0) as u64,
+                    member.raw.losses.max(0) as u64,
+                    null.break_even,
+                );
+                (Some(null), None, Some(score), None, None)
+            }
+            Err(reason) => (
+                None,
+                Some(reason.clone()),
+                None,
+                None,
+                screen.map(|_| format!("inapplicable: {reason}")),
+            ),
+        };
     }
-    .then(b.0.settled.cmp(&a.0.settled))
-    .then(a.1.cmp(b.1))
-    .then(a.2.cmp(b.2))
+    let applicable: Vec<usize> = (0..members.len())
+        .filter(|&index| members[index].score.is_some())
+        .collect();
+    let adjusted = benjamini_hochberg(
+        &applicable
+            .iter()
+            .map(|&index| members[index].score.expect("applicable"))
+            .collect::<Vec<_>>(),
+    );
+    for (&index, &value) in applicable.iter().zip(&adjusted) {
+        members[index].adjusted = Some(value);
+    }
+    if let Some(screen) = screen {
+        let mut order = applicable.clone();
+        order.sort_by(|&a, &b| {
+            members[a]
+                .adjusted
+                .partial_cmp(&members[b].adjusted)
+                .unwrap_or(Ordering::Equal)
+                .then(a.cmp(&b))
+        });
+        for (position, &index) in order.iter().enumerate() {
+            let adjusted = members[index].adjusted.expect("applicable");
+            members[index].screened = if adjusted > screen.max_adjusted_score {
+                Some(format!(
+                    "adjusted score {adjusted} above the maximum {}",
+                    screen.max_adjusted_score
+                ))
+            } else if screen.top.is_some_and(|top| position >= top as usize) {
+                Some(format!(
+                    "beyond the first {} members by adjusted score",
+                    screen.top.expect("set")
+                ))
+            } else {
+                None
+            };
+        }
+    }
+    applicable.len() as u64
+}
+
+/// Gates every replayed member on its development group and ranks the passing members: net
+/// profit descending, settled count descending, then member order. Returns the passing members
+/// in rank order.
+pub fn rank(members: &mut [Member], gates: &Gates, currency: &str) -> Vec<usize> {
+    let mut passed = Vec::new();
+    for (index, member) in members.iter_mut().enumerate() {
+        member.rank = None;
+        member.rejected = match (&member.screened, &member.development) {
+            (None, Some(group)) => {
+                let rejected = gate(group, currency, gates).err();
+                if rejected.is_none() {
+                    passed.push(index);
+                }
+                rejected
+            }
+            _ => None,
+        };
+    }
+    passed.sort_by(|&a, &b| {
+        let (x, y) = (
+            members[a].development.as_ref().expect("replayed"),
+            members[b].development.as_ref().expect("replayed"),
+        );
+        match (profit(x, currency), profit(y, currency)) {
+            (Some(p), Some(q)) => q.compare(p).unwrap_or(Ordering::Equal),
+            _ => Ordering::Equal,
+        }
+        .then(y.settled.cmp(&x.settled))
+    });
+    for (rank, &index) in passed.iter().enumerate() {
+        members[index].rank = Some(rank as u32 + 1);
+    }
+    passed
 }
 
 // ----------------------------------------------------------------------------------------------
@@ -1241,19 +1350,115 @@ mod tests {
             "unresolved 1 above the maximum 0"
         );
         let richer = Group {
-            settled: 1,
+            settled: 2,
             profit: BTreeMap::from([("unit".to_string(), Some(decimal("5")))]),
             ..Group::default()
         };
+        let member = |development: Option<Group>, screened: Option<&str>| Member {
+            logic_identity: String::new(),
+            conditions: Vec::new(),
+            contract: "c".into(),
+            raw: RawCounts::default(),
+            null: None,
+            inapplicable: None,
+            score: None,
+            adjusted: None,
+            screened: screened.map(str::to_string),
+            development,
+            rejected: None,
+            rank: None,
+            evaluation: None,
+            evaluation_splits: BTreeMap::new(),
+            stability: BTreeMap::new(),
+        };
+        group.unresolved = 0;
+        let mut members = vec![
+            member(Some(group.clone()), None),
+            member(Some(richer.clone()), None),
+            member(Some(richer.clone()), None),
+            member(None, Some("screened")),
+            member(Some(Group::default()), None),
+        ];
+        assert_eq!(rank(&mut members, &gates, "unit"), vec![1, 2, 0]);
         assert_eq!(
-            rank_order((&richer, "b", "c"), (&group, "a", "c"), "unit"),
-            Ordering::Less
+            members.iter().map(|m| m.rank).collect::<Vec<_>>(),
+            [Some(3), Some(1), Some(2), None, None],
+            "ties keep member order"
         );
-        let same = richer.clone();
         assert_eq!(
-            rank_order((&same, "b", "c"), (&richer, "a", "c"), "unit"),
-            Ordering::Greater
+            members[4].rejected.as_deref(),
+            Some("settled 0 below the minimum 2")
         );
+        assert_eq!(members[3].rejected, None);
+    }
+
+    #[test]
+    fn scores_adjust_over_the_applicable_subset_and_screen_in_order() {
+        let mut members: Vec<Member> = [(16, 16), (12, 4), (0, 0), (16, 16), (12, 4), (0, 0)]
+            .into_iter()
+            .map(|(wins, losses)| Member {
+                logic_identity: String::new(),
+                conditions: Vec::new(),
+                contract: String::new(),
+                raw: RawCounts {
+                    total: wins + losses,
+                    wins,
+                    losses,
+                    ties: 0,
+                    invalid: 0,
+                },
+                null: None,
+                inapplicable: None,
+                score: None,
+                adjusted: None,
+                screened: None,
+                development: None,
+                rejected: None,
+                rank: None,
+                evaluation: None,
+                evaluation_splits: BTreeMap::new(),
+                stability: BTreeMap::new(),
+            })
+            .collect();
+        let contracts = [
+            contract("1", "0", "1.80", "1"),
+            contract("1", "0", "1.80", "0.95"),
+        ];
+        let screen = Screen {
+            max_adjusted_score: 0.5,
+            top: Some(1),
+        };
+        // Contracts cycle fastest: members 0, 2, 4 use the neutral tie, 1, 3, 5 the odd tie.
+        assert_eq!(score(&mut members, &contracts, Some(&screen)), 3);
+        assert!(members[4].screened.is_none(), "{:?}", members[4]);
+        assert_eq!(
+            members[4].adjusted,
+            Some(upper_tail(12, 4, 1.0 / 1.8) * 3.0 / 1.0)
+        );
+        assert!(
+            members[1]
+                .screened
+                .as_deref()
+                .unwrap()
+                .starts_with("inapplicable: ")
+        );
+        assert_eq!(members[2].adjusted, Some(1.0));
+        assert!(
+            members[2]
+                .screened
+                .as_deref()
+                .unwrap()
+                .contains("above the maximum")
+        );
+        assert!(
+            members[0]
+                .screened
+                .as_deref()
+                .unwrap()
+                .contains("above the maximum")
+        );
+        assert_eq!(score(&mut members, &contracts, None), 3);
+        assert!(members.iter().all(|m| m.screened.is_none()));
     }
 
     #[test]

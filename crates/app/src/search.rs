@@ -175,7 +175,7 @@ pub fn search(config: &Config, local: &Store, destination: &Store) -> Result<Str
     };
     clock.lowering = lowering_started.elapsed();
 
-    // 3. Score the complete family once per contract duration.
+    // 3. Score the complete family once per contract duration, adjust, and screen.
     let raw = score_members(
         &backend,
         settings,
@@ -186,65 +186,10 @@ pub fn search(config: &Config, local: &Store, destination: &Store) -> Result<Str
         &references,
         &mut clock,
     )?;
-    let contracts = settings.contracts.len();
-    for (index, member) in members.iter_mut().enumerate() {
-        let contract = &settings.contracts[index % contracts];
-        member.raw = raw[index].clone();
-        match search::null_rate(contract) {
-            Ok(null) => {
-                member.score = Some(search::upper_tail(
-                    member.raw.wins as u64,
-                    member.raw.losses as u64,
-                    null.break_even,
-                ));
-                member.null = Some(null);
-            }
-            Err(reason) => member.inapplicable = Some(reason),
-        }
+    for (member, raw) in members.iter_mut().zip(raw) {
+        member.raw = raw;
     }
-    let applicable: Vec<usize> = (0..members.len())
-        .filter(|&index| members[index].score.is_some())
-        .collect();
-    let adjusted = search::benjamini_hochberg(
-        &applicable
-            .iter()
-            .map(|&index| members[index].score.expect("applicable"))
-            .collect::<Vec<_>>(),
-    );
-    for (&index, &value) in applicable.iter().zip(&adjusted) {
-        members[index].adjusted = Some(value);
-    }
-
-    // 4. Screen under heuristic scope; exhaustive scope replays every member.
-    if let Some(screen) = &settings.screen {
-        let mut order: Vec<usize> = applicable.clone();
-        order.sort_by(|&a, &b| {
-            members[a]
-                .adjusted
-                .partial_cmp(&members[b].adjusted)
-                .unwrap_or(std::cmp::Ordering::Equal)
-                .then(a.cmp(&b))
-        });
-        for (position, &index) in order.iter().enumerate() {
-            let adjusted = members[index].adjusted.expect("applicable");
-            if adjusted > screen.max_adjusted_score {
-                members[index].screened = Some(format!(
-                    "adjusted score {adjusted} above the maximum {}",
-                    screen.max_adjusted_score
-                ));
-            } else if screen.top.is_some_and(|top| position >= top as usize) {
-                members[index].screened = Some(format!(
-                    "beyond the first {} members by adjusted score",
-                    screen.top.expect("set")
-                ));
-            }
-        }
-        for member in members.iter_mut() {
-            if let Some(reason) = &member.inapplicable {
-                member.screened = Some(format!("inapplicable: {reason}"));
-            }
-        }
-    }
+    let applicable = search::score(&mut members, &settings.contracts, settings.screen.as_ref());
 
     // 5. Replay survivors through the engine in canonical chunks; gate and rank.
     let currency = settings.account.currency.to_string();
@@ -282,23 +227,23 @@ pub fn search(config: &Config, local: &Store, destination: &Store) -> Result<Str
                 replay::publish(&chunk_config(config, table), local, destination, true)?;
             let summary = published.summary;
             let events = chunk_events(destination, &published.manifest)?;
-            let splits = search::project_splits(events.iter().cloned(), &currency);
+            let mut splits = if role == DatasetRole::Evaluation {
+                search::project_splits(events.iter().cloned(), &currency)
+            } else {
+                BTreeMap::new()
+            };
             for (id, _, _) in &chunk_members {
                 let index: usize = id[1..].parse().expect("member id");
                 let group = summary.strategies.get(id).cloned().unwrap_or_default();
-                let series = settled_profits(&events, id, settings.account.scale);
-                profits.insert((id.clone(), role.to_string()), series);
-                match role {
-                    DatasetRole::Development => {
-                        members[index].rejected =
-                            search::gate(&group, &currency, &settings.gates).err();
-                        members[index].development = Some(group);
-                    }
-                    _ => {
-                        members[index].evaluation_splits =
-                            splits.get(id).cloned().unwrap_or_default();
-                        members[index].evaluation = Some(group);
-                    }
+                profits.insert(
+                    (id.clone(), role.to_string()),
+                    settled_profits(&events, id, settings.account.scale),
+                );
+                if role == DatasetRole::Development {
+                    members[index].development = Some(group);
+                } else {
+                    members[index].evaluation_splits = splits.remove(id).unwrap_or_default();
+                    members[index].evaluation = Some(group);
                 }
             }
             chunks.push(ChunkRef {
@@ -318,35 +263,12 @@ pub fn search(config: &Config, local: &Store, destination: &Store) -> Result<Str
         &mut chunks,
         &mut profits,
     )?;
-    let mut passed: Vec<usize> = survivors
-        .iter()
-        .copied()
-        .filter(|&index| members[index].rejected.is_none())
-        .collect();
-    passed.sort_by(|&a, &b| {
-        search::rank_order(
-            (
-                members[a].development.as_ref().expect("replayed"),
-                &members[a].logic_identity,
-                &members[a].contract,
-            ),
-            (
-                members[b].development.as_ref().expect("replayed"),
-                &members[b].logic_identity,
-                &members[b].contract,
-            ),
-            &currency,
-        )
-    });
-    for (rank, &index) in passed.iter().enumerate() {
-        members[index].rank = Some(rank as u32 + 1);
-    }
+    let passed = search::rank(&mut members, &settings.gates, &currency);
     // The development result is complete here; only now may evaluation objects be read.
     let mut inputs = vec![development.input.clone()];
-    let evaluated: Vec<usize> = passed.to_vec();
     if let Some(window) = &settings.evaluation {
         inputs.push(bind_evaluation(settings, &development)?);
-        let mut ordered = evaluated.clone();
+        let mut ordered = passed.clone();
         ordered.sort_unstable();
         run_chunks(
             DatasetRole::Evaluation,
@@ -387,7 +309,7 @@ pub fn search(config: &Config, local: &Store, destination: &Store) -> Result<Str
         base_stream: settings.base_stream,
         kernel_module: kernel_identity(),
         sampler: SAMPLER_VERSION.to_string(),
-        applicable: applicable.len() as u64,
+        applicable,
         members,
         lowering: lowering_ref,
         chunks,
@@ -459,7 +381,7 @@ pub fn search(config: &Config, local: &Store, destination: &Store) -> Result<Str
         survivors.len(),
         passed.len(),
         if settings.evaluation.is_some() {
-            evaluated.len()
+            passed.len()
         } else {
             0
         }
@@ -612,7 +534,7 @@ fn read_object(store: &Store, objects: &[ObjectRecord], path: &str) -> Result<Ve
 
 /// The base stream's reference rows of the outcome generation.
 fn read_references(development: &Development) -> Result<Vec<i64>, String> {
-    let base = development.base_stream();
+    let base = development.base_stream;
     development
         .outcome
         .streams
@@ -636,12 +558,6 @@ fn read_references(development: &Development) -> Result<Vec<i64>, String> {
         )?,
         i64::from_le_bytes,
     )
-}
-
-impl Development {
-    fn base_stream(&self) -> binary_alpha_engine::config::StreamKey {
-        self.base_stream
-    }
 }
 
 /// The outcome builder over the outcome generation's stored tick arrays.
@@ -671,8 +587,8 @@ fn device_rows(
 ) -> Result<DeviceRows, String> {
     let objects = &development.outcome.objects;
     let paths = stream_object_paths(
-        development.base_stream().duration_seconds,
-        development.base_stream().offset_seconds,
+        development.base_stream.duration_seconds,
+        development.base_stream.offset_seconds,
     );
     let entries = from_le_bytes(
         &read_object(&development.outcome_store, objects, &paths[1])?,
@@ -1032,10 +948,14 @@ fn restored_definition(
     }
 }
 
-/// Verifies a family generation: the manifest and its content-addressed object, the complete
-/// member set re-enumerated from the recorded search table, every referenced replay through the
-/// replay verifier, each member's groups against those verified summaries and the shared
-/// ledger projection, and every recomputed score, adjustment, screen decision, gate, and rank.
+/// Verifies a family generation: the manifest and its content-addressed object, the member set
+/// re-enumerated from the recorded search table, the bound inputs against the manifest, every
+/// referenced replay through the replay verifier and its restored definition against the table
+/// synthesized for its recorded members, the raw counts recomputed through the CPU kernel from
+/// the verified lowering records and outcome objects, every score, adjustment, screen decision,
+/// gate and rank recomputed by the engine owner, every group and split group against the
+/// verified summaries and the shared ledger projection, and every stability result recomputed
+/// from the verified settlement profits.
 pub fn verify_family(uri: &str, store: &Store, key: &str, bytes: &[u8]) -> Result<String, String> {
     let manifest = FamilyManifest::from_json(bytes).map_err(|error| format!("{uri}: {error}"))?;
     if manifest.key() != key {
@@ -1044,14 +964,19 @@ pub fn verify_family(uri: &str, store: &Store, key: &str, bytes: &[u8]) -> Resul
             manifest.generation
         ));
     }
-    let (bytes_read, _) = verify::fetch(store, &manifest.objects[0], false)?;
-    let family = Family::from_json(&read_object(store, &manifest.objects, FAMILY_OBJECT_PATH)?)
+    let family_bytes = read_object(store, &manifest.objects, FAMILY_OBJECT_PATH)?;
+    let family = Family::from_json(&family_bytes)
         .map_err(|error| format!("{uri}: {FAMILY_OBJECT_PATH}: {error}"))?;
     if family.members.len() as u64 != manifest.members {
         return Err(format!(
             "{uri}: the manifest records {} members but the family holds {}",
             manifest.members,
             family.members.len()
+        ));
+    }
+    if family.kernel_module != kernel_identity() || family.sampler != SAMPLER_VERSION {
+        return Err(format!(
+            "{uri}: the family records kernel sources or a sampler this binary does not carry"
         ));
     }
     let settings = &family.search;
@@ -1074,166 +999,41 @@ pub fn verify_family(uri: &str, store: &Store, key: &str, bytes: &[u8]) -> Resul
             candidates.len() * contracts
         ));
     }
-    let scores: Vec<Option<f64>> = family
-        .members
-        .iter()
-        .enumerate()
-        .map(|(index, member)| {
-            let candidate = &candidates[index / contracts];
-            let contract = &settings.contracts[index % contracts];
-            let expected: Vec<_> = candidate
-                .conditions
-                .iter()
-                .map(|&i| conditions[i].clone())
-                .collect();
-            if member.logic_identity != candidate.logic_identity
-                || member.conditions != expected
-                || member.contract != contract.id
-            {
-                return Err(format!(
-                    "{uri}: member {index} is not the enumerated member"
-                ));
-            }
-            let (null, score) = match search::null_rate(contract) {
-                Ok(null) => {
-                    let score = search::upper_tail(
-                        member.raw.wins as u64,
-                        member.raw.losses as u64,
-                        null.break_even,
-                    );
-                    (Some(null), Some(score))
-                }
-                Err(_) => (None, None),
-            };
-            if member.null != null
-                || member.score != score
-                || member.inapplicable.is_some() != score.is_none()
-            {
-                return Err(format!(
-                    "{uri}: member {index} records a score its contract and counts do not produce"
-                ));
-            }
-            Ok(score)
-        })
-        .collect::<Result<_, _>>()?;
-    let applicable: Vec<usize> = (0..scores.len()).filter(|&i| scores[i].is_some()).collect();
-    if family.applicable != applicable.len() as u64 {
-        return Err(format!(
-            "{uri}: the applicable count {} is not {}",
-            family.applicable,
-            applicable.len()
-        ));
-    }
-    let adjusted = search::benjamini_hochberg(
-        &applicable
+    for (index, member) in family.members.iter().enumerate() {
+        let candidate = &candidates[index / contracts];
+        let expected: Vec<_> = candidate
+            .conditions
             .iter()
-            .map(|&i| scores[i].expect("applicable"))
-            .collect::<Vec<_>>(),
-    );
-    for (&index, &value) in applicable.iter().zip(&adjusted) {
-        if family.members[index].adjusted != Some(value) {
+            .map(|&i| conditions[i].clone())
+            .collect();
+        if member.logic_identity != candidate.logic_identity
+            || member.conditions != expected
+            || member.contract != settings.contracts[index % contracts].id
+        {
             return Err(format!(
-                "{uri}: member {index} records an adjusted score the family does not produce"
+                "{uri}: member {index} is not the enumerated member"
             ));
         }
     }
-    // Screen decisions, gates, and ranks follow from the recorded groups and settings.
-    let currency = settings.account.currency.to_string();
-    let mut screened = 0;
-    if let Some(screen) = &settings.screen {
-        let mut order = applicable.clone();
-        order.sort_by(|&a, &b| {
-            family.members[a]
-                .adjusted
-                .partial_cmp(&family.members[b].adjusted)
-                .unwrap_or(std::cmp::Ordering::Equal)
-                .then(a.cmp(&b))
-        });
-        for (index, member) in family.members.iter().enumerate() {
-            let position = order.iter().position(|&i| i == index);
-            let expected = member.inapplicable.is_some()
-                || member
-                    .adjusted
-                    .is_some_and(|value| value > screen.max_adjusted_score)
-                || position
-                    .is_some_and(|position| screen.top.is_some_and(|top| position >= top as usize));
-            if member.screened.is_some() != expected {
-                return Err(format!(
-                    "{uri}: member {index} records a screen decision the settings do not produce"
-                ));
-            }
-        }
-        screened = family
-            .members
-            .iter()
-            .filter(|m| m.screened.is_some())
-            .count();
-    } else if family
-        .members
-        .iter()
-        .any(|member| member.screened.is_some())
-    {
-        return Err(format!("{uri}: exhaustive scope screens nothing"));
-    }
-    let mut passed = Vec::new();
-    for (index, member) in family.members.iter().enumerate() {
-        match (&member.screened, &member.development) {
-            (Some(_), None) => {}
-            (None, Some(group)) => {
-                let rejected = search::gate(group, &currency, &settings.gates).err();
-                if member.rejected != rejected {
-                    return Err(format!(
-                        "{uri}: member {index} records a gate outcome its group does not produce"
-                    ));
-                }
-                if rejected.is_none() {
-                    passed.push(index);
-                }
-            }
-            _ => {
-                return Err(format!(
-                    "{uri}: member {index} is both screened and replayed, or neither"
-                ));
-            }
-        }
-    }
-    passed.sort_by(|&a, &b| {
-        let (x, y) = (&family.members[a], &family.members[b]);
-        search::rank_order(
-            (
-                x.development.as_ref().expect("replayed"),
-                &x.logic_identity,
-                &x.contract,
-            ),
-            (
-                y.development.as_ref().expect("replayed"),
-                &y.logic_identity,
-                &y.contract,
-            ),
-            &currency,
-        )
-    });
-    for (index, member) in family.members.iter().enumerate() {
-        let rank = passed
-            .iter()
-            .position(|&i| i == index)
-            .map(|rank| rank as u32 + 1);
-        if member.rank != rank {
-            return Err(format!(
-                "{uri}: member {index} records a rank the ranking does not produce"
-            ));
-        }
-    }
-    // Every referenced replay restores through the replay verifier, its restored definition is
-    // the table synthesized for the recorded members, and every group, split group, raw count,
-    // and stability result is recomputed from the verified records.
+    // The bound development (and evaluation) generations are the manifest's inputs.
     let development = bind_development(settings)?;
-    if development.plan_identity != family.plan_identity {
+    if development.plan_identity != family.plan_identity
+        || family.base_stream != settings.base_stream
+    {
         return Err(format!(
-            "{uri}: the bound development plan {} is not the recorded {}",
-            development.plan_identity, family.plan_identity
+            "{uri}: the bound development plan is not the recorded plan and base stream"
         ));
     }
+    let mut inputs = vec![development.input.clone()];
+    if settings.evaluation.is_some() {
+        inputs.push(bind_evaluation(settings, &development)?);
+    }
+    if manifest.inputs != inputs {
+        return Err(format!(
+            "{uri}: the manifest inputs are not the bound generations"
+        ));
+    }
+    // Every referenced replay restores through its verifier at the recorded code revision.
     let mut clock = Clock::default();
     let read_chunk = |chunk: &ChunkRef| -> Result<(ReplayManifest, Vec<FinancialEvent>), String> {
         let chunk_key = manifest_key(&chunk.generation);
@@ -1241,15 +1041,18 @@ pub fn verify_family(uri: &str, store: &Store, key: &str, bytes: &[u8]) -> Resul
         store.read_to(&chunk_key, None, &mut bytes)?;
         let chunk_uri = store.uri(&chunk_key);
         replay::verify_replay(&chunk_uri, store, &chunk_key, &bytes)?;
-        let manifest =
+        let chunk_manifest =
             ReplayManifest::from_json(&bytes).map_err(|error| format!("{chunk_uri}: {error}"))?;
-        if manifest.summary_identity != chunk.summary_identity
-            || manifest.role.to_string() != chunk.role
+        if chunk_manifest.summary_identity != chunk.summary_identity
+            || chunk_manifest.role.to_string() != chunk.role
+            || chunk_manifest.code_revision != manifest.code_revision
         {
-            return Err(format!("{uri}: {chunk_uri} is not the recorded chunk"));
+            return Err(format!(
+                "{uri}: {chunk_uri} is not the recorded chunk at the recorded code revision"
+            ));
         }
-        let events = chunk_events(store, &manifest)?;
-        Ok((manifest, events))
+        let events = chunk_events(store, &chunk_manifest)?;
+        Ok((chunk_manifest, events))
     };
     let (_, lowering_events) = read_chunk(&family.lowering)?;
     let expected_lowering =
@@ -1266,6 +1069,8 @@ pub fn verify_family(uri: &str, store: &Store, key: &str, bytes: &[u8]) -> Resul
             "{uri}: the lowering replay is not the table synthesized for this family"
         ));
     }
+    // Raw counts, scores, adjustments, screen decisions, gates and ranks are recomputed by the
+    // owners that published them and compared field by field.
     let references = read_references(&development)?;
     let codes = lowering_codes(&lowering_events, &references, conditions.len())?;
     let expiries = expiry_columns(settings, &development)?;
@@ -1279,17 +1084,32 @@ pub fn verify_family(uri: &str, store: &Store, key: &str, bytes: &[u8]) -> Resul
         &references,
         &mut clock,
     )?;
-    for (index, member) in family.members.iter().enumerate() {
-        if member.raw != raw[index] {
+    let currency = settings.account.currency.to_string();
+    let mut expected = family.members.clone();
+    for (member, raw) in expected.iter_mut().zip(raw) {
+        member.raw = raw;
+    }
+    let applicable = search::score(&mut expected, &settings.contracts, settings.screen.as_ref());
+    search::rank(&mut expected, &settings.gates, &currency);
+    if family.applicable != applicable {
+        return Err(format!(
+            "{uri}: the applicable count {} is not {applicable}",
+            family.applicable
+        ));
+    }
+    for (index, (member, expected)) in family.members.iter().zip(&expected).enumerate() {
+        if member != expected {
             return Err(format!(
-                "{uri}: member {index} records raw counts the lowering records and outcomes do not produce"
+                "{uri}: member {index} records counts, scores, screen, gate, or rank the family does not produce"
             ));
         }
     }
-    let mut replayed = 0;
+    // Every chunk is the table synthesized for its members; groups, split groups and stability
+    // agree with the verified records; every member is replayed exactly as its status requires.
     let mut seen: BTreeMap<(String, String), ()> = BTreeMap::new();
+    let mut replayed = 0;
     for chunk in &family.chunks {
-        let (manifest, events) = read_chunk(chunk)?;
+        let (chunk_manifest, events) = read_chunk(chunk)?;
         let members = chunk_members(
             &chunk.bindings,
             settings,
@@ -1307,7 +1127,7 @@ pub fn verify_family(uri: &str, store: &Store, key: &str, bytes: &[u8]) -> Resul
             ),
             other => return Err(format!("{uri}: chunk role `{other}`")),
         };
-        let expected = search::replay_table(
+        let table = search::replay_table(
             settings,
             role,
             window,
@@ -1315,17 +1135,23 @@ pub fn verify_family(uri: &str, store: &Store, key: &str, bytes: &[u8]) -> Resul
             &members,
             settings.account.initial_cash,
         );
-        let definition = restored_definition(&events)?;
-        if definition.replay != expected {
+        if restored_definition(&events)?.replay != table {
             return Err(format!(
                 "{uri}: chunk {} is not the table synthesized for its recorded members",
                 chunk.generation
             ));
         }
-        let summary =
-            Summary::from_json(&read_object(store, &manifest.objects, SUMMARY_OBJECT_PATH)?)
-                .map_err(|error| format!("{uri}: {}: {error}", chunk.generation))?;
-        let splits = search::project_splits(events.iter().cloned(), &currency);
+        let summary = Summary::from_json(&read_object(
+            store,
+            &chunk_manifest.objects,
+            SUMMARY_OBJECT_PATH,
+        )?)
+        .map_err(|error| format!("{uri}: {}: {error}", chunk.generation))?;
+        let splits = if role == DatasetRole::Evaluation {
+            search::project_splits(events.iter().cloned(), &currency)
+        } else {
+            BTreeMap::new()
+        };
         for (id, _, _) in &members {
             let index: usize = id[1..].parse().expect("checked");
             if seen.insert((id.clone(), chunk.role.clone()), ()).is_some() {
@@ -1336,16 +1162,12 @@ pub fn verify_family(uri: &str, store: &Store, key: &str, bytes: &[u8]) -> Resul
             }
             let member = &family.members[index];
             let group = summary.strategies.get(id).cloned().unwrap_or_default();
-            let matches = match role {
-                DatasetRole::Development => {
-                    replayed += 1;
-                    member.screened.is_none() && member.development.as_ref() == Some(&group)
-                }
-                _ => {
-                    member.rejected.is_none()
-                        && member.evaluation.as_ref() == Some(&group)
-                        && member.evaluation_splits == splits.get(id).cloned().unwrap_or_default()
-                }
+            let matches = if role == DatasetRole::Development {
+                replayed += 1;
+                member.development.as_ref() == Some(&group)
+            } else {
+                member.evaluation.as_ref() == Some(&group)
+                    && member.evaluation_splits == splits.get(id).cloned().unwrap_or_default()
             };
             if !matches {
                 return Err(format!(
@@ -1353,11 +1175,11 @@ pub fn verify_family(uri: &str, store: &Store, key: &str, bytes: &[u8]) -> Resul
                     chunk.role, chunk.generation
                 ));
             }
-            if member.rejected.is_none() && member.screened.is_none() {
+            if member.rank.is_some() {
                 let series = settled_profits(&events, id, settings.account.scale);
-                let expected =
+                let stability =
                     resample(&Backend::Cpu, settings, member, role, &series, &mut clock)?;
-                if member.stability.get(&chunk.role) != Some(&expected) {
+                if member.stability.get(&chunk.role) != Some(&stability) {
                     return Err(format!(
                         "{uri}: member {index} records {} stability its settlements do not produce",
                         chunk.role
@@ -1367,34 +1189,37 @@ pub fn verify_family(uri: &str, store: &Store, key: &str, bytes: &[u8]) -> Resul
         }
     }
     for (index, member) in family.members.iter().enumerate() {
-        let expected_roles: Vec<String> = match (&member.screened, &member.rejected) {
-            (None, None) => {
-                let mut roles = vec!["development".to_string()];
-                if settings.evaluation.is_some() {
-                    roles.push("evaluation".to_string());
-                }
-                roles
-            }
-            _ => Vec::new(),
+        let id = format!("m{index}");
+        let replayed_development = seen.contains_key(&(id.clone(), "development".into()));
+        let replayed_evaluation = seen.contains_key(&(id, "evaluation".into()));
+        let expect_evaluation = member.rank.is_some() && settings.evaluation.is_some();
+        let roles: Vec<&str> = member.stability.keys().map(String::as_str).collect();
+        let expected_roles: &[&str] = match (member.rank.is_some(), expect_evaluation) {
+            (true, true) => &["development", "evaluation"],
+            (true, false) => &["development"],
+            _ => &[],
         };
-        if member.stability.keys().cloned().collect::<Vec<_>>() != expected_roles
-            || (member.screened.is_some() && member.development.is_some())
-            || (member.rejected.is_some() && member.evaluation.is_some())
-            || expected_roles
-                .iter()
-                .any(|role| !seen.contains_key(&(format!("m{index}"), role.clone())))
+        if replayed_development != member.screened.is_none()
+            || replayed_evaluation != expect_evaluation
+            || member.evaluation.is_some() != expect_evaluation
+            || (!member.evaluation_splits.is_empty() && !expect_evaluation)
+            || roles != expected_roles
         {
             return Err(format!(
                 "{uri}: member {index} is not replayed and resampled exactly as its status requires"
             ));
         }
     }
-    let _ = screened;
     Ok(format!(
-        "verified search generation {} members {} applicable {} replayed {replayed} passed {} objects 1 bytes {bytes_read}",
+        "verified search generation {} members {} applicable {} replayed {replayed} passed {} objects 1 bytes {}",
         manifest.generation,
         family.members.len(),
         family.applicable,
-        passed.len()
+        family
+            .members
+            .iter()
+            .filter(|member| member.rank.is_some())
+            .count(),
+        family_bytes.len()
     ))
 }
