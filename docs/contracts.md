@@ -114,6 +114,7 @@ and content hash; the application package owns reading it from a path.
 | `outcomes` | table | optional; consumed only by `outcomes build`, which requires it |
 | `accelerator.backend` | string | optional section; explicit offline backend `cpu` or `cuda` |
 | `search` | table | optional; consumed only by `search`, which requires it |
+| `portfolio` | table | optional; consumed only by `portfolio optimize`, which requires it |
 
 Every `import.sources` entry declares `kind`, `path` (a relative path resolves against the
 configuration file's directory), `broker`, and `role` (`development` or `evaluation`; `holdout` is
@@ -636,7 +637,11 @@ stay beside their codes. The fitted plan records the fit windows (rows and first
 decision time per stream), every label list and edge list, and its identity is SHA-256 over
 `binary-alpha feature plan v1` and the plan's JSON bytes. Applying a frozen plan recomputes
 rows under its settings and encodes under its labels without refitting; no artifact records
-wall-clock time.
+wall-clock time. A consumer may address one development-fifths interval by its zero-based
+low-to-high ordinal `0` to `4`: the label is the `LEFT_to_RIGHT` text of the right-closed bin
+between the fitted cuts and the unbounded tails, and it resolves only when the fit produced four
+distinct cuts and retained that label under `max_labels`; frequency-ranked codes are never
+ordinals.
 
 ### Feature generations
 
@@ -1157,3 +1162,134 @@ and the bound outcome objects, compares every group and split group with the ver
 and the ledger projection, recomputes stability, applicability, scores, adjustments, screen
 decisions, gates and ranks, and writes
 `verified search generation GENERATION members M applicable A replayed R passed P objects 1 bytes B`.
+
+## Portfolio selection
+
+The engine module `portfolio` owns the finite enumeration of complete joint policies, the logical
+and resolved form of every choice, the projection and gates of a verified restored engine, the
+frozen objective, tie breaks and ranking, and the selection records; the application module
+`portfolio` binds the inputs, builds the fold, refit and outer feature generations through the
+feature owner, publishes every joint replay through the replay owner, and publishes and verifies
+the selection. `binary-alpha portfolio optimize --config PATH` requires `run_mode = "research"`.
+Selection uses development data only; the chosen policy freezes before one optional outer
+evaluation. Every result compares separately funded folds; it is never a continuous equity path,
+a certification, or evidence of trading profitability.
+
+### Configuration
+
+The optional `portfolio` table declares, in canonical order: `families` (nonempty, distinct
+ready-manifest locations of development-only search families), positive `max_policies`, positive
+`embargo_micros`, the `objective` (`profit_then_drawdown`: larger completed net profit then lower
+drawdown; `drawdown_then_profit`: lower drawdown then larger profit), the `gates` (positive
+`min_settled`, `max_unresolved`, `min_profit`, non-negative `max_drawdown`, in the reporting
+currency), the shared funded `accounts`, the reporting contract (`reporting_currency`,
+`reporting_scale`, `max_rate_age_micros` and optional `rates`, as in `replay`), the nonempty base
+universe `members` (each a `family` index, a `member` index of that family and optional
+`ordinals`, each naming a `condition` index of the member and an interval `ordinal` `0` to `4`),
+nonempty `repairs` (a unique `id` and a conjunction of existing conditions; an empty conjunction
+is no repair), nonempty `bindings` (a unique `id`, an `account`, an `instrument` as
+`BROKER:PROVIDER_SYMBOL` and nonempty `alternatives`, each one complete `contract` whose `id` is
+unique across every alternative and one `envelope` that admits it), nonempty `subsets` (each a
+nonempty ordered list of `deployments`, one `member`, `repair` and `binding` index each), nonempty
+`risk_policies` (existing fields, unique ids), nonempty `folds` (each a `cutoff`, a
+`decision_start` at least the embargo after the cutoff, a `decision_end` and nonempty `inputs`,
+each one development `fit` entry in the `features.instruments` form without a frozen plan and one
+`assessment_manifest` development tick generation), the `refit` (a `cutoff` and nonempty
+development `fits`) and the optional `evaluation` (a window at least the embargo after the refit
+cutoff, nonempty `inputs` evaluation tick manifests and optional `splits`). The declared count,
+computed with checked arithmetic as the sum over subsets of the product of each deployment's
+alternative count, times the number of risk policies, must neither overflow nor exceed
+`max_policies`; the embargo must be at least every alternative's duration plus its permitted
+settlement delay; one contract identity names one contract, so identical terms may repeat under
+their identity while conflicting terms may not. Accounts, every alternative, every risk policy,
+the rates, the reporting contract and the first fold's window are validated by the execution rules
+before any choice is enumerated. Omitting the table preserves every existing configuration
+identity.
+
+### Stages and identities
+
+Every declared development input is read on its manifest bytes before any output exists: a fit
+resolves through the feature owner and its whole coverage must end before its cutoff; an
+assessment tick generation must carry the development role (holdout is refused) and the fit's
+instrument; every binding's instrument must have one input in every fold and in the refit. The
+optional evaluation inputs are not read at all until selection and refit succeed; only then are
+their manifests read for role and instrument and their objects opened. Each family is read through
+the typed development-only reader: every manifest input must be development before `family.json`
+is opened; the family must carry no evaluation window, no lowering or chunk of another role and no
+member evaluation group, split group or stability entry before any referenced generation is
+followed; then the family verifies exactly as `data verify` does, whose chunk reader checks each
+referenced replay manifest's own role and summary before restoring it. Nothing is stripped to make
+an input acceptable.
+
+The logical universe is the declared members' conditions with their ordinals; an ordinal
+condition compares text with `eq` or `ne`. Choices enumerate in declared order: subsets, then each
+deployment's alternatives with the last deployment cycling fastest, then risk policies;
+deployments keep their subset position as `d{position}`. A choice's logical form carries the plan
+identity `logical:INSTRUMENT` of its deployment's instrument and renders every ordinal as the text
+`interval ORDINAL`; its identity is SHA-256 over `binary-alpha portfolio choice v1\n` and the JSON
+of its strategies, bindings, contracts and risk policy. Structure applies the execution rules to the logical table with the
+first fold's window and inputs, which they never open: a rejected choice, such as two deployments
+of one member differing only by repair under equal terms and envelope on one account, records its
+reason and is never replayed.
+
+Per fold, each instrument's fit builds a new plan on its own profile's source generation and the
+assessment applies that plan through `frozen_plan` under the same profile reference, each through
+the feature owner (a completed identical generation is reused). Each structurally valid choice
+resolves under the fold's plans: a literal condition keeps its threshold; an ordinal condition on
+a development-fifths encoding takes that plan's interval label, and a missing, collapsed or
+omitted interval makes the choice inapplicable for that fold; a condition naming a
+development-fifths encoding without an ordinal, or an ordinal on another output, is an error. The
+resolved policy replays jointly through the replay owner with the shared accounts, the fold
+window, the assessment inputs and no splits, as a synthesized configuration carrying only the
+schema, run mode, storage and that table; a completed generation is reused only after its own
+verifier restores it. The projection reads the verified restored engine: settlement support first
+(`settled >= min_settled`, `unresolved <= max_unresolved`), then every account's native completed
+profit converted by the engine at the restored ledger's final event time
+(`Summary.last_time_micros`) with the replay's reporting currency, scale, rates and freshness,
+summed with checked arithmetic and its rate identities retained, then the engine's reporting
+drawdown, which passes only with zero unavailable reporting observations. A missing or stale rate
+or an unavailable drawdown fails the choice; an arithmetic error stops the command. A choice passes
+when every fold passes; its profit is the sum of the fold profits and its drawdown the largest
+fold drawdown. Ranking orders passing choices by the objective, then fewer deployments, then the
+canonical identity ascending, writing one-based ranks; the first is selected. No standalone
+profit, score or admission flag prunes.
+
+Only a selected choice is refitted: each refit fit builds a new plan on the full permitted
+development generation and the choice re-resolves under it; an inapplicable refit is terminal
+(`refit_inapplicable`) and never chooses the next rank, and a resolved choice whose conditions or
+repairs name a column the refit plan does not compile is an error. Only a refitted choice is evaluated: each
+evaluation input applies its instrument's refit plan through `frozen_plan`, and one continuous
+joint replay with `role = "evaluation"` and the declared splits projects and gates the frozen
+choice once; splits attribute records without resetting cash, exposure or unresolved obligations.
+A failing outer projection is `outer_rejected` with the frozen choice recorded unchanged. With no
+passing choice the result is `no_feasible_policy` with no refit and no outer read.
+
+### Selection generations
+
+The selection generation publishes one object, `selection.json`: the resolved configuration,
+whose content hash the manifest binds, every family (generation, plan identity, base stream and every source member with its logic
+identity, contract and the bases that declare it), the logical members, the declared, rejected,
+valid and passing counts, every fold's fit and assessment generations, every choice (subset,
+alternatives, risk policy, identity, structural rejection, fold results with their replay
+generation and summary identity, projection and inapplicability, aggregate profit and drawdown,
+failure and rank), the selected index, the refit generations, the frozen policy, the outer result
+(feature generations, replay reference, projection and split groups) and the terminal `state`
+(`selected`, `no_feasible_policy`, `refit_inapplicable` with its reason, `outer_rejected` with its
+reason); only `selected` carries a deployable candidate, never a certification. The ready manifest
+records `kind` (`portfolio_selection`), `schema_version` (`1`), `generation`, `config_hash`,
+`code_revision`, the `families` generations, `state` and `objects`; the generation is SHA-256 over
+`binary-alpha portfolio selection v1\n`, the configuration hash, the code revision and every
+family generation, each followed by a newline, so extending a grid changes the identity even when
+the winner is unchanged. The command writes
+`portfolio generation GENERATION declared D rejected R valid V passing P state S objects 1`
+followed by `[bind S folds S refit S publish S]` or `(already published)`, then the verification
+line. An interruption preserves every completed replay and feature generation and publishes no
+selection; the rerun reuses them and recomputes the rest. `data verify` on a selection checks
+the recorded configuration's hash against the manifest, re-reads the families through the
+development-only reader, re-enumerates the choices, identities and structural rejections,
+verifies every recorded fit, assessment, refit and outer feature generation through the feature
+verifier and re-resolves every configured fit through the feature owner against the recorded plan
+before its fit and against its cutoff, restores every recorded replay through its verifier and checks its definition against the table
+rebuilt for that choice and fold, recomputes every projection, gate, aggregate, rank, the frozen
+policy and its compilation under the refit plans, and the terminal state, and writes
+`verified portfolio generation GENERATION declared D rejected R valid V passing P state S objects 1 bytes B`.

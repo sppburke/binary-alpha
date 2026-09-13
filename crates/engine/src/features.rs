@@ -2175,6 +2175,22 @@ impl FeaturePlan {
     pub fn is_fitted(&self) -> bool {
         self.fit_windows.len() == self.streams.len()
     }
+
+    /// The plan as resolved before its development fit: no fit windows, no labels, and no
+    /// development-fitted edges, so a fitted plan compares with the plan its entry resolves.
+    pub fn unfitted(&self) -> Self {
+        let mut plan = self.clone();
+        plan.fit_windows.clear();
+        for stream in &mut plan.streams {
+            for encoding in &mut stream.encodings {
+                encoding.labels.clear();
+                if encoding.encoding == ProjectionKind::DevelopmentFifths {
+                    encoding.edges = None;
+                }
+            }
+        }
+        plan
+    }
 }
 
 /// Compiles one configured encoding against a stream's selected outputs. An encoding whose
@@ -4933,6 +4949,39 @@ impl FittedEncoding {
             }
             _ => edges.clone(),
         })
+    }
+
+    /// The label of one development-fifths interval by its zero-based low-to-high ordinal, `0`
+    /// to `4`: the right-closed bin between the fitted cuts with the unbounded tails, labelled
+    /// exactly as the fit labelled it. Requires a development-fifths encoding fitted with four
+    /// distinct cuts and a label retained under the label limit; the reason names anything
+    /// else. Frequency-ranked label codes are never interval ordinals.
+    pub fn interval_label(&self, ordinal: u8) -> Result<String, String> {
+        if self.encoding != ProjectionKind::DevelopmentFifths {
+            return Err(format!(
+                "encoding `{}` is `{}`, not `development_fifths`",
+                self.output, self.encoding
+            ));
+        }
+        if ordinal > 4 {
+            return Err(format!("interval ordinal {ordinal} is not within 0 to 4"));
+        }
+        let cuts = self.edges.as_ref().map_or(0, Vec::len);
+        if cuts != 4 {
+            return Err(format!(
+                "encoding `{}` fitted {cuts} distinct cuts, not four",
+                self.output
+            ));
+        }
+        let edges = self.full_edges().expect("four cuts");
+        let label = edge_label(edges[usize::from(ordinal)], edges[usize::from(ordinal) + 1]);
+        if !self.labels.contains(&label) {
+            return Err(format!(
+                "encoding `{}` did not retain interval {ordinal} `{label}` under its label limit",
+                self.output
+            ));
+        }
+        Ok(label)
     }
 
     /// The label of one value under this encoding, or `None` for a missing value, an

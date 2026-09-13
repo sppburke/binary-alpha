@@ -89,6 +89,20 @@ does not compile, and conflicting shared policies are refused before any tick is
 replay generation with the same `data verify` command, which restores the ledger record by record.
 Historical replay performs no broker, live, paper, or production action and needs no operator task.
 
+Portfolio: declare the `[portfolio]` table (the development-only families, the base members and
+repairs, the bindings with their exact contract and envelope alternatives, the ordered subsets,
+the risk policies, the inner folds, the refit, and the optional evaluation; see
+[docs/contracts.md](contracts.md), section "Portfolio selection"), then run
+`binary-alpha portfolio optimize --config PATH`. The command reads every declared input on its
+manifest bytes and refuses a holdout, later-role, or ill-formed input before any output, builds
+the fold, refit, and outer feature generations and publishes every joint replay through the same
+owners as `features build` and `replay`, retains and publishes the selection object, and
+publishes and mirrors the manifest last after verification. It is resumable and idempotent the
+same way import is: an interrupted run leaves completed replay and feature generations and no
+selection, and the rerun reuses every completed generation after its own verifier restores it.
+Verify a selection with the same `data verify` command, which restores every referenced replay.
+Selection performs no broker, live, paper, or production action and needs no operator task.
+
 Rollout to Google Cloud Storage: discover and reuse existing projects, buckets, identities, and
 regions first; create nothing in a region whose name begins `us-west`; provision the bucket and a
 least-privilege identity that can read and create objects but not create or delete buckets, outside

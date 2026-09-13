@@ -88,42 +88,7 @@ pub(crate) fn bind_inputs(
     feature_manifest: &ManifestUri,
     what: &str,
 ) -> Result<Bound, String> {
-    let uri = tick_manifest.to_string();
-    let (tick_store, tick_key) = verify::open(&uri)?;
-    let mut bytes = Vec::new();
-    tick_store.read_to(&tick_key, None, &mut bytes)?;
-    if let Some(kind) = verify::manifest_kind(&bytes)? {
-        return Err(format!(
-            "{}: {uri} is a `{kind}` manifest, not a dataset ready manifest",
-            field("tick_manifest")
-        ));
-    }
-    let tick = GenerationManifest::from_json(&bytes)
-        .map_err(|error| format!("{}: {uri}: {error}", field("tick_manifest")))?;
-    if tick.key() != tick_key {
-        return Err(format!(
-            "{}: {uri} holds the manifest of generation {}",
-            field("tick_manifest"),
-            tick.generation
-        ));
-    }
-    if tick.role == DatasetRole::Holdout {
-        return Err(format!(
-            "{}: holdout data never enters {what}",
-            field("tick_manifest")
-        ));
-    }
-    if tick.role != role {
-        return Err(format!(
-            "role: declared `{role}`, but generation {} is `{}`",
-            tick.generation, tick.role
-        ));
-    }
-    tick.require(Capability::Ticks)
-        .map_err(|error| format!("{}: {error}", field("tick_manifest")))?;
-    let PriceRepresentation::IntegerUnits { scale } = tick.price_representation else {
-        unreachable!("a validated tick generation carries integer units at microsecond times")
-    };
+    let (tick_store, tick, scale) = bind_tick(&field("tick_manifest"), role, tick_manifest, what)?;
     let (feature_store, feature) =
         features::feature_manifest(&field("feature_manifest"), &feature_manifest.to_string())?;
     if feature.input_generation != tick.generation {
@@ -188,6 +153,49 @@ fn bind(settings: &Outcomes) -> Result<Bound, String> {
         ));
     }
     Ok(bound)
+}
+
+/// Reads and checks one tick ready manifest for a build of `role` on its bytes alone: another
+/// kind, another generation, holdout data, another role, and a source without ticks are refused
+/// before any object is read. `field` names the input in errors and `what` names the build.
+pub(crate) fn bind_tick(
+    field: &str,
+    role: DatasetRole,
+    tick_manifest: &ManifestUri,
+    what: &str,
+) -> Result<(Store, GenerationManifest, PriceScale), String> {
+    let uri = tick_manifest.to_string();
+    let (tick_store, tick_key) = verify::open(&uri)?;
+    let mut bytes = Vec::new();
+    tick_store.read_to(&tick_key, None, &mut bytes)?;
+    if let Some(kind) = verify::manifest_kind(&bytes)? {
+        return Err(format!(
+            "{field}: {uri} is a `{kind}` manifest, not a dataset ready manifest"
+        ));
+    }
+    let tick = GenerationManifest::from_json(&bytes)
+        .map_err(|error| format!("{field}: {uri}: {error}"))?;
+    if tick.key() != tick_key {
+        return Err(format!(
+            "{field}: {uri} holds the manifest of generation {}",
+            tick.generation
+        ));
+    }
+    if tick.role == DatasetRole::Holdout {
+        return Err(format!("{field}: holdout data never enters {what}"));
+    }
+    if tick.role != role {
+        return Err(format!(
+            "role: declared `{role}`, but generation {} is `{}`",
+            tick.generation, tick.role
+        ));
+    }
+    tick.require(Capability::Ticks)
+        .map_err(|error| format!("{field}: {error}"))?;
+    let PriceRepresentation::IntegerUnits { scale } = tick.price_representation else {
+        unreachable!("a validated tick generation carries integer units at microsecond times")
+    };
+    Ok((tick_store, tick, scale))
 }
 
 /// Every tick of one generation, in order, through the Phase 02 readers.
