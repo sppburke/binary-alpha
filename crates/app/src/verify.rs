@@ -2,7 +2,8 @@
 //! store objects alone, and reconstruct what the manifest asserts. A dataset manifest has no
 //! top-level `kind`; a stream manifest carries `kind = "instrument_stream"`, a feature
 //! generation `kind = "feature_generation"`, an outcome generation
-//! `kind = "outcome_generation"`, and an engine replay `kind = "engine_replay"`.
+//! `kind = "outcome_generation"`, an engine replay `kind = "engine_replay"`, a search family
+//! `kind = "search_family"`, and a portfolio selection `kind = "portfolio_selection"`.
 
 use std::fs::{self, File};
 use std::path::PathBuf;
@@ -16,6 +17,7 @@ use binary_alpha_engine::execution::REPLAY_MANIFEST_KIND;
 use binary_alpha_engine::features::FEATURE_MANIFEST_KIND;
 use binary_alpha_engine::market::format_event_time_micros;
 use binary_alpha_engine::outcomes::OUTCOME_MANIFEST_KIND;
+use binary_alpha_engine::portfolio::SELECTION_MANIFEST_KIND;
 use binary_alpha_engine::search::FAMILY_MANIFEST_KIND;
 use binary_alpha_engine::stream::{
     InstrumentProfile, PROFILE_OBJECT_PATH, STREAM_MANIFEST_KIND, StreamManifest, StreamSummary,
@@ -44,6 +46,9 @@ pub fn run(uri: &str) -> Result<String, String> {
         }
         Some(FAMILY_MANIFEST_KIND) => {
             crate::search::verify_family(uri, &store, &manifest_key, &bytes)
+        }
+        Some(SELECTION_MANIFEST_KIND) => {
+            crate::portfolio::verify_selection(uri, &store, &manifest_key, &bytes)
         }
         Some(kind) => Err(format!("{uri}: unsupported manifest kind `{kind}`")),
     }

@@ -225,7 +225,7 @@ pub fn search(config: &Config, local: &Store, destination: &Store) -> Result<Str
             );
             let published =
                 replay::publish(&chunk_config(config, table), local, destination, true)?;
-            let summary = published.summary;
+            let summary = published.engine.summary();
             let events = chunk_events(destination, &published.manifest)?;
             let mut splits = if role == DatasetRole::Evaluation {
                 search::project_splits(events.iter().cloned(), &currency)
@@ -409,14 +409,8 @@ pub fn search(config: &Config, local: &Store, destination: &Store) -> Result<Str
 /// table, so its hash and generation depend on nothing else.
 fn chunk_config(config: &Config, table: binary_alpha_engine::config::Replay) -> Config {
     Config {
-        import: None,
-        instruments: Vec::new(),
-        features: None,
-        outcomes: None,
         replay: Some(table),
-        accelerator: None,
-        search: None,
-        ..config.clone()
+        ..crate::skeleton(config)
     }
 }
 
@@ -522,7 +516,11 @@ fn bind_evaluation(settings: &Search, development: &Development) -> Result<Famil
 }
 
 /// The bytes of one stored object of a generation, verified against its record.
-fn read_object(store: &Store, objects: &[ObjectRecord], path: &str) -> Result<Vec<u8>, String> {
+pub(crate) fn read_object(
+    store: &Store,
+    objects: &[ObjectRecord],
+    path: &str,
+) -> Result<Vec<u8>, String> {
     let object = objects
         .iter()
         .find(|object| object.path == path)
@@ -957,6 +955,73 @@ fn restored_definition(
 /// verified summaries and the shared ledger projection, and every stability result recomputed
 /// from the verified settlement profits.
 pub fn verify_family(uri: &str, store: &Store, key: &str, bytes: &[u8]) -> Result<String, String> {
+    let manifest = family_manifest(uri, key, bytes)?;
+    let (family, family_bytes) = read_family(uri, store, &manifest)?;
+    let replayed = verify_read_family(uri, store, &manifest, &family)?;
+    Ok(format!(
+        "verified search generation {} members {} applicable {} replayed {replayed} passed {} objects 1 bytes {family_bytes}",
+        manifest.generation,
+        family.members.len(),
+        family.applicable,
+        family
+            .members
+            .iter()
+            .filter(|member| member.rank.is_some())
+            .count()
+    ))
+}
+
+/// The typed development-only reader of a verified family: every manifest input is development
+/// before `family.json` is opened; the family carries no evaluation window, lowering or chunk
+/// of another role, or member evaluation evidence before any referenced generation is followed;
+/// then the whole family verifies exactly as `data verify` does. Nothing is stripped to make an
+/// input acceptable.
+pub(crate) fn development_family(uri: &str) -> Result<(FamilyManifest, Family), String> {
+    let (store, key) = verify::open(uri)?;
+    let mut bytes = Vec::new();
+    store.read_to(&key, None, &mut bytes)?;
+    if verify::manifest_kind(&bytes)?.as_deref() != Some(search::FAMILY_MANIFEST_KIND) {
+        return Err(format!("{uri} is not a search family manifest"));
+    }
+    let manifest = family_manifest(uri, &key, &bytes)?;
+    let development = DatasetRole::Development.to_string();
+    if let Some(input) = manifest
+        .inputs
+        .iter()
+        .find(|input| input.role != development)
+    {
+        return Err(format!(
+            "{uri}: input {} of {} is `{}`; a portfolio universe reads development-only families",
+            input.tick_generation, input.instrument, input.role
+        ));
+    }
+    let (family, _) = read_family(uri, &store, &manifest)?;
+    let later = if family.search.evaluation.is_some() {
+        Some("an evaluation window")
+    } else if family.lowering.role != development {
+        Some("a lowering replay of another role")
+    } else if family.chunks.iter().any(|chunk| chunk.role != development) {
+        Some("a replay chunk of another role")
+    } else if family.members.iter().any(|member| {
+        member.evaluation.is_some()
+            || !member.evaluation_splits.is_empty()
+            || member.stability.keys().any(|role| *role != development)
+    }) {
+        Some("member evaluation evidence")
+    } else {
+        None
+    };
+    if let Some(what) = later {
+        return Err(format!(
+            "{uri}: the family carries {what}; a portfolio universe reads development-only families"
+        ));
+    }
+    verify_read_family(uri, &store, &manifest, &family)?;
+    Ok((manifest, family))
+}
+
+/// The manifest of the family generation at `key`.
+fn family_manifest(uri: &str, key: &str, bytes: &[u8]) -> Result<FamilyManifest, String> {
     let manifest = FamilyManifest::from_json(bytes).map_err(|error| format!("{uri}: {error}"))?;
     if manifest.key() != key {
         return Err(format!(
@@ -964,6 +1029,16 @@ pub fn verify_family(uri: &str, store: &Store, key: &str, bytes: &[u8]) -> Resul
             manifest.generation
         ));
     }
+    Ok(manifest)
+}
+
+/// The family object of a manifest and its byte count, checked against the recorded member
+/// count and the kernel sources and sampler this binary carries.
+fn read_family(
+    uri: &str,
+    store: &Store,
+    manifest: &FamilyManifest,
+) -> Result<(Family, usize), String> {
     let family_bytes = read_object(store, &manifest.objects, FAMILY_OBJECT_PATH)?;
     let family = Family::from_json(&family_bytes)
         .map_err(|error| format!("{uri}: {FAMILY_OBJECT_PATH}: {error}"))?;
@@ -979,6 +1054,17 @@ pub fn verify_family(uri: &str, store: &Store, key: &str, bytes: &[u8]) -> Resul
             "{uri}: the family records kernel sources or a sampler this binary does not carry"
         ));
     }
+    Ok((family, family_bytes.len()))
+}
+
+/// Verifies a read family against its bound generations and every referenced replay, returning
+/// the number of members replayed on development data.
+fn verify_read_family(
+    uri: &str,
+    store: &Store,
+    manifest: &FamilyManifest,
+    family: &Family,
+) -> Result<usize, String> {
     let settings = &family.search;
     settings
         .validate()
@@ -1212,16 +1298,5 @@ pub fn verify_family(uri: &str, store: &Store, key: &str, bytes: &[u8]) -> Resul
             ));
         }
     }
-    Ok(format!(
-        "verified search generation {} members {} applicable {} replayed {replayed} passed {} objects 1 bytes {}",
-        manifest.generation,
-        family.members.len(),
-        family.applicable,
-        family
-            .members
-            .iter()
-            .filter(|member| member.rank.is_some())
-            .count(),
-        family_bytes.len()
-    ))
+    Ok(replayed)
 }

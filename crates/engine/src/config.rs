@@ -11,8 +11,8 @@ use sha2::{Digest, Sha256};
 
 use crate::dataset::{DatasetRole, NativeGranularity};
 use crate::execution::{
-    AccountSpec, Comparator, ContractTerms, Decimal, DeploymentBinding, Envelope, RateEvent,
-    ReplayInput, RiskPolicy, Split, StrategySpec, Threshold,
+    AccountSpec, Comparator, Condition, ContractTerms, Decimal, DeploymentBinding, Envelope,
+    RateEvent, ReplayInput, RiskPolicy, Split, StrategySpec, Threshold,
 };
 use crate::market::{BrokerId, Currency, InstrumentId, PriceScale, ProviderSymbol};
 
@@ -43,6 +43,8 @@ pub struct Config {
     pub accelerator: Option<Accelerator>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub search: Option<Search>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub portfolio: Option<Portfolio>,
 }
 
 impl Config {
@@ -110,6 +112,11 @@ impl Config {
             search
                 .validate()
                 .map_err(|reason| format!("search.{reason}"))?;
+        }
+        if let Some(portfolio) = &self.portfolio {
+            portfolio
+                .validate()
+                .map_err(|reason| format!("portfolio.{reason}"))?;
         }
         let Some(import) = &self.import else {
             return Ok(());
@@ -1050,6 +1057,147 @@ pub struct StabilitySettings {
     pub block_length: u32,
     pub simulations: u32,
     pub rolling_horizon: u32,
+}
+
+/// The optional `portfolio` table: one finite joint selection over development-only families
+/// through the chronological engine. Omitting the table preserves every existing configuration
+/// identity. The engine module `portfolio` owns every rule and record.
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct Portfolio {
+    pub families: Vec<ManifestUri>,
+    pub max_policies: u64,
+    pub embargo_micros: i64,
+    pub objective: crate::portfolio::Objective,
+    pub gates: crate::portfolio::Gates,
+    pub accounts: Vec<AccountSpec>,
+    pub reporting_currency: Currency,
+    pub reporting_scale: u8,
+    pub max_rate_age_micros: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rates: Option<Vec<RateEvent>>,
+    pub members: Vec<PortfolioMember>,
+    pub repairs: Vec<Repair>,
+    pub bindings: Vec<PortfolioBinding>,
+    pub subsets: Vec<Subset>,
+    pub risk_policies: Vec<RiskPolicy>,
+    pub folds: Vec<Fold>,
+    pub refit: Refit,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evaluation: Option<Evaluation>,
+}
+
+impl Portfolio {
+    /// The rules a single field's deserializer cannot see; an error names the field.
+    pub fn validate(&self) -> Result<(), String> {
+        crate::portfolio::validate(self)
+    }
+}
+
+/// One base of the universe: a member of a listed family, with the interval ordinal every
+/// development-fifths condition resolves to per fold.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PortfolioMember {
+    pub family: usize,
+    pub member: usize,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ordinals: Vec<Ordinal>,
+}
+
+/// The zero-based low-to-high interval ordinal, `0` to `4`, of one member condition on a
+/// development-fifths encoding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct Ordinal {
+    pub condition: usize,
+    pub ordinal: u8,
+}
+
+/// One protective-condition alternative; an empty conjunction is no repair.
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct Repair {
+    pub id: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub conditions: Vec<Condition>,
+}
+
+/// One account and instrument a deployment binds to, with its complete contract and envelope
+/// alternatives.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PortfolioBinding {
+    pub id: String,
+    pub account: String,
+    /// `BROKER:PROVIDER_SYMBOL`, the neutral instrument identity of one fold input.
+    pub instrument: String,
+    pub alternatives: Vec<Alternative>,
+}
+
+/// One complete exact contract and its matching envelope.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct Alternative {
+    pub contract: ContractTerms,
+    pub envelope: Envelope,
+}
+
+/// One allowed ordered subset: the deployments in binding priority order.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct Subset {
+    pub deployments: Vec<Deployment>,
+}
+
+/// One deployment of a subset: the base member with one repair on one binding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct Deployment {
+    pub member: usize,
+    pub repair: usize,
+    pub binding: usize,
+}
+
+/// One inner fold: the cutoff every fit ends before, the assessment window that starts at
+/// least the embargo after it, and one fit and assessment input per instrument.
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct Fold {
+    pub cutoff: String,
+    pub decision_start: String,
+    pub decision_end: String,
+    pub inputs: Vec<FoldInput>,
+}
+
+/// One instrument's fold inputs: the development fit entry (a new plan on its own profile's
+/// source generation) and the development tick generation the fitted plan is applied to.
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct FoldInput {
+    pub fit: FeatureInstrument,
+    pub assessment_manifest: ManifestUri,
+}
+
+/// The final refit of the selected choice: the cutoff and one development fit per instrument
+/// on the full permitted development generation.
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct Refit {
+    pub cutoff: String,
+    pub fits: Vec<FeatureInstrument>,
+}
+
+/// The optional outer evaluation of the frozen choice: one continuous joint replay over the
+/// evaluation tick generations with the declared reporting splits.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct Evaluation {
+    pub decision_start: String,
+    pub decision_end: String,
+    pub inputs: Vec<ManifestUri>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub splits: Option<Vec<Split>>,
 }
 
 /// Explicit offline accelerator selection. Absence preserves existing configuration identity.

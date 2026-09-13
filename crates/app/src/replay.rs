@@ -18,7 +18,7 @@ use binary_alpha_engine::execution::{
     ColumnSpec, EVENTS_OBJECT_PATH, Engine, EventKind, EventSource, FinancialEvent,
     HISTORICAL_AVAILABILITY, InstrumentBinding, Observation, REPLAY_MANIFEST_KIND,
     REPLAY_SCHEMA_VERSION, ReplayManifest, RunDefinition, SUMMARY_OBJECT_PATH, StreamColumns,
-    Summary, replay_generation_id,
+    replay_generation_id,
 };
 use binary_alpha_engine::features::{FeaturePlan, StreamPlan, Value};
 use binary_alpha_engine::market::parse_event_time_micros;
@@ -506,11 +506,11 @@ fn simulate(
     Ok(engine)
 }
 
-/// One published replay generation: its ready manifest, the published summary, and the report
-/// and reconstruction lines of the command.
+/// One published replay generation: its ready manifest, the engine its verifier restored from
+/// the published ledger, and the report and reconstruction lines of the command.
 pub(crate) struct Published {
     pub(crate) manifest: ReplayManifest,
-    pub(crate) summary: Summary,
+    pub(crate) engine: Engine,
     pub(crate) report: String,
 }
 
@@ -564,20 +564,7 @@ pub(crate) fn publish(
             ));
         }
         // A completed generation is reused only after its own verifier restores it.
-        verify_replay(&uri, destination, &key, &bytes)?;
-        let summary_object = manifest
-            .objects
-            .iter()
-            .find(|object| object.path == SUMMARY_OBJECT_PATH)
-            .ok_or_else(|| format!("{uri} lists no `{SUMMARY_OBJECT_PATH}`"))?;
-        let mut bytes = Vec::new();
-        destination.read_to(&summary_object.key, summary_object.generation, &mut bytes)?;
-        let summary = Summary::from_json(&bytes).map_err(|error| format!("{uri}: {error}"))?;
-        if summary.identity() != manifest.summary_identity {
-            return Err(format!(
-                "{uri}: the published summary does not match the manifest"
-            ));
-        }
+        let restored = restore_verified(&uri, destination, &key, &bytes)?;
         return Ok(Published {
             report: format!(
                 "replay {} generation {generation} instruments {} events {} (already published)",
@@ -586,7 +573,7 @@ pub(crate) fn publish(
                 manifest.events
             ),
             manifest,
-            summary,
+            engine: restored.engine,
         });
     }
     let mut inputs = Vec::with_capacity(bound.len());
@@ -720,7 +707,8 @@ pub(crate) fn publish(
     // Reconstruct from the published ledger under the manifest bytes about to become ready; a
     // generation its own verifier rejects is never marked ready.
     let uri = destination.uri(&key);
-    let verified = verify_replay(&uri, destination, &key, &committed)?;
+    let restored = restore_verified(&uri, destination, &key, &committed)?;
+    let verified = restored.line();
     let temporary = import::temporary_path(local, &format!("manifest-{generation}"))?;
     fs::write(&temporary, &committed)
         .map_err(|error| format!("cannot write {}: {error}", temporary.display()))?;
@@ -739,18 +727,56 @@ pub(crate) fn publish(
             published.as_secs_f64()
         ),
     };
-    let manifest = ReplayManifest::from_json(&committed).expect("the committed manifest parsed");
     Ok(Published {
-        manifest,
-        summary,
+        manifest: restored.manifest,
+        engine: restored.engine,
         report: format!("{line}\n{verified}"),
     })
+}
+
+/// One verified restoration of a published replay generation: its manifest, the engine restored
+/// from the published ledger, and the verified byte count.
+pub(crate) struct Restored {
+    pub(crate) manifest: ReplayManifest,
+    pub(crate) engine: Engine,
+    bytes_verified: u64,
+}
+
+impl Restored {
+    /// The reconstruction line `data verify` writes.
+    fn line(&self) -> String {
+        let portfolio = &self.engine.summary().portfolio;
+        format!(
+            "verified {} generation {} events {} signals {} accepted {} settled {} unresolved {} objects {} bytes {}",
+            self.manifest.role,
+            self.manifest.generation,
+            self.manifest.events,
+            portfolio.signals,
+            portfolio.accepted,
+            portfolio.settled,
+            portfolio.unresolved,
+            self.manifest.objects.len(),
+            self.bytes_verified
+        )
+    }
 }
 
 /// Verifies a replay generation: every object's bytes and hashes, the ledger restored record by
 /// record through the engine's one event-application function, and the restored sequence,
 /// final state, and summary against the manifest and the published summary bytes.
 pub fn verify_replay(uri: &str, store: &Store, key: &str, bytes: &[u8]) -> Result<String, String> {
+    restore_verified(uri, store, key, bytes).map(|restored| restored.line())
+}
+
+/// Restores and verifies a replay generation, returning the verified restored engine so that a
+/// consumer projects the same financial state the verifier proved, without a second
+/// restoration.
+pub(crate) fn restore_verified(
+    uri: &str,
+    store: &Store,
+    key: &str,
+    bytes: &[u8],
+) -> Result<Restored, String> {
     let manifest = ReplayManifest::from_json(bytes).map_err(|error| format!("{uri}: {error}"))?;
     if manifest.key() != key {
         return Err(format!(
@@ -803,16 +829,9 @@ pub fn verify_replay(uri: &str, store: &Store, key: &str, bytes: &[u8]) -> Resul
             "{summary_location}: the published summary disagrees with the projection restored from the ledger"
         ));
     }
-    let portfolio = &engine.summary().portfolio;
-    Ok(format!(
-        "verified {} generation {} events {} signals {} accepted {} settled {} unresolved {} objects {} bytes {bytes_verified}",
-        manifest.role,
-        manifest.generation,
-        manifest.events,
-        portfolio.signals,
-        portfolio.accepted,
-        portfolio.settled,
-        portfolio.unresolved,
-        manifest.objects.len()
-    ))
+    Ok(Restored {
+        manifest,
+        engine,
+        bytes_verified,
+    })
 }

@@ -183,9 +183,9 @@ pub fn run(config_path: &Path, out: &mut dyn Write) -> Result<(), String> {
         resolved.push(item);
     }
     for (index, item) in resolved.into_iter().enumerate() {
-        let line = build(item, &config, &local, &destination)
+        let built = build(item, &config, &local, &destination)
             .map_err(|reason| format!("features.instruments[{index}]: {reason}"))?;
-        writeln!(out, "{line}")
+        writeln!(out, "{}", built.report)
             .and_then(|()| out.flush())
             .map_err(|error| format!("cannot write the report: {error}"))?;
     }
@@ -376,13 +376,30 @@ struct StreamOutput {
 }
 
 /// One entry's bound inputs and its resolved or frozen plan.
-struct Resolved {
+pub(crate) struct Resolved {
     bound: Bound,
     plan: FeaturePlan,
     frozen_from: Option<String>,
 }
 
-fn resolve(entry: &FeatureInstrument) -> Result<Resolved, String> {
+impl Resolved {
+    /// The bound input generation.
+    pub(crate) fn input(&self) -> &GenerationManifest {
+        &self.bound.input
+    }
+}
+
+/// One published feature generation: its committed ready manifest, the plan it applies, and
+/// the report and reconstruction lines of the command.
+pub(crate) struct Built {
+    pub(crate) manifest: FeatureManifest,
+    pub(crate) plan: FeaturePlan,
+    pub(crate) report: String,
+}
+
+/// Binds one entry's inputs and resolves its new plan or reads its frozen one; nothing is
+/// streamed or published.
+pub(crate) fn resolve(entry: &FeatureInstrument) -> Result<Resolved, String> {
     let bound = bind(entry)?;
     let reference = profile_reference(
         &bound.stream_manifest,
@@ -420,12 +437,14 @@ fn resolve(entry: &FeatureInstrument) -> Result<Resolved, String> {
     })
 }
 
-fn build(
+/// Streams, fits or applies, encodes, publishes, and reconstructs one resolved entry as a
+/// feature generation; a completed identical generation is reused.
+pub(crate) fn build(
     resolved: Resolved,
     config: &Config,
     local: &Store,
     destination: &Store,
-) -> Result<String, String> {
+) -> Result<Built, String> {
     let Resolved {
         bound,
         mut plan,
@@ -734,7 +753,12 @@ fn build(
             published.as_secs_f64()
         ),
     };
-    Ok(format!("{line}\n{verified}"))
+    let manifest = FeatureManifest::from_json(&committed).expect("the committed manifest parsed");
+    Ok(Built {
+        manifest,
+        plan,
+        report: format!("{line}\n{verified}"),
+    })
 }
 
 /// Verifies a feature generation: every object's bytes and hashes, the plan's identity, and

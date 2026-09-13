@@ -9,6 +9,7 @@ pub mod execution;
 pub mod features;
 pub mod market;
 pub mod outcomes;
+pub mod portfolio;
 pub mod search;
 pub mod stream;
 

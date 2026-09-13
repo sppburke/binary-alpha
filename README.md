@@ -32,6 +32,8 @@ cargo run --release --locked -p binary-alpha-app -- data verify --manifest URI
 cargo run --release --locked -p binary-alpha-app -- features build --config PATH
 cargo run --release --locked -p binary-alpha-app -- outcomes build --config PATH
 cargo run --release --locked -p binary-alpha-app -- replay --config PATH
+cargo run --release --locked -p binary-alpha-app -- search --config PATH
+cargo run --release --locked -p binary-alpha-app -- portfolio optimize --config PATH
 BINARY_ALPHA_TEST_CONFIG=PATH BINARY_ALPHA_CUDA_REFERENCE_OUTPUT=NEW_DIRECTORY cargo test --release --locked -p binary-alpha-app --features cuda --test phase07_cuda_parity capture_legacy_reference -- --exact --ignored --nocapture
 BINARY_ALPHA_TEST_CONFIG=PATH BINARY_ALPHA_CUDA_REFERENCE=MANIFEST cargo test --release --locked -p binary-alpha-app --features cuda --test phase07_cuda_parity governed_parity -- --exact --ignored --nocapture
 ```
@@ -50,9 +52,14 @@ events, and encoded rows as a feature generation; `binary-alpha outcomes build -
 labels every decision row of the `[outcomes]` feature generation against its tick generation and
 publishes the future-only outcome generation; `binary-alpha replay --config PATH` feeds the
 `[replay]` inputs through the engine with the configured simulation and publishes the ledger and
-summary as a replay generation; `binary-alpha data verify --manifest URI`
-re-reads one generation of any kind from its manifest and objects alone. All six are documented in
-[docs/contracts.md](docs/contracts.md) and [docs/operations.md](docs/operations.md). The example
+summary as a replay generation; `binary-alpha search --config PATH` enumerates, scores, replays,
+evaluates, and resamples one candidate family and publishes it; `binary-alpha portfolio optimize
+--config PATH` enumerates every declared complete joint policy over development-only families,
+replays each one jointly per inner fold through the engine, selects under the frozen objective,
+refits, optionally evaluates once, and publishes one selection generation; `binary-alpha data
+verify --manifest URI` re-reads one generation of any kind from its manifest and objects alone.
+Every command is documented in [docs/contracts.md](docs/contracts.md) and
+[docs/operations.md](docs/operations.md). The example
 configuration retains data in the repository-local `historical_data/` folder, which Git ignores,
 and declares one instrument. The governed-fixture proof of the instrument stream is
 `BINARY_ALPHA_TEST_CONFIG=PATH cargo test --locked -p binary-alpha-app --test phase03_instrument_stream -- --ignored --nocapture`,

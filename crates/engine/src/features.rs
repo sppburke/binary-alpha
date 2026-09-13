@@ -4935,6 +4935,39 @@ impl FittedEncoding {
         })
     }
 
+    /// The label of one development-fifths interval by its zero-based low-to-high ordinal, `0`
+    /// to `4`: the right-closed bin between the fitted cuts with the unbounded tails, labelled
+    /// exactly as the fit labelled it. Requires a development-fifths encoding fitted with four
+    /// distinct cuts and a label retained under the label limit; the reason names anything
+    /// else. Frequency-ranked label codes are never interval ordinals.
+    pub fn interval_label(&self, ordinal: u8) -> Result<String, String> {
+        if self.encoding != ProjectionKind::DevelopmentFifths {
+            return Err(format!(
+                "encoding `{}` is `{}`, not `development_fifths`",
+                self.output, self.encoding
+            ));
+        }
+        if ordinal > 4 {
+            return Err(format!("interval ordinal {ordinal} is not within 0 to 4"));
+        }
+        let cuts = self.edges.as_ref().map_or(0, Vec::len);
+        if cuts != 4 {
+            return Err(format!(
+                "encoding `{}` fitted {cuts} distinct cuts, not four",
+                self.output
+            ));
+        }
+        let edges = self.full_edges().expect("four cuts");
+        let label = edge_label(edges[usize::from(ordinal)], edges[usize::from(ordinal) + 1]);
+        if !self.labels.contains(&label) {
+            return Err(format!(
+                "encoding `{}` did not retain interval {ordinal} `{label}` under its label limit",
+                self.output
+            ));
+        }
+        Ok(label)
+    }
+
     /// The label of one value under this encoding, or `None` for a missing value, an
     /// out-of-range number, or an unfitted development quantile.
     pub fn label(&self, value: Option<&Value>) -> Option<Cow<'_, str>> {

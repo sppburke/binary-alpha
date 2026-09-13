@@ -496,7 +496,7 @@ pub struct Envelope {
 }
 
 impl Envelope {
-    fn admits(&self, terms: &ContractTerms) -> Result<bool, String> {
+    pub(crate) fn admits(&self, terms: &ContractTerms) -> Result<bool, String> {
         let within = |value: Decimal, maximum: Decimal| -> Result<bool, String> {
             Ok(value.compare(maximum)? != Ordering::Greater)
         };

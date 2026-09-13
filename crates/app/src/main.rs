@@ -1,6 +1,6 @@
 //! The `binary-alpha` executable: configuration validation, historical-data import, instrument
-//! audit, feature builds, outcome builds, engine replay, candidate search, verification, and the
-//! external adapters those commands need.
+//! audit, feature builds, outcome builds, engine replay, candidate search, portfolio selection,
+//! verification, and the external adapters those commands need.
 
 mod archive;
 mod audit;
@@ -8,6 +8,7 @@ mod features;
 mod import;
 mod outcomes;
 mod parallel;
+mod portfolio;
 mod replay;
 mod search;
 mod store;
@@ -65,6 +66,24 @@ enum Command {
     /// Enumerate, score, replay, evaluate, and resample one candidate family and publish it.
     Search {
         /// Path of the TOML configuration document with the `search` table.
+        #[arg(long)]
+        config: PathBuf,
+    },
+    /// Compare complete joint policies through the engine over development folds and publish
+    /// one selection.
+    #[command(disable_help_subcommand = true)]
+    Portfolio {
+        #[command(subcommand)]
+        command: PortfolioCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum PortfolioCommand {
+    /// Enumerate every declared complete policy, replay each one jointly per inner fold, select
+    /// under the frozen objective, refit, optionally evaluate, and publish the selection.
+    Optimize {
+        /// Path of the TOML configuration document with the `portfolio` table.
         #[arg(long)]
         config: PathBuf,
     },
@@ -150,6 +169,9 @@ fn main() -> ExitCode {
         } => outcomes::run(&config, &mut std::io::stdout().lock()),
         Command::Replay { config } => replay::run(&config, &mut std::io::stdout().lock()),
         Command::Search { config } => search::run(&config, &mut std::io::stdout().lock()),
+        Command::Portfolio {
+            command: PortfolioCommand::Optimize { config },
+        } => portfolio::run(&config, &mut std::io::stdout().lock()),
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,
@@ -167,6 +189,23 @@ fn validate(path: &Path) -> Result<String, String> {
         config.content_hash(),
         config.canonical_toml()
     ))
+}
+
+/// The schema, run mode, and storage of a configuration with every table cleared: the base of
+/// a synthesized configuration whose hash and generations depend on nothing but the one table
+/// its caller adds.
+fn skeleton(config: &Config) -> Config {
+    Config {
+        import: None,
+        instruments: Vec::new(),
+        features: None,
+        outcomes: None,
+        replay: None,
+        accelerator: None,
+        search: None,
+        portfolio: None,
+        ..config.clone()
+    }
 }
 
 /// All configuration-path commands share parsing and build-capability checks.
