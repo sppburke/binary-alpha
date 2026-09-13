@@ -1126,18 +1126,19 @@ fn verify_read_family(
         let mut bytes = Vec::new();
         store.read_to(&chunk_key, None, &mut bytes)?;
         let chunk_uri = store.uri(&chunk_key);
-        replay::verify_replay(&chunk_uri, store, &chunk_key, &bytes)?;
         let chunk_manifest =
             ReplayManifest::from_json(&bytes).map_err(|error| format!("{chunk_uri}: {error}"))?;
-        // Reuse without simulation (the search's resume path) requires the recorded revision;
-        // a re-simulation under another revision that reproduces the identical generation is
-        // reused by the store, so verification restores every chunk and checks its definition
-        // regardless of the revision that first published it.
+        // The manifest's own role and summary must be the recorded ones before any object of
+        // the chunk is opened. Reuse without simulation (the search's resume path) requires the
+        // recorded revision; a re-simulation under another revision that reproduces the
+        // identical generation is reused by the store, so verification restores every chunk and
+        // checks its definition regardless of the revision that first published it.
         if chunk_manifest.summary_identity != chunk.summary_identity
             || chunk_manifest.role.to_string() != chunk.role
         {
             return Err(format!("{uri}: {chunk_uri} is not the recorded chunk"));
         }
+        replay::verify_replay(&chunk_uri, store, &chunk_key, &bytes)?;
         let events = chunk_events(store, &chunk_manifest)?;
         Ok((chunk_manifest, events))
     };

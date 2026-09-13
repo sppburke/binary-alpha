@@ -472,6 +472,14 @@ impl ContractTerms {
             .max(Decimal::zero(0))
     }
 
+    /// The duration plus the permitted settlement delay: how long after entry a contract may
+    /// still settle.
+    pub fn settlement_horizon(&self) -> Result<i64, String> {
+        self.duration_micros
+            .checked_add(self.settlement.max_settlement_delay_micros)
+            .ok_or_else(|| "duration_micros: duration plus settlement delay overflows".to_string())
+    }
+
     /// `gross_payout - quoted_cost - entry_fee - win_terminal_fee`.
     pub fn winning_net(&self) -> Result<Decimal, String> {
         self.win
@@ -1999,6 +2007,7 @@ struct Rate {
 /// Converts `amount` from `source` into `reporting` units at `scale` as of `at`: same-currency
 /// amounts rescale exactly; otherwise the latest supplied rate whose provider and availability
 /// times are no later than `at` and whose provider age is at most `max_age` multiplies once.
+/// `None` when no such rate exists; an error only when the arithmetic fails.
 fn convert(
     amount: Decimal,
     source: &Currency,
@@ -2007,14 +2016,14 @@ fn convert(
     at: i64,
     max_age: i64,
     rates: &[Rate],
-) -> Result<Converted, String> {
+) -> Result<Option<Converted>, String> {
     if source == reporting {
-        return Ok(Converted {
+        return Ok(Some(Converted {
             amount: amount.rescale(scale)?,
             rate: None,
-        });
+        }));
     }
-    let rate = rates
+    let Some(rate) = rates
         .iter()
         .filter(|rate| {
             rate.source == *source
@@ -2024,16 +2033,13 @@ fn convert(
                 && at - rate.provider_time_micros <= max_age
         })
         .max_by_key(|rate| rate.provider_time_micros)
-        .ok_or_else(|| {
-            format!(
-                "no {source} to {reporting} rate is available at {} within {max_age} microseconds",
-                format_event_time_micros(at)
-            )
-        })?;
-    Ok(Converted {
+    else {
+        return Ok(None);
+    };
+    Ok(Some(Converted {
         amount: amount.checked_mul(rate.rate)?.rescale(scale)?,
         rate: Some(rate.id.clone()),
-    })
+    }))
 }
 
 /// The group keys of one binding's records.
@@ -2475,8 +2481,10 @@ impl Engine {
         crate::hex(&hasher.finalize())
     }
 
-    /// Converts one amount for reporting or portfolio risk as of the current decision time.
-    pub fn convert(&self, amount: Decimal, source: &Currency) -> Result<Converted, String> {
+    /// Converts one amount for reporting or portfolio risk as of the current decision time:
+    /// `None` when no supplied rate is available and fresh, an error only when the arithmetic
+    /// fails.
+    pub fn convert(&self, amount: Decimal, source: &Currency) -> Result<Option<Converted>, String> {
         convert(
             amount,
             source,
@@ -3502,11 +3510,11 @@ impl Engine {
                     .map(|other| (other.unresolved_loss, &other.currency)),
             ) {
                 match self.convert(amount, currency) {
-                    Ok(converted) => {
+                    Ok(Some(converted)) => {
                         total = total.checked_add(converted.amount)?;
                         rates.extend(converted.rate);
                     }
-                    Err(_) => return blocked(Disposition::ConversionUnavailable),
+                    Ok(None) | Err(_) => return blocked(Disposition::ConversionUnavailable),
                 }
             }
             rates.sort_unstable();
@@ -4205,7 +4213,8 @@ impl Engine {
                         at,
                         replay.max_rate_age_micros,
                         &self.rates,
-                    )
+                    )?
+                    .ok_or_else(|| "no rate is available".to_string())
                 };
                 let converted_equity = convert(account.settled_equity()?)?;
                 let converted_loss = convert(account.unresolved_loss)?;

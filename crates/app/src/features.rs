@@ -387,6 +387,12 @@ impl Resolved {
     pub(crate) fn input(&self) -> &GenerationManifest {
         &self.bound.input
     }
+
+    /// The raw-row identity the resolved plan will carry: its profile, input, and settings,
+    /// before any fit.
+    pub(crate) fn raw_identity(&self) -> &str {
+        &self.plan.raw_identity
+    }
 }
 
 /// One published feature generation: its committed ready manifest, the plan it applies, and

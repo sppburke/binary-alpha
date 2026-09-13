@@ -161,7 +161,7 @@ fn bind_instrument(settings: &Replay, index: usize) -> Result<BoundInstrument, S
 /// The streams and columns the strategies frozen on `plan` name, in frozen-plan order: every
 /// base stream and condition stream, each with the compiled outputs and fitted encodings its
 /// conditions read. A name that is neither is refused here with its strategy and condition.
-fn stream_columns(
+pub(crate) fn stream_columns(
     settings: &Replay,
     plan: &FeaturePlan,
     plan_identity: &str,

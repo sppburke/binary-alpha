@@ -13,7 +13,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::config::{FeatureInstrument, Portfolio, Replay, StreamKey};
+use crate::config::{Config, FeatureInstrument, Portfolio, Replay, StreamKey};
 use crate::dataset::{DatasetRole, ObjectRecord};
 use crate::execution::{
     AccountSpec, Comparator, Condition, ContractTerms, Decimal, DeploymentBinding, Engine, Group,
@@ -28,7 +28,8 @@ pub const SELECTION_MANIFEST_KIND: &str = "portfolio_selection";
 pub const SELECTION_SCHEMA_VERSION: u32 = 1;
 /// The one object of a selection generation.
 pub const SELECTION_OBJECT_PATH: &str = "selection.json";
-/// The plan identity of every strategy's logical form, before a fold resolves it.
+/// The plan identity prefix of a strategy's logical form, before a fold resolves it: the
+/// prefix and the deployment's instrument, since every instrument carries its own fitted plan.
 pub const LOGICAL_PLAN_IDENTITY: &str = "logical";
 const SELECTION_DOMAIN_V1: &[u8] = b"binary-alpha portfolio selection v1\n";
 const CHOICE_DOMAIN_V1: &[u8] = b"binary-alpha portfolio choice v1\n";
@@ -118,9 +119,9 @@ fn embargoed(
 
 /// The rules of the `portfolio` table a single field's deserializer cannot see; an error names
 /// the field. Accounts, every contract alternative, every risk policy, the rates, the reporting
-/// contract, and the first fold's window are validated by the execution rules through one
-/// placeholder table per risk policy; a choice's own duplicate-deployment and shared-policy
-/// rules apply when it is enumerated.
+/// contract, and the first fold's window are validated by the execution rules through the
+/// structure of one policy per risk policy binding every alternative once; a choice's own
+/// duplicate-deployment and shared-policy rules apply when it is enumerated.
 pub fn validate(portfolio: &Portfolio) -> Result<(), String> {
     if portfolio.families.is_empty() {
         return Err("families: at least one family is required".to_string());
@@ -135,6 +136,21 @@ pub fn validate(portfolio: &Portfolio) -> Result<(), String> {
     }
     if portfolio.embargo_micros <= 0 {
         return Err("embargo_micros: must be positive".to_string());
+    }
+    for (index, binding) in portfolio.bindings.iter().enumerate() {
+        for (position, alternative) in binding.alternatives.iter().enumerate() {
+            let field = format!("bindings[{index}].alternatives[{position}].contract");
+            let required = alternative
+                .contract
+                .settlement_horizon()
+                .map_err(|reason| format!("{field}.{reason}"))?;
+            if portfolio.embargo_micros < required {
+                return Err(format!(
+                    "embargo_micros: {} is shorter than {field}'s duration plus settlement delay {required}",
+                    portfolio.embargo_micros
+                ));
+            }
+        }
     }
     if portfolio.gates.min_settled == 0 {
         return Err("gates.min_settled: must be positive".to_string());
@@ -189,14 +205,18 @@ pub fn validate(portfolio: &Portfolio) -> Result<(), String> {
         }
         for (position, alternative) in binding.alternatives.iter().enumerate() {
             let field = format!("bindings[{index}].alternatives[{position}]");
-            if contracts
+            match contracts
                 .iter()
-                .any(|contract| contract.id == alternative.contract.id)
+                .find(|contract| contract.id == alternative.contract.id)
             {
-                return Err(format!(
-                    "{field}.contract.id: `{}` is already an alternative; every alternative names its own contract",
-                    alternative.contract.id
-                ));
+                Some(existing) if *existing != alternative.contract => {
+                    return Err(format!(
+                        "{field}.contract.id: `{}` names different terms elsewhere; one identity is one contract",
+                        alternative.contract.id
+                    ));
+                }
+                Some(_) => {}
+                None => contracts.push(alternative.contract.clone()),
             }
             match alternative.envelope.admits(&alternative.contract) {
                 Ok(true) => {}
@@ -208,7 +228,6 @@ pub fn validate(portfolio: &Portfolio) -> Result<(), String> {
                 }
                 Err(reason) => return Err(format!("{field}.contract: {reason}")),
             }
-            contracts.push(alternative.contract.clone());
         }
     }
     if portfolio.subsets.is_empty() {
@@ -301,71 +320,46 @@ pub fn validate(portfolio: &Portfolio) -> Result<(), String> {
         }
     }
     // Every account, contract, policy, rate, and the reporting contract under the execution
-    // rules: one placeholder table per risk policy binds every alternative once.
-    for (index, policy) in portfolio.risk_policies.iter().enumerate() {
-        let mut strategies = Vec::new();
-        let mut bindings = Vec::new();
+    // rules: one policy per risk policy binds every alternative once, each through its own
+    // placeholder strategy.
+    for (index, risk_policy) in portfolio.risk_policies.iter().enumerate() {
+        let mut policy = Policy {
+            strategies: Vec::new(),
+            bindings: Vec::new(),
+            contracts: contracts.clone(),
+            risk_policies: vec![risk_policy.clone()],
+        };
         for binding in &portfolio.bindings {
             for alternative in &binding.alternatives {
-                let id = format!("validation-{}", strategies.len());
-                strategies.push(StrategySpec {
+                let id = format!("validation-{}", policy.strategies.len());
+                let stream = StreamKey {
+                    duration_seconds: 1,
+                    offset_seconds: 0,
+                };
+                policy.strategies.push(StrategySpec {
                     id: id.clone(),
                     plan_identity: "validation".to_string(),
-                    base_stream: StreamKey {
-                        duration_seconds: 1,
-                        offset_seconds: 0,
-                    },
+                    base_stream: stream,
                     conditions: vec![Condition {
-                        stream: StreamKey {
-                            duration_seconds: 1,
-                            offset_seconds: 0,
-                        },
+                        stream,
                         output: "validation".to_string(),
                         comparator: Comparator::Eq,
-                        threshold: Threshold::Number(strategies.len() as f64),
+                        threshold: Threshold::Number(policy.strategies.len() as f64),
                     }],
                     repair: Vec::new(),
                 });
-                bindings.push(DeploymentBinding {
-                    id,
-                    strategy: String::new(),
+                policy.bindings.push(DeploymentBinding {
+                    id: id.clone(),
+                    strategy: id,
                     account: binding.account.clone(),
                     instrument: binding.instrument.clone(),
                     contract: alternative.contract.id.clone(),
-                    risk_policy: policy.id.clone(),
+                    risk_policy: risk_policy.id.clone(),
                     envelope: alternative.envelope.clone(),
                 });
             }
         }
-        for binding in &mut bindings {
-            binding.strategy = binding.id.clone();
-        }
-        let fold = &portfolio.folds[0];
-        let table = Replay {
-            role: DatasetRole::Development,
-            decision_start: fold.decision_start.clone(),
-            decision_end: fold.decision_end.clone(),
-            inputs: fold
-                .inputs
-                .iter()
-                .map(|input| ReplayInput {
-                    tick_manifest: input.assessment_manifest.clone(),
-                    feature_manifest: input.assessment_manifest.clone(),
-                    outcome_manifest: None,
-                })
-                .collect(),
-            splits: None,
-            accounts: portfolio.accounts.clone(),
-            strategies,
-            bindings,
-            contracts: contracts.clone(),
-            risk_policies: vec![policy.clone()],
-            reporting_currency: portfolio.reporting_currency.clone(),
-            reporting_scale: portfolio.reporting_scale,
-            max_rate_age_micros: portfolio.max_rate_age_micros,
-            rates: portfolio.rates.clone(),
-        };
-        crate::execution::validate(&table)
+        structure(portfolio, &policy)
             .map_err(|reason| format!("under risk_policies[{index}]: {reason}"))?;
     }
     Ok(())
@@ -408,7 +402,6 @@ pub struct LogicalCondition {
 pub struct LogicalMember {
     pub family: usize,
     pub member: usize,
-    pub logic_identity: String,
     pub base_stream: StreamKey,
     pub conditions: Vec<LogicalCondition>,
 }
@@ -466,7 +459,6 @@ pub fn logical_members(
             Ok(LogicalMember {
                 family: base.family,
                 member: base.member,
-                logic_identity: member.logic_identity.clone(),
                 base_stream: family.base_stream,
                 conditions,
             })
@@ -550,8 +542,9 @@ impl Policy {
 /// Which form a choice's strategies take.
 #[derive(Clone, Copy)]
 pub enum Form<'a> {
-    /// The frozen logical form: the plan identity `logical` and every ordinal rendered as the
-    /// text `interval ORDINAL`, so identity and structure depend on nothing a fold fits.
+    /// The frozen logical form: the plan identity `logical:INSTRUMENT` and every ordinal
+    /// rendered as the text `interval ORDINAL`, so identity and structure depend on nothing a
+    /// fold fits.
     Logical,
     /// Resolved under one fitted plan per instrument: the plan identity of the deployment's
     /// instrument and every ordinal replaced by that plan's fitted interval label.
@@ -626,7 +619,7 @@ pub fn policy(
         let field = |index: usize| format!("{id} (member {}) condition {index}", deployment.member);
         let (plan_identity, conditions) = match form {
             Form::Logical => (
-                LOGICAL_PLAN_IDENTITY.to_string(),
+                format!("{LOGICAL_PLAN_IDENTITY}:{}", binding.instrument),
                 member
                     .conditions
                     .iter()
@@ -768,7 +761,8 @@ pub struct Projection {
 /// Projects and gates one verified restored engine: settlement support first; only then every
 /// account's native completed profit converted by the engine at the restored ledger's final
 /// event time and summed with checked arithmetic; then the engine's reporting drawdown, which
-/// passes only when every reporting observation was available. An arithmetic error stops.
+/// passes only when every reporting observation was available. A missing rate is a failed
+/// gate; an arithmetic error stops.
 pub fn project(engine: &Engine, gates: &Gates) -> Result<Projection, String> {
     let summary = engine.summary();
     let mut projection = Projection {
@@ -795,17 +789,24 @@ pub fn project(engine: &Engine, gates: &Gates) -> Result<Projection, String> {
         ));
         return Ok(projection);
     }
-    let mut total = Decimal::zero(engine.definition().replay.reporting_scale);
+    let replay = &engine.definition().replay;
+    let mut total = Decimal::zero(replay.reporting_scale);
     for account in engine.accounts() {
-        match engine.convert(account.completed_profit, &account.currency) {
-            Ok(converted) => {
+        match engine.convert(account.completed_profit, &account.currency)? {
+            Some(converted) => {
                 total = total.checked_add(converted.amount)?;
                 projection.rates.extend(converted.rate);
             }
-            Err(reason) => {
+            None => {
                 projection.failure = Some(format!(
-                    "the completed profit of account `{}` is unavailable: {reason}",
-                    account.id
+                    "the completed profit of account `{}` is unavailable: no {} to {} rate is available at {} within {} microseconds",
+                    account.id,
+                    account.currency,
+                    replay.reporting_currency,
+                    summary
+                        .last_time_micros
+                        .map_or_else(|| "the start".to_string(), format_event_time_micros),
+                    replay.max_rate_age_micros
                 ));
                 return Ok(projection);
             }
@@ -1089,10 +1090,11 @@ impl State {
     }
 }
 
-/// The complete selection as published in `selection.json`.
+/// The complete selection as published in `selection.json`: the resolved configuration whose
+/// hash the manifest binds, then everything the procedure computed.
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 pub struct Selection {
-    pub portfolio: Portfolio,
+    pub config: Config,
     pub families: Vec<FamilyRecord>,
     pub members: Vec<LogicalMember>,
     pub declared: u64,

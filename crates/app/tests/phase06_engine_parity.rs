@@ -2578,19 +2578,18 @@ fn quote_envelopes_pauses_conversion_and_projections_are_exact() {
         live.engine
             .convert(decimal("1.5"), &u)
             .unwrap()
+            .unwrap()
             .amount
             .to_string(),
         "1.50"
     );
-    assert!(
-        live.engine
-            .convert(decimal("1"), &v)
-            .unwrap_err()
-            .contains("no v to u rate"),
+    assert_eq!(
+        live.engine.convert(decimal("1"), &v).unwrap(),
+        None,
         "future availability"
     );
     live.simulate(103, vec![tick(103, 500)]);
-    let converted = live.engine.convert(decimal("1.5"), &v).unwrap();
+    let converted = live.engine.convert(decimal("1.5"), &v).unwrap().unwrap();
     assert_eq!(
         (converted.amount.to_string(), converted.rate),
         ("3.75".into(), Some("r1".into()))
@@ -2602,11 +2601,9 @@ fn quote_envelopes_pauses_conversion_and_projections_are_exact() {
             .contains("loses precision")
     );
     live.simulate(106, vec![tick(106, 500)]);
-    assert!(
-        live.engine
-            .convert(decimal("1"), &v)
-            .unwrap_err()
-            .contains("no v to u rate"),
+    assert_eq!(
+        live.engine.convert(decimal("1"), &v).unwrap(),
+        None,
         "stale beyond the maximum age"
     );
     // A foreign-currency account: the portfolio projection is observed at the start and after

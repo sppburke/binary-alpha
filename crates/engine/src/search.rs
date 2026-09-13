@@ -158,9 +158,8 @@ pub fn validate(search: &Search) -> Result<(), String> {
     }
     for (index, contract) in search.contracts.iter().enumerate() {
         let required = contract
-            .duration_micros
-            .checked_add(contract.settlement.max_settlement_delay_micros)
-            .ok_or_else(|| format!("contracts[{index}].duration_micros: overflows"))?;
+            .settlement_horizon()
+            .map_err(|reason| format!("contracts[{index}].{reason}"))?;
         if search.embargo_micros < required {
             return Err(format!(
                 "embargo_micros: {} is shorter than contracts[{index}]'s duration plus settlement delay {required}",

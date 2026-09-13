@@ -1139,7 +1139,8 @@ fn counting_grid_selects_verifies_and_resumes() {
         assert_eq!(account.completed_profit, profit);
         assert!(account.reserved.is_zero() && account.paid_basis.is_zero());
         assert_eq!(account.open, 0);
-        let nets: BTreeSet<String> = replay_events(&scratch, generation)
+        let events = replay_events(&scratch, generation);
+        let nets: BTreeSet<String> = events
             .iter()
             .filter_map(|event| match &event.kind {
                 EventKind::Settled { profit, .. } => Some(profit.to_string()),
@@ -1149,6 +1150,27 @@ fn counting_grid_selects_verifies_and_resumes() {
         assert_eq!(
             nets,
             BTreeSet::from(["-2.05".to_string(), "1.55".to_string()])
+        );
+        // Every acceptance debits exactly the purchase basis of terms B (cost 2 plus the 0.05
+        // entry fee) and reserves exactly the terminal reserve beyond it, which is zero.
+        let accepted: Vec<(String, String)> = events
+            .iter()
+            .filter_map(|event| match &event.kind {
+                EventKind::Accepted {
+                    debit, reservation, ..
+                } => Some((debit.to_string(), reservation.to_string())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            accepted.len() as u64,
+            fold.projection.as_ref().unwrap().settled
+        );
+        assert!(
+            accepted
+                .iter()
+                .all(|posting| *posting == ("2.05".to_string(), "0.00".to_string())),
+            "{accepted:?}"
         );
     }
 
@@ -1531,8 +1553,8 @@ fn interval_ordinals_follow_each_fold_fit() {
     let menu = format!(
         "\n[[search.conditions]]\nstream = {STREAM}\noutput = \"tick_volume_dev_quantile\"\ncomparator = \"eq\"\nthresholds = [\"{top}\"]\n"
     );
-    let (family_manifest, family) = family(&scratch, "volume", &dev, BASE_MS, &menu, "");
-    assert_eq!(family.members.len(), 1);
+    let (family_manifest, volume) = family(&scratch, "volume", &dev, BASE_MS, &menu, "");
+    assert_eq!(volume.members.len(), 1);
     let fits = [
         Fit {
             tick: dev.tick.clone(),
@@ -1614,23 +1636,45 @@ fn interval_ordinals_follow_each_fold_fit() {
     );
     let gates =
         "{ min_settled = 1, max_unresolved = 0, min_profit = \"-1000\", max_drawdown = \"1000\" }";
+    let (direction_manifest, direction) =
+        family(&scratch, "direction", &dev, BASE_MS, DIRECTION_MENU, "");
+    let ordinal_member = "{ family = 0, member = 0, ordinals = [{ condition = 0, ordinal = 4 }] }";
+    let runner_up = format!(
+        "{ordinal_member}, {{ family = 1, member = {} }}",
+        member(&direction, "down")
+    );
     let table = |folds: &str,
                  refit_base_ms: i64,
                  refit: &Fit,
                  evaluation_base_ms: i64,
                  evaluation: &Path,
-                 max_labels: u32| {
+                 max_labels: u32,
+                 with_runner_up: bool| {
+        let families: Vec<&Path> = if with_runner_up {
+            vec![&family_manifest, &direction_manifest]
+        } else {
+            vec![&family_manifest]
+        };
+        let subsets = if with_runner_up {
+            format!(
+                "{}, {}",
+                subset(&[deployment(0, 0, 0)]),
+                subset(&[deployment(1, 0, 0)])
+            )
+        } else {
+            subset(&[deployment(0, 0, 0)])
+        };
         format!(
             "{}\n[[portfolio.bindings]]\nid = \"b\"\naccount = \"a\"\ninstrument = \"{INSTRUMENT}\"\n{}{folds}{}{}",
             head_toml(
-                &[&family_manifest],
+                &families,
                 "profit_then_drawdown",
                 gates,
                 ACCOUNT,
                 NO_RATES,
-                "{ family = 0, member = 0, ordinals = [{ condition = 0, ordinal = 4 }] }",
+                if with_runner_up { &runner_up } else { ordinal_member },
                 "{ id = \"none\" }",
-                &subset(&[deployment(0, 0, 0)]),
+                &subsets,
                 &risk_policy("cap1", 1),
                 10
             ),
@@ -1659,6 +1703,7 @@ fn interval_ordinals_follow_each_fold_fit() {
             BASE_MS + 6 * HOUR_MS,
             &evaluation,
             32768,
+            false,
         ),
     );
     let (lines, manifest, selection) = optimize(&scratch, &config).unwrap();
@@ -1752,6 +1797,7 @@ fn interval_ordinals_follow_each_fold_fit() {
             BASE_MS + 6 * HOUR_MS,
             &evaluation,
             32768,
+            false,
         ),
     );
     let (_, _, changed) = optimize(&scratch, &other).unwrap();
@@ -1770,6 +1816,7 @@ fn interval_ordinals_follow_each_fold_fit() {
             BASE_MS + 6 * HOUR_MS,
             &other_evaluation,
             32768,
+            false,
         ),
     );
     let (_, _, moved) = optimize(&scratch, &outer).unwrap();
@@ -1803,6 +1850,7 @@ fn interval_ordinals_follow_each_fold_fit() {
             BASE_MS + 6 * HOUR_MS,
             &evaluation,
             32768,
+            false,
         ),
     );
     let (lines, manifest, selection) = optimize(&scratch, &collapsed).unwrap();
@@ -1833,6 +1881,7 @@ fn interval_ordinals_follow_each_fold_fit() {
             BASE_MS + 6 * HOUR_MS,
             &evaluation,
             4,
+            false,
         ),
     );
     let (lines, _, selection) = optimize(&scratch, &omitted).unwrap();
@@ -1855,13 +1904,19 @@ fn interval_ordinals_follow_each_fold_fit() {
             BASE_MS + 10 * HOUR_MS,
             &late_evaluation,
             32768,
+            true,
         ),
     );
     let (lines, manifest, selection) = optimize(&scratch, &refit_config).unwrap();
     assert!(
-        lines[0].contains(" passing 1 state refit_inapplicable "),
+        lines[0].contains(" declared 2 rejected 0 valid 2 passing 2 state refit_inapplicable "),
         "{}",
         lines[0]
+    );
+    // The feasible runner-up (down, rank two) is never chosen in the winner's place.
+    assert_eq!(
+        (selection.choices[0].rank, selection.choices[1].rank),
+        (Some(1), Some(2))
     );
     assert!(
         matches!(&selection.state, State::RefitInapplicable { reason } if reason.contains("fitted 0 distinct cuts, not four")),
@@ -2061,8 +2116,8 @@ fn later_role_evidence_and_ill_formed_inputs_are_refused_before_output() {
             evaluation_toml(BASE_MS - HOUR_MS, &assessment)
         ),
     );
-    let error =
-        command(&["config", "validate", "--config", reversed.to_str().unwrap()]).unwrap_err();
+    let error = optimize(&scratch, &reversed).unwrap_err();
+    assert_eq!(snapshot(&scratch), before);
     assert!(
         error.contains("evaluation.decision_start")
             && error.contains("begins less than the embargo after the cutoff"),
@@ -2196,12 +2251,17 @@ fn synchronized_and_separated_losses_differ_and_terminal_states_are_distinct() {
 
     // Every completed choice failing the gates is a no-feasible result with no refit and no
     // outer read; an outer rejection keeps the frozen choice without changing it.
+    // The configured evaluation manifest does not exist: an all-infeasible grid never reads it.
+    let absent = scratch.path(&format!(
+        "published/manifests/{}/ready.json",
+        "0".repeat(64)
+    ));
     let infeasible = scratch.config(
         "portfolio_infeasible.toml",
         &table(
             "drawdown_then_profit",
             "{ min_settled = 1, max_unresolved = 0, min_profit = \"1000\", max_drawdown = \"1000\" }",
-            "",
+            &evaluation_toml(BASE_MS + 6 * HOUR_MS, &absent),
         ),
     );
     let (lines, manifest, selection) = optimize(&scratch, &infeasible).unwrap();
