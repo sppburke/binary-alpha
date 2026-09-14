@@ -23,6 +23,7 @@ use binary_alpha_engine::execution::{
 use binary_alpha_engine::features::{FeaturePlan, StreamPlan, Value};
 use binary_alpha_engine::market::parse_event_time_micros;
 use binary_alpha_engine::outcomes::{OUTCOME_MANIFEST_KIND, OutcomeManifest};
+use binary_alpha_engine::research::Access;
 
 use crate::archive::TableReader;
 use crate::features::{self, ROWS_MESSAGE};
@@ -72,7 +73,11 @@ struct BoundInstrument {
 /// Binds one input through the shared tick and feature binder, then refuses an outcome
 /// generation of other inputs and decision times outside the declared window on the manifest
 /// bytes alone.
-fn bind_instrument(settings: &Replay, index: usize) -> Result<BoundInstrument, String> {
+fn bind_instrument(
+    settings: &Replay,
+    index: usize,
+    access: Access<'_>,
+) -> Result<BoundInstrument, String> {
     let input = &settings.inputs[index];
     let field = |name: &str| format!("inputs[{index}].{name}");
     let inputs = bind_inputs(
@@ -81,6 +86,7 @@ fn bind_instrument(settings: &Replay, index: usize) -> Result<BoundInstrument, S
         &input.tick_manifest,
         &input.feature_manifest,
         "a replay",
+        access,
     )?;
     let Bound {
         tick,
@@ -436,22 +442,38 @@ impl Inputs {
 
 /// Feeds every instrument's observations available at each time, in input order with ticks
 /// before rows and rows in frozen-plan order, through the engine; answers each admitted signal
-/// with the configured simulated acceptance at the same time; and closes the window.
+/// with the configured simulated acceptance, at the same time or, under an acceptance-delay
+/// scenario, at its decision time plus the delay through its own instrument's evidence
+/// horizon; and closes the window.
 fn simulate(
     definition: RunDefinition,
     inputs: &mut [Inputs],
+    access: Access<'_>,
     sink: &mut dyn FnMut(&FinancialEvent) -> Result<(), String>,
 ) -> Result<Engine, String> {
-    let mut engine = Engine::new(definition)?;
+    let delay = definition
+        .replay
+        .scenario
+        .as_ref()
+        .map_or(0, |scenario| scenario.acceptance_delay_micros);
+    let mut engine = Engine::with_access(definition, access)?;
     for event in engine.drain() {
         sink(&event)?;
     }
+    // Scheduled responses in (response time, instrument, command) order: every admitted
+    // command's synthetic acceptance at its decision time plus the delay, scheduled only
+    // through its own instrument's last input tick; a response beyond that horizon is never
+    // delivered and the command stays unaccepted for `Engine::finish`.
+    let mut pending: Vec<(i64, usize, String)> = Vec::new();
     loop {
         let mut time: Option<i64> = None;
         for input in inputs.iter_mut() {
             if let Some(next) = input.peek()? {
                 time = Some(time.map_or(next, |time| time.min(next)));
             }
+        }
+        if let Some((response, _, _)) = pending.first() {
+            time = Some(time.map_or(*response, |time| time.min(*response)));
         }
         let Some(time) = time else { break };
         let mut observations = Vec::new();
@@ -477,31 +499,77 @@ fn simulate(
                 }
             }
         }
+        // Responses due now follow the same-time ticks and rows and precede new decisions, each
+        // at its instrument's latest causally available tick.
+        let due = pending
+            .iter()
+            .take_while(|(response, _, _)| *response == time)
+            .count();
+        for (_, instrument, command) in pending.drain(..due) {
+            let input = &inputs[instrument];
+            let latest = input
+                .next_tick
+                .checked_sub(1)
+                .ok_or_else(|| format!("{command}: no tick precedes its scheduled response"))?;
+            observations.push(Observation::Accepted {
+                source: EventSource {
+                    id: format!("{HISTORICAL_AVAILABILITY}:{command}"),
+                    provider_time_micros: input.times[latest],
+                    available_at_micros: time,
+                    simulated: true,
+                },
+                command,
+                entry_time_micros: time,
+                entry_price_units: input.prices[latest],
+                price_time_micros: input.times[latest],
+            });
+        }
         engine.step(time, observations)?;
         let mut acceptances = Vec::new();
         for event in engine.drain() {
             if let EventKind::Signal {
+                instrument,
                 command: Some(command),
                 quote_price_units: Some(entry_price_units),
                 quote_time_micros: Some(price_time_micros),
                 ..
             } = &event.kind
             {
-                acceptances.push(Observation::Accepted {
-                    command: command.clone(),
-                    source: EventSource {
-                        id: format!("{HISTORICAL_AVAILABILITY}:{command}"),
-                        provider_time_micros: time,
-                        available_at_micros: time,
-                        simulated: true,
-                    },
-                    entry_time_micros: time,
-                    entry_price_units: *entry_price_units,
-                    price_time_micros: *price_time_micros,
-                });
+                if delay == 0 {
+                    acceptances.push(Observation::Accepted {
+                        command: command.clone(),
+                        source: EventSource {
+                            id: format!("{HISTORICAL_AVAILABILITY}:{command}"),
+                            provider_time_micros: time,
+                            available_at_micros: time,
+                            simulated: true,
+                        },
+                        entry_time_micros: time,
+                        entry_price_units: *entry_price_units,
+                        price_time_micros: *price_time_micros,
+                    });
+                } else {
+                    let response = time
+                        .checked_add(delay)
+                        .ok_or("the scheduled response time overflows microseconds")?;
+                    let index = engine
+                        .definition()
+                        .instruments
+                        .iter()
+                        .position(|bound| bound.instrument == *instrument)
+                        .ok_or_else(|| format!("{command}: signal names an unbound instrument"))?;
+                    if inputs[index]
+                        .times
+                        .last()
+                        .is_some_and(|horizon| response <= *horizon)
+                    {
+                        pending.push((response, index, command.clone()));
+                    }
+                }
             }
             sink(&event)?;
         }
+        pending.sort();
         if !acceptances.is_empty() {
             engine.step(time, acceptances)?;
             for event in engine.drain() {
@@ -528,7 +596,7 @@ pub(crate) struct Published {
 /// generation of the configuration's `replay` table, returning its report and reconstruction
 /// lines.
 pub fn replay(config: &Config, local: &Store, destination: &Store) -> Result<String, String> {
-    publish(config, local, destination, false).map(|published| published.report)
+    publish(config, local, destination, false, Access::ORDINARY).map(|published| published.report)
 }
 
 /// Binds, simulates, publishes, and reconstructs one replay generation. With `resume`, a
@@ -539,6 +607,7 @@ pub(crate) fn publish(
     local: &Store,
     destination: &Store,
     resume: bool,
+    access: Access<'_>,
 ) -> Result<Published, String> {
     let settings = config
         .replay
@@ -546,7 +615,7 @@ pub(crate) fn publish(
         .ok_or("replay: the table is required")?;
     let loading = Instant::now();
     let bound = (0..settings.inputs.len())
-        .map(|index| bind_instrument(settings, index))
+        .map(|index| bind_instrument(settings, index, access))
         .collect::<Result<Vec<_>, _>>()?;
     let definition = RunDefinition {
         schema_version: if settings.bindings.iter().any(|binding| {
@@ -571,8 +640,8 @@ pub(crate) fn publish(
         let mut bytes = Vec::new();
         destination.read_to(&key, None, &mut bytes)?;
         let uri = destination.uri(&key);
-        let manifest =
-            ReplayManifest::from_json(&bytes).map_err(|error| format!("{uri}: {error}"))?;
+        let manifest = ReplayManifest::from_json_with(&bytes, access)
+            .map_err(|error| format!("{uri}: {error}"))?;
         if manifest.key() != key
             || manifest.instruments != definition.instruments
             || manifest.config_hash != definition.config_hash
@@ -583,7 +652,7 @@ pub(crate) fn publish(
             ));
         }
         // A completed generation is reused only after its own verifier restores it.
-        let restored = restore_verified(&uri, destination, &key, &bytes)?;
+        let restored = restore_verified(&uri, destination, &key, &bytes, access)?;
         return Ok(Published {
             report: format!(
                 "replay {} generation {generation} instruments {} events {} (already published)",
@@ -619,7 +688,7 @@ pub(crate) fn publish(
 
     let simulating = Instant::now();
     let mut ledger = Temporary::create(local, &format!("replay-{generation}-events"))?;
-    let engine = simulate(definition, &mut inputs, &mut |event| {
+    let engine = simulate(definition, &mut inputs, access, &mut |event| {
         ledger.write(&event.to_line())
     })?;
     for (index, (instrument, input)) in bound.iter().zip(&inputs).enumerate() {
@@ -650,6 +719,7 @@ pub(crate) fn publish(
         destination,
         loaded,
         simulating.elapsed(),
+        access,
     )
 }
 
@@ -676,6 +746,7 @@ pub fn publish_ledger(
         destination,
         std::time::Duration::ZERO,
         std::time::Duration::ZERO,
+        Access::ORDINARY,
     )
     .map(|published| published.manifest)
 }
@@ -687,6 +758,7 @@ fn publish_completed(
     destination: &Store,
     loaded: std::time::Duration,
     simulated: std::time::Duration,
+    access: Access<'_>,
 ) -> Result<Published, String> {
     let generation = replay_generation_id(
         &engine.definition().config_hash,
@@ -753,7 +825,7 @@ fn publish_completed(
         Some(_) => {
             let mut bytes = Vec::new();
             destination.read_to(&key, None, &mut bytes)?;
-            let committed = ReplayManifest::from_json(&bytes)
+            let committed = ReplayManifest::from_json_with(&bytes, access)
                 .map_err(|error| format!("{}: {error}", destination.uri(&key)))?;
             if !(committed.generation == manifest.generation
                 && committed.role == manifest.role
@@ -775,7 +847,7 @@ fn publish_completed(
     // Reconstruct from the published ledger under the manifest bytes about to become ready; a
     // generation its own verifier rejects is never marked ready.
     let uri = destination.uri(&key);
-    let restored = restore_verified(&uri, destination, &key, &committed)?;
+    let restored = restore_verified(&uri, destination, &key, &committed, access)?;
     let verified = restored.line();
     let temporary = import::temporary_path(local, &format!("manifest-{generation}"))?;
     fs::write(&temporary, &committed)
@@ -833,7 +905,7 @@ impl Restored {
 /// record through the engine's one event-application function, and the restored sequence,
 /// final state, and summary against the manifest and the published summary bytes.
 pub fn verify_replay(uri: &str, store: &Store, key: &str, bytes: &[u8]) -> Result<String, String> {
-    restore_verified(uri, store, key, bytes).map(|restored| restored.line())
+    restore_verified(uri, store, key, bytes, Access::ORDINARY).map(|restored| restored.line())
 }
 
 /// Restores and verifies a replay generation, returning the verified restored engine so that a
@@ -844,8 +916,10 @@ pub(crate) fn restore_verified(
     store: &Store,
     key: &str,
     bytes: &[u8],
+    access: Access<'_>,
 ) -> Result<Restored, String> {
-    let manifest = ReplayManifest::from_json(bytes).map_err(|error| format!("{uri}: {error}"))?;
+    let manifest =
+        ReplayManifest::from_json_with(bytes, access).map_err(|error| format!("{uri}: {error}"))?;
     if manifest.key() != key {
         return Err(format!(
             "{uri} holds the manifest of generation {}",
@@ -873,7 +947,8 @@ pub(crate) fn restore_verified(
     let lines = BufReader::with_capacity(1 << 20, file)
         .split(b'\n')
         .map(|line| line.map_err(|error| format!("cannot read {ledger_location}: {error}")));
-    let engine = Engine::restore(lines).map_err(|reason| format!("{ledger_location}: {reason}"))?;
+    let engine = Engine::restore_with(lines, access)
+        .map_err(|reason| format!("{ledger_location}: {reason}"))?;
     let definition = engine.definition();
     if definition.schema_version != manifest.schema_version
         || engine.sequence() != manifest.events

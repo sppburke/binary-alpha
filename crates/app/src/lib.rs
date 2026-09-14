@@ -6,6 +6,7 @@ pub mod outcomes;
 pub mod parallel;
 pub mod portfolio;
 pub mod replay;
+pub mod research;
 pub mod search;
 pub mod store;
 pub mod verify;
@@ -30,6 +31,7 @@ pub fn skeleton(config: &Config) -> Config {
         accelerator: None,
         search: None,
         portfolio: None,
+        research: None,
         brokers: Vec::new(),
         history: None,
         inspect: None,

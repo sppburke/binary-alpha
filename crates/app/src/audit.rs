@@ -21,6 +21,8 @@ use crate::archive::{self, CandleWriter};
 use crate::import::{self, CODE_REVISION};
 use crate::store::{self, ObjectIdentity, Put, Store};
 use crate::verify;
+use binary_alpha_engine::config::{Config, ManifestUri};
+use binary_alpha_engine::research::Access;
 
 /// Runs the audit of the generation whose ready manifest is at `uri` under the configuration at
 /// `config_path`, writing one report line to `out`.
@@ -28,6 +30,39 @@ pub fn run(config_path: &Path, uri: &str, out: &mut dyn Write) -> Result<(), Str
     let config = crate::load_config(config_path)?;
     let base = config_path.parent().unwrap_or(Path::new("."));
     let historical_dir = base.join(config.storage.historical_data_dir.as_path());
+    fs::create_dir_all(&historical_dir)
+        .map_err(|error| format!("cannot create {}: {error}", historical_dir.display()))?;
+    let local = Store::filesystem(&historical_dir);
+    let destination = Store::open(&config.storage.publication_uri)?;
+    let declaration = crate::research::declaration(&config)?;
+    let access = Access {
+        declaration: declaration.as_ref(),
+        certification: None,
+    };
+    let line = audit(&config, uri, &local, &destination, access)?.report;
+    writeln!(out, "{line}")
+        .and_then(|()| out.flush())
+        .map_err(|error| format!("cannot write the report: {error}"))
+}
+
+/// One published stream generation and the report line of the command.
+pub(crate) struct Audited {
+    pub(crate) generation: String,
+    pub(crate) report: String,
+}
+
+/// The typed audit every caller uses: the target needs a read permit before it is opened; then
+/// its generation streams through the configured instrument and publishes its profile,
+/// candles, and stream manifest; a completed identical generation is reused.
+pub(crate) fn audit(
+    config: &Config,
+    uri: &str,
+    local: &Store,
+    destination: &Store,
+    access: Access<'_>,
+) -> Result<Audited, String> {
+    let target: ManifestUri = uri.parse()?;
+    access.permit(None, target.generation())?;
     let (source_store, source_key) = verify::open(uri)?;
     let mut bytes = Vec::new();
     source_store.read_to(&source_key, None, &mut bytes)?;
@@ -59,10 +94,6 @@ pub fn run(config_path: &Path, uri: &str, out: &mut dyn Write) -> Result<(), Str
             format!("no configured instrument maps {id}; an instrument is never defaulted")
         })?;
     let mut stream = InstrumentStream::new(instrument, Source::from_manifest(&manifest))?;
-    fs::create_dir_all(&historical_dir)
-        .map_err(|error| format!("cannot create {}: {error}", historical_dir.display()))?;
-    let local = Store::filesystem(&historical_dir);
-    let destination = Store::open(&config.storage.publication_uri)?;
     let generation = stream_generation_id(&manifest.generation, &instrument.canonical_toml());
     let key = manifest_key(&generation);
 
@@ -70,7 +101,7 @@ pub fn run(config_path: &Path, uri: &str, out: &mut dyn Write) -> Result<(), Str
     let mut writers = Vec::with_capacity(instrument.candles.len());
     let mut temporaries = Vec::with_capacity(instrument.candles.len() + 1);
     for (index, spec) in instrument.candles.iter().enumerate() {
-        let path = import::temporary_path(&local, &format!("audit-{generation}-{index}"))?;
+        let path = import::temporary_path(local, &format!("audit-{generation}-{index}"))?;
         writers.push(CandleWriter::create(
             &path,
             &id,
@@ -115,7 +146,7 @@ pub fn run(config_path: &Path, uri: &str, out: &mut dyn Write) -> Result<(), Str
             last_close_time: last_close.map(format_event_time_micros),
         });
     }
-    let profile_path = import::temporary_path(&local, &format!("audit-{generation}-profile"))?;
+    let profile_path = import::temporary_path(local, &format!("audit-{generation}-profile"))?;
     fs::write(&profile_path, profile.to_json())
         .map_err(|error| format!("cannot write {}: {error}", profile_path.display()))?;
     temporaries.insert(0, profile_path);
@@ -188,7 +219,7 @@ pub fn run(config_path: &Path, uri: &str, out: &mut dyn Write) -> Result<(), Str
         }
         None => stream_manifest.to_json(),
     };
-    let temporary = import::temporary_path(&local, &format!("manifest-{generation}"))?;
+    let temporary = import::temporary_path(local, &format!("manifest-{generation}"))?;
     fs::write(&temporary, &committed)
         .map_err(|error| format!("cannot write {}: {error}", temporary.display()))?;
     let identity = store::identify(&temporary)?;
@@ -205,9 +236,10 @@ pub fn run(config_path: &Path, uri: &str, out: &mut dyn Write) -> Result<(), Str
             published.as_secs_f64()
         ),
     };
-    writeln!(out, "{line}")
-        .and_then(|()| out.flush())
-        .map_err(|error| format!("cannot write the report: {error}"))
+    Ok(Audited {
+        generation,
+        report: line,
+    })
 }
 
 /// Verifies and decodes every data object of a published generation in manifest order through

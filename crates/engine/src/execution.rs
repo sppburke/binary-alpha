@@ -23,6 +23,7 @@ use crate::market::{
     BrokerId, Currency, ProviderSymbol, format_event_time_micros, parse_event_time_micros,
     split_decimal,
 };
+use crate::research::Access;
 
 /// The preserved historical ledger and manifest schema.
 pub const REPLAY_SCHEMA_VERSION: u32 = 1;
@@ -825,8 +826,21 @@ fn time(field: &str, text: &str) -> Result<i64, String> {
 /// resolved references, exact and representable money, positive durations and thresholds,
 /// non-negative ages, agreeing splits, and one immutable shared policy per scope.
 pub fn validate(replay: &Replay) -> Result<(), String> {
+    validate_with(replay, Access::ORDINARY)
+}
+
+/// The same rules under an explicit read permit: holdout data enters a replay only through the
+/// certification context that names every input generation.
+pub fn validate_with(replay: &Replay, access: Access<'_>) -> Result<(), String> {
     if replay.role == DatasetRole::Holdout {
-        return Err("role: holdout data never enters a replay".to_string());
+        access
+            .protected(
+                replay
+                    .inputs
+                    .iter()
+                    .map(|input| input.tick_manifest.generation()),
+            )
+            .map_err(|reason| format!("role: holdout data never enters a replay; {reason}"))?;
     }
     let start = time("decision_start", &replay.decision_start)?;
     let end = time("decision_end", &replay.decision_end)?;
@@ -835,6 +849,18 @@ pub fn validate(replay: &Replay) -> Result<(), String> {
             "decision_end: {} must be after decision_start {}",
             replay.decision_end, replay.decision_start
         ));
+    }
+    if let Some(scenario) = &replay.scenario {
+        if scenario.schema_version != 1 {
+            return Err(format!(
+                "scenario.schema_version: unsupported version {}, expected 1",
+                scenario.schema_version
+            ));
+        }
+        identifier("scenario.id", &scenario.id)?;
+        if scenario.acceptance_delay_micros < 0 {
+            return Err("scenario.acceptance_delay_micros: must be non-negative".to_string());
+        }
     }
     if replay.inputs.is_empty() {
         return Err("inputs: at least one instrument input is required".to_string());
@@ -2622,8 +2648,14 @@ impl Engine {
     /// Compiles the definition against its own column lists and starts from the accounts'
     /// initial cash with no obligations. The definition record is the first ledger record.
     pub fn new(definition: RunDefinition) -> Result<Self, String> {
+        Self::with_access(definition, Access::ORDINARY)
+    }
+
+    /// `new` under an explicit read permit; only the certification context admits a holdout
+    /// definition.
+    pub fn with_access(definition: RunDefinition, access: Access<'_>) -> Result<Self, String> {
         let replay = &definition.replay;
-        validate(replay)?;
+        validate_with(replay, access)?;
         if !matches!(
             definition.schema_version,
             REPLAY_SCHEMA_VERSION | REPLAY_SCHEMA_VERSION_BROKER
@@ -2922,6 +2954,15 @@ impl Engine {
     /// function that generated it. Sequences must be contiguous from zero and the first record
     /// must be the definition.
     pub fn restore(lines: impl Iterator<Item = Result<Vec<u8>, String>>) -> Result<Self, String> {
+        Self::restore_with(lines, Access::ORDINARY)
+    }
+
+    /// `restore` under an explicit read permit; only the certification context restores a
+    /// holdout ledger.
+    pub fn restore_with(
+        lines: impl Iterator<Item = Result<Vec<u8>, String>>,
+        access: Access<'_>,
+    ) -> Result<Self, String> {
         let mut engine: Option<Self> = None;
         for (expected, line) in lines.enumerate() {
             let event = FinancialEvent::from_line(&line?)
@@ -2934,7 +2975,7 @@ impl Engine {
             }
             match (&mut engine, event.kind) {
                 (None, EventKind::RunDefinition { definition }) => {
-                    let mut restored = Self::new(*definition)?;
+                    let mut restored = Self::with_access(*definition, access)?;
                     if restored.events[0].time_micros != event.time_micros {
                         return Err("the definition record does not reproduce".to_string());
                     }
@@ -6236,6 +6277,12 @@ impl ReplayManifest {
     /// a permitted role, a generation that matches the configuration and inputs, exactly the
     /// ledger and summary objects, and content-addressed objects with unique paths.
     pub fn from_json(bytes: &[u8]) -> Result<Self, String> {
+        Self::from_json_with(bytes, Access::ORDINARY)
+    }
+
+    /// `from_json` under an explicit read permit; only the certification context that names
+    /// every bound tick generation parses a holdout replay generation.
+    pub fn from_json_with(bytes: &[u8], access: Access<'_>) -> Result<Self, String> {
         let manifest: Self = serde_json::from_slice(bytes).map_err(|error| error.to_string())?;
         if manifest.kind != REPLAY_MANIFEST_KIND {
             return Err(format!(
@@ -6253,7 +6300,16 @@ impl ReplayManifest {
             ));
         }
         if manifest.role == DatasetRole::Holdout {
-            return Err("a replay generation never carries holdout data".to_string());
+            access
+                .protected(
+                    manifest
+                        .instruments
+                        .iter()
+                        .map(|instrument| instrument.tick_generation.as_str()),
+                )
+                .map_err(|reason| {
+                    format!("a replay generation never carries holdout data; {reason}")
+                })?;
         }
         if manifest.generation != replay_generation_id(&manifest.config_hash, &manifest.instruments)
         {

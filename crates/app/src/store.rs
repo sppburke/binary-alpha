@@ -102,6 +102,18 @@ impl Store {
         }
     }
 
+    /// The optional access log of the filesystem implementation: when `BINARY_ALPHA_STORE_LOG`
+    /// names a file, every operation appends `OPERATION KEY` to it. Test instrumentation only;
+    /// it changes no identity and the Google implementation never writes it.
+    fn log(&self, operation: &str, key: &str) {
+        if let Self::Filesystem { .. } = self
+            && let Ok(path) = std::env::var("BINARY_ALPHA_STORE_LOG")
+            && let Ok(mut file) = fs::OpenOptions::new().append(true).create(true).open(path)
+        {
+            let _ = writeln!(file, "{operation} {key}");
+        }
+    }
+
     /// The full location of a key, for diagnostics and manifest URIs.
     pub fn uri(&self, key: &str) -> String {
         match self {
@@ -112,6 +124,7 @@ impl Store {
 
     /// The local path of a key, only for the filesystem implementation.
     pub fn local_path(&self, key: &str) -> Option<PathBuf> {
+        self.log("local_path", key);
         match self {
             Self::Filesystem { root } => Some(root.join(key)),
             Self::GoogleCloud(_) => None,
@@ -128,6 +141,7 @@ impl Store {
 
     /// Metadata of an object, or `None` when the key does not exist.
     pub fn head(&self, key: &str) -> Result<Option<StoredObject>, String> {
+        self.log("head", key);
         match self {
             Self::Filesystem { root } => match fs::metadata(root.join(key)) {
                 Ok(metadata) if metadata.is_file() => Ok(Some(StoredObject {
@@ -163,6 +177,7 @@ impl Store {
         local: &Path,
         identity: &ObjectIdentity,
     ) -> Result<Put, String> {
+        self.log("put_new", key);
         if let Some(existing) = self.head(key)? {
             return self.reuse(key, existing, identity);
         }
@@ -296,6 +311,7 @@ impl Store {
         generation: Option<i64>,
         sink: &mut dyn Write,
     ) -> Result<u64, String> {
+        self.log("read_to", key);
         match self {
             Self::Filesystem { root } => {
                 let mut file = File::open(root.join(key))

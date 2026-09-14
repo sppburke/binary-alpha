@@ -311,6 +311,7 @@ pub fn replay_table(
         reporting_scale: search.account.scale,
         max_rate_age_micros: 0,
         rates: None,
+        scenario: None,
     }
 }
 

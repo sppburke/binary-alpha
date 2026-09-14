@@ -35,6 +35,7 @@ use crate::outcomes::{bind_inputs, from_le_bytes};
 use crate::replay;
 use crate::store::{self, Put, Store};
 use crate::verify;
+use binary_alpha_engine::research::Access;
 
 /// Runs the configured search, writing its report and verification lines to `out`.
 pub fn run(config_path: &Path, out: &mut dyn Write) -> Result<(), String> {
@@ -99,9 +100,24 @@ fn add(total: &mut Timings, measured: Timings) {
     total.allocated_bytes = total.allocated_bytes.max(measured.allocated_bytes);
 }
 
+/// One published family generation and the report and verification lines of the command.
+pub(crate) struct Searched {
+    pub(crate) generation: String,
+    pub(crate) report: String,
+}
+
 /// The typed search every caller uses: bind, lower, score, replay, evaluate, resample, publish,
 /// and verify one family generation of the configuration's `search` table.
 pub fn search(config: &Config, local: &Store, destination: &Store) -> Result<String, String> {
+    family(config, local, destination).map(|searched| searched.report)
+}
+
+/// `search` with its typed result.
+pub(crate) fn family(
+    config: &Config,
+    local: &Store,
+    destination: &Store,
+) -> Result<Searched, String> {
     let settings = config
         .search
         .as_ref()
@@ -160,7 +176,13 @@ pub fn search(config: &Config, local: &Store, destination: &Store) -> Result<Str
         &development.instrument,
     );
     let lowering_bindings: Vec<String> = lowering.strategies.iter().map(|s| s.id.clone()).collect();
-    let lowered = replay::publish(&chunk_config(config, lowering), local, destination, true)?;
+    let lowered = replay::publish(
+        &chunk_config(config, lowering),
+        local,
+        destination,
+        true,
+        Access::ORDINARY,
+    )?;
     let references = read_references(&development)?;
     let codes = lowering_codes(
         &chunk_events(destination, &lowered.manifest)?,
@@ -223,8 +245,13 @@ pub fn search(config: &Config, local: &Store, destination: &Store) -> Result<Str
                 &chunk_members,
                 settings.account.initial_cash,
             );
-            let published =
-                replay::publish(&chunk_config(config, table), local, destination, true)?;
+            let published = replay::publish(
+                &chunk_config(config, table),
+                local,
+                destination,
+                true,
+                Access::ORDINARY,
+            )?;
             let summary = published.engine.summary();
             let events = chunk_events(destination, &published.manifest)?;
             let mut splits = if role == DatasetRole::Evaluation {
@@ -402,7 +429,10 @@ pub fn search(config: &Config, local: &Store, destination: &Store) -> Result<Str
             peak_rss_kb()
         ),
     };
-    Ok(format!("{line}\n{verified}"))
+    Ok(Searched {
+        generation,
+        report: format!("{line}\n{verified}"),
+    })
 }
 
 /// The configuration of one synthesized replay: only the schema, run mode, storage, and that
@@ -424,6 +454,7 @@ fn bind_development(settings: &Search) -> Result<Development, String> {
         &input.tick_manifest,
         &input.feature_manifest,
         "a search",
+        Access::ORDINARY,
     )?;
     let uri = input
         .outcome_manifest
@@ -485,6 +516,7 @@ fn bind_evaluation(settings: &Search, development: &Development) -> Result<Famil
         &input.tick_manifest,
         &input.feature_manifest,
         "a search",
+        Access::ORDINARY,
     )?;
     if bound.tick.instrument != development.instrument {
         return Err(format!(
@@ -746,7 +778,7 @@ fn kernel_identity() -> String {
     binary_alpha_engine::hex(&hasher.finalize())
 }
 
-fn peak_rss_kb() -> u64 {
+pub(crate) fn peak_rss_kb() -> u64 {
     fs::read_to_string("/proc/self/status")
         .ok()
         .and_then(|status| {

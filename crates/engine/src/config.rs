@@ -45,6 +45,8 @@ pub struct Config {
     pub search: Option<Search>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub portfolio: Option<Portfolio>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub research: Option<Research>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub brokers: Vec<Broker>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -123,6 +125,11 @@ impl Config {
             portfolio
                 .validate()
                 .map_err(|reason| format!("portfolio.{reason}"))?;
+        }
+        if let Some(research) = &self.research {
+            research
+                .validate()
+                .map_err(|reason| format!("research.{reason}"))?;
         }
         self.validate_brokers()?;
         let Some(import) = &self.import else {
@@ -1311,6 +1318,8 @@ pub struct Replay {
     pub max_rate_age_micros: i64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rates: Option<Vec<RateEvent>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scenario: Option<ReplayScenario>,
 }
 
 impl Replay {
@@ -1551,6 +1560,219 @@ pub struct Evaluation {
     pub inputs: Vec<ManifestUri>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub splits: Option<Vec<Split>>,
+}
+
+/// The optional `research` table: the one-command study that prepares, searches, selects,
+/// assesses, and, under separate authorization, certifies one policy over the declared
+/// historical generations. Omitting the table preserves every existing configuration identity.
+/// The engine module `research` owns every rule, record, and lowering into the existing tables.
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct Research {
+    pub study: Study,
+    pub instruments: Vec<ResearchInstrument>,
+    pub folds: Vec<ResearchFold>,
+    pub refit: ResearchRefit,
+    /// The outer evaluation: its window, one evaluation tick generation per instrument, and
+    /// optional reporting splits.
+    pub evaluation: Evaluation,
+    /// The holdout window and one holdout tick generation reference per instrument, validated
+    /// for syntax only; the run never opens them before certification.
+    pub holdout: Evaluation,
+    pub portfolio: ResearchPortfolio,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub scenarios: Vec<ResearchScenario>,
+    pub qualification: Qualification,
+}
+
+impl Research {
+    /// The rules a single field's deserializer cannot see; an error names the field.
+    pub fn validate(&self) -> Result<(), String> {
+        crate::research::validate(self)
+    }
+}
+
+/// The study and attempt identities, the operator-declared non-sensitive governance
+/// declaration, the predecessor attempts, and the declared manual or procedure changes.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct Study {
+    pub study: String,
+    pub attempt: String,
+    /// `file:///DIR/FILE.json` or `gs://BUCKET/KEY`: the declaration object.
+    pub governance_manifest: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub predecessors: Vec<String>,
+    pub changes: String,
+}
+
+/// One instrument of the study: the development family-source generation and the feature,
+/// outcome, and search settings the run applies to it.
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ResearchInstrument {
+    /// `BROKER:PROVIDER_SYMBOL`, the neutral identity of one configured instrument.
+    pub instrument: String,
+    pub source_manifest: ManifestUri,
+    pub features: FeatureSettings,
+    pub outcomes: OutcomeSettings,
+    pub search: ResearchSearch,
+}
+
+/// The new-plan settings of a feature fit, exactly the optional settings of a
+/// `features.instruments` entry.
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct FeatureSettings {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub streams: Option<Vec<StreamKey>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outputs: Option<Outputs>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub moving_average_periods: Option<Vec<u32>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rolling_window: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_history: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub structure: Option<StructureSettings>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub price_epsilon: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tick_path_streams: Option<Vec<StreamKey>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub encodings: Option<Encodings>,
+}
+
+/// The outcome-build settings, exactly the `outcomes` table without its role and manifests.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct OutcomeSettings {
+    pub expiry_seconds: Vec<u32>,
+    pub max_entry_delay_ms: u64,
+    pub max_settlement_delay_ms: u64,
+    pub max_tick_gap_ms: u64,
+    pub true_jump_max_gap_ms: u64,
+    pub true_jump_basis_points: String,
+    pub frozen_min_ticks: u32,
+    pub frozen_min_ms: u64,
+}
+
+/// The development-only search of one instrument: the `search` table's settings with its
+/// development window and no inputs or evaluation; the run binds the inputs.
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ResearchSearch {
+    pub decision_start: String,
+    pub decision_end: String,
+    pub scope: Scope,
+    pub seed: u64,
+    pub chunk_size: u32,
+    pub max_candidates: u64,
+    pub min_conditions: u32,
+    pub max_conditions: u32,
+    pub embargo_micros: i64,
+    pub base_stream: StreamKey,
+    pub conditions: Vec<SearchCondition>,
+    pub contracts: Vec<ContractTerms>,
+    pub account: SearchAccount,
+    pub risk_policy: RiskPolicy,
+    pub envelope: Envelope,
+    pub gates: crate::search::Gates,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub screen: Option<Screen>,
+    pub stability: StabilitySettings,
+}
+
+/// One inner fold: the cutoff, the assessment window, and per instrument the development fit
+/// and assessment tick generations, in instrument order.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ResearchFold {
+    pub cutoff: String,
+    pub decision_start: String,
+    pub decision_end: String,
+    pub inputs: Vec<ResearchFoldInput>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ResearchFoldInput {
+    pub fit_manifest: ManifestUri,
+    pub assessment_manifest: ManifestUri,
+}
+
+/// The final refit: the cutoff and one development fit tick generation per instrument.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ResearchRefit {
+    pub cutoff: String,
+    pub fits: Vec<ManifestUri>,
+}
+
+/// The portfolio selection settings, exactly the `portfolio` table without its families, folds,
+/// refit, and evaluation; the run lowers those from the declarations above. Family index `i`
+/// of a member is instrument `i`.
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ResearchPortfolio {
+    pub max_policies: u64,
+    pub embargo_micros: i64,
+    pub objective: crate::portfolio::Objective,
+    pub gates: crate::portfolio::Gates,
+    pub accounts: Vec<AccountSpec>,
+    pub reporting_currency: Currency,
+    pub reporting_scale: u8,
+    pub max_rate_age_micros: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rates: Option<Vec<RateEvent>>,
+    pub members: Vec<PortfolioMember>,
+    pub repairs: Vec<Repair>,
+    pub bindings: Vec<PortfolioBinding>,
+    pub subsets: Vec<Subset>,
+    pub risk_policies: Vec<RiskPolicy>,
+}
+
+/// One required assessment scenario: a checked non-negative synthetic acceptance delay and the
+/// complete per-binding exact contract and envelope map the frozen policy is replayed under.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ResearchScenario {
+    pub id: String,
+    pub acceptance_delay_micros: i64,
+    pub alternatives: Vec<ScenarioAlternative>,
+}
+
+/// The exact terms one portfolio binding deploys under in a scenario.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ScenarioAlternative {
+    pub binding: String,
+    pub contract: ContractTerms,
+    pub envelope: Envelope,
+}
+
+/// The empirical qualification: the version-one claim and the exact gates the frozen policy
+/// must satisfy on every scenario, against the analytic zero-profit benchmark on the same
+/// initial capital; `min_profit` is the minimum economically useful improvement.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct Qualification {
+    pub claim: String,
+    pub gates: crate::portfolio::Gates,
+}
+
+/// The optional acceptance-delay scenario of a replay, version one: every admitted command's
+/// synthetic acceptance is scheduled at its decision time plus the delay. Omission is immediate
+/// acceptance with every existing identity preserved.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReplayScenario {
+    /// `1`: acceptance at the checked decision time plus the delay, at the instrument's latest
+    /// causally available tick, drained through that instrument's own evidence horizon.
+    pub schema_version: u32,
+    pub id: String,
+    pub acceptance_delay_micros: i64,
 }
 
 /// Explicit offline accelerator selection. Absence preserves existing configuration identity.
