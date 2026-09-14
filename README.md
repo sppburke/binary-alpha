@@ -13,8 +13,8 @@ imports existing historical data into immutable published generations, audits ea
 generation through its configured instrument stream into a profile and finalized causal candles,
 builds feature and future-only outcome generations, replays governed historical inputs through the
 one execution engine into a reconstructable financial ledger, runs candidate search and portfolio
-selection, and verifies every kind of generation. It also supports bounded broker history downloads,
-optional foreground refresh passes, live market subscriptions and non-purchasing broker inspection. The accelerator supplies thirteen retained device kernels and their deterministic
+selection, and verifies every kind of generation. The accelerator supplies thirteen retained device
+kernels and their deterministic
 central-processor references; it has no production consumer. The checkout executes no live, paper,
 or production trading action. Browser-driven operation, click execution, and any live, paper, certification,
 deployment, or production action without its own authorization are unsupported.

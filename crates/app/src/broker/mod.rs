@@ -7,62 +7,15 @@ pub mod wire;
 use std::collections::VecDeque;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-pub use binary_alpha_engine::config::BrokerKind;
 use binary_alpha_engine::config::{AccountClass, Broker, Config, RateBudgets, RateLimit};
+pub use binary_alpha_engine::config::{BrokerKind, Capabilities};
 use binary_alpha_engine::execution::{
-    BrokerLiability, CashFact, ContractSemantics, Decimal, Direction, EventSource, Proposal,
-    Settlement, TerminalFact,
+    BrokerLiability, CashFact, ContractSemantics, Decimal, Direction, EventSource, Settlement,
+    TerminalFact,
 };
 use binary_alpha_engine::market::{BrokerId, Currency, InstrumentId, PriceScale, Tick};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
-
-/// Capabilities of a compiled adapter.
-#[derive(Debug, Clone, Copy)]
-pub struct Capabilities {
-    pub history: bool,
-    pub live: bool,
-    pub execution: bool,
-}
-pub fn capabilities(kind: BrokerKind) -> Capabilities {
-    match kind {
-        BrokerKind::Deriv => Capabilities {
-            history: true,
-            live: true,
-            execution: true,
-        },
-        BrokerKind::PocketOption => Capabilities {
-            history: true,
-            live: true,
-            execution: false,
-        },
-    }
-}
-
-pub fn validate_capabilities(config: &Config) -> Result<(), String> {
-    if let Some(history) = &config.history {
-        let broker = config
-            .brokers
-            .iter()
-            .find(|broker| broker.id() == &history.broker)
-            .ok_or("history: broker is not declared")?;
-        let supported = capabilities(broker.kind());
-        if !supported.history {
-            return Err("history: broker has no history capability".into());
-        }
-        if config
-            .inspect
-            .as_ref()
-            .is_some_and(|inspect| inspect.proposal.is_some())
-            && (!supported.execution || broker.credential().is_none())
-        {
-            return Err(
-                "inspect: proposal requires execution capability and a credential reference".into(),
-            );
-        }
-    }
-    Ok(())
-}
 
 /// Resolves a reference without including its value in diagnostics.
 pub fn resolve_secret(reference: &str) -> Result<String, String> {
@@ -114,12 +67,8 @@ pub enum LiveEvent {
 #[derive(Debug, Clone)]
 pub struct HistoryPage {
     pub raw: Vec<u8>,
-    pub raw_name: String,
-    pub anchor: Option<i64>,
     pub anchor_token: Option<String>,
     pub rows: Vec<Tick>,
-    pub first_micros: Option<i64>,
-    pub last_micros: Option<i64>,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Cancellation {
@@ -255,7 +204,7 @@ impl RateBudget {
 }
 
 /// Binds normalized history to its provider mapping, including the declared source clock.
-pub(crate) fn source_identity(settings: &Broker) -> String {
+pub fn source_identity(settings: &Broker) -> String {
     let mut hasher = Sha256::new();
     hasher.update(b"binary-alpha broker market source v1\n");
     hasher.update(settings.kind().as_str().as_bytes());
@@ -293,7 +242,6 @@ impl Adapter {
     }
 }
 pub fn connect(config: &Config) -> Result<Adapter, String> {
-    validate_capabilities(config)?;
     let history = config
         .history
         .as_ref()
@@ -366,7 +314,6 @@ pub enum PurchaseOutcome {
     },
     Rejected {
         code: String,
-        message: String,
     },
     ProvenNotSent {
         reason: String,
@@ -405,15 +352,4 @@ pub struct OpenContract {
     pub expiry_micros: Option<i64>,
     pub instrument: String,
     pub direction: Direction,
-}
-pub trait OptionsBroker {
-    fn account(&self) -> &AccountIdentity;
-    fn balance(&mut self) -> Result<Decimal, String>;
-    fn subscribe_transactions(&mut self) -> Result<(), String>;
-    fn proposal(&mut self, request: &ProposalRequest, receipt: i64) -> Result<Proposal, String>;
-    fn purchase(&mut self, prepared: &PreparedPurchase) -> Result<PurchaseOutcome, String>;
-    fn subscribe_contract(&mut self, contract_ref: &str) -> Result<(), String>;
-    fn next_account_event(&mut self, timeout_micros: i64) -> Result<Option<AccountEvent>, String>;
-    fn open_contracts(&mut self) -> Result<Vec<OpenContract>, String>;
-    fn statement(&mut self, from_secs: i64, through_secs: i64) -> Result<Vec<CashFact>, String>;
 }

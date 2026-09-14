@@ -2,7 +2,7 @@ use crate::broker::deriv::{Balance, ContractAvailability, DerivAccounts, DerivOp
 use crate::broker::transport::{WebSocketConnector, endpoint_host};
 use crate::broker::{
     self, AccountEvent, AccountIdentity, Adapter, Cancellation, Clock, Continuity,
-    DiscoveredInstrument, LiveEvent, OptionsBroker, ProposalRequest, SystemClock,
+    DiscoveredInstrument, LiveEvent, ProposalRequest, SystemClock,
 };
 use crate::store::Store;
 use binary_alpha_engine::config::{Broker, Config};
@@ -77,23 +77,26 @@ impl InspectionReport {
         instrument: Option<String>,
         result: Result<InspectionDetail, String>,
     ) {
-        self.checks.push(match result {
-            Ok(detail) => InspectionCheck {
-                name: name.into(),
-                instrument,
-                result: if matches!(&detail, InspectionDetail::History { rows: 0, .. }) {
-                    "observed: empty history page".into()
+        let (result, detail) = match result {
+            Ok(detail) => (
+                if matches!(&detail, InspectionDetail::History { rows: 0, .. }) {
+                    "observed: empty history page"
                 } else {
-                    "verified".into()
-                },
+                    "verified"
+                }
+                .into(),
                 detail,
-            },
-            Err(error) => InspectionCheck {
-                name: name.into(),
-                instrument,
-                result: format!("unavailable: {error}"),
-                detail: InspectionDetail::Unavailable,
-            },
+            ),
+            Err(error) => (
+                format!("unavailable: {error}"),
+                InspectionDetail::Unavailable,
+            ),
+        };
+        self.checks.push(InspectionCheck {
+            name: name.into(),
+            instrument,
+            result,
+            detail,
         });
     }
 }
@@ -153,9 +156,7 @@ pub fn run(config_path: &Path, out: &mut dyn Write) -> Result<(), String> {
                 )
             })();
             match authenticated {
-                Ok(mut authenticated) => {
-                    observe_account(&config, &mut authenticated, &mut SystemClock, &mut report)
-                }
+                Ok(mut authenticated) => observe_account(&config, &mut authenticated, &mut report),
                 Err(error) => report.check("authentication", None, Err(error)),
             }
         }
@@ -179,12 +180,7 @@ pub fn run(config_path: &Path, out: &mut dyn Write) -> Result<(), String> {
 }
 
 /// Checks authenticated economics without preparing or purchasing an order.
-pub fn observe_account(
-    config: &Config,
-    options: &mut DerivOptions,
-    clock: &mut dyn Clock,
-    report: &mut InspectionReport,
-) {
+pub fn observe_account(config: &Config, options: &mut DerivOptions, report: &mut InspectionReport) {
     let balance = options.balance().map(|amount| InspectionDetail::Balance {
         balance: Balance {
             amount,
@@ -243,22 +239,17 @@ pub fn observe_account(
                     max_tick_gap_micros: 0,
                 },
             };
-            let result = options.proposal(&request, clock.now_micros()).map(|quote| {
+            let result = options.proposal(&request).map(|quote| {
+                let (spot, longcode) = options
+                    .proposal_details(&quote.identity)
+                    .expect("issued proposal");
                 InspectionDetail::Proposal {
                     direction,
                     ask_price: quote.terms.quoted_cost,
                     payout: quote.terms.win.gross_return,
-                    spot: options
-                        .proposal_details(&quote.identity)
-                        .expect("issued proposal")
-                        .0
-                        .into(),
+                    spot: spot.into(),
                     spot_time: format_event_time_micros(quote.spot_time_micros),
-                    longcode: options
-                        .proposal_details(&quote.identity)
-                        .expect("issued proposal")
-                        .1
-                        .into(),
+                    longcode: longcode.into(),
                 }
             });
             report.check("proposal", Some(instrument.to_string()), result);
@@ -329,8 +320,14 @@ pub fn observe(
                 .history_page(instrument, definition.price_scale, None)
                 .map(|page| InspectionDetail::History {
                     rows: page.rows.len(),
-                    first: page.first_micros.map(format_event_time_micros),
-                    last: page.last_micros.map(format_event_time_micros),
+                    first: page
+                        .rows
+                        .first()
+                        .map(|row| format_event_time_micros(row.event_time_micros)),
+                    last: page
+                        .rows
+                        .last()
+                        .map(|row| format_event_time_micros(row.event_time_micros)),
                 }),
         );
     }
@@ -461,9 +458,7 @@ fn collect(
                     let count = counts
                         .get_mut(&observation.instrument.to_string())
                         .ok_or("inspect: unexpected live instrument")?;
-                    if maximum.is_none_or(|limit| *count < limit) {
-                        *count += 1;
-                    }
+                    *count += 1;
                 }
             }
         }
@@ -485,7 +480,6 @@ pub fn publish(
         .ok_or("inspect: local retention must be a filesystem store")?;
     let inspection = format!("inspections/{}-{}.json", report.started, report.broker);
     binary_alpha_engine::config::relative_path(&inspection)?;
-    // put_new also protects an already completed inspection identity.
     local.put_new(&inspection, &path, &identity)?;
     destination.put_new(&key, &path, &identity)?;
     for check in &report.checks {

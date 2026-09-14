@@ -702,6 +702,15 @@ fn check_source(source: &EventSource, now: i64) -> Result<(), String> {
     Ok(())
 }
 
+impl CashFact {
+    fn key(&self) -> (String, String) {
+        (self.account.clone(), self.transaction_ref.clone())
+    }
+    fn block_key(&self) -> String {
+        format!("transaction:{}:{}", self.account, self.transaction_ref)
+    }
+}
+
 fn same_cash(a: &CashFact, b: &CashFact) -> Result<bool, String> {
     Ok(a.account == b.account
         && a.transaction_ref == b.transaction_ref
@@ -1404,6 +1413,8 @@ pub struct EventSource {
 pub struct Proposal {
     pub identity: String,
     pub request_identity: String,
+    pub account: String,
+    pub instrument: String,
     pub terms: ContractTerms,
     pub spot_units: i64,
     pub spot_time_micros: i64,
@@ -1413,11 +1424,40 @@ pub struct Proposal {
 }
 
 impl Proposal {
+    /// Hashes the canonical request scope and terms, independently of the provider quote.
+    pub fn canonical_request_identity(&self) -> Result<String, String> {
+        let (broker, symbol) = self
+            .instrument
+            .split_once(':')
+            .ok_or("proposal.instrument must be BROKER:PROVIDER_SYMBOL")?;
+        let instrument = crate::market::InstrumentId {
+            broker: broker.to_string().try_into()?,
+            provider_symbol: symbol.to_string().try_into()?,
+        };
+        if self.terms.duration_micros % 1_000_000 != 0 {
+            return Err("proposal duration must be whole seconds".into());
+        }
+        let bytes = serde_json::to_vec(&(
+            &instrument.broker,
+            &self.account,
+            &instrument,
+            &self.terms.currency,
+            self.terms.direction,
+            self.terms.duration_micros / 1_000_000,
+            self.terms.stake.normalized(),
+            self.terms.semantics,
+        ))
+        .map_err(|_| "proposal: cannot encode normalized request")?;
+        Ok(crate::hex(&Sha256::digest(bytes)))
+    }
+
     fn same_fact(&self, other: &Self) -> Result<bool, String> {
         let a = &self.terms;
         let b = &other.terms;
         if self.identity != other.identity
             || self.request_identity != other.request_identity
+            || self.account != other.account
+            || self.instrument != other.instrument
             || self.spot_units != other.spot_units
             || self.spot_time_micros != other.spot_time_micros
             || self.receipt_micros != other.receipt_micros
@@ -1534,7 +1574,7 @@ pub enum Resolution {
 
 /// One observation in availability order.
 #[derive(Debug, Clone, PartialEq)]
-#[allow(clippy::large_enum_variant)] // The shared observation boundary carries proposals by value.
+#[allow(clippy::large_enum_variant)]
 pub enum Observation {
     /// The current proposal for one deployment binding.
     Proposal { binding: String, proposal: Proposal },
@@ -1826,7 +1866,7 @@ pub struct FinancialEvent {
 /// The tagged transition of one ledger record.
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
-#[allow(clippy::large_enum_variant)] // Preserve the shared by-value proposal field.
+#[allow(clippy::large_enum_variant)]
 pub enum EventKind {
     /// The complete resolved run, frozen identities, and initial state.
     RunDefinition { definition: Box<RunDefinition> },
@@ -2013,7 +2053,7 @@ impl EventKind {
                 ),
             )),
             Self::CashObserved { source, fact, .. } => Some(external_identity(
-                &format!("transaction:{}", fact.transaction_ref),
+                &fact.block_key(),
                 source,
                 format!(
                     "cash {:?}",
@@ -2029,7 +2069,7 @@ impl EventKind {
                 source: Some(source),
                 ..
             } => Some(external_identity(
-                &format!("{command}\nterminal"),
+                &format!("{command}\nterminal:{}", terminal_payload(fact)),
                 source,
                 terminal_payload(fact),
             )),
@@ -2517,6 +2557,12 @@ struct GroupKey {
     split: Option<String>,
 }
 
+struct TransactionRecord {
+    fact: CashFact,
+    pending: bool,
+    source: Option<EventSource>,
+}
+
 /// The one chronological and financial owner.
 pub struct Engine {
     definition: RunDefinition,
@@ -2535,10 +2581,7 @@ pub struct Engine {
     accounts: Vec<AccountState>,
     obligations: BTreeMap<String, Obligation>,
     proposals: Vec<Option<Proposal>>,
-    /// Keyed by transaction so a buy and sell of the same contract are both retained.
-    pending_cash: BTreeMap<String, CashFact>,
-    cash_seen: BTreeMap<String, CashFact>,
-    cash_sources: BTreeMap<String, EventSource>,
+    transactions: BTreeMap<(String, String), TransactionRecord>,
     terminals: BTreeMap<String, TerminalFact>,
     purchases: BTreeMap<String, (Decimal, BrokerLiability)>,
     closed_confirmed: BTreeMap<String, [Option<i64>; 4]>,
@@ -2839,9 +2882,7 @@ impl Engine {
             accounts,
             obligations: BTreeMap::new(),
             proposals: vec![None; replay.bindings.len()],
-            pending_cash: BTreeMap::new(),
-            cash_seen: BTreeMap::new(),
-            cash_sources: BTreeMap::new(),
+            transactions: BTreeMap::new(),
             terminals: BTreeMap::new(),
             purchases: BTreeMap::new(),
             closed_confirmed: BTreeMap::new(),
@@ -2962,11 +3003,11 @@ impl Engine {
             obligations: &'a BTreeMap<String, Obligation>,
             open_total: u32,
             #[serde(skip_serializing_if = "BTreeMap::is_empty")]
-            pending_cash: &'a BTreeMap<String, CashFact>,
+            pending_cash: BTreeMap<String, &'a CashFact>,
             #[serde(skip_serializing_if = "BTreeMap::is_empty")]
-            cash_seen: &'a BTreeMap<String, CashFact>,
+            cash_seen: BTreeMap<String, &'a CashFact>,
             #[serde(skip_serializing_if = "BTreeMap::is_empty")]
-            cash_sources: &'a BTreeMap<String, EventSource>,
+            cash_sources: BTreeMap<String, &'a EventSource>,
             #[serde(skip_serializing_if = "BTreeMap::is_empty")]
             terminals: &'a BTreeMap<String, TerminalFact>,
             #[serde(skip_serializing_if = "BTreeMap::is_empty")]
@@ -2979,9 +3020,22 @@ impl Engine {
             accounts: &self.accounts,
             obligations: &self.obligations,
             open_total: self.open_total,
-            pending_cash: &self.pending_cash,
-            cash_seen: &self.cash_seen,
-            cash_sources: &self.cash_sources,
+            pending_cash: self
+                .transactions
+                .values()
+                .filter(|r| r.pending)
+                .map(|r| (r.fact.block_key(), &r.fact))
+                .collect(),
+            cash_seen: self
+                .transactions
+                .values()
+                .map(|r| (r.fact.block_key(), &r.fact))
+                .collect(),
+            cash_sources: self
+                .transactions
+                .values()
+                .filter_map(|r| r.source.as_ref().map(|source| (r.fact.block_key(), source)))
+                .collect(),
             terminals: &self.terminals,
             purchases: &self.purchases,
             closed_confirmed: &self.closed_confirmed,
@@ -3490,7 +3544,10 @@ impl Engine {
         let binding = &self.bindings[index];
         let template = &self.definition.replay.contracts[binding.contract];
         let terms = &proposal.terms;
-        if template.settlement.rule != SettlementRule::BrokerAuthoritativeV1
+        if proposal.account != self.accounts[binding.account].id
+            || proposal.instrument != self.definition.instruments[binding.instrument].instrument
+            || proposal.request_identity != proposal.canonical_request_identity()?
+            || template.settlement.rule != SettlementRule::BrokerAuthoritativeV1
             || terms.id != proposal.identity
             || terms.direction != template.direction
             || terms.duration_micros != template.duration_micros
@@ -3631,7 +3688,7 @@ impl Engine {
     ) -> Result<(), String> {
         let obligation = &self.obligations[command];
         // Provider purchase clocks carry whole seconds, so a purchase is causal when it is no
-        // earlier than the second the command was dispatched in.
+        // earlier than the second the command was prepared in.
         let dispatch_second = obligation.sent_micros - obligation.sent_micros.rem_euclid(1_000_000);
         if liability.purchase_time_micros < dispatch_second
             || liability.purchase_time_micros > self.now
@@ -3644,7 +3701,9 @@ impl Engine {
         let binding = obligation.binding;
         let account_index = self.bindings[binding].account;
         if self.purchases.iter().any(|(other, (_, known))| {
-            other != command && known.transaction_ref == liability.transaction_ref
+            other != command
+                && self.command_account(other) == account_index
+                && known.transaction_ref == liability.transaction_ref
         }) {
             return Err(format!(
                 "{command} purchase transaction {} is already booked",
@@ -3665,8 +3724,10 @@ impl Engine {
             ));
         }
         let account = &self.accounts[account_index];
-        if let Some(known) = self.cash_seen.get(&liability.transaction_ref)
-            && !matches_purchase(known, &account.id, postings.debit, liability)?
+        if let Some(known) = self
+            .transactions
+            .get(&(account.id.clone(), liability.transaction_ref.clone()))
+            && !matches_purchase(&known.fact, &account.id, postings.debit, liability)?
         {
             return Err(format!(
                 "transaction {} contradicts the purchase",
@@ -3707,10 +3768,17 @@ impl Engine {
                 },
             );
         }
-        self.pending_cash.remove(&liability.transaction_ref);
-        account
-            .blocked
-            .remove(&format!("transaction:{}", liability.transaction_ref));
+        if let Some(record) = self
+            .transactions
+            .get_mut(&(account.id.clone(), liability.transaction_ref.clone()))
+        {
+            record.pending = false;
+            record.source = None;
+        }
+        account.blocked.remove(&format!(
+            "transaction:{}:{}",
+            account.id, liability.transaction_ref
+        ));
         self.purchases
             .insert(command.to_string(), (postings.debit, liability.clone()));
         self.refresh_cash_blocks();
@@ -3784,10 +3852,19 @@ impl Engine {
     ) -> Result<(), String> {
         check_source(&source, self.now)?;
         if let Some(known) = self.closed_confirmed.get(&command) {
+            let purchase = &self.purchases[&command].1;
+            let entry = fields[1].or(known[1]);
+            let start = fields[2].or(known[2]);
+            let expiry = fields[3].or(known[3]);
             if fields
                 .iter()
                 .zip(known)
-                .any(|(new, old)| new.is_some() && new != old)
+                .any(|(new, old)| new.zip(*old).is_some_and(|(new, old)| new != old))
+                || entry.is_some_and(|time| time < purchase.purchase_time_micros || time > self.now)
+                || start.is_some_and(|time| time < purchase.purchase_time_micros || time > self.now)
+                || start
+                    .zip(expiry)
+                    .is_some_and(|(start, expiry)| expiry <= start)
             {
                 return Err(format!(
                     "{command} confirmed update contradicts its closed contract"
@@ -3856,17 +3933,17 @@ impl Engine {
         Ok(())
     }
 
-    fn check_terminal(
+    fn merged_terminal(
         &self,
         command: &str,
         source: &EventSource,
         fact: &TerminalFact,
-    ) -> Result<(), String> {
-        self.require(command, ObligationState::Accepted)?;
-        let liability = self.obligations[command]
-            .liability
-            .as_ref()
-            .ok_or_else(|| format!("{command} has no broker liability"))?;
+    ) -> Result<TerminalFact, String> {
+        let liability = &self
+            .purchases
+            .get(command)
+            .ok_or_else(|| format!("{command} has no broker liability"))?
+            .1;
         if fact.exit_time_micros.is_some_and(|exit| {
             exit < liability.purchase_time_micros || exit > source.provider_time_micros
         }) {
@@ -3874,16 +3951,37 @@ impl Engine {
                 "{command} terminal clocks are inconsistent with its purchase and source"
             ));
         }
-        if self
-            .terminals
-            .get(command)
-            .is_some_and(|known| known != fact)
+        let Some(known) = self.terminals.get(command) else {
+            return Ok(fact.clone());
+        };
+        if known.status != fact.status
+            || known
+                .exit_price_units
+                .zip(fact.exit_price_units)
+                .is_some_and(|(a, b)| a != b)
+            || known
+                .exit_time_micros
+                .zip(fact.exit_time_micros)
+                .is_some_and(|(a, b)| a != b)
+            || known
+                .transaction_ref
+                .as_ref()
+                .zip(fact.transaction_ref.as_ref())
+                .is_some_and(|(a, b)| a != b)
         {
             return Err(format!(
                 "{command} terminal contradicts the recorded terminal fact"
             ));
         }
-        Ok(())
+        Ok(TerminalFact {
+            status: known.status,
+            exit_price_units: known.exit_price_units.or(fact.exit_price_units),
+            exit_time_micros: known.exit_time_micros.or(fact.exit_time_micros),
+            transaction_ref: known
+                .transaction_ref
+                .clone()
+                .or_else(|| fact.transaction_ref.clone()),
+        })
     }
 
     fn observe_terminal(
@@ -3893,26 +3991,21 @@ impl Engine {
         fact: TerminalFact,
     ) -> Result<(), String> {
         check_source(&source, self.now)?;
-        if let Some(known) = self.terminals.get(&command) {
-            return if *known == fact {
-                Ok(())
-            } else {
-                Err(format!(
-                    "{command} terminal contradicts the recorded terminal fact"
-                ))
-            };
+        let fact = self.merged_terminal(&command, &source, &fact)?;
+        if self.terminals.get(&command) == Some(&fact) {
+            return Ok(());
         }
-        self.check_terminal(&command, &source, &fact)?;
-        let path = self.broker_path(&command, &fact)?;
+        let path = if self.obligations.contains_key(&command) {
+            self.broker_path(&command, &fact)?
+        } else {
+            None
+        };
         self.emit(
             self.now,
             EventKind::Unresolved {
                 command,
                 reason: UnresolvedReason::AwaitingCash,
-                evidence: format!(
-                    "terminal {} awaits the matching cash transaction",
-                    fact.status
-                ),
+                evidence: format!("terminal {} evidence updated", fact.status),
                 path,
                 terminal: Some(fact),
                 source: Some(source),
@@ -3964,8 +4057,8 @@ impl Engine {
 
     fn observe_cash(&mut self, source: EventSource, fact: CashFact) -> Result<(), String> {
         self.check_cash(&source, &fact)?;
-        if let Some(known) = self.cash_seen.get(&fact.transaction_ref) {
-            return if same_cash(known, &fact)? {
+        if let Some(known) = self.transactions.get(&fact.key()) {
+            return if same_cash(&known.fact, &fact)? {
                 Ok(())
             } else {
                 Err(format!(
@@ -3990,12 +4083,18 @@ impl Engine {
         )
     }
 
+    fn command_account(&self, command: &str) -> usize {
+        let (binding, _) = command.rsplit_once('/').expect("prepared command");
+        self.bindings[self.binding_index[binding]].account
+    }
+
     /// Purchase identity and debit prove a buy, without assuming its transaction clock.
     fn check_purchase_cash(&self, fact: &CashFact) -> Result<bool, String> {
-        let Some((command, (debit, liability))) = self
-            .purchases
-            .iter()
-            .find(|(_, (_, liability))| liability.transaction_ref == fact.transaction_ref)
+        let Some((command, (debit, liability))) =
+            self.purchases.iter().find(|(command, (_, liability))| {
+                self.accounts[self.command_account(command)].id == fact.account
+                    && liability.transaction_ref == fact.transaction_ref
+            })
         else {
             return Ok(false);
         };
@@ -4010,37 +4109,38 @@ impl Engine {
         Ok(true)
     }
 
-    fn matching_cash_of(&self, obligation: &Obligation) -> Option<String> {
+    fn matching_cash_of(&self, obligation: &Obligation) -> Option<(String, String)> {
         let mut matches = self
-            .pending_cash
+            .transactions
             .values()
+            .filter(|record| record.pending)
+            .map(|record| &record.fact)
             .filter(|cash| self.matches_sell(obligation, cash));
         let first = matches.next()?;
-        matches
-            .next()
-            .is_none()
-            .then(|| first.transaction_ref.clone())
+        matches.next().is_none().then(|| first.key())
     }
 
     /// A terminal reference establishes which pending sell belongs to this liability.
     fn refresh_cash_blocks(&mut self) {
         for fact in self
-            .pending_cash
+            .transactions
             .values()
+            .filter(|record| record.pending)
+            .map(|record| &record.fact)
             .filter(|fact| fact.action == CashAction::Sell)
         {
             let command = self.cash_command(fact);
             let matched = command.as_ref().is_some_and(|command| {
                 let obligation = &self.obligations[command];
                 obligation.terminal.is_none()
-                    || self.matching_cash_of(obligation).as_deref() == Some(&fact.transaction_ref)
+                    || self.matching_cash_of(obligation).as_ref() == Some(&fact.key())
             });
             let account = self
                 .accounts
                 .iter_mut()
                 .find(|account| account.id == fact.account)
                 .expect("checked cash account");
-            let key = format!("transaction:{}", fact.transaction_ref);
+            let key = fact.block_key();
             if matched {
                 account.blocked.remove(&key);
             } else {
@@ -4059,7 +4159,9 @@ impl Engine {
 
     fn matching_cash(&self, command: &str) -> Option<&CashFact> {
         let transaction = self.matching_cash_of(self.obligations.get(command)?)?;
-        self.pending_cash.get(&transaction)
+        self.transactions
+            .get(&transaction)
+            .map(|record| &record.fact)
     }
 
     fn broker_source(&self, command: &str, cash: &CashFact) -> EventSource {
@@ -4069,7 +4171,10 @@ impl Engine {
             .terminal_source
             .as_ref()
             .expect("terminal recorded");
-        let cash_source = &self.cash_sources[&cash.transaction_ref];
+        let cash_source = self.transactions[&cash.key()]
+            .source
+            .as_ref()
+            .expect("pending sell source");
         EventSource {
             id: format!("{}+{}", terminal_source.id, cash_source.id),
             provider_time_micros: terminal.exit_time_micros.unwrap_or(cash.time_micros),
@@ -4465,7 +4570,11 @@ impl Engine {
                 terminal_fee,
                 ..
             } => {
-                self.check_closure_evidence(command, resolution, *gross_return)?;
+                self.check_closure_evidence(
+                    command,
+                    resolution,
+                    gross_return.checked_sub(*terminal_fee)?,
+                )?;
                 if let Resolution::ExternallyClosed { status, .. } = resolution
                     && !matches!(status, TerminalStatus::Sold | TerminalStatus::Cancelled)
                 {
@@ -4496,7 +4605,7 @@ impl Engine {
         &self,
         command: &str,
         resolution: &Resolution,
-        gross_return: Decimal,
+        net_credit: Decimal,
     ) -> Result<(), String> {
         let obligation = &self.obligations[command];
         if let Some(terminal) = &obligation.terminal {
@@ -4529,13 +4638,15 @@ impl Engine {
             }
         }
         for cash in self
-            .pending_cash
+            .transactions
             .values()
+            .filter(|record| record.pending)
+            .map(|record| &record.fact)
             .filter(|cash| self.matches_sell(obligation, cash))
         {
-            if gross_return.compare(cash.amount)? != Ordering::Equal {
+            if net_credit.compare(cash.amount)? != Ordering::Equal {
                 return Err(format!(
-                    "{command} reconciliation contradicts recorded sell cash {} amount {}",
+                    "{command} reconciliation contradicts the recorded cash transaction {} amount {}",
                     cash.transaction_ref, cash.amount
                 ));
             }
@@ -4607,7 +4718,14 @@ impl Engine {
                     transaction_ref, ..
                 },
                 Resolution::External,
-            ) if command == format!("transaction:{transaction_ref}") => Some(i64::MIN),
+            ) if command
+                == format!(
+                    "transaction:{}:{transaction_ref}",
+                    self.accounts[account].id
+                ) =>
+            {
+                Some(i64::MIN)
+            }
             (
                 Block::Purchased { debit, .. },
                 Resolution::Purchased {
@@ -5164,11 +5282,12 @@ impl Engine {
             );
         }
         if let Some(cash) = self.matching_cash_of(&obligation) {
-            self.pending_cash.remove(&cash);
-            self.cash_sources.remove(&cash);
+            let record = self.transactions.get_mut(&cash).expect("matched cash");
+            record.pending = false;
+            record.source = None;
             self.accounts[self.bindings[binding].account]
                 .blocked
-                .remove(&format!("transaction:{cash}"));
+                .remove(&record.fact.block_key());
         }
         self.instruments[self.bindings[binding].instrument]
             .tracked
@@ -5541,9 +5660,7 @@ impl Engine {
                 matched,
             } => {
                 let account = self.check_cash(source, fact)?;
-                if self.cash_seen.contains_key(&fact.transaction_ref)
-                    || self.check_purchase_cash(fact)?
-                {
+                if self.transactions.contains_key(&fact.key()) || self.check_purchase_cash(fact)? {
                     return Err(format!(
                         "transaction {} is already recorded",
                         fact.transaction_ref
@@ -5560,17 +5677,17 @@ impl Engine {
                         fact.transaction_ref
                     ));
                 }
-                self.cash_seen
-                    .insert(fact.transaction_ref.clone(), fact.clone());
-                if fact.action == CashAction::Sell {
-                    self.cash_sources
-                        .insert(fact.transaction_ref.clone(), source.clone());
-                }
-                self.pending_cash
-                    .insert(fact.transaction_ref.clone(), fact.clone());
+                self.transactions.insert(
+                    fact.key(),
+                    TransactionRecord {
+                        fact: fact.clone(),
+                        pending: true,
+                        source: (fact.action == CashAction::Sell).then(|| source.clone()),
+                    },
+                );
                 if matched.is_none() {
                     self.accounts[account].blocked.insert(
-                        format!("transaction:{}", fact.transaction_ref),
+                        fact.block_key(),
                         Block::UnmatchedCash {
                             transaction_ref: fact.transaction_ref.clone(),
                             contract_ref: fact.contract_ref.clone(),
@@ -5726,7 +5843,21 @@ impl Engine {
                             "{command} awaiting_cash requires terminal evidence and source"
                         ));
                     };
-                    self.check_terminal(command, source, fact)?;
+                    let merged = self.merged_terminal(command, source, fact)?;
+                    if merged != *fact || self.terminals.get(command) == Some(fact) {
+                        return Err(format!(
+                            "{command} terminal record must monotonically add facts"
+                        ));
+                    }
+                    if !self.obligations.contains_key(command) {
+                        if path.is_some() {
+                            return Err(format!(
+                                "{command} closed terminal cannot add path diagnostics"
+                            ));
+                        }
+                        self.terminals.insert(command.clone(), fact.clone());
+                        return Ok(());
+                    }
                     if *path != self.broker_path(command, fact)? {
                         return Err(format!(
                             "{command} terminal path disagrees with its recorded entry and exit"
@@ -5744,7 +5875,8 @@ impl Engine {
                     ));
                 }
                 let obligation = self.open_obligation(command)?;
-                if obligation.unresolved.is_some() {
+                let newly_unresolved = obligation.unresolved.is_none();
+                if !newly_unresolved && *reason != UnresolvedReason::AwaitingCash {
                     return Err(format!("{command} is already unresolved"));
                 }
                 obligation.unresolved = Some(*reason);
@@ -5762,8 +5894,10 @@ impl Engine {
                     .tracked
                     .retain(|tracked| tracked != command);
                 let key = self.keys(binding, split.as_deref());
-                for group in self.groups(&key) {
-                    group.unresolved += 1;
+                if newly_unresolved {
+                    for group in self.groups(&key) {
+                        group.unresolved += 1;
+                    }
                 }
                 self.refresh_cash_blocks();
             }
@@ -5853,9 +5987,13 @@ impl Engine {
                     }
                 }
                 if let Resolution::External = resolution {
-                    let transaction = command.strip_prefix("transaction:").expect("checked block");
-                    self.pending_cash.remove(transaction);
-                    self.cash_sources.remove(transaction);
+                    let record = self
+                        .transactions
+                        .values_mut()
+                        .find(|record| record.fact.block_key() == *command)
+                        .expect("checked transaction block");
+                    record.pending = false;
+                    record.source = None;
                 }
             }
             EventKind::RateAvailable { rate } => {

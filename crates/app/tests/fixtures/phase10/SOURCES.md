@@ -96,5 +96,6 @@ Integer microsecond/price-unit vectors below were calculated independently with 
 | `expected-live-EURUSD_otc.csv` | 23 | `47ab2ca840051a5dff716a4537b9a8c6beb917fba30a9c32921e06521fd57703` |
 | `expected-live-AAPL_otc.csv` | 4 | `1eb0f17e0e1e8c4705c483aff47f993e56f5796654edff6cb80ceb4438deaf89` |
 
-`execution-definition.toml` is the synthetic Phase 06 direct-engine input template, specialized in `phase10_execution.rs`; it does not name real data.
-Its SHA-256 is `4bd096a76c581753ba91e713de1fce496cbf99e7bf06a6b848ccb04a3d335f6d`.
+`execution-definition.toml` is the synthetic single-CALL broker-authoritative configuration used directly by `phase10_execution.rs`; it does not name real data. The optional PUT test extends this definition.
+
+`deriv-execution-portfolio.json` is synthetic from the pinned portfolio schema and uses `underlying_symbol`. `pocket-history-initial-period60.json` and `pocket-history-older-period60.json` are synthetic negative period fixtures, not provider observations. Deriv pagination tests cut retained history into forty-row pages with one overlapping boundary; the Pocket binary server converts retained initial numeric tokens into the pinned older-page shape. These transformations prove local paging, not additional external acceptance.

@@ -50,6 +50,5 @@ pub fn load_config(path: &Path) -> Result<Config, String> {
     {
         return Err("accelerator.backend: `cuda` requested but this binary was built without the `cuda` feature".into());
     }
-    broker::validate_capabilities(&config)?;
     Ok(config)
 }

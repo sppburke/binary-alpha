@@ -597,8 +597,66 @@ pub fn read_normalized_ticks(store: &Path, dataset: &GenerationManifest) -> Vec<
 
 /// Scripted broker transport and clock shared by Phase 10 proofs.
 pub mod broker {
+    pub struct HttpCall {
+        pub method: String,
+        pub url: String,
+        pub headers: Vec<(String, String)>,
+    }
+    pub struct FakeHttp {
+        pub responses: VecDeque<Vec<u8>>,
+        pub calls: Vec<HttpCall>,
+    }
+    impl Http for FakeHttp {
+        fn get_json(&mut self, url: &str, headers: &[(String, String)]) -> Result<Vec<u8>, String> {
+            self.calls.push(HttpCall {
+                method: "GET".into(),
+                url: url.into(),
+                headers: headers.to_vec(),
+            });
+            self.responses
+                .pop_front()
+                .ok_or("unexpected HTTP request".into())
+        }
+        fn post_json(
+            &mut self,
+            url: &str,
+            headers: &[(String, String)],
+        ) -> Result<Vec<u8>, String> {
+            self.calls.push(HttpCall {
+                method: "POST".into(),
+                url: url.into(),
+                headers: headers.to_vec(),
+            });
+            self.responses
+                .pop_front()
+                .ok_or("unexpected HTTP request".into())
+        }
+    }
+    pub fn fixture(name: &str) -> String {
+        std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/phase10")
+                .join(name),
+        )
+        .unwrap()
+        .trim_end()
+        .into()
+    }
+    pub fn replace(text: &str, key: &str, value: &str) -> String {
+        let mut fields: std::collections::BTreeMap<String, Box<serde_json::value::RawValue>> =
+            serde_json::from_str(text).unwrap();
+        fields.insert(
+            key.into(),
+            serde_json::value::RawValue::from_string(value.into()).unwrap(),
+        );
+        serde_json::to_string(&fields).unwrap()
+    }
+    pub fn correlated(text: &str, req_id: u64) -> String {
+        replace(text, "req_id", &req_id.to_string())
+    }
+
     use binary_alpha_app::broker::Clock;
-    use binary_alpha_app::broker::transport::{Connector, Frame, Transport};
+    use binary_alpha_app::broker::transport::{Connector, Frame, Http, Transport};
     use std::cell::{Cell, RefCell};
     use std::collections::VecDeque;
     use std::rc::Rc;

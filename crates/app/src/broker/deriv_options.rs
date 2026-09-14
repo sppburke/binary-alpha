@@ -2,10 +2,10 @@ use super::{AuthenticatedAddress, DerivAuthenticated, Response, SCHEMA, decode, 
 use crate::broker::transport::{Connector, Frame};
 use crate::broker::wire::WireDecimal;
 use crate::broker::{
-    AccountEvent, AccountIdentity, Clock, OpenContract, OptionsBroker, PreparedPurchase,
-    ProposalRequest, PurchaseOutcome, RateGroup, payload_hash,
+    AccountEvent, AccountIdentity, Clock, OpenContract, PreparedPurchase, ProposalRequest,
+    PurchaseOutcome, RateGroup, payload_hash,
 };
-use binary_alpha_engine::config::RateBudgets;
+use binary_alpha_engine::config::{AccountClass, RateBudgets};
 use binary_alpha_engine::execution::{
     self, BrokerLiability, CashAction, CashFact, Cashflow, ContractSemantics, ContractTerms,
     Decimal, Direction, EventSource, Proposal, SettlementRule, TerminalFact, TerminalStatus,
@@ -13,6 +13,35 @@ use binary_alpha_engine::execution::{
 use binary_alpha_engine::market::{Currency, InstrumentId, PriceScale};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
+
+// deriv-demo-run-01 is the measured scope of this economic mapping.
+const MEASURED_ACCOUNT_CLASS: AccountClass = AccountClass::Demo;
+const MEASURED_CURRENCY: &str = "USD";
+pub(super) const MEASURED_CONTRACT_CATEGORY: &str = "callput";
+const MEASURED_CONTRACT_TYPES: [&str; 2] = ["CALL", "PUT"];
+
+#[derive(Debug, Clone)]
+pub struct StatementRow {
+    pub cash: CashFact,
+    pub payout: Option<Decimal>,
+}
+
+/// A statement buy row alone can recover the debit and purchased liability.
+pub fn recover_purchase(row: &StatementRow) -> Option<(Decimal, BrokerLiability)> {
+    if row.cash.action != CashAction::Buy || !row.cash.amount.is_negative() {
+        return None;
+    }
+    Some((
+        Decimal::zero(0).checked_sub(row.cash.amount).ok()?,
+        BrokerLiability {
+            contract_ref: row.cash.contract_ref.clone()?,
+            transaction_ref: row.cash.transaction_ref.clone(),
+            purchase_time_micros: row.cash.time_micros,
+            expected_start_micros: None,
+            payout: row.payout?,
+        },
+    ))
+}
 
 #[derive(Serialize)]
 struct SubscribeRequest {
@@ -66,6 +95,7 @@ struct QuoteResponse {
 }
 #[derive(Deserialize)]
 struct Quote {
+    commission: Option<WireDecimal>,
     id: String,
     ask_price: WireDecimal,
     payout: WireDecimal,
@@ -106,11 +136,11 @@ struct ContractResponse {
 }
 #[derive(Deserialize)]
 struct Contract {
-    contract_type: String,
+    contract_type: Option<String>,
     contract_id: WireDecimal,
-    status: String,
-    currency: Currency,
-    underlying_symbol: String,
+    status: Option<String>,
+    currency: Option<Currency>,
+    underlying_symbol: Option<String>,
     entry_spot: Option<WireDecimal>,
     entry_spot_time: Option<i64>,
     date_start: Option<i64>,
@@ -144,7 +174,7 @@ struct PortfolioContract {
     date_start: Option<i64>,
     expiry_time: Option<i64>,
     currency: Currency,
-    symbol: String,
+    underlying_symbol: String,
     contract_type: String,
 }
 #[derive(Deserialize)]
@@ -154,10 +184,11 @@ struct StatementResponse {
 #[derive(Deserialize)]
 struct Statement {
     count: u32,
-    transactions: Vec<StatementRow>,
+    transactions: Vec<StatementTransaction>,
 }
 #[derive(Deserialize)]
-struct StatementRow {
+struct StatementTransaction {
+    payout: Option<WireDecimal>,
     action_type: CashAction,
     amount: WireDecimal,
     contract_id: Option<WireDecimal>,
@@ -177,6 +208,7 @@ pub struct DerivOptions {
     instruments: BTreeMap<String, PriceScale>,
     proposals: BTreeMap<String, IssuedProposal>,
     written: BTreeSet<String>,
+    possibly_sent: BTreeSet<String>,
     transactions: bool,
     contracts: BTreeSet<String>,
     events: VecDeque<AccountEvent>,
@@ -212,6 +244,7 @@ impl DerivOptions {
             instruments: selected,
             proposals: BTreeMap::new(),
             written: BTreeSet::new(),
+            possibly_sent: BTreeSet::new(),
             transactions: false,
             contracts: BTreeSet::new(),
             events: VecDeque::new(),
@@ -230,7 +263,7 @@ impl DerivOptions {
     }
     fn decode_event(&mut self, response: Response) -> Result<(), String> {
         if let Some(error) = response.header.error {
-            return Err(format!("deriv account: {}: {}", error.code, error.message));
+            return Err(format!("deriv account: {}", error.code));
         }
         match response.header.msg_type.as_str() {
             "transaction" => {
@@ -264,32 +297,50 @@ impl DerivOptions {
             "proposal_open_contract" => {
                 let body: ContractResponse = decode(&response.raw, "proposal_open_contract")?;
                 let c = body.proposal_open_contract;
-                self.currency(&c.currency)?;
-                direction(&c.contract_type)?;
-                let scale = *self
-                    .instruments
-                    .get(&c.underlying_symbol)
-                    .ok_or("deriv contract: instrument outside configured scope")?;
+                if let Some(currency) = &c.currency {
+                    self.currency(currency)?;
+                }
+                if let Some(kind) = &c.contract_type {
+                    direction(kind)?;
+                }
+                let scale = c
+                    .underlying_symbol
+                    .as_ref()
+                    .map(|symbol| {
+                        self.instruments
+                            .get(symbol)
+                            .copied()
+                            .ok_or("deriv contract: instrument outside configured scope")
+                    })
+                    .transpose()?;
                 let contract_ref = identifier(&c.contract_id)?;
                 if !self.contracts.contains(&contract_ref) {
                     return Err("deriv contract: unexpected contract identity".into());
                 }
-                let status = if c.status == "open" {
-                    None
-                } else {
-                    Some(match c.status.as_str() {
-                        "won" => TerminalStatus::Won,
-                        "lost" => TerminalStatus::Lost,
-                        "sold" => TerminalStatus::Sold,
-                        "cancelled" => TerminalStatus::Cancelled,
-                        _ => return Err("deriv contract: unsupported status".into()),
-                    })
+                let status = match c.status.as_deref() {
+                    None | Some("open") => None,
+                    Some("won") => Some(TerminalStatus::Won),
+                    Some("lost") => Some(TerminalStatus::Lost),
+                    Some("sold") => Some(TerminalStatus::Sold),
+                    Some("cancelled") => Some(TerminalStatus::Cancelled),
+                    _ => return Err("deriv contract: unsupported status".into()),
                 };
-                let update_time = micros(
-                    c.current_spot_time
-                        .or(c.purchase_time)
-                        .ok_or("deriv contract: update source time missing")?,
-                )?;
+                let has_update = c.entry_spot.is_some()
+                    || c.entry_spot_time.is_some()
+                    || c.date_start.is_some()
+                    || c.date_expiry.is_some();
+                if !has_update && status.is_none() {
+                    return Ok(());
+                }
+                let update_time = c
+                    .current_spot_time
+                    .or(c.purchase_time)
+                    .or(c.entry_spot_time)
+                    .or(c.date_start)
+                    .or(c.date_expiry)
+                    .map(micros)
+                    .transpose()?
+                    .unwrap_or(response.receipt_micros);
                 let update = AccountEvent::ContractUpdate {
                     contract_ref: contract_ref.clone(),
                     source: source(
@@ -303,7 +354,12 @@ impl DerivOptions {
                     entry_price_units: c
                         .entry_spot
                         .as_ref()
-                        .map(|price| price.price_units(scale))
+                        .map(|price| {
+                            price.price_units(
+                                scale
+                                    .ok_or("deriv contract: underlying_symbol missing for price")?,
+                            )
+                        })
                         .transpose()?,
                     entry_time_micros: c.entry_spot_time.map(micros).transpose()?,
                     start_micros: c.date_start.map(micros).transpose()?,
@@ -313,7 +369,10 @@ impl DerivOptions {
                     .map(|status| {
                         Ok::<_, String>(AccountEvent::Terminal {
                             source: source(
-                                format!("deriv:contract:{contract_ref}:{status}"),
+                                format!(
+                                    "deriv:contract:{contract_ref}:{status}:{}",
+                                    payload_hash(&response.raw)
+                                ),
                                 micros(
                                     c.sell_time
                                         .or(c.exit_spot_time)
@@ -328,7 +387,11 @@ impl DerivOptions {
                                 exit_price_units: c
                                     .exit_spot
                                     .as_ref()
-                                    .map(|price| price.price_units(scale))
+                                    .map(|price| {
+                                        price.price_units(scale.ok_or(
+                                            "deriv contract: underlying_symbol missing for price",
+                                        )?)
+                                    })
                                     .transpose()?,
                                 exit_time_micros: c.exit_spot_time.map(micros).transpose()?,
                                 transaction_ref: c
@@ -341,7 +404,9 @@ impl DerivOptions {
                         })
                     })
                     .transpose()?;
-                self.events.push_back(update);
+                if has_update {
+                    self.events.push_back(update);
+                }
                 if let Some(terminal) = terminal {
                     self.events.push_back(terminal);
                 }
@@ -352,8 +417,7 @@ impl DerivOptions {
     }
 }
 fn number(value: &WireDecimal) -> Result<Decimal, String> {
-    value.require_number()?;
-    value.decimal()
+    value.require_number()
 }
 fn identifier(value: &WireDecimal) -> Result<String, String> {
     let id = number(value)?.rescale(0)?;
@@ -377,14 +441,14 @@ fn source(id: String, provider_time_micros: i64, available_at_micros: i64) -> Ev
         simulated: false,
     }
 }
-impl OptionsBroker for DerivOptions {
-    fn account(&self) -> &AccountIdentity {
+impl DerivOptions {
+    pub fn account(&self) -> &AccountIdentity {
         &self.account
     }
-    fn balance(&mut self) -> Result<Decimal, String> {
+    pub fn balance(&mut self) -> Result<Decimal, String> {
         Ok(self.authenticated.balance()?.amount)
     }
-    fn subscribe_transactions(&mut self) -> Result<(), String> {
+    pub fn subscribe_transactions(&mut self) -> Result<(), String> {
         if self.transactions {
             return Err("deriv transaction: already subscribed".into());
         }
@@ -415,7 +479,13 @@ impl OptionsBroker for DerivOptions {
         self.transactions = true;
         Ok(())
     }
-    fn proposal(&mut self, request: &ProposalRequest, receipt: i64) -> Result<Proposal, String> {
+    pub fn proposal(&mut self, request: &ProposalRequest) -> Result<Proposal, String> {
+        // deriv-demo-run-01 measured strict callput CALL/PUT economics on demo USD only.
+        if self.account.class != MEASURED_ACCOUNT_CLASS
+            || self.account.currency.as_str() != MEASURED_CURRENCY
+        {
+            return Err("deriv: the strict Rise/Fall mapping is measured only for demo USD accounts; inspect and extend the mapping before use".into());
+        }
         self.currency(&request.currency)?;
         if request.binding.is_empty()
             || request.instrument.broker != self.account.broker
@@ -438,8 +508,8 @@ impl OptionsBroker for DerivOptions {
                     amount: WireDecimal::from_decimal(request.stake),
                     basis: "stake",
                     contract_type: match request.direction {
-                        Direction::Buy => "CALL",
-                        Direction::Sell => "PUT",
+                        Direction::Buy => MEASURED_CONTRACT_TYPES[0],
+                        Direction::Sell => MEASURED_CONTRACT_TYPES[1],
                     },
                     currency: &request.currency,
                     duration: request.duration_seconds,
@@ -449,6 +519,14 @@ impl OptionsBroker for DerivOptions {
                 })?;
         let body: QuoteResponse = decode(&response.raw, "proposal")?;
         let q = body.proposal;
+        if q.commission
+            .as_ref()
+            .map(number)
+            .transpose()?
+            .is_some_and(|fee| !fee.is_zero())
+        {
+            return Err("deriv proposal: commission has unresolved fee inclusion".into());
+        }
         q.spot.require_number()?;
         if q.id.is_empty() {
             return Err("deriv proposal: empty identity".into());
@@ -458,24 +536,15 @@ impl OptionsBroker for DerivOptions {
             self.authenticated.connection.continuity().generation(),
             q.id
         );
-        let request_bytes = serde_json::to_vec(&(
-            &self.account.broker,
-            &self.account.account,
-            &request.instrument,
-            &request.currency,
-            request.direction,
-            request.duration_seconds,
-            request.stake.normalized(),
-            request.semantics,
-        ))
-        .map_err(|_| "deriv proposal: cannot encode normalized request")?;
         let zero = Cashflow {
             gross_return: Decimal::zero(0),
             terminal_fee: Decimal::zero(0),
         };
-        let proposal = Proposal {
+        let mut proposal = Proposal {
             identity: identity.clone(),
-            request_identity: payload_hash(&request_bytes),
+            request_identity: String::new(),
+            account: self.account.account.clone(),
+            instrument: request.instrument.to_string(),
             terms: ContractTerms {
                 id: identity.clone(),
                 direction: request.direction,
@@ -495,10 +564,11 @@ impl OptionsBroker for DerivOptions {
             },
             spot_units: q.spot.price_units(request.scale)?,
             spot_time_micros: micros(q.spot_time)?,
-            receipt_micros: receipt,
+            receipt_micros: response.receipt_micros,
             schema: format!("{SCHEMA}:proposal"),
             payload_sha256: payload_hash(&response.raw),
         };
+        proposal.request_identity = proposal.canonical_request_identity()?;
         if proposal.terms.quoted_cost.coefficient() <= 0
             || proposal.terms.win.gross_return.is_negative()
         {
@@ -507,18 +577,20 @@ impl OptionsBroker for DerivOptions {
         self.proposals.insert(
             identity,
             IssuedProposal {
-                spot: q.spot.token()?,
+                spot: q.spot.token()?.into_owned(),
                 provider_id: q.id,
                 longcode: q.longcode,
             },
         );
         Ok(proposal)
     }
-    fn purchase(&mut self, prepared: &PreparedPurchase) -> Result<PurchaseOutcome, String> {
+    pub fn purchase(&mut self, prepared: &PreparedPurchase) -> Result<PurchaseOutcome, String> {
         if prepared.dispatch_claim.is_empty() {
             return Err("deriv buy: dispatch claim is required".into());
         }
-        if self.written.contains(&prepared.dispatch_claim) {
+        if self.written.contains(&prepared.dispatch_claim)
+            || self.possibly_sent.contains(&prepared.command)
+        {
             return Err("deriv buy: dispatch claim already written or possibly sent; reconcile before any retry".into());
         }
         let encoded = (|| {
@@ -542,6 +614,7 @@ impl OptionsBroker for DerivOptions {
             Err(reason) => return Ok(PurchaseOutcome::ProvenNotSent { reason }),
         };
         self.written.insert(prepared.dispatch_claim.clone());
+        self.possibly_sent.insert(prepared.command.clone());
         let response = self
             .authenticated
             .connection
@@ -553,17 +626,18 @@ impl OptionsBroker for DerivOptions {
             Err(reason) => return Ok(PurchaseOutcome::PossiblySent { reason }),
         };
         if let Some(error) = response.header.error {
-            return Ok(PurchaseOutcome::Rejected {
-                code: error.code,
-                message: error.message,
-            });
+            self.possibly_sent.remove(&prepared.command);
+            return Ok(PurchaseOutcome::Rejected { code: error.code });
         }
         Ok(match purchase_fact(&response.raw) {
-            Ok((debit, liability)) => PurchaseOutcome::Accepted { debit, liability },
+            Ok((debit, liability)) => {
+                self.possibly_sent.remove(&prepared.command);
+                PurchaseOutcome::Accepted { debit, liability }
+            }
             Err(reason) => PurchaseOutcome::PossiblySent { reason },
         })
     }
-    fn subscribe_contract(&mut self, contract_ref: &str) -> Result<(), String> {
+    pub fn subscribe_contract(&mut self, contract_ref: &str) -> Result<(), String> {
         if self.contracts.contains(contract_ref) {
             return Err("deriv contract: already subscribed".into());
         }
@@ -591,7 +665,10 @@ impl OptionsBroker for DerivOptions {
         self.authenticated.connection.subscriptions.insert(id);
         Ok(())
     }
-    fn next_account_event(&mut self, timeout_micros: i64) -> Result<Option<AccountEvent>, String> {
+    pub fn next_account_event(
+        &mut self,
+        timeout_micros: i64,
+    ) -> Result<Option<AccountEvent>, String> {
         if let Some(event) = self.events.pop_front() {
             return Ok(Some(event));
         }
@@ -609,7 +686,7 @@ impl OptionsBroker for DerivOptions {
         self.decode_event(response)?;
         Ok(self.events.pop_front())
     }
-    fn open_contracts(&mut self) -> Result<Vec<OpenContract>, String> {
+    pub fn open_contracts(&mut self) -> Result<Vec<OpenContract>, String> {
         let response =
             self.authenticated
                 .connection
@@ -625,7 +702,7 @@ impl OptionsBroker for DerivOptions {
             .into_iter()
             .map(|c| {
                 self.currency(&c.currency)?;
-                if !self.instruments.contains_key(&c.symbol) {
+                if !self.instruments.contains_key(&c.underlying_symbol) {
                     return Err("deriv portfolio: instrument outside configured scope".into());
                 }
                 Ok(OpenContract {
@@ -636,13 +713,17 @@ impl OptionsBroker for DerivOptions {
                     purchase_time_micros: micros(c.purchase_time)?,
                     start_micros: c.date_start.map(micros).transpose()?,
                     expiry_micros: c.expiry_time.map(micros).transpose()?,
-                    instrument: c.symbol,
+                    instrument: c.underlying_symbol,
                     direction: direction(&c.contract_type)?,
                 })
             })
             .collect()
     }
-    fn statement(&mut self, from_secs: i64, through_secs: i64) -> Result<Vec<CashFact>, String> {
+    pub fn statement(
+        &mut self,
+        from_secs: i64,
+        through_secs: i64,
+    ) -> Result<Vec<StatementRow>, String> {
         if from_secs > through_secs {
             return Err("deriv statement: invalid range".into());
         }
@@ -675,13 +756,16 @@ impl OptionsBroker for DerivOptions {
                 if t.transaction_time < from_secs || t.transaction_time >= date_to {
                     return Err("deriv statement: transaction outside requested range".into());
                 }
-                facts.push(CashFact {
-                    account: self.account.account.clone(),
-                    transaction_ref: identifier(&t.transaction_id)?,
-                    contract_ref: t.contract_id.as_ref().map(identifier).transpose()?,
-                    action: t.action_type,
-                    amount: number(&t.amount)?,
-                    time_micros: micros(t.transaction_time)?,
+                facts.push(StatementRow {
+                    payout: t.payout.as_ref().map(number).transpose()?,
+                    cash: CashFact {
+                        account: self.account.account.clone(),
+                        transaction_ref: identifier(&t.transaction_id)?,
+                        contract_ref: t.contract_id.as_ref().map(identifier).transpose()?,
+                        action: t.action_type,
+                        amount: number(&t.amount)?,
+                        time_micros: micros(t.transaction_time)?,
+                    },
                 });
             }
             if body.statement.count < 100 {

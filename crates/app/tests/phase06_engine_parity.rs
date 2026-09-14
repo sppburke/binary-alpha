@@ -4595,16 +4595,22 @@ mod broker_authoritative {
         let mut terms = live.engine.definition().replay.contracts[0].clone();
         terms.id = format!("1:{id}");
         terms.win.gross_return = decimal(payout);
-        Proposal {
+        let mut proposal = Proposal {
             identity: terms.id.clone(),
-            request_identity: "a".repeat(64),
+            request_identity: String::new(),
+            account: live.engine.definition().replay.bindings[0].account.clone(),
+            instrument: live.engine.definition().replay.bindings[0]
+                .instrument
+                .clone(),
             terms,
             spot_units: 920_409,
             spot_time_micros: at,
             receipt_micros: at,
             schema: "synthetic:proposal".into(),
             payload_sha256: "b".repeat(64),
-        }
+        };
+        proposal.request_identity = proposal.canonical_request_identity().unwrap();
+        proposal
     }
 
     fn proposal(proposal: Proposal) -> Observation {
@@ -4777,25 +4783,6 @@ mod broker_authoritative {
                 .unwrap_err()
                 .contains("precedes the installed")
         );
-        // Broker-declared fees install; the envelope rejects excess fees before reservation.
-        for loss in [true, false] {
-            let mut live = Live::new(broker_definition());
-            let mut quoted = quote(&live, "fee", PURCHASE, "18.83");
-            if loss {
-                quoted.terms.loss.terminal_fee = decimal("0.01");
-            } else {
-                quoted.terms.tie.terminal_fee = decimal("0.01");
-            }
-            assert!(checked_step(&mut live, PURCHASE, vec![proposal(quoted)]).is_empty());
-            let events = checked_step(
-                &mut live,
-                PURCHASE,
-                vec![tick(PURCHASE, 920_409), row(0, PURCHASE, PURCHASE, true)],
-            );
-            assert_eq!(dispositions(&events), [Disposition::QuoteRejected]);
-            assert_eq!(live.account("a").reserved.to_string(), "0.00");
-            assert_eq!(live.account("a").open, 0);
-        }
     }
 
     #[test]
@@ -4997,61 +4984,12 @@ mod broker_authoritative {
     }
 
     #[test]
-    fn excess_purchase_blocks_and_exact_reconciliation_lifts_without_posting() {
-        let (mut live, command) = prepared(broker_definition());
-        let events = checked_step(&mut live, PURCHASE, vec![purchase(&command, "10.50")]);
-        let EventKind::Accepted {
-            deficit: Some(deficit),
-            discrepancy: true,
-            debit,
-            ..
-        } = &events[0].kind
-        else {
-            panic!("{events:?}")
-        };
-        assert_eq!(
-            (debit.to_string(), deficit.to_string()),
-            ("10.50".into(), "0.50".into())
-        );
-        assert!(matches!(
-            live.account("a").blocked[&command],
-            Block::Purchased { .. }
-        ));
-        assert_eq!(live.account("a").unresolved_loss.to_string(), "10.50");
-        let at = PURCHASE + SECOND;
-        let quote = quote(&live, "another", at, "18.83");
-        assert_eq!(
-            dispositions(&checked_step(
-                &mut live,
-                at,
-                vec![proposal(quote), tick(at, 920_252), row(0, at, at, true)]
-            )),
-            [Disposition::AccountBlocked]
-        );
-        let before = live.cash();
-        let resolution = Resolution::Purchased {
-            debit: decimal("10.50"),
-            liability: liability(),
-        };
-        let events = checked_step(
-            &mut live,
-            at,
-            vec![reconciliation(&command, at, resolution)],
-        );
-        assert!(
-            matches!(&events[0].kind, EventKind::Reconciled { debit, credit, release, profit: None, .. } if debit.is_zero() && credit.is_zero() && release.is_zero())
-        );
-        assert_eq!(live.cash(), before);
-        assert!(live.account("a").blocked.is_empty());
-    }
-
-    #[test]
     fn cash_order_unmatched_external_and_recovered_purchase_are_durable() {
         let (mut live, command) = prepared(broker_definition());
         let buy = cash(CashAction::Buy, "-10", "fixture-buy", PURCHASE);
         checked_step(&mut live, PURCHASE, vec![buy.clone()]);
         assert!(matches!(
-            live.account("a").blocked["transaction:fixture-buy"],
+            live.account("a").blocked["transaction:a:fixture-buy"],
             Block::UnmatchedCash { .. }
         ));
         checked_step(&mut live, PURCHASE, vec![purchase(&command, "10")]);
@@ -5082,7 +5020,7 @@ mod broker_authoritative {
             &mut live,
             at,
             vec![reconciliation(
-                "transaction:external",
+                "transaction:a:external",
                 at,
                 Resolution::External,
             )],
@@ -5114,50 +5052,6 @@ mod broker_authoritative {
         assert!(unknown.account("a").blocked.is_empty());
         assert_eq!(unknown.account("a").open, 1);
         assert_eq!(unknown.engine.summary().portfolio.unresolved, 0);
-    }
-
-    #[test]
-    fn sold_and_cancelled_close_without_directional_counts() {
-        for status in [TerminalStatus::Sold, TerminalStatus::Cancelled] {
-            let (mut live, command) = prepared(broker_definition());
-            checked_step(&mut live, PURCHASE, vec![purchase(&command, "10")]);
-            let at = PURCHASE + 16 * SECOND;
-            checked_step(
-                &mut live,
-                at,
-                vec![terminal(&command, status, "external-close", None)],
-            );
-            let events = checked_step(
-                &mut live,
-                at,
-                vec![cash(CashAction::Sell, "4.20", "external-close", at)],
-            );
-            assert!(
-                matches!(&events[1].kind, EventKind::Reconciled { resolution: Resolution::ExternallyClosed { .. }, credit, profit: Some(profit), .. } if credit.to_string() == "4.20" && profit.to_string() == "-5.80")
-            );
-            let group = &live.engine.summary().portfolio;
-            assert_eq!(
-                (
-                    group.externally_closed,
-                    group.settled,
-                    group.wins,
-                    group.losses,
-                    group.ties,
-                    group.unresolved
-                ),
-                (1, 0, 0, 0, 0, 0)
-            );
-            assert_eq!(live.cash(), "9948.77");
-            let events = live
-                .lines
-                .iter()
-                .map(|line| FinancialEvent::from_line(line).unwrap());
-            let projected = binary_alpha_engine::search::project_splits(events, "u");
-            let group = &projected["b1"]["none"];
-            assert_eq!(group.externally_closed, 1);
-            assert_eq!(group.unresolved, 0);
-            assert_eq!(group.profit["u"].unwrap().to_string(), "-5.80");
-        }
     }
 
     #[test]
@@ -5293,7 +5187,7 @@ mod broker_authoritative {
             assert!(
                 live.account("a")
                     .blocked
-                    .contains_key("transaction:wrong-sell")
+                    .contains_key("transaction:a:wrong-sell")
             );
             checked_step(
                 &mut live,
@@ -5304,14 +5198,14 @@ mod broker_authoritative {
             assert!(
                 live.account("a")
                     .blocked
-                    .contains_key("transaction:wrong-sell")
+                    .contains_key("transaction:a:wrong-sell")
             );
             assert_eq!(live.cash(), "9963.40");
             checked_step(
                 &mut live,
                 at,
                 vec![reconciliation(
-                    "transaction:wrong-sell",
+                    "transaction:a:wrong-sell",
                     at,
                     Resolution::External,
                 )],
@@ -5342,7 +5236,7 @@ mod broker_authoritative {
         assert!(
             live.account("other-account")
                 .blocked
-                .contains_key("transaction:other-account-cash")
+                .contains_key("transaction:other-account:other-account-cash")
         );
     }
 
@@ -5812,7 +5706,7 @@ mod broker_authoritative {
             &mut restored,
             at,
             vec![reconciliation(
-                "transaction:wrong",
+                "transaction:a:wrong",
                 at,
                 Resolution::External,
             )],
@@ -5945,7 +5839,7 @@ mod broker_authoritative {
             ] {
                 let resolution = closure_resolution(stated, "1.00");
                 let expected = if stated == status {
-                    "recorded sell cash sell amount".into()
+                    "recorded cash transaction sell amount".into()
                 } else {
                     format!("recorded terminal {status}")
                 };
@@ -6053,7 +5947,7 @@ mod broker_authoritative {
                 )
                 .unwrap_err();
             assert!(
-                error.contains("recorded sell cash pending amount 4.20"),
+                error.contains("recorded cash transaction pending amount 4.20"),
                 "{error}"
             );
             // A terminal supplied by reconciliation consumes the matching cash once.

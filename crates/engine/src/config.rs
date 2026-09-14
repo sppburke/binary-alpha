@@ -251,10 +251,14 @@ impl Config {
             history
                 .validate()
                 .map_err(|reason| format!("history: {reason}"))?;
-            self.brokers
+            let broker = self
+                .brokers
                 .iter()
                 .find(|broker| broker.id() == &history.broker)
                 .ok_or("history: broker is not declared under brokers")?;
+            if !broker.kind().capabilities().history {
+                return Err("history: broker has no history capability".into());
+            }
             for (index, symbol) in history.instruments.iter().enumerate() {
                 if history.instruments[..index].contains(symbol) {
                     return Err(format!("history: instruments[{index}] is listed twice"));
@@ -280,8 +284,11 @@ impl Config {
                 .iter()
                 .find(|broker| broker.id() == &history.broker)
                 .ok_or("inspect: history broker is not declared")?;
+            if !broker.kind().capabilities().live {
+                return Err("inspect: broker has no live capability".into());
+            }
             if inspect.proposal.is_some()
-                && (broker.kind() != BrokerKind::Deriv || broker.credential().is_none())
+                && (!broker.kind().capabilities().execution || broker.credential().is_none())
             {
                 return Err(
                     "inspect: proposal requires a Deriv broker with a credential reference".into(),
@@ -296,6 +303,24 @@ crate::string_enum! {
     /// A statically compiled provider adapter.
     BrokerKind "broker kind" { Deriv => "deriv", PocketOption => "pocket_option" }
 }
+
+/// Capabilities of each compiled adapter, checked before connection.
+#[derive(Debug, Clone, Copy)]
+pub struct Capabilities {
+    pub history: bool,
+    pub live: bool,
+    pub execution: bool,
+}
+impl BrokerKind {
+    pub fn capabilities(self) -> Capabilities {
+        Capabilities {
+            history: true,
+            live: true,
+            execution: self == Self::Deriv,
+        }
+    }
+}
+
 crate::string_enum! {
     /// The account class the server must confirm.
     AccountClass "account_class" { Demo => "demo", Real => "real" }

@@ -139,8 +139,8 @@ range. Every selection must resolve to a declared broker and a matching `[[instr
 with tick native granularity. `inspect` declares positive `live_observations` and `live_seconds`,
 then optional `proposal = { stake = "10", duration_seconds = 15 }` with positive exact stake and
 duration. Proposal inspection requires the history broker to support execution and have a
-credential reference. Capability checks run during application configuration loading, before
-connection. `ws://` and `http://` endpoints are permitted only under `run_mode = "research"`;
+credential reference. Capability checks run in `Config::validate`, before connection. `ws://` and
+`http://` endpoints are permitted only under `run_mode = "research"`;
 otherwise WebSocket endpoints use `wss://` and the bootstrap uses `https://`.
 
 The new execution fields retain their enclosing records' canonical order:
@@ -252,10 +252,7 @@ of unsupported combinations; none may relax causality, holdout isolation, or fin
 A run mode selects capabilities and input or output, never semantics. `research` runs development,
 evaluation, optimization, and, under a separate operator grant, locked-holdout certification;
 `replay` drives the live runtime from a recorded event log without broker mutation; `paper` runs the
-live path without real orders; `live` places real orders under its own authorization. The current
-checkout implements offline research, historical replay, bounded broker history downloads, live
-market subscriptions and non-purchasing inspection. It provides no live, paper, production execution,
-or locked-holdout certification entry point.
+live path without real orders; `live` places real orders under its own authorization.
 
 ### Canonical form
 
@@ -446,8 +443,10 @@ connections first GET `{bootstrap_endpoint}/accounts` with a resolved bearer cre
 `Deriv-App-ID`, select the single active account of the declared class, then POST
 `{bootstrap_endpoint}/accounts/{account_id}/otp` without a body and connect directly to the returned
 address. Its path must be `/trading/v1/options/ws/{account_class}`. The adapter checks account and
-currency on balance, and currency on account events; provider login ids and authenticated addresses
-stay private. Numeric fields are decoded from original bytes with `RawValue` and the shared exact
+currency on balance, and supplied currency on account events. Provider errors retain only the code
+and request name; malformed-response diagnostics name the field without echoing its value. Inspection
+reports omit provider error messages, keeping echoed login ids and authenticated addresses private.
+Numeric fields are decoded from original bytes with `RawValue` and the shared exact
 Decimal/price-unit readers. Outgoing amounts are unquoted exact tokens. Used handwritten structures
 are pinned to `crates/app/schemas/deriv/production_v20260819_0`; its source inventory records the
 release, archive digest, selected fields and absence of an upstream license statement. Builds do
@@ -463,14 +462,17 @@ resolved from the named environment variable. Fresh `successauth` and
 must occur in the observed 19-element `updateAssets` rows. Incomplete attachments never become
 observations. The adapter does not log authentication, renew credentials or generate chart points.
 
-Live records retain provider event time, local receipt time, source/parser identity, connection
+Live records retain provider event time, local receipt time, the same full source identity as fetch, connection
 generation, receipt sequence and payload SHA-256. Neither pinned provider has a durable tick
 sequence; the receipt sequence detects internal loss/reordering but proves no provider completeness.
 Every explicit reconnect starts a new generation and a continuity break, requiring resubscription
-and causal warm-up rebuilt from verified history before entries resume. Deriv epochs are seconds.
+and a fresh causal stream rebuilt from verified history before entries resume. The local reconnect
+proof rebuilds `InstrumentStream` from a verified generation, then feeds live rows; live rows alone
+do not finalize a candle before that warm-up. Phase 12 owns the production readiness gate.
+Deriv epochs are seconds.
 Pocket Option fractional provider seconds convert exactly to microseconds after subtracting the
 configured offset times 60 seconds; request anchors convert back to the provider clock. That offset,
-account class, endpoint and mapping bind history source identity. The observed 120 minutes is not a
+account class, endpoint and pinned schema/mapping bind both history and live source identity. The observed 120 minutes is not a
 universal default. Market ticks from both adapters use the same `Tick` and `InstrumentStream` owners.
 
 Deriv request admission enforces both sliding windows per connection. Configuration may lower them.
@@ -484,21 +486,27 @@ Unhandled failures stop the caller; there is no automatic retry or endpoint fall
 | Other | discovery, history, ticks, forget, transaction subscription | 220 | 14400 |
 
 `binary-alpha data fetch --config PATH` acquires each selected instrument sequentially. One pass
-freezes its requested end, pages backward, validates chronological rows, applies exact local
+freezes its requested end, anchors its first page there, pages backward, validates chronological rows, applies exact local
 `[start,end)` bounds and removes only identical page-boundary overlap. Within-page repeats remain
 source observations. Repairing a shortfall preserves the verified suffix: every overlapping row,
 including multiplicity, must agree, and a missing verified row or changed price stops publication.
 Deriv requests 100 tick rows with its seconds anchor. Pocket `changeSymbol` requests period 1;
 `loadHistoryPeriod` uses the earliest provider-clock token, index, offset 200 and period 1, while
-matching the observed period-0 reply by asset and index. Empty or non-progressing pages report an
+matching the observed period-0 reply by asset and index. Initial replies must have period 1 and
+older replies period 0; other periods fail. Empty or non-progressing pages report an
 unresolved prefix, never historical exhaustion. An initially empty pass retains raw evidence and
-coverage but cannot publish a dataset manifest requiring actual first/last events.
+coverage but cannot publish a dataset manifest requiring actual first/last events. Verified coverage
+ends one microsecond after the last received observation, capped at the requested end; a received
+point at or beyond that end establishes the upper bound. An unreceived suffix remains `unresolved_tail` and is requested again from the verified
+end. If a prefix and tail are both unresolved, `shortfall` preserves the prefix and `tail_shortfall`
+records the tail; neither is skipped.
 
 The shared import publication owner retains and publishes immutable `broker_history` generations:
 raw response objects, `normalized/ticks.parquet`, and `provenance/coverage.json`. The coverage
 record's version 1 separates requested range, verified range, actual first/last times, row count,
-page hashes/anchors and shortfall. The dataset ready manifest remains version 1; the new source kind
-requires tick capability and those objects. Only ready publication advances verified progress.
+page hashes/anchors and shortfalls. The `broker_history` dataset manifest stays at schema version 1
+with the versioned `provenance/coverage.json` object. The source kind requires tick capability and
+those objects. Only ready publication advances verified progress.
 Interrupted objects remain reusable; restarting repairs an unresolved prefix before extending the
 suffix. A refresh interval completes the initial range, then waits between sequential passes whose
 new end is sampled once. Unchanged content/coverage reuses the generation and ensures its objects
@@ -1109,27 +1117,37 @@ time, fails.
 contract and envelope. Templates carry zero outcome returns; proposals supply their own exact
 terms. CALL/Rise wins strictly above entry and PUT/Fall strictly below entry; equality loses the
 stake under the pinned subset. Loss and tie gross returns are zero, and every outcome's fees must
-satisfy the envelope. Deriv proposals carry zero separately charged fees in this measured mapping;
-no commission or universal fee-inclusion rule is inferred for other accounts or contract types.
+satisfy the envelope. The options method group implemented by `DerivOptions` prepares proposals only
+for demo USD accounts and the strict `callput` CALL/PUT mapping measured in `deriv-demo-run-01`.
+Other classes/currencies are rejected before a proposal request. A nonzero proposal `commission`
+is unresolved fee inclusion and produces no proposal; the demonstrated cash table has no separately
+charged fee.
 
 A proposal records connection generation plus provider id, a SHA-256 of normalized broker,
 configured account, instrument, currency, direction, duration, stake and semantics, exact terms,
-spot/time, receipt time, schema and payload digest. New proposals replace the current binding quote;
+spot/time, transport response receipt time, schema and payload digest. Serialized account and
+`BROKER:PROVIDER_SYMBOL` fields let Engine validate binding scope and recompute the canonical request
+hash at installation and restored admission. New proposals replace the current binding quote;
 admitted signals freeze their own proposal and reservation. `max_proposal_age_micros` bounds age
 from receipt locally; spot time is not a quote issuance or valid-until clock. Before dispatch,
 Phase 12 must durably bind deployment and command identity, binding/account/instrument, full
 proposal/request/payload identity and economics, maximum purchase price and reservation in its
 claim. Phase 11 bundles bind settlement authority, semantic identity and all envelope bounds.
 No Phase 10 application command purchases; the library refuses an empty dispatch claim, reports
-pre-write failure separately, and retains every written claim so an uncertain submission cannot be
-retried. Request ids provide correlation, not provider idempotency.
+pre-write failure separately, and retains written claims and possibly-sent command identities.
+Changing the claim cannot permit another write for a possibly-sent command. Request ids provide
+correlation, not provider idempotency.
 
 Purchase acceptance posts the actual debit once with contract/transaction references, purchase time,
 expected start and proposed payout. Entry price/time and confirmed expiry may be absent. A larger
 debit remains an accepted liability with exact paid basis, exposure, deficit and an account block;
 `Reconciliation { Purchased }` confirms the same evidence to lift that block without a second debit.
 `confirmed` records monotonically fill entry, start and expiry: absent values never erase facts,
-equal redelivery is a no-op, and contradictions require reconciliation. Expected start remains
+equal redelivery is a no-op, and changed known facts fail. Same-status terminal observations merge
+previously missing exit price/time or transaction references. Consistent updates after closure do
+not repost cash: terminal enrichment is retained and contract updates are idempotent no-ops against
+retained purchase/confirmation facts. Nullable open-contract members are absent facts; an object
+containing only `contract_id` adds no observation. Expected start remains
 separate; a buy transaction's approximate `date_expiry` never confirms expiry.
 
 Broker ticks provide continuity only and never settle or free capacity. A matched terminal
@@ -1137,25 +1155,30 @@ Broker ticks provide continuity only and never settle or free capacity. A matche
 loss; terminal evidence alone remains `awaiting_cash`. `sell` action and `is_sold` do not determine
 outcome. Sources retain contract/payload update identity, terminal status/time, and
 `deriv:transaction:TRANSACTION_ID` for cash from both stream and statement. Duplicate cash across
-restoration and sources posts once. Unknown cash blocks the account until matching purchase or
+restoration and sources posts once. Cash and purchase uniqueness is scoped by configured account;
+unmatched-cash reconciliation addresses `transaction:ACCOUNT:TRANSACTION_REF`. Unknown cash blocks
+the account until matching purchase or
 terminal evidence, or an explicit `External` reconciliation, resolves it. External sold/cancelled
 status plus actual cash produces `Reconciled`/`ExternallyClosed` and a separate closure count,
-never a directional win/loss/tie. Reconciliation cannot contradict already recorded terminal or
-cash facts.
+never a directional win/loss/tie. Reconciliation cannot contradict recorded terminal status or cash:
+`gross_return - terminal_fee` must equal the recorded sell amount by value. That cash is already the
+net posting; no further fee is deducted from it.
 
 Financial settlement needs no fabricated path. Confirmed entry and exit alone form authoritative
 path diagnostics; missing entry/exit leaves them unavailable. Sparse exit time before expiry is
 preserved. Statement windows include the complete target second by sending exclusive
 `date_to = through_secs + 1`, paging by 100 while a full page is returned. Portfolio provides open
-liabilities; its local fixture is synthetic from the pinned schema. `CashFact` alone does not carry
-purchase payout or purchase time: recovery must obtain those from purchase/contract evidence, not
-infer them from the proposal or the cash transaction clock.
+liabilities using `underlying_symbol`; its local fixture is synthetic from the pinned schema.
+Statement results carry `StatementRow { cash, payout }`; `recover_purchase` uses the buy row alone,
+including its payout and `transaction_time` as purchase time, without a lost acknowledgement.
 
-One current Engine constraint remains relevant to the Phase 12 handoff: the financial ledger
-retains an admitted proposal but does not restore a proposal received before any signal; market,
-feature and unadmitted proposal inputs need an input replay boundary. Provider purchase clocks carry
-whole seconds, so Engine accepts a purchase whose time is no earlier than the second the command was
-dispatched in and no later than the decision; the adapter preserves the provider clock unchanged.
+The financial ledger retains admitted proposals; normalized proposals received before a signal are
+re-supplied by the input replay boundary after a restart, like ticks and feature rows. Re-supplying
+the proposal and continuing produces identical ledger bytes. The admitted signal is the prepared
+command, and `sent_micros` records its preparation time. Provider purchase clocks carry whole
+seconds, so Engine accepts a purchase no earlier than the second the command was prepared in and
+no later than the decision. Phase 12 binds the durable dispatch claim before any write; the adapter
+preserves the provider purchase clock unchanged.
 
 ### Pause, conversion, and projections
 

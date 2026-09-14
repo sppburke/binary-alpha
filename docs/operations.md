@@ -50,10 +50,10 @@ either copy. No quiescence is required; readers of the source files continue dur
 Fetch: configure `[[brokers]]`, tick `[[instruments]]`, `[history]`, the retained folder and destination.
 Choose a finite `[start,end)` and optionally `refresh_interval_seconds`, then, with authorization for
 the exact provider/account/action, run `binary-alpha data fetch --config PATH`. Refresh runs in the
-foreground with one fixed end per pass and no overlapping passes. Reports distinguish actual data,
-verified coverage and shortfall. Stopping preserves verified work; rerunning resumes it and reuses
-retained objects through manifest-last publication. Overlapping repair must agree with every verified
-observation and repeat. Removing `[history]` restores the offline import/audit workflow.
+foreground; stop it to end ongoing downloads and restart with the same
+configuration to resume verified work. See [broker fetch contracts](contracts.md#broker-access)
+for pagination, coverage, shortfalls and publication mechanics. Removing `[history]` restores the
+offline import/audit workflow.
 
 Inspect: after authorization for the exact provider, account and non-purchasing checks, configure
 `[inspect]` and run `binary-alpha broker inspect --config PATH`. It checks bounded history and live

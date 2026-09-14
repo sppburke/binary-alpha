@@ -70,6 +70,8 @@ pub struct HistoryCoverage {
     pub rows: u64,
     pub pages: Vec<PageCoverage>,
     pub shortfall: Option<Shortfall>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tail_shortfall: Option<Shortfall>,
 }
 #[derive(Debug, Clone, Copy)]
 pub enum PassLimit {
@@ -122,7 +124,7 @@ pub fn passes(
         } else {
             clock.now_micros()
         };
-        pass(config, broker, local, destination, clock, (start, end), out)?;
+        pass(config, broker, local, destination, (start, end), out)?;
         index += 1;
         let Some(interval) = history.refresh_interval_seconds else {
             return Ok(());
@@ -252,7 +254,6 @@ pub fn pass(
     broker: &mut dyn MarketDataBroker,
     local: &Store,
     destination: &Store,
-    _clock: &mut dyn Clock,
     requested: (i64, i64),
     out: &mut dyn Write,
 ) -> Result<(), String> {
@@ -278,9 +279,6 @@ pub fn pass(
         let definition = config
             .instrument(&instrument, NativeGranularity::Tick)
             .ok_or("fetch: instrument is not declared")?;
-        if definition.native_granularity != NativeGranularity::Tick {
-            return Err("fetch: history requires tick granularity".into());
-        }
         let prior = prior(
             local,
             &instrument,
@@ -334,7 +332,8 @@ pub fn pass(
             .map(|prior| prior.coverage.pages.clone())
             .unwrap_or_default();
         let mut earliest = None;
-        let mut anchor = None;
+        let mut anchor = Some(requested.1);
+        let mut received_end = None;
         let shortfall = loop {
             let page = broker.history_page(&instrument, definition.price_scale, anchor)?;
             let mut sequence = TickSequence::default();
@@ -345,6 +344,13 @@ pub fn pass(
             }
             let first = page.rows.first().map(|row| row.event_time_micros);
             let last = page.rows.last().map(|row| row.event_time_micros);
+            if let Some(last) = last.filter(|last| *last >= fetch_start) {
+                received_end = Some(
+                    received_end
+                        .unwrap_or(i64::MIN)
+                        .max(last.saturating_add(1).min(requested.1)),
+                );
+            }
             let identity = import::retain_bytes(local, &page.raw, "history-page")?;
             let path = format!("raw/{}.json", identity.sha256);
             if !objects.iter().any(|object| object.path == path) {
@@ -403,6 +409,7 @@ pub fn pass(
             anchor = Some(first);
         };
         let new_count = rows.len();
+
         let mut previous_rows = Vec::new();
         let mut repeats_prior = false;
         if let Some(prior) = &prior {
@@ -463,16 +470,28 @@ pub fn pass(
                 .as_ref()
                 .and_then(|prior| prior.coverage.verified.clone())
         } else if shortfall.is_none() {
-            Some(Range::new(requested.0, requested.1))
+            Some(Range::new(
+                requested.0,
+                received_end.expect("received rows"),
+            ))
         } else {
             Some(Range::new(
                 earliest
                     .unwrap_or(requested.1)
                     .max(fetch_start)
                     .min(requested.1),
-                requested.1,
+                received_end.expect("received rows"),
             ))
         };
+        let tail = received_end
+            .or(previous_verified.map(|(_, end)| end))
+            .filter(|end| *end < requested.1)
+            .map(|end| Shortfall {
+                reason: "unresolved_tail".into(),
+                unresolved: Range::new(end.max(fetch_start), requested.1),
+            });
+        let tail_shortfall = shortfall.as_ref().and(tail.clone());
+        let shortfall = shortfall.or(tail);
         let mut coverage = HistoryCoverage {
             schema_version: 1,
             source_identity: source_identity.clone(),
@@ -488,10 +507,12 @@ pub fn pass(
             rows: rows.len() as u64,
             pages,
             shortfall,
+            tail_shortfall,
         };
         let no_change = (new_count == 0 || repeats_prior)
             && prior.as_ref().is_some_and(|prior| {
                 prior.coverage.shortfall == coverage.shortfall
+                    && prior.coverage.tail_shortfall == coverage.tail_shortfall
                     && prior.coverage.verified == coverage.verified
             });
         if no_change {

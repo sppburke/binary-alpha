@@ -1,5 +1,5 @@
 use super::socket_io::{self, Packet};
-use super::transport::{Connector, Frame, Transport, endpoint_host};
+use super::transport::{Connector, Frame, Transport};
 use super::wire::WireDecimal;
 use super::{
     Cancellation, Clock, Continuity, DiscoveredInstrument, HistoryPage, LiveEvent, LiveObservation,
@@ -14,8 +14,7 @@ use std::collections::{BTreeMap, VecDeque};
 
 /// Converts the declared provider clock directly to universal integer microseconds.
 pub fn universal_micros(token: &WireDecimal, offset_minutes: i32) -> Result<i64, String> {
-    token.require_number()?;
-    let value = token.decimal()?;
+    let value = token.require_number()?;
     if value.scale() > 6 {
         return Err("pocket_option: provider time has more than six fractional digits".into());
     }
@@ -85,7 +84,6 @@ pub struct PocketMarketData {
     pending: Option<String>,
     discovered: Vec<DiscoveredInstrument>,
     subscribed: BTreeMap<String, (InstrumentId, PriceScale)>,
-    anchors: BTreeMap<InstrumentId, (i64, WireDecimal)>,
     next_index: u64,
     continuity: Continuity,
     events: VecDeque<LiveEvent>,
@@ -123,12 +121,13 @@ impl PocketMarketData {
             pending: None,
             discovered: Vec::new(),
             subscribed: BTreeMap::new(),
-            anchors: BTreeMap::new(),
             next_index: 1,
             continuity: Continuity::default(),
             events: VecDeque::new(),
             received_counts: BTreeMap::new(),
-            source: format!("pocket_option:{}", endpoint_host(&settings.endpoint)?),
+            source: super::source_identity(&binary_alpha_engine::config::Broker::PocketOption(
+                settings.clone(),
+            )),
         };
         broker.handshake()?;
         Ok(broker)
@@ -386,7 +385,12 @@ impl MarketDataBroker for PocketMarketData {
                 if response.asset != instrument.provider_symbol.as_str() {
                     return Err("pocket_option: initial history asset mismatch".into());
                 }
-                response.period.require_number()?;
+                let period = response.period.require_number()?;
+                if period.compare(Decimal::parse("1")?)? != std::cmp::Ordering::Equal {
+                    return Err(format!(
+                        "pocket_option updateHistoryNewFast: unsupported period {period}"
+                    ));
+                }
                 (
                     event,
                     response
@@ -398,11 +402,8 @@ impl MarketDataBroker for PocketMarketData {
                 )
             }
             Some(before) => {
-                let time = match self.anchors.get(instrument) {
-                    Some((micros, token)) if *micros == before => token.clone(),
-                    _ => provider_token(before, self.settings.server_offset_minutes)?,
-                };
-                let anchor_token = Some(time.token()?);
+                let time = provider_token(before, self.settings.server_offset_minutes)?;
+                let anchor_token = Some(time.token()?.into_owned());
                 let index = self.next_index;
                 self.next_index = index
                     .checked_add(1)
@@ -425,7 +426,12 @@ impl MarketDataBroker for PocketMarketData {
                     return Err("pocket_option: history asset or index mismatch".into());
                 }
                 // Request period 1 produced response period 0 in both retained older pages.
-                response.period.require_number()?;
+                let period = response.period.require_number()?;
+                if !period.is_zero() {
+                    return Err(format!(
+                        "pocket_option loadHistoryPeriod: unsupported period {period}"
+                    ));
+                }
                 (event, response.data, anchor_token)
             }
         };
@@ -442,18 +448,8 @@ impl MarketDataBroker for PocketMarketData {
                 })
             })
             .collect::<Result<Vec<_>, String>>()?;
-        if let (Some(row), Some(raw)) = (rows.first(), raw_rows.first()) {
-            self.anchors.insert(
-                instrument.clone(),
-                (row.event_time_micros, raw.time.clone()),
-            );
-        }
         Ok(HistoryPage {
-            first_micros: rows.first().map(|row| row.event_time_micros),
-            last_micros: rows.last().map(|row| row.event_time_micros),
-            raw_name: payload_hash(&event.raw),
             raw: event.raw,
-            anchor: before_micros,
             anchor_token,
             rows,
         })
@@ -522,7 +518,6 @@ impl MarketDataBroker for PocketMarketData {
         self.pending = None;
         self.subscribed.clear();
         self.discovered.clear();
-        self.anchors.clear();
         self.events.clear();
         self.next_index = 1;
         let generation = self.continuity.reconnect()?;

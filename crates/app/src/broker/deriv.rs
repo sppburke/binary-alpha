@@ -1,8 +1,11 @@
 #[path = "deriv_options.rs"]
 mod options;
-pub use options::{DerivOptions, purchase_fact, purchase_observation, to_observation};
+pub use options::{
+    DerivOptions, StatementRow, purchase_fact, purchase_observation, recover_purchase,
+    to_observation,
+};
 
-use super::transport::{Connector, Frame, Http, Transport, endpoint_host};
+use super::transport::{Connector, Frame, Http, Transport};
 use super::wire::WireDecimal;
 use super::{
     Cancellation, Clock, Continuity, DiscoveredInstrument, HistoryPage, LiveEvent, LiveObservation,
@@ -18,7 +21,6 @@ pub const SCHEMA: &str = "deriv:production_v20260819_0";
 #[derive(Debug, Deserialize)]
 pub struct WireError {
     pub code: String,
-    pub message: String,
 }
 #[derive(Debug, Deserialize)]
 pub struct Subscription {
@@ -32,19 +34,62 @@ pub struct Envelope {
     pub subscription: Option<Subscription>,
 }
 /// The original response bytes and local receipt identity, before typed body decoding.
-pub struct Response {
-    pub raw: Vec<u8>,
-    pub header: Envelope,
-    pub receipt_micros: i64,
-    pub stamp: Option<(u64, u64)>,
+struct Response {
+    raw: Vec<u8>,
+    header: Envelope,
+    receipt_micros: i64,
+    stamp: Option<(u64, u64)>,
 }
-pub fn decode<T: DeserializeOwned>(raw: &[u8], context: &str) -> Result<T, String> {
-    serde_json::from_slice(raw)
-        .map_err(|error| format!("deriv {context}: malformed response: {error}"))
+fn decode<T: DeserializeOwned>(raw: &[u8], context: &str) -> Result<T, String> {
+    serde_json::from_slice(raw).map_err(|error| {
+        // Only schema field names enter diagnostics; deserializer messages can echo private values.
+        const FIELDS: &str = concat!(
+            "msg_type req_id error code subscription id proposal ",
+            "ask_price payout spot spot_time longcode commission buy ",
+            "buy_price purchase_time contract_id transaction_id start_time transaction action ",
+            "amount currency transaction_time proposal_open_contract contract_type status underlying_symbol ",
+            "entry_spot entry_spot_time date_start date_expiry exit_spot exit_spot_time transaction_ids ",
+            "sell current_spot_time sell_time portfolio contracts expiry_time statement ",
+            "count transactions action_type history prices times pip_size ",
+            "tick epoch quote symbol balance loginid data ",
+            "account_id account_type url active_symbols contracts_for available contract_category ",
+            "barriers min_contract_duration expiry_type forget ",
+        );
+        let message = error.to_string();
+        let missing = FIELDS
+            .split_whitespace()
+            .find(|field| message.starts_with(&format!("missing field `{field}`")));
+        let prefix = raw
+            .split(|byte| *byte == b'\n')
+            .take(error.line())
+            .enumerate()
+            .flat_map(|(line, bytes)| {
+                bytes.iter().copied().take(if line + 1 == error.line() {
+                    error.column()
+                } else {
+                    bytes.len()
+                })
+            })
+            .collect::<Vec<_>>();
+        let prefix = String::from_utf8_lossy(&prefix);
+        let field = missing.or_else(|| {
+                FIELDS
+                    .split_whitespace()
+                    .filter_map(|field| {
+                        prefix
+                            .rfind(&format!("\"{field}\""))
+                            .map(|position| (position, field))
+                    })
+                    .max_by_key(|(position, _)| *position)
+                    .map(|(_, field)| field)
+            })
+            .unwrap_or("object");
+        format!("deriv {context}: malformed {field} field")
+    })
 }
 
 /// Correlation, rate admission, and explicit connection replacement shared by Deriv methods.
-pub struct DerivConnection {
+struct DerivConnection {
     connector: Box<dyn Connector>,
     transport: Box<dyn Transport>,
     clock: Box<dyn Clock>,
@@ -57,7 +102,7 @@ pub struct DerivConnection {
     queued: VecDeque<Response>,
 }
 impl DerivConnection {
-    pub fn connect(
+    fn connect(
         url: &str,
         mut connector: Box<dyn Connector>,
         clock: Box<dyn Clock>,
@@ -122,7 +167,7 @@ impl DerivConnection {
             }
         }
     }
-    pub fn request<T: Serialize>(
+    fn request<T: Serialize>(
         &mut self,
         group: RateGroup,
         expected: &str,
@@ -132,10 +177,7 @@ impl DerivConnection {
         self.transport.send(Frame::Text(text))?;
         let response = self.response(id, expected)?;
         if let Some(error) = &response.header.error {
-            return Err(format!(
-                "deriv {expected}: {}: {}",
-                error.code, error.message
-            ));
+            return Err(format!("deriv {expected}: {}", error.code));
         }
         Ok(response)
     }
@@ -168,10 +210,7 @@ impl DerivConnection {
                 .ok_or_else(|| format!("deriv {expected}: response timeout"))?;
             if response.header.req_id == Some(id) {
                 if response.header.msg_type != expected {
-                    return Err(format!(
-                        "deriv {expected}: unexpected msg_type {}",
-                        response.header.msg_type
-                    ));
+                    return Err(format!("deriv {expected}: unexpected msg_type field"));
                 }
                 return Ok(response);
             }
@@ -185,7 +224,7 @@ impl DerivConnection {
                 .is_some_and(|s| self.subscriptions.contains(&s.id))
             {
                 if let Some(error) = &response.header.error {
-                    return Err(format!("deriv tick: {}: {}", error.code, error.message));
+                    return Err(format!("deriv tick: {}", error.code));
                 }
                 self.queued.push_back(response);
             } else {
@@ -200,7 +239,7 @@ impl DerivConnection {
             self.receive(timeout_micros)
         }
     }
-    pub fn reconnect(&mut self) -> Result<u64, String> {
+    fn reconnect(&mut self) -> Result<u64, String> {
         self.transport.close()?;
         self.transport = self.connector.connect(&self.url, &[])?;
         self.next_id = 1;
@@ -209,7 +248,7 @@ impl DerivConnection {
         self.queued.clear();
         self.continuity.reconnect()
     }
-    pub fn continuity(&self) -> &Continuity {
+    fn continuity(&self) -> &Continuity {
         &self.continuity
     }
 }
@@ -303,8 +342,7 @@ fn micros(seconds: i64) -> Result<i64, String> {
         .ok_or("deriv: epoch overflows microseconds".into())
 }
 fn precision(pip_size: &WireDecimal, scale: PriceScale) -> Result<(), String> {
-    pip_size.require_number()?;
-    let digits = pip_size.decimal()?.rescale(0)?.coefficient();
+    let digits = pip_size.require_number()?.rescale(0)?.coefficient();
     if digits < 0 || digits > i128::from(scale.digits()) {
         return Err("deriv: pip_size exceeds configured price scale".into());
     }
@@ -337,7 +375,9 @@ impl DerivMarketData {
             subscriptions: BTreeMap::new(),
             active: BTreeMap::new(),
             events: VecDeque::new(),
-            source: format!("deriv:{}", endpoint_host(&settings.public_endpoint)?),
+            source: super::source_identity(&binary_alpha_engine::config::Broker::Deriv(
+                settings.clone(),
+            )),
         })
     }
     pub fn contracts_for(&mut self, symbol: &str) -> Result<Vec<ContractAvailability>, String> {
@@ -354,7 +394,7 @@ impl DerivMarketData {
         for contract in contracts.contracts_for.available {
             contract.barriers.require_number()?;
             if contract.underlying_symbol == symbol
-                && contract.contract_category == "callput"
+                && contract.contract_category == options::MEASURED_CONTRACT_CATEGORY
                 && matches!(contract.contract_type.as_str(), "CALL" | "PUT")
             {
                 selected.push(contract);
@@ -370,16 +410,10 @@ impl DerivMarketData {
     }
     fn observation(&self, response: Response) -> Result<LiveEvent, String> {
         if let Some(error) = &response.header.error {
-            return Err(format!(
-                "deriv {}: {}: {}",
-                response.header.msg_type, error.code, error.message
-            ));
+            return Err(format!("deriv market: {}", error.code));
         }
         if response.header.msg_type != "tick" {
-            return Err(format!(
-                "deriv: unexpected msg_type {}",
-                response.header.msg_type
-            ));
+            return Err("deriv: unexpected msg_type field".into());
         }
         let subscription = response
             .header
@@ -426,12 +460,11 @@ impl MarketDataBroker for DerivMarketData {
             .active_symbols
             .into_iter()
             .map(|symbol| {
-                symbol.pip_size.require_number()?;
+                let pip = symbol.pip_size.require_number()?.normalized();
                 if symbol.exchange_is_open > 1 || symbol.is_trading_suspended > 1 {
                     return Err("deriv active_symbols: invalid market status".into());
                 }
                 // This schema describes pip_size as the minimum fluctuation, not a digit count.
-                let pip = symbol.pip_size.decimal()?.normalized();
                 if pip.coefficient() != 1 {
                     return Err("deriv active_symbols: unsupported pip_size precision".into());
                 }
@@ -484,11 +517,7 @@ impl MarketDataBroker for DerivMarketData {
             })
             .collect::<Result<Vec<_>, String>>()?;
         Ok(HistoryPage {
-            first_micros: rows.first().map(|r| r.event_time_micros),
-            last_micros: rows.last().map(|r| r.event_time_micros),
-            raw_name: payload_hash(&response.raw),
             raw: response.raw,
-            anchor: before_micros,
             anchor_token: before_micros.map(|t| t.div_euclid(1_000_000).to_string()),
             rows,
         })
@@ -694,7 +723,7 @@ pub struct Balance {
     pub account_class: AccountClass,
 }
 pub struct DerivAuthenticated {
-    pub connection: DerivConnection,
+    connection: DerivConnection,
     account: String,
     currency: Currency,
     account_class: AccountClass,
@@ -720,13 +749,11 @@ impl DerivAuthenticated {
                 balance: 1,
                 req_id,
             })?;
-        let response: BalanceResponse = serde_json::from_slice(&response.raw)
-            .map_err(|_| "deriv balance: malformed response")?;
+        let response: BalanceResponse = decode(&response.raw, "balance")?;
         if response.balance.currency != self.currency || response.balance.loginid != self.account {
             return Err("deriv balance: account or currency mismatch".into());
         }
-        response.balance.balance.require_number()?;
-        let amount = response.balance.balance.decimal()?;
+        let amount = response.balance.balance.require_number()?;
         if amount.is_negative() {
             return Err("deriv balance: negative balance".into());
         }

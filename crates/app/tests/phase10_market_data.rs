@@ -2,17 +2,17 @@ mod common;
 
 use binary_alpha_app::broker::deriv::{DerivAccounts, DerivAuthenticated, DerivMarketData};
 use binary_alpha_app::broker::pocket_option::{PocketMarketData, provider_token, universal_micros};
-use binary_alpha_app::broker::transport::{Connector, Frame, Http, WebSocketConnector};
+use binary_alpha_app::broker::transport::{Connector, Frame, WebSocketConnector};
 use binary_alpha_app::broker::wire::WireDecimal;
 use binary_alpha_app::broker::{
     Adapter, Cancellation, Clock, Continuity, HistoryPage, LiveEvent, MarketDataBroker, RateBudget,
     RateGroup,
 };
 use binary_alpha_app::store::Store;
-use binary_alpha_app::{archive, broker, fetch, verify};
+use binary_alpha_app::{broker, fetch, verify};
 use binary_alpha_engine::config::{Broker, Config, DerivSettings, PocketSettings, RateBudgets};
 use binary_alpha_engine::dataset::{
-    Capability, DatasetRole, GenerationManifest, NativeGranularity, ObjectRole, SourceKind,
+    Capability, DatasetRole, GenerationManifest, NativeGranularity, SourceKind,
 };
 use binary_alpha_engine::execution::Decimal;
 use binary_alpha_engine::market::{
@@ -21,28 +21,17 @@ use binary_alpha_engine::market::{
 };
 use binary_alpha_engine::stream::{Candle, Flags, InstrumentStream, Observation, Source};
 use common::Scratch;
-use common::broker::{FakeClock, connector};
+use common::broker::{FakeClock, FakeHttp, connector, correlated, fixture, replace};
 use serde::{Deserialize, de::DeserializeOwned};
 use serde_json::value::RawValue;
 use std::cell::RefCell;
 use std::collections::{BTreeMap, VecDeque};
 use std::fs;
-use std::path::Path;
 use std::rc::Rc;
 
 fn hash(bytes: &[u8]) -> String {
     use sha2::{Digest, Sha256};
     binary_alpha_engine::hex(&Sha256::digest(bytes))
-}
-fn fixture(name: &str) -> String {
-    fs::read_to_string(
-        Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("tests/fixtures/phase10")
-            .join(name),
-    )
-    .unwrap()
-    .trim_end()
-    .to_string()
 }
 fn expected_rows(kind: &str, symbol: &str) -> Vec<Tick> {
     fixture(&format!(
@@ -59,19 +48,8 @@ fn expected_rows(kind: &str, symbol: &str) -> Vec<Tick> {
     })
     .collect()
 }
-fn raw(text: &str) -> Box<RawValue> {
-    RawValue::from_string(text.into()).unwrap()
-}
 fn field<T: DeserializeOwned>(map: &BTreeMap<String, Box<RawValue>>, key: &str) -> T {
     serde_json::from_str(map[key].get()).unwrap()
-}
-fn replace(text: &str, key: &str, value: &str) -> String {
-    let mut fields: BTreeMap<String, Box<RawValue>> = serde_json::from_str(text).unwrap();
-    fields.insert(key.into(), raw(value));
-    serde_json::to_string(&fields).unwrap()
-}
-fn correlated(text: &str, req_id: u64) -> String {
-    replace(text, "req_id", &req_id.to_string())
 }
 fn frame(name: &str, id: u64) -> Frame {
     Frame::Text(correlated(&fixture(name), id))
@@ -305,7 +283,7 @@ fn deriv_rejects_malformed_missing_fields_wrong_types_and_wrong_request_ids() {
     let cases = vec![
         (replace(&base, "pip_size", "5"), "pip_size"),
         ("{not json".into(), "malformed"),
-        (serde_json::to_string(&missing).unwrap(), "missing field"),
+        (serde_json::to_string(&missing).unwrap(), "msg_type field"),
         (
             replace(&base, "history", "{\"prices\":[\"18.83\"],\"times\":[1]}"),
             "numeric token",
@@ -411,12 +389,20 @@ fn pocket_retained_paging_live_cancellation_and_heartbeats() {
     assert_eq!(initial.rows.len(), 1478);
     assert_eq!(initial.rows[0].event_time_micros, 1_789_347_292_749_000);
     let older = broker
-        .history_page(&instrument, scale(5), initial.first_micros)
+        .history_page(
+            &instrument,
+            scale(5),
+            initial.rows.first().map(|row| row.event_time_micros),
+        )
         .unwrap();
     assert_eq!(older.rows.len(), 413);
     assert_eq!(older.anchor_token.as_deref(), Some("1789354492.749"));
     let oldest = broker
-        .history_page(&instrument, scale(5), older.first_micros)
+        .history_page(
+            &instrument,
+            scale(5),
+            older.rows.first().map(|row| row.event_time_micros),
+        )
         .unwrap();
     assert_eq!(oldest.rows.len(), 409);
     let rows = fetch::prepend_page(oldest.rows, fetch::prepend_page(older.rows, initial.rows));
@@ -579,37 +565,6 @@ fn test_config(scratch: &Scratch, kind: &str, endpoint: &str, two: bool) -> Conf
     Config::parse(&config.canonical_toml()).unwrap()
 }
 
-struct HttpCall {
-    method: String,
-    url: String,
-    headers: Vec<(String, String)>,
-}
-struct FakeHttp {
-    responses: VecDeque<Vec<u8>>,
-    calls: Vec<HttpCall>,
-}
-impl Http for FakeHttp {
-    fn get_json(&mut self, url: &str, headers: &[(String, String)]) -> Result<Vec<u8>, String> {
-        self.calls.push(HttpCall {
-            method: "GET".into(),
-            url: url.into(),
-            headers: headers.to_vec(),
-        });
-        self.responses
-            .pop_front()
-            .ok_or("unexpected HTTP request".into())
-    }
-    fn post_json(&mut self, url: &str, headers: &[(String, String)]) -> Result<Vec<u8>, String> {
-        self.calls.push(HttpCall {
-            method: "POST".into(),
-            url: url.into(),
-            headers: headers.to_vec(),
-        });
-        self.responses
-            .pop_front()
-            .ok_or("unexpected HTTP request".into())
-    }
-}
 #[test]
 fn authenticated_bootstrap_and_balance_are_exact_class_bound_and_non_purchasing() {
     // Synthetic accounts and OTP address: no retained account or subscription identifier is copied.
@@ -742,12 +697,42 @@ fn both_live_adapters_feed_the_shared_stream_and_replay_identically() {
                 .subscribe(&definition.id(), definition.price_scale)
                 .unwrap();
         }
+        let mut streams = config
+            .instruments
+            .iter()
+            .map(|definition| {
+                (
+                    definition.id(),
+                    (
+                        InstrumentStream::new(definition, stream_source(definition.price_scale))
+                            .unwrap(),
+                        Vec::new(),
+                    ),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
         let mut observations = Vec::new();
         let mut continuity = Continuity::default();
         while let Some(event) = adapter.market().next_live(1_000_000).unwrap() {
             let row = observation(Some(event));
             continuity.accept(&row).unwrap();
             assert_ne!(row.receipt_micros, row.provider_time_micros);
+            let (stream, candles) = streams.get_mut(&row.instrument).unwrap();
+            stream
+                .push(
+                    Observation::Tick(Tick {
+                        event_time_micros: row.provider_time_micros,
+                        price_units: row.price_units,
+                    }),
+                    candles,
+                )
+                .unwrap();
+            let settings = if kind == "deriv" {
+                Broker::Deriv(deriv_settings())
+            } else {
+                Broker::PocketOption(pocket_settings())
+            };
+            assert_eq!(row.source, broker::source_identity(&settings));
             observations.push(row);
         }
         for definition in &config.instruments {
@@ -784,7 +769,7 @@ fn both_live_adapters_feed_the_shared_stream_and_replay_identically() {
                 }
                 candles
             };
-            let first = replay();
+            let (_, first) = streams.remove(&definition.id()).unwrap();
 
             let deriv = kind == "deriv";
             let aapl = definition.provider_symbol.as_str() == "#AAPL_otc";
@@ -894,12 +879,8 @@ fn page(rows: &[(i64, i64)]) -> HistoryPage {
     // Synthetic deterministic provider rows, with integer prices already normalized by the fake adapter.
     let raw = serde_json::to_vec(&rows).unwrap();
     HistoryPage {
-        raw_name: hash(&raw),
         raw,
-        anchor: None,
         anchor_token: None,
-        first_micros: rows.first().map(|r| r.0 * 1_000_000),
-        last_micros: rows.last().map(|r| r.0 * 1_000_000),
         rows: rows
             .iter()
             .map(|&(t, p)| Tick {
@@ -965,7 +946,15 @@ fn fetch_refresh_overlap_no_new_data_verification_and_phase03_audit() {
     .unwrap();
     assert_eq!(clock.now_micros(), 30_000_000);
     assert!(pages.pages.is_empty());
-    assert_eq!(pages.anchors, [None, Some(5_000_000), None, None]);
+    assert_eq!(
+        pages.anchors,
+        [
+            Some(10_000_000),
+            Some(5_000_000),
+            Some(20_000_000),
+            Some(30_000_000)
+        ]
+    );
     let manifests = read_manifests(&scratch);
     assert_eq!(
         manifests.iter().map(|m| m.row_count).collect::<Vec<_>>(),
@@ -977,10 +966,13 @@ fn fetch_refresh_overlap_no_new_data_verification_and_phase03_audit() {
             coverage.verified,
             Some(fetch::Range {
                 start: time_text(0),
-                end: time_text((index as i64 + 1) * 10_000_000)
+                end: time_text((index as i64 + 1) * 10_000_000 - 999_999)
             })
         );
-        assert!(coverage.shortfall.is_none());
+        assert_eq!(
+            coverage.shortfall.as_ref().unwrap().reason,
+            "unresolved_tail"
+        );
         assert_eq!(coverage.rows, manifest.row_count);
         assert!(
             verify::run(&destination.uri(&manifest.key()))
@@ -998,8 +990,7 @@ fn fetch_refresh_overlap_no_new_data_verification_and_phase03_audit() {
         &mut none,
         &local,
         &destination,
-        &mut clock,
-        (0, 40_000_000),
+        (0, 30_000_000),
         &mut out,
     )
     .unwrap();
@@ -1030,14 +1021,13 @@ fn fetch_shortfalls_never_skip_the_unverified_prefix() {
             range_page(5, 8)
         };
         let mut pages = Pages::new(vec![range_page(5, 8), second]);
-        let mut clock = FakeClock::default();
+
         let mut out = Vec::new();
         fetch::pass(
             &config,
             &mut pages,
             &local,
             &destination,
-            &mut clock,
             (0, 10_000_000),
             &mut out,
         )
@@ -1054,24 +1044,39 @@ fn fetch_shortfalls_never_skip_the_unverified_prefix() {
             coverage.shortfall.as_ref().unwrap().unresolved.end,
             time_text(5_000_000)
         );
+        assert_eq!(
+            coverage.verified.as_ref().unwrap().end,
+            time_text(7_000_001)
+        );
+        assert_eq!(
+            coverage.tail_shortfall,
+            Some(fetch::Shortfall {
+                reason: "unresolved_tail".into(),
+                unresolved: fetch::Range {
+                    start: time_text(7_000_001),
+                    end: time_text(10_000_000)
+                },
+            })
+        );
         let mut repair = Pages::new(vec![range_page(0, 10)]);
         fetch::pass(
             &config,
             &mut repair,
             &local,
             &destination,
-            &mut clock,
             (0, 10_000_000),
             &mut out,
         )
         .unwrap();
-        assert_eq!(repair.anchors, [None]);
+        assert_eq!(repair.anchors, [Some(10_000_000)]);
         let repaired = read_manifests(&scratch);
         assert_eq!(repaired.last().unwrap().row_count, 10);
-        assert!(
+        assert_eq!(
             read_coverage(&scratch, repaired.last().unwrap())
                 .shortfall
-                .is_none()
+                .unwrap()
+                .reason,
+            "unresolved_tail"
         );
     }
     let scratch = Scratch::new("phase10_empty_first");
@@ -1083,7 +1088,6 @@ fn fetch_shortfalls_never_skip_the_unverified_prefix() {
         &mut Pages::new(vec![page(&[])]),
         &local,
         &destination,
-        &mut FakeClock::default(),
         (0, 10_000_000),
         &mut out,
     )
@@ -1107,7 +1111,7 @@ fn fetch_conflicts_provider_errors_and_interrupted_publication_do_not_advance() 
     let scratch = Scratch::new("phase10_fetch_failures");
     let config = test_config(&scratch, "deriv", "ws://127.0.0.1/", false);
     let (local, destination) = stores(&scratch);
-    let mut clock = FakeClock::default();
+
     let mut out = Vec::new();
     let mut conflict = Pages::new(vec![
         page(&[(5, 100), (6, 101)]),
@@ -1119,7 +1123,6 @@ fn fetch_conflicts_provider_errors_and_interrupted_publication_do_not_advance() 
             &mut conflict,
             &local,
             &destination,
-            &mut clock,
             (0, 10_000_000),
             &mut out
         )
@@ -1137,7 +1140,6 @@ fn fetch_conflicts_provider_errors_and_interrupted_publication_do_not_advance() 
             &mut failure,
             &local,
             &destination,
-            &mut clock,
             (0, 10_000_000),
             &mut out
         )
@@ -1155,7 +1157,6 @@ fn fetch_conflicts_provider_errors_and_interrupted_publication_do_not_advance() 
             &mut Pages::new(vec![first.clone(), second.clone()]),
             &local,
             &destination,
-            &mut clock,
             (0, 10_000_000),
             &mut out
         )
@@ -1174,7 +1175,6 @@ fn fetch_conflicts_provider_errors_and_interrupted_publication_do_not_advance() 
         &mut Pages::new(vec![first, second]),
         &local,
         &destination,
-        &mut clock,
         (0, 10_000_000),
         &mut out,
     )
@@ -1251,6 +1251,60 @@ fn real_websocket_transport_round_trips_and_redacts_failed_addresses() {
 fn synthetic_pocket_second_history() -> String {
     r##"{"asset":"#AAPL_otc","period":1,"history":[[1789354492.749,181.343],[1789354493.749,181.344],[1789354494.749,181.345]],"synthetic":true}"##.into()
 }
+// Synthetic page boundaries cut the retained numeric tokens without changing their values.
+fn deriv_history_response(symbol: &str, end: &str, req_id: u64) -> String {
+    let original = fixture(&format!("deriv-history-{symbol}.json"));
+    if end == "latest" {
+        return correlated(&original, req_id);
+    }
+    let fields: BTreeMap<String, Box<RawValue>> = serde_json::from_str(&original).unwrap();
+    let history: BTreeMap<String, Box<RawValue>> =
+        serde_json::from_str(fields["history"].get()).unwrap();
+    let times: Vec<i64> = field(&history, "times");
+    let prices: Vec<Box<RawValue>> = field(&history, "prices");
+    let end: i64 = end.parse().unwrap();
+    let upper = times.partition_point(|time| *time <= end);
+    let lower = upper.saturating_sub(40);
+    let history = replace(
+        fields["history"].get(),
+        "times",
+        &serde_json::to_string(&times[lower..upper]).unwrap(),
+    );
+    let history = replace(
+        &history,
+        "prices",
+        &serde_json::to_string(&prices[lower..upper]).unwrap(),
+    );
+    correlated(&replace(&original, "history", &history), req_id)
+}
+
+fn pocket_history_response(symbol: &str, before: &WireDecimal, index: u64) -> String {
+    let initial = if symbol == "EURUSD_otc" {
+        fixture("pocket-history-initial.json")
+    } else {
+        synthetic_pocket_second_history()
+    };
+    let initial: BTreeMap<String, Box<RawValue>> = serde_json::from_str(&initial).unwrap();
+    let rows: Vec<[Box<RawValue>; 2]> = field(&initial, "history");
+    let data = rows
+        .iter()
+        .filter(|row| {
+            let time: WireDecimal = serde_json::from_str(row[0].get()).unwrap();
+            time.decimal()
+                .unwrap()
+                .compare(before.decimal().unwrap())
+                .unwrap()
+                != std::cmp::Ordering::Greater
+        })
+        .map(|row| format!(r#"{{"time":{},"price":{}}}"#, row[0].get(), row[1].get()))
+        .collect::<Vec<_>>()
+        .join(",");
+    format!(
+        r#"{{"asset":{},"index":{index},"period":0,"data":[{data}]}}"#,
+        serde_json::to_string(symbol).unwrap()
+    )
+}
+
 fn serve_broker(kind: &'static str) -> (String, std::thread::JoinHandle<()>) {
     use futures_util::{SinkExt, StreamExt};
     use tokio_tungstenite::tungstenite::Message;
@@ -1309,8 +1363,8 @@ fn serve_broker(kind: &'static str) -> (String, std::thread::JoinHandle<()>) {
                             let end: String = field(&fields, "end");
                             assert_eq!(style, "ticks");
                             assert_eq!(count, 100);
-                            assert_eq!(end, "latest");
-                            replies.push(frame(&format!("deriv-history-{symbol}.json"), req_id));
+                            replies
+                                .push(Frame::Text(deriv_history_response(&symbol, &end, req_id)));
                         } else if fields.contains_key("ticks") {
                             let symbol: String = field(&fields, "ticks");
                             replies.push(shifted_tick(
@@ -1368,6 +1422,26 @@ fn serve_broker(kind: &'static str) -> (String, std::thread::JoinHandle<()>) {
                                         assert_eq!(request.asset, "#AAPL_otc");
                                         synthetic_pocket_second_history()
                                     },
+                                ));
+                            }
+                            "loadHistoryPeriod" => {
+                                #[derive(Deserialize)]
+                                struct Older {
+                                    asset: String,
+                                    time: WireDecimal,
+                                    index: u64,
+                                    period: u8,
+                                    offset: u16,
+                                }
+                                let request: Older = serde_json::from_slice(&argument).unwrap();
+                                assert_eq!((request.period, request.offset), (1, 200));
+                                replies.extend(attachment(
+                                    "loadHistoryPeriod",
+                                    pocket_history_response(
+                                        &request.asset,
+                                        &request.time,
+                                        request.index,
+                                    ),
                                 ));
                             }
                             "subscribeSymbol" => {
@@ -1457,7 +1531,7 @@ fn binary_fetch_verify_and_inspect_both_providers_over_real_local_transports() {
             let end = (*first.history.times.last().unwrap())
                 .min(*second.history.times.last().unwrap())
                 * 1_000_000
-                + 1_000_000;
+                + 1;
             config.history.as_mut().unwrap().start = time_text(start);
             config.history.as_mut().unwrap().end = time_text(end);
         } else {
@@ -1489,7 +1563,7 @@ fn binary_fetch_verify_and_inspect_both_providers_over_real_local_transports() {
         assert_eq!(first.lines().count(), 2);
         assert!(first.lines().all(
             |line| line.starts_with(&format!("fetch development {kind}:"))
-                && line.contains("shortfall none")
+                && line.contains("shortfall ")
         ));
         let manifests = read_manifests(&scratch);
         assert_eq!(manifests.len(), 2);
@@ -1504,30 +1578,7 @@ fn binary_fetch_verify_and_inspect_both_providers_over_real_local_transports() {
                 ),
             ]);
             assert!(report.starts_with("verified"));
-            let normalized = manifest
-                .objects
-                .iter()
-                .find(|object| object.role == ObjectRole::Normalized)
-                .unwrap();
-            let definition = config
-                .instrument(
-                    &InstrumentId {
-                        broker: manifest.broker.clone(),
-                        provider_symbol: manifest.provider_symbol.clone(),
-                    },
-                    NativeGranularity::Tick,
-                )
-                .unwrap();
-            let mut rows = Vec::new();
-            archive::read_ticks_with(
-                &scratch.path("published").join(&normalized.key),
-                definition.price_scale,
-                |row| {
-                    rows.push(row);
-                    Ok(())
-                },
-            )
-            .unwrap();
+            let rows = common::read_normalized_ticks(&scratch.path("published"), manifest);
             assert_eq!(rows.len() as u64, manifest.row_count);
             assert_eq!(
                 rows,
@@ -1539,27 +1590,42 @@ fn binary_fetch_verify_and_inspect_both_providers_over_real_local_transports() {
                     .all(|row| time(&history.start).unwrap() <= row.event_time_micros
                         && row.event_time_micros < time(&history.end).unwrap())
             );
-            let expected = if kind == "deriv" {
-                correlated(
-                    &fixture(&format!("deriv-history-{}.json", manifest.provider_symbol)),
-                    if manifest.provider_symbol.as_str() == "R_50" {
-                        1
-                    } else {
-                        2
-                    },
+            let coverage = read_coverage(&scratch, manifest);
+            if kind == "deriv" {
+                assert_eq!(coverage.pages.len(), 3);
+            }
+            for page in &coverage.pages {
+                let raw = fs::read(
+                    scratch
+                        .path("published")
+                        .join(binary_alpha_engine::dataset::object_key(&page.sha256)),
                 )
-            } else if manifest.provider_symbol.as_str() == "EURUSD_otc" {
-                fixture("pocket-history-initial.json")
-            } else {
-                synthetic_pocket_second_history()
-            };
-            assert!(
-                manifest
-                    .objects
-                    .iter()
-                    .any(|object| object.role == ObjectRole::Source
-                        && object.sha256 == hash(expected.as_bytes()))
-            );
+                .unwrap();
+                assert_eq!(hash(&raw), page.sha256);
+                let expected = if kind == "deriv" {
+                    let envelope: binary_alpha_app::broker::deriv::Envelope =
+                        serde_json::from_slice(&raw).unwrap();
+                    deriv_history_response(
+                        manifest.provider_symbol.as_str(),
+                        page.anchor.as_deref().unwrap(),
+                        envelope.req_id.unwrap(),
+                    )
+                } else {
+                    #[derive(Deserialize)]
+                    struct Page {
+                        index: u64,
+                    }
+                    let response: Page = serde_json::from_slice(&raw).unwrap();
+                    let anchor: WireDecimal =
+                        serde_json::from_str(page.anchor.as_deref().unwrap()).unwrap();
+                    pocket_history_response(
+                        manifest.provider_symbol.as_str(),
+                        &anchor,
+                        response.index,
+                    )
+                };
+                assert_eq!(raw, expected.as_bytes());
+            }
             for object in &manifest.objects {
                 assert_eq!(
                     fs::read(scratch.path("published").join(&object.key)).unwrap(),
@@ -1574,10 +1640,30 @@ fn binary_fetch_verify_and_inspect_both_providers_over_real_local_transports() {
             .map(|path| (path.clone(), fs::read(path).unwrap()))
             .collect::<Vec<_>>();
         let second = command(&args);
-        assert_eq!(second.matches("(already published)").count(), 2);
+        assert_eq!(
+            second.matches("(already published)").count(),
+            if kind == "deriv" { 2 } else { 0 }
+        );
+        if kind == "pocket_option" {
+            assert_eq!(second.matches("(no new data)").count(), 2);
+        }
         assert_eq!(objects, scratch.objects("published"));
         for (path, bytes) in before {
             assert_eq!(fs::read(path).unwrap(), bytes);
+        }
+        for manifest in &manifests {
+            let report = command(&[
+                "data",
+                "audit",
+                "--config",
+                config_path.to_str().unwrap(),
+                "--manifest",
+                &format!(
+                    "file://{}",
+                    scratch.path("published").join(manifest.key()).display()
+                ),
+            ]);
+            assert!(report.contains("candles"), "{report}");
         }
         let inspected = command(&[
             "broker",
@@ -1722,14 +1808,8 @@ fn configuration_rejects_unsupported_selections_before_connection_and_skeleton_c
         duration_seconds: 15,
     });
     Config::parse(&allowed.canonical_toml()).unwrap();
-    broker::validate_capabilities(&allowed).unwrap();
     let mut unsupported = test_config(&scratch, "pocket_option", "ws://127.0.0.1/", false);
     unsupported.inspect.as_mut().unwrap().proposal = allowed.inspect.unwrap().proposal;
-    assert!(
-        broker::validate_capabilities(&unsupported)
-            .unwrap_err()
-            .starts_with("inspect:")
-    );
     assert!(
         Config::parse(&unsupported.canonical_toml())
             .unwrap_err()
@@ -1793,14 +1873,13 @@ fn repeated_shortfall_reuses_verified_content_and_preserves_within_page_repeats(
     let config = test_config(&scratch, "deriv", "ws://127.0.0.1/", false);
     let (local, destination) = stores(&scratch);
     let mut out = Vec::new();
-    let mut clock = FakeClock::default();
+
     let first = page(&[(5, 100), (5, 100), (6, 101)]);
     fetch::pass(
         &config,
         &mut Pages::new(vec![first.clone(), page(&[])]),
         &local,
         &destination,
-        &mut clock,
         (0, 10_000_000),
         &mut out,
     )
@@ -1815,7 +1894,6 @@ fn repeated_shortfall_reuses_verified_content_and_preserves_within_page_repeats(
         &mut Pages::new(vec![repeated, page(&[])]),
         &local,
         &destination,
-        &mut clock,
         (0, 10_000_000),
         &mut out,
     )
@@ -1859,14 +1937,13 @@ fn history_resume_is_bound_to_the_declared_provider_clock() {
     let scratch = Scratch::new("phase10_source_clock");
     let mut config = test_config(&scratch, "pocket_option", "ws://127.0.0.1/", false);
     let (local, destination) = stores(&scratch);
-    let mut clock = FakeClock::default();
+
     let mut out = Vec::new();
     fetch::pass(
         &config,
         &mut Pages::new(vec![range_page(0, 10)]),
         &local,
         &destination,
-        &mut clock,
         (0, 10_000_000),
         &mut out,
     )
@@ -1882,12 +1959,11 @@ fn history_resume_is_bound_to_the_declared_provider_clock() {
         &mut pages,
         &local,
         &destination,
-        &mut clock,
         (0, 10_000_000),
         &mut out,
     )
     .unwrap();
-    assert_eq!(pages.anchors, [None]);
+    assert_eq!(pages.anchors, [Some(10_000_000)]);
     let manifests = read_manifests(&scratch);
     assert_eq!(manifests.len(), 2);
     let new = manifests
@@ -1905,13 +1981,12 @@ fn prefix_repair_preserves_verified_rows_and_repeats() {
         let (local, destination) = stores(&scratch);
         let verified = [(5, 100), (5, 100), (6, 101), (7, 102)];
         let mut initial = Pages::new(vec![page(&verified), page(&[])]);
-        let mut clock = FakeClock::default();
+
         fetch::pass(
             &config,
             &mut initial,
             &local,
             &destination,
-            &mut clock,
             (0, 10_000_000),
             &mut Vec::new(),
         )
@@ -1928,7 +2003,6 @@ fn prefix_repair_preserves_verified_rows_and_repeats() {
             &mut pages,
             &local,
             &destination,
-            &mut clock,
             (0, 10_000_000),
             &mut Vec::new(),
         );
@@ -1937,21 +2011,7 @@ fn prefix_repair_preserves_verified_rows_and_repeats() {
             let manifests = read_manifests(&scratch);
             let manifest = manifests.last().unwrap();
             assert_eq!(manifest.row_count, 5);
-            let normalized = manifest
-                .objects
-                .iter()
-                .find(|o| o.role == ObjectRole::Normalized)
-                .unwrap();
-            let mut rows = Vec::new();
-            archive::read_ticks_with(
-                &scratch.path("published").join(&normalized.key),
-                scale(4),
-                |row| {
-                    rows.push(row);
-                    Ok(())
-                },
-            )
-            .unwrap();
+            let rows = common::read_normalized_ticks(&scratch.path("published"), manifest);
             assert_eq!(rows, page(&repair).rows);
             assert!(
                 verify::run(&destination.uri(&manifest.key()))
@@ -1971,14 +2031,13 @@ fn reused_history_is_published_to_the_current_destination() {
     let mut config = test_config(&scratch, "deriv", "ws://127.0.0.1/", false);
     let (local, first) = stores(&scratch);
     let second = Store::filesystem(scratch.path("destination-b"));
-    let mut clock = FakeClock::default();
+
     fetch::pass(
         &config,
         &mut Pages::new(vec![range_page(0, 10)]),
         &local,
         &first,
-        &mut clock,
-        (0, 10_000_000),
+        (0, 9_000_001),
         &mut Vec::new(),
     )
     .unwrap();
@@ -1989,8 +2048,7 @@ fn reused_history_is_published_to_the_current_destination() {
         &mut no_refetch,
         &local,
         &second,
-        &mut clock,
-        (0, 10_000_000),
+        (0, 9_000_001),
         &mut Vec::new(),
     )
     .unwrap();
@@ -2008,7 +2066,7 @@ fn reused_history_is_published_to_the_current_destination() {
 }
 
 #[test]
-fn inspection_caps_each_instrument_during_uneven_arrivals() {
+fn inspection_reports_actual_counts_during_uneven_arrivals() {
     let scratch = Scratch::new("phase10_inspection_uneven");
     let mut config = test_config(&scratch, "deriv", "ws://127.0.0.1/", true);
     config.inspect.as_mut().unwrap().live_observations = 1;
@@ -2038,8 +2096,359 @@ fn inspection_caps_each_instrument_during_uneven_arrivals() {
     let binary_alpha_app::inspect::InspectionDetail::Live { counts } = &live.detail else {
         panic!("{live:?}")
     };
+    assert_eq!(live.result, "verified");
     assert_eq!(
         counts,
-        &BTreeMap::from([("deriv:R_50".into(), 1), ("deriv:R_100".into(), 1)])
+        &BTreeMap::from([("deriv:R_50".into(), 3), ("deriv:R_100".into(), 1)])
     );
+}
+
+#[test]
+fn pocket_period_pins_and_retained_anchor_text_are_exact() {
+    for token in ["1789354492.749", "1789354293.216"] {
+        let wire: WireDecimal = serde_json::from_str(token).unwrap();
+        let universal = universal_micros(&wire, 120).unwrap();
+        assert_eq!(
+            provider_token(universal, 120).unwrap().token().unwrap(),
+            token
+        );
+    }
+    for (file, event, anchor) in [
+        (
+            "pocket-history-initial-period60.json",
+            "updateHistoryNewFast",
+            None,
+        ),
+        (
+            "pocket-history-older-period60.json",
+            "loadHistoryPeriod",
+            Some(1_789_347_292_749_000),
+        ),
+    ] {
+        let mut frames = handshake();
+        frames.extend(attachment(event, fixture(file)));
+        let (mut broker, _) = pocket(frames);
+        let error = broker
+            .history_page(&pocket_ids()[0], scale(5), anchor)
+            .unwrap_err();
+        assert!(
+            error.contains(event) && error.contains("period 60"),
+            "{error}"
+        );
+    }
+}
+
+#[test]
+fn concrete_deriv_tail_shortfall_is_requested_again() {
+    let scratch = Scratch::new("phase10_deriv_tail");
+    let config = test_config(&scratch, "deriv", "ws://127.0.0.1/", false);
+    let (local, destination) = stores(&scratch);
+    let clock = FakeClock::default();
+    let body = r#"{"msg_type":"history","pip_size":4,"history":{"prices":[1,1,1,1,1],"times":[0,1,2,3,4]}}"#;
+    let (connector, sent) = connector(
+        vec![vec![
+            Frame::Text(correlated(body, 1)),
+            Frame::Text(correlated(body, 2)),
+        ]],
+        &clock,
+    );
+    let mut adapter =
+        DerivMarketData::connect(&deriv_settings(), connector, Box::new(clock)).unwrap();
+    let mut out = Vec::new();
+    fetch::pass(
+        &config,
+        &mut adapter,
+        &local,
+        &destination,
+        (0, 10_000_000),
+        &mut out,
+    )
+    .unwrap();
+    let manifests = read_manifests(&scratch);
+    let coverage = read_coverage(&scratch, &manifests[0]);
+    assert_eq!(
+        coverage.verified,
+        Some(fetch::Range {
+            start: time_text(0),
+            end: time_text(4_000_001)
+        })
+    );
+    assert_eq!(
+        coverage.shortfall,
+        Some(fetch::Shortfall {
+            reason: "unresolved_tail".into(),
+            unresolved: fetch::Range {
+                start: time_text(4_000_001),
+                end: time_text(10_000_000)
+            }
+        })
+    );
+    fetch::pass(
+        &config,
+        &mut adapter,
+        &local,
+        &destination,
+        (0, 10_000_000),
+        &mut out,
+    )
+    .unwrap();
+    assert_eq!(read_manifests(&scratch).len(), 1);
+    assert_eq!(
+        sent.borrow().len(),
+        2,
+        "the incomplete tail must request evidence again"
+    );
+    for frame in sent.borrow().iter() {
+        assert!(matches!(frame, Frame::Text(text) if text.contains("\"end\":\"10\"")));
+    }
+}
+
+#[test]
+fn concrete_adapters_resume_interrupted_publication_and_page_backward() {
+    for kind in ["deriv", "pocket_option"] {
+        let scratch = Scratch::new(&format!("phase10_concrete_resume_{kind}"));
+        let config = test_config(&scratch, kind, "ws://127.0.0.1/", false);
+        let (local, destination) = stores(&scratch);
+        let clock = FakeClock::at(1_789_348_010_000_000);
+        let (range, history_frames, raw_pages) = if kind == "deriv" {
+            let mut end = "1789346760".to_string();
+            let mut frames = Vec::new();
+            let mut raw_pages = Vec::new();
+            for request in 1..=3 {
+                let raw = deriv_history_response("R_50", &end, request);
+                #[derive(Deserialize)]
+                struct Response {
+                    history: Times,
+                }
+                #[derive(Deserialize)]
+                struct Times {
+                    times: Vec<i64>,
+                }
+                let response: Response = serde_json::from_str(&raw).unwrap();
+                end = response.history.times[0].to_string();
+                raw_pages.push(raw.clone());
+                frames.push(Frame::Text(raw));
+            }
+            (
+                (1_789_346_562_000_000, 1_789_346_760_000_001),
+                frames,
+                raw_pages,
+            )
+        } else {
+            let first = replace(&fixture("pocket-history-older-1.json"), "index", "1");
+            let second = replace(&fixture("pocket-history-older-2.json"), "index", "2");
+            let mut frames = attachment("loadHistoryPeriod", first.clone());
+            frames.extend(attachment("loadHistoryPeriod", second.clone()));
+            (
+                (1_789_346_894_149_000, 1_789_347_292_749_001),
+                frames,
+                vec![first, second],
+            )
+        };
+        let create = || {
+            let mut frames = if kind == "pocket_option" {
+                handshake()
+            } else {
+                vec![]
+            };
+            frames.extend(history_frames.clone());
+            let (connector, sent) = connector(vec![frames], &clock);
+            let adapter = if kind == "deriv" {
+                Adapter::Deriv(
+                    DerivMarketData::connect(&deriv_settings(), connector, Box::new(clock.clone()))
+                        .unwrap(),
+                )
+            } else {
+                Adapter::PocketOption(
+                    PocketMarketData::connect(
+                        &pocket_settings(),
+                        &pocket_ids(),
+                        connector,
+                        Box::new(clock.clone()),
+                        "{}".into(),
+                    )
+                    .unwrap(),
+                )
+            };
+            (adapter, sent)
+        };
+        let failed_object = scratch
+            .path("published/objects")
+            .join(hash(raw_pages.last().unwrap().as_bytes()));
+        fs::create_dir_all(&failed_object).unwrap();
+        let (mut first, _) = create();
+        assert!(
+            fetch::pass(
+                &config,
+                first.market(),
+                &local,
+                &destination,
+                range,
+                &mut Vec::new()
+            )
+            .is_err()
+        );
+        assert!(read_manifests(&scratch).is_empty());
+        let retained = fs::read(
+            scratch
+                .path("retained/objects")
+                .join(hash(raw_pages[0].as_bytes())),
+        )
+        .unwrap();
+        fs::remove_dir(&failed_object).unwrap();
+        let (mut resumed, sent) = create();
+        fetch::pass(
+            &config,
+            resumed.market(),
+            &local,
+            &destination,
+            range,
+            &mut Vec::new(),
+        )
+        .unwrap();
+        let manifest = read_manifests(&scratch).remove(0);
+        assert!(
+            verify::run(&destination.uri(&manifest.key()))
+                .unwrap()
+                .contains("verified")
+        );
+        assert_eq!(
+            retained,
+            fs::read(
+                scratch
+                    .path("retained/objects")
+                    .join(hash(raw_pages[0].as_bytes()))
+            )
+            .unwrap()
+        );
+        let coverage = read_coverage(&scratch, &manifest);
+        assert_eq!(
+            coverage.verified,
+            Some(fetch::Range {
+                start: time_text(range.0),
+                end: time_text(range.1)
+            })
+        );
+        assert!(coverage.shortfall.is_none());
+        let rows = common::read_normalized_ticks(&scratch.path("published"), &manifest);
+        if kind == "deriv" {
+            assert_eq!(rows, expected_rows("history", "R_50"));
+            let requests = sent.borrow();
+            let anchors = requests
+                .iter()
+                .filter_map(|frame| match frame {
+                    Frame::Text(text) => {
+                        let fields: BTreeMap<String, Box<RawValue>> =
+                            serde_json::from_str(text).unwrap();
+                        Some(field::<String>(&fields, "end"))
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(anchors, ["1789346760", "1789346682", "1789346604"]);
+        } else {
+            assert_eq!(rows.len(), 820);
+            assert_eq!(rows.first().unwrap().event_time_micros, range.0);
+            assert_eq!(rows.last().unwrap().event_time_micros, range.1 - 1);
+            assert!(sent.borrow().iter().any(|frame| matches!(frame, Frame::Text(text) if text.contains("\"time\":1789354293.216"))));
+        }
+    }
+}
+
+#[test]
+fn reconnect_rebuilds_causal_stream_from_verified_history_before_live_finalization() {
+    let scratch = Scratch::new("phase10_reconnect_warmup");
+    let config = test_config(&scratch, "deriv", "ws://127.0.0.1/", false);
+    let (local, destination) = stores(&scratch);
+    let clock = FakeClock::at(1_789_348_010_000_000);
+    let (connector, _) = connector(
+        vec![
+            vec![shifted_tick("deriv-tick-R_50.json", 1, 0)],
+            vec![
+                frame("deriv-history-R_50.json", 1),
+                shifted_tick("deriv-tick-R_50.json", 2, 0),
+            ],
+        ],
+        &clock,
+    );
+    let mut adapter =
+        DerivMarketData::connect(&deriv_settings(), connector, Box::new(clock)).unwrap();
+    adapter.subscribe(&id("deriv", "R_50"), scale(4)).unwrap();
+    let before = observation(adapter.next_live(1_000_000).unwrap());
+    adapter.reconnect().unwrap();
+    assert!(matches!(
+        adapter.next_live(1_000_000).unwrap(),
+        Some(LiveEvent::Break { generation: 1, .. })
+    ));
+    fetch::pass(
+        &config,
+        &mut adapter,
+        &local,
+        &destination,
+        (1_789_346_562_000_000, 1_789_346_760_000_001),
+        &mut Vec::new(),
+    )
+    .unwrap();
+    let manifest = read_manifests(&scratch).remove(0);
+    verify::run(&destination.uri(&manifest.key())).unwrap();
+    let definition = &config.instruments[0];
+    let mut warmed = InstrumentStream::new(definition, stream_source(scale(4))).unwrap();
+    let mut candles = Vec::new();
+    for tick in common::read_normalized_ticks(&scratch.path("published"), &manifest) {
+        warmed.push(Observation::Tick(tick), &mut candles).unwrap();
+    }
+    let history_count = candles.len();
+    adapter.subscribe(&definition.id(), scale(4)).unwrap();
+    let live = observation(adapter.next_live(1_000_000).unwrap());
+    assert_eq!(
+        (before.generation, live.generation, live.sequence),
+        (0, 1, 1)
+    );
+    let tick = Observation::Tick(Tick {
+        event_time_micros: live.provider_time_micros,
+        price_units: live.price_units,
+    });
+    let mut cold = InstrumentStream::new(definition, stream_source(scale(4))).unwrap();
+    let mut cold_candles = Vec::new();
+    cold.push(tick, &mut cold_candles).unwrap();
+    assert!(
+        cold_candles.is_empty(),
+        "live rows alone have not warmed a completed candle"
+    );
+    warmed.push(tick, &mut candles).unwrap();
+    assert_eq!(candles.len(), history_count + 1);
+    let candle = &candles.last().unwrap().1;
+    assert_eq!(candle.open_time_micros, 1_789_346_760_000_000);
+    assert_eq!(candle.close_time_micros, 1_789_346_761_000_000);
+    assert_eq!(candle.known_at_micros, live.provider_time_micros);
+}
+
+#[test]
+fn received_upper_boundary_caps_coverage_without_publishing_out_of_range_rows() {
+    for last in [9_999_999, 10_000_000, 11_000_000] {
+        let scratch = Scratch::new(&format!("phase10_received_upper_bound_{last}"));
+        let config = test_config(&scratch, "deriv", "ws://127.0.0.1/", false);
+        let (local, destination) = stores(&scratch);
+        let mut input = page(&[(0, 1), (4, 1), (10, 1)]);
+        input.rows.last_mut().unwrap().event_time_micros = last;
+        let mut pages = Pages::new(vec![input]);
+        fetch::pass(
+            &config,
+            &mut pages,
+            &local,
+            &destination,
+            (0, 10_000_000),
+            &mut Vec::new(),
+        )
+        .unwrap();
+        let manifest = read_manifests(&scratch).remove(0);
+        let coverage = read_coverage(&scratch, &manifest);
+        assert_eq!(coverage.verified.unwrap().end, time_text(10_000_000));
+        assert!(coverage.shortfall.is_none());
+        assert!(
+            common::read_normalized_ticks(&scratch.path("published"), &manifest)
+                .iter()
+                .all(|row| row.event_time_micros < 10_000_000)
+        );
+    }
 }

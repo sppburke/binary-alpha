@@ -7,11 +7,11 @@ publication_uri = "file:///p"
 
 [replay]
 role = "development"
-decision_start = "1970-01-01T00:00:00Z"
-decision_end = "1970-01-01T01:00:00Z"
+decision_start = "2026-09-13T00:00:00Z"
+decision_end = "2026-09-15T00:00:00Z"
 inputs = [{ tick_manifest = "file:///p/manifests/1111111111111111111111111111111111111111111111111111111111111111/ready.json", feature_manifest = "file:///p/manifests/2222222222222222222222222222222222222222222222222222222222222222/ready.json" }]
-accounts = [{ id = "a", broker = "b", currency = "u", scale = 2, initial_cash = "1000" }]
-reporting_currency = "u"
+accounts = [{ id = "a", broker = "deriv", currency = "USD", scale = 2, initial_cash = "9955.74" }]
+reporting_currency = "USD"
 reporting_scale = 2
 max_rate_age_micros = 5
 
@@ -22,31 +22,34 @@ base_stream = { duration_seconds = 5, offset_seconds = 0 }
 conditions = [{ stream = { duration_seconds = 5, offset_seconds = 0 }, output = "signal", comparator = "eq", threshold = true }]
 
 [[replay.contracts]]
-id = "c"
+id = "call"
 direction = "buy"
-duration_micros = 10
-currency = "u"
-stake = "1"
-quoted_cost = "1"
+duration_micros = 15000000
+currency = "USD"
+stake = "10"
+quoted_cost = "10"
 entry_fee = "0"
-win = { gross_return = "1.92", terminal_fee = "0" }
+win = { gross_return = "0", terminal_fee = "0" }
 loss = { gross_return = "0", terminal_fee = "0" }
-tie = { gross_return = "1", terminal_fee = "0" }
-settlement = { rule = "price_at_due_v1", max_settlement_delay_micros = 5, max_tick_gap_micros = 60 }
+tie = { gross_return = "0", terminal_fee = "0" }
+settlement = { rule = "broker_authoritative_v1", max_settlement_delay_micros = 120000000, max_tick_gap_micros = 120000000 }
+
+semantics = "rise_fall_strict_v1"
 
 [[replay.risk_policies]]
 id = "p"
-max_open_per_strategy = 1
+max_open_per_strategy = 3
 same_entry = "all"
 deduplicate_signal_logic = false
-max_feature_age_micros = 1000
-max_quote_age_micros = 1000
+max_feature_age_micros = 120000000
+max_quote_age_micros = 120000000
+max_proposal_age_micros = 60000000
 
 [[replay.bindings]]
-id = "b1"
+id = "call"
 strategy = "s"
 account = "a"
-instrument = "b:X"
-contract = "c"
+instrument = "deriv:R_50"
+contract = "call"
 risk_policy = "p"
-envelope = { max_purchase_cost = "1", max_entry_fee = "0", max_win_terminal_fee = "0", max_loss_terminal_fee = "0", max_tie_terminal_fee = "0", min_winning_net_return = "0.92", settlement_rule = "price_at_due_v1" }
+envelope = { max_purchase_cost = "10", max_entry_fee = "0", max_win_terminal_fee = "0", max_loss_terminal_fee = "0", max_tie_terminal_fee = "0", min_winning_net_return = "8.83", settlement_rule = "broker_authoritative_v1", semantics = "rise_fall_strict_v1" }
