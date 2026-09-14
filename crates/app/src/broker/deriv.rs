@@ -341,6 +341,26 @@ fn micros(seconds: i64) -> Result<i64, String> {
         .checked_mul(1_000_000)
         .ok_or("deriv: epoch overflows microseconds".into())
 }
+/// The digit count of a discovered pip size. The schema describes it as the minimum
+/// fluctuation, a JSON number the provider writes plainly (`0.0001`) or, for five-decimal
+/// pairs, in exponent form (`1e-05`); both are read exactly, without floating point.
+fn pip_digits(pip_size: &WireDecimal) -> Result<u8, String> {
+    const INVALID: &str = "deriv active_symbols: unsupported pip_size precision";
+    let token = pip_size.0.get();
+    let (mantissa, exponent) = match token.split_once(['e', 'E']) {
+        Some((mantissa, exponent)) => (mantissa, exponent.parse::<i16>().map_err(|_| INVALID)?),
+        None => (token, 0),
+    };
+    let pip = Decimal::parse(mantissa).map_err(|_| INVALID)?.normalized();
+    let digits = i32::from(pip.scale()) - i32::from(exponent);
+    if token.starts_with('"') || pip.coefficient() != 1 || exponent > 0 || digits < 0 {
+        return Err(INVALID.into());
+    }
+    u8::try_from(digits)
+        .ok()
+        .filter(|digits| *digits <= binary_alpha_engine::execution::MAX_SCALE)
+        .ok_or_else(|| INVALID.into())
+}
 fn precision(pip_size: &WireDecimal, scale: PriceScale) -> Result<(), String> {
     let digits = pip_size.require_number()?.rescale(0)?.coefficient();
     if digits < 0 || digits > i128::from(scale.digits()) {
@@ -460,18 +480,13 @@ impl MarketDataBroker for DerivMarketData {
             .active_symbols
             .into_iter()
             .map(|symbol| {
-                let pip = symbol.pip_size.require_number()?.normalized();
                 if symbol.exchange_is_open > 1 || symbol.is_trading_suspended > 1 {
                     return Err("deriv active_symbols: invalid market status".into());
-                }
-                // This schema describes pip_size as the minimum fluctuation, not a digit count.
-                if pip.coefficient() != 1 {
-                    return Err("deriv active_symbols: unsupported pip_size precision".into());
                 }
                 Ok(DiscoveredInstrument {
                     symbol: symbol.underlying_symbol,
                     display_name: Some(symbol.underlying_symbol_name),
-                    precision: Some(pip.scale()),
+                    precision: Some(pip_digits(&symbol.pip_size)?),
                     open: Some(symbol.exchange_is_open == 1 && symbol.is_trading_suspended == 0),
                 })
             })

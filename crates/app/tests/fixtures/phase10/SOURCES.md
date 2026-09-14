@@ -6,6 +6,7 @@ Provider numeric token spelling is preserved. Deriv original raw frame strings a
 
 | Fixture | Origin | SHA-256 |
 | --- | --- | --- |
+| deriv-active_symbols-excerpt.json | Public `active_symbols` (`full`) response captured during the authorized inspection of 2026-09-14 (retained as `phase10-inspect-20260914T123527Z/deriv-active_symbols-full.json`, SHA-256 `d18148fbdd892d01c44ec4431b314057b01f283f67e024dc7d11129491f0df92`); the three rows `R_100`, `R_50` and `frxEURUSD` sliced from the raw text, so `1e-05` keeps its provider spelling; no identifiers | `466bde420e7bdc2962b50496ee69051514a8c6eb4fa36795e37cd36cf3bc9abd` |
 | deriv-contracts_for-R_50.json | `targeted-public-run-01/frames.jsonl:3`; subscription IDs synthetic | `2634d0cfebcaa3d01368590ad0740ec9ecc9e3c19b616a2510d7a948aa7d769d` |
 | deriv-history-R_50.json | `targeted-public-run-01/frames.jsonl:5`; subscription IDs synthetic | `46455b4f400459c9a6288ff4324fe8dac88944ed92e71613d59afcd2f3d8165b` |
 | deriv-contracts_for-R_100.json | `targeted-public-run-01/frames.jsonl:7`; subscription IDs synthetic | `893c14bb6fc70d1390178fdec3891be404151444eb5a6fd9bd17e5a2f09fedc0` |
