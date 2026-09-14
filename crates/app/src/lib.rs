@@ -35,6 +35,7 @@ pub fn skeleton(config: &Config) -> Config {
         brokers: Vec::new(),
         history: None,
         inspect: None,
+        live: None,
         ..config.clone()
     }
 }

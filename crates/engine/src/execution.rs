@@ -447,6 +447,34 @@ crate::string_enum! {
 }
 
 impl ContractTerms {
+    /// The complete exact baseline economic tuple: direction, duration, currency, stake,
+    /// quoted cost, entry fee, and every outcome's return and fee. Provider identity,
+    /// settlement rule, and semantics are compared separately by the caller.
+    pub fn same_economics(&self, baseline: &Self) -> Result<bool, String> {
+        if self.direction != baseline.direction
+            || self.duration_micros != baseline.duration_micros
+            || self.currency != baseline.currency
+        {
+            return Ok(false);
+        }
+        for (actual, assessed) in [
+            (self.stake, baseline.stake),
+            (self.quoted_cost, baseline.quoted_cost),
+            (self.entry_fee, baseline.entry_fee),
+            (self.win.gross_return, baseline.win.gross_return),
+            (self.win.terminal_fee, baseline.win.terminal_fee),
+            (self.loss.gross_return, baseline.loss.gross_return),
+            (self.loss.terminal_fee, baseline.loss.terminal_fee),
+            (self.tie.gross_return, baseline.tie.gross_return),
+            (self.tie.terminal_fee, baseline.tie.terminal_fee),
+        ] {
+            if actual.compare(assessed)? != Ordering::Equal {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
     fn cashflow(&self, outcome: Outcome) -> Cashflow {
         match outcome {
             Outcome::Win => self.win,
@@ -6476,6 +6504,41 @@ mod tests {
                 .unwrap_err()
                 .contains("zero entry price")
         );
+    }
+
+    #[test]
+    fn same_economics_equal_tuple() {
+        let baseline = contract();
+        let mut offer = baseline.clone();
+        offer.id = "provider-quote".into();
+        offer.settlement.rule = SettlementRule::BrokerAuthoritativeV1;
+        offer.semantics = Some(ContractSemantics::RiseFallStrictV1);
+        assert!(offer.same_economics(&baseline).unwrap());
+    }
+
+    #[test]
+    fn same_economics_higher_payout() {
+        let baseline = contract();
+        let mut offer = baseline.clone();
+        offer.win.gross_return = decimal("19.01");
+        assert!(!offer.same_economics(&baseline).unwrap());
+    }
+
+    #[test]
+    fn same_economics_different_tie_fee() {
+        let baseline = contract();
+        let mut offer = baseline.clone();
+        offer.tie.terminal_fee = decimal("0.01");
+        assert!(!offer.same_economics(&baseline).unwrap());
+    }
+
+    #[test]
+    fn same_economics_equal_value_different_scale() {
+        let mut baseline = contract();
+        baseline.win.gross_return = decimal("1.80");
+        let mut offer = baseline.clone();
+        offer.win.gross_return = decimal("1.800");
+        assert!(offer.same_economics(&baseline).unwrap());
     }
 
     fn contract() -> ContractTerms {

@@ -15,12 +15,17 @@ use sha2::{Digest, Sha256};
 
 use crate::config::{
     Alternative, Config, Evaluation, FeatureInstrument, ManifestUri, Outcomes, Portfolio,
-    PublicationUri, Research, ResearchInstrument, ResearchScenario, Search, SearchWindow,
+    PublicationUri, Replay, Research, ResearchInstrument, ResearchScenario, Search, SearchWindow,
 };
 use crate::dataset::{Coverage, DatasetRole, ObjectRecord, validate_objects};
-use crate::execution::{AccountSpec, ContractTerms, ReplayInput};
-use crate::market::Currency;
-use crate::portfolio::{ChoiceKey, Gates, Objective, Outer, Policy, Projection};
+use crate::execution::{
+    AccountSpec, Cashflow, ContractSemantics, ContractTerms, Decimal, ReplayInput, Settlement,
+    SettlementRule,
+};
+use crate::market::{BrokerId, Currency};
+use crate::portfolio::{
+    ChoiceKey, FeatureRef, Gates, Objective, Outer, Policy, Projection, Selection,
+};
 
 pub const RUN_MANIFEST_KIND: &str = "research_run";
 pub const RUN_SCHEMA_VERSION: u32 = 1;
@@ -43,6 +48,8 @@ pub const MARKET_INFERENCE: &str = "unavailable";
 pub const INFERENCE_JUSTIFICATION: &str = "no observation model or uncertainty justification is established; support counts, adjusted scores, and synthetic resampling are not market inference";
 /// The scenario under the frozen policy's own terms and immediate acceptance.
 pub const BASELINE_SCENARIO: &str = "baseline";
+/// The immutable historical-baseline projection accepted by the live runtime.
+pub const EXECUTION_CONTRACT_V1: &str = "historical_baseline_to_broker_v1";
 const DECLARATION_DOMAIN_V1: &[u8] = b"binary-alpha governance declaration v1\n";
 const GRANT_DOMAIN_V1: &[u8] = b"binary-alpha holdout grant v1\n";
 const RUN_DOMAIN_V1: &[u8] = b"binary-alpha research run v1\n";
@@ -1001,6 +1008,182 @@ pub fn scenario_policy(
     Ok(scenario_policy)
 }
 
+/// The verified sources one live definition derives from.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct LiveSource {
+    pub research: String,
+    pub bundle_sha256: String,
+    pub frozen: String,
+    pub selection: String,
+    pub policy: String,
+    pub certification: String,
+}
+
+/// Broker request templates derived from one frozen baseline, its exact assessed economics,
+/// and the refit references the application binds through the existing feature owner.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LivePolicy {
+    pub source: LiveSource,
+    pub replay: Replay,
+    pub baseline: Vec<ContractTerms>,
+    pub scenario_delay_micros: i64,
+    pub refit: Vec<FeatureRef>,
+}
+
+/// Projects verified public bundle records into broker templates without changing the frozen
+/// policy or opening certification children. Inputs are resolved by the application in frozen
+/// instrument order; observation supplies the new half-open decision window.
+#[allow(clippy::too_many_arguments)]
+pub fn live_policy(
+    manifest: &RunManifest,
+    run: &Run,
+    frozen: &Frozen,
+    selection: &Selection,
+    certification: &CertificationManifest,
+    broker: &BrokerId,
+    account: &str,
+    observation: (&str, &str),
+    inputs: Vec<ReplayInput>,
+) -> Result<LivePolicy, String> {
+    run.complete_bundle()
+        .map_err(|reason| format!("live policy rule 1: {reason}"))?;
+    let frozen_identity = digest(b"", &frozen.to_json());
+    if run.frozen.as_deref() != Some(frozen_identity.as_str())
+        || manifest.state != RunState::AwaitingHoldoutAuthorization.status()
+    {
+        return Err(
+            "live policy rule 1: manifest must be awaiting and the frozen stage must match the run"
+                .into(),
+        );
+    }
+    if certification.research != manifest.generation
+        || certification.bundle_sha256 != manifest.bundle_sha256()
+        || certification.state != "certified"
+    {
+        return Err("live policy rule 2: certification must be certified and match the research generation and bundle_sha256".into());
+    }
+    let policy = selection
+        .frozen
+        .as_ref()
+        .ok_or("live policy rule 3: selection carries no frozen policy")?;
+    let research = run
+        .config
+        .research
+        .as_ref()
+        .ok_or("live policy rule 3: run has no research portfolio")?;
+    let portfolio = &research.portfolio;
+    if portfolio.accounts.len() != 1 {
+        return Err("live policy rule 3: refuse a multiaccount portfolio rather than pruning; exactly one account is required".into());
+    }
+    let assessed_account = &portfolio.accounts[0];
+    if assessed_account.id != account || &assessed_account.broker != broker {
+        return Err(
+            "live policy rule 3: account and broker must match the frozen portfolio account".into(),
+        );
+    }
+    if policy
+        .bindings
+        .iter()
+        .any(|binding| binding.account != account)
+    {
+        return Err(
+            "live policy rule 3: every frozen binding must reference the one account".into(),
+        );
+    }
+    for risk in &policy.risk_policies {
+        if risk.max_proposal_age_micros.is_none() {
+            return Err(format!(
+                "live policy rule 4: risk policy `{}` requires a predeclared max_proposal_age_micros",
+                risk.id
+            ));
+        }
+    }
+    for contract in &policy.contracts {
+        if contract.settlement.rule != SettlementRule::PriceAtDueV1
+            || [
+                contract.loss.gross_return,
+                contract.tie.gross_return,
+                contract.loss.terminal_fee,
+                contract.tie.terminal_fee,
+            ]
+            .iter()
+            .any(|amount| !amount.is_zero())
+        {
+            return Err(format!(
+                "live policy rule 5: contract `{}` requires price_at_due_v1 and zero loss/tie gross_return and terminal_fee for rise_fall_strict_v1",
+                contract.id
+            ));
+        }
+    }
+    let zero = Cashflow {
+        gross_return: Decimal::zero(0),
+        terminal_fee: Decimal::zero(0),
+    };
+    let contracts = policy
+        .contracts
+        .iter()
+        .map(|contract| ContractTerms {
+            quoted_cost: contract.stake,
+            entry_fee: Decimal::zero(0),
+            win: zero,
+            loss: zero,
+            tie: zero,
+            settlement: Settlement {
+                rule: SettlementRule::BrokerAuthoritativeV1,
+                ..contract.settlement
+            },
+            semantics: Some(ContractSemantics::RiseFallStrictV1),
+            ..contract.clone()
+        })
+        .collect();
+    let mut bindings = policy.bindings.clone();
+    for binding in &mut bindings {
+        binding.envelope.settlement_rule = SettlementRule::BrokerAuthoritativeV1;
+        binding.envelope.semantics = Some(ContractSemantics::RiseFallStrictV1);
+    }
+    if inputs.len() != frozen.instruments.len() {
+        return Err(format!(
+            "live policy rule 7: inputs has {} entries for {} frozen instruments; one per instrument is required",
+            inputs.len(),
+            frozen.instruments.len()
+        ));
+    }
+    let replay = Replay {
+        role: DatasetRole::Development,
+        decision_start: observation.0.into(),
+        decision_end: observation.1.into(),
+        inputs,
+        splits: None,
+        accounts: vec![assessed_account.clone()],
+        strategies: policy.strategies.clone(),
+        bindings,
+        contracts,
+        risk_policies: policy.risk_policies.clone(),
+        reporting_currency: frozen.descriptor.reporting_currency.clone(),
+        reporting_scale: frozen.descriptor.reporting_scale,
+        max_rate_age_micros: portfolio.max_rate_age_micros,
+        rates: portfolio.rates.clone(),
+        scenario: None,
+    };
+    replay
+        .validate()
+        .map_err(|reason| format!("live policy rule 7: {reason}"))?;
+    Ok(LivePolicy {
+        source: LiveSource {
+            research: manifest.generation.clone(),
+            bundle_sha256: manifest.bundle_sha256().into(),
+            frozen: frozen_identity,
+            selection: run.selection.clone(),
+            policy: policy.identity(),
+            certification: certification.generation.clone(),
+        },
+        replay,
+        baseline: policy.contracts.clone(),
+        scenario_delay_micros: 0,
+        refit: selection.refit.clone(),
+    })
+}
+
 // ----------------------------------------------------------------------------------------------
 // Qualification
 // ----------------------------------------------------------------------------------------------
@@ -1497,6 +1680,466 @@ mod tests {
         format!("file:///store/manifests/{}/ready.json", generation(byte))
             .parse()
             .unwrap()
+    }
+
+    struct LiveFixture {
+        manifest: RunManifest,
+        run: Run,
+        frozen: Frozen,
+        selection: Selection,
+        certification: CertificationManifest,
+        inputs: Vec<ReplayInput>,
+    }
+
+    impl LiveFixture {
+        fn project(&self) -> Result<LivePolicy, String> {
+            live_policy(
+                &self.manifest,
+                &self.run,
+                &self.frozen,
+                &self.selection,
+                &self.certification,
+                &"deriv".to_string().try_into().unwrap(),
+                "one",
+                ("2026-01-06T00:00:00Z", "2026-01-06T01:00:00Z"),
+                self.inputs.clone(),
+            )
+        }
+
+        fn policy(&mut self) -> &mut Policy {
+            self.selection.frozen.as_mut().unwrap()
+        }
+    }
+
+    fn live_fixture() -> LiveFixture {
+        use serde_json::json;
+        let config = Config::parse("schema_version = 1\nrun_mode = \"research\"\n[storage]\nhistorical_data_dir = \"historical\"\npublication_uri = \"file:///synthetic\"\n").unwrap();
+        let account: AccountSpec = serde_json::from_value(json!({
+            "id":"one", "broker":"deriv", "currency":"USD", "scale":2, "initial_cash":"100.00"
+        }))
+        .unwrap();
+        let contract: ContractTerms = serde_json::from_value(json!({
+            "id":"rise", "direction":"buy", "duration_micros":5_000_000, "currency":"USD",
+            "stake":"1.00", "quoted_cost":"1.00", "entry_fee":"0.01",
+            "win":{"gross_return":"1.80", "terminal_fee":"0.02"},
+            "loss":{"gross_return":"0", "terminal_fee":"0"},
+            "tie":{"gross_return":"0", "terminal_fee":"0"},
+            "settlement":{"rule":"price_at_due_v1", "max_settlement_delay_micros":1_000_000,
+                "max_tick_gap_micros":2_000_000}
+        }))
+        .unwrap();
+        let mut second = contract.clone();
+        second.id = "fall".into();
+        second.direction = crate::execution::Direction::Sell;
+        let envelope = json!({"max_purchase_cost":"1", "max_entry_fee":"0.01",
+            "max_win_terminal_fee":"0.02", "max_loss_terminal_fee":"0", "max_tie_terminal_fee":"0",
+            "min_winning_net_return":"0.77", "settlement_rule":"price_at_due_v1"});
+        let risk = json!({"id":"risk", "max_open_total":1, "same_entry":"all",
+            "deduplicate_signal_logic":false, "max_feature_age_micros":60_000_000,
+            "max_quote_age_micros":1_000_000, "max_proposal_age_micros":2_000_000});
+        let stream = json!({"duration_seconds":5,"offset_seconds":0});
+        let strategies: Vec<_> = [("second", "up"), ("first", "down")].into_iter().map(|(id, threshold)| {
+            json!({"id":id,"plan_identity":generation(9),"base_stream":stream,
+                "conditions":[{"stream":stream,"output":"candle_direction","comparator":"eq","threshold":threshold}]})
+        }).collect();
+        let policy: Policy = serde_json::from_value(json!({
+            "strategies":strategies,
+            "bindings":[
+                {"id":"z","strategy":"second","account":"one","instrument":"deriv:R_50","contract":"rise","risk_policy":"risk","envelope":envelope},
+                {"id":"a","strategy":"first","account":"one","instrument":"deriv:R_50","contract":"fall","risk_policy":"risk","envelope":envelope}],
+            "contracts":[contract,second],"risk_policies":[risk]
+        })).unwrap();
+        let selection = Selection {
+            config: config.clone(),
+            families: Vec::new(),
+            members: Vec::new(),
+            declared: 1,
+            rejected: 0,
+            valid: 1,
+            passing: 1,
+            folds: Vec::new(),
+            choices: Vec::new(),
+            selected: Some(0),
+            refit: vec![FeatureRef {
+                instrument: "deriv:R_50".into(),
+                input_generation: generation(1),
+                generation: generation(8),
+                plan_identity: generation(9),
+            }],
+            frozen: Some(policy),
+            outer: None,
+            state: crate::portfolio::State::Selected,
+        };
+        let mut config = config;
+        // Only the already-verified records consumed by the pure projection are needed here;
+        // the application integration fixture owns research construction and verification.
+        config.research = Some(serde_json::from_value(json!({
+            "study":{"study":"synthetic","attempt":"one","governance_manifest":"file:///synthetic/declaration.json","changes":"initial"},
+            "instruments":[],"folds":[],"refit":{"cutoff":"2026-01-05T00:00:00Z","fits":[]},
+            "evaluation":{"decision_start":"2026-01-05T00:00:00Z","decision_end":"2026-01-05T01:00:00Z","inputs":[]},
+            "holdout":{"decision_start":"2026-01-05T02:00:00Z","decision_end":"2026-01-05T03:00:00Z","inputs":[]},
+            "portfolio":{"max_policies":1,"embargo_micros":0,"objective":"profit_then_drawdown","gates":gates(),
+                "accounts":[account],"reporting_currency":"USD","reporting_scale":2,"max_rate_age_micros":60_000_000,
+                "members":[],"repairs":[],"bindings":[],"subsets":[],"risk_policies":[risk]},
+            "qualification":{"claim":QUALIFICATION_CLAIM_V1,"gates":gates()}
+        })).unwrap());
+        let descriptor = descriptor(config.research.as_ref().unwrap());
+        let mut manifest = run_manifest();
+        manifest.config_hash = config.content_hash();
+        manifest.generation = run_generation_id(
+            &manifest.config_hash,
+            &manifest.code_revision,
+            &manifest.declaration,
+        );
+        manifest.selection = crate::portfolio::selection_generation_id(
+            &selection.config.content_hash(),
+            &manifest.code_revision,
+            &[],
+        );
+        let frozen = Frozen {
+            research: manifest.generation.clone(),
+            intent: "intent".into(),
+            declaration: manifest.declaration.clone(),
+            instruments: vec![InstrumentRecord {
+                instrument: "deriv:R_50".into(),
+                source: generation(1),
+                profile: generation(2),
+                feature: generation(3),
+                outcome: generation(4),
+                family: generation(5),
+            }],
+            selection: manifest.selection.clone(),
+            scenarios: Vec::new(),
+            descriptor: descriptor.clone(),
+        };
+        let run = Run {
+            config,
+            declaration: frozen.declaration.clone(),
+            intent: frozen.intent.clone(),
+            frozen: Some(digest(b"", &frozen.to_json())),
+            instruments: frozen.instruments.clone(),
+            selection: frozen.selection.clone(),
+            descriptor,
+            claims: vec!["synthetic-outer-claim".into()],
+            outer: vec![ScenarioResult {
+                scenario: BASELINE_SCENARIO.into(),
+                outer: Outer {
+                    features: selection.refit.clone(),
+                    replay: ReplayRef {
+                        generation: generation(10),
+                        summary_identity: generation(11),
+                    },
+                    projection: projection(2, Some("1"), Some("0"), 0, None),
+                    splits: BTreeMap::new(),
+                },
+                verdict: Verdict::Pass,
+            }],
+            state: RunState::AwaitingHoldoutAuthorization,
+        };
+        manifest.objects[0].sha256 = digest(b"", &run.to_json());
+        let certification = CertificationManifest {
+            kind: CERTIFICATION_MANIFEST_KIND.into(),
+            schema_version: CERTIFICATION_SCHEMA_VERSION,
+            generation: certification_generation_id(&manifest.generation, "grant"),
+            research: manifest.generation.clone(),
+            bundle_sha256: manifest.bundle_sha256().into(),
+            grant: "grant".into(),
+            receipt: "receipt".into(),
+            state: "certified".into(),
+            objects: Vec::new(),
+        };
+        LiveFixture {
+            manifest,
+            run,
+            frozen,
+            selection,
+            certification,
+            inputs: vec![ReplayInput {
+                tick_manifest: manifest_uri(1),
+                feature_manifest: manifest_uri(8),
+                outcome_manifest: None,
+            }],
+        }
+    }
+
+    #[test]
+    fn live_policy_preserves_the_frozen_baseline_and_derives_broker_templates() {
+        let fixture = live_fixture();
+        let live = fixture.project().unwrap();
+        let policy = fixture.selection.frozen.as_ref().unwrap();
+        assert_eq!(live.baseline, policy.contracts);
+        assert_eq!(live.replay.strategies, policy.strategies);
+        assert_eq!(live.replay.risk_policies, policy.risk_policies);
+        assert_eq!(live.replay.accounts, fixture.frozen.descriptor.accounts);
+        assert_eq!(
+            live.replay.reporting_currency,
+            fixture.frozen.descriptor.reporting_currency
+        );
+        assert_eq!(
+            live.replay.reporting_scale,
+            fixture.frozen.descriptor.reporting_scale
+        );
+        let portfolio = &fixture.run.config.research.as_ref().unwrap().portfolio;
+        assert_eq!(
+            live.replay.max_rate_age_micros,
+            portfolio.max_rate_age_micros
+        );
+        assert_eq!(live.replay.rates, portfolio.rates);
+        assert_eq!(live.replay.inputs, fixture.inputs);
+        assert_eq!(live.replay.role, DatasetRole::Development);
+        assert_eq!(live.replay.decision_start, "2026-01-06T00:00:00Z");
+        assert_eq!(live.replay.decision_end, "2026-01-06T01:00:00Z");
+        assert_eq!(live.replay.splits, None);
+        assert_eq!(live.replay.scenario, None);
+        assert_eq!(live.scenario_delay_micros, 0);
+        assert_eq!(live.refit, fixture.selection.refit);
+        assert_eq!(
+            live.replay
+                .bindings
+                .iter()
+                .map(|binding| binding.id.as_str())
+                .collect::<Vec<_>>(),
+            ["z", "a"]
+        );
+        for (template, baseline) in live.replay.contracts.iter().zip(&policy.contracts) {
+            let zero = Cashflow {
+                gross_return: Decimal::zero(0),
+                terminal_fee: Decimal::zero(0),
+            };
+            assert_eq!(
+                template,
+                &ContractTerms {
+                    quoted_cost: baseline.stake,
+                    entry_fee: Decimal::zero(0),
+                    win: zero,
+                    loss: zero,
+                    tie: zero,
+                    settlement: Settlement {
+                        rule: SettlementRule::BrokerAuthoritativeV1,
+                        ..baseline.settlement
+                    },
+                    semantics: Some(ContractSemantics::RiseFallStrictV1),
+                    ..baseline.clone()
+                }
+            );
+            assert!(!template.same_economics(baseline).unwrap());
+        }
+        for (binding, baseline) in live.replay.bindings.iter().zip(&policy.bindings) {
+            let mut expected = baseline.clone();
+            expected.envelope.settlement_rule = SettlementRule::BrokerAuthoritativeV1;
+            expected.envelope.semantics = Some(ContractSemantics::RiseFallStrictV1);
+            assert_eq!(binding, &expected);
+        }
+        assert_eq!(
+            live.source,
+            LiveSource {
+                research: fixture.manifest.generation.clone(),
+                bundle_sha256: fixture.manifest.bundle_sha256().into(),
+                frozen: fixture.run.frozen.clone().unwrap(),
+                selection: fixture.run.selection.clone(),
+                policy: policy.identity(),
+                certification: fixture.certification.generation.clone(),
+            }
+        );
+    }
+
+    #[test]
+    fn live_policy_refuses_not_awaiting_or_mismatched_sources() {
+        for field in ["run", "manifest", "frozen"] {
+            let mut fixture = live_fixture();
+            match field {
+                "run" => fixture.run.state = RunState::NoFeasiblePolicy,
+                "manifest" => fixture.manifest.state = "no_feasible_policy".into(),
+                "frozen" => fixture.run.frozen = Some("wrong".into()),
+                _ => unreachable!(),
+            }
+            let error = fixture.project().unwrap_err();
+            assert!(error.starts_with("live policy rule 1:"), "{field}: {error}");
+        }
+    }
+
+    #[test]
+    fn live_policy_refuses_uncertified_or_mismatched_certification() {
+        for field in ["state", "research", "bundle"] {
+            let mut fixture = live_fixture();
+            match field {
+                "state" => fixture.certification.state = "rejected".into(),
+                "research" => fixture.certification.research = "wrong".into(),
+                "bundle" => fixture.certification.bundle_sha256 = "wrong".into(),
+                _ => unreachable!(),
+            }
+            assert!(
+                fixture
+                    .project()
+                    .unwrap_err()
+                    .starts_with("live policy rule 2:"),
+                "{field}"
+            );
+        }
+    }
+
+    #[test]
+    fn live_policy_refuses_multiaccount_portfolios_including_unused_accounts() {
+        for used in [false, true] {
+            let mut fixture = live_fixture();
+            let accounts = &mut fixture
+                .run
+                .config
+                .research
+                .as_mut()
+                .unwrap()
+                .portfolio
+                .accounts;
+            let mut second = accounts[0].clone();
+            second.id = "two".into();
+            accounts.push(second);
+            if used {
+                fixture.policy().bindings[1].account = "two".into();
+            }
+            assert!(
+                fixture
+                    .project()
+                    .unwrap_err()
+                    .contains("rule 3: refuse a multiaccount portfolio")
+            );
+        }
+    }
+
+    #[test]
+    fn live_policy_refuses_binding_on_another_account() {
+        let mut fixture = live_fixture();
+        fixture.policy().bindings[1].account = "two".into();
+        assert!(
+            fixture
+                .project()
+                .unwrap_err()
+                .contains("rule 3: every frozen binding")
+        );
+    }
+
+    #[test]
+    fn live_policy_refuses_missing_frozen_policy() {
+        let mut fixture = live_fixture();
+        fixture.selection.frozen = None;
+        assert_eq!(
+            fixture.project().unwrap_err(),
+            "live policy rule 3: selection carries no frozen policy"
+        );
+    }
+
+    #[test]
+    fn live_policy_refuses_wrong_requested_account() {
+        let fixture = live_fixture();
+        let error = live_policy(
+            &fixture.manifest,
+            &fixture.run,
+            &fixture.frozen,
+            &fixture.selection,
+            &fixture.certification,
+            &"deriv".to_string().try_into().unwrap(),
+            "another-account",
+            ("2026-01-06T00:00:00Z", "2026-01-06T01:00:00Z"),
+            fixture.inputs.clone(),
+        )
+        .unwrap_err();
+        assert_eq!(
+            error,
+            "live policy rule 3: account and broker must match the frozen portfolio account"
+        );
+    }
+
+    #[test]
+    fn live_policy_refuses_wrong_broker() {
+        let mut fixture = live_fixture();
+        fixture
+            .run
+            .config
+            .research
+            .as_mut()
+            .unwrap()
+            .portfolio
+            .accounts[0]
+            .broker = "other".to_string().try_into().unwrap();
+        assert!(
+            fixture
+                .project()
+                .unwrap_err()
+                .contains("rule 3: account and broker")
+        );
+    }
+
+    #[test]
+    fn live_policy_refuses_missing_proposal_age() {
+        let mut fixture = live_fixture();
+        fixture.policy().risk_policies[0].max_proposal_age_micros = None;
+        let error = fixture.project().unwrap_err();
+        assert!(
+            error.starts_with("live policy rule 4:") && error.contains("max_proposal_age_micros")
+        );
+    }
+
+    #[test]
+    fn live_policy_refuses_refund_on_tie() {
+        let mut fixture = live_fixture();
+        fixture.policy().contracts[0].tie.gross_return = decimal("1");
+        assert!(
+            fixture
+                .project()
+                .unwrap_err()
+                .starts_with("live policy rule 5:")
+        );
+    }
+
+    #[test]
+    fn live_policy_refuses_nonzero_loss_or_tie_fee() {
+        for tie in [false, true] {
+            let mut fixture = live_fixture();
+            let contract = &mut fixture.policy().contracts[0];
+            if tie {
+                contract.tie.terminal_fee = decimal("0.01");
+            } else {
+                contract.loss.terminal_fee = decimal("0.01");
+            }
+            assert!(
+                fixture
+                    .project()
+                    .unwrap_err()
+                    .starts_with("live policy rule 5:")
+            );
+        }
+    }
+
+    #[test]
+    fn live_policy_refuses_nonzero_loss_return_or_wrong_settlement() {
+        for settlement in [false, true] {
+            let mut fixture = live_fixture();
+            let contract = &mut fixture.policy().contracts[0];
+            if settlement {
+                contract.settlement.rule = SettlementRule::BrokerAuthoritativeV1;
+            } else {
+                contract.loss.gross_return = decimal("0.01");
+            }
+            assert!(
+                fixture
+                    .project()
+                    .unwrap_err()
+                    .starts_with("live policy rule 5:")
+            );
+        }
+    }
+
+    #[test]
+    fn live_policy_refuses_wrong_input_count() {
+        for count in [0, 2] {
+            let mut fixture = live_fixture();
+            fixture.inputs.resize(count, fixture.inputs[0].clone());
+            assert!(
+                fixture
+                    .project()
+                    .unwrap_err()
+                    .starts_with("live policy rule 7: inputs")
+            );
+        }
     }
 
     fn grant(hash: bool) -> Grant {

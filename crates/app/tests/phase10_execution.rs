@@ -293,7 +293,7 @@ fn account_event(
         .unwrap()
         .expect("account event");
     let receipt = clock.now_micros();
-    let observation = to_observation(event, &|contract| commands.get(contract).cloned(), receipt)
+    let observation = to_observation(event, &|contract| commands.get(contract).cloned())
         .expect("financial observation");
     run.step(receipt, vec![observation])
 }
@@ -443,8 +443,14 @@ fn pinned_rise_and_fall_restore_publish_and_verify_exact_cash() {
         assert_eq!(rows.len(), count);
         for row in rows {
             let cash = row.cash;
-            let observation =
-                to_observation(AccountEvent::Cash(cash), &|_| None, clock.now_micros()).unwrap();
+            let observation = to_observation(
+                AccountEvent::Cash {
+                    fact: cash,
+                    receipt_micros: row.receipt_micros,
+                },
+                &|_| None,
+            )
+            .unwrap();
             assert!(run.step(clock.now_micros(), vec![observation]).is_empty());
         }
     }
@@ -602,7 +608,10 @@ fn excess_debit_is_accepted_blocked_and_reconciled() {
     let (mut run, prepared) = one_prepared(&mut options, &clock);
     advance(&mut clock, PURCHASE);
     let outcome = options.purchase(&prepared).unwrap();
-    let PurchaseOutcome::Accepted { debit, liability } = outcome.clone() else {
+    let PurchaseOutcome::Accepted {
+        debit, liability, ..
+    } = outcome.clone()
+    else {
         panic!("{outcome:?}")
     };
     let events = run.step(
@@ -991,8 +1000,14 @@ fn statement_and_portfolio_recover_acceptance_without_retry() {
             run.step(
                 clock.now_micros(),
                 vec![
-                    to_observation(AccountEvent::Cash(cash), &|_| None, clock.now_micros())
-                        .unwrap(),
+                    to_observation(
+                        AccountEvent::Cash {
+                            fact: cash,
+                            receipt_micros: row.receipt_micros,
+                        },
+                        &|_| None,
+                    )
+                    .unwrap(),
                 ],
             );
             (debit, liability)
@@ -1278,6 +1293,174 @@ fn proposal_before_signal_restart_resupplies_input_and_continues_identically() {
             .collect::<Vec<_>>()
     );
     assert_eq!(uninterrupted.state_identity(), restored.state_identity());
+}
+
+#[test]
+fn split_purchase_and_queued_cash_preserve_transport_receipts() {
+    let mut clock = FakeClock::at(PURCHASE);
+    let (mut options, sent) = options(
+        vec![
+            frame("transaction-ack", 1),
+            frame("proposal-call", 2),
+            frame("transaction-buy-call", 1),
+            frame("buy-call", 3),
+            frame("statement-three", 4),
+        ],
+        &clock,
+    );
+    options.subscribe_transactions().unwrap();
+    assert!(matches!(
+        options.next_account_event(SECOND).unwrap(),
+        Some(AccountEvent::TransactionAcknowledged)
+    ));
+    let (mut run, prepared) = one_prepared(&mut options, &clock);
+    let before_write = sent.borrow().len();
+    let encoded = options.prepare_purchase(&prepared).unwrap();
+    assert_eq!(
+        sent.borrow().len(),
+        before_write,
+        "preparation must not write"
+    );
+    let before_response = clock.now_micros();
+    let outcome = options.write_purchase(encoded).unwrap();
+    assert_eq!(sent.borrow().len(), before_write + 1);
+    let buy_receipt = clock.now_micros();
+    assert!(
+        matches!(&outcome, PurchaseOutcome::Accepted { receipt_micros, .. } if *receipt_micros == buy_receipt)
+    );
+    clock.sleep(SECOND);
+    let purchased = purchase_observation(
+        &prepared.command,
+        &prepared.dispatch_claim,
+        outcome,
+        clock.now_micros(),
+    );
+    assert!(
+        matches!(&purchased, Observation::Purchased { source, .. } if source.available_at_micros == buy_receipt && source.provider_time_micros == PURCHASE)
+    );
+    let event = options.next_account_event(SECOND).unwrap().unwrap();
+    let cash = to_observation(event, &|_| None).unwrap();
+    assert!(
+        matches!(&cash, Observation::Cash { source, .. } if source.available_at_micros == before_response + 10 && source.available_at_micros < buy_receipt && source.provider_time_micros == PURCHASE)
+    );
+    let events = run.step(clock.now_micros(), vec![cash]);
+    assert!(events.iter().any(|event| matches!(&event.kind, EventKind::CashObserved { source, .. } if source.available_at_micros == before_response + 10)));
+    run.step(clock.now_micros(), vec![purchased]);
+    let rows = options.statement(1_789_347_035, 1_789_347_053).unwrap();
+    let statement_receipt = clock.now_micros();
+    clock.sleep(SECOND);
+    for row in rows {
+        assert_eq!(row.receipt_micros, statement_receipt);
+        let observation = to_observation(
+            AccountEvent::Cash {
+                fact: row.cash,
+                receipt_micros: row.receipt_micros,
+            },
+            &|_| None,
+        )
+        .unwrap();
+        assert!(
+            matches!(observation, Observation::Cash { source, .. } if source.available_at_micros == statement_receipt)
+        );
+    }
+    assert!(
+        options.prepare_purchase(&prepared).is_err(),
+        "a written claim cannot be retried"
+    );
+}
+
+#[test]
+fn split_purchases_keep_each_encoded_command_bound_to_its_claim() {
+    let clock = FakeClock::at(PURCHASE);
+    let (mut options, sent) = options(
+        vec![
+            frame("proposal-call", 1),
+            frame("proposal-put", 2),
+            frame("buy-call", 3),
+            frame("buy-put", 4),
+        ],
+        &clock,
+    );
+    let (_, a) = one_prepared(&mut options, &clock);
+    let proposal_b = options.proposal(&request(Direction::Sell)).unwrap();
+    let b = PreparedPurchase {
+        dispatch_claim: "fake-durable-claim:b".into(),
+        command: "b".into(),
+        proposal_identity: proposal_b.identity,
+        maximum_price: proposal_b.terms.quoted_cost,
+    };
+    let before = sent.borrow().len();
+    let encoded_a = options.prepare_purchase(&a).unwrap();
+    let encoded_b = options.prepare_purchase(&b).unwrap();
+    assert_eq!(sent.borrow().len(), before);
+    assert!(matches!(
+        options.write_purchase(encoded_a).unwrap(),
+        PurchaseOutcome::Accepted { .. }
+    ));
+    assert_eq!(sent.borrow().len(), before + 1);
+    assert!(matches!(
+        options.write_purchase(encoded_b).unwrap(),
+        PurchaseOutcome::Accepted { .. }
+    ));
+    assert_eq!(sent.borrow().len(), before + 2);
+    assert_eq!(
+        options.prepare_purchase(&a).err().unwrap(),
+        "deriv buy: dispatch claim already written or possibly sent; reconcile before any retry"
+    );
+    assert_eq!(sent.borrow().len(), before + 2);
+}
+
+#[test]
+fn split_purchase_refuses_a_second_prepared_token_for_the_same_claim_without_writing() {
+    let clock = FakeClock::at(PURCHASE);
+    let (mut options, sent) = options(
+        vec![frame("proposal-call", 1), frame("buy-call", 2)],
+        &clock,
+    );
+    let (_, prepared) = one_prepared(&mut options, &clock);
+    let before = sent.borrow().len();
+    let first = options.prepare_purchase(&prepared).unwrap();
+    let second = options.prepare_purchase(&prepared).unwrap();
+    assert_eq!(sent.borrow().len(), before);
+    assert!(matches!(
+        options.write_purchase(first).unwrap(),
+        PurchaseOutcome::Accepted { .. }
+    ));
+    assert_eq!(sent.borrow().len(), before + 1);
+    assert_eq!(
+        options.write_purchase(second).unwrap_err(),
+        "deriv buy: dispatch claim already written or possibly sent; reconcile before any retry"
+    );
+    assert_eq!(sent.borrow().len(), before + 1);
+}
+
+#[test]
+fn rejected_purchase_preserves_response_receipt_when_normalized_later() {
+    let mut clock = FakeClock::at(PURCHASE);
+    let rejection = r#"{"msg_type":"buy","req_id":2,"error":{"code":"InvalidContractProposal","message":"Synthetic rejection"}}"#;
+    let (mut options, _) = options(
+        vec![frame("proposal-call", 1), Frame::Text(rejection.into())],
+        &clock,
+    );
+    let (mut run, prepared) = one_prepared(&mut options, &clock);
+    let outcome = options.purchase(&prepared).unwrap();
+    let receipt = clock.now_micros();
+    assert!(
+        matches!(&outcome, PurchaseOutcome::Rejected { code, receipt_micros } if code == "InvalidContractProposal" && *receipt_micros == receipt)
+    );
+    clock.sleep(SECOND);
+    let observation = purchase_observation(
+        &prepared.command,
+        &prepared.dispatch_claim,
+        outcome,
+        clock.now_micros(),
+    );
+    assert!(
+        matches!(&observation, Observation::Rejected { source, .. } if source.available_at_micros == receipt)
+    );
+    run.step(clock.now_micros(), vec![observation]);
+    assert_eq!(run.account().cash.to_string(), "9955.74");
+    assert_eq!(run.account().open, 0);
 }
 
 #[test]
@@ -2333,12 +2516,7 @@ fn partial_contract_update_uses_provider_clock_or_receipt_and_fills_expiry() {
         assert!(
             matches!(&event, AccountEvent::ContractUpdate { source, expiry_micros: Some(expiry), .. } if source.provider_time_micros == expected.unwrap_or(clock.now_micros()) && source.available_at_micros == clock.now_micros() && *expiry == PURCHASE + 15 * SECOND)
         );
-        let observation = to_observation(
-            event,
-            &|_| Some(prepared.command.clone()),
-            clock.now_micros(),
-        )
-        .unwrap();
+        let observation = to_observation(event, &|_| Some(prepared.command.clone())).unwrap();
         let events = run.step(clock.now_micros(), vec![observation]);
         assert!(events.iter().any(|event| matches!(&event.kind,
             EventKind::Confirmed { expiry_micros: Some(expiry), .. }

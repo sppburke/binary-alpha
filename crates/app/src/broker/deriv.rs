@@ -1,7 +1,7 @@
 #[path = "deriv_options.rs"]
 mod options;
 pub use options::{
-    DerivOptions, StatementRow, purchase_fact, purchase_observation, recover_purchase,
+    DerivOptions, Encoded, StatementRow, purchase_fact, purchase_observation, recover_purchase,
     to_observation,
 };
 

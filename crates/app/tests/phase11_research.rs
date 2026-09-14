@@ -751,6 +751,60 @@ fn research_run_freezes_awaits_and_certifies() {
     assert_manifest_snapshot(&fixture.scratch.path("published"), &before);
 }
 
+#[test]
+fn verify_run_refuses_changed_account_capital_currency_or_scale() {
+    let fixture = Fixture::new("phase12_account_verification");
+    fixture.run().unwrap();
+    let (manifest, run) = fixture.run_record();
+    let store =
+        binary_alpha_app::store::Store::open(&fixture.config.storage.publication_uri).unwrap();
+    let before = manifest_snapshot(&fixture.scratch.path("published"));
+    for field in ["capital", "currency", "scale"] {
+        let mut changed = run.clone();
+        let account = &mut changed.config.research.as_mut().unwrap().portfolio.accounts[0];
+        match field {
+            "capital" => {
+                account.initial_cash = account.initial_cash.checked_add(decimal("1")).unwrap()
+            }
+            "currency" => account.currency = "other".to_string().try_into().unwrap(),
+            "scale" => account.scale += 1,
+            _ => unreachable!(),
+        }
+        let mut changed_manifest = manifest.clone();
+        changed_manifest.config_hash = changed.config.content_hash();
+        changed_manifest.generation = research::run_generation_id(
+            &changed_manifest.config_hash,
+            &changed_manifest.code_revision,
+            &changed_manifest.declaration,
+        );
+        let bytes = changed.to_json();
+        let object = &mut changed_manifest.objects[0];
+        object.sha256 = research::digest(b"", &bytes);
+        object.key = binary_alpha_engine::dataset::object_key(&object.sha256);
+        object.bytes = bytes.len() as u64;
+        write(&fixture.scratch.path("published").join(&object.key), bytes);
+        let key = changed_manifest.key();
+        let uri = store.uri(&key);
+        let error = binary_alpha_app::research::verify_run(
+            &uri,
+            &store,
+            &key,
+            &changed_manifest.to_json(),
+            research::Access::ORDINARY,
+        )
+        .unwrap_err();
+        assert_eq!(
+            error,
+            format!(
+                "{uri}: the run record does not carry the manifest's configuration, declaration, selection, state, and descriptor"
+            ),
+            "{field}"
+        );
+    }
+    assert_manifest_snapshot(&fixture.scratch.path("published"), &before);
+    no_access(&logged(&fixture.log()), &fixture.protected());
+}
+
 fn assert_development(fixture: &Fixture, manifest: &RunManifest, run: &Run, report: &str) {
     assert_eq!(run.instruments.len(), 2);
     let research_config = fixture.config.research.as_ref().unwrap();

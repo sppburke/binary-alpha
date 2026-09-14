@@ -311,9 +311,11 @@ pub enum PurchaseOutcome {
     Accepted {
         debit: Decimal,
         liability: BrokerLiability,
+        receipt_micros: i64,
     },
     Rejected {
         code: String,
+        receipt_micros: i64,
     },
     ProvenNotSent {
         reason: String,
@@ -326,7 +328,10 @@ pub enum PurchaseOutcome {
 #[derive(Debug, Clone)]
 pub enum AccountEvent {
     TransactionAcknowledged,
-    Cash(CashFact),
+    Cash {
+        fact: CashFact,
+        receipt_micros: i64,
+    },
     ContractUpdate {
         contract_ref: String,
         source: EventSource,
