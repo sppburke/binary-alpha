@@ -98,7 +98,7 @@ pub fn declaration(config: &Config) -> Result<Option<Declaration>, String> {
 /// One record published beneath a store by conditional creation and confirmed by exact
 /// readback: an existing identical record is reused, any other content is a conflict that
 /// replaces nothing.
-fn publish_record(local: &Store, store: &Store, key: &str, bytes: &[u8]) -> Result<Put, String> {
+pub(crate) fn publish_record(local: &Store, store: &Store, key: &str, bytes: &[u8]) -> Result<Put, String> {
     let name = key.replace('/', "-");
     let temporary = import::temporary_path(local, &name)?;
     fs::write(&temporary, bytes)

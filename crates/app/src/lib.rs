@@ -2,6 +2,7 @@ pub mod archive;
 pub mod audit;
 pub mod features;
 pub mod import;
+pub mod live;
 pub mod outcomes;
 pub mod parallel;
 pub mod portfolio;
