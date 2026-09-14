@@ -16,8 +16,10 @@ one execution engine into a reconstructable financial ledger, runs candidate sea
 selection, runs the one-command study to an awaiting state and, under a separately created grant,
 to one certification result, and verifies every kind of generation. The accelerator supplies thirteen retained device
 kernels and their deterministic
-central-processor references; it has no production consumer. The checkout executes no live, paper,
-or production trading action. Browser-driven operation, click execution, and any live, paper, certification,
+central-processor references; it has no production consumer. Phase 12 adds the live configuration,
+baseline projection, journal, cooperative lease/claim control, and immutable authorization owners.
+The ordered runtime and its live commands are design-specified pending application composition;
+see [Live runtime](docs/contracts.md#live-runtime). Browser-driven operation, click execution, and any live, paper, certification,
 deployment, or production action without its own authorization are unsupported.
 
 ## Build and entry points
@@ -40,6 +42,10 @@ cargo run --release --locked -p binary-alpha-app -- search --config PATH
 cargo run --release --locked -p binary-alpha-app -- portfolio optimize --config PATH
 cargo run --release --locked -p binary-alpha-app -- research run --config PATH
 cargo run --release --locked -p binary-alpha-app -- holdout grant create --config PATH --bundle-manifest URI --holdout-manifest URI --reason TEXT
+# Phase 12 design-specified commands; registration is pending in this checkout.
+cargo run --release --locked -p binary-alpha-app -- live replay --config PATH
+cargo run --release --locked -p binary-alpha-app -- live run --config PATH
+cargo run --release --locked -p binary-alpha-app -- live authorization create --deployment-manifest URI --bundle-manifest URI --broker ID --account ID --reason TEXT
 BINARY_ALPHA_TEST_CONFIG=PATH BINARY_ALPHA_CUDA_REFERENCE_OUTPUT=NEW_DIRECTORY cargo test --release --locked -p binary-alpha-app --features cuda --test phase07_cuda_parity capture_legacy_reference -- --exact --ignored --nocapture
 BINARY_ALPHA_TEST_CONFIG=PATH BINARY_ALPHA_CUDA_REFERENCE=MANIFEST cargo test --release --locked -p binary-alpha-app --features cuda --test phase07_cuda_parity governed_parity -- --exact --ignored --nocapture
 ```
@@ -73,6 +79,13 @@ configuration's governance declaration before it is opened.
 broker into the same retained folder and immutable generations. `binary-alpha broker inspect
 --config PATH` records bounded discovery, history, live/cancellation and configured account/proposal
 checks without purchasing. Both external commands require authorization for their exact action.
+The design-specified `binary-alpha live replay --config PATH` drives a recorded broker-event log
+through the same Engine with fake broker/control transports under `research` or `replay` mode;
+`binary-alpha live run --config PATH` selects non-purchasing `paper` or authorized `live` operation;
+`binary-alpha live authorization create` creates the immutable operator authorization for one
+exact deployment, configuration, certified bundle, broker, and account. The
+[mode matrix and implementation status](docs/contracts.md#live-runtime) and
+[rollout procedure](docs/operations.md#live-runtime) apply.
 Every command is documented in [docs/contracts.md](docs/contracts.md) and
 [docs/operations.md](docs/operations.md). The example
 configuration retains data in the repository-local `historical_data/` folder, which Git ignores,
