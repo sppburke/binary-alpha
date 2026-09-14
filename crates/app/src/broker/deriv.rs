@@ -1,3 +1,7 @@
+#[path = "deriv_options.rs"]
+mod options;
+pub use options::{DerivOptions, purchase_fact, purchase_observation, to_observation};
+
 use super::transport::{Connector, Frame, Http, Transport, endpoint_host};
 use super::wire::WireDecimal;
 use super::{
@@ -6,7 +10,7 @@ use super::{
 };
 use binary_alpha_engine::config::{AccountClass, DerivSettings, RateBudgets};
 use binary_alpha_engine::execution::Decimal;
-use binary_alpha_engine::market::{Currency, InstrumentId, PriceScale, Tick};
+use binary_alpha_engine::market::{BrokerId, Currency, InstrumentId, PriceScale, Tick};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
@@ -47,6 +51,7 @@ pub struct DerivConnection {
     budget: RateBudget,
     url: String,
     next_id: u64,
+    closed: bool,
     continuity: Continuity,
     subscriptions: BTreeSet<String>,
     queued: VecDeque<Response>,
@@ -67,6 +72,7 @@ impl DerivConnection {
             budget,
             url: url.to_string(),
             next_id: 1,
+            closed: false,
             continuity: Continuity::default(),
             subscriptions: BTreeSet::new(),
             queued: VecDeque::new(),
@@ -79,13 +85,20 @@ impl DerivConnection {
             .saturating_add(timeout_micros.max(0));
         loop {
             let remaining = deadline.saturating_sub(self.clock.now_micros()).max(0);
-            let Some(frame) = self.transport.receive(remaining)? else {
+            let received = self.transport.receive(remaining);
+            if received.is_err() {
+                self.closed = true;
+            }
+            let Some(frame) = received? else {
                 return Ok(None);
             };
             match frame {
                 Frame::Ping(bytes) => self.transport.send(Frame::Pong(bytes))?,
                 Frame::Pong(_) => (),
-                Frame::Close => return Err("deriv: connection closed".into()),
+                Frame::Close => {
+                    self.closed = true;
+                    return Err("deriv: connection closed".into());
+                }
                 Frame::Binary(_) => return Err("deriv: unexpected binary frame".into()),
                 Frame::Text(text) => {
                     let receipt_micros = self.clock.now_micros();
@@ -115,6 +128,25 @@ impl DerivConnection {
         expected: &str,
         build: impl FnOnce(u64) -> T,
     ) -> Result<Response, String> {
+        let (id, text) = self.prepare(group, build)?;
+        self.transport.send(Frame::Text(text))?;
+        let response = self.response(id, expected)?;
+        if let Some(error) = &response.header.error {
+            return Err(format!(
+                "deriv {expected}: {}: {}",
+                error.code, error.message
+            ));
+        }
+        Ok(response)
+    }
+    fn prepare<T: Serialize>(
+        &mut self,
+        group: RateGroup,
+        build: impl FnOnce(u64) -> T,
+    ) -> Result<(u64, String), String> {
+        if self.closed {
+            return Err("deriv: connection closed before write".into());
+        }
         let id = self.next_id;
         self.next_id = id
             .checked_add(1)
@@ -122,7 +154,9 @@ impl DerivConnection {
         let text =
             serde_json::to_string(&build(id)).map_err(|_| "deriv: request serialization failed")?;
         self.budget.admit(group, &mut *self.clock);
-        self.transport.send(Frame::Text(text))?;
+        Ok((id, text))
+    }
+    fn response(&mut self, id: u64, expected: &str) -> Result<Response, String> {
         let deadline = self.clock.now_micros().saturating_add(20_000_000);
         loop {
             let remaining = deadline.saturating_sub(self.clock.now_micros());
@@ -133,12 +167,6 @@ impl DerivConnection {
                 .receive(remaining)?
                 .ok_or_else(|| format!("deriv {expected}: response timeout"))?;
             if response.header.req_id == Some(id) {
-                if let Some(error) = &response.header.error {
-                    return Err(format!(
-                        "deriv {}: {}: {}",
-                        response.header.msg_type, error.code, error.message
-                    ));
-                }
                 if response.header.msg_type != expected {
                     return Err(format!(
                         "deriv {expected}: unexpected msg_type {}",
@@ -147,12 +175,14 @@ impl DerivConnection {
                 }
                 return Ok(response);
             }
-            if response.header.msg_type == "tick"
-                && response
-                    .header
-                    .subscription
-                    .as_ref()
-                    .is_some_and(|s| self.subscriptions.contains(&s.id))
+            if matches!(
+                response.header.msg_type.as_str(),
+                "tick" | "transaction" | "proposal_open_contract"
+            ) && response
+                .header
+                .subscription
+                .as_ref()
+                .is_some_and(|s| self.subscriptions.contains(&s.id))
             {
                 if let Some(error) = &response.header.error {
                     return Err(format!("deriv tick: {}: {}", error.code, error.message));
@@ -174,6 +204,7 @@ impl DerivConnection {
         self.transport.close()?;
         self.transport = self.connector.connect(&self.url, &[])?;
         self.next_id = 1;
+        self.closed = false;
         self.subscriptions.clear();
         self.queued.clear();
         self.continuity.reconnect()
@@ -281,7 +312,7 @@ fn precision(pip_size: &WireDecimal, scale: PriceScale) -> Result<(), String> {
 }
 
 pub struct DerivMarketData {
-    settings: DerivSettings,
+    broker: BrokerId,
     connection: DerivConnection,
     subscriptions: BTreeMap<String, (InstrumentId, PriceScale)>,
     active: BTreeMap<InstrumentId, String>,
@@ -301,7 +332,7 @@ impl DerivMarketData {
             settings.budgets.clone().unwrap_or_default(),
         )?;
         Ok(Self {
-            settings: settings.clone(),
+            broker: settings.id.clone(),
             connection,
             subscriptions: BTreeMap::new(),
             active: BTreeMap::new(),
@@ -332,7 +363,7 @@ impl DerivMarketData {
         Ok(selected)
     }
     fn check_instrument(&self, instrument: &InstrumentId) -> Result<(), String> {
-        if instrument.broker != self.settings.id {
+        if instrument.broker != self.broker {
             return Err("deriv: instrument belongs to a different broker".into());
         }
         Ok(())

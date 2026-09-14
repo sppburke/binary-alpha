@@ -594,3 +594,103 @@ pub fn read_normalized_ticks(store: &Path, dataset: &GenerationManifest) -> Vec<
         })
         .collect()
 }
+
+/// Scripted broker transport and clock shared by Phase 10 proofs.
+pub mod broker {
+    use binary_alpha_app::broker::Clock;
+    use binary_alpha_app::broker::transport::{Connector, Frame, Transport};
+    use std::cell::{Cell, RefCell};
+    use std::collections::VecDeque;
+    use std::rc::Rc;
+    #[derive(Clone, Default)]
+    pub struct FakeClock(Rc<Cell<i64>>);
+    impl FakeClock {
+        pub fn at(value: i64) -> Self {
+            Self(Rc::new(Cell::new(value)))
+        }
+    }
+    impl Clock for FakeClock {
+        fn now_micros(&self) -> i64 {
+            self.0.get()
+        }
+        fn sleep(&mut self, micros: i64) {
+            self.0.set(self.0.get() + micros);
+        }
+    }
+    struct ScriptTransport {
+        frames: VecDeque<Frame>,
+        sent: Rc<RefCell<Vec<Frame>>>,
+        clock: FakeClock,
+        fail_on_write: Option<usize>,
+    }
+    impl Transport for ScriptTransport {
+        fn send(&mut self, frame: Frame) -> Result<(), String> {
+            self.sent.borrow_mut().push(frame);
+            if self.fail_on_write == Some(self.sent.borrow().len()) {
+                return Err("synthetic socket send failure".into());
+            }
+            Ok(())
+        }
+        fn receive(&mut self, timeout: i64) -> Result<Option<Frame>, String> {
+            let frame = self.frames.pop_front();
+            self.clock.sleep(if frame.is_some() { 10 } else { timeout });
+            Ok(frame)
+        }
+        fn close(&mut self) -> Result<(), String> {
+            self.send(Frame::Close)
+        }
+    }
+    struct ScriptConnector {
+        sessions: VecDeque<Vec<Frame>>,
+        sent: Rc<RefCell<Vec<Frame>>>,
+        clock: FakeClock,
+        fail_on_write: Option<usize>,
+    }
+    impl Connector for ScriptConnector {
+        fn connect(
+            &mut self,
+            _: &str,
+            _: &[(String, String)],
+        ) -> Result<Box<dyn Transport>, String> {
+            Ok(Box::new(ScriptTransport {
+                frames: self
+                    .sessions
+                    .pop_front()
+                    .ok_or("unexpected connection")?
+                    .into(),
+                sent: Rc::clone(&self.sent),
+                clock: self.clock.clone(),
+                fail_on_write: self.fail_on_write,
+            }))
+        }
+    }
+    pub fn connector(
+        sessions: Vec<Vec<Frame>>,
+        clock: &FakeClock,
+    ) -> (Box<dyn Connector>, Rc<RefCell<Vec<Frame>>>) {
+        scripted(sessions, clock, None)
+    }
+    pub fn failing_connector(
+        sessions: Vec<Vec<Frame>>,
+        clock: &FakeClock,
+        fail_on_write: usize,
+    ) -> (Box<dyn Connector>, Rc<RefCell<Vec<Frame>>>) {
+        scripted(sessions, clock, Some(fail_on_write))
+    }
+    fn scripted(
+        sessions: Vec<Vec<Frame>>,
+        clock: &FakeClock,
+        fail_on_write: Option<usize>,
+    ) -> (Box<dyn Connector>, Rc<RefCell<Vec<Frame>>>) {
+        let sent = Rc::new(RefCell::new(Vec::new()));
+        (
+            Box::new(ScriptConnector {
+                sessions: sessions.into(),
+                sent: Rc::clone(&sent),
+                clock: clock.clone(),
+                fail_on_write,
+            }),
+            sent,
+        )
+    }
+}

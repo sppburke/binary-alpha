@@ -2,7 +2,7 @@ mod common;
 
 use binary_alpha_app::broker::deriv::{DerivAccounts, DerivAuthenticated, DerivMarketData};
 use binary_alpha_app::broker::pocket_option::{PocketMarketData, provider_token, universal_micros};
-use binary_alpha_app::broker::transport::{Connector, Frame, Http, Transport, WebSocketConnector};
+use binary_alpha_app::broker::transport::{Connector, Frame, Http, WebSocketConnector};
 use binary_alpha_app::broker::wire::WireDecimal;
 use binary_alpha_app::broker::{
     Adapter, Cancellation, Clock, Continuity, HistoryPage, LiveEvent, MarketDataBroker, RateBudget,
@@ -19,11 +19,12 @@ use binary_alpha_engine::market::{
     InstrumentId, PriceScale, Tick, format_event_time_micros as time_text,
     parse_event_time_micros as time,
 };
-use binary_alpha_engine::stream::{InstrumentStream, Observation, Source};
+use binary_alpha_engine::stream::{Candle, Flags, InstrumentStream, Observation, Source};
 use common::Scratch;
+use common::broker::{FakeClock, connector};
 use serde::{Deserialize, de::DeserializeOwned};
 use serde_json::value::RawValue;
-use std::cell::{Cell, RefCell};
+use std::cell::RefCell;
 use std::collections::{BTreeMap, VecDeque};
 use std::fs;
 use std::path::Path;
@@ -42,6 +43,21 @@ fn fixture(name: &str) -> String {
     .unwrap()
     .trim_end()
     .to_string()
+}
+fn expected_rows(kind: &str, symbol: &str) -> Vec<Tick> {
+    fixture(&format!(
+        "expected-{kind}-{}.csv",
+        symbol.trim_start_matches('#')
+    ))
+    .lines()
+    .map(|line| {
+        let (time, price) = line.split_once(',').unwrap();
+        Tick {
+            event_time_micros: time.parse().unwrap(),
+            price_units: price.parse().unwrap(),
+        }
+    })
+    .collect()
 }
 fn raw(text: &str) -> Box<RawValue> {
     RawValue::from_string(text.into()).unwrap()
@@ -79,72 +95,6 @@ fn handshake() -> Vec<Frame> {
     .to_vec();
     frames.extend(attachment("updateAssets", fixture("pocket-assets.json")));
     frames
-}
-#[derive(Clone, Default)]
-struct FakeClock(Rc<Cell<i64>>);
-impl FakeClock {
-    fn at(value: i64) -> Self {
-        Self(Rc::new(Cell::new(value)))
-    }
-}
-impl Clock for FakeClock {
-    fn now_micros(&self) -> i64 {
-        self.0.get()
-    }
-    fn sleep(&mut self, micros: i64) {
-        self.0.set(self.0.get() + micros);
-    }
-}
-struct ScriptTransport {
-    frames: VecDeque<Frame>,
-    sent: Rc<RefCell<Vec<Frame>>>,
-    clock: FakeClock,
-}
-impl Transport for ScriptTransport {
-    fn send(&mut self, frame: Frame) -> Result<(), String> {
-        self.sent.borrow_mut().push(frame);
-        Ok(())
-    }
-    fn receive(&mut self, timeout: i64) -> Result<Option<Frame>, String> {
-        let frame = self.frames.pop_front();
-        self.clock.sleep(if frame.is_some() { 10 } else { timeout });
-        Ok(frame)
-    }
-    fn close(&mut self) -> Result<(), String> {
-        self.send(Frame::Close)
-    }
-}
-struct ScriptConnector {
-    sessions: VecDeque<Vec<Frame>>,
-    sent: Rc<RefCell<Vec<Frame>>>,
-    clock: FakeClock,
-}
-impl Connector for ScriptConnector {
-    fn connect(&mut self, _: &str, _: &[(String, String)]) -> Result<Box<dyn Transport>, String> {
-        Ok(Box::new(ScriptTransport {
-            frames: self
-                .sessions
-                .pop_front()
-                .ok_or("unexpected connection")?
-                .into(),
-            sent: Rc::clone(&self.sent),
-            clock: self.clock.clone(),
-        }))
-    }
-}
-fn connector(
-    sessions: Vec<Vec<Frame>>,
-    clock: &FakeClock,
-) -> (Box<dyn Connector>, Rc<RefCell<Vec<Frame>>>) {
-    let sent = Rc::new(RefCell::new(Vec::new()));
-    (
-        Box::new(ScriptConnector {
-            sessions: sessions.into(),
-            sent: Rc::clone(&sent),
-            clock: clock.clone(),
-        }),
-        sent,
-    )
 }
 fn id(broker: &str, symbol: &str) -> InstrumentId {
     InstrumentId {
@@ -801,6 +751,18 @@ fn both_live_adapters_feed_the_shared_stream_and_replay_identically() {
             observations.push(row);
         }
         for definition in &config.instruments {
+            let normalized = observations
+                .iter()
+                .filter(|row| row.instrument == definition.id())
+                .map(|row| Tick {
+                    event_time_micros: row.provider_time_micros,
+                    price_units: row.price_units,
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                normalized,
+                expected_rows("live", definition.provider_symbol.as_str())
+            );
             let replay = || {
                 let mut stream =
                     InstrumentStream::new(definition, stream_source(definition.price_scale))
@@ -823,7 +785,55 @@ fn both_live_adapters_feed_the_shared_stream_and_replay_identically() {
                 candles
             };
             let first = replay();
-            assert!(!first.is_empty(), "{}", definition.id());
+
+            let deriv = kind == "deriv";
+            let aapl = definition.provider_symbol.as_str() == "#AAPL_otc";
+            let (open, high, low, close) = match definition.provider_symbol.as_str() {
+                "R_50" => (918_608, 918_608, 918_608, 918_608),
+                "R_100" => (57_252, 57_252, 57_252, 57_252),
+                "EURUSD_otc" => (114_806, 114_808, 114_806, 114_808),
+                "#AAPL_otc" => (181_338, 181_338, 181_334, 181_334),
+                _ => unreachable!(),
+            };
+            let start = if deriv {
+                1_789_346_764_000_000
+            } else {
+                1_789_347_995_000_000
+            };
+            assert_eq!(
+                first[usize::from(!deriv)].1,
+                Candle {
+                    open_time_micros: start,
+                    close_time_micros: start + 1_000_000,
+                    known_at_micros: if deriv {
+                        start + 2_000_000
+                    } else {
+                        start + 1_061_000 + i64::from(aapl) * 1000
+                    },
+                    first_event_micros: if deriv { start } else { start + 61_000 },
+                    last_event_micros: if deriv { start } else { start + 561_000 },
+                    active_span_micros: if deriv { 0 } else { 500_000 },
+                    open_units: open,
+                    high_units: high,
+                    low_units: low,
+                    close_units: close,
+                    observations: if deriv { 1 } else { 2 },
+                    duplicates: 0,
+                    volume: None,
+                    gap_before_micros: if deriv { None } else { Some(500_000) },
+                    max_gap_inside_micros: if deriv { 0 } else { 500_000 },
+                    missing_buckets_before: 0,
+                    frozen_observations: 1,
+                    frozen_micros: 0,
+                    max_jump_basis_points: 0,
+                    max_delayed_jump_basis_points: 0,
+                    max_reopen_jump_basis_points: 0,
+                    flags: Flags {
+                        low_activity: true,
+                        ..Flags::default()
+                    },
+                }
+            );
             assert_eq!(first, replay());
             assert!(first.iter().any(|(_, candle)| candle.flags.low_activity));
             if kind == "deriv" {
@@ -1519,7 +1529,10 @@ fn binary_fetch_verify_and_inspect_both_providers_over_real_local_transports() {
             )
             .unwrap();
             assert_eq!(rows.len() as u64, manifest.row_count);
-            assert!(!rows.is_empty());
+            assert_eq!(
+                rows,
+                expected_rows("history", manifest.provider_symbol.as_str())
+            );
             let history = config.history.as_ref().unwrap();
             assert!(
                 rows.iter()
@@ -1594,22 +1607,30 @@ fn binary_fetch_verify_and_inspect_both_providers_over_real_local_transports() {
         } else {
             assert_eq!(discovery.result, "verified");
         }
+        let history_counts = report
+            .checks
+            .iter()
+            .filter(|check| check.name == "history")
+            .map(|check| check.detail.rows.unwrap())
+            .collect::<Vec<_>>();
         assert_eq!(
-            report
-                .checks
-                .iter()
-                .filter(|c| c.name == "history" && c.detail.rows.is_some_and(|rows| rows > 0))
-                .count(),
-            2
+            history_counts,
+            if kind == "deriv" {
+                vec![100, 100]
+            } else {
+                vec![1478, 3]
+            }
         );
         let live = report.checks.iter().find(|c| c.name == "live").unwrap();
-        assert!(
+        assert_eq!(
             live.detail
                 .counts
                 .as_ref()
                 .unwrap()
                 .values()
-                .all(|n| *n >= 2)
+                .copied()
+                .collect::<Vec<_>>(),
+            vec![2, 2]
         );
         let cancellation = report
             .checks
@@ -1874,4 +1895,151 @@ fn history_resume_is_bound_to_the_declared_provider_clock() {
         .find(|manifest| manifest.generation != original.generation)
         .unwrap();
     assert_ne!(source, read_coverage(&scratch, new).source_identity);
+}
+
+#[test]
+fn prefix_repair_preserves_verified_rows_and_repeats() {
+    for consistent in [false, true] {
+        let scratch = Scratch::new(&format!("phase10_prefix_repair_{consistent}"));
+        let config = test_config(&scratch, "deriv", "ws://127.0.0.1/", false);
+        let (local, destination) = stores(&scratch);
+        let verified = [(5, 100), (5, 100), (6, 101), (7, 102)];
+        let mut initial = Pages::new(vec![page(&verified), page(&[])]);
+        let mut clock = FakeClock::default();
+        fetch::pass(
+            &config,
+            &mut initial,
+            &local,
+            &destination,
+            &mut clock,
+            (0, 10_000_000),
+            &mut Vec::new(),
+        )
+        .unwrap();
+        let before = scratch.manifests("published");
+        let repair = if consistent {
+            vec![(0, 90), (5, 100), (5, 100), (6, 101), (7, 102)]
+        } else {
+            vec![(0, 90), (5, 100), (7, 102)]
+        };
+        let mut pages = Pages::new(vec![page(&repair)]);
+        let result = fetch::pass(
+            &config,
+            &mut pages,
+            &local,
+            &destination,
+            &mut clock,
+            (0, 10_000_000),
+            &mut Vec::new(),
+        );
+        if consistent {
+            result.unwrap();
+            let manifests = read_manifests(&scratch);
+            let manifest = manifests.last().unwrap();
+            assert_eq!(manifest.row_count, 5);
+            let normalized = manifest
+                .objects
+                .iter()
+                .find(|o| o.role == ObjectRole::Normalized)
+                .unwrap();
+            let mut rows = Vec::new();
+            archive::read_ticks_with(
+                &scratch.path("published").join(&normalized.key),
+                scale(4),
+                |row| {
+                    rows.push(row);
+                    Ok(())
+                },
+            )
+            .unwrap();
+            assert_eq!(rows, page(&repair).rows);
+            assert!(
+                verify::run(&destination.uri(&manifest.key()))
+                    .unwrap()
+                    .contains("rows 5")
+            );
+        } else {
+            assert!(result.unwrap_err().contains("inconsistent reread"));
+            assert_eq!(scratch.manifests("published"), before);
+        }
+    }
+}
+
+#[test]
+fn reused_history_is_published_to_the_current_destination() {
+    let scratch = Scratch::new("phase10_destination_switch");
+    let mut config = test_config(&scratch, "deriv", "ws://127.0.0.1/", false);
+    let (local, first) = stores(&scratch);
+    let second = Store::filesystem(scratch.path("destination-b"));
+    let mut clock = FakeClock::default();
+    fetch::pass(
+        &config,
+        &mut Pages::new(vec![range_page(0, 10)]),
+        &local,
+        &first,
+        &mut clock,
+        (0, 10_000_000),
+        &mut Vec::new(),
+    )
+    .unwrap();
+    config.storage.publication_uri = second.uri("").parse().unwrap();
+    let mut no_refetch = Pages::new(vec![]);
+    fetch::pass(
+        &config,
+        &mut no_refetch,
+        &local,
+        &second,
+        &mut clock,
+        (0, 10_000_000),
+        &mut Vec::new(),
+    )
+    .unwrap();
+    assert!(no_refetch.anchors.is_empty());
+    let manifest = read_manifests(&scratch).remove(0);
+    for object in &manifest.objects {
+        assert!(second.head(&object.key).unwrap().is_some());
+    }
+    assert!(second.head(&manifest.key()).unwrap().is_some());
+    assert!(
+        verify::run(&second.uri(&manifest.key()))
+            .unwrap()
+            .contains("rows 10")
+    );
+}
+
+#[test]
+fn inspection_caps_each_instrument_during_uneven_arrivals() {
+    let scratch = Scratch::new("phase10_inspection_uneven");
+    let mut config = test_config(&scratch, "deriv", "ws://127.0.0.1/", true);
+    config.inspect.as_mut().unwrap().live_observations = 1;
+    let mut clock = FakeClock::default();
+    let frames = vec![
+        frame("deriv-rate-limit.json", 1),
+        frame("deriv-contracts_for-R_50.json", 2),
+        frame("deriv-history-R_50.json", 3),
+        frame("deriv-contracts_for-R_100.json", 4),
+        frame("deriv-history-R_100.json", 5),
+        frame("deriv-tick-R_50.json", 6),
+        frame("deriv-tick-R_50.json", 6),
+        frame("deriv-tick-R_50.json", 6),
+        frame("deriv-tick-R_100.json", 7),
+        frame("deriv-forget.json", 8),
+    ];
+    let (connector, _) = connector(vec![frames], &clock);
+    let mut adapter = Adapter::Deriv(
+        DerivMarketData::connect(&deriv_settings(), connector, Box::new(clock.clone())).unwrap(),
+    );
+    let report = binary_alpha_app::inspect::observe(&config, &mut adapter, &mut clock).unwrap();
+    let live = report
+        .checks
+        .iter()
+        .find(|check| check.name == "live")
+        .unwrap();
+    let binary_alpha_app::inspect::InspectionDetail::Live { counts } = &live.detail else {
+        panic!("{live:?}")
+    };
+    assert_eq!(
+        counts,
+        &BTreeMap::from([("deriv:R_50".into(), 1), ("deriv:R_100".into(), 1)])
+    );
 }

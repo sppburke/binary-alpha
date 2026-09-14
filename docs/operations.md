@@ -19,7 +19,9 @@ credential, the configuration names a reference and the application resolves it 
 environment or an authorized secret store at run time; the Google Cloud Storage client uses
 Application Default Credentials and the configuration names only the bucket and prefix. Credentials, broker and account material,
 proprietary source data, locked holdout, completed evidence, and production cloud state are protected
-state.
+state. Broker `credential` fields name process environment variables. Deriv resolves a bearer token;
+Pocket Option resolves the complete opaque JSON authentication object. Keep values out of
+configuration, logs and evidence. Credential renewal is an operator action.
 
 ## Artifact ownership
 
@@ -30,8 +32,7 @@ checkpoint. A completed evidence identity is never overwritten.
 
 ## Historical data
 
-`storage.historical_data_dir` names the retained local copy shared by `data import` and the later
-history downloaders; `storage.publication_uri` names the durable destination (see
+`storage.historical_data_dir` names the retained local copy shared by `data import` and `data fetch`; `storage.publication_uri` names the durable destination (see
 [docs/contracts.md](contracts.md), section "Historical datasets"). The Google client resolves
 Application Default Credentials from the process environment; the configuration carries only the
 bucket and prefix. A `file://` destination is the non-live test boundary, accepted only under
@@ -45,6 +46,21 @@ the ready manifest is published last and mirrored locally. The command is resuma
 after an interruption at any point reuses identical existing objects, finishes the missing ones, and
 completes the local mirror; different content at an existing key stops the command without replacing
 either copy. No quiescence is required; readers of the source files continue during import.
+
+Fetch: configure `[[brokers]]`, tick `[[instruments]]`, `[history]`, the retained folder and destination.
+Choose a finite `[start,end)` and optionally `refresh_interval_seconds`, then, with authorization for
+the exact provider/account/action, run `binary-alpha data fetch --config PATH`. Refresh runs in the
+foreground with one fixed end per pass and no overlapping passes. Reports distinguish actual data,
+verified coverage and shortfall. Stopping preserves verified work; rerunning resumes it and reuses
+retained objects through manifest-last publication. Overlapping repair must agree with every verified
+observation and repeat. Removing `[history]` restores the offline import/audit workflow.
+
+Inspect: after authorization for the exact provider, account and non-purchasing checks, configure
+`[inspect]` and run `binary-alpha broker inspect --config PATH`. It checks bounded history and live
+subscriptions/cancellation; credentialed Deriv also checks balance, transaction acknowledgement and
+optional CALL/PUT proposal economics. It never buys. Retain the report at its printed `inspection URI`
+and its local content-addressed copy; an unavailable check is not external acceptance. Schema-2
+execution fixtures prove the library boundary only; deployment and durable dispatch remain Phase 12.
 
 Verify: `binary-alpha data verify --manifest URI` re-reads one generation from its ready manifest and
 objects alone, from either the destination or the retained mirror.
@@ -135,7 +151,7 @@ service, runner, and secret.
 ## Rollback
 
 A repository change rolls back by reverting its merge commit. Published dataset, stream, feature,
-outcome, and replay generations are
+outcome, broker-history, and replay generations are
 immutable and are never deleted by rollback; the retained historical-data folder and the original
 source files stay intact, and a consumer selects the prior generation by its identity. Schema, broker, and other production state do not exist at this phase; the
 phase that creates any of them records its own cause-specific verification and rollback before it
@@ -148,3 +164,5 @@ resumption, verifies the cause-specific result, and retains rollback.
 Every plan and delivery report states production operator tasks and linked matching Sentry issues,
 using `none` where evidence proves none. Reporting does not create a Sentry project or integration.
 An already linked matching Sentry issue is closed only after deployed proof, with no waiting period.
+
+Production operator tasks: none. Linked matching Sentry issues: none.

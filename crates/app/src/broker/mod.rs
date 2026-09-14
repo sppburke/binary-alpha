@@ -8,8 +8,12 @@ use std::collections::VecDeque;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 pub use binary_alpha_engine::config::BrokerKind;
-use binary_alpha_engine::config::{Broker, Config, RateBudgets, RateLimit};
-use binary_alpha_engine::market::{InstrumentId, PriceScale, Tick};
+use binary_alpha_engine::config::{AccountClass, Broker, Config, RateBudgets, RateLimit};
+use binary_alpha_engine::execution::{
+    BrokerLiability, CashFact, ContractSemantics, Decimal, Direction, EventSource, Proposal,
+    Settlement, TerminalFact,
+};
+use binary_alpha_engine::market::{BrokerId, Currency, InstrumentId, PriceScale, Tick};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
@@ -325,4 +329,91 @@ pub fn connect(config: &Config) -> Result<Adapter, String> {
             ))
         }
     }
+}
+
+/// The configured account identity; provider login identifiers stay inside the adapter.
+#[derive(Debug, Clone)]
+pub struct AccountIdentity {
+    pub broker: BrokerId,
+    pub account: String,
+    pub class: AccountClass,
+    pub currency: Currency,
+}
+#[derive(Debug, Clone)]
+pub struct ProposalRequest {
+    pub binding: String,
+    pub instrument: InstrumentId,
+    pub scale: PriceScale,
+    pub direction: Direction,
+    pub duration_seconds: u32,
+    pub stake: Decimal,
+    pub currency: Currency,
+    pub semantics: ContractSemantics,
+    pub settlement: Settlement,
+}
+#[derive(Debug, Clone)]
+pub struct PreparedPurchase {
+    pub dispatch_claim: String,
+    pub command: String,
+    pub proposal_identity: String,
+    pub maximum_price: Decimal,
+}
+#[derive(Debug, Clone)]
+pub enum PurchaseOutcome {
+    Accepted {
+        debit: Decimal,
+        liability: BrokerLiability,
+    },
+    Rejected {
+        code: String,
+        message: String,
+    },
+    ProvenNotSent {
+        reason: String,
+    },
+    PossiblySent {
+        reason: String,
+    },
+}
+/// Confirmed facts with provider provenance, ready for the single Engine mapping.
+#[derive(Debug, Clone)]
+pub enum AccountEvent {
+    TransactionAcknowledged,
+    Cash(CashFact),
+    ContractUpdate {
+        contract_ref: String,
+        source: EventSource,
+        entry_price_units: Option<i64>,
+        entry_time_micros: Option<i64>,
+        start_micros: Option<i64>,
+        expiry_micros: Option<i64>,
+    },
+    Terminal {
+        contract_ref: String,
+        source: EventSource,
+        fact: TerminalFact,
+    },
+}
+#[derive(Debug, Clone)]
+pub struct OpenContract {
+    pub contract_ref: String,
+    pub transaction_ref: String,
+    pub buy_price: Decimal,
+    pub payout: Decimal,
+    pub purchase_time_micros: i64,
+    pub start_micros: Option<i64>,
+    pub expiry_micros: Option<i64>,
+    pub instrument: String,
+    pub direction: Direction,
+}
+pub trait OptionsBroker {
+    fn account(&self) -> &AccountIdentity;
+    fn balance(&mut self) -> Result<Decimal, String>;
+    fn subscribe_transactions(&mut self) -> Result<(), String>;
+    fn proposal(&mut self, request: &ProposalRequest, receipt: i64) -> Result<Proposal, String>;
+    fn purchase(&mut self, prepared: &PreparedPurchase) -> Result<PurchaseOutcome, String>;
+    fn subscribe_contract(&mut self, contract_ref: &str) -> Result<(), String>;
+    fn next_account_event(&mut self, timeout_micros: i64) -> Result<Option<AccountEvent>, String>;
+    fn open_contracts(&mut self) -> Result<Vec<OpenContract>, String>;
+    fn statement(&mut self, from_secs: i64, through_secs: i64) -> Result<Vec<CashFact>, String>;
 }

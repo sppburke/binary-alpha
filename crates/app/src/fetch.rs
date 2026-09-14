@@ -233,6 +233,20 @@ pub fn prepend_page(mut older: Vec<Tick>, newer: Vec<Tick>) -> Vec<Tick> {
     older
 }
 
+fn publish_retained(
+    manifest: &GenerationManifest,
+    local: &Store,
+    destination: &Store,
+) -> Result<(), String> {
+    let identities = manifest
+        .objects
+        .iter()
+        .map(|object| store::identify(&local.local_path(&object.key).expect("local mirror")))
+        .collect::<Result<Vec<_>, _>>()?;
+    import::publish_generation(manifest.clone(), &identities, local, destination)?;
+    Ok(())
+}
+
 pub fn pass(
     config: &Config,
     broker: &mut dyn MarketDataBroker,
@@ -287,6 +301,7 @@ pub fn pass(
             let prior = prior
                 .as_ref()
                 .expect("only prior coverage can exhaust the range");
+            publish_retained(&prior.manifest, local, destination)?;
             let line = report(
                 &instrument,
                 history.role,
@@ -407,30 +422,42 @@ pub fn pass(
                 },
             )?;
             repeats_prior = rows == previous_rows;
-            // A repaired leading shortfall may re-read the previous suffix. Check prices before replacing that covered segment.
-            let old_prices: std::collections::BTreeMap<_, _> = previous_rows
-                .iter()
-                .map(|row| (row.event_time_micros, row.price_units))
-                .collect();
-            for row in &rows {
-                if old_prices
-                    .get(&row.event_time_micros)
-                    .is_some_and(|price| *price != row.price_units)
+            if let (Some(first), Some(last), Some(old_first), Some(old_last)) = (
+                rows.first(),
+                rows.last(),
+                previous_rows.first(),
+                previous_rows.last(),
+            ) {
+                let start = first.event_time_micros.max(old_first.event_time_micros);
+                let end = last.event_time_micros.min(old_last.event_time_micros);
+                let overlap =
+                    |row: &&Tick| row.event_time_micros >= start && row.event_time_micros <= end;
+                if !rows
+                    .iter()
+                    .filter(overlap)
+                    .eq(previous_rows.iter().filter(overlap))
                 {
                     return Err(format!(
-                        "fetch {instrument}: conflicting observation with prior generation"
+                        "fetch {instrument}: conflicting or inconsistent reread of verified observations"
                     ));
                 }
             }
-            if let Some(first) = rows.first() {
-                previous_rows.retain(|row| {
-                    row.event_time_micros < first.event_time_micros
-                        || row.event_time_micros >= requested.1
-                });
-            }
         }
-        rows.extend(previous_rows);
-        rows.sort_by_key(|row| row.event_time_micros);
+        if let Some(last) = previous_rows.last() {
+            let suffix = rows.split_off(
+                rows.partition_point(|row| row.event_time_micros <= last.event_time_micros),
+            );
+            rows = if rows
+                .first()
+                .zip(previous_rows.first())
+                .is_some_and(|(new, old)| new.event_time_micros <= old.event_time_micros)
+            {
+                prepend_page(rows, previous_rows)
+            } else {
+                previous_rows
+            };
+            rows = prepend_page(rows, suffix);
+        }
         let verified = if new_count == 0 {
             prior
                 .as_ref()
@@ -471,6 +498,7 @@ pub fn pass(
             let prior = prior.as_ref().expect("no change has a prior generation");
             coverage = prior.coverage.clone();
             coverage.requested = Range::new(requested.0, requested.1);
+            publish_retained(&prior.manifest, local, destination)?;
             let line = report(
                 &instrument,
                 history.role,

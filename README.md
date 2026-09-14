@@ -12,10 +12,11 @@ The configuration vocabulary freezes four run modes: `research`, `replay`, `pape
 imports existing historical data into immutable published generations, audits each published
 generation through its configured instrument stream into a profile and finalized causal candles,
 builds feature and future-only outcome generations, replays governed historical inputs through the
-one execution engine into a reconstructable financial ledger, and verifies every kind of
-generation. The accelerator supplies thirteen retained device kernels and their deterministic
+one execution engine into a reconstructable financial ledger, runs candidate search and portfolio
+selection, and verifies every kind of generation. It also supports bounded broker history downloads,
+optional foreground refresh passes, live market subscriptions and non-purchasing broker inspection. The accelerator supplies thirteen retained device kernels and their deterministic
 central-processor references; it has no production consumer. The checkout executes no live, paper,
-or broker mode. Browser-driven operation, click execution, and any live, paper, certification,
+or production trading action. Browser-driven operation, click execution, and any live, paper, certification,
 deployment, or production action without its own authorization are unsupported.
 
 ## Build and entry points
@@ -27,6 +28,8 @@ BINARY_ALPHA_NVCC=/home/sean/.local/cuda/13.4.1/bin/nvcc BINARY_ALPHA_HOST_COMPI
 cargo run --locked -p binary-alpha-app -- --help
 cargo run --locked -p binary-alpha-app -- config validate --config configs/example.toml
 cargo run --release --locked -p binary-alpha-app -- data import --config PATH
+cargo run --release --locked -p binary-alpha-app -- data fetch --config PATH
+cargo run --release --locked -p binary-alpha-app -- broker inspect --config PATH
 cargo run --release --locked -p binary-alpha-app -- data audit --config PATH --manifest URI
 cargo run --release --locked -p binary-alpha-app -- data verify --manifest URI
 cargo run --release --locked -p binary-alpha-app -- features build --config PATH
@@ -58,6 +61,10 @@ evaluates, and resamples one candidate family and publishes it; `binary-alpha po
 replays each one jointly per inner fold through the engine, selects under the frozen objective,
 refits, optionally evaluates once, and publishes one selection generation; `binary-alpha data
 verify --manifest URI` re-reads one generation of any kind from its manifest and objects alone.
+`binary-alpha data fetch --config PATH` downloads the `[history]` selection through either compiled
+broker into the same retained folder and immutable generations. `binary-alpha broker inspect
+--config PATH` records bounded discovery, history, live/cancellation and configured account/proposal
+checks without purchasing. Both external commands require authorization for their exact action.
 Every command is documented in [docs/contracts.md](docs/contracts.md) and
 [docs/operations.md](docs/operations.md). The example
 configuration retains data in the repository-local `historical_data/` folder, which Git ignores,
@@ -101,6 +108,7 @@ The authorized offline setup and runner rollback are recorded in [operations](do
 | --- | --- |
 | `crates/engine` | Package `binary-alpha-engine`: configuration validation and identity, immutable tick and bar records, dataset roles and capabilities, generation identity, ready manifests, the instrument stream with its profile, candles, and stream manifest, the feature engine and frozen plans, future-only outcome labels, and the execution engine with exact money, its ledger, and its summaries. No files, network, cloud, broker, command-line, or device calls. |
 | `crates/app` | Package `binary-alpha-app`: the `binary-alpha` executable, configuration loading, historical-data import, instrument audit, feature and outcome builds, replay, verification, Parquet input and output, the filesystem and Google Cloud Storage artifact stores, and all other external adapters. |
+| `crates/app/schemas` | Pinned used Deriv schema subset, release and digest provenance; no build-time download. |
 | `crates/accelerator` | Package `binary-alpha-accelerator`: the thirteen retained device kernels, the ahead-of-time CUDA build behind the `cuda` feature, the device host over cudarc, and the central-processor reference of every kernel. No engine or application dependency. |
 | `configs/example.toml` | The checked-in example configuration; it contains only implemented fields, one instrument, and no credentials. |
 | `docs/` | [architecture](docs/architecture.md), [contracts](docs/contracts.md), [migration map](docs/migration-map.md), and [operations](docs/operations.md). |
@@ -149,6 +157,6 @@ compilation is not used. Build flags retain `--std=c++11` without fast math.
 7. [#8](https://github.com/sppburke/binary-alpha/issues/8) Phase 07 — Preserve and port every existing NVIDIA CUDA kernel behind Rust
 8. [#9](https://github.com/sppburke/binary-alpha/issues/9) Phase 08 — Build candidate search, chronological evaluation, model-based statistical scores, and stability analysis
 9. [#10](https://github.com/sppburke/binary-alpha/issues/10) Phase 09 — Unify repair, portfolio selection, and risk tuning
-10. [#11](https://github.com/sppburke/binary-alpha/issues/11) Phase 10 — Add broker-neutral direct WebSocket contracts and a Deriv adapter
+10. [#11](https://github.com/sppburke/binary-alpha/issues/11) Phase 10 — Pocket Option and Deriv history and live feeds, plus Deriv execution
 11. [#12](https://github.com/sppburke/binary-alpha/issues/12) Phase 11 — Deliver one-command research, optimization, and locked-holdout certification
 12. [#13](https://github.com/sppburke/binary-alpha/issues/13) Phase 12 — Ship one ordered browser-free live runtime and resumable cutover

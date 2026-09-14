@@ -1,11 +1,15 @@
-use crate::broker::deriv::{Balance, ContractAvailability, DerivAccounts, DerivAuthenticated};
+use crate::broker::deriv::{Balance, ContractAvailability, DerivAccounts, DerivOptions};
 use crate::broker::transport::{WebSocketConnector, endpoint_host};
 use crate::broker::{
-    self, Adapter, Cancellation, Clock, Continuity, DiscoveredInstrument, LiveEvent, SystemClock,
+    self, AccountEvent, AccountIdentity, Adapter, Cancellation, Clock, Continuity,
+    DiscoveredInstrument, LiveEvent, OptionsBroker, ProposalRequest, SystemClock,
 };
-use crate::store::{self, Store};
+use crate::store::Store;
 use binary_alpha_engine::config::{Broker, Config};
 use binary_alpha_engine::dataset::{NativeGranularity, object_key};
+use binary_alpha_engine::execution::{
+    ContractSemantics, Decimal, Direction, Settlement, SettlementRule,
+};
 use binary_alpha_engine::market::{InstrumentId, format_event_time_micros};
 use serde::Serialize;
 use std::collections::BTreeMap;
@@ -52,6 +56,15 @@ pub enum InspectionDetail {
     },
     Balance {
         balance: Balance,
+    },
+    TransactionAcknowledged,
+    Proposal {
+        direction: Direction,
+        ask_price: Decimal,
+        payout: Decimal,
+        spot: String,
+        spot_time: String,
+        longcode: String,
     },
     AccountClass {
         account_class: String,
@@ -105,21 +118,46 @@ pub fn run(config_path: &Path, out: &mut dyn Write) -> Result<(), String> {
         .expect("validated broker");
     match settings {
         Broker::Deriv(settings) if settings.credential.is_some() => {
-            let balance = (|| {
+            let authenticated = (|| {
                 let connector = WebSocketConnector::new()?;
                 let mut http = connector.http();
                 let address = DerivAccounts::resolve(settings, &mut http)?;
-                let mut authenticated = DerivAuthenticated::connect(
+                let account = AccountIdentity {
+                    broker: settings.id.clone(),
+                    account: "inspection".into(),
+                    class: address.account_class,
+                    currency: address.currency.clone(),
+                };
+                let instruments = history
+                    .instruments
+                    .iter()
+                    .map(|symbol| {
+                        let id = InstrumentId {
+                            broker: history.broker.clone(),
+                            provider_symbol: symbol.clone(),
+                        };
+                        let scale = config
+                            .instrument(&id, NativeGranularity::Tick)
+                            .expect("validated instrument")
+                            .price_scale;
+                        (id, scale)
+                    })
+                    .collect::<Vec<_>>();
+                DerivOptions::connect(
                     address,
+                    account,
+                    &instruments,
                     Box::new(connector),
                     Box::new(SystemClock),
                     settings.budgets.clone().unwrap_or_default(),
-                )?;
-                Ok(InspectionDetail::Balance {
-                    balance: authenticated.balance()?,
-                })
+                )
             })();
-            report.check("authentication", None, balance);
+            match authenticated {
+                Ok(mut authenticated) => {
+                    observe_account(&config, &mut authenticated, &mut SystemClock, &mut report)
+                }
+                Err(error) => report.check("authentication", None, Err(error)),
+            }
         }
         Broker::PocketOption(settings) => report.check(
             "authentication",
@@ -130,17 +168,6 @@ pub fn run(config_path: &Path, out: &mut dyn Write) -> Result<(), String> {
         ),
         _ => (),
     }
-    if config
-        .inspect
-        .as_ref()
-        .is_some_and(|inspect| inspect.proposal.is_some())
-    {
-        report.check(
-            "proposal",
-            None,
-            Err("proposal inspection is unavailable in this build".into()),
-        );
-    }
     let local = Store::filesystem(
         config_path
             .parent()
@@ -149,6 +176,94 @@ pub fn run(config_path: &Path, out: &mut dyn Write) -> Result<(), String> {
     );
     let destination = Store::open(&config.storage.publication_uri)?;
     publish(&report, &local, &destination, out)
+}
+
+/// Checks authenticated economics without preparing or purchasing an order.
+pub fn observe_account(
+    config: &Config,
+    options: &mut DerivOptions,
+    clock: &mut dyn Clock,
+    report: &mut InspectionReport,
+) {
+    let balance = options.balance().map(|amount| InspectionDetail::Balance {
+        balance: Balance {
+            amount,
+            currency: options.account().currency.clone(),
+            account_class: options.account().class,
+        },
+    });
+    let ready = balance.is_ok();
+    report.check("authentication", None, balance);
+    if !ready {
+        return;
+    }
+    let acknowledgement = (|| {
+        options.subscribe_transactions()?;
+        match options.next_account_event(20_000_000)? {
+            Some(AccountEvent::TransactionAcknowledged) => {
+                Ok(InspectionDetail::TransactionAcknowledged)
+            }
+            _ => Err("deriv transaction: subscription acknowledgement missing".into()),
+        }
+    })();
+    let ready = acknowledgement.is_ok();
+    report.check("transactions", None, acknowledgement);
+    if !ready {
+        return;
+    }
+    let Some(proposal) = config
+        .inspect
+        .as_ref()
+        .and_then(|inspect| inspect.proposal.as_ref())
+    else {
+        return;
+    };
+    let history = config.history.as_ref().expect("validated history");
+    for symbol in &history.instruments {
+        let instrument = InstrumentId {
+            broker: history.broker.clone(),
+            provider_symbol: symbol.clone(),
+        };
+        let definition = config
+            .instrument(&instrument, NativeGranularity::Tick)
+            .expect("validated instrument");
+        for direction in [Direction::Buy, Direction::Sell] {
+            let request = ProposalRequest {
+                binding: format!("inspection:{instrument}:{direction}"),
+                instrument: instrument.clone(),
+                scale: definition.price_scale,
+                direction,
+                duration_seconds: proposal.duration_seconds,
+                stake: proposal.stake,
+                currency: options.account().currency.clone(),
+                semantics: ContractSemantics::RiseFallStrictV1,
+                settlement: Settlement {
+                    rule: SettlementRule::BrokerAuthoritativeV1,
+                    max_settlement_delay_micros: 0,
+                    max_tick_gap_micros: 0,
+                },
+            };
+            let result = options.proposal(&request, clock.now_micros()).map(|quote| {
+                InspectionDetail::Proposal {
+                    direction,
+                    ask_price: quote.terms.quoted_cost,
+                    payout: quote.terms.win.gross_return,
+                    spot: options
+                        .proposal_details(&quote.identity)
+                        .expect("issued proposal")
+                        .0
+                        .into(),
+                    spot_time: format_event_time_micros(quote.spot_time_micros),
+                    longcode: options
+                        .proposal_details(&quote.identity)
+                        .expect("issued proposal")
+                        .1
+                        .into(),
+                }
+            });
+            report.check("proposal", Some(instrument.to_string()), result);
+        }
+    }
 }
 
 /// Runs the finite market checks against the same adapter used by fetch.
@@ -346,7 +461,9 @@ fn collect(
                     let count = counts
                         .get_mut(&observation.instrument.to_string())
                         .ok_or("inspect: unexpected live instrument")?;
-                    *count += 1;
+                    if maximum.is_none_or(|limit| *count < limit) {
+                        *count += 1;
+                    }
                 }
             }
         }
@@ -369,7 +486,7 @@ pub fn publish(
     let inspection = format!("inspections/{}-{}.json", report.started, report.broker);
     binary_alpha_engine::config::relative_path(&inspection)?;
     // put_new also protects an already completed inspection identity.
-    local.put_new(&inspection, &path, &store::identify(&path)?)?;
+    local.put_new(&inspection, &path, &identity)?;
     destination.put_new(&key, &path, &identity)?;
     for check in &report.checks {
         writeln!(

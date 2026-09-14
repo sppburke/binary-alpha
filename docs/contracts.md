@@ -1,10 +1,10 @@
 # System contracts
 
-These contracts bind every phase of Binary Alpha. The current checkout implements the
-[configuration](#configuration), [historical datasets](#historical-datasets),
-[instrument streams](#instrument-streams), [feature plans](#feature-plans), and
-[outcomes](#outcomes) sections; the other sections are frozen now so that later phases implement them once, in one place, without
-reinterpretation. Specification intent, checkout
+These contracts bind every phase of Binary Alpha. The current checkout implements configuration,
+historical datasets, causal instrument streams, features and outcomes, the shared execution engine,
+NVIDIA CUDA kernels, candidate search and portfolio selection, and the Phase 10 broker adapters,
+history acquisition and non-purchasing inspection. It has no live, paper, or production execution
+runtime. Specification intent, checkout
 implementation, observed runtime state, immutable measured artifacts, and hosted Git state are
 distinct kinds of truth and are never substituted for one another.
 
@@ -109,12 +109,46 @@ and content hash; the application package owns reading it from a path.
 | `storage.historical_data_dir` | string | a non-empty path of the retained historical-data folder; a relative path resolves against the configuration file's directory |
 | `storage.publication_uri` | string | `gs://BUCKET` or `gs://BUCKET/PREFIX` in every run mode; `file:///ABSOLUTE/DIR` only with `run_mode = "research"`, as the non-live test boundary |
 | `import.sources` | array of tables | optional; consumed only by `data import`, which requires at least one entry |
-| `instruments` | array of tables | optional; consumed only by `data audit`, which requires the entry that maps the audited generation |
+| `instruments` | array of tables | optional; maps audit generations and selected broker history/live instruments |
 | `features.instruments` | array of tables | optional; consumed only by `features build`, which requires at least one entry |
 | `outcomes` | table | optional; consumed only by `outcomes build`, which requires it |
+| `replay` | table | optional; historical simulation through `replay`, with exact contracts, envelopes and risk policies described under [Execution](#execution) |
 | `accelerator.backend` | string | optional section; explicit offline backend `cpu` or `cuda` |
 | `search` | table | optional; consumed only by `search`, which requires it |
 | `portfolio` | table | optional; consumed only by `portfolio optimize`, which requires it |
+| `brokers` | array of tables | optional; unique broker ids and compiled `deriv` or `pocket_option` connection settings |
+| `history` | table | optional; required by `data fetch` and `broker inspect` |
+| `inspect` | table | optional; required by `broker inspect` |
+
+The optional broker tables follow `portfolio` in canonical order: `[[brokers]]`, `[history]`,
+then `[inspect]`. All reject unknown fields and are omitted when absent, preserving existing
+configuration hashes. Every broker entry starts with `kind` and then `id`. A Deriv entry then
+contains `public_endpoint`, `bootstrap_endpoint`, `app_id`, optional `credential`, optional
+`account_class` (`demo` or `real`, required with a credential), and optional `budgets`.
+`app_id` is a non-secret application identifier sent as `Deriv-App-ID` during bootstrap.
+`budgets` contains `trade`, `account`, `portfolio`, and `other`, each with positive `per_minute`
+and `per_hour` no greater than the limits in [Broker access](#broker-access); absence uses those
+limits. A Pocket Option entry instead contains `endpoint`, optional `origin`, required
+`credential`, `account_class` (`demo` or `real`), and `server_offset_minutes` (no default).
+Credentials are environment-variable names, never their values.
+
+`history` declares `broker`, a nonempty unique list of provider-symbol `instruments`, `role`
+(`development` or `evaluation`; `holdout` is rejected), `start`, `end`, and optional positive
+`refresh_interval_seconds`. Start and end are universal-time text forming a nonempty half-open
+range. Every selection must resolve to a declared broker and a matching `[[instruments]]` entry
+with tick native granularity. `inspect` declares positive `live_observations` and `live_seconds`,
+then optional `proposal = { stake = "10", duration_seconds = 15 }` with positive exact stake and
+duration. Proposal inspection requires the history broker to support execution and have a
+credential reference. Capability checks run during application configuration loading, before
+connection. `ws://` and `http://` endpoints are permitted only under `run_mode = "research"`;
+otherwise WebSocket endpoints use `wss://` and the bootstrap uses `https://`.
+
+The new execution fields retain their enclosing records' canonical order:
+`replay.contracts[].semantics` follows `settlement`,
+`replay.bindings[].envelope.semantics` follows `settlement_rule`, and
+`replay.risk_policies[].max_proposal_age_micros` follows `pause`. They are optional and omitted
+when absent. Broker-authoritative bindings require `rise_fall_strict_v1` in both contract and
+envelope, and a finite non-negative local proposal-age limit; historical bindings omit semantics.
 
 Every `import.sources` entry declares `kind`, `path` (a relative path resolves against the
 configuration file's directory), `broker`, and `role` (`development` or `evaluation`; `holdout` is
@@ -200,22 +234,18 @@ admit, or settle Engine observations.
 
 Every field is required and has no default, except that the `import` table, the `provenance`
 list, the `instruments` list, the `features` table, the `outcomes` table, the `accelerator`
-table, and the optional
+table, the `replay`, `search`, `portfolio`, `brokers`, `history`, and `inspect` sections, and the optional
 instrument and feature fields named above may be absent. Any
 other field is rejected as unknown, so a raw secret value has no place to live. Validation opens
 no source or destination and mutates nothing.
 
 ### Deferred entries
 
-The envelope will also carry lists of brokers, accounts, feature definitions, contract terms,
-research splits, objectives, risk policies, and live settings. The phase that first consumes each
-one adds it to the table above together with its
-validation: neutral typed identifiers rather than strings with implicit meaning; durations and times
-with explicit units; currency-bearing exact amounts parsed from decimal text without binary floating
-point; credentials only as references that the application resolves outside the document; and
-rejection of duplicate identifiers, invalid references, unsupported combinations, and any value that
-would relax causal ordering, holdout isolation, or a financial invariant. None of these exists in
-the current checkout.
+Live runtime settings and terminal certification grants remain deferred to their owning phases.
+Broker connections, funded accounts, features, contract terms, research splits, objectives, and
+risk policies already have implemented owners. New fields must retain neutral typed identifiers,
+explicit durations and clocks, exact currency-bearing amounts, credential references, and rejection
+of unsupported combinations; none may relax causality, holdout isolation, or financial invariants.
 
 ### Run modes
 
@@ -223,7 +253,9 @@ A run mode selects capabilities and input or output, never semantics. `research`
 evaluation, optimization, and, under a separate operator grant, locked-holdout certification;
 `replay` drives the live runtime from a recorded event log without broker mutation; `paper` runs the
 live path without real orders; `live` places real orders under its own authorization. The current
-checkout validates the value and executes no mode.
+checkout implements offline research, historical replay, bounded broker history downloads, live
+market subscriptions and non-purchasing inspection. It provides no live, paper, production execution,
+or locked-holdout certification entry point.
 
 ### Canonical form
 
@@ -290,7 +322,7 @@ provider symbol contain no ASCII control character.
 The ready manifest is pretty-printed JSON with two-space indentation, keys in the order below, and
 one trailing line feed. It records `schema_version` (`1`); `generation`; `broker`; `provider_symbol`;
 `instrument` (`BROKER:PROVIDER_SYMBOL`); `role`; `source_kind` (`tick_csv`, `tick_parquet_daily`,
-or `bar_parquet`);
+`bar_parquet`, or `broker_history`);
 `native_granularity` (`{"kind": "tick"}` or `{"kind": "bar", "period_seconds": N}`); `time_unit`
 (`microsecond` for ticks, `second` for bars); `price_representation`
 (`{"kind": "integer_units", "scale": N}` or `{"kind": "binary_float64"}`); `coverage` with
@@ -398,6 +430,97 @@ other kind is rejected.
 `data import`, `data audit`, and `data verify` exit with status 0 on success and, on any failure,
 write nothing further to standard output, write one diagnostic to standard error, and exit with
 status 1. None removes source files, retained objects, or published objects.
+
+## Broker access
+
+`crates/app/src/broker` owns synchronous market-data and options method groups over the shared
+WebSocket transport. Engine records remain neutral; only app wire readers know provider fields.
+
+| Adapter | History | Live market data | Options execution contract |
+| --- | --- | --- | --- |
+| `deriv` | raw ticks | ticks, acknowledged cancellation | proposals, claimed purchases, account transactions, contract facts, portfolio and statement |
+| `pocket_option` | raw ticks | streams, cancellation sent without acknowledgement | unsupported |
+
+The Deriv public connection supplies discovery, tick history and subscriptions. Authenticated
+connections first GET `{bootstrap_endpoint}/accounts` with a resolved bearer credential and
+`Deriv-App-ID`, select the single active account of the declared class, then POST
+`{bootstrap_endpoint}/accounts/{account_id}/otp` without a body and connect directly to the returned
+address. Its path must be `/trading/v1/options/ws/{account_class}`. The adapter checks account and
+currency on balance, and currency on account events; provider login ids and authenticated addresses
+stay private. Numeric fields are decoded from original bytes with `RawValue` and the shared exact
+Decimal/price-unit readers. Outgoing amounts are unquoted exact tokens. Used handwritten structures
+are pinned to `crates/app/schemas/deriv/production_v20260819_0`; its source inventory records the
+release, archive digest, selected fields and absence of an upstream license statement. Builds do
+not download schemas. Discovery returning `RateLimit` is unavailable evidence, never a successful
+instrument inventory. Targeted `contracts_for` preserves the observed CALL/PUT `barriers:1` mapping.
+
+Pocket Option uses the configured WebSocket address verbatim, including the operator-supplied
+`EIO=4&transport=websocket` query. Socket.IO framing is the observed `0` opening, `40` namespace,
+`42` event and single `451-` binary attachment subset. Text heartbeat `2` answers `3`; WebSocket
+Ping answers Pong with the same payload. The `auth` argument is an opaque operator-held JSON object
+resolved from the named environment variable. Fresh `successauth` and
+`successupdateBalance.isDemo` matching the declared class precede market commands; selected symbols
+must occur in the observed 19-element `updateAssets` rows. Incomplete attachments never become
+observations. The adapter does not log authentication, renew credentials or generate chart points.
+
+Live records retain provider event time, local receipt time, source/parser identity, connection
+generation, receipt sequence and payload SHA-256. Neither pinned provider has a durable tick
+sequence; the receipt sequence detects internal loss/reordering but proves no provider completeness.
+Every explicit reconnect starts a new generation and a continuity break, requiring resubscription
+and causal warm-up rebuilt from verified history before entries resume. Deriv epochs are seconds.
+Pocket Option fractional provider seconds convert exactly to microseconds after subtracting the
+configured offset times 60 seconds; request anchors convert back to the provider clock. That offset,
+account class, endpoint and mapping bind history source identity. The observed 120 minutes is not a
+universal default. Market ticks from both adapters use the same `Tick` and `InstrumentStream` owners.
+
+Deriv request admission enforces both sliding windows per connection. Configuration may lower them.
+Unhandled failures stop the caller; there is no automatic retry or endpoint fallback.
+
+| Group | Used requests | Per minute | Per hour |
+| --- | --- | ---: | ---: |
+| Trade | proposal, buy, proposal_open_contract | 360 | 14400 |
+| Account | balance, statement | 100 | 2000 |
+| Portfolio | portfolio | 30 | 1500 |
+| Other | discovery, history, ticks, forget, transaction subscription | 220 | 14400 |
+
+`binary-alpha data fetch --config PATH` acquires each selected instrument sequentially. One pass
+freezes its requested end, pages backward, validates chronological rows, applies exact local
+`[start,end)` bounds and removes only identical page-boundary overlap. Within-page repeats remain
+source observations. Repairing a shortfall preserves the verified suffix: every overlapping row,
+including multiplicity, must agree, and a missing verified row or changed price stops publication.
+Deriv requests 100 tick rows with its seconds anchor. Pocket `changeSymbol` requests period 1;
+`loadHistoryPeriod` uses the earliest provider-clock token, index, offset 200 and period 1, while
+matching the observed period-0 reply by asset and index. Empty or non-progressing pages report an
+unresolved prefix, never historical exhaustion. An initially empty pass retains raw evidence and
+coverage but cannot publish a dataset manifest requiring actual first/last events.
+
+The shared import publication owner retains and publishes immutable `broker_history` generations:
+raw response objects, `normalized/ticks.parquet`, and `provenance/coverage.json`. The coverage
+record's version 1 separates requested range, verified range, actual first/last times, row count,
+page hashes/anchors and shortfall. The dataset ready manifest remains version 1; the new source kind
+requires tick capability and those objects. Only ready publication advances verified progress.
+Interrupted objects remain reusable; restarting repairs an unresolved prefix before extending the
+suffix. A refresh interval completes the initial range, then waits between sequential passes whose
+new end is sampled once. Unchanged content/coverage reuses the generation and ensures its objects
+and manifest exist at the current destination, without refetching a completed range. No scheduler
+or service is introduced.
+
+Each instrument reports
+`fetch ROLE INSTRUMENT generation G requested START END verified START END rows N pages P objects O reused R shortfall REASON [fetch S publish S]`,
+with `none` for unavailable verified bounds or no shortfall. Reuse adds `(already published)` or
+`(no new data)`. `data verify` and `data audit` consume these generations through the existing owners.
+
+`binary-alpha broker inspect --config PATH` checks discovery, targeted contracts, finite history,
+per-instrument live observations until the row target or deadline, then cancellation with a separate
+uncapped observation window. It keeps consuming receipts for continuity after an instrument reaches
+its target. Credentialed Deriv inspection checks bootstrap/balance, records the identifier-only
+transaction acknowledgement without posting cash, and, when configured, requests one CALL and one
+PUT proposal per history instrument. It reports exact ask price, payout, original spot text, spot
+time and longcode. Economic admission belongs to Engine and is not computed by inspection. It never
+buys. The JSON report preserves per-check verified/unavailable/observed results, is retained by
+content address and local inspection name, published through the artifact store, and ends with
+`inspection URI`. Built-adapter external acceptance requires retaining an inspection authorized for
+the exact provider, account and action; the local fixtures do not establish that acceptance.
 
 ## Instrument streams
 
@@ -825,13 +948,15 @@ booleans compare only with `eq` and `ne`, numbers must be finite), `bindings` (o
 broker, contract in the account's currency, and risk policy, plus the frozen `envelope`),
 `contracts` (unique `id`, `direction`, positive `duration_micros`, `currency`, positive `stake`
 and `quoted_cost`, non-negative `entry_fee`, exhaustive `win`, `loss`, and `tie` cashflows of
-non-negative `gross_return` and `terminal_fee`, and `settlement` with `rule = "price_at_due_v1"`,
-`max_settlement_delay_micros`, and `max_tick_gap_micros`), `risk_policies` (unique `id`; optional
+non-negative `gross_return` and `terminal_fee`, `settlement` with `rule` (`price_at_due_v1` or
+`broker_authoritative_v1`), `max_settlement_delay_micros`, and `max_tick_gap_micros`, then optional
+`semantics` (`rise_fall_strict_v1`)), `risk_policies` (unique `id`; optional
 positive `max_open_per_strategy`, `max_open_per_duration`, `max_open_per_instrument`,
 `max_open_per_account`, and `max_open_total`, where absence is no limit; `same_entry` as `all` or
 `first`; `deduplicate_signal_logic`; non-negative `max_feature_age_micros` and
 `max_quote_age_micros`; optional positive `max_unresolved_loss_per_account` and
-`max_unresolved_loss_total`; optional `pause` with positive `drawdown` and `duration_micros`), and
+`max_unresolved_loss_total`; optional `pause` with positive `drawdown` and `duration_micros`; optional non-negative
+`max_proposal_age_micros`, required for broker-authoritative bindings), and
 optional `rates` (unique `id`, distinct `source_currency` and `reporting_currency`, `provider`,
 `provider_time`, `available_at` no earlier than the provider time, positive `rate` in
 reporting-currency units per source unit). Every contract amount, loss limit, and pause threshold
@@ -852,7 +977,8 @@ envelope's JSON with every amount normalized, so equal money values written at d
 share one identity. Quotes belong to events. The envelope states the maximum purchase cost, entry fee,
 and each outcome's terminal fee, the minimum winning net return
 (`gross_payout - quoted_cost - entry_fee - win_terminal_fee`), and the settlement rule a quote must
-declare; a quote at equal terms passes.
+declare, plus optional `semantics`; a quote at equal terms passes. Broker deployment identities
+include `rise_fall_strict_v1` and the settlement authority through that frozen envelope.
 
 ### Binding
 
@@ -878,8 +1004,8 @@ tags `availability = "provider_order_simulation"`.
 ### Decisions
 
 Observations at one availability time apply in source order before any decision at that time:
-ticks, then feature rows in frozen-plan order, then external acknowledgements, acceptances,
-rejections, settlements, and reconciliations; an expired account pause ends first. A tick updates
+the caller orders ticks, feature rows, proposals and external purchase, contract, cash and
+reconciliation facts; an expired account pause ends first. A tick updates
 the paths of every accepted obligation of its instrument in acceptance order and settles those due
 under `price_at_due_v1`; an unresolved obligation is no longer driven by ticks. The engine keeps
 one latest available row per stream: a row must close strictly later than the installed row, an
@@ -902,7 +1028,7 @@ deduplication is enabled), `repair_blocked`, `no_quote`, `stale_feature` (decisi
 logical close time beyond the maximum; equality passes), `stale_quote` (decision time minus the
 quote's provider time beyond the maximum), `gap_at_entry` (the inter-arrival into the quote tick
 exceeds the contract's maximum tick gap; a repeated tick at the same time keeps that
-inter-arrival), `account_paused`, `account_blocked`, `quote_rejected`
+inter-arrival), `no_proposal` or `stale_proposal` for broker-authoritative bindings, `account_paused`, `account_blocked`, `quote_rejected`
 (the envelope), `capacity_strategy`, `capacity_duration`, `capacity_instrument`,
 `capacity_account`, `capacity_total` (the prospective count may equal a maximum), `insufficient_cash`,
 `unresolved_loss_account`, `unresolved_loss_total`, `conversion_unavailable`, or `admitted`; the
@@ -914,7 +1040,8 @@ stay with the obligation through settlement.
 
 With `A = quoted_cost + entry_fee` and `F = max(0, max over outcomes of terminal_fee -
 gross_return)`, an admitted signal reserves `A + F`, requires native cash minus unpaid
-reservations to cover it, and sends the command `BINDING/CLOSE_TIME_MICROS`. Acceptance debits `A`
+reservations to cover it, and prepares the command `BINDING/CLOSE_TIME_MICROS`; this is not a socket write.
+Simulated acceptance debits `A`
 exactly once, keeps `A` as paid basis, and reserves only `F`. The worst unresolved loss of an open
 obligation is `max(0, A + max over outcomes of terminal_fee - gross_return)`; capacity counts and
 unresolved exposure include every sent, acknowledged, accepted, and possibly sent obligation. An
@@ -923,8 +1050,8 @@ not-sent, and possibly-sent transitions are permitted only from a sent or acknow
 rejected or proven not-sent command releases its reservation and capacity without debit. A
 possibly sent command keeps its full reservation, blocks new entries for its account, and waits
 for reconciliation; nothing is retried and no acceptance is taken for it. An account's block is
-the set of commands awaiting reconciliation, each with its reason (possibly sent, or settled
-with a discrepancy or deficit at the booked cashflow); each reconciliation removes only its own
+the set of commands and unmatched transactions awaiting reconciliation, with reasons for possibly
+sent commands, purchased or settled discrepancies, and unmatched cash; each reconciliation removes only its own
 command, and entries stay blocked while any remains. A settled discrepancy is lifted only by a
 reconciliation stating the same settlement, because no corrective posting exists; a
 contradicting resolution is a reconciliation failure. Settled equity is native cash plus the paid basis of open
@@ -971,9 +1098,65 @@ with a supplied rate due, so a record that
 disagrees or a ledger that omits one fails at generation and at restoration alike. An external event's payload
 is its transition fields and its source's provider time, availability, and simulation flag: the
 same identity with the exact payload is a no-op, before and after restoration; the same identity
-with another payload, including an equal amount written at another scale, fails; a ledger that
+with another payload fails. Version-1 external identities also distinguish equal amounts at
+different scales; version 2 compares evidence amounts by value and retains account-scale postings; a ledger that
 applies one external identity twice, or a record whose source is available after its decision
 time, fails.
+
+### Broker-authoritative obligations
+
+`broker_authoritative_v1` requires a proposal for the binding and `rise_fall_strict_v1` in both
+contract and envelope. Templates carry zero outcome returns; proposals supply their own exact
+terms. CALL/Rise wins strictly above entry and PUT/Fall strictly below entry; equality loses the
+stake under the pinned subset. Loss and tie gross returns are zero, and every outcome's fees must
+satisfy the envelope. Deriv proposals carry zero separately charged fees in this measured mapping;
+no commission or universal fee-inclusion rule is inferred for other accounts or contract types.
+
+A proposal records connection generation plus provider id, a SHA-256 of normalized broker,
+configured account, instrument, currency, direction, duration, stake and semantics, exact terms,
+spot/time, receipt time, schema and payload digest. New proposals replace the current binding quote;
+admitted signals freeze their own proposal and reservation. `max_proposal_age_micros` bounds age
+from receipt locally; spot time is not a quote issuance or valid-until clock. Before dispatch,
+Phase 12 must durably bind deployment and command identity, binding/account/instrument, full
+proposal/request/payload identity and economics, maximum purchase price and reservation in its
+claim. Phase 11 bundles bind settlement authority, semantic identity and all envelope bounds.
+No Phase 10 application command purchases; the library refuses an empty dispatch claim, reports
+pre-write failure separately, and retains every written claim so an uncertain submission cannot be
+retried. Request ids provide correlation, not provider idempotency.
+
+Purchase acceptance posts the actual debit once with contract/transaction references, purchase time,
+expected start and proposed payout. Entry price/time and confirmed expiry may be absent. A larger
+debit remains an accepted liability with exact paid basis, exposure, deficit and an account block;
+`Reconciliation { Purchased }` confirms the same evidence to lift that block without a second debit.
+`confirmed` records monotonically fill entry, start and expiry: absent values never erase facts,
+equal redelivery is a no-op, and contradictions require reconciliation. Expected start remains
+separate; a buy transaction's approximate `date_expiry` never confirms expiry.
+
+Broker ticks provide continuity only and never settle or free capacity. A matched terminal
+`won`/`lost` fact requires its linked exact sell cash transaction, including an explicit zero for a
+loss; terminal evidence alone remains `awaiting_cash`. `sell` action and `is_sold` do not determine
+outcome. Sources retain contract/payload update identity, terminal status/time, and
+`deriv:transaction:TRANSACTION_ID` for cash from both stream and statement. Duplicate cash across
+restoration and sources posts once. Unknown cash blocks the account until matching purchase or
+terminal evidence, or an explicit `External` reconciliation, resolves it. External sold/cancelled
+status plus actual cash produces `Reconciled`/`ExternallyClosed` and a separate closure count,
+never a directional win/loss/tie. Reconciliation cannot contradict already recorded terminal or
+cash facts.
+
+Financial settlement needs no fabricated path. Confirmed entry and exit alone form authoritative
+path diagnostics; missing entry/exit leaves them unavailable. Sparse exit time before expiry is
+preserved. Statement windows include the complete target second by sending exclusive
+`date_to = through_secs + 1`, paging by 100 while a full page is returned. Portfolio provides open
+liabilities; its local fixture is synthetic from the pinned schema. `CashFact` alone does not carry
+purchase payout or purchase time: recovery must obtain those from purchase/contract evidence, not
+infer them from the proposal or the cash transaction clock.
+
+Two current Engine constraints remain relevant to the Phase 12 handoff. The financial ledger
+retains an admitted proposal but does not restore a proposal received before any signal; market,
+feature and unadmitted proposal inputs need an input replay boundary. Engine also requires purchase
+time no earlier than dispatch; a seconds-resolution provider purchase in the same second as a
+later microsecond dispatch currently fails that check. The adapter preserves the provider clock
+and does not adjust it to hide this constraint.
 
 ### Pause, conversion, and projections
 
@@ -1010,7 +1193,7 @@ price.
 The ledger is one canonical compact JSON record per line in `ledger/events.jsonl`, each carrying a
 contiguous `sequence` from zero, the decision `time_micros`, and a tagged `kind`: the
 `run_definition` (the complete resolved run) first, then `signal`, `acknowledged`, `accepted`,
-`released`, `possibly_sent`, `settled`, `unresolved`, `reconciled`, `rate_available`,
+`released`, `possibly_sent`, `confirmed`, `cash_observed`, `settled`, `unresolved`, `reconciled`, `rate_available`,
 `pause_started`, and `pause_ended` records
 with their exact postings and provenance (`source` identity, provider and availability times, and
 whether it is a configured simulation). Tick and feature data are referenced inputs, never copied.
@@ -1030,7 +1213,7 @@ hash, and each instrument's identity, tick generation, feature generation, plan 
 outcome generation, one per line. Its objects, both role `normalized` under the content-addressed
 create-once rules of dataset generations, are the ledger and the summary. The ready manifest at
 `manifests/GENERATION/ready.json`, published last and mirrored, records `kind` (`engine_replay`),
-`schema_version` (`1`), `generation`, `role`, `config_hash`, `code_revision`, `availability`,
+`schema_version` (`1` for simulated history, `2` for broker-authoritative runs), `generation`, `role`, `config_hash`, `code_revision`, `availability`,
 `decision_start`, `decision_end`, `instruments`, `events`, `final_state_identity`,
 `summary_identity`, and `objects`; a manifest whose `generation` is not the identity of its
 `config_hash` and `instruments` is rejected. The command writes
@@ -1043,6 +1226,9 @@ the ledger through the engine, compares the restored event count, definition, fi
 and summary identity with the manifest and the restored summary bytes with the published summary,
 and writes
 `verified ROLE generation GENERATION events E signals S accepted A settled T unresolved U objects 2 bytes B`.
+Version 2 retains proposal-bound signals, partial liabilities, confirmations, terminal/cash evidence
+and external closures; version 1 rejects those records and its completed artifact bytes and identities
+remain unchanged. Historical replay, search and portfolio refuse broker-authoritative inputs.
 Restoring the ledger alone proves the financial state; input replay through the command proves
 that signals and paths were derived from the inputs.
 
