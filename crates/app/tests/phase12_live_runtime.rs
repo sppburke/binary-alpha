@@ -1,6 +1,8 @@
 mod common;
 #[path = "phase12_live_runtime/control.rs"]
 mod control;
+#[path = "phase12_live_runtime/faults.rs"]
+mod faults;
 
 use binary_alpha_app::{broker, live};
 

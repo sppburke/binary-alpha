@@ -797,4 +797,138 @@ pub fn postgres_control() {
         .unwrap()
         .get(0);
     assert_eq!(before, after, "failed TLS connections mutated control rows");
+
+    // Runtime recovery half: two actual Postgres sessions, the same checkpoint and
+    // statement scenarios as the ordinary fake-control gate, and recorded broker I/O.
+    for (name, point) in [
+        ("claimed", crate::live::Checkpoint::AfterClaimBeforeWrite),
+        ("during", crate::live::Checkpoint::DuringWrite),
+        (
+            "written",
+            crate::live::Checkpoint::AfterWriteBeforeAcknowledgement,
+        ),
+        (
+            "acknowledged",
+            crate::live::Checkpoint::AfterAcknowledgement,
+        ),
+    ] {
+        let account = format!("{namespace}-runtime-{name}");
+        let mut fixture = super::support::Fixture::for_account(&format!("t1-pg-{name}"), &account);
+        fixture
+            .config
+            .live
+            .as_mut()
+            .unwrap()
+            .journal
+            .segment_records = 1024;
+        let first = RecoverySession(Arc::new(std::sync::Mutex::new(settings.connect().unwrap())));
+        let second = RecoverySession(Arc::new(std::sync::Mutex::new(settings.connect().unwrap())));
+        let mut inspect = second.clone();
+        let original = super::faults::checkpoint_recovery_scenario(
+            &fixture,
+            Box::new(first.clone()),
+            Box::new(second.clone()),
+            &mut inspect,
+            point,
+        );
+        let row = runtime
+            .block_on(client.query_one(TEST_ROWS_SQL, &[&account, &original.command]))
+            .unwrap();
+        let payload: Claim = serde_json::from_str(row.get(0)).unwrap();
+        assert_eq!(
+            payload,
+            Claim {
+                state: ClaimState::Claimed,
+                contract_ref: None,
+                transaction_ref: None,
+                ..original.clone()
+            }
+        );
+        assert_eq!(row.get::<_, &str>(1), "possibly_sent");
+        assert_eq!(row.get::<_, Option<String>>(2), original.contract_ref);
+        assert_eq!(row.get::<_, Option<String>>(3), original.transaction_ref);
+        assert_eq!(row.get::<_, i64>(4), original.token as i64);
+        let EventKind::Signal {
+            proposal: Some(proposal),
+            ..
+        } = &original.signal.kind
+        else {
+            unreachable!()
+        };
+        assert_eq!(row.get::<_, &str>(5), proposal.identity);
+        assert_eq!(row.get::<_, &str>(6), proposal.request_identity);
+        assert_eq!(row.get::<_, &str>(7), original.claim);
+        assert_eq!(row.get::<_, &str>(8), original.deployment);
+        assert!(row.get::<_, i64>(10) >= row.get::<_, i64>(9));
+        super::faults::statement_recovery_scenario(
+            &fixture,
+            Box::new(first),
+            &mut inspect,
+            &original,
+        );
+        assert!(
+            runtime
+                .block_on(client.query(TEST_ROWS_SQL, &[&account, &original.command]))
+                .unwrap()
+                .is_empty()
+        );
+    }
+}
+
+/// Shares access to one actual session so runtime ownership and the independent
+/// readback use exactly the two database sessions in each recovery scenario.
+#[derive(Clone)]
+struct RecoverySession(Arc<std::sync::Mutex<Postgres>>);
+impl Control for RecoverySession {
+    fn acquire(
+        &mut self,
+        key: LeaseKey<'_>,
+        owner: &str,
+        deployment: &str,
+        ttl: i64,
+    ) -> Result<Option<crate::live::control::Lease>, String> {
+        self.0.lock().unwrap().acquire(key, owner, deployment, ttl)
+    }
+    fn renew(
+        &mut self,
+        key: LeaseKey<'_>,
+        owner: &str,
+        token: u64,
+        ttl: i64,
+    ) -> Result<Option<crate::live::control::Lease>, String> {
+        self.0.lock().unwrap().renew(key, owner, token, ttl)
+    }
+    fn release(&mut self, key: LeaseKey<'_>, owner: &str, token: u64) -> Result<bool, String> {
+        self.0.lock().unwrap().release(key, owner, token)
+    }
+    fn claim(
+        &mut self,
+        key: LeaseKey<'_>,
+        owner: &str,
+        token: u64,
+        claim: &Claim,
+    ) -> Result<ClaimOutcome, String> {
+        self.0.lock().unwrap().claim(key, owner, token, claim)
+    }
+    fn update_claim(
+        &mut self,
+        key: LeaseKey<'_>,
+        owner: &str,
+        token: u64,
+        claim: &str,
+        state: ClaimState,
+        contract: Option<&str>,
+        transaction: Option<&str>,
+    ) -> Result<bool, String> {
+        self.0
+            .lock()
+            .unwrap()
+            .update_claim(key, owner, token, claim, state, contract, transaction)
+    }
+    fn unresolved(&mut self, key: LeaseKey<'_>) -> Result<Vec<Claim>, String> {
+        self.0.lock().unwrap().unresolved(key)
+    }
+    fn delete_reconciled(&mut self, key: LeaseKey<'_>, claim: &str) -> Result<(), String> {
+        self.0.lock().unwrap().delete_reconciled(key, claim)
+    }
 }
