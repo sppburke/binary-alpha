@@ -17,7 +17,7 @@ use binary_alpha_accelerator::{Backend, KERNEL_SOURCES, Timings, bootstrap, sear
 use binary_alpha_engine::config::{Backend as Selected, Config, RunMode, Search};
 use binary_alpha_engine::dataset::{DatasetRole, ObjectRecord, ObjectRole, manifest_key};
 use binary_alpha_engine::execution::{
-    EVENTS_OBJECT_PATH, EventKind, FinancialEvent, ReplayManifest, SUMMARY_OBJECT_PATH,
+    EVENTS_OBJECT_PATH, EventKind, FinancialEvent, ReplayManifest, Resolution, SUMMARY_OBJECT_PATH,
     StrategySpec, Summary,
 };
 use binary_alpha_engine::outcomes::{
@@ -659,6 +659,12 @@ fn settled_profits(events: &[FinancialEvent], binding: &str, scale: u8) -> Vec<f
         .filter_map(|event| match &event.kind {
             EventKind::Settled {
                 command, profit, ..
+            }
+            | EventKind::Reconciled {
+                command,
+                resolution: Resolution::ExternallyClosed { .. } | Resolution::Settled { .. },
+                profit: Some(profit),
+                ..
             } if command.starts_with(&prefix) => Some(
                 profit
                     .rescale(scale)
