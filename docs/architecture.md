@@ -46,7 +46,50 @@ research table and governance declaration ──▶ app: permit every declared i
    manifest (the bundle), awaiting authorization ──▶ operator grant ──▶ app: protected claims,
    receipt, certification context ──▶ the same plans and scenarios over holdout ──▶ app:
    certification record and manifest ──▶ standard output
+
+verified public bundle records ──▶ engine: live_policy, exact baseline and broker request templates
+   ──▶ existing execution definition and financial identity owners
+
+ordered financial events ──▶ app: append-only journal, closed segments
+account ownership and prepared signal ──▶ app: PostgreSQL lease and dispatch-claim transactions
+exact deployment bindings ──▶ app: immutable authorization through the existing artifact store
 ```
+
+The Phase 12 `live` owner composes configuration, projection, journal, control, authorization,
+receipt, recorded transports, deployment manifests, and command dispatch:
+
+```text
+broker market/account workers or recorded transports (input/output only)
+   ──▶ one ordered ingress lane: connection generation, receipt sequence, source clocks
+   ──▶ one shared causal feature state: existing InstrumentStream and FeatureEngine per instrument
+   ──▶ one Engine: ordered evaluation, capacity, risk, reservations, settlement, accounting
+   ──▶ one execution adapter: rate admission ─▶ committed dispatch claim ─▶ eligibility check
+   ──▶ queued write ──▶ account worker
+   ──▶ typed broker observations ──▶ the same Engine
+
+financial events and control records ──▶ one single-writer journal ──▶ existing artifact store
+   ──▶ verified immutable closed segments, ledger, compatibility receipt
+verified bundle + exact configuration ──▶ immutable deployment manifest ──▶ exact entry authorization
+```
+
+One process owns one deployment bundle and one execution account across all configured instruments
+and strategies. Broker tasks may perform concurrent network input/output; they never evaluate a
+strategy or mutate financial state, and execute only prepared intents from the ordered owner.
+Each accepted market event enters the shared feature owner once. Base rows wait for requested
+proposals and enter the Engine in queue order; bindings evaluate in frozen order. Stale queued
+rows expire under the instrument's greatest bound `max_feature_age_micros`. One proposal request
+per binding and one prepared dispatch are outstanding at a time. Market and account workers wait
+for owner acknowledgement after delivering ingress. The storage worker publishes closed segments,
+ledger, receipt, and final manifest. Production lease renewal uses a dedicated control connection;
+claim transactions, local journal writes, and health writes run on the ordered owner. Startup
+verification, warm-up, and deployment publication complete before these workers start.
+The same Engine restores financial state and applies authoritative account evidence. Restart
+rebuilds causal features from verified warm-up ticks; live ticks are not journaled. Every restart
+or market break requires a ready base row for each bound instrument before entries resume.
+Entry vetoes preserve account observation, settlement, reconciliation, journaling, and cloud retry.
+Contracts are in
+[Live runtime](contracts.md#live-runtime); separately authorized handoff is in
+[operations](operations.md#live-runtime).
 
 `binary-alpha config validate --config PATH` reads the document; the engine parses it into typed
 values, rejects unknown fields and unsupported values with field-specific errors, serializes the
@@ -87,25 +130,6 @@ family through the accelerator boundary, resamples settlement paths through the 
 bootstrap primitive, and publishes the family generation through the same store after verifying
 it.
 
-## Data flow owned by later phases
-
-The same single process grows along one causal path and one chronological path. Each stage below
-names its implementing issue. The existing ingestion, Engine, and accelerator owners supply the
-later consumers shown here.
-
-```
-historical import (#3) ──┐
-                         ├─▶ instrument stream and candles (#4) ─▶ features and regimes (#5) ─▶ outcomes (#6)
-live feed (#11) ─────────┘                                                                            │
-                                                                                                      ▼
-artifacts: Google Cloud Storage, Supabase references (#3)  ◀── strategy, replay, settlement, accounting, risk (#7, this checkout)
-                                                                     ▲                     │
-accelerator with central-processor reference (#8, this checkout) ─▶ candidate search and evaluation (#9, this checkout)  │
-                                                     repair, portfolio, risk tuning (#10)  │
-research, optimization, certification (#12, this checkout) ◀────────────────────────────────┘
-live runtime and cutover (#13) ─▶ execution ─▶ broker adapter (#11)
-```
-
 ## Semantic owners
 
 | Concern | Owner | Introduced by |
@@ -129,7 +153,16 @@ live runtime and cutover (#13) ─▶ execution ─▶ broker adapter (#11)
 | Broker contracts and adapters, secrets resolution | `binary-alpha-app` | [#11](https://github.com/sppburke/binary-alpha/issues/11) |
 | Governance declarations and read permits, research records and identities, lowering into the existing tables, qualification, the certification context | `binary-alpha-engine`, module `research` | this checkout ([#12](https://github.com/sppburke/binary-alpha/issues/12)) |
 | The research sequence over the existing owners, governance records, grants, receipts, research verification | `binary-alpha-app`, module `research` | this checkout ([#12](https://github.com/sppburke/binary-alpha/issues/12)) |
-| Live runtime, authorization, resumable cutover | `binary-alpha-app` | [#13](https://github.com/sppburke/binary-alpha/issues/13) |
+| Live configuration, baseline projection, exact economic comparison | `binary-alpha-engine`, modules `config`, `research`, `execution` | this checkout ([#13](https://github.com/sppburke/binary-alpha/issues/13)) |
+| Durable local records, hash chain, segment restoration and cleanup | `binary-alpha-app`, module `live::journal` | this checkout ([#13](https://github.com/sppburke/binary-alpha/issues/13)) |
+| Two-table migration, lease/claim transactions, encrypted PostgreSQL connection, fake control | `binary-alpha-app`, module `live::control` | this checkout ([#13](https://github.com/sppburke/binary-alpha/issues/13)) |
+| Immutable authorization object, identity, creation and read validation | `binary-alpha-app`, module `live::authorization`, through the existing `store` | this checkout ([#13](https://github.com/sppburke/binary-alpha/issues/13)) |
+| Transport receipt provenance and purchase preparation/write boundary | `binary-alpha-app`, modules `broker` and `broker::deriv_options` | this checkout ([#13](https://github.com/sppburke/binary-alpha/issues/13)) |
+| One ingress lane, live definition, ordered runtime, recovery, entry gates, health, deployment manifest and publication | `binary-alpha-app`, modules `live`, `live::owner`, `live::workers`, reusing `features`, `replay`, `research`, and `store` owners | this checkout ([#13](https://github.com/sppburke/binary-alpha/issues/13)) |
+| Deterministic execution-compatibility receipt | `binary-alpha-app`, module `live::receipt` | this checkout ([#13](https://github.com/sppburke/binary-alpha/issues/13)) |
+| Recorded broker transports and replay clock | `binary-alpha-app`, module `broker::transport` | this checkout ([#13](https://github.com/sppburke/binary-alpha/issues/13)) |
+| Live commands and operator authorization command | `binary-alpha-app`, `main` dispatch into `live` | this checkout ([#13](https://github.com/sppburke/binary-alpha/issues/13)) |
+| Resumable account handoff and rollback | Authorized operator, [procedure](operations.md#live-runtime) | Phase 12; production execution requires separate authorization |
 
 The engine stays free of external effects so that development, evaluation, optimization,
 certification, replay, and live operation run the same validated semantics; adapters in the

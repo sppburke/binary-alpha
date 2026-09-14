@@ -148,6 +148,159 @@ least-privilege identity that can read and create objects but not create or dele
 the application; then run the import above. Rollback reverts the application and configuration
 change; source files, the retained copy, and published generations stay intact.
 
+## Live runtime
+
+Phase 12 implements the [ordered runtime, projection, journal, control, authorization,
+compatibility receipt, recorded transports, deployment manifest, and live
+commands](contracts.md#live-runtime).
+This procedure records the separately authorized rollout required by issue
+[#13](https://github.com/sppburke/binary-alpha/issues/13); it records no completed production action.
+
+### Rollout and handoff
+
+1. Discover and reuse an existing Supabase project and approved Google resources. If a resource
+   must be created, create nothing in a region whose name begins `us-west`; choose the existing
+   compute region or a measured permitted region.
+2. Apply the `live_leases` and `live_dispatch_claims` migration idempotently. Record its schema
+   version and result so another agent can resume. Grant the runtime only the row operations
+   needed for its account lease and dispatch claims. The implemented `Postgres::migrate` uses
+   `MIGRATION_SQL`, with `binary-alpha live control schema v1` recorded as a comment on both
+   tables; it adds no third table. Use the direct endpoint, or the documented session pooler when
+   required by the deployment network, with supplied trusted roots and hostname verification.
+3. Deploy the binary inactive with approved secrets and a certified DeploymentBundle. The next
+   authorized runtime start publishes its immutable deployment manifest after verification and
+   warm-up. Keep entries disabled until the exact entry authorization exists.
+4. Run immutable replay, paper mode, the complete Deriv demo workflow, and cause-specific cloud
+   and lease checks. These observations and purchases each require their exact authorization.
+   Create the exact demo entry authorization below before demo purchases. Preserve the required
+   account-class distinctions and frozen compatibility support.
+5. Start the production instance observation-only. Warm features, replay its journal, reconcile
+   transactions/open contracts/balance, and prove cloud publication.
+6. Initial migration from a non-cooperative legacy runtime uses a short per-account entry handoff:
+   stop new legacy submissions, preserve observation and settlement, resolve every ambiguous
+   dispatch, acquire the new lease, then keep the new owner observation-only. Existing accepted
+   contracts continue to settlement. Deriv does not enforce the cooperative fencing token;
+   stopping legacy submissions is an operator duty.
+7. For a supported execution account, require replay, demo, reconciliation, deployment, account,
+   bundle, lease, and passing execution-compatibility proof under the frozen account-class
+   requirements. Use the operator-only command below to create the exact entry authorization
+   before enabling new entries. Discover and validate the deterministic object before creating it so another agent can
+   resume after a lost response. Absence, conflict, or mismatch leaves observation, settlement,
+   and reconciliation active but new entries disabled.
+8. Later target-to-target deploys transfer the account lease transactionally. The old owner stops
+   new submissions before release and may continue observation; the new owner begins only after
+   lease, claims, broker state, and entry authorization are proven. Once release begins
+   the old owner stays entry-disabled even if the response is lost. Resolve uncertain release by
+   readback or expiry; the next acquisition has a greater fencing token.
+9. Checkpoint every command by deployment hash, migration version, lease fencing token, journal
+   sequence, and object generation so another agent can resume safely. Keep command result and
+   exact configuration, code revision, environment, broker/account class, and evidence window with
+   those identities; preserve completed evidence.
+10. Verify source continuity, warm-up, bundle identity, lease ownership, broker balance, open
+    contracts, unresolved dispatch claims, journal commitment, cloud objects, and final manifests
+    before declaring production complete. Measure market-event-to-decision and claim-to-socket
+    delays on the deployment host, separately from decision-to-acceptance delay; verify bounded
+    queues and no sustained growth. A refused incompatible receipt is refusal proof, not a passing
+    execution-fidelity result.
+11. Rollback stops new entries, continues settlement/reconciliation, resolves ambiguous dispatches,
+    transfers the lease only when safe, and restores the previous binary and certified bundle.
+    Never delete legacy data or evidence during cutover. Retain unresolved claims; remove a
+    reconciled terminal claim only after its complete journal lifecycle and final manifest
+    references are verified in Google Cloud Storage. If the previous binary/bundle cannot satisfy
+    current bindings, keep entries disabled.
+
+No global service downtime is required. The only intended interruption is the shortest safe
+account-specific new-entry handoff; observation, reconciliation, and settlement remain active.
+Commands in steps 4 and 7:
+
+```sh
+binary-alpha live replay --config PATH
+binary-alpha live run --config PATH
+binary-alpha live authorization create --deployment-manifest URI --bundle-manifest URI --broker ID --account ID --reason TEXT
+```
+
+`live replay` accepts `research` or `replay`; the filesystem publication boundary still requires
+`research`. It reads a recorded broker-event log and never connects to a broker or resolves its
+credential. `live run` accepts `paper` or `live`; paper keeps account observations but does not
+purchase. Every `live` entry, including demo, requires the exact authorization object. The current
+options adapter permits proposals only for demo USD; a real account can supply observations but
+cannot obtain a supported purchase proposal. Configure the operator's Google identity to create
+but not overwrite authorization objects and the runtime identity to read them. Repeat creation
+after response loss with the same bindings, operator, and reason. Any deployment/configuration/bundle/broker/account change
+requires a new exact authorization. See the [command matrix](contracts.md#live-runtime),
+[authorization object](contracts.md#authorization), and
+[compatibility receipt](contracts.md#compatibility-receipt).
+
+### PostgreSQL control gate
+
+The required non-live `postgres_control` gate runs against an isolated non-production PostgreSQL
+database with two actual control sessions and a raw test session for row-lock ordering. It applies
+the production migration and lease/claim statements, with a fake broker and the existing
+Engine/journal recovery. Ordinary fake-control tests cannot replace it. The procedure itself
+does not authorize a production migration.
+
+`BINARY_ALPHA_TEST_CONFIG` names an untracked JavaScript Object Notation (`JSON`) document. The
+implemented wrapper in
+[phase12_live_runtime/control.rs](../crates/app/tests/phase12_live_runtime/control.rs) reads exactly
+these connection and negative-certificate inputs:
+
+```json
+{
+  "control": {
+    "host": "localhost",
+    "port": 5432,
+    "database": "phase12_control",
+    "user": "phase12_test",
+    "credential": "BINARY_ALPHA_TEST_DATABASE_PASSWORD",
+    "root_certificate": "/ABSOLUTE/PATH/trusted-root.pem"
+  },
+  "wrong_root_certificate": "/ABSOLUTE/PATH/unrelated-root.pem",
+  "wrong_host": "127.0.0.1"
+}
+```
+
+Replace the example connection with the approved isolated endpoint. The password is read from the
+environment variable named by `control.credential`; the JSON contains its name, never its value.
+Certificate files contain trusted roots, not secrets. Use
+absolute paths for reproducibility; the test passes these paths directly, without resolving them
+against the JSON file. The correct root and hostname must validate the endpoint. `wrong_host`
+must reach that same test server under a name its certificate excludes; the current negative
+assertion specifically expects `127.0.0.1`. The supplied incorrect root must fail issuer
+verification. The implemented wrapper does not read runtime owner or lease timing settings;
+it chooses those within its test cases.
+
+Record the isolated server/database/schema identity, schema comment/version, configuration
+identity, and clean code revision with the gate result. The wrapper has no separate schema field;
+confirm the connection's actual schema before running its idempotent migration. Run:
+
+```sh
+cargo test --locked -p binary-alpha-app --test phase12_live_runtime
+BINARY_ALPHA_TEST_CONFIG=PATH cargo test --locked -p binary-alpha-app --test phase12_live_runtime postgres_control -- --exact --ignored --nocapture
+```
+
+The gate must prove migration repeated twice, acquisition contention, renewal blocked behind
+release, claim insertion racing release/acquisition, expiry while waiting for the lease row lock,
+stale-token refusal, lost commit response/readback, and post-claim reconstruction of exact
+exposure without an unauthorized or ambiguous purchase write. The clock query occurs after the
+row lock returns, as specified in [Leases and dispatch claims](contracts.md#leases-and-dispatch-claims).
+Incorrect root or hostname must fail before control mutation. Preserve the returned rows/tokens,
+durable claim contents, recovery result, and test output. An unavailable database, credential,
+certificate, or endpoint is unavailable evidence, never a passing fake result. This documentation
+change does not run the gate or establish its result.
+
+The broader Phase 12 delivery also requires retained Phase 10 execution and Phase 11 research
+tests, the complete deterministic live replay fixture, and the workspace and selected-feature
+workflow gates at one clean commit. Separately authorized demo and deployment proofs remain
+external acceptance.
+
+Production operator tasks: the separately authorized rollout, account handoff, verification, and
+rollback in steps 1–11; none executed by this documentation change.
+
+Linked matching Sentry issues: none. Issue #13 records no target Sentry configuration or linked
+matching issue. Rediscover at deployment; do not create a project solely for this phase. If an
+implementation pull request links a matching issue, close it immediately after its corresponding
+production proof in steps 4–10, with no waiting period.
+
 ## Offline NVIDIA runner
 
 Issue [#8](https://github.com/sppburke/binary-alpha/issues/8) authorized the offline compiler setup
@@ -179,9 +332,11 @@ every governance record (intent, claim, grant, receipt) are
 immutable and are never deleted by rollback; a research rollback selects the last certified
 bundle or disables promotion and never deletes a rejected bundle, grant, receipt, source object,
 or prior generation; the retained historical-data folder and the original
-source files stay intact, and a consumer selects the prior generation by its identity. Schema, broker, and other production state do not exist at this phase; the
-phase that creates any of them records its own cause-specific verification and rollback before it
-ships. Production work minimizes downtime, prefers
+source files stay intact, and a consumer selects the prior generation by its identity. Phase 12
+implements the control schema and broker durability boundaries; production state exists only
+after separately authorized operation. Its account-specific verification and rollback are recorded
+in [Live runtime](#live-runtime), including preservation of journal, authorization, and dispatch
+evidence. Production work minimizes downtime, prefers
 a safe non-quiescent alternative when one preserves proof and rollback, checkpoints each mutation for
 resumption, verifies the cause-specific result, and retains rollback.
 
@@ -191,4 +346,7 @@ Every plan and delivery report states production operator tasks and linked match
 using `none` where evidence proves none. Reporting does not create a Sentry project or integration.
 An already linked matching Sentry issue is closed only after deployed proof, with no waiting period.
 
-Production operator tasks: none. Linked matching Sentry issues: none.
+Production operator tasks: Phase 12 rollout and rollback above, under separate authorization;
+none executed by this documentation change.
+
+Linked matching Sentry issues: none.
