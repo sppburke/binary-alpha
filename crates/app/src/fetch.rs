@@ -379,6 +379,9 @@ pub fn pass(
         let mut earliest = None;
         let mut anchor = Some(requested.1);
         let mut received_end = None;
+        // Every received row, assembled across page boundaries before the resume filter, so a
+        // repeated observation split between two pages still matches the verified multiplicity.
+        let mut received_all: Vec<Tick> = Vec::new();
         let shortfall = loop {
             let page = broker.history_page(&instrument, definition.price_scale, anchor)?;
             let mut sequence = TickSequence::default();
@@ -387,7 +390,7 @@ pub fn pass(
                     .accept(*row)
                     .map_err(|error| format!("fetch {instrument}: {error}"))?;
             }
-            check_verified_overlap(&instrument, &previous_rows, &page.rows)?;
+            received_all = prepend_page(page.rows.clone(), received_all);
             let first = page.rows.first().map(|row| row.event_time_micros);
             let last = page.rows.last().map(|row| row.event_time_micros);
             if let Some(last) = last.filter(|last| *last >= fetch_start) {
@@ -454,6 +457,7 @@ pub fn pass(
             }
             anchor = Some(first);
         };
+        check_verified_overlap(&instrument, &previous_rows, &received_all)?;
         let new_count = rows.len();
 
         let repeats_prior = rows == previous_rows;

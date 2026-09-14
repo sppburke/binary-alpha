@@ -2454,6 +2454,79 @@ fn received_upper_boundary_caps_coverage_without_publishing_out_of_range_rows() 
 }
 
 #[test]
+fn repeated_boundary_observations_split_across_repair_pages_keep_multiplicity() {
+    let repeated = [(5, 100_005), (5, 100_005), (6, 100_006), (7, 100_007)];
+    let older = [
+        (0, 100_000),
+        (1, 100_001),
+        (2, 100_002),
+        (3, 100_003),
+        (4, 100_004),
+        (5, 100_005),
+        (5, 100_005),
+    ];
+    // The repeat at second 5 arrives split across the repair's page boundary, or whole in one page.
+    let split = vec![
+        page(&[
+            (5, 100_005),
+            (6, 100_006),
+            (7, 100_007),
+            (8, 100_008),
+            (9, 100_009),
+        ]),
+        page(&older),
+    ];
+    let whole = vec![
+        page(&[
+            (5, 100_005),
+            (5, 100_005),
+            (6, 100_006),
+            (7, 100_007),
+            (8, 100_008),
+            (9, 100_009),
+        ]),
+        page(&older[..5]),
+    ];
+    for (name, repair) in [("split", split), ("whole", whole)] {
+        let scratch = Scratch::new(&format!("phase10_boundary_repeat_{name}"));
+        let config = test_config(&scratch, "deriv", "ws://127.0.0.1/", false);
+        let (local, destination) = stores(&scratch);
+        let pass = |pages: Vec<HistoryPage>| {
+            fetch::pass(
+                &config,
+                &mut Pages::new(pages),
+                &local,
+                &destination,
+                (0, 10_000_000),
+                &mut Vec::new(),
+            )
+        };
+        pass(vec![page(&repeated), page(&[])]).unwrap();
+        pass(repair).unwrap();
+        let manifests = read_manifests(&scratch);
+        assert_eq!(manifests.len(), 2, "{name}");
+        let repaired = read_coverage(&scratch, &manifests[1]);
+        assert_eq!(repaired.rows, 11, "{name}");
+        let rows = common::read_normalized_ticks(&scratch.path("published"), &manifests[1]);
+        assert_eq!(
+            rows.iter()
+                .filter(|row| row.event_time_micros == 5_000_000)
+                .count(),
+            2,
+            "{name}"
+        );
+        assert_eq!(
+            repaired.verified,
+            Some(fetch::Range {
+                start: time_text(0),
+                end: time_text(9_000_001)
+            }),
+            "{name}"
+        );
+    }
+}
+
+#[test]
 fn prefix_repair_preserves_verified_end_and_restart_rejects_changed_prefix() {
     let scratch = Scratch::new("phase10_monotonic_repair");
     let config = test_config(&scratch, "deriv", "ws://127.0.0.1/", false);
