@@ -4610,7 +4610,6 @@ mod broker_authoritative {
     fn proposal(proposal: Proposal) -> Observation {
         Observation::Proposal {
             binding: "b1".into(),
-            source: source(&proposal.identity, proposal.receipt_micros),
             proposal,
         }
     }
@@ -4778,21 +4777,24 @@ mod broker_authoritative {
                 .unwrap_err()
                 .contains("precedes the installed")
         );
-        // A loss/tie fee changes the strict semantic cash table and is rejected at the boundary.
+        // Broker-declared fees install; the envelope rejects excess fees before reservation.
         for loss in [true, false] {
-            let mut invalid = live.restored();
-            let mut bad = quote(&invalid, "bad", at + 2, "18.83");
+            let mut live = Live::new(broker_definition());
+            let mut quoted = quote(&live, "fee", PURCHASE, "18.83");
             if loss {
-                bad.terms.loss.terminal_fee = decimal("0.01");
+                quoted.terms.loss.terminal_fee = decimal("0.01");
             } else {
-                bad.terms.tie.terminal_fee = decimal("0.01");
+                quoted.terms.tie.terminal_fee = decimal("0.01");
             }
-            assert!(
-                invalid
-                    .try_step(at + 2, vec![proposal(bad)])
-                    .unwrap_err()
-                    .contains("loss and tie cashflows must be zero")
+            assert!(checked_step(&mut live, PURCHASE, vec![proposal(quoted)]).is_empty());
+            let events = checked_step(
+                &mut live,
+                PURCHASE,
+                vec![tick(PURCHASE, 920_409), row(0, PURCHASE, PURCHASE, true)],
             );
+            assert_eq!(dispositions(&events), [Disposition::QuoteRejected]);
+            assert_eq!(live.account("a").reserved.to_string(), "0.00");
+            assert_eq!(live.account("a").open, 0);
         }
     }
 
@@ -5822,7 +5824,7 @@ mod broker_authoritative {
     }
 
     #[test]
-    fn broker_ticks_record_diagnostics_and_equal_price_is_a_broker_loss() {
+    fn broker_ticks_before_terminal_restore_byte_identical_continuation() {
         let (mut live, command) = prepared(broker_definition());
         checked_step(&mut live, PURCHASE, vec![purchase(&command, "10")]);
         checked_step(
@@ -5842,23 +5844,43 @@ mod broker_authoritative {
             PURCHASE + SECOND,
             vec![tick(PURCHASE + SECOND, 920_409)],
         );
-        let at = PURCHASE + 16 * SECOND;
-        checked_step(
-            &mut live,
-            at,
-            vec![terminal(
-                &command,
-                TerminalStatus::Lost,
-                "equal-loss",
-                Some((920_252, PURCHASE + 14 * SECOND)),
-            )],
-        );
         let mut restored = live.restored();
-        let events = checked_step(
-            &mut restored,
-            at,
-            vec![cash(CashAction::Sell, "0", "equal-loss", at)],
+        let at = PURCHASE + 16 * SECOND;
+        let end = terminal(
+            &command,
+            TerminalStatus::Lost,
+            "equal-loss",
+            Some((920_252, PURCHASE + 14 * SECOND)),
         );
+        let events = checked_step(&mut live, at, vec![end.clone()]);
+        checked_step(&mut restored, at, vec![end]);
+        assert_eq!(live.lines, restored.lines);
+        let EventKind::Unresolved {
+            path: Some(path), ..
+        } = &events[0].kind
+        else {
+            panic!("{events:?}")
+        };
+        assert_eq!(*path, PathMetrics::new(PURCHASE));
+        rejects_altered(
+            &live,
+            |kind| {
+                if let EventKind::Unresolved {
+                    path: Some(path), ..
+                } = kind
+                {
+                    path.max_favorable_units = 157;
+                    true
+                } else {
+                    false
+                }
+            },
+            "terminal path",
+        );
+        let sell = cash(CashAction::Sell, "0", "equal-loss", at);
+        let events = checked_step(&mut live, at, vec![sell.clone()]);
+        checked_step(&mut restored, at, vec![sell]);
+        assert_eq!(live.lines, restored.lines);
         let EventKind::Settled {
             outcome,
             profit,
@@ -5870,8 +5892,640 @@ mod broker_authoritative {
         };
         assert_eq!(*outcome, Outcome::Loss);
         assert_eq!(profit.to_string(), "-10.00");
-        assert_eq!(path.final_move_units, 0);
-        assert_eq!(path.max_favorable_units, 157);
+        assert_eq!(*path, PathMetrics::new(PURCHASE));
+        assert_eq!(restored.cash(), "9944.57");
         assert_eq!(restored.engine.summary().portfolio.ties, 0);
+    }
+
+    fn closure_resolution(status: TerminalStatus, gross: &str) -> Resolution {
+        let gross_return = decimal(gross);
+        let terminal_fee = decimal("0");
+        match status {
+            TerminalStatus::Won | TerminalStatus::Lost => Resolution::Settled {
+                outcome: if status == TerminalStatus::Won {
+                    Outcome::Win
+                } else {
+                    Outcome::Loss
+                },
+                gross_return,
+                terminal_fee,
+            },
+            _ => Resolution::ExternallyClosed {
+                status,
+                gross_return,
+                terminal_fee,
+            },
+        }
+    }
+
+    #[test]
+    fn contradictory_reconciled_replacement_cannot_restore_recorded_terminal_or_cash() {
+        for (status, gross) in [
+            (TerminalStatus::Won, "18.83"),
+            (TerminalStatus::Lost, "0"),
+            (TerminalStatus::Sold, "4.20"),
+            (TerminalStatus::Cancelled, "4.20"),
+        ] {
+            let (mut live, command) = prepared(broker_definition());
+            checked_step(&mut live, PURCHASE, vec![purchase(&command, "10")]);
+            let at = PURCHASE + 16 * SECOND;
+            checked_step(
+                &mut live,
+                at,
+                vec![
+                    terminal(&command, status, "sell", None),
+                    cash(CashAction::Sell, gross, "sell", at),
+                ],
+            );
+            for stated in [
+                TerminalStatus::Won,
+                TerminalStatus::Lost,
+                TerminalStatus::Sold,
+                TerminalStatus::Cancelled,
+            ] {
+                let resolution = closure_resolution(stated, "1.00");
+                let expected = if stated == status {
+                    "recorded sell cash sell amount".into()
+                } else {
+                    format!("recorded terminal {status}")
+                };
+                rejects_altered(
+                    &live,
+                    |kind| {
+                        let source = match kind {
+                            EventKind::Settled { source, .. }
+                            | EventKind::Reconciled {
+                                source,
+                                resolution: Resolution::ExternallyClosed { .. },
+                                ..
+                            } => source.clone(),
+                            _ => return false,
+                        };
+                        *kind = EventKind::Reconciled {
+                            command: command.clone(),
+                            source,
+                            resolution: resolution.clone(),
+                            release: decimal("0.00"),
+                            debit: decimal("0.00"),
+                            credit: decimal("1.00"),
+                            profit: Some(decimal("-9.00")),
+                        };
+                        true
+                    },
+                    &expected,
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn live_reconciliation_cannot_contradict_recorded_terminal_or_pending_cash() {
+        for status in [
+            TerminalStatus::Won,
+            TerminalStatus::Lost,
+            TerminalStatus::Sold,
+            TerminalStatus::Cancelled,
+        ] {
+            let (mut live, command) = prepared(broker_definition());
+            checked_step(&mut live, PURCHASE, vec![purchase(&command, "10")]);
+            let at = PURCHASE + 16 * SECOND;
+            checked_step(
+                &mut live,
+                at,
+                vec![terminal(&command, status, "sell", None)],
+            );
+            for stated in [
+                TerminalStatus::Won,
+                TerminalStatus::Lost,
+                TerminalStatus::Sold,
+                TerminalStatus::Cancelled,
+            ] {
+                if stated == status {
+                    continue;
+                }
+                let mut fork = live.restored();
+                let error = fork
+                    .try_step(
+                        at,
+                        vec![reconciliation(
+                            &command,
+                            at,
+                            closure_resolution(stated, "4.20"),
+                        )],
+                    )
+                    .unwrap_err();
+                assert!(
+                    error.contains(&format!("recorded terminal {status}")),
+                    "{error}"
+                );
+            }
+            // Missing cash may be supplied without changing the recorded terminal.
+            checked_step(
+                &mut live,
+                at,
+                vec![reconciliation(
+                    &command,
+                    at,
+                    closure_resolution(status, "4.20"),
+                )],
+            );
+            assert_eq!(live.cash(), "9948.77");
+            assert_eq!(live.account("a").open, 0);
+        }
+        for status in [TerminalStatus::Won, TerminalStatus::Sold] {
+            let (mut live, command) = prepared(broker_definition());
+            checked_step(&mut live, PURCHASE, vec![purchase(&command, "10")]);
+            let at = PURCHASE + 16 * SECOND;
+            checked_step(
+                &mut live,
+                at,
+                vec![cash(CashAction::Sell, "4.20", "pending", at)],
+            );
+            let mut fork = live.restored();
+            let error = fork
+                .try_step(
+                    at,
+                    vec![reconciliation(
+                        &command,
+                        at,
+                        closure_resolution(status, "0"),
+                    )],
+                )
+                .unwrap_err();
+            assert!(
+                error.contains("recorded sell cash pending amount 4.20"),
+                "{error}"
+            );
+            // A terminal supplied by reconciliation consumes the matching cash once.
+            checked_step(
+                &mut live,
+                at,
+                vec![reconciliation(
+                    &command,
+                    at,
+                    closure_resolution(status, "4.200"),
+                )],
+            );
+            assert_eq!(live.cash(), "9948.77");
+            assert!(live.account("a").blocked.is_empty());
+            assert!(
+                checked_step(
+                    &mut live,
+                    at,
+                    vec![cash(CashAction::Sell, "4.20", "pending", at)]
+                )
+                .is_empty()
+            );
+        }
+    }
+
+    #[test]
+    fn buy_transaction_clock_is_independent_in_both_purchase_arrival_orders() {
+        for cash_first in [false, true] {
+            let (mut live, command) = prepared(broker_definition());
+            let at = PURCHASE + SECOND;
+            let buy = cash(CashAction::Buy, "-10", "fixture-buy", at);
+            if cash_first {
+                let events = checked_step(&mut live, at, vec![buy.clone()]);
+                assert!(
+                    matches!(&events[0].kind, EventKind::CashObserved { fact, matched: None, .. } if fact.time_micros == at)
+                );
+            }
+            checked_step(&mut live, at, vec![purchase(&command, "10")]);
+            assert!(checked_step(&mut live, at, vec![buy.clone(), buy]).is_empty());
+            assert_eq!(live.cash(), "9944.57");
+            assert_eq!(live.account("a").paid_basis.to_string(), "10.00");
+            assert!(live.account("a").blocked.is_empty());
+            let mut restored = live.restored();
+            assert!(
+                checked_step(
+                    &mut restored,
+                    at,
+                    vec![cash(CashAction::Buy, "-10.00", "fixture-buy", at)]
+                )
+                .is_empty()
+            );
+            let error = restored
+                .try_step(at, vec![cash(CashAction::Buy, "-10.01", "fixture-buy", at)])
+                .unwrap_err();
+            assert!(
+                error.contains("fixture-buy")
+                    && (error.contains("contradicts") || error.contains("different cash fact")),
+                "{error}"
+            );
+        }
+    }
+
+    #[test]
+    fn scale_equivalent_liability_redelivery_is_a_noop_for_same_and_new_sources() {
+        let (mut live, command) = prepared(broker_definition());
+        checked_step(&mut live, PURCHASE, vec![purchase(&command, "10")]);
+        let original_lines = live.lines.clone();
+        for new_source in [false, true] {
+            let mut repeated = purchase(&command, "10.00");
+            if let Observation::Purchased {
+                liability,
+                source: provenance,
+                ..
+            } = &mut repeated
+            {
+                liability.payout = decimal("18.830");
+                if new_source {
+                    *provenance = source("other-source", PURCHASE + SECOND);
+                }
+            }
+            assert!(checked_step(&mut live, PURCHASE + SECOND, vec![repeated]).is_empty());
+        }
+        assert_eq!(live.lines, original_lines);
+        let mut changed = purchase(&command, "10");
+        if let Observation::Purchased {
+            liability,
+            source: provenance,
+            ..
+        } = &mut changed
+        {
+            liability.payout = decimal("18.84");
+            *provenance = source("changed-source", PURCHASE + SECOND);
+        }
+        assert!(
+            live.try_step(PURCHASE + SECOND, vec![changed])
+                .unwrap_err()
+                .contains("recorded liability")
+        );
+    }
+
+    #[test]
+    fn discrepancy_confirmation_at_another_scale_works_open_and_closed() {
+        for closed in [false, true] {
+            let (mut live, command) = prepared(broker_definition());
+            checked_step(&mut live, PURCHASE, vec![purchase(&command, "10.50")]);
+            let at = PURCHASE + 16 * SECOND;
+            if closed {
+                checked_step(
+                    &mut live,
+                    at,
+                    vec![
+                        terminal(&command, TerminalStatus::Sold, "sell", None),
+                        cash(CashAction::Sell, "4.20", "sell", at),
+                    ],
+                );
+            }
+            let mut equivalent = liability();
+            equivalent.payout = decimal("18.830");
+            let before = live.cash();
+            let resolution = Resolution::Purchased {
+                debit: decimal("10.500"),
+                liability: equivalent,
+            };
+            let events = checked_step(
+                &mut live,
+                at,
+                vec![reconciliation(&command, at, resolution)],
+            );
+            assert!(
+                matches!(&events[0].kind, EventKind::Reconciled { release, debit, credit, profit: None, .. } if release.is_zero() && debit.is_zero() && credit.is_zero())
+            );
+            assert!(
+                checked_step(
+                    &mut live,
+                    at,
+                    vec![reconciliation(
+                        &command,
+                        at,
+                        Resolution::Purchased {
+                            debit: decimal("10.50"),
+                            liability: liability()
+                        }
+                    )]
+                )
+                .is_empty()
+            );
+            assert_eq!(live.cash(), before);
+            assert!(live.account("a").blocked.is_empty());
+        }
+    }
+
+    #[test]
+    fn purchase_block_lift_while_awaiting_cash_preserves_engine_and_projection_unresolved() {
+        let (mut live, command) = prepared(broker_definition());
+        checked_step(&mut live, PURCHASE, vec![purchase(&command, "10.50")]);
+        let at = PURCHASE + 16 * SECOND;
+        checked_step(
+            &mut live,
+            at,
+            vec![terminal(&command, TerminalStatus::Won, "sell", None)],
+        );
+        checked_step(
+            &mut live,
+            at,
+            vec![reconciliation(
+                &command,
+                at,
+                Resolution::Purchased {
+                    debit: decimal("10.50"),
+                    liability: liability(),
+                },
+            )],
+        );
+        let projected = binary_alpha_engine::search::project_splits(
+            live.lines
+                .iter()
+                .map(|line| FinancialEvent::from_line(line).unwrap()),
+            "u",
+        );
+        assert_eq!(live.engine.summary().portfolio.unresolved, 1);
+        assert_eq!(projected["b1"]["none"].unresolved, 1);
+        assert_eq!(projected["b1"]["none"], live.engine.summary().portfolio);
+        assert_eq!(live.cash(), "9944.07");
+        assert_eq!(live.account("a").paid_basis.to_string(), "10.50");
+        assert_eq!(live.account("a").unresolved_loss.to_string(), "10.50");
+        assert!(live.account("a").blocked.is_empty());
+        checked_step(
+            &mut live,
+            at,
+            vec![cash(CashAction::Sell, "18.83", "sell", at)],
+        );
+        assert_eq!(live.cash(), "9962.90");
+        assert_eq!(live.engine.summary().portfolio.unresolved, 0);
+    }
+
+    #[test]
+    fn partial_confirmation_accepts_expiry_first_and_entry_first() {
+        for expiry_first in [true, false] {
+            let (mut live, command) = prepared(broker_definition());
+            checked_step(&mut live, PURCHASE, vec![purchase(&command, "10")]);
+            let at = PURCHASE + 2 * SECOND;
+            let expiry = confirmed(&command, at, None, None, None, Some(PURCHASE + 15 * SECOND));
+            let entry = confirmed(&command, at, Some(920_252), Some(at), Some(PURCHASE), None);
+            let ordered = if expiry_first {
+                [expiry, entry]
+            } else {
+                [entry, expiry]
+            };
+            for observation in &ordered {
+                let events = checked_step(&mut live, at, vec![observation.clone()]);
+                assert_eq!(kinds(&events), ["confirmed"]);
+            }
+            assert!(checked_step(&mut live, at, ordered.into_iter().rev().collect()).is_empty());
+            let at = PURCHASE + 16 * SECOND;
+            checked_step(
+                &mut live,
+                at,
+                vec![
+                    terminal(
+                        &command,
+                        TerminalStatus::Won,
+                        "sell",
+                        Some((920_308, PURCHASE + 14 * SECOND)),
+                    ),
+                    cash(CashAction::Sell, "18.83", "sell", at),
+                ],
+            );
+            assert_eq!(live.cash(), "9963.40");
+            assert_eq!(live.engine.summary().portfolio.wins, 1);
+        }
+    }
+
+    #[test]
+    fn unknown_expiry_ticks_are_continuity_only_and_restore_before_terminal() {
+        let mut definition = broker_definition();
+        definition.replay.contracts[0]
+            .settlement
+            .max_tick_gap_micros = SECOND;
+        let (mut live, command) = prepared(definition);
+        checked_step(&mut live, PURCHASE, vec![purchase(&command, "10")]);
+        checked_step(
+            &mut live,
+            PURCHASE,
+            vec![confirmed(
+                &command,
+                PURCHASE,
+                Some(920_252),
+                Some(PURCHASE),
+                None,
+                None,
+            )],
+        );
+        assert!(
+            checked_step(
+                &mut live,
+                PURCHASE + 10 * SECOND,
+                vec![tick(PURCHASE + 10 * SECOND, 920_409)]
+            )
+            .is_empty()
+        );
+        assert_eq!(live.engine.summary().portfolio.unresolved, 0);
+        assert_eq!(live.account("a").open, 1);
+        let mut restored = live.restored();
+        let at = PURCHASE + 16 * SECOND;
+        let observations = vec![
+            terminal(
+                &command,
+                TerminalStatus::Won,
+                "sell",
+                Some((920_308, PURCHASE + 14 * SECOND)),
+            ),
+            cash(CashAction::Sell, "18.83", "sell", at),
+        ];
+        let events = checked_step(&mut live, at, observations.clone());
+        checked_step(&mut restored, at, observations);
+        assert_eq!(live.lines, restored.lines);
+        let EventKind::Settled {
+            path: Some(path), ..
+        } = &events[2].kind
+        else {
+            panic!("{events:?}")
+        };
+        assert_eq!(path.final_move_units, 56);
+        assert_eq!(path.max_favorable_units, 56);
+        assert_eq!(live.cash(), "9963.40");
+    }
+
+    #[test]
+    fn known_entry_unavailable_exit_settles_without_price_or_path() {
+        let (mut live, command) = prepared(broker_definition());
+        checked_step(&mut live, PURCHASE, vec![purchase(&command, "10")]);
+        checked_step(
+            &mut live,
+            PURCHASE,
+            vec![confirmed(
+                &command,
+                PURCHASE,
+                Some(920_252),
+                Some(PURCHASE),
+                Some(PURCHASE),
+                None,
+            )],
+        );
+        checked_step(
+            &mut live,
+            PURCHASE + SECOND,
+            vec![tick(PURCHASE + SECOND, 920_409)],
+        );
+        let at = PURCHASE + 16 * SECOND;
+        let events = checked_step(
+            &mut live,
+            at,
+            vec![
+                terminal(&command, TerminalStatus::Won, "sell", None),
+                cash(CashAction::Sell, "18.83", "sell", at),
+            ],
+        );
+        assert!(matches!(
+            &events[0].kind,
+            EventKind::Unresolved { path: None, .. }
+        ));
+        let EventKind::Settled {
+            settlement_price_units: None,
+            path: None,
+            credit,
+            profit,
+            ..
+        } = &events[2].kind
+        else {
+            panic!("{events:?}")
+        };
+        assert_eq!(credit.to_string(), "18.83");
+        assert_eq!(profit.to_string(), "8.83");
+        let line = String::from_utf8(events[2].to_line()).unwrap();
+        assert!(!line.contains("settlement_price_units") && !line.contains("\"path\""));
+        assert_eq!(live.cash(), "9963.40");
+        assert_eq!(live.account("a").open, 0);
+    }
+
+    #[test]
+    fn strict_proposal_fees_are_broker_declared_and_returns_remain_zero() {
+        let mut definition = broker_definition();
+        definition.replay.bindings[0].envelope.max_loss_terminal_fee = decimal("0.30");
+        definition.replay.bindings[0].envelope.max_tie_terminal_fee = decimal("0.20");
+        let mut live = Live::new(definition);
+        let mut quoted = quote(&live, "fees", PURCHASE, "18.83");
+        quoted.terms.loss.terminal_fee = decimal("0.30");
+        quoted.terms.tie.terminal_fee = decimal("0.20");
+        let events = checked_step(
+            &mut live,
+            PURCHASE,
+            vec![
+                proposal(quoted.clone()),
+                tick(PURCHASE, 920_409),
+                row(0, PURCHASE, PURCHASE, true),
+            ],
+        );
+        assert_eq!(dispositions(&events), [Disposition::Admitted]);
+        assert_eq!(live.account("a").reserved.to_string(), "10.30");
+        let command = Live::command(&events);
+        checked_step(&mut live, PURCHASE, vec![purchase(&command, "10")]);
+        assert_eq!(live.account("a").reserved.to_string(), "0.30");
+        assert_eq!(live.account("a").unresolved_loss.to_string(), "10.30");
+        for loss in [true, false] {
+            for invalid_return in [true, false] {
+                let mut fork = live.restored();
+                let mut invalid = quoted.clone();
+                let cashflow = if loss {
+                    &mut invalid.terms.loss
+                } else {
+                    &mut invalid.terms.tie
+                };
+                if invalid_return {
+                    cashflow.gross_return = decimal("0.01");
+                } else {
+                    cashflow.terminal_fee = decimal("-0.01");
+                }
+                let error = fork
+                    .try_step(PURCHASE, vec![proposal(invalid)])
+                    .unwrap_err();
+                assert!(
+                    error.contains(if invalid_return {
+                        "loss and tie returns must be zero"
+                    } else {
+                        "must not be negative"
+                    }),
+                    "{error}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn scale_equivalent_proposal_preserves_the_installed_fact() {
+        let mut live = Live::new(broker_definition());
+        let original = quote(&live, "same", PURCHASE, "18.83");
+        checked_step(&mut live, PURCHASE, vec![proposal(original.clone())]);
+        let mut equivalent = original.clone();
+        equivalent.terms.stake = decimal("10.00");
+        equivalent.terms.quoted_cost = decimal("10.000");
+        equivalent.terms.entry_fee = decimal("0.00");
+        equivalent.terms.win.gross_return = decimal("18.830");
+        equivalent.terms.win.terminal_fee = decimal("0.00");
+        equivalent.terms.loss.gross_return = decimal("0.000");
+        equivalent.terms.loss.terminal_fee = decimal("0.000");
+        equivalent.terms.tie.gross_return = decimal("0.00");
+        equivalent.terms.tie.terminal_fee = decimal("0.00");
+        checked_step(&mut live, PURCHASE, vec![proposal(equivalent)]);
+        let events = checked_step(
+            &mut live,
+            PURCHASE,
+            vec![tick(PURCHASE, 920_409), row(0, PURCHASE, PURCHASE, true)],
+        );
+        assert!(
+            matches!(&events[0].kind, EventKind::Signal { proposal: Some(recorded), .. } if recorded == &original)
+        );
+        assert_eq!(live.account("a").reserved.to_string(), "10.00");
+    }
+
+    #[test]
+    fn broker_ledger_postings_compare_values_and_keep_account_scale() {
+        let (mut live, command) = prepared(broker_definition());
+        checked_step(&mut live, PURCHASE, vec![purchase(&command, "10")]);
+        let at = PURCHASE + 16 * SECOND;
+        checked_step(
+            &mut live,
+            at,
+            vec![
+                terminal(&command, TerminalStatus::Won, "sell", None),
+                cash(CashAction::Sell, "18.83", "sell", at),
+            ],
+        );
+        let mut events: Vec<_> = live
+            .lines
+            .iter()
+            .map(|line| FinancialEvent::from_line(line).unwrap())
+            .collect();
+        for event in &mut events {
+            match &mut event.kind {
+                EventKind::Signal {
+                    reservation: Some(reservation),
+                    ..
+                } => *reservation = decimal("10.000"),
+                EventKind::Accepted {
+                    debit, reservation, ..
+                } => {
+                    *debit = decimal("10.000");
+                    *reservation = decimal("0.000");
+                }
+                EventKind::Settled {
+                    credit,
+                    profit,
+                    release,
+                    gross_return,
+                    terminal_fee,
+                    ..
+                } => {
+                    *credit = decimal("18.830");
+                    *profit = decimal("8.830");
+                    *release = decimal("0.000");
+                    *gross_return = decimal("18.830");
+                    *terminal_fee = decimal("0.000");
+                }
+                _ => {}
+            }
+        }
+        let restored = Engine::restore(events.iter().map(|event| Ok(event.to_line()))).unwrap();
+        assert_eq!(restored.accounts(), live.engine.accounts());
+        assert_eq!(restored.state_identity(), live.engine.state_identity());
+        assert_eq!(
+            restored.summary().to_json(),
+            live.engine.summary().to_json()
+        );
     }
 }

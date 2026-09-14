@@ -779,9 +779,10 @@ pub fn project_splits(
                 ..
             } => {
                 if open.contains(&command)
+                    && accepted.insert(command.clone())
                     && let Some(group) = group_of(&mut groups, &commands, &command)
                 {
-                    group.accepted += u64::from(accepted.insert(command.clone()));
+                    group.accepted += 1;
                     group.unresolved -= u64::from(unresolved.remove(&command));
                 }
             }
@@ -794,8 +795,7 @@ pub fn project_splits(
                 if open.remove(&command)
                     && let Some(group) = group_of(&mut groups, &commands, &command)
                 {
-                    group.open -= 1;
-                    group.unresolved -= u64::from(unresolved.remove(&command));
+                    group.close(unresolved.remove(&command));
                     group.released += 1;
                 }
             }
@@ -814,19 +814,9 @@ pub fn project_splits(
                 if open.remove(&command)
                     && let Some(group) = group_of(&mut groups, &commands, &command)
                 {
-                    group.settled += 1;
-                    group.open -= 1;
-                    group.unresolved -= u64::from(unresolved.remove(&command));
-                    match outcome {
-                        crate::execution::Outcome::Win => group.wins += 1,
-                        crate::execution::Outcome::Loss => group.losses += 1,
-                        crate::execution::Outcome::Tie => group.ties += 1,
-                    }
-                    let entry = group
-                        .profit
-                        .entry(currency.to_string())
-                        .or_insert_with(|| Some(Decimal::zero(profit.scale())));
-                    *entry = entry.and_then(|total| total.checked_add(profit).ok());
+                    group.close(unresolved.remove(&command));
+                    group.outcome(outcome);
+                    group.add_profit(currency, profit);
                 }
             }
             EventKind::Reconciled {
@@ -839,13 +829,8 @@ pub fn project_splits(
                     && let Some(group) = group_of(&mut groups, &commands, &command)
                 {
                     group.externally_closed += 1;
-                    group.open -= 1;
-                    group.unresolved -= u64::from(unresolved.remove(&command));
-                    let entry = group
-                        .profit
-                        .entry(currency.to_string())
-                        .or_insert_with(|| Some(Decimal::zero(profit.scale())));
-                    *entry = entry.and_then(|total| total.checked_add(profit).ok());
+                    group.close(unresolved.remove(&command));
+                    group.add_profit(currency, profit);
                 }
             }
             EventKind::Unresolved { command, .. } | EventKind::PossiblySent { command, .. } => {
