@@ -506,6 +506,34 @@ pub fn runtime_with_io(
         Box<dyn binary_alpha_app::broker::transport::Connector>,
     ) -> Box<dyn binary_alpha_app::broker::transport::Connector>,
 ) -> Result<live::Runtime, String> {
+    runtime_with_owner_clock(
+        fixture,
+        mode,
+        recorded,
+        control,
+        edit,
+        wrap_market,
+        wrap_account,
+        None,
+    )
+}
+
+/// Overrides only the owner's local clock for measured database round-trip/skew scenarios.
+#[allow(clippy::too_many_arguments)]
+pub fn runtime_with_owner_clock(
+    fixture: &Fixture,
+    mode: live::Mode,
+    recorded: &binary_alpha_app::broker::transport::RecordedConnector,
+    control: Box<dyn binary_alpha_app::live::control::Control>,
+    edit: impl FnOnce(&mut live::LiveDefinition),
+    wrap_market: impl FnOnce(
+        Box<dyn binary_alpha_app::broker::MarketDataBroker>,
+    ) -> Box<dyn binary_alpha_app::broker::MarketDataBroker>,
+    wrap_account: impl FnOnce(
+        Box<dyn binary_alpha_app::broker::transport::Connector>,
+    ) -> Box<dyn binary_alpha_app::broker::transport::Connector>,
+    owner_clock: Option<Box<dyn binary_alpha_app::broker::Clock>>,
+) -> Result<live::Runtime, String> {
     use binary_alpha_app::broker::{
         AccountIdentity,
         deriv::{DerivAccounts, DerivMarketData, DerivOptions},
@@ -565,10 +593,131 @@ pub fn runtime_with_io(
         control,
         wrap_market(Box::new(market)),
         options,
-        Box::new(clock.clone()),
+        owner_clock.unwrap_or_else(|| Box::new(clock.clone())),
         Some(clock),
         mode,
     )
+}
+
+/// A separate synthetic host, retaining the exact source/configuration/deployment identity.
+pub fn isolated_fixture(fixture: &Fixture, name: &str) -> Fixture {
+    let root = fixture.scratch.path(name);
+    fs::create_dir_all(&root).unwrap();
+    Fixture {
+        scratch: Scratch { root: root.clone() },
+        config: fixture.config.clone(),
+        path: root.join("live.toml"),
+        bundle: fixture.bundle.clone(),
+        run: fixture.run.clone(),
+        datasets: fixture.datasets.clone(),
+    }
+}
+
+pub fn scenario_rows(log: &str) -> Vec<Value> {
+    log.lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect()
+}
+pub fn scenario_log(rows: &[Value]) -> String {
+    rows.iter().map(|row| format!("{row}\n")).collect()
+}
+pub fn account_row(at: i64, frame: &str) -> Value {
+    serde_json::from_str(&log_line("account", at, frame)).unwrap()
+}
+pub fn scenario_tick(at: i64, price: &str) -> Value {
+    let tick = change(
+        &change(
+            &crate::common::broker::fixture("deriv-tick-R_50.json"),
+            "tick",
+            "epoch",
+            &(at / 1_000_000).to_string(),
+        ),
+        "tick",
+        "quote",
+        price,
+    );
+    serde_json::from_str(&log_line("market", at, &tick)).unwrap()
+}
+pub fn ledger_events(owner: &live::Runtime) -> Vec<binary_alpha_engine::execution::FinancialEvent> {
+    owner
+        .records()
+        .iter()
+        .filter_map(|r| match &r.kind {
+            live::journal::RecordKind::Ledger { event } => Some(event.clone()),
+            _ => None,
+        })
+        .collect()
+}
+/// Computes the real receipt owner against a runtime's current (possibly incomplete) journal.
+pub fn scenario_receipt(fixture: &Fixture, owner: &live::Runtime) -> live::receipt::Receipt {
+    scenario_receipt_records(fixture, owner, owner.records())
+}
+
+/// Measures an exact journal prefix without synthesizing or editing financial events.
+pub fn scenario_receipt_records(
+    fixture: &Fixture,
+    owner: &live::Runtime,
+    records: &[live::journal::Record],
+) -> live::receipt::Receipt {
+    let settings = &fixture.config.live.as_ref().unwrap().compatibility;
+    live::receipt::compute(&live::receipt::Inputs {
+        deployment: &owner.definition.deployment,
+        definition: &owner.definition.definition,
+        baseline: &owner.definition.policy.baseline,
+        source: &owner.definition.policy.source,
+        account_class: owner.health().account_class,
+        required_account_class: settings.required_account_class,
+        observation: &binary_alpha_engine::research::Window {
+            decision_start: settings.observation_start.clone(),
+            decision_end: settings.observation_end.clone(),
+        },
+        min_samples: settings.min_samples,
+        scenarios: &owner.definition.scenarios,
+        ledger: &owner.definition.manifest.definition,
+        events: &records
+            .iter()
+            .filter_map(|r| match &r.kind {
+                live::journal::RecordKind::Ledger { event } => Some(event.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>(),
+        refusals: records,
+    })
+}
+
+/// Writes an interrupted synthetic host's prefix into a fresh host; completed evidence stays put.
+pub fn seed_scenario_prefix(fixture: &Fixture, records: &[live::journal::Record]) {
+    let (mut journal, existing) = live::journal::Journal::open(
+        &fixture.scratch.path("journal"),
+        &fixture.definition().deployment,
+        u64::from(
+            fixture
+                .config
+                .live
+                .as_ref()
+                .unwrap()
+                .journal
+                .segment_records,
+        ),
+    )
+    .unwrap();
+    assert_eq!(existing, []);
+    for record in records {
+        assert_eq!(
+            journal
+                .append(record.time_micros, record.kind.clone())
+                .unwrap(),
+            *record
+        );
+    }
+    journal
+        .append(
+            records.last().unwrap().time_micros,
+            live::journal::RecordKind::Discontinuity {
+                reason: "synthetic scenario restart boundary".into(),
+            },
+        )
+        .unwrap();
 }
 
 /// Retains the provider's relative entry/expiry/exit and purchase delays; shifts only the epoch.
