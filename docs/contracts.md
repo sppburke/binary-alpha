@@ -1151,12 +1151,11 @@ liabilities; its local fixture is synthetic from the pinned schema. `CashFact` a
 purchase payout or purchase time: recovery must obtain those from purchase/contract evidence, not
 infer them from the proposal or the cash transaction clock.
 
-Two current Engine constraints remain relevant to the Phase 12 handoff. The financial ledger
+One current Engine constraint remains relevant to the Phase 12 handoff: the financial ledger
 retains an admitted proposal but does not restore a proposal received before any signal; market,
-feature and unadmitted proposal inputs need an input replay boundary. Engine also requires purchase
-time no earlier than dispatch; a seconds-resolution provider purchase in the same second as a
-later microsecond dispatch currently fails that check. The adapter preserves the provider clock
-and does not adjust it to hide this constraint.
+feature and unadmitted proposal inputs need an input replay boundary. Provider purchase clocks carry
+whole seconds, so Engine accepts a purchase whose time is no earlier than the second the command was
+dispatched in and no later than the decision; the adapter preserves the provider clock unchanged.
 
 ### Pause, conversion, and projections
 

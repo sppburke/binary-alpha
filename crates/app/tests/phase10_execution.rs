@@ -1250,8 +1250,8 @@ fn financial_ledger_does_not_restore_an_unadmitted_proposal() {
 }
 
 #[test]
-fn same_second_provider_purchase_before_dispatch_is_an_engine_constraint() {
-    // The provider supplies integer seconds; Engine currently requires purchase >= dispatch.
+fn same_second_provider_purchase_is_accepted_as_causal() {
+    // The provider supplies integer seconds; a purchase in the dispatch second is causal.
     let clock = FakeClock::at(PURCHASE);
     let (mut options, _) = options(
         vec![frame("proposal-call", 1), frame("buy-call", 2)],
@@ -1266,15 +1266,18 @@ fn same_second_provider_purchase_before_dispatch_is_an_engine_constraint() {
         outcome,
         clock.now_micros(),
     );
-    let error = run
-        .engine
-        .step(clock.now_micros(), vec![observation])
-        .unwrap_err();
     assert!(
-        error.contains("acceptance clocks are inconsistent"),
-        "{error}"
+        clock.now_micros() > PURCHASE,
+        "the dispatch is later in the same second"
     );
-    assert_eq!(run.account().cash.to_string(), "9955.74");
+    let events = run.step(clock.now_micros(), vec![observation]);
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event.kind, EventKind::Accepted { .. })),
+        "{events:?}"
+    );
+    assert_eq!(run.account().cash.to_string(), "9945.74");
 }
 
 #[test]

@@ -3630,7 +3630,10 @@ impl Engine {
         postings: PurchasePostings,
     ) -> Result<(), String> {
         let obligation = &self.obligations[command];
-        if liability.purchase_time_micros < obligation.sent_micros
+        // Provider purchase clocks carry whole seconds, so a purchase is causal when it is no
+        // earlier than the second the command was dispatched in.
+        let dispatch_second = obligation.sent_micros - obligation.sent_micros.rem_euclid(1_000_000);
+        if liability.purchase_time_micros < dispatch_second
             || liability.purchase_time_micros > self.now
         {
             return Err(format!(
