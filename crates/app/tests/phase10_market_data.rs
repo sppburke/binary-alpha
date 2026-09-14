@@ -1,4 +1,6 @@
 mod common;
+#[path = "common/research.rs"]
+mod research_fixture;
 
 use binary_alpha_app::broker::deriv::{DerivAccounts, DerivAuthenticated, DerivMarketData};
 use binary_alpha_app::broker::pocket_option::{PocketMarketData, provider_token, universal_micros};
@@ -2071,6 +2073,28 @@ fn prefix_repair_preserves_verified_rows_and_repeats() {
 
 #[test]
 fn reused_history_is_published_to_the_current_destination() {
+    // Set the store-log environment only on an isolated test process. Other parallel tests
+    // keep their own environment, and the fake broker remains entirely in memory.
+    if std::env::var_os("BINARY_ALPHA_FETCH_REUSE_CHILD").is_none() {
+        let driver = Scratch::new("phase10_reuse_driver");
+        let result = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "reused_history_is_published_to_the_current_destination",
+                "--nocapture",
+            ])
+            .env("BINARY_ALPHA_FETCH_REUSE_CHILD", "1")
+            .env("BINARY_ALPHA_STORE_LOG", driver.path("access.log"))
+            .output()
+            .unwrap();
+        assert!(
+            result.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&result.stdout),
+            String::from_utf8_lossy(&result.stderr)
+        );
+        return;
+    }
     let scratch = Scratch::new("phase10_destination_switch");
     let mut config = test_config(&scratch, "deriv", "ws://127.0.0.1/", false);
     let (local, first) = stores(&scratch);
@@ -2107,6 +2131,119 @@ fn reused_history_is_published_to_the_current_destination() {
             .unwrap()
             .contains("rows 10")
     );
+
+    use binary_alpha_engine::research::{Declaration, Population, to_json};
+    let mut declaration = Declaration {
+        schema_version: 1,
+        operator: "synthetic-operator".into(),
+        root: format!("file://{}", scratch.path("governance").display())
+            .parse()
+            .unwrap(),
+        namespace: "fetch-reuse".into(),
+        populations: vec![Population {
+            id: "history".into(),
+            role: DatasetRole::Development,
+            instrument: manifest.instrument.clone(),
+            source: "synthetic-pages".into(),
+            coverage: manifest.coverage.clone(),
+            generations: vec![manifest.generation.clone()],
+            tokens: vec!["history-observations".into()],
+            exposure: vec![],
+        }],
+    };
+    let declaration_path = scratch.path("declaration.json");
+    config.research = research_fixture::configuration(&scratch.root).research;
+    let log = std::path::PathBuf::from(std::env::var_os("BINARY_ALPHA_STORE_LOG").unwrap());
+    for permitted in [true, false] {
+        if !permitted {
+            declaration.populations.clear();
+        }
+        fs::write(&declaration_path, to_json(&declaration)).unwrap();
+        let destination =
+            Store::filesystem(scratch.path(if permitted { "permitted" } else { "undeclared" }));
+        config.storage.publication_uri = destination.uri("").parse().unwrap();
+        let refreshed = page(
+            &(0..10)
+                .map(|second| (second, 200_000 + second))
+                .collect::<Vec<_>>(),
+        );
+        let mut pages = Pages::new(if permitted {
+            vec![]
+        } else {
+            vec![refreshed.clone()]
+        });
+        fs::write(&log, []).unwrap();
+        fetch::pass(
+            &config,
+            &mut pages,
+            &local,
+            &destination,
+            (0, 9_000_001),
+            &mut Vec::new(),
+        )
+        .unwrap();
+        let accesses = fs::read_to_string(&log).unwrap();
+        assert_eq!(
+            pages.anchors,
+            if permitted {
+                vec![]
+            } else {
+                vec![Some(9_000_001)]
+            }
+        );
+        assert_eq!(
+            accesses
+                .lines()
+                .any(|line| line == format!("read_to {}", manifest.key())),
+            permitted
+        );
+        if !permitted {
+            // The undeclared prior is discovered by the logged listing only: no metadata, read,
+            // or local-path operation names it.
+            assert!(
+                accesses
+                    .lines()
+                    .filter(|line| line.contains(&manifest.generation))
+                    .all(|line| line.starts_with("probe ")),
+                "{accesses}"
+            );
+        }
+        if permitted {
+            assert_eq!(
+                fs::read(destination.local_path(&manifest.key()).unwrap()).unwrap(),
+                manifest.to_json()
+            );
+            for object in &manifest.objects {
+                assert_eq!(
+                    fs::read(destination.local_path(&object.key).unwrap()).unwrap(),
+                    fs::read(first.local_path(&object.key).unwrap()).unwrap()
+                );
+            }
+            assert!(
+                verify::run(&destination.uri(&manifest.key()))
+                    .unwrap()
+                    .contains("rows 10")
+            );
+        } else {
+            let root = destination.local_path("manifests").unwrap();
+            let entries = fs::read_dir(root)
+                .unwrap()
+                .map(|e| e.unwrap().path().join("ready.json"))
+                .collect::<Vec<_>>();
+            assert_eq!(entries.len(), 1);
+            let fresh = GenerationManifest::from_json(&fs::read(&entries[0]).unwrap()).unwrap();
+            assert_ne!(fresh.generation, manifest.generation);
+            assert_eq!(
+                common::read_normalized_ticks(&destination.local_path("").unwrap(), &fresh),
+                refreshed.rows
+            );
+            assert!(
+                verify::run(&destination.uri(&fresh.key()))
+                    .unwrap()
+                    .contains("rows 10")
+            );
+        }
+    }
 }
 
 #[test]

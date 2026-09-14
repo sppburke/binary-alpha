@@ -218,3 +218,156 @@ fn cuda_configuration_requires_the_build_feature() {
             "accelerator.backend: `cuda` requested but this binary was built without the `cuda` feature"));
     }
 }
+
+#[path = "common/research.rs"]
+mod research_fixture;
+
+fn validate_document(name: &str, document: &str) -> Output {
+    let root = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join("phase11_config_documents");
+    std::fs::create_dir_all(&root).unwrap();
+    let path = root.join(format!("{name}.toml"));
+    std::fs::write(&path, document).unwrap();
+    validate(path.to_str().unwrap())
+}
+
+#[test]
+fn research_and_replay_scenario_documents_validate_and_round_trip() {
+    use binary_alpha_engine::config::{Config, ReplayScenario};
+    let root = std::path::Path::new("/synthetic/config-only-never-opened");
+    let research = research_fixture::configuration(root);
+    let mut replay = research_fixture::replay_configuration(root);
+    replay.replay.as_mut().unwrap().scenario = Some(ReplayScenario {
+        schema_version: 1,
+        id: "delay".into(),
+        acceptance_delay_micros: 100_000,
+    });
+    for (name, config) in [("research", research), ("scenario", replay)] {
+        let document = config.canonical_toml();
+        let result = validate_document(name, &document);
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        assert!(result.stderr.is_empty());
+        assert_eq!(
+            String::from_utf8(result.stdout).unwrap(),
+            format!("# content-hash: {}\n{document}", config.content_hash())
+        );
+        assert_eq!(Config::parse(&document).unwrap(), config);
+    }
+}
+
+#[test]
+fn research_and_scenario_rejections_name_the_exact_rule() {
+    use binary_alpha_engine::config::ReplayScenario;
+    let root = std::path::Path::new("/synthetic/config-only-never-opened");
+    let research = research_fixture::configuration(root);
+    let mut cases = Vec::new();
+    let mut changed = research.clone();
+    changed.research.as_mut().unwrap().scenarios[0]
+        .alternatives
+        .pop();
+    cases.push((
+        changed,
+        "research.scenarios[0].alternatives: every portfolio binding needs exactly one alternative"
+            .to_string(),
+    ));
+    let mut changed = research.clone();
+    changed.research.as_mut().unwrap().scenarios[0].id = "baseline".into();
+    cases.push((
+        changed,
+        "research.scenarios[0].id: `baseline` is the baseline or is listed twice".into(),
+    ));
+    let mut changed = research.clone();
+    changed.research.as_mut().unwrap().scenarios[0].acceptance_delay_micros = -1;
+    cases.push((
+        changed,
+        "research.scenarios[0].acceptance_delay_micros: must be non-negative".into(),
+    ));
+    let mut changed = research.clone();
+    changed.research.as_mut().unwrap().qualification.claim = "positive_expected_profit".into();
+    cases.push((changed, "research.qualification.claim: `positive_expected_profit` is not the supported claim `empirical_policy_qualification_v1`".into()));
+    let mut changed = research.clone();
+    changed.research.as_mut().unwrap().evaluation.inputs.pop();
+    cases.push((changed, "research.evaluation.inputs: 1 entries for 2 instruments; one entry per instrument in instrument order is required".into()));
+    let mut changed = research.clone();
+    changed.research.as_mut().unwrap().portfolio.max_policies = 11;
+    cases.push((
+        changed,
+        "research.portfolio.max_policies: the grid declares 12 policies, above the maximum 11"
+            .into(),
+    ));
+    let mut changed = research.clone();
+    changed.research.as_mut().unwrap().instruments[0]
+        .search
+        .max_candidates = 1;
+    cases.push((changed, "research.instruments[0].search.max_candidates: the menu enumerates 2 members, above the maximum 1".into()));
+    let mut changed = research;
+    let table = &mut changed.research.as_mut().unwrap().portfolio;
+    table.max_policies = u64::MAX;
+    table.subsets = vec![binary_alpha_engine::config::Subset {
+        deployments: vec![table.subsets[0].deployments[0]; 64],
+    }];
+    cases.push((
+        changed,
+        "research.portfolio.subsets[0]: the declared policy count overflows".into(),
+    ));
+    for (version, delay, message) in [
+        (
+            2,
+            0,
+            "replay.scenario.schema_version: unsupported version 2, expected 1",
+        ),
+        (
+            1,
+            -1,
+            "replay.scenario.acceptance_delay_micros: must be non-negative",
+        ),
+    ] {
+        let mut changed = research_fixture::replay_configuration(root);
+        changed.replay.as_mut().unwrap().scenario = Some(ReplayScenario {
+            schema_version: version,
+            id: "test".into(),
+            acceptance_delay_micros: delay,
+        });
+        cases.push((changed, message.into()));
+    }
+    for (index, (config, message)) in cases.into_iter().enumerate() {
+        let output = validate_document(&format!("invalid-{index}"), &config.canonical_toml());
+        assert_eq!(output.status.code(), Some(1));
+        assert!(output.stdout.is_empty());
+        let error = String::from_utf8(output.stderr).unwrap();
+        assert_eq!(error.trim(), message, "case {index}");
+    }
+}
+
+#[test]
+fn omitted_research_and_scenario_preserve_canonical_bytes_and_hash() {
+    use binary_alpha_engine::config::Config;
+    let legacy = std::fs::read_to_string(fixture("equivalent.toml")).unwrap();
+    let config = Config::parse(&legacy).unwrap();
+    assert!(config.research.is_none());
+    assert_eq!(
+        format!(
+            "# content-hash: {}\n{}",
+            config.content_hash(),
+            config.canonical_toml()
+        ),
+        EXPECTED_REPORT
+    );
+    // Explicit None deserializes from JSON; TOML has no null spelling. Neither optional field
+    // appears in the canonical TOML, and the pre-scenario replay document hashes identically.
+    let replay = research_fixture::replay_configuration(std::path::Path::new(
+        "/synthetic/config-only-never-opened",
+    ));
+    let legacy_replay = replay.canonical_toml();
+    assert!(!legacy_replay.contains("[research]") && !legacy_replay.contains("scenario"));
+    let mut explicit = serde_json::to_value(&replay).unwrap();
+    explicit["research"] = serde_json::Value::Null;
+    explicit["replay"]["scenario"] = serde_json::Value::Null;
+    let explicit: Config = serde_json::from_value(explicit).unwrap();
+    let without = Config::parse(&legacy_replay).unwrap();
+    assert_eq!(explicit.canonical_toml(), legacy_replay);
+    assert_eq!(explicit.content_hash(), without.content_hash());
+}

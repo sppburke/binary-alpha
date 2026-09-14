@@ -116,12 +116,13 @@ and content hash; the application package owns reading it from a path.
 | `accelerator.backend` | string | optional section; explicit offline backend `cpu` or `cuda` |
 | `search` | table | optional; consumed only by `search`, which requires it |
 | `portfolio` | table | optional; consumed only by `portfolio optimize`, which requires it |
+| `research` | table | optional; consumed only by `research run` and `holdout grant create`, which require it; described under [Research](#research) |
 | `brokers` | array of tables | optional; unique broker ids and compiled `deriv` or `pocket_option` connection settings |
 | `history` | table | optional; required by `data fetch` and `broker inspect` |
 | `inspect` | table | optional; required by `broker inspect` |
 
-The optional broker tables follow `portfolio` in canonical order: `[[brokers]]`, `[history]`,
-then `[inspect]`. All reject unknown fields and are omitted when absent, preserving existing
+The optional `research` table follows `portfolio`, and the optional broker tables follow it in
+canonical order: `[[brokers]]`, `[history]`, then `[inspect]`. All reject unknown fields and are omitted when absent, preserving existing
 configuration hashes. Every broker entry starts with `kind` and then `id`. A Deriv entry then
 contains `public_endpoint`, `bootstrap_endpoint`, `app_id`, optional `credential`, optional
 `account_class` (`demo` or `real`, required with a credential), and optional `budgets`.
@@ -422,7 +423,9 @@ its paths are unique and clean. It writes one line to standard output:
 `verified INSTRUMENT ROLE generation GENERATION rows N objects K bytes B`. A manifest whose
 top-level `kind` is `instrument_stream` is verified as a stream generation (see
 [instrument streams](#instrument-streams)); a manifest with no `kind` is a dataset generation; any
-other kind is rejected.
+other kind is rejected. With `--config PATH`, the configuration's `research.study` declaration
+permits the target before it is opened and refuses an undeclared dataset (see
+[Research](#research)).
 
 `data import`, `data audit`, and `data verify` exit with status 0 on success and, on any failure,
 write nothing further to standard output, write one diagnostic to standard error, and exit with
@@ -970,7 +973,10 @@ positive `max_open_per_strategy`, `max_open_per_duration`, `max_open_per_instrum
 `max_proposal_age_micros`, required for broker-authoritative bindings), and
 optional `rates` (unique `id`, distinct `source_currency` and `reporting_currency`, `provider`,
 `provider_time`, `available_at` no earlier than the provider time, positive `rate` in
-reporting-currency units per source unit). Every contract amount, loss limit, and pause threshold
+reporting-currency units per source unit), and the optional `scenario` descriptor (`schema_version`
+`1`, an identifier `id`, and a non-negative `acceptance_delay_micros`; see
+[Research](#research)), whose omission is immediate acceptance with every existing identity
+preserved. Every contract amount, loss limit, and pause threshold
 must be representable at the scale of each account it binds to. Two bindings sharing an account,
 instrument, contract duration, same-entry key, or deduplication key must declare that scope's
 policy identically, including absent versus configured limits; two bindings of one deployment
@@ -1504,3 +1510,239 @@ before its fit and against its cutoff, restores every recorded replay through it
 rebuilt for that choice and fold, recomputes every projection, gate, aggregate, rank, the frozen
 policy and its compilation under the refit plans, and the terminal state, and writes
 `verified portfolio generation GENERATION declared D rejected R valid V passing P state S objects 1 bytes B`.
+
+## Research
+
+`binary-alpha research run --config PATH` is the one-command study: one operating-system process
+calling the existing owners in a fixed order. It prepares every declared instrument (profile,
+features, outcomes, family), selects one joint policy through the portfolio owner with evaluation
+disabled, publishes the immutable frozen stage, claims the outer populations, assesses the frozen
+policy under every scenario, publishes the run record, and exits successfully in the state
+`awaiting_holdout_authorization`. The same command resumes the same identity: with the exact
+operator grant, every protected population claim, and the consumption receipt it creates the
+internal certification context, applies the same frozen plans and scenarios to the holdout
+generations, and publishes one certified or rejected result. No fitting, ranking, scenario choice,
+or later research reads a holdout observation or result. The engine module `research` owns every
+record, identity, permit rule, and qualification; the application module `research` owns the
+sequence, the governance effects, and the verifiers.
+
+### Configuration
+
+The optional `research` table declares, in canonical order: `study` (`study` and `attempt`
+identifiers, `governance_manifest` as `file:///DIR/FILE.json` or `gs://BUCKET/KEY` naming the
+declaration object, optional `predecessors` attempt identifiers other than the attempt itself,
+and the non-empty declared `changes`); the ordered `instruments` (each `instrument` as
+`BROKER:PROVIDER_SYMBOL` mapping one configured `[[instruments]]` entry, `source_manifest` (the
+development family-source tick generation), `features` (exactly the optional new-plan settings of
+a `[[features.instruments]]` entry), `outcomes` (exactly the `outcomes` table without its role
+and manifests), and `search` (the `search` table's settings with its development
+`decision_start` and `decision_end` and without inputs or evaluation)); `folds` (each `cutoff`,
+`decision_start`, `decision_end`, and one `{ fit_manifest, assessment_manifest }` per instrument
+in instrument order); `refit` (`cutoff` and one development fit tick generation per instrument);
+`evaluation` and `holdout` (each an evaluation window: `decision_start`, `decision_end`, one
+tick generation per instrument, optional `splits`; holdout references are validated for syntax
+and declared role only and are never opened before certification); `portfolio` (exactly the
+`portfolio` table without families, folds, refit, and evaluation; a member's family index is its
+instrument index); optional `scenarios` (each a unique identifier `id` other than `baseline`, a
+non-negative `acceptance_delay_micros`, and `alternatives` naming every portfolio binding exactly
+once with an exact `contract` and `envelope`; equal contract identifiers within one scenario carry
+equal terms); and `qualification` (`claim`, which must be `empirical_policy_qualification_v1`, and
+`gates`, the exact `min_settled`, `max_unresolved`, `min_profit`, and `max_drawdown` every
+scenario must satisfy, where `min_profit` is the minimum economically useful improvement over the
+analytic zero-profit benchmark on the same initial capital). Validation lowers the declared
+settings into the existing feature, outcome, search, and portfolio tables with the source
+manifests standing in for unpublished generations and applies their validators, under the
+evaluation window, under the holdout window, under the qualification gates, and under every
+scenario's alternatives, and checks each later window's own `splits` under the execution split
+rules, so no later structural rejection consumes a claim. Omitting the table preserves every
+existing configuration identity; the
+table follows `portfolio` and precedes `[[brokers]]` in canonical order. The command requires
+`run_mode = "research"`.
+
+The optional `replay.scenario` descriptor, version `1`, carries `schema_version` (`1`), an
+identifier `id`, and a non-negative `acceptance_delay_micros`. Every admitted command's synthetic
+acceptance is scheduled at its checked decision time plus the delay, independently of later
+prices, and delivered only through its own instrument's evidence horizon, the availability of that
+instrument's last input tick, including equality; another instrument's later evidence cannot
+extend it. Pending responses merge with input observations by availability time: same-time ticks
+and rows precede the responses, which precede new decisions, in instrument and canonical command
+order. A delivered response is an `accepted` record whose entry time is the response time and
+whose entry price and price time are the instrument's latest causally available tick at that time;
+the engine validates the clocks, derives the due time, and posts as for every acceptance. A response
+beyond its horizon is never delivered: the command stays unaccepted with its reservation and
+`Engine::finish` records it unresolved. Zero delay and an omitted descriptor take the existing
+immediate second same-time engine step and produce identical ledger records apart from the run
+definition; the descriptor is part of the replay table and therefore of every replay identity.
+This is a declared synthetic delay and fill convention, not measured broker execution fidelity.
+
+### Governance declaration and read permits
+
+The declaration is a JSON object (`schema_version` `1`, `operator`, the authoritative `root`
+store, an identifier `namespace`, and `populations`). Each population declares `id`, `role`,
+`instrument`, `source`, `coverage`, its `generations` (every dataset generation identity that
+carries it; a generation belongs to one population), its complete sorted non-empty `tokens`
+(overlapping populations share a token), and optional `exposure` history (`study`, `attempt`,
+`role`). A token declared on a holdout population is never declared on a development or
+evaluation population, and no population is recorded as exposed on the other side of the protected
+boundary; either is rejected when the declaration is read. Its identity is SHA-256 over
+`binary-alpha governance declaration v1\n` and its canonical JSON. Every governance record lives
+beneath `ROOT/NAMESPACE/`: `attempts/STUDY/ATTEMPT/intent.json`, `assessment-use/TOKEN`,
+`holdout-use/TOKEN`, `grants/RESEARCH.json`, and `receipts/GRANT_HASH.json`, each created once by
+the store's conditional creation and confirmed by exact readback; a different existing record is a
+conflict that replaces nothing.
+
+Every dataset ready-manifest reader obtains a permit from the shared helper before opening its
+target: the feature, outcome, replay, search, portfolio, audit, fetch-cache, and verification
+paths. With a declaration (the configuration's `research.study`, supplied to `data verify` with
+`--config PATH`), the target generation must be declared and its declared role must be the role
+the reader expects; a holdout target requires the certification context that names it, and an
+undeclared target is refused. Without a declaration an ordinary reader keeps its existing
+post-read role guard and holdout is refused. A ready manifest is the public reference envelope
+of its generation: a reader opens it to learn the role and references it must permit, and opens
+no object of a generation it may not read. A derived generation whose manifest carries the
+holdout role or whose declared input generation is holdout (a stream, feature, outcome, replay,
+or family of holdout data, whatever its own label says) is parsed, restored, or verified only
+within the certification context naming its dataset generations. Only the
+application research owner creates that context, from the matching run manifest, grant, and
+receipt; no configuration flag or role relabelling grants access. The fetch cache traversal lists
+the mirror through the store, reads only the declaration's generations of the fetched instrument
+and role when a declaration is present, refuses a candidate location holding another
+generation's manifest, and verifies the selected prior under the same declaration.
+
+### Stages and identities
+
+The run identity is SHA-256 over `binary-alpha research run v1\n`, the configuration hash, the
+code revision, and the declaration identity, each followed by a newline; it is computed before any
+work; an existing run manifest of that identity passes the complete run verifier and then
+resumes from its recorded state, and an existing frozen stage of that identity restores every
+child through its verifier instead of recomputing it. Before any read the run permits every
+declared input in its declared role and for its declared instrument, checks every predecessor
+intent exists under the same study, root, and namespace (a changed governance root fails
+freshness rather than creating authority) and that every population it used keeps its side of
+the protected boundary in this declaration (an exposed token never becomes protected), and
+creates the intent (configuration hash, code revision, declaration,
+root, namespace, predecessors, changes, and the populations used with their roles and tokens); an
+attempt that already ran with another configuration is refused and must be declared as a new
+attempt with the old one as predecessor. Per instrument the run audits the source generation
+(reusing one profile per generation, including every fold and refit fit source), fits the
+features, builds the outcomes, and searches once with evaluation disabled; the search child
+retains the declared `accelerator`. It then lowers the portfolio table (families in instrument
+order, every fit under its published profile, no evaluation) and selects. The frozen stage
+`manifests/RESEARCH/frozen.json` (run identity, intent key, declaration identity, every
+instrument's source, profile, feature, outcome, and family generations, the selection generation,
+the scenario definitions, and the qualification descriptor) is published before any outer claim.
+The descriptor freezes the claim, `look = "fixed_horizon_once"`, `benchmark =
+"analytic_zero_profit"`, the objective, the qualification gates, the reporting currency and scale,
+the initial accounts, both later-role windows, the per-instrument evidence-horizon rule, the
+scenario identifiers with `baseline` first, `market_inference = "unavailable"`, and the recorded
+absence of an observation-model or uncertainty justification.
+
+A selected policy claims `assessment-use/TOKEN` for every token of the evaluation populations in
+canonical order, each bound to the study, attempt, run, frozen-stage identity, declaration, and
+complete token set, before any evaluation object is opened; the complete set is read back once
+more. The refit plans apply to the evaluation generations through the feature owner, and each
+scenario replays once through the replay owner: `baseline` under the frozen policy's own terms
+with no descriptor, then each declared scenario under its delay and its alternatives, where
+deployment `d{p}` takes the contract and envelope declared for the portfolio binding the selected
+subset deploys at position `p`. Each replay is projected under the qualification gates through
+the existing restored-engine projection and qualified: insufficient settlement support, an
+unavailable conversion, or an unavailable drawdown observation is `insufficient_evidence`; any
+remaining gate failure is `economic_failure`; otherwise the scenario passes. The finite set
+aggregates once: any insufficient scenario makes the evidence insufficient, otherwise any economic
+failure rejects, otherwise the policy passes. A failing scenario never removes a scenario or
+chooses a replacement. Completed no-feasible selection, inapplicable refit, and every non-passing
+outer result are terminal and open no holdout.
+
+The run generation publishes one object, `research.json`: the resolved configuration, the
+declaration identity, the intent key, the frozen-stage identity, every instrument record, the
+selection generation, the descriptor carried unchanged, the claim keys, every scenario result
+(the applied feature generations, the replay reference, the projection with its splits, and the
+verdict), and the `state` (`no_feasible_policy`, `refit_inapplicable` with its reason,
+`outer_rejected` with its verdict, or `awaiting_holdout_authorization`). In the awaiting state
+this record is the DeploymentBundle the future live consumer parses: it references immutable
+evidence rather than duplicating it, and it is not certified or executable: the engine's
+bundle-completeness check (`Run::complete_bundle`) proves the frozen stage, the version-one claim,
+and one passing result per frozen scenario and authorizes nothing, and live consumption
+additionally requires this run's verified `certified` certification manifest. The ready manifest
+records `kind` (`research_run`), `schema_version` (`1`), `generation`, `config_hash`,
+`code_revision`, `declaration`, `selection`, `state`, and `objects`; the bundle hash a grant
+binds is the object's SHA-256, and the manifest is published only after the run verifier accepts
+its exact bytes. The command writes every child owner's report lines, then
+`research generation GENERATION scenarios N` with `[bind S development S selection S outer S
+publish S] peak_rss_kb K` or `(already published)`, the verification line, and
+`research generation GENERATION state STATE selection SELECTION`; timings and memory are
+receipts outside every identity.
+
+### Grant, claims, receipt, and certification
+
+`binary-alpha holdout grant create --config PATH --bundle-manifest URI --holdout-manifest URI
+--reason TEXT` loads `research.study`, validates its declaration, requires the bundle manifest to
+be the run of this configuration and declaration in the awaiting state and to pass the complete
+run verifier, requires one `--holdout-manifest` per instrument in instrument order equal to the
+declared holdout references,
+and creates `grants/RESEARCH.json` once: `schema_version`, `research`, `bundle_sha256`,
+`holdout` (instrument and exact ready-manifest location), `declaration`, `root`, `namespace`, the
+complete sorted protected `tokens` of the declared holdout populations, `operator` (the local
+account that ran the command, from the `USER` environment variable, or `unavailable`; not an
+authenticated store principal), `reason`, `created_at`, and `hash` (SHA-256 over
+`binary-alpha holdout grant v1\n` and the record with an empty hash). It never opens a holdout
+object; an existing grant for the same bundle and population is reported, any other existing grant
+is refused, and the operator identity that creates grants must not be able to overwrite them. It
+writes `holdout grant HASH research GENERATION at URI`.
+
+On resumption the run validates the grant (run, bundle hash, holdout references, declaration,
+root, namespace, tokens) before any claim; a mismatch fails before holdout resolution or any
+mutation, and an absent grant leaves the run awaiting. It then claims `holdout-use/TOKEN` for
+every protected token in canonical order (each bound as above plus the grant hash), reads the
+complete set back, and creates `receipts/GRANT_HASH.json` (grant, run, bundle, holdout
+references, claim keys, declaration). A receipt from another run means the grant is consumed;
+a conflicting claim fails before any holdout read and leaves every earlier claim in place; no
+claim is ever released. The certification context is created only from the matching run
+manifest, grant, and receipt, and permits only the grant's holdout generations. A completed
+certification of this run and grant is verified within that context and returned; otherwise the
+refit plans apply to the holdout generations and every scenario replays with `role = "holdout"`
+exactly as the outer assessment did (the command writes `research scenario ID replay GENERATION`
+per scenario in place of the replay owner's report, so no support count leaves the evidence
+objects), and the result is published after the certification verifier accepts its exact bytes:
+object `certification.json`
+(run, bundle hash, frozen-stage identity, grant, receipt, claims, holdout references, every
+scenario result, and the verdict with its reason) and a ready manifest with `kind`
+(`research_certification`), `schema_version` (`1`), `generation` (SHA-256 over
+`binary-alpha research certification v1\n`, the run generation, and the grant hash), `research`,
+`bundle_sha256`, `grant`, `receipt`, `state` (`certified` or `rejected`), and `objects`. The
+command writes `research certification GENERATION state STATE` with `[certify S] peak_rss_kb K`
+or `(already published)` and the verification line. Every terminal result consumes the attempt;
+`certified` retains its meaning only with the version-one claim attached: this one frozen policy
+satisfied its predeclared financial, support, and scenario rules on the named historical
+populations. It is not established positive expected profit, market false-discovery control, a
+posterior probability, or execution proof.
+
+### Verification
+
+`data verify` on a run generation checks the manifest against the record, re-lowers the recorded
+research configuration, restores every child through its own verifier, and compares each with the
+configuration: each instrument's profile (a development
+stream of its source), feature generation (the configured fit under that profile, resolved before
+its fit and compared with the recorded plan), outcome generation (the configured rule over that
+source and feature, by identity), and family (whose search table, child configuration hash, and
+input instrument equal the lowered search), the selection (through the selection verifier, whose
+recorded configuration must equal the lowered portfolio table), the frozen stage, and, under the
+declaration the run was frozen under, the intent and every claim by exact reconstruction, and,
+for a selected policy, every scenario: each applied feature generation through the recorded refit,
+each replay restored and checked against the exact lowered table with its descriptor, the
+projection and verdict recomputed, and the aggregate state; it writes
+`verified research generation GENERATION state STATE instruments N scenarios M objects 1 bytes B`.
+On a certification generation without the matching context it checks the envelope (the run,
+bundle hash, and, with `--config`, the grant, every protected claim by exact reconstruction, and
+the receipt's consumption of that grant) without resolving a protected child and
+writes `verified research certification GENERATION state STATE envelope only: protected evidence is
+verified within the authorized certification run`; within the matching context it re-derives every
+holdout scenario and writes
+`verified research certification GENERATION state STATE scenarios M objects 1 bytes B`.
+
+Interruption at any point preserves every completed child, claim, and record; the rerun reuses each
+completed generation after its own verifier restores it, recreates nothing that exists, and reaches
+the same identities. The filesystem store appends `OPERATION KEY` (`head`, `read_to`, `put_new`,
+`local_path`, `list`, and `probe` of a listed manifest) to the file named by the
+`BINARY_ALPHA_STORE_LOG` environment variable when it is set, as test instrumentation outside every
+identity.

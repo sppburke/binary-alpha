@@ -29,6 +29,7 @@ use crate::audit::feed_generation;
 use crate::import::{self, CODE_REVISION};
 use crate::store::{self, ObjectIdentity, Put, Store};
 use crate::verify;
+use binary_alpha_engine::research::Access;
 
 /// The schema message names of the four table objects of every stream.
 pub const ROWS_MESSAGE: &str = "binary_alpha_feature_rows";
@@ -159,13 +160,18 @@ pub fn run(config_path: &Path, out: &mut dyn Write) -> Result<(), String> {
         .map_err(|error| format!("cannot create {}: {error}", historical_dir.display()))?;
     let local = Store::filesystem(&historical_dir);
     let destination = Store::open(&config.storage.publication_uri)?;
+    let declaration = crate::research::declaration(&config)?;
+    let access = Access {
+        declaration: declaration.as_ref(),
+        certification: None,
+    };
     // Every entry resolves, and every resolved instrument and stream has one owner in one role,
     // before anything is streamed or published.
     let mut resolved = Vec::with_capacity(entries.instruments.len());
     let mut owners: HashMap<String, usize> = HashMap::new();
     for (index, entry) in entries.instruments.iter().enumerate() {
-        let item =
-            resolve(entry).map_err(|reason| format!("features.instruments[{index}]: {reason}"))?;
+        let item = resolve(entry, access)
+            .map_err(|reason| format!("features.instruments[{index}]: {reason}"))?;
         for stream in &item.plan.streams {
             let owned = format!(
                 "{} {} {}s/{}s",
@@ -202,9 +208,13 @@ struct Bound {
     profile_sha256: String,
 }
 
-/// Reads and checks the input and profile manifests. Role mismatches are refused on the
-/// manifest bytes alone; the profile object is the first child read.
-fn bind(entry: &FeatureInstrument) -> Result<Bound, String> {
+/// Reads and checks the input and profile manifests. The input target needs a read permit
+/// before it is opened; role mismatches are refused on the manifest bytes alone; the profile
+/// object is the first child read.
+fn bind(entry: &FeatureInstrument, access: Access<'_>) -> Result<Bound, String> {
+    access
+        .permit(Some(entry.role), entry.input_manifest.generation())
+        .map_err(|reason| format!("input_manifest: {reason}"))?;
     let (input_store, input_key) = verify::open(&entry.input_manifest.to_string())?;
     let mut bytes = Vec::new();
     input_store.read_to(&input_key, None, &mut bytes)?;
@@ -223,7 +233,11 @@ fn bind(entry: &FeatureInstrument) -> Result<Bound, String> {
         ));
     }
     if input.role == DatasetRole::Holdout {
-        return Err("input_manifest: holdout data never enters a feature build".to_string());
+        access
+            .protected(std::iter::once(input.generation.as_str()))
+            .map_err(|reason| {
+                format!("input_manifest: holdout data never enters a feature build; {reason}")
+            })?;
     }
     if input.role != entry.role {
         return Err(format!(
@@ -254,6 +268,11 @@ fn bind(entry: &FeatureInstrument) -> Result<Bound, String> {
             stream_manifest.generation, stream_manifest.role
         ));
     }
+    // The profile's source is protected by its declared role whatever the profile's own label
+    // says: refused before the profile object is opened.
+    access
+        .lookup(&stream_manifest.source_generation)
+        .map_err(|reason| format!("profile_manifest: {reason}"))?;
     let definition = &stream_manifest.definition;
     if definition.broker != input.broker
         || definition.provider_symbol != input.provider_symbol
@@ -293,8 +312,14 @@ fn bind(entry: &FeatureInstrument) -> Result<Bound, String> {
 }
 
 /// Reads the ready manifest of a completed feature generation, naming `field`, the
-/// configuration field that referenced it, in every refusal.
-pub(crate) fn feature_manifest(field: &str, uri: &str) -> Result<(Store, FeatureManifest), String> {
+/// configuration field that referenced it, in every refusal. A generation of holdout data
+/// resolves only within the certification context naming its input generation; nothing else
+/// of it is read first.
+pub(crate) fn feature_manifest(
+    field: &str,
+    uri: &str,
+    access: Access<'_>,
+) -> Result<(Store, FeatureManifest), String> {
     let (store, key) = verify::open(uri)?;
     let mut bytes = Vec::new();
     store.read_to(&key, None, &mut bytes)?;
@@ -310,6 +335,13 @@ pub(crate) fn feature_manifest(field: &str, uri: &str) -> Result<(Store, Feature
             "{field}: {uri} holds the manifest of generation {}",
             manifest.generation
         ));
+    }
+    if manifest.role == DatasetRole::Holdout
+        || access.lookup(&manifest.input_generation)? == Some(DatasetRole::Holdout)
+    {
+        access
+            .protected(std::iter::once(manifest.input_generation.as_str()))
+            .map_err(|reason| format!("{field}: {uri}: {reason}"))?;
     }
     Ok((store, manifest))
 }
@@ -405,8 +437,8 @@ pub(crate) struct Built {
 
 /// Binds one entry's inputs and resolves its new plan or reads its frozen one; nothing is
 /// streamed or published.
-pub(crate) fn resolve(entry: &FeatureInstrument) -> Result<Resolved, String> {
-    let bound = bind(entry)?;
+pub(crate) fn resolve(entry: &FeatureInstrument, access: Access<'_>) -> Result<Resolved, String> {
+    let bound = bind(entry, access)?;
     let reference = profile_reference(
         &bound.stream_manifest,
         &bound.profile,
@@ -426,7 +458,7 @@ pub(crate) fn resolve(entry: &FeatureInstrument) -> Result<Resolved, String> {
             )
         }
         Some(uri) => {
-            let (store, manifest) = feature_manifest("frozen_plan", &uri.to_string())?;
+            let (store, manifest) = feature_manifest("frozen_plan", &uri.to_string(), access)?;
             let plan = fitted_plan("frozen_plan", &store, &manifest)?;
             if plan.profile != reference {
                 return Err(

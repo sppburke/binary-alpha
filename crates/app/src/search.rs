@@ -35,6 +35,7 @@ use crate::outcomes::{bind_inputs, from_le_bytes};
 use crate::replay;
 use crate::store::{self, Put, Store};
 use crate::verify;
+use binary_alpha_engine::research::Access;
 
 /// Runs the configured search, writing its report and verification lines to `out`.
 pub fn run(config_path: &Path, out: &mut dyn Write) -> Result<(), String> {
@@ -99,9 +100,35 @@ fn add(total: &mut Timings, measured: Timings) {
     total.allocated_bytes = total.allocated_bytes.max(measured.allocated_bytes);
 }
 
+/// One published family generation and the report and verification lines of the command.
+pub(crate) struct Searched {
+    pub(crate) generation: String,
+    pub(crate) report: String,
+}
+
 /// The typed search every caller uses: bind, lower, score, replay, evaluate, resample, publish,
 /// and verify one family generation of the configuration's `search` table.
 pub fn search(config: &Config, local: &Store, destination: &Store) -> Result<String, String> {
+    let declaration = crate::research::declaration(config)?;
+    family(
+        config,
+        local,
+        destination,
+        Access {
+            declaration: declaration.as_ref(),
+            certification: None,
+        },
+    )
+    .map(|searched| searched.report)
+}
+
+/// `search` with its typed result, under the caller's read permit.
+pub(crate) fn family(
+    config: &Config,
+    local: &Store,
+    destination: &Store,
+    access: Access<'_>,
+) -> Result<Searched, String> {
     let settings = config
         .search
         .as_ref()
@@ -114,7 +141,7 @@ pub fn search(config: &Config, local: &Store, destination: &Store) -> Result<Str
     let started = Instant::now();
 
     // 1. Bind the development input and enumerate the family before any allocation.
-    let development = bind_development(settings)?;
+    let development = bind_development(settings, access)?;
     let conditions = search::conditions(&settings.conditions);
     let candidates = search::candidates(
         &development.plan_identity,
@@ -160,7 +187,13 @@ pub fn search(config: &Config, local: &Store, destination: &Store) -> Result<Str
         &development.instrument,
     );
     let lowering_bindings: Vec<String> = lowering.strategies.iter().map(|s| s.id.clone()).collect();
-    let lowered = replay::publish(&chunk_config(config, lowering), local, destination, true)?;
+    let lowered = replay::publish(
+        &chunk_config(config, lowering),
+        local,
+        destination,
+        true,
+        access,
+    )?;
     let references = read_references(&development)?;
     let codes = lowering_codes(
         &chunk_events(destination, &lowered.manifest)?,
@@ -223,8 +256,13 @@ pub fn search(config: &Config, local: &Store, destination: &Store) -> Result<Str
                 &chunk_members,
                 settings.account.initial_cash,
             );
-            let published =
-                replay::publish(&chunk_config(config, table), local, destination, true)?;
+            let published = replay::publish(
+                &chunk_config(config, table),
+                local,
+                destination,
+                true,
+                access,
+            )?;
             let summary = published.engine.summary();
             let events = chunk_events(destination, &published.manifest)?;
             let mut splits = if role == DatasetRole::Evaluation {
@@ -267,7 +305,7 @@ pub fn search(config: &Config, local: &Store, destination: &Store) -> Result<Str
     // The development result is complete here; only now may evaluation objects be read.
     let mut inputs = vec![development.input.clone()];
     if let Some(window) = &settings.evaluation {
-        inputs.push(bind_evaluation(settings, &development)?);
+        inputs.push(bind_evaluation(settings, &development, access)?);
         let mut ordered = passed.clone();
         ordered.sort_unstable();
         run_chunks(
@@ -358,7 +396,7 @@ pub fn search(config: &Config, local: &Store, destination: &Store) -> Result<Str
         None => manifest.to_json(),
     };
     let uri = destination.uri(&key);
-    let verified = verify_family(&uri, destination, &key, &committed)?;
+    let verified = verify_family(&uri, destination, &key, &committed, access)?;
     let temporary = import::temporary_path(local, &format!("manifest-{generation}"))?;
     fs::write(&temporary, &committed)
         .map_err(|error| format!("cannot write {}: {error}", temporary.display()))?;
@@ -402,7 +440,10 @@ pub fn search(config: &Config, local: &Store, destination: &Store) -> Result<Str
             peak_rss_kb()
         ),
     };
-    Ok(format!("{line}\n{verified}"))
+    Ok(Searched {
+        generation,
+        report: format!("{line}\n{verified}"),
+    })
 }
 
 /// The configuration of one synthesized replay: only the schema, run mode, storage, and that
@@ -415,7 +456,7 @@ fn chunk_config(config: &Config, table: binary_alpha_engine::config::Replay) -> 
 }
 
 /// Binds the development input: the plan identity, instrument, and the outcome generation.
-fn bind_development(settings: &Search) -> Result<Development, String> {
+fn bind_development(settings: &Search, access: Access<'_>) -> Result<Development, String> {
     let input = &settings.development.inputs[0];
     let field = |name: &str| format!("development.inputs[0].{name}");
     let bound = bind_inputs(
@@ -424,6 +465,7 @@ fn bind_development(settings: &Search) -> Result<Development, String> {
         &input.tick_manifest,
         &input.feature_manifest,
         "a search",
+        access,
     )?;
     let uri = input
         .outcome_manifest
@@ -475,7 +517,11 @@ fn bind_development(settings: &Search) -> Result<Development, String> {
 
 /// Binds the evaluation input after the development result is frozen: the same instrument
 /// applying the development plan unchanged.
-fn bind_evaluation(settings: &Search, development: &Development) -> Result<FamilyInput, String> {
+fn bind_evaluation(
+    settings: &Search,
+    development: &Development,
+    access: Access<'_>,
+) -> Result<FamilyInput, String> {
     let window = settings.evaluation.as_ref().expect("configured");
     let input = &window.inputs[0];
     let field = |name: &str| format!("evaluation.inputs[0].{name}");
@@ -485,6 +531,7 @@ fn bind_evaluation(settings: &Search, development: &Development) -> Result<Famil
         &input.tick_manifest,
         &input.feature_manifest,
         "a search",
+        access,
     )?;
     if bound.tick.instrument != development.instrument {
         return Err(format!(
@@ -746,7 +793,7 @@ fn kernel_identity() -> String {
     binary_alpha_engine::hex(&hasher.finalize())
 }
 
-fn peak_rss_kb() -> u64 {
+pub(crate) fn peak_rss_kb() -> u64 {
     fs::read_to_string("/proc/self/status")
         .ok()
         .and_then(|status| {
@@ -960,10 +1007,16 @@ fn restored_definition(
 /// gate and rank recomputed by the engine owner, every group and split group against the
 /// verified summaries and the shared ledger projection, and every stability result recomputed
 /// from the verified settlement profits.
-pub fn verify_family(uri: &str, store: &Store, key: &str, bytes: &[u8]) -> Result<String, String> {
+pub fn verify_family(
+    uri: &str,
+    store: &Store,
+    key: &str,
+    bytes: &[u8],
+    access: Access<'_>,
+) -> Result<String, String> {
     let manifest = family_manifest(uri, key, bytes)?;
     let (family, family_bytes) = read_family(uri, store, &manifest)?;
-    let replayed = verify_read_family(uri, store, &manifest, &family)?;
+    let replayed = verify_read_family(uri, store, &manifest, &family, access)?;
     Ok(format!(
         "verified search generation {} members {} applicable {} replayed {replayed} passed {} objects 1 bytes {family_bytes}",
         manifest.generation,
@@ -982,7 +1035,10 @@ pub fn verify_family(uri: &str, store: &Store, key: &str, bytes: &[u8]) -> Resul
 /// of another role, or member evaluation evidence before any referenced generation is followed;
 /// then the whole family verifies exactly as `data verify` does. Nothing is stripped to make an
 /// input acceptable.
-pub(crate) fn development_family(uri: &str) -> Result<(FamilyManifest, Family), String> {
+pub(crate) fn development_family(
+    uri: &str,
+    access: Access<'_>,
+) -> Result<(FamilyManifest, Family), String> {
     let (store, key) = verify::open(uri)?;
     let mut bytes = Vec::new();
     store.read_to(&key, None, &mut bytes)?;
@@ -1000,6 +1056,15 @@ pub(crate) fn development_family(uri: &str) -> Result<(FamilyManifest, Family), 
             "{uri}: input {} of {} is `{}`; a portfolio universe reads development-only families",
             input.tick_generation, input.instrument, input.role
         ));
+    }
+    // A declared holdout input is protected whatever the family's own labels say.
+    for input in &manifest.inputs {
+        access.lookup(&input.tick_generation).map_err(|reason| {
+            format!(
+                "{uri}: input {} of {}: {reason}",
+                input.tick_generation, input.instrument
+            )
+        })?;
     }
     let (family, _) = read_family(uri, &store, &manifest)?;
     let later = if family.search.evaluation.is_some() {
@@ -1022,7 +1087,7 @@ pub(crate) fn development_family(uri: &str) -> Result<(FamilyManifest, Family), 
             "{uri}: the family carries {what}; a portfolio universe reads development-only families"
         ));
     }
-    verify_read_family(uri, &store, &manifest, &family)?;
+    verify_read_family(uri, &store, &manifest, &family, access)?;
     Ok((manifest, family))
 }
 
@@ -1070,6 +1135,7 @@ fn verify_read_family(
     store: &Store,
     manifest: &FamilyManifest,
     family: &Family,
+    access: Access<'_>,
 ) -> Result<usize, String> {
     let settings = &family.search;
     settings
@@ -1108,7 +1174,7 @@ fn verify_read_family(
         }
     }
     // The bound development (and evaluation) generations are the manifest's inputs.
-    let development = bind_development(settings)?;
+    let development = bind_development(settings, access)?;
     if development.plan_identity != family.plan_identity
         || family.base_stream != settings.base_stream
     {
@@ -1118,7 +1184,7 @@ fn verify_read_family(
     }
     let mut inputs = vec![development.input.clone()];
     if settings.evaluation.is_some() {
-        inputs.push(bind_evaluation(settings, &development)?);
+        inputs.push(bind_evaluation(settings, &development, access)?);
     }
     if manifest.inputs != inputs {
         return Err(format!(
@@ -1144,7 +1210,7 @@ fn verify_read_family(
         {
             return Err(format!("{uri}: {chunk_uri} is not the recorded chunk"));
         }
-        replay::verify_replay(&chunk_uri, store, &chunk_key, &bytes)?;
+        replay::verify_replay(&chunk_uri, store, &chunk_key, &bytes, access)?;
         let events = chunk_events(store, &chunk_manifest)?;
         Ok((chunk_manifest, events))
     };

@@ -716,6 +716,7 @@ pub fn replay_table(
         reporting_scale: portfolio.reporting_scale,
         max_rate_age_micros: portfolio.max_rate_age_micros,
         rates: portfolio.rates.clone(),
+        scenario: None,
     }
 }
 

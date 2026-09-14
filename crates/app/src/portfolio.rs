@@ -16,7 +16,8 @@ use std::path::Path;
 use std::time::Instant;
 
 use binary_alpha_engine::config::{
-    Config, Evaluation, FeatureInstrument, Features, ManifestUri, Portfolio, Replay, RunMode,
+    Config, Evaluation, FeatureInstrument, Features, ManifestUri, Portfolio, Replay,
+    ReplayScenario, RunMode,
 };
 use binary_alpha_engine::dataset::{DatasetRole, GenerationManifest, ObjectRole, manifest_key};
 use binary_alpha_engine::execution::{ReplayInput, Split};
@@ -28,6 +29,7 @@ use binary_alpha_engine::portfolio::{
     SELECTION_SCHEMA_VERSION, Selection, SelectionManifest, SourceMember, State,
     selection_generation_id,
 };
+use binary_alpha_engine::research::Access;
 use binary_alpha_engine::search::Family;
 
 use crate::features;
@@ -68,8 +70,10 @@ fn bind_fit(
     field: &str,
     entry: &FeatureInstrument,
     cutoff: i64,
+    access: Access<'_>,
 ) -> Result<features::Resolved, String> {
-    let resolved = features::resolve(entry).map_err(|reason| format!("{field}: {reason}"))?;
+    let resolved =
+        features::resolve(entry, access).map_err(|reason| format!("{field}: {reason}"))?;
     let coverage = &resolved.input().coverage.last_event_time;
     if parse_event_time_micros(coverage)? >= cutoff {
         return Err(format!(
@@ -115,19 +119,20 @@ struct Bound {
     refit: Vec<BoundInput>,
 }
 
-fn bind(settings: &Portfolio) -> Result<Bound, String> {
+fn bind(settings: &Portfolio, access: Access<'_>) -> Result<Bound, String> {
     let mut folds = Vec::with_capacity(settings.folds.len());
     for (index, fold) in settings.folds.iter().enumerate() {
         let cutoff = parse_event_time_micros(&fold.cutoff)?;
         let mut inputs = Vec::with_capacity(fold.inputs.len());
         for (position, input) in fold.inputs.iter().enumerate() {
             let field = format!("folds[{index}].inputs[{position}]");
-            let fit = bind_fit(&format!("{field}.fit"), &input.fit, cutoff)?;
+            let fit = bind_fit(&format!("{field}.fit"), &input.fit, cutoff, access)?;
             let (_, assessment, _) = outcomes::bind_tick(
                 &format!("{field}.assessment_manifest"),
                 DatasetRole::Development,
                 &input.assessment_manifest,
                 "a portfolio selection",
+                access,
             )?;
             if assessment.instrument != fit.input().instrument {
                 return Err(format!(
@@ -160,7 +165,7 @@ fn bind(settings: &Portfolio) -> Result<Bound, String> {
         .iter()
         .enumerate()
         .map(|(position, entry)| {
-            let fit = bind_fit(&format!("refit.fits[{position}]"), entry, cutoff)?;
+            let fit = bind_fit(&format!("refit.fits[{position}]"), entry, cutoff, access)?;
             Ok(BoundInput {
                 instrument: fit.input().instrument.clone(),
                 entry: entry.clone(),
@@ -184,6 +189,7 @@ fn bind(settings: &Portfolio) -> Result<Bound, String> {
 fn bind_evaluation(
     settings: &Portfolio,
     evaluation: &Evaluation,
+    access: Access<'_>,
 ) -> Result<Vec<GenerationManifest>, String> {
     let manifests = evaluation
         .inputs
@@ -195,6 +201,7 @@ fn bind_evaluation(
                 DatasetRole::Evaluation,
                 uri,
                 "a portfolio selection",
+                access,
             )
             .map(|(_, manifest, _)| manifest)
         })
@@ -215,7 +222,7 @@ fn bind_evaluation(
 // ----------------------------------------------------------------------------------------------
 
 /// The configuration of one synthesized feature build or replay: the skeleton and that table.
-fn features_config(config: &Config, entry: &FeatureInstrument) -> Config {
+pub(crate) fn features_config(config: &Config, entry: &FeatureInstrument) -> Config {
     Config {
         features: Some(Features {
             instruments: vec![entry.clone()],
@@ -224,7 +231,7 @@ fn features_config(config: &Config, entry: &FeatureInstrument) -> Config {
     }
 }
 
-fn replay_config(config: &Config, table: Replay) -> Config {
+pub(crate) fn replay_config(config: &Config, table: Replay) -> Config {
     Config {
         replay: Some(table),
         ..crate::skeleton(config)
@@ -232,11 +239,11 @@ fn replay_config(config: &Config, table: Replay) -> Config {
 }
 
 /// The ready-manifest location of a published generation in `destination`.
-fn published_uri(destination: &Store, generation: &str) -> Result<ManifestUri, String> {
+pub(crate) fn published_uri(destination: &Store, generation: &str) -> Result<ManifestUri, String> {
     destination.uri(&manifest_key(generation)).parse()
 }
 
-fn feature_ref(manifest: &FeatureManifest) -> FeatureRef {
+pub(crate) fn feature_ref(manifest: &FeatureManifest) -> FeatureRef {
     FeatureRef {
         instrument: manifest.instrument.clone(),
         input_generation: manifest.input_generation.clone(),
@@ -282,7 +289,8 @@ struct Applied {
 /// Applies the fitted plan of generation `fit_generation`, fitted by `fit_entry`, to
 /// `input_manifest` of `role` under the fit's own profile reference through the feature owner,
 /// returning the applied generation and its replay input.
-fn apply(
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn apply(
     config: &Config,
     local: &Store,
     destination: &Store,
@@ -290,6 +298,7 @@ fn apply(
     input_manifest: &ManifestUri,
     fit_entry: &FeatureInstrument,
     fit_generation: &str,
+    access: Access<'_>,
 ) -> Result<(FeatureRef, ReplayInput), String> {
     let entry = application(
         role,
@@ -298,7 +307,7 @@ fn apply(
         published_uri(destination, fit_generation)?,
     );
     let applied = features::build(
-        features::resolve(&entry)?,
+        features::resolve(&entry, access)?,
         &features_config(config, &entry),
         local,
         destination,
@@ -321,6 +330,7 @@ fn fit_and_apply(
     bound: BoundInput,
     role: DatasetRole,
     input_manifest: &ManifestUri,
+    access: Access<'_>,
 ) -> Result<Applied, String> {
     let fitted = features::build(
         bound.fit,
@@ -336,6 +346,7 @@ fn fit_and_apply(
         input_manifest,
         &bound.entry,
         &fitted.manifest.generation,
+        access,
     )?;
     Ok(Applied {
         input,
@@ -380,7 +391,7 @@ fn plans_of(applied: &[Applied]) -> BTreeMap<String, FeaturePlan> {
 /// Publishes (or resumes) one joint replay of `policy` and projects its verified restored
 /// engine under the gates.
 #[allow(clippy::too_many_arguments)]
-fn replay_policy(
+pub(crate) fn replay_policy(
     config: &Config,
     local: &Store,
     destination: &Store,
@@ -390,14 +401,25 @@ fn replay_policy(
     window: (&str, &str),
     inputs: Vec<ReplayInput>,
     splits: Option<Vec<Split>>,
+    scenario: Option<ReplayScenario>,
+    gates: &engine::Gates,
+    access: Access<'_>,
 ) -> Result<(replay::Published, engine::Projection), String> {
-    let table = engine::replay_table(settings, policy, role, window.0, window.1, inputs, splits);
-    let published = replay::publish(&replay_config(config, table), local, destination, true)?;
-    let projection = engine::project(&published.engine, &settings.gates)?;
+    let mut table =
+        engine::replay_table(settings, policy, role, window.0, window.1, inputs, splits);
+    table.scenario = scenario;
+    let published = replay::publish(
+        &replay_config(config, table),
+        local,
+        destination,
+        true,
+        access,
+    )?;
+    let projection = engine::project(&published.engine, gates)?;
     Ok((published, projection))
 }
 
-fn replay_ref(published: &replay::Published) -> ReplayRef {
+pub(crate) fn replay_ref(published: &replay::Published) -> ReplayRef {
     ReplayRef {
         generation: published.manifest.generation.clone(),
         summary_identity: published.manifest.summary_identity.clone(),
@@ -409,11 +431,14 @@ fn replay_ref(published: &replay::Published) -> ReplayRef {
 // ----------------------------------------------------------------------------------------------
 
 /// The verified families in declared order with their source-member records.
-fn families(settings: &Portfolio) -> Result<(Vec<Family>, Vec<FamilyRecord>), String> {
+fn families(
+    settings: &Portfolio,
+    access: Access<'_>,
+) -> Result<(Vec<Family>, Vec<FamilyRecord>), String> {
     let mut families = Vec::with_capacity(settings.families.len());
     let mut records = Vec::with_capacity(settings.families.len());
     for (index, uri) in settings.families.iter().enumerate() {
-        let (manifest, family) = search::development_family(&uri.to_string())
+        let (manifest, family) = search::development_family(&uri.to_string(), access)
             .map_err(|reason| format!("families[{index}]: {reason}"))?;
         records.push(FamilyRecord {
             generation: manifest.generation,
@@ -489,10 +514,33 @@ struct Clock {
     publish: f64,
 }
 
+/// One published selection: its committed ready manifest, the selection, and the report and
+/// verification lines of the command.
+pub(crate) struct Selected {
+    pub(crate) manifest: SelectionManifest,
+    pub(crate) selection: Selection,
+    pub(crate) report: String,
+}
+
 /// The typed selection every caller uses: bind, enumerate, fit, replay, select, refit,
 /// evaluate, publish, and verify one selection generation of the configuration's `portfolio`
 /// table, returning its report and verification lines.
 pub fn optimize(config: &Config, local: &Store, destination: &Store) -> Result<String, String> {
+    let declaration = crate::research::declaration(config)?;
+    let access = Access {
+        declaration: declaration.as_ref(),
+        certification: None,
+    };
+    select(config, local, destination, access).map(|selected| selected.report)
+}
+
+/// `optimize` with its typed result, under the caller's read permit.
+pub(crate) fn select(
+    config: &Config,
+    local: &Store,
+    destination: &Store,
+    access: Access<'_>,
+) -> Result<Selected, String> {
     let settings = config
         .portfolio
         .as_ref()
@@ -502,8 +550,8 @@ pub fn optimize(config: &Config, local: &Store, destination: &Store) -> Result<S
 
     // 1. Every declared input on its manifest bytes, then the verified development-only
     //    families, the frozen logical universe, and every declared choice.
-    let bound = bind(settings)?;
-    let (families, family_records) = families(settings)?;
+    let bound = bind(settings, access)?;
+    let (families, family_records) = families(settings, access)?;
     let members = engine::logical_members(settings, &families)?;
     let mut choices = choices(settings, &members)?;
     let declared = engine::declared_count(settings)?;
@@ -529,6 +577,7 @@ pub fn optimize(config: &Config, local: &Store, destination: &Store) -> Result<S
                     bound,
                     DatasetRole::Development,
                     &input.assessment_manifest,
+                    access,
                 )
             })
             .collect::<Result<Vec<_>, _>>()?;
@@ -564,6 +613,9 @@ pub fn optimize(config: &Config, local: &Store, destination: &Store) -> Result<S
                             .map(|applied| applied.input.clone())
                             .collect(),
                         None,
+                        None,
+                        &settings.gates,
+                        access,
                     )?;
                     FoldResult {
                         inapplicable: None,
@@ -612,8 +664,9 @@ pub fn optimize(config: &Config, local: &Store, destination: &Store) -> Result<S
                     if let Some(evaluation) = &settings.evaluation {
                         let mut features = Vec::new();
                         let mut inputs = Vec::new();
-                        for (position, manifest) in
-                            bind_evaluation(settings, evaluation)?.iter().enumerate()
+                        for (position, manifest) in bind_evaluation(settings, evaluation, access)?
+                            .iter()
+                            .enumerate()
                         {
                             let (entry, fitted) = fits
                                 .iter()
@@ -627,6 +680,7 @@ pub fn optimize(config: &Config, local: &Store, destination: &Store) -> Result<S
                                 &evaluation.inputs[position],
                                 entry,
                                 &fitted.generation,
+                                access,
                             )?;
                             features.push(applied);
                             inputs.push(input);
@@ -641,6 +695,9 @@ pub fn optimize(config: &Config, local: &Store, destination: &Store) -> Result<S
                             (&evaluation.decision_start, &evaluation.decision_end),
                             inputs,
                             evaluation.splits.clone(),
+                            None,
+                            &settings.gates,
+                            access,
                         )?;
                         if let Some(reason) = &projection.failure {
                             state = State::OuterRejected {
@@ -730,7 +787,7 @@ pub fn optimize(config: &Config, local: &Store, destination: &Store) -> Result<S
         None => manifest.to_json(),
     };
     let uri = destination.uri(&key);
-    let verified = verify_selection(&uri, destination, &key, &committed)?;
+    let verified = verify_selection(&uri, destination, &key, &committed, access)?;
     let temporary = import::temporary_path(local, &format!("manifest-{generation}"))?;
     fs::write(&temporary, &committed)
         .map_err(|error| format!("cannot write {}: {error}", temporary.display()))?;
@@ -751,7 +808,11 @@ pub fn optimize(config: &Config, local: &Store, destination: &Store) -> Result<S
             clock.bind, clock.folds, clock.refit, clock.publish
         ),
     };
-    Ok(format!("{line}\n{verified}"))
+    Ok(Selected {
+        manifest,
+        selection,
+        report: format!("{line}\n{verified}"),
+    })
 }
 
 // ----------------------------------------------------------------------------------------------
@@ -767,10 +828,11 @@ fn recorded_feature(
     role: DatasetRole,
     input: &ManifestUri,
     frozen_from: Option<&str>,
+    access: Access<'_>,
 ) -> Result<(FeatureManifest, FeaturePlan), String> {
     let key = manifest_key(&record.generation);
     let location = store.uri(&key);
-    let (feature_store, manifest) = features::feature_manifest(uri, &location)?;
+    let (feature_store, manifest) = features::feature_manifest(uri, &location, access)?;
     if manifest.role != role
         || manifest.instrument != record.instrument
         || manifest.input_generation != record.input_generation
@@ -794,8 +856,10 @@ fn recorded_feature(
     Ok((manifest, plan))
 }
 
-/// The recorded fit and application of one instrument, as replay input and plan.
-fn recorded_input(
+/// The recorded fit and application of one instrument, as replay input and plan, under the
+/// caller's read permit.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn recorded_input(
     uri: &str,
     store: &Store,
     fit: &FeatureRef,
@@ -803,8 +867,17 @@ fn recorded_input(
     applied: &FeatureRef,
     applied_role: DatasetRole,
     applied_input: &ManifestUri,
+    access: Access<'_>,
 ) -> Result<(String, FeaturePlan, ReplayInput), String> {
-    let (_, plan) = recorded_feature(uri, store, fit, DatasetRole::Development, fit_input, None)?;
+    let (_, plan) = recorded_feature(
+        uri,
+        store,
+        fit,
+        DatasetRole::Development,
+        fit_input,
+        None,
+        access,
+    )?;
     if applied.plan_identity != fit.plan_identity || applied.instrument != fit.instrument {
         return Err(format!(
             "{uri}: feature generation {} does not apply the fitted plan {} of {}",
@@ -818,6 +891,7 @@ fn recorded_input(
         applied_role,
         applied_input,
         Some(&fit.generation),
+        access,
     )?;
     Ok((
         fit.instrument.clone(),
@@ -839,8 +913,10 @@ fn configured_fit(
     entry: &FeatureInstrument,
     cutoff: i64,
     plan: &FeaturePlan,
+    access: Access<'_>,
 ) -> Result<(), String> {
-    let resolved = bind_fit(field, entry, cutoff).map_err(|reason| format!("{uri}: {reason}"))?;
+    let resolved =
+        bind_fit(field, entry, cutoff, access).map_err(|reason| format!("{uri}: {reason}"))?;
     if *resolved.plan() != plan.unfitted() {
         return Err(format!(
             "{uri}: {field} does not resolve to the recorded plan before its fit"
@@ -850,17 +926,18 @@ fn configured_fit(
 }
 
 /// Restores one recorded replay through its verifier and checks that it ran exactly `table`.
-fn recorded_replay(
+pub(crate) fn recorded_replay(
     uri: &str,
     store: &Store,
     record: &ReplayRef,
     table: &Replay,
+    access: Access<'_>,
 ) -> Result<replay::Restored, String> {
     let key = manifest_key(&record.generation);
     let mut bytes = Vec::new();
     store.read_to(&key, None, &mut bytes)?;
     let location = store.uri(&key);
-    let restored = replay::restore_verified(&location, store, &key, &bytes)?;
+    let restored = replay::restore_verified(&location, store, &key, &bytes, access)?;
     if restored.manifest.summary_identity != record.summary_identity
         || restored.engine.definition().replay != *table
     {
@@ -881,6 +958,7 @@ pub(crate) fn verified_selection(
     store: &Store,
     key: &str,
     bytes: &[u8],
+    access: Access<'_>,
 ) -> Result<(SelectionManifest, Selection, usize), String> {
     let manifest =
         SelectionManifest::from_json(bytes).map_err(|error| format!("{uri}: {error}"))?;
@@ -914,7 +992,7 @@ pub(crate) fn verified_selection(
         ));
     }
     // The universe: verified families, their records, the logical members, and every choice.
-    let (families, family_records) = families(settings)?;
+    let (families, family_records) = families(settings, access)?;
     if family_records != selection.families
         || manifest.families
             != family_records
@@ -988,8 +1066,9 @@ pub(crate) fn verified_selection(
                 applied,
                 DatasetRole::Development,
                 &input.assessment_manifest,
+                access,
             )?;
-            configured_fit(uri, &field, &input.fit, cutoff, &plan)?;
+            configured_fit(uri, &field, &input.fit, cutoff, &plan, access)?;
             plans.insert(instrument, plan);
             inputs.push(replay_input);
         }
@@ -1029,7 +1108,7 @@ pub(crate) fn verified_selection(
                         inputs.clone(),
                         None,
                     );
-                    let restored = recorded_replay(uri, store, replay, &table)?;
+                    let restored = recorded_replay(uri, store, replay, &table, access)?;
                     FoldResult {
                         inapplicable: None,
                         replay: Some(replay.clone()),
@@ -1093,6 +1172,7 @@ pub(crate) fn verified_selection(
                     DatasetRole::Development,
                     &entry.input_manifest,
                     None,
+                    access,
                 )?;
                 configured_fit(
                     uri,
@@ -1100,6 +1180,7 @@ pub(crate) fn verified_selection(
                     entry,
                     cutoff,
                     &plan,
+                    access,
                 )?;
                 plans.insert(record.instrument.clone(), plan);
             }
@@ -1157,6 +1238,7 @@ pub(crate) fn verified_selection(
                                     applied,
                                     DatasetRole::Evaluation,
                                     input,
+                                    access,
                                 )?;
                                 inputs.push(replay_input);
                             }
@@ -1169,7 +1251,8 @@ pub(crate) fn verified_selection(
                                 inputs,
                                 evaluation.splits.clone(),
                             );
-                            let restored = recorded_replay(uri, store, &outer.replay, &table)?;
+                            let restored =
+                                recorded_replay(uri, store, &outer.replay, &table, access)?;
                             let projection = engine::project(&restored.engine, &settings.gates)?;
                             if projection != outer.projection
                                 || restored.engine.summary().splits != outer.splits
@@ -1211,8 +1294,9 @@ pub fn verify_selection(
     store: &Store,
     key: &str,
     bytes: &[u8],
+    access: Access<'_>,
 ) -> Result<String, String> {
-    let (manifest, selection, bytes) = verified_selection(uri, store, key, bytes)?;
+    let (manifest, selection, bytes) = verified_selection(uri, store, key, bytes, access)?;
     Ok(format!(
         "verified portfolio generation {} declared {} rejected {} valid {} passing {} state {} objects 1 bytes {bytes}",
         manifest.generation,

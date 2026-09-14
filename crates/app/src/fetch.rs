@@ -7,12 +7,13 @@ use binary_alpha_engine::config::Config;
 use binary_alpha_engine::dataset::{
     Capability, Coverage, DatasetRole, GenerationManifest, Input, MANIFEST_SCHEMA_VERSION,
     NativeGranularity, ObjectRole, PriceRepresentation, SourceKind, TimeUnit, generation_id,
-    object_key,
+    manifest_key, object_key,
 };
 use binary_alpha_engine::market::{
     InstrumentId, PriceScale, Tick, TickSequence, format_event_time_micros as time_text,
     parse_event_time_micros as time,
 };
+use binary_alpha_engine::research::{Access, Declaration};
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::io::Write;
@@ -140,36 +141,52 @@ struct Prior {
     manifest: GenerationManifest,
     coverage: HistoryCoverage,
 }
+/// The prior broker-history generation of this instrument and role in the local mirror, if
+/// any: under a declaration, only its declared generations are candidates and the mirror is
+/// never listed; otherwise every mirrored ready manifest is a candidate.
 fn prior(
     local: &Store,
     instrument: &InstrumentId,
     role: DatasetRole,
     scale: PriceScale,
     source_identity: &str,
+    declaration: Option<&Declaration>,
 ) -> Result<Option<Prior>, String> {
-    let root = local
-        .local_path("manifests")
-        .ok_or("fetch: local mirror must be a filesystem store")?;
-    let entries = match fs::read_dir(&root) {
-        Ok(entries) => entries,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(format!("cannot inspect {}: {error}", root.display())),
+    let candidates: Vec<String> = match declaration {
+        Some(declaration) => declaration
+            .populations
+            .iter()
+            .filter(|population| {
+                population.role == role && population.instrument == instrument.to_string()
+            })
+            .flat_map(|population| population.generations.iter())
+            .map(|generation| manifest_key(generation))
+            .collect(),
+        None => local
+            .list_manifests()
+            .map_err(|reason| format!("fetch: {reason}"))?
+            .iter()
+            .map(|generation| manifest_key(generation))
+            .collect(),
     };
     let mut selected: Option<Prior> = None;
-    for entry in entries {
-        let path = entry
-            .map_err(|error| format!("cannot inspect manifests: {error}"))?
-            .path()
-            .join("ready.json");
-        if !path.is_file() {
+    for key in candidates {
+        if local.head(&key)?.is_none() {
             continue;
         }
-        let bytes =
-            fs::read(&path).map_err(|error| format!("cannot read {}: {error}", path.display()))?;
+        let mut bytes = Vec::new();
+        local.read_to(&key, None, &mut bytes)?;
         if verify::manifest_kind(&bytes)?.is_some() {
             continue;
         }
         let manifest = GenerationManifest::from_json(&bytes)?;
+        if manifest.key() != key {
+            return Err(format!(
+                "fetch: {} holds the manifest of generation {}",
+                local.uri(&key),
+                manifest.generation
+            ));
+        }
         if manifest.source_kind != SourceKind::BrokerHistory
             || manifest.instrument != instrument.to_string()
             || manifest.role != role
@@ -219,7 +236,13 @@ fn prior(
         }
     }
     if let Some(prior) = &selected {
-        verify::run(&local.uri(&prior.manifest.key()))?;
+        verify::run_with(
+            &local.uri(&prior.manifest.key()),
+            Access {
+                declaration,
+                certification: None,
+            },
+        )?;
     }
     Ok(selected)
 }
@@ -298,6 +321,7 @@ pub fn pass(
     if requested.0 >= requested.1 {
         return Err("fetch: requested start must precede end".into());
     }
+    let declaration = crate::research::declaration(config)?;
     for symbol in &history.instruments {
         let instrument = InstrumentId {
             broker: history.broker.clone(),
@@ -312,6 +336,7 @@ pub fn pass(
             history.role,
             definition.price_scale,
             &source_identity,
+            declaration.as_ref(),
         )?;
         let previous_verified = prior
             .as_ref()

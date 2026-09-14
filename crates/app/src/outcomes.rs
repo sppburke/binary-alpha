@@ -24,6 +24,7 @@ use binary_alpha_engine::outcomes::{
     OutcomeManifest, OutcomeRule, OutcomeStreamSummary, REFERENCE_CLOCK, TICK_PRICE_OBJECT_PATH,
     TICK_TIME_OBJECT_PATH, outcome_generation_id, stream_object_paths,
 };
+use binary_alpha_engine::research::Access;
 use binary_alpha_engine::stream::Observation;
 
 use crate::archive::TableReader;
@@ -59,8 +60,14 @@ pub fn run(config_path: &Path, out: &mut dyn Write) -> Result<(), String> {
         .map_err(|error| format!("cannot create {}: {error}", historical_dir.display()))?;
     let local = Store::filesystem(&historical_dir);
     let destination = Store::open(&config.storage.publication_uri)?;
-    let line = build(settings, &config, &local, &destination)
-        .map_err(|reason| format!("outcomes: {reason}"))?;
+    let declaration = crate::research::declaration(&config)?;
+    let access = Access {
+        declaration: declaration.as_ref(),
+        certification: None,
+    };
+    let line = build(settings, &config, &local, &destination, access)
+        .map_err(|reason| format!("outcomes: {reason}"))?
+        .report;
     writeln!(out, "{line}")
         .and_then(|()| out.flush())
         .map_err(|error| format!("cannot write the report: {error}"))
@@ -87,10 +94,15 @@ pub(crate) fn bind_inputs(
     tick_manifest: &ManifestUri,
     feature_manifest: &ManifestUri,
     what: &str,
+    access: Access<'_>,
 ) -> Result<Bound, String> {
-    let (tick_store, tick, scale) = bind_tick(&field("tick_manifest"), role, tick_manifest, what)?;
-    let (feature_store, feature) =
-        features::feature_manifest(&field("feature_manifest"), &feature_manifest.to_string())?;
+    let (tick_store, tick, scale) =
+        bind_tick(&field("tick_manifest"), role, tick_manifest, what, access)?;
+    let (feature_store, feature) = features::feature_manifest(
+        &field("feature_manifest"),
+        &feature_manifest.to_string(),
+        access,
+    )?;
     if feature.input_generation != tick.generation {
         return Err(format!(
             "{}: feature generation {} was computed from tick generation {}, not {}",
@@ -138,13 +150,14 @@ pub(crate) fn bind_inputs(
 
 /// The bound inputs of an outcome build, whose ticks must be indexable below the missing
 /// index.
-fn bind(settings: &Outcomes) -> Result<Bound, String> {
+fn bind(settings: &Outcomes, access: Access<'_>) -> Result<Bound, String> {
     let bound = bind_inputs(
         &|name| name.to_string(),
         settings.role,
         &settings.tick_manifest,
         &settings.feature_manifest,
         "an outcome build",
+        access,
     )?;
     if u32::try_from(bound.tick.row_count).is_err() {
         return Err(format!(
@@ -163,8 +176,12 @@ pub(crate) fn bind_tick(
     role: DatasetRole,
     tick_manifest: &ManifestUri,
     what: &str,
+    access: Access<'_>,
 ) -> Result<(Store, GenerationManifest, PriceScale), String> {
     let uri = tick_manifest.to_string();
+    access
+        .permit(Some(role), tick_manifest.generation())
+        .map_err(|reason| format!("{field}: {reason}"))?;
     let (tick_store, tick_key) = verify::open(&uri)?;
     let mut bytes = Vec::new();
     tick_store.read_to(&tick_key, None, &mut bytes)?;
@@ -182,7 +199,9 @@ pub(crate) fn bind_tick(
         ));
     }
     if tick.role == DatasetRole::Holdout {
-        return Err(format!("{field}: holdout data never enters {what}"));
+        access
+            .protected(std::iter::once(tick.generation.as_str()))
+            .map_err(|reason| format!("{field}: holdout data never enters {what}; {reason}"))?;
     }
     if tick.role != role {
         return Err(format!(
@@ -373,13 +392,22 @@ impl Temporary {
     }
 }
 
-fn build(
+/// One published outcome generation and the report and verification lines of the command.
+pub(crate) struct Built {
+    pub(crate) generation: String,
+    pub(crate) report: String,
+}
+
+/// Binds, labels, publishes, and reconstructs one outcome generation; a completed identical
+/// generation is reused.
+pub(crate) fn build(
     settings: &Outcomes,
     config: &Config,
     local: &Store,
     destination: &Store,
-) -> Result<String, String> {
-    let bound = bind(settings)?;
+    access: Access<'_>,
+) -> Result<Built, String> {
+    let bound = bind(settings, access)?;
     let rule = OutcomeRule::resolve(settings)?;
     let generation =
         outcome_generation_id(&bound.tick.generation, &bound.feature.generation, &rule);
@@ -545,7 +573,10 @@ fn build(
             published.as_secs_f64()
         ),
     };
-    Ok(format!("{line}\n{verified}"))
+    Ok(Built {
+        generation,
+        report: format!("{line}\n{verified}"),
+    })
 }
 
 /// One verified object read back in order and compared with the bytes recomputed for it.

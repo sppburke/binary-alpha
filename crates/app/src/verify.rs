@@ -18,6 +18,7 @@ use binary_alpha_engine::features::FEATURE_MANIFEST_KIND;
 use binary_alpha_engine::market::format_event_time_micros;
 use binary_alpha_engine::outcomes::OUTCOME_MANIFEST_KIND;
 use binary_alpha_engine::portfolio::SELECTION_MANIFEST_KIND;
+use binary_alpha_engine::research::{Access, CERTIFICATION_MANIFEST_KIND, RUN_MANIFEST_KIND};
 use binary_alpha_engine::search::FAMILY_MANIFEST_KIND;
 use binary_alpha_engine::stream::{
     InstrumentProfile, PROFILE_OBJECT_PATH, STREAM_MANIFEST_KIND, StreamManifest, StreamSummary,
@@ -29,11 +30,46 @@ use crate::store::{Hasher, Store, Tee};
 
 /// Verifies the generation whose ready manifest is at `uri` and returns its report line.
 pub fn run(uri: &str) -> Result<String, String> {
+    run_with(uri, Access::ORDINARY)
+}
+
+/// `run` with the declaration of the configuration at `config`, when one is given: a declared
+/// target is permitted before it is opened, and an undeclared dataset is refused.
+pub fn run_configured(config: Option<&std::path::Path>, uri: &str) -> Result<String, String> {
+    let config = config.map(crate::load_config).transpose()?;
+    let declaration = config
+        .as_ref()
+        .map(crate::research::declaration)
+        .transpose()?
+        .flatten();
+    run_with(
+        uri,
+        Access {
+            declaration: declaration.as_ref(),
+            certification: None,
+        },
+    )
+}
+
+/// `run` under an explicit read permit: a dataset generation needs the permit of its role;
+/// derived generations keep their own role checks; protected research evidence is verified
+/// only within the matching certification context.
+pub fn run_with(uri: &str, access: Access<'_>) -> Result<String, String> {
+    let target: ManifestUri = uri.parse()?;
+    access.lookup(target.generation())?;
     let (store, manifest_key) = open(uri)?;
     let mut bytes = Vec::new();
     store.read_to(&manifest_key, None, &mut bytes)?;
+    protected_envelope(uri, &bytes, access)?;
     match manifest_kind(&bytes)?.as_deref() {
-        None => verify_dataset(uri, &store, &manifest_key, &bytes),
+        None => {
+            let manifest =
+                GenerationManifest::from_json(&bytes).map_err(|error| format!("{uri}: {error}"))?;
+            access
+                .permit(Some(manifest.role), &manifest.generation)
+                .map_err(|reason| format!("{uri}: {reason}"))?;
+            verify_dataset(uri, &store, &manifest_key, &bytes)
+        }
         Some(STREAM_MANIFEST_KIND) => verify_stream(uri, &store, &manifest_key, &bytes),
         Some(FEATURE_MANIFEST_KIND) => {
             crate::features::verify_feature(uri, &store, &manifest_key, &bytes)
@@ -42,16 +78,87 @@ pub fn run(uri: &str) -> Result<String, String> {
             crate::outcomes::verify_outcome(uri, &store, &manifest_key, &bytes)
         }
         Some(REPLAY_MANIFEST_KIND) => {
-            crate::replay::verify_replay(uri, &store, &manifest_key, &bytes)
+            crate::replay::verify_replay(uri, &store, &manifest_key, &bytes, access)
         }
         Some(FAMILY_MANIFEST_KIND) => {
-            crate::search::verify_family(uri, &store, &manifest_key, &bytes)
+            crate::search::verify_family(uri, &store, &manifest_key, &bytes, access)
         }
         Some(SELECTION_MANIFEST_KIND) => {
-            crate::portfolio::verify_selection(uri, &store, &manifest_key, &bytes)
+            crate::portfolio::verify_selection(uri, &store, &manifest_key, &bytes, access)
+        }
+        Some(RUN_MANIFEST_KIND) => {
+            crate::research::verify_run(uri, &store, &manifest_key, &bytes, access)
+        }
+        Some(CERTIFICATION_MANIFEST_KIND) => {
+            crate::research::verify_certification(uri, &store, &manifest_key, &bytes, access)
         }
         Some(kind) => Err(format!("{uri}: unsupported manifest kind `{kind}`")),
     }
+}
+
+/// A derived generation of holdout data (a stream, feature, outcome, or replay manifest whose
+/// `role` is holdout) resolves only within the certification context that names the dataset
+/// generations it was computed from; its children are never opened publicly.
+fn protected_envelope(uri: &str, bytes: &[u8], access: Access<'_>) -> Result<(), String> {
+    use binary_alpha_engine::dataset::DatasetRole;
+    #[derive(Deserialize)]
+    struct Envelope {
+        role: Option<DatasetRole>,
+        source_generation: Option<String>,
+        input_generation: Option<String>,
+        tick_generation: Option<String>,
+        #[serde(default)]
+        instruments: Vec<BoundInstrument>,
+        #[serde(default)]
+        inputs: Vec<BoundInput>,
+    }
+    #[derive(Deserialize)]
+    struct BoundInstrument {
+        tick_generation: Option<String>,
+    }
+    #[derive(Deserialize)]
+    struct BoundInput {
+        role: Option<String>,
+        tick_generation: Option<String>,
+    }
+    let envelope: Envelope =
+        serde_json::from_slice(bytes).map_err(|error| format!("{uri}: {error}"))?;
+    let bound: Vec<&str> = envelope
+        .source_generation
+        .iter()
+        .chain(envelope.input_generation.iter())
+        .chain(envelope.tick_generation.iter())
+        .chain(
+            envelope
+                .instruments
+                .iter()
+                .filter_map(|instrument| instrument.tick_generation.as_ref()),
+        )
+        .chain(
+            envelope
+                .inputs
+                .iter()
+                .filter_map(|input| input.tick_generation.as_ref()),
+        )
+        .map(String::as_str)
+        .collect();
+    // A declared holdout source is protected whatever the derived manifest's own label says.
+    for generation in &bound {
+        access
+            .lookup(generation)
+            .map_err(|reason| format!("{uri}: {reason}"))?;
+    }
+    let labelled = envelope.role == Some(DatasetRole::Holdout)
+        || envelope
+            .inputs
+            .iter()
+            .any(|input| input.role.as_deref() == Some(DatasetRole::Holdout.as_str()));
+    if labelled {
+        access
+            .protected(bound.iter().copied())
+            .map_err(|reason| format!("{uri}: {reason}"))?;
+    }
+    Ok(())
 }
 
 /// The top-level `kind` a manifest declares; a dataset ready manifest declares none.

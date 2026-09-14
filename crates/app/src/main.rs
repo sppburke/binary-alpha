@@ -3,8 +3,8 @@
 //! verification, and the external adapters those commands need.
 
 use binary_alpha_app::{
-    audit, features, fetch, import, inspect, load_config, outcomes, portfolio, replay, search,
-    verify,
+    audit, features, fetch, import, inspect, load_config, outcomes, portfolio, replay, research,
+    search, verify,
 };
 
 use std::path::{Path, PathBuf};
@@ -72,6 +72,60 @@ enum Command {
     Portfolio {
         #[command(subcommand)]
         command: PortfolioCommand,
+    },
+    /// Prepare, search, select, assess, and, under a separate grant, certify one policy.
+    #[command(disable_help_subcommand = true)]
+    Research {
+        #[command(subcommand)]
+        command: ResearchCommand,
+    },
+    /// Operator-only holdout authorizations.
+    #[command(disable_help_subcommand = true)]
+    Holdout {
+        #[command(subcommand)]
+        command: HoldoutCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum ResearchCommand {
+    /// Run the configured study from its declared historical generations to one immutable
+    /// research state, resuming the same identity on every invocation.
+    Run {
+        /// Path of the TOML configuration document with the `research` table.
+        #[arg(long)]
+        config: PathBuf,
+    },
+}
+
+#[derive(Subcommand)]
+enum HoldoutCommand {
+    /// Holdout grants.
+    #[command(disable_help_subcommand = true)]
+    Grant {
+        #[command(subcommand)]
+        command: GrantCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum GrantCommand {
+    /// Create the one-use grant that authorizes exactly one frozen bundle to open exactly the
+    /// declared holdout generations; never opens holdout data.
+    Create {
+        /// Path of the TOML configuration document with the `research.study` table.
+        #[arg(long)]
+        config: PathBuf,
+        /// `file://` or `gs://` location of the research run ready manifest.
+        #[arg(long)]
+        bundle_manifest: String,
+        /// `file://` or `gs://` location of one declared holdout ready manifest; repeat once per
+        /// instrument in instrument order.
+        #[arg(long, required = true)]
+        holdout_manifest: Vec<String>,
+        /// The recorded reason for the authorization.
+        #[arg(long)]
+        reason: String,
     },
 }
 
@@ -154,6 +208,10 @@ enum DataCommand {
         /// `file://` or `gs://` location ending in `manifests/GENERATION/ready.json`.
         #[arg(long)]
         manifest: String,
+        /// Path of a TOML configuration document whose `research.study` declaration permits the
+        /// target before it is opened.
+        #[arg(long)]
+        config: Option<PathBuf>,
     },
 }
 
@@ -175,8 +233,8 @@ fn main() -> ExitCode {
             command: DataCommand::Audit { config, manifest },
         } => audit::run(&config, &manifest, &mut std::io::stdout().lock()),
         Command::Data {
-            command: DataCommand::Verify { manifest },
-        } => verify::run(&manifest).map(|line| println!("{line}")),
+            command: DataCommand::Verify { manifest, config },
+        } => verify::run_configured(config.as_deref(), &manifest).map(|line| println!("{line}")),
         Command::Features {
             command: FeaturesCommand::Build { config },
         } => features::run(&config, &mut std::io::stdout().lock()),
@@ -188,6 +246,27 @@ fn main() -> ExitCode {
         Command::Portfolio {
             command: PortfolioCommand::Optimize { config },
         } => portfolio::run(&config, &mut std::io::stdout().lock()),
+        Command::Research {
+            command: ResearchCommand::Run { config },
+        } => research::run(&config, &mut std::io::stdout().lock()),
+        Command::Holdout {
+            command:
+                HoldoutCommand::Grant {
+                    command:
+                        GrantCommand::Create {
+                            config,
+                            bundle_manifest,
+                            holdout_manifest,
+                            reason,
+                        },
+                },
+        } => research::grant(
+            &config,
+            &bundle_manifest,
+            &holdout_manifest,
+            &reason,
+            &mut std::io::stdout().lock(),
+        ),
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,
