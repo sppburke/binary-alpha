@@ -7,26 +7,21 @@ mod fixture_config;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output, Stdio};
+use std::process::{Command, Stdio};
 use std::time::{Duration, Instant, SystemTime};
 
 use binary_alpha_engine::config::{Config, ManifestUri, ReplayScenario};
-use binary_alpha_engine::dataset::{
-    DatasetRole, GenerationManifest, PriceRepresentation, generation_id, manifest_key,
-};
+use binary_alpha_engine::dataset::{DatasetRole, GenerationManifest, manifest_key};
 use binary_alpha_engine::execution::{Decimal, EventKind, FinancialEvent, Summary, Threshold};
 use binary_alpha_engine::features::{FeatureManifest, FeaturePlan};
-use binary_alpha_engine::market::InstrumentId;
 use binary_alpha_engine::portfolio::{Selection, State};
 use binary_alpha_engine::research::{
     self as research, CertificationManifest, CertificationRecord, Claim, ClaimKind, Declaration,
     Frozen, Grant, Intent, Population, Receipt, Run, RunManifest, RunState, Verdict,
 };
 use binary_alpha_engine::search::Family;
-use common::{Scratch, command, write_ticks};
-use fixture_config::{
-    BASE, CANDLE, CURRENCIES, HOUR, INSTRUMENTS, ROWS, SCALES, SYMBOLS, time, uri,
-};
+use common::{Scratch, command};
+use fixture_config::{BASE, CANDLE, CURRENCIES, HOUR, INSTRUMENTS, SCALES, SYMBOLS, time, uri};
 use serde_json::Value;
 
 const PLANTED: [u8; 4] = [0b0011_1111, 0b0000_0011, 0b0001_1111, 0b0000_1111];
@@ -36,91 +31,9 @@ const PROTECTED: &str =
 /// The distinct operator account the grant command runs under.
 const OPERATOR: &str = "synthetic-operator";
 
-#[derive(Clone, Copy)]
-struct Row {
-    up: bool,
-    wide: bool,
-    win: bool,
-}
-
-fn recipe(cells: [u8; 4]) -> Vec<Row> {
-    (0..ROWS)
-        .map(|k| {
-            let (up, wide) = (k % 4 >= 2, k % 2 == 1);
-            let cell = match (up, wide) {
-                (true, false) => 0,
-                (true, true) => 1,
-                (false, false) => 2,
-                (false, true) => 3,
-            };
-            Row {
-                up,
-                wide,
-                win: cells[cell] & (1 << (k / 4)) != 0,
-            }
-        })
-        .collect()
-}
-
-/// Phase 09's planted candle recipe; the five-second outcome persists for one extra tick
-/// so the required 100 ms acceptance delay has the same known outcomes. Both scales have
-/// the same relative movement: B's numeric price is 1000 times A's, not a rounded A price.
+use fixture_config::{Row, recipe};
 fn ticks(base: i64, rows: &[Row], instrument: usize) -> Vec<String> {
-    let mut lines = Vec::new();
-    for k in 0..=rows.len() {
-        for step in 0..80 {
-            let previous = k.checked_sub(1).map(|i| rows[i]);
-            let current = rows.get(k);
-            let price = 1_800_000
-                + match (step, current) {
-                    (0, _) => 0,
-                    (20 | 21, _) => {
-                        if previous.is_none_or(|r| r.win) {
-                            2
-                        } else {
-                            -2
-                        }
-                    }
-                    (32, Some(r)) => {
-                        if r.wide {
-                            12
-                        } else {
-                            4
-                        }
-                    }
-                    (48, Some(r)) => {
-                        if r.wide {
-                            -12
-                        } else {
-                            -4
-                        }
-                    }
-                    (79, Some(r)) => {
-                        if r.up {
-                            1
-                        } else {
-                            -1
-                        }
-                    }
-                    _ => {
-                        if step % 2 == 0 {
-                            1
-                        } else {
-                            -1
-                        }
-                    }
-                };
-            let divisor = 10_i64.pow(u32::from(SCALES[instrument]));
-            lines.push(format!(
-                "{},SYNTHETIC,{}.{:0width$}",
-                time(base + k as i64 * CANDLE + step * 250_000),
-                price / divisor,
-                price % divisor,
-                width = usize::from(SCALES[instrument])
-            ));
-        }
-    }
-    lines
+    fixture_config::ticks_at_scale(base, rows, SCALES[instrument])
 }
 
 fn decimal(text: &str) -> Decimal {
@@ -135,41 +48,7 @@ fn cents(value: i64) -> Decimal {
     ))
 }
 
-fn output(result: Output) -> Result<String, String> {
-    let stdout = String::from_utf8(result.stdout).unwrap();
-    let stderr = String::from_utf8(result.stderr).unwrap();
-    if result.status.success() {
-        assert!(stderr.is_empty(), "{stderr}");
-        Ok(stdout)
-    } else {
-        assert_eq!(result.status.code(), Some(1));
-        Err(stderr)
-    }
-}
-
-fn cli(log: &Path, args: &[&str]) -> Result<String, String> {
-    fs::write(log, []).unwrap();
-    output(
-        Command::new(env!("CARGO_BIN_EXE_binary-alpha"))
-            .args(args)
-            .env("BINARY_ALPHA_STORE_LOG", log)
-            .output()
-            .unwrap(),
-    )
-}
-
-/// `cli` under a distinct operator account: the grant command's simulated operator capability.
-fn cli_as(log: &Path, user: &str, args: &[&str]) -> Result<String, String> {
-    fs::write(log, []).unwrap();
-    output(
-        Command::new(env!("CARGO_BIN_EXE_binary-alpha"))
-            .args(args)
-            .env("BINARY_ALPHA_STORE_LOG", log)
-            .env("USER", user)
-            .output()
-            .unwrap(),
-    )
-}
+use common::{cli, cli_as, logged_output as output};
 
 fn logged(log: &Path) -> Vec<String> {
     fs::read_to_string(log)
@@ -491,54 +370,15 @@ fn import_pair_text(
     role: DatasetRole,
     lines: [Vec<String>; 2],
 ) -> Vec<GenerationManifest> {
-    let mut sources = String::new();
-    for (i, lines) in lines.iter().enumerate() {
-        let relative = format!("sources/{name}-{i}.csv");
-        write_ticks(
-            &scratch.path(&relative),
-            &lines.iter().map(String::as_str).collect::<Vec<_>>(),
-        );
-        sources.push_str(&format!("\n[[import.sources]]\nkind = \"tick_csv\"\npath = \"{relative}\"\nbroker = \"pocket_option\"\nrole = \"{}\"\nprovider_symbol = \"{}\"\nsource_symbol = \"SYNTHETIC\"\nprice_scale = {}\n",
-            if role==DatasetRole::Holdout {DatasetRole::Development} else {role},SYMBOLS[i],SCALES[i]));
-    }
-    let config = scratch.config(&format!("import-{name}.toml"), &sources);
-    let output = command(&["data", "import", "--config", config.to_str().unwrap()]).unwrap();
-    output
-        .iter()
-        .filter(|line| line.starts_with("published "))
-        .map(|line| {
-            let generation = common::generation(line);
-            let mut manifest = GenerationManifest::from_json(
-                &fs::read(scratch.path("published").join(manifest_key(&generation))).unwrap(),
-            )
-            .unwrap();
-            if role == DatasetRole::Holdout {
-                // SYNTHETIC FIXTURE ONLY: data import deliberately refuses holdout. Reuse the
-                // invented content-addressed objects in a second ready manifest with its true
-                // fixture role and recompute the role-bearing dataset generation identity.
-                let PriceRepresentation::IntegerUnits { scale } = manifest.price_representation
-                else {
-                    panic!("tick scale")
-                };
-                manifest.role = role;
-                manifest.generation = generation_id(
-                    &InstrumentId {
-                        broker: manifest.broker.clone(),
-                        provider_symbol: manifest.provider_symbol.clone(),
-                    },
-                    manifest.source_kind,
-                    role,
-                    Some(scale),
-                    &manifest.objects,
-                );
-                write(
-                    &scratch.path("published").join(manifest.key()),
-                    manifest.to_json(),
-                );
-            }
-            manifest
-        })
-        .collect()
+    fixture_config::import_ticks(
+        &scratch.root,
+        name,
+        role,
+        "pocket_option",
+        &SYMBOLS,
+        &SCALES,
+        &lines,
+    )
 }
 
 /// Independent Phase 09 `joint` oracle: signal membership, ordered admission, exact native

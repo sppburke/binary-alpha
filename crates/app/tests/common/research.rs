@@ -149,3 +149,166 @@ pub fn replay_configuration(root: &Path) -> Config {
     })).unwrap());
     Config::parse(&config.canonical_toml()).unwrap()
 }
+
+#[derive(Clone, Copy)]
+pub struct Row {
+    pub up: bool,
+    pub wide: bool,
+    pub win: bool,
+}
+
+pub fn recipe(cells: [u8; 4]) -> Vec<Row> {
+    (0..ROWS)
+        .map(|k| {
+            let (up, wide) = (k % 4 >= 2, k % 2 == 1);
+            let cell = match (up, wide) {
+                (true, false) => 0,
+                (true, true) => 1,
+                (false, false) => 2,
+                (false, true) => 3,
+            };
+            Row {
+                up,
+                wide,
+                win: cells[cell] & (1 << (k / 4)) != 0,
+            }
+        })
+        .collect()
+}
+
+/// Phase 09's planted candle recipe; the five-second outcome persists for one extra tick
+/// so the required 100 ms acceptance delay has the same known outcomes. Both scales have
+/// the same relative movement: B's numeric price is 1000 times A's, not a rounded A price.
+pub fn ticks_at_scale(base: i64, rows: &[Row], scale: u8) -> Vec<String> {
+    let mut lines = Vec::new();
+    for k in 0..=rows.len() {
+        for step in 0..80 {
+            let previous = k.checked_sub(1).map(|i| rows[i]);
+            let current = rows.get(k);
+            let price = 1_800_000
+                + match (step, current) {
+                    (0, _) => 0,
+                    (20 | 21, _) => {
+                        if previous.is_none_or(|r| r.win) {
+                            2
+                        } else {
+                            -2
+                        }
+                    }
+                    (32, Some(r)) => {
+                        if r.wide {
+                            12
+                        } else {
+                            4
+                        }
+                    }
+                    (48, Some(r)) => {
+                        if r.wide {
+                            -12
+                        } else {
+                            -4
+                        }
+                    }
+                    (79, Some(r)) => {
+                        if r.up {
+                            1
+                        } else {
+                            -1
+                        }
+                    }
+                    _ => {
+                        if step % 2 == 0 {
+                            1
+                        } else {
+                            -1
+                        }
+                    }
+                };
+            let divisor = 10_i64.pow(u32::from(scale));
+            lines.push(format!(
+                "{},SYNTHETIC,{}.{:0width$}",
+                time(base + k as i64 * CANDLE + step * 250_000),
+                price / divisor,
+                price % divisor,
+                width = usize::from(scale)
+            ));
+        }
+    }
+    lines
+}
+
+/// Imports invented ticks through the CLI, including synthetic-only holdout role binding.
+pub fn import_ticks(
+    root: &Path,
+    name: &str,
+    role: binary_alpha_engine::dataset::DatasetRole,
+    broker: &str,
+    symbols: &[&str],
+    scales: &[u8],
+    lines: &[Vec<String>],
+) -> Vec<binary_alpha_engine::dataset::GenerationManifest> {
+    use binary_alpha_engine::dataset::{
+        DatasetRole, GenerationManifest, PriceRepresentation, generation_id, manifest_key,
+    };
+    use binary_alpha_engine::market::InstrumentId;
+    use std::fs;
+    fn write(path: &Path, bytes: impl AsRef<[u8]>) {
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, bytes).unwrap();
+    }
+    let mut sources = String::new();
+    for (i, lines) in lines.iter().enumerate() {
+        let relative = format!("sources/{name}-{i}.csv");
+        crate::common::write_ticks(
+            &root.join(&relative),
+            &lines.iter().map(String::as_str).collect::<Vec<_>>(),
+        );
+        sources.push_str(&format!("\n[[import.sources]]\nkind = \"tick_csv\"\npath = \"{relative}\"\nbroker = \"{broker}\"\nrole = \"{}\"\nprovider_symbol = \"{}\"\nsource_symbol = \"SYNTHETIC\"\nprice_scale = {}\n",
+            if role==DatasetRole::Holdout {DatasetRole::Development} else {role},symbols[i],scales[i]));
+    }
+    let config = root.join(format!("import-{name}.toml"));
+    write(
+        &config,
+        format!(
+            "schema_version = 1\nrun_mode = \"research\"\n[storage]\nhistorical_data_dir = \"retained\"\npublication_uri = \"file://{}/published\"\n{sources}",
+            root.display()
+        ),
+    );
+    crate::common::command(&["data", "import", "--config", config.to_str().unwrap()])
+        .unwrap()
+        .iter()
+        .filter(|line| line.starts_with("published "))
+        .map(|line| {
+            let generation = crate::common::generation(line);
+            let mut manifest = GenerationManifest::from_json(
+                &fs::read(root.join("published").join(manifest_key(&generation))).unwrap(),
+            )
+            .unwrap();
+            if role == DatasetRole::Holdout {
+                // SYNTHETIC FIXTURE ONLY: data import deliberately refuses holdout. Reuse the
+                // invented content-addressed objects in a second ready manifest with its true
+                // fixture role and recompute the role-bearing dataset generation identity.
+                let PriceRepresentation::IntegerUnits { scale } = manifest.price_representation
+                else {
+                    panic!("tick scale")
+                };
+                manifest.role = role;
+                manifest.generation = generation_id(
+                    &InstrumentId {
+                        broker: manifest.broker.clone(),
+                        provider_symbol: manifest.provider_symbol.clone(),
+                    },
+                    manifest.source_kind,
+                    role,
+                    Some(scale),
+                    &manifest.objects,
+                );
+                write(
+                    &root.join("published").join(manifest.key()),
+                    manifest.to_json(),
+                );
+            }
+            manifest
+        })
+        .collect()
+}

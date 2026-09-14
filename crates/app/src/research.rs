@@ -184,13 +184,13 @@ fn publish_manifest(
     Ok((verified, put))
 }
 
-fn read_key(store: &Store, key: &str) -> Result<Vec<u8>, String> {
+pub(crate) fn read_key(store: &Store, key: &str) -> Result<Vec<u8>, String> {
     let mut bytes = Vec::new();
     store.read_to(key, None, &mut bytes)?;
     Ok(bytes)
 }
 
-fn ready_uri(store: &Store, generation: &str) -> Result<ManifestUri, String> {
+pub(crate) fn ready_uri(store: &Store, generation: &str) -> Result<ManifestUri, String> {
     store.uri(&manifest_key(generation)).parse()
 }
 

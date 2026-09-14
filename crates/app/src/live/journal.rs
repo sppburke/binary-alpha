@@ -46,8 +46,13 @@ pub enum RecordKind {
     },
     Refused {
         binding: String,
-        proposal: Proposal,
+        proposal: Option<Proposal>,
         reason: String,
+    },
+    DueTick {
+        command: String,
+        provider_time_micros: i64,
+        price_units: i64,
     },
     Claimed {
         command: String,
@@ -68,6 +73,15 @@ pub enum RecordKind {
     Segment {
         closed: u64,
     },
+}
+
+/// Local-only unfinished segment identity; this is not a cloud restore reference.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OpenTail {
+    pub first_sequence: u64,
+    pub last_sequence: u64,
+    pub sha256: String,
+    pub bytes: u64,
 }
 
 pub struct Journal {
@@ -223,10 +237,15 @@ impl Journal {
         Ok(record)
     }
 
-    /// Closes and renames a nonempty segment before opening the next one.
+    /// Closes only a full segment; a partial tail remains local until it fills.
     pub fn rotate(&mut self) -> Result<Option<String>, String> {
-        if self.first == self.next_sequence {
+        if self.next_sequence - self.first < self.segment_records {
             return Ok(None);
+        }
+        if self.next_sequence - self.first != self.segment_records
+            || !(self.first - 1).is_multiple_of(self.segment_records)
+        {
+            return Err("journal rotation requires one aligned full segment".into());
         }
         let name = segment_name(self.first, self.next_sequence - 1);
         if self.dir.join(&name).exists() || self.dir.join(format!("{name}.uploaded")).exists() {
@@ -249,6 +268,19 @@ impl Journal {
             .and_then(|file| file.sync_all())
             .map_err(|error| error.to_string())?;
         Ok(Some(name))
+    }
+
+    pub fn open_tail(&self) -> Result<Option<OpenTail>, String> {
+        if self.first == self.next_sequence {
+            return Ok(None);
+        }
+        let bytes = fs::read(self.dir.join("open.jsonl")).map_err(|e| e.to_string())?;
+        Ok(Some(OpenTail {
+            first_sequence: self.first,
+            last_sequence: self.next_sequence - 1,
+            sha256: digest(b"", &bytes),
+            bytes: bytes.len() as u64,
+        }))
     }
 
     pub fn closed(&self) -> Result<Vec<String>, String> {
@@ -302,8 +334,11 @@ impl Journal {
     }
 
     pub fn key(&self, name: &str) -> Result<String, String> {
-        if !valid_segment(name) {
-            return Err("invalid journal segment name".into());
+        let (first, last) = segment_range(name).ok_or("invalid journal segment name")?;
+        if last - first + 1 != self.segment_records
+            || !(first - 1).is_multiple_of(self.segment_records)
+        {
+            return Err("cloud journal key requires one aligned full segment".into());
         }
         Ok(format!("live/{}/journal/{name}", self.deployment))
     }
@@ -312,7 +347,7 @@ impl Journal {
 fn segment_name(first: u64, last: u64) -> String {
     format!("{first:020}-{last:020}.jsonl")
 }
-fn segment_range(name: &str) -> Option<(u64, u64)> {
+pub(super) fn segment_range(name: &str) -> Option<(u64, u64)> {
     let (first, last) = name.strip_suffix(".jsonl")?.split_once('-')?;
     if first.len() != 20
         || last.len() != 20
@@ -458,7 +493,9 @@ mod tests {
         journal.remove_uploaded().unwrap();
         assert!(!dir.join(format!("{}.uploaded", closed[0])).exists());
         assert_eq!(journal.spool_bytes().unwrap(), open_size);
-        assert_eq!(journal.rotate().unwrap(), Some(segment_name(3, 3)));
+        assert_eq!(journal.rotate().unwrap(), None);
+        assert!(!dir.join(segment_name(3, 3)).exists());
+        assert!(journal.key(&segment_name(3, 3)).is_err());
         assert_eq!(journal.rotate().unwrap(), None);
         fs::remove_dir_all(dir).unwrap();
     }
@@ -491,7 +528,7 @@ mod tests {
         fs::remove_dir_all(dir).unwrap();
     }
     #[test]
-    fn cleanup_restore_preserves_the_chain_and_keeps_partial_segments() {
+    fn cleanup_restore_preserves_the_chain_and_keeps_the_open_tail() {
         let dir = root("restore");
         let (mut journal, _) = Journal::open(&dir, "deployment", 2).unwrap();
         let records: Vec<_> = (1..=5)
@@ -509,7 +546,9 @@ mod tests {
         journal.remove_uploaded().unwrap();
         journal.remove_uploaded().unwrap();
         let partial = dir.join(format!("{}.uploaded", segment_name(5, 5)));
-        assert!(partial.exists());
+        assert!(!partial.exists());
+        assert_eq!(cloud.len(), 2);
+        assert_eq!(journal.open_tail().unwrap().unwrap().first_sequence, 5);
         for (first, last) in [(1, 2), (3, 4)] {
             assert!(
                 !dir.join(format!("{}.uploaded", segment_name(first, last)))

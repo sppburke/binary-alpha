@@ -25,7 +25,7 @@ pub fn resolve_secret(reference: &str) -> Result<String, String> {
         .ok_or_else(|| format!("credential reference {reference} is unavailable"))
 }
 
-pub trait Clock {
+pub trait Clock: Send + Sync {
     fn now_micros(&self) -> i64;
     fn sleep(&mut self, micros: i64);
 }
@@ -126,7 +126,7 @@ impl Continuity {
     }
 }
 
-pub trait MarketDataBroker {
+pub trait MarketDataBroker: Send {
     fn discover(&mut self) -> Result<Vec<DiscoveredInstrument>, String>;
     fn history_page(
         &mut self,
@@ -357,4 +357,42 @@ pub struct OpenContract {
     pub expiry_micros: Option<i64>,
     pub instrument: String,
     pub direction: Direction,
+}
+
+#[cfg(test)]
+mod clock_api_regressions {
+    use super::Clock;
+    struct TimeOnly;
+    impl Clock for TimeOnly {
+        fn now_micros(&self) -> i64 {
+            1
+        }
+        fn sleep(&mut self, _: i64) {}
+    }
+    // Compile-time regression: these calls become ambiguous if scheduler lifecycle methods
+    // are added to Clock, even when those methods have default implementations.
+    trait SessionOwner {
+        fn complete(&self) {}
+        fn cancel(&self) {}
+        fn wake(&self, _: &str) {}
+        fn begin(&self, _: &str) {}
+        fn stalled(&self) -> bool {
+            false
+        }
+        fn failure(&self) -> Option<String> {
+            None
+        }
+    }
+    impl SessionOwner for TimeOnly {}
+    #[test]
+    fn clock_does_not_claim_session_lifecycle_methods() {
+        let clock = TimeOnly;
+        clock.complete();
+        clock.cancel();
+        clock.wake("account");
+        clock.begin("account");
+        assert!(!clock.stalled());
+        assert_eq!(clock.failure(), None);
+        assert_eq!(clock.now_micros(), 1);
+    }
 }

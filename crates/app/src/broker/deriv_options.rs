@@ -22,6 +22,8 @@ const MEASURED_CONTRACT_TYPES: [&str; 2] = ["CALL", "PUT"];
 
 #[derive(Debug, Clone)]
 pub struct StatementRow {
+    pub instrument: Option<String>,
+    pub direction: Option<Direction>,
     pub cash: CashFact,
     pub payout: Option<Decimal>,
     /// Transport receipt time of the statement page carrying this row.
@@ -29,10 +31,17 @@ pub struct StatementRow {
 }
 
 /// One rate-admitted, encoded purchase, ready for the claimed socket-write boundary.
+#[derive(Debug, Clone)]
 pub struct Encoded {
     prepared: PreparedPurchase,
     id: u64,
     text: String,
+}
+
+impl Encoded {
+    pub fn command(&self) -> &str {
+        &self.prepared.command
+    }
 }
 
 /// A statement buy row alone can recover the debit and purchased liability.
@@ -197,6 +206,8 @@ struct Statement {
 }
 #[derive(Deserialize)]
 struct StatementTransaction {
+    underlying_symbol: Option<String>,
+    contract_type: Option<String>,
     payout: Option<WireDecimal>,
     action_type: CashAction,
     amount: WireDecimal,
@@ -258,6 +269,12 @@ impl DerivOptions {
             contracts: BTreeSet::new(),
             events: VecDeque::new(),
         })
+    }
+    pub fn rejected(&self, reason: &str) -> bool {
+        self.authenticated.connection.last_rejection.as_deref() == Some(reason)
+    }
+    pub fn now_micros(&self) -> i64 {
+        self.authenticated.connection.clock.now_micros()
     }
     pub fn proposal_details(&self, identity: &str) -> Option<(&str, &str)> {
         self.proposals
@@ -703,16 +720,30 @@ impl DerivOptions {
         self.authenticated.connection.subscriptions.insert(id);
         Ok(())
     }
+    /// Drains facts already decoded by a completed synchronous request, without socket I/O.
+    pub fn queued_account_event(&mut self) -> Result<Option<AccountEvent>, String> {
+        while self.events.is_empty() {
+            let Some(response) = self.authenticated.connection.queued.pop_front() else {
+                break;
+            };
+            self.account_response(response)?;
+        }
+        Ok(self.events.pop_front())
+    }
     pub fn next_account_event(
         &mut self,
         timeout_micros: i64,
     ) -> Result<Option<AccountEvent>, String> {
-        if let Some(event) = self.events.pop_front() {
+        if let Some(event) = self.queued_account_event()? {
             return Ok(Some(event));
         }
         let Some(response) = self.authenticated.connection.next(timeout_micros)? else {
             return Ok(None);
         };
+        self.account_response(response)?;
+        Ok(self.events.pop_front())
+    }
+    fn account_response(&mut self, response: Response) -> Result<(), String> {
         if !response
             .header
             .subscription
@@ -721,8 +752,7 @@ impl DerivOptions {
         {
             return Err("deriv account: unknown subscription".into());
         }
-        self.decode_event(response)?;
-        Ok(self.events.pop_front())
+        self.decode_event(response)
     }
     pub fn open_contracts(&mut self) -> Result<Vec<OpenContract>, String> {
         let response =
@@ -795,6 +825,8 @@ impl DerivOptions {
                     return Err("deriv statement: transaction outside requested range".into());
                 }
                 facts.push(StatementRow {
+                    instrument: t.underlying_symbol,
+                    direction: t.contract_type.as_deref().map(direction).transpose()?,
                     receipt_micros: response.receipt_micros,
                     payout: t.payout.as_ref().map(number).transpose()?,
                     cash: CashFact {

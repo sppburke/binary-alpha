@@ -3183,6 +3183,19 @@ impl Engine {
     // Stepping: observations, then decisions, at one availability time
     // ------------------------------------------------------------------------------------------
 
+    /// Invalidates a cached offer before the owner requests its replacement.
+    pub fn withdraw_proposal(&mut self, binding: &str) -> Result<(), String> {
+        let index = self
+            .definition
+            .replay
+            .bindings
+            .iter()
+            .position(|item| item.id == binding)
+            .ok_or_else(|| format!("unknown proposal binding {binding}"))?;
+        self.proposals[index] = None;
+        Ok(())
+    }
+
     /// Applies every observation available at `time` in source order, then evaluates the base
     /// rows installed by them at decision time `time`. Times never decrease. A failed step
     /// leaves the engine unusable: its state may hold observations the ledger does not, so the

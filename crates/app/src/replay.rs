@@ -28,7 +28,7 @@ use binary_alpha_engine::research::Access;
 use crate::archive::TableReader;
 use crate::features::{self, ROWS_MESSAGE};
 use crate::import::{self, CODE_REVISION};
-use crate::outcomes::{Bound, Temporary, bind_inputs, load_ticks};
+use crate::outcomes::{Bound, Temporary, bind_source_inputs, load_ticks};
 use crate::store::{self, ObjectIdentity, Put, Store};
 use crate::verify;
 
@@ -65,28 +65,33 @@ pub fn run(config_path: &Path, out: &mut dyn Write) -> Result<(), String> {
 }
 
 /// One instrument's bound inputs and its frozen binding.
-struct BoundInstrument {
-    inputs: Bound,
-    binding: InstrumentBinding,
+pub(crate) struct BoundInstrument {
+    pub(crate) inputs: Bound,
+    pub(crate) binding: InstrumentBinding,
 }
 
 /// Binds one input through the shared tick and feature binder, then refuses an outcome
 /// generation of other inputs and decision times outside the declared window on the manifest
 /// bytes alone.
-fn bind_instrument(
+pub(crate) fn bind_instrument(
     settings: &Replay,
     index: usize,
     access: Access<'_>,
 ) -> Result<BoundInstrument, String> {
     let input = &settings.inputs[index];
     let field = |name: &str| format!("inputs[{index}].{name}");
-    let inputs = bind_inputs(
+    let broker = settings
+        .contracts
+        .iter()
+        .any(|terms| terms.settlement.rule == SettlementRule::BrokerAuthoritativeV1);
+    let inputs = bind_source_inputs(
         &field,
         settings.role,
         &input.tick_manifest,
         &input.feature_manifest,
         "a replay",
         access,
+        broker,
     )?;
     let Bound {
         tick,
@@ -104,7 +109,7 @@ fn bind_instrument(
         ] {
             let Some(time) = time else { continue };
             let micros = parse_event_time_micros(time)?;
-            if micros < start || micros >= end {
+            if !broker && (micros < start || micros >= end) {
                 return Err(format!(
                     "{}: the {what} decision time {time} of stream {}s/{}s lies outside the declared decision window",
                     field("feature_manifest"),

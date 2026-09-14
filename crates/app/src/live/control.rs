@@ -68,6 +68,7 @@ pub enum ClaimOutcome {
 }
 
 pub trait Control {
+    fn advance_to(&mut self, _micros: i64) {}
     fn acquire(
         &mut self,
         key: LeaseKey<'_>,
@@ -102,6 +103,11 @@ pub trait Control {
         transaction_ref: Option<&str>,
     ) -> Result<bool, String>;
     fn unresolved(&mut self, key: LeaseKey<'_>) -> Result<Vec<Claim>, String>;
+    /// Durable recovery rows, including reconciled claims awaiting verified journal archival.
+    /// Controls that retain reconciled rows must include them here until deletion.
+    fn retained_claims(&mut self, key: LeaseKey<'_>) -> Result<Vec<Claim>, String> {
+        self.unresolved(key)
+    }
     fn delete_reconciled(&mut self, key: LeaseKey<'_>, claim: &str) -> Result<(), String>;
 }
 
@@ -218,6 +224,10 @@ fn proposal<'a>(
 }
 
 impl Control for FakeControl {
+    fn advance_to(&mut self, micros: i64) {
+        let mut state = self.state.lock().unwrap();
+        state.clock = state.clock.max(micros);
+    }
     fn acquire(
         &mut self,
         key: LeaseKey<'_>,
@@ -349,15 +359,18 @@ impl Control for FakeControl {
         })
     }
     fn unresolved(&mut self, key: LeaseKey<'_>) -> Result<Vec<Claim>, String> {
+        Ok(self
+            .retained_claims(key)?
+            .into_iter()
+            .filter(|claim| claim.state != ClaimState::Reconciled)
+            .collect())
+    }
+    fn retained_claims(&mut self, key: LeaseKey<'_>) -> Result<Vec<Claim>, String> {
         self.apply(|state| {
             let mut claims: Vec<_> = state
                 .claims
                 .iter()
-                .filter(|((broker, account, _), (_, claim))| {
-                    broker == key.broker
-                        && account == key.account
-                        && claim.state != ClaimState::Reconciled
-                })
+                .filter(|((broker, account, _), _)| broker == key.broker && account == key.account)
                 .map(|(_, value)| value)
                 .collect();
             claims.sort_by(|(a, x), (b, y)| (a, &x.command).cmp(&(b, &y.command)));
@@ -409,6 +422,7 @@ const CLAIM_SQL: &str = "INSERT INTO live_dispatch_claims (broker, account, comm
 const REPLAY_SQL: &str = "SELECT payload::text, state, contract_ref, transaction_ref FROM live_dispatch_claims WHERE broker=$1 AND account=$2 AND command=$3";
 const UPDATE_SQL: &str = "UPDATE live_dispatch_claims SET state=$4, contract_ref=COALESCE($5, contract_ref), transaction_ref=COALESCE($6, transaction_ref), updated_at=clock_timestamp() WHERE broker=$1 AND account=$2 AND command=$3 AND token <= $7";
 const UNRESOLVED_SQL: &str = "SELECT payload::text, state, contract_ref, transaction_ref FROM live_dispatch_claims WHERE broker=$1 AND account=$2 AND state <> 'reconciled' ORDER BY created_at, command";
+const RETAINED_SQL: &str = "SELECT payload::text, state, contract_ref, transaction_ref FROM live_dispatch_claims WHERE broker=$1 AND account=$2 ORDER BY created_at, command";
 const DELETE_SQL: &str = "DELETE FROM live_dispatch_claims WHERE broker=$1 AND account=$2 AND command=$3 AND state='reconciled'";
 
 /// One PostgreSQL session, driven only while its current-thread runtime is entered.
@@ -464,6 +478,27 @@ impl Postgres {
             Ok::<_, String>(client)
         })?;
         Ok(Self { runtime, client })
+    }
+
+    fn read_claims(&mut self, key: LeaseKey<'_>, query: &str) -> Result<Vec<Claim>, String> {
+        async fn operation(
+            transaction: &Transaction<'_>,
+            key: LeaseKey<'_>,
+            query: &str,
+        ) -> Result<Vec<Claim>, String> {
+            transaction
+                .query(query, &[&key.broker, &key.account])
+                .await
+                .map_err(pg_error)?
+                .into_iter()
+                .map(decode_claim)
+                .collect()
+        }
+        self.runtime.block_on(async {
+            let transaction = self.client.transaction().await.map_err(pg_error)?;
+            let result = operation(&transaction, key, query).await;
+            finish(transaction, result).await
+        })
     }
 
     pub fn migrate(&mut self) -> Result<(), String> {
@@ -797,23 +832,10 @@ impl Control for Postgres {
         })
     }
     fn unresolved(&mut self, key: LeaseKey<'_>) -> Result<Vec<Claim>, String> {
-        async fn operation(
-            transaction: &Transaction<'_>,
-            key: LeaseKey<'_>,
-        ) -> Result<Vec<Claim>, String> {
-            transaction
-                .query(UNRESOLVED_SQL, &[&key.broker, &key.account])
-                .await
-                .map_err(pg_error)?
-                .into_iter()
-                .map(decode_claim)
-                .collect()
-        }
-        self.runtime.block_on(async {
-            let transaction = self.client.transaction().await.map_err(pg_error)?;
-            let result = operation(&transaction, key).await;
-            finish(transaction, result).await
-        })
+        self.read_claims(key, UNRESOLVED_SQL)
+    }
+    fn retained_claims(&mut self, key: LeaseKey<'_>) -> Result<Vec<Claim>, String> {
+        self.read_claims(key, RETAINED_SQL)
     }
     fn delete_reconciled(&mut self, key: LeaseKey<'_>, command: &str) -> Result<(), String> {
         async fn operation(

@@ -96,6 +96,28 @@ pub(crate) fn bind_inputs(
     what: &str,
     access: Access<'_>,
 ) -> Result<Bound, String> {
+    bind_source_inputs(
+        field,
+        role,
+        tick_manifest,
+        feature_manifest,
+        what,
+        access,
+        false,
+    )
+}
+
+/// A live source may use a separately fitted plan; all scope and scale checks are shared.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn bind_source_inputs(
+    field: &dyn Fn(&str) -> String,
+    role: DatasetRole,
+    tick_manifest: &ManifestUri,
+    feature_manifest: &ManifestUri,
+    what: &str,
+    access: Access<'_>,
+    refit: bool,
+) -> Result<Bound, String> {
     let (tick_store, tick, scale) =
         bind_tick(&field("tick_manifest"), role, tick_manifest, what, access)?;
     let (feature_store, feature) = features::feature_manifest(
@@ -103,7 +125,7 @@ pub(crate) fn bind_inputs(
         &feature_manifest.to_string(),
         access,
     )?;
-    if feature.input_generation != tick.generation {
+    if !refit && feature.input_generation != tick.generation {
         return Err(format!(
             "{}: feature generation {} was computed from tick generation {}, not {}",
             field("feature_manifest"),

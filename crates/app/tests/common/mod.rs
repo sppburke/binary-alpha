@@ -657,34 +657,37 @@ pub mod broker {
 
     use binary_alpha_app::broker::Clock;
     use binary_alpha_app::broker::transport::{Connector, Frame, Http, Transport};
-    use std::cell::{Cell, RefCell};
     use std::collections::VecDeque;
-    use std::rc::Rc;
+    use std::sync::Arc;
+    use std::sync::{
+        Mutex,
+        atomic::{AtomicI64, Ordering},
+    };
     #[derive(Clone, Default)]
-    pub struct FakeClock(Rc<Cell<i64>>);
+    pub struct FakeClock(Arc<AtomicI64>);
     impl FakeClock {
         pub fn at(value: i64) -> Self {
-            Self(Rc::new(Cell::new(value)))
+            Self(Arc::new(AtomicI64::new(value)))
         }
     }
     impl Clock for FakeClock {
         fn now_micros(&self) -> i64 {
-            self.0.get()
+            self.0.load(Ordering::SeqCst)
         }
         fn sleep(&mut self, micros: i64) {
-            self.0.set(self.0.get() + micros);
+            self.0.fetch_add(micros, Ordering::SeqCst);
         }
     }
     struct ScriptTransport {
         frames: VecDeque<Frame>,
-        sent: Rc<RefCell<Vec<Frame>>>,
+        sent: Arc<Mutex<Vec<Frame>>>,
         clock: FakeClock,
         fail_on_write: Option<usize>,
     }
     impl Transport for ScriptTransport {
         fn send(&mut self, frame: Frame) -> Result<(), String> {
-            self.sent.borrow_mut().push(frame);
-            if self.fail_on_write == Some(self.sent.borrow().len()) {
+            self.sent.lock().unwrap().push(frame);
+            if self.fail_on_write == Some(self.sent.lock().unwrap().len()) {
                 return Err("synthetic socket send failure".into());
             }
             Ok(())
@@ -700,7 +703,7 @@ pub mod broker {
     }
     struct ScriptConnector {
         sessions: VecDeque<Vec<Frame>>,
-        sent: Rc<RefCell<Vec<Frame>>>,
+        sent: Arc<Mutex<Vec<Frame>>>,
         clock: FakeClock,
         fail_on_write: Option<usize>,
     }
@@ -716,7 +719,7 @@ pub mod broker {
                     .pop_front()
                     .ok_or("unexpected connection")?
                     .into(),
-                sent: Rc::clone(&self.sent),
+                sent: Arc::clone(&self.sent),
                 clock: self.clock.clone(),
                 fail_on_write: self.fail_on_write,
             }))
@@ -725,30 +728,66 @@ pub mod broker {
     pub fn connector(
         sessions: Vec<Vec<Frame>>,
         clock: &FakeClock,
-    ) -> (Box<dyn Connector>, Rc<RefCell<Vec<Frame>>>) {
+    ) -> (Box<dyn Connector>, Arc<Mutex<Vec<Frame>>>) {
         scripted(sessions, clock, None)
     }
     pub fn failing_connector(
         sessions: Vec<Vec<Frame>>,
         clock: &FakeClock,
         fail_on_write: usize,
-    ) -> (Box<dyn Connector>, Rc<RefCell<Vec<Frame>>>) {
+    ) -> (Box<dyn Connector>, Arc<Mutex<Vec<Frame>>>) {
         scripted(sessions, clock, Some(fail_on_write))
     }
     fn scripted(
         sessions: Vec<Vec<Frame>>,
         clock: &FakeClock,
         fail_on_write: Option<usize>,
-    ) -> (Box<dyn Connector>, Rc<RefCell<Vec<Frame>>>) {
-        let sent = Rc::new(RefCell::new(Vec::new()));
+    ) -> (Box<dyn Connector>, Arc<Mutex<Vec<Frame>>>) {
+        let sent = Arc::new(Mutex::new(Vec::new()));
         (
             Box::new(ScriptConnector {
                 sessions: sessions.into(),
-                sent: Rc::clone(&sent),
+                sent: Arc::clone(&sent),
                 clock: clock.clone(),
                 fail_on_write,
             }),
             sent,
         )
     }
+}
+
+pub fn logged_output(result: Output) -> Result<String, String> {
+    let stdout = String::from_utf8(result.stdout).unwrap();
+    let stderr = String::from_utf8(result.stderr).unwrap();
+    if result.status.success() {
+        assert!(stderr.is_empty(), "{stderr}");
+        Ok(stdout)
+    } else {
+        assert_eq!(result.status.code(), Some(1));
+        Err(stderr)
+    }
+}
+
+pub fn cli(log: &Path, args: &[&str]) -> Result<String, String> {
+    fs::write(log, []).unwrap();
+    logged_output(
+        Command::new(env!("CARGO_BIN_EXE_binary-alpha"))
+            .args(args)
+            .env("BINARY_ALPHA_STORE_LOG", log)
+            .output()
+            .unwrap(),
+    )
+}
+
+/// `cli` under a distinct operator account: the grant command's simulated operator capability.
+pub fn cli_as(log: &Path, user: &str, args: &[&str]) -> Result<String, String> {
+    fs::write(log, []).unwrap();
+    logged_output(
+        Command::new(env!("CARGO_BIN_EXE_binary-alpha"))
+            .args(args)
+            .env("BINARY_ALPHA_STORE_LOG", log)
+            .env("USER", user)
+            .output()
+            .unwrap(),
+    )
 }

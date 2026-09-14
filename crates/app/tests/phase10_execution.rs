@@ -21,9 +21,9 @@ use binary_alpha_engine::market::{InstrumentId, PriceScale};
 use common::Scratch;
 use common::broker::{FakeClock, FakeHttp, connector, correlated, replace};
 use serde_json::value::RawValue;
-use std::cell::RefCell;
 use std::collections::BTreeMap;
-use std::rc::Rc;
+use std::sync::Arc;
+use std::sync::Mutex;
 
 const SECOND: i64 = 1_000_000;
 const PURCHASE: i64 = 1_789_347_036_000_000;
@@ -170,7 +170,7 @@ fn connect_options_scoped(
     )
     .unwrap()
 }
-fn options(frames: Vec<Frame>, clock: &FakeClock) -> (DerivOptions, Rc<RefCell<Vec<Frame>>>) {
+fn options(frames: Vec<Frame>, clock: &FakeClock) -> (DerivOptions, Arc<Mutex<Vec<Frame>>>) {
     let (connector, sent) = connector(vec![frames], clock);
     (
         connect_options(
@@ -459,7 +459,8 @@ fn pinned_rise_and_fall_restore_publish_and_verify_exact_cash() {
         run.account().cash.to_string()
     );
     let requests = sent
-        .borrow()
+        .lock()
+        .unwrap()
         .iter()
         .filter_map(|frame| {
             if let Frame::Text(text) = frame {
@@ -868,14 +869,14 @@ fn dispatch_requires_claim_and_never_retries_an_uncertain_write() {
         let (mut run, mut prepared) = one_prepared(&mut options, &clock);
         let mut missing = prepared.clone();
         missing.dispatch_claim.clear();
-        let before = sent.borrow().len();
+        let before = sent.lock().unwrap().len();
         assert!(
             options
                 .purchase(&missing)
                 .unwrap_err()
                 .contains("dispatch claim")
         );
-        assert_eq!(sent.borrow().len(), before);
+        assert_eq!(sent.lock().unwrap().len(), before);
         if failure == "not_sent" {
             prepared.proposal_identity = "other-connection:proposal".into();
         }
@@ -913,20 +914,20 @@ fn dispatch_requires_claim_and_never_retries_an_uncertain_write() {
         if failure == "lost_ack" {
             assert_eq!(run.account().blocked.len(), 1);
             assert_eq!(run.account().reserved.to_string(), "10.00");
-            let count = sent.borrow().len();
+            let count = sent.lock().unwrap().len();
             assert!(
                 options
                     .purchase(&prepared)
                     .unwrap_err()
                     .contains("possibly sent; reconcile before any retry")
             );
-            assert_eq!(sent.borrow().len(), count);
+            assert_eq!(sent.lock().unwrap().len(), count);
         } else {
             assert!(run.account().blocked.is_empty());
             assert_eq!(run.account().reserved.to_string(), "0.00");
         }
         assert_eq!(
-            sent.borrow().len() - before,
+            sent.lock().unwrap().len() - before,
             usize::from(failure == "lost_ack" || failure == "rejected")
         );
     }
@@ -1032,7 +1033,8 @@ fn statement_and_portfolio_recover_acceptance_without_retry() {
         assert_eq!(run.account().cash.to_string(), "9964.57");
         assert_eq!(run.account().open, 0);
         assert_eq!(
-            sent.borrow()
+            sent.lock()
+                .unwrap()
                 .iter()
                 .filter(|f| matches!(f,Frame::Text(t) if t.contains("\"buy\":")))
                 .count(),
@@ -1040,7 +1042,8 @@ fn statement_and_portfolio_recover_acceptance_without_retry() {
         );
         assert!(
             !recovery_sent
-                .borrow()
+                .lock()
+                .unwrap()
                 .iter()
                 .any(|f| matches!(f,Frame::Text(t) if t.contains("\"buy\":")))
         );
@@ -1146,7 +1149,7 @@ proposal={stake="10",duration_seconds=15}
         assert_eq!(actual_time, spot_time);
         assert!(longcode.contains(word));
     }
-    let requests = sent.borrow();
+    let requests = sent.lock().unwrap();
     assert_eq!(requests.len(), 4);
     for frame in requests.iter() {
         let Frame::Text(text) = frame else { panic!() };
@@ -1191,12 +1194,12 @@ fn socket_send_failure_is_possibly_sent_and_claim_is_never_written_twice() {
     );
     assert_eq!(run.account().blocked.len(), 1);
     assert_eq!(run.account().reserved.to_string(), "10.00");
-    assert_eq!(sent.borrow().len(), 2);
+    assert_eq!(sent.lock().unwrap().len(), 2);
     assert!(options.purchase(&prepared).is_err());
     let mut replacement = prepared.clone();
     replacement.dispatch_claim.push_str(":replacement");
     assert!(options.purchase(&replacement).is_err());
-    assert_eq!(sent.borrow().len(), 2);
+    assert_eq!(sent.lock().unwrap().len(), 2);
 }
 
 #[test]
@@ -1213,7 +1216,7 @@ fn proposal_scope_and_provider_errors_stop_before_preparation() {
             _ => unreachable!(),
         }
         assert!(options.proposal(&request).is_err());
-        assert!(sent.borrow().is_empty());
+        assert!(sent.lock().unwrap().is_empty());
     }
     for frame in [Frame::Text(r#"{"msg_type":"proposal","req_id":1,"error":{"code":"RateLimit","message":"Synthetic trade limit"}}"#.into()),frame("proposal-call",99),response(&change(&fixture("proposal-call"),"proposal","spot","null"),1), response(&change(&fixture("proposal-call"),"proposal","ask_price","\"10\""),1)] {
         let (mut options,_)=self::options(vec![frame],&clock);
@@ -1314,16 +1317,16 @@ fn split_purchase_and_queued_cash_preserve_transport_receipts() {
         Some(AccountEvent::TransactionAcknowledged)
     ));
     let (mut run, prepared) = one_prepared(&mut options, &clock);
-    let before_write = sent.borrow().len();
+    let before_write = sent.lock().unwrap().len();
     let encoded = options.prepare_purchase(&prepared).unwrap();
     assert_eq!(
-        sent.borrow().len(),
+        sent.lock().unwrap().len(),
         before_write,
         "preparation must not write"
     );
     let before_response = clock.now_micros();
     let outcome = options.write_purchase(encoded).unwrap();
-    assert_eq!(sent.borrow().len(), before_write + 1);
+    assert_eq!(sent.lock().unwrap().len(), before_write + 1);
     let buy_receipt = clock.now_micros();
     assert!(
         matches!(&outcome, PurchaseOutcome::Accepted { receipt_micros, .. } if *receipt_micros == buy_receipt)
@@ -1389,25 +1392,25 @@ fn split_purchases_keep_each_encoded_command_bound_to_its_claim() {
         proposal_identity: proposal_b.identity,
         maximum_price: proposal_b.terms.quoted_cost,
     };
-    let before = sent.borrow().len();
+    let before = sent.lock().unwrap().len();
     let encoded_a = options.prepare_purchase(&a).unwrap();
     let encoded_b = options.prepare_purchase(&b).unwrap();
-    assert_eq!(sent.borrow().len(), before);
+    assert_eq!(sent.lock().unwrap().len(), before);
     assert!(matches!(
         options.write_purchase(encoded_a).unwrap(),
         PurchaseOutcome::Accepted { .. }
     ));
-    assert_eq!(sent.borrow().len(), before + 1);
+    assert_eq!(sent.lock().unwrap().len(), before + 1);
     assert!(matches!(
         options.write_purchase(encoded_b).unwrap(),
         PurchaseOutcome::Accepted { .. }
     ));
-    assert_eq!(sent.borrow().len(), before + 2);
+    assert_eq!(sent.lock().unwrap().len(), before + 2);
     assert_eq!(
         options.prepare_purchase(&a).err().unwrap(),
         "deriv buy: dispatch claim already written or possibly sent; reconcile before any retry"
     );
-    assert_eq!(sent.borrow().len(), before + 2);
+    assert_eq!(sent.lock().unwrap().len(), before + 2);
 }
 
 #[test]
@@ -1418,20 +1421,20 @@ fn split_purchase_refuses_a_second_prepared_token_for_the_same_claim_without_wri
         &clock,
     );
     let (_, prepared) = one_prepared(&mut options, &clock);
-    let before = sent.borrow().len();
+    let before = sent.lock().unwrap().len();
     let first = options.prepare_purchase(&prepared).unwrap();
     let second = options.prepare_purchase(&prepared).unwrap();
-    assert_eq!(sent.borrow().len(), before);
+    assert_eq!(sent.lock().unwrap().len(), before);
     assert!(matches!(
         options.write_purchase(first).unwrap(),
         PurchaseOutcome::Accepted { .. }
     ));
-    assert_eq!(sent.borrow().len(), before + 1);
+    assert_eq!(sent.lock().unwrap().len(), before + 1);
     assert_eq!(
         options.write_purchase(second).unwrap_err(),
         "deriv buy: dispatch claim already written or possibly sent; reconcile before any retry"
     );
-    assert_eq!(sent.borrow().len(), before + 1);
+    assert_eq!(sent.lock().unwrap().len(), before + 1);
 }
 
 #[test]
@@ -1626,7 +1629,7 @@ fn statement_pages_use_offset_and_preserve_explicit_zero_cash() {
     assert_eq!(cash.len(), 101);
     assert!(cash[..100].iter().all(|fact| fact.cash.amount.is_zero()));
     assert_eq!(cash[100].cash.amount.to_string(), "18.83");
-    let sent = sent.borrow();
+    let sent = sent.lock().unwrap();
     assert!(matches!(&sent[0],Frame::Text(text) if text.contains("\"offset\":0")));
     assert!(
         matches!(&sent[1],Frame::Text(text) if text.contains("\"offset\":100")&&text.contains("\"date_to\":1789347055"))
@@ -2091,7 +2094,7 @@ fn strict_mapping_rejects_unmeasured_scope_before_proposal_write() {
             options.proposal(&request).unwrap_err(),
             "deriv: the strict Rise/Fall mapping is measured only for demo USD accounts; inspect and extend the mapping before use"
         );
-        assert!(sent.borrow().is_empty());
+        assert!(sent.lock().unwrap().is_empty());
     }
 }
 
@@ -2112,7 +2115,7 @@ fn proposal_commission_requires_resolved_zero_fee_inclusion() {
         } else {
             assert!(result.unwrap_err().contains("commission"));
         }
-        assert_eq!(sent.borrow().len(), 1);
+        assert_eq!(sent.lock().unwrap().len(), 1);
     }
 }
 
@@ -2191,7 +2194,7 @@ fn actual_options_requests_share_trade_and_account_rate_windows() {
     assert_eq!(clock.now_micros(), before_balance + 10);
     options.statement(1_789_347_035, 1_789_347_054).unwrap();
     assert!(clock.now_micros() >= before_balance + 60 * SECOND);
-    assert_eq!(sent.borrow().len(), 5);
+    assert_eq!(sent.lock().unwrap().len(), 5);
 }
 
 #[test]
