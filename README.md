@@ -13,7 +13,8 @@ imports existing historical data into immutable published generations, audits ea
 generation through its configured instrument stream into a profile and finalized causal candles,
 builds feature and future-only outcome generations, replays governed historical inputs through the
 one execution engine into a reconstructable financial ledger, runs candidate search and portfolio
-selection, and verifies every kind of generation. The accelerator supplies thirteen retained device
+selection, runs the one-command study to an awaiting state and, under a separately created grant,
+to one certification result, and verifies every kind of generation. The accelerator supplies thirteen retained device
 kernels and their deterministic
 central-processor references; it has no production consumer. The checkout executes no live, paper,
 or production trading action. Browser-driven operation, click execution, and any live, paper, certification,
@@ -31,12 +32,14 @@ cargo run --release --locked -p binary-alpha-app -- data import --config PATH
 cargo run --release --locked -p binary-alpha-app -- data fetch --config PATH
 cargo run --release --locked -p binary-alpha-app -- broker inspect --config PATH
 cargo run --release --locked -p binary-alpha-app -- data audit --config PATH --manifest URI
-cargo run --release --locked -p binary-alpha-app -- data verify --manifest URI
+cargo run --release --locked -p binary-alpha-app -- data verify --manifest URI [--config PATH]
 cargo run --release --locked -p binary-alpha-app -- features build --config PATH
 cargo run --release --locked -p binary-alpha-app -- outcomes build --config PATH
 cargo run --release --locked -p binary-alpha-app -- replay --config PATH
 cargo run --release --locked -p binary-alpha-app -- search --config PATH
 cargo run --release --locked -p binary-alpha-app -- portfolio optimize --config PATH
+cargo run --release --locked -p binary-alpha-app -- research run --config PATH
+cargo run --release --locked -p binary-alpha-app -- holdout grant create --config PATH --bundle-manifest URI --holdout-manifest URI --reason TEXT
 BINARY_ALPHA_TEST_CONFIG=PATH BINARY_ALPHA_CUDA_REFERENCE_OUTPUT=NEW_DIRECTORY cargo test --release --locked -p binary-alpha-app --features cuda --test phase07_cuda_parity capture_legacy_reference -- --exact --ignored --nocapture
 BINARY_ALPHA_TEST_CONFIG=PATH BINARY_ALPHA_CUDA_REFERENCE=MANIFEST cargo test --release --locked -p binary-alpha-app --features cuda --test phase07_cuda_parity governed_parity -- --exact --ignored --nocapture
 ```
@@ -59,8 +62,13 @@ summary as a replay generation; `binary-alpha search --config PATH` enumerates, 
 evaluates, and resamples one candidate family and publishes it; `binary-alpha portfolio optimize
 --config PATH` enumerates every declared complete joint policy over development-only families,
 replays each one jointly per inner fold through the engine, selects under the frozen objective,
-refits, optionally evaluates once, and publishes one selection generation; `binary-alpha data
-verify --manifest URI` re-reads one generation of any kind from its manifest and objects alone.
+refits, optionally evaluates once, and publishes one selection generation; `binary-alpha research
+run --config PATH` runs the one-command study over the declared historical generations to one
+immutable awaiting state and, once the separately created grant exists, resumes to one certified or
+rejected result; `binary-alpha holdout grant create` is the operator-only authorization that never
+opens holdout data; `binary-alpha data verify --manifest URI` re-reads one generation of any kind
+from its manifest and objects alone, with `--config PATH` permitting the target through the
+configuration's governance declaration before it is opened.
 `binary-alpha data fetch --config PATH` downloads the `[history]` selection through either compiled
 broker into the same retained folder and immutable generations. `binary-alpha broker inspect
 --config PATH` records bounded discovery, history, live/cancellation and configured account/proposal

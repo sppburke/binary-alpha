@@ -38,6 +38,14 @@ tick, feature, and outcome manifest URIs ──▶ app: bind identities, resolve
    merge ticks and rows by availability ──▶ engine: evaluate, admit, reserve, settle, account, risk
    ──▶ app: simulated acceptances, ledger and summary through the same store ──▶ app: restore the
    ledger through the engine ──▶ standard output
+
+research table and governance declaration ──▶ app: permit every declared input, publish the attempt
+   intent ──▶ audit, feature, outcome, search, and portfolio owners per instrument ──▶ engine:
+   frozen stage, qualification descriptor ──▶ app: claim the outer populations, apply the refit
+   plans, replay every scenario ──▶ engine: projection, verdict, aggregate ──▶ app: run record and
+   manifest (the bundle), awaiting authorization ──▶ operator grant ──▶ app: protected claims,
+   receipt, certification context ──▶ the same plans and scenarios over holdout ──▶ app:
+   certification record and manifest ──▶ standard output
 ```
 
 `binary-alpha config validate --config PATH` reads the document; the engine parses it into typed
@@ -66,6 +74,11 @@ engine owns the exact money, the records, every decision and posting, the ledger
 and the summary; the application binds the inputs, feeds ticks and feature rows in availability
 order with the configured simulated acceptances, and publishes the replay generation through the
 same store after restoring it.
+`binary-alpha research run --config PATH` and `binary-alpha holdout grant create` are the
+research path described in section "Research": the engine owns the governance declaration and
+read permits, every research record and identity, the lowering into the existing tables, the
+qualification descriptor and verdicts, and the certification context; the application owns the
+fixed sequence over the existing owners, the conditional governance records, and the verifiers.
 `binary-alpha search --config PATH` is the candidate-search path described in section "Search":
 the engine owns enumeration, family identity, the model score and its adjustment, the sampler,
 the gates and the ranking; the application binds one development and one optional evaluation
@@ -89,7 +102,7 @@ artifacts: Google Cloud Storage, Supabase references (#3)  ◀── strategy, r
                                                                      ▲                     │
 accelerator with central-processor reference (#8, this checkout) ─▶ candidate search and evaluation (#9, this checkout)  │
                                                      repair, portfolio, risk tuning (#10)  │
-research, optimization, certification (#12) ◀──────────────────────────────────────────────┘
+research, optimization, certification (#12, this checkout) ◀────────────────────────────────┘
 live runtime and cutover (#13) ─▶ execution ─▶ broker adapter (#11)
 ```
 
@@ -114,7 +127,8 @@ live runtime and cutover (#13) ─▶ execution ─▶ broker adapter (#11)
 | Binding search inputs, the lowering and chunk replays, device scoring, stability resampling, family publication and verification | `binary-alpha-app`, module `search` | this checkout ([#9](https://github.com/sppburke/binary-alpha/issues/9)) |
 | Repair, portfolio, risk tuning | `binary-alpha-engine` with thin application entry points | [#10](https://github.com/sppburke/binary-alpha/issues/10) |
 | Broker contracts and adapters, secrets resolution | `binary-alpha-app` | [#11](https://github.com/sppburke/binary-alpha/issues/11) |
-| Research orchestration, holdout grants, certification | `binary-alpha-app` over engine stages | [#12](https://github.com/sppburke/binary-alpha/issues/12) |
+| Governance declarations and read permits, research records and identities, lowering into the existing tables, qualification, the certification context | `binary-alpha-engine`, module `research` | this checkout ([#12](https://github.com/sppburke/binary-alpha/issues/12)) |
+| The research sequence over the existing owners, governance records, grants, receipts, research verification | `binary-alpha-app`, module `research` | this checkout ([#12](https://github.com/sppburke/binary-alpha/issues/12)) |
 | Live runtime, authorization, resumable cutover | `binary-alpha-app` | [#13](https://github.com/sppburke/binary-alpha/issues/13) |
 
 The engine stays free of external effects so that development, evaluation, optimization,

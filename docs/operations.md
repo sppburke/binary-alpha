@@ -119,6 +119,28 @@ selection, and the rerun reuses every completed generation after its own verifie
 Verify a selection with the same `data verify` command, which restores every referenced replay.
 Selection performs no broker, live, paper, or production action and needs no operator task.
 
+Research: author the non-sensitive governance declaration from authorized records (operator,
+authoritative root, namespace, and every population with its role, instrument, source, coverage,
+generation aliases, sorted stable conflict tokens, and exposure history; see
+[docs/contracts.md](contracts.md), section "Research") and publish it at the location
+`research.study.governance_manifest` names; never open holdout data to discover aliases, overlaps,
+or prior outcomes, and record an unknown mapping as unavailable. Declare the `[research]` table
+and run `binary-alpha research run --config PATH`. The command permits every declared input
+before any read, creates the attempt intent beneath the authoritative root, publishes every child
+through the same owners as the individual commands, publishes the frozen stage and the run record,
+and exits successfully awaiting holdout authorization; rerun it to resume the same identity after
+any interruption. Copy protected holdout objects to the approved bucket only under a separate
+logged byte-transfer authorization that preserves bytes, hashes, and role. After the run reports
+its identity, an operator with a distinct identity that may create but not overwrite grant objects
+runs `binary-alpha holdout grant create --config PATH --bundle-manifest URI --holdout-manifest URI
+--reason TEXT` (one `--holdout-manifest` per instrument, in instrument order); the grant never
+enters tracked configuration. Rerunning `research run` then claims the protected population,
+creates the receipt, and publishes one certified or rejected result; another agent may rerun the
+same command safely, because every transfer, grant, claim, receipt, and generation uses
+deterministic identities and conditional creation and the grant is consumed once. A rejected
+result is terminal for that frozen run: it never tunes, reranks, retries, or opens another stage.
+No live service quiescence or downtime is involved.
+
 Rollout to Google Cloud Storage: discover and reuse existing projects, buckets, identities, and
 regions first; create nothing in a region whose name begins `us-west`; provision the bucket and a
 least-privilege identity that can read and create objects but not create or delete buckets, outside
@@ -151,8 +173,11 @@ service, runner, and secret.
 ## Rollback
 
 A repository change rolls back by reverting its merge commit. Published dataset, stream, feature,
-outcome, broker-history, and replay generations are
-immutable and are never deleted by rollback; the retained historical-data folder and the original
+outcome, broker-history, replay, family, selection, research, and certification generations and
+every governance record (intent, claim, grant, receipt) are
+immutable and are never deleted by rollback; a research rollback selects the last certified
+bundle or disables promotion and never deletes a rejected bundle, grant, receipt, source object,
+or prior generation; the retained historical-data folder and the original
 source files stay intact, and a consumer selects the prior generation by its identity. Schema, broker, and other production state do not exist at this phase; the
 phase that creates any of them records its own cause-specific verification and rollback before it
 ships. Production work minimizes downtime, prefers

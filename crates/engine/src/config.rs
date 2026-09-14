@@ -130,6 +130,18 @@ impl Config {
             research
                 .validate()
                 .map_err(|reason| format!("research.{reason}"))?;
+            for (index, instrument) in research.instruments.iter().enumerate() {
+                if !self
+                    .instruments
+                    .iter()
+                    .any(|configured| configured.id().to_string() == instrument.instrument)
+                {
+                    return Err(format!(
+                        "research.instruments[{index}].instrument: {} maps no configured instrument",
+                        instrument.instrument
+                    ));
+                }
+            }
         }
         self.validate_brokers()?;
         let Some(import) = &self.import else {
