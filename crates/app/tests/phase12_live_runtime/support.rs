@@ -51,6 +51,13 @@ impl Fixture {
         Self::with_instruments(name, 2)
     }
     fn with_instruments(name: &str, count: usize) -> Self {
+        Self::with_account(name, count, "a0")
+    }
+    /// Namespaces real database scenarios without changing their frozen logical account binding.
+    pub fn for_account(name: &str, account: &str) -> Self {
+        Self::with_account(name, 1, account)
+    }
+    fn with_account(name: &str, count: usize, account: &str) -> Self {
         let scratch = Scratch::new(name);
         let mut value = serde_json::to_value(shared::configuration(&scratch.root)).unwrap();
         value["instruments"].as_array_mut().unwrap().truncate(1);
@@ -139,6 +146,13 @@ impl Fixture {
                     .unwrap()
                     .push(second);
             }
+        }
+        value["research"]["portfolio"]["accounts"][0]["id"] = json!(account);
+        for binding in value["research"]["portfolio"]["bindings"]
+            .as_array_mut()
+            .unwrap()
+        {
+            binding["account"] = json!(account);
         }
         let mut config: Config = serde_json::from_value(value).unwrap();
         let mut datasets = Vec::new();
@@ -276,7 +290,7 @@ impl Fixture {
         config.brokers=serde_json::from_value(json!([{"kind":"deriv","id":"deriv","public_endpoint":"ws://127.0.0.1/public",
             "bootstrap_endpoint":"http://127.0.0.1/trading/v1/options","app_id":"SYNTHETIC","account_class":"demo"}])).unwrap();
         config.live=Some(serde_json::from_value(json!({"execution_contract":research::EXECUTION_CONTRACT_V1,
-            "bundle_manifest":uri(&scratch.root,&generation),"certification_manifest":uri(&scratch.root,&cert),"broker":"deriv","account":"a0",
+            "bundle_manifest":uri(&scratch.root,&generation),"certification_manifest":uri(&scratch.root,&cert),"broker":"deriv","account":account,
             "warmup":warmup.iter().map(|w| uri(&scratch.root,&w.generation)).collect::<Vec<_>>(),"compatibility":{"observation_start":time(START),"observation_end":time(START+2*CANDLE),"required_account_class":"demo","min_samples":1},
             "journal":{"dir":"journal","segment_records":16,"max_spool_bytes":10_000_000},
             "control":{"host":"localhost","port":5432,"database":"synthetic","user":"synthetic","credential":"SYNTHETIC_PASSWORD",
@@ -312,6 +326,24 @@ impl Fixture {
 
 pub fn frame(name: &str) -> String {
     crate::common::broker::fixture(&format!("deriv-execution-{name}.json"))
+}
+
+/// A verified one-tick warm-up cannot supply a completed feature-history interval.
+pub fn short_warmup(fixture: &mut Fixture) {
+    let manifests = shared::import_ticks(
+        &fixture.scratch.root,
+        "short-warmup",
+        DatasetRole::Development,
+        "deriv",
+        &["R_50"],
+        &[4],
+        &[vec![format!(
+            "{},SYNTHETIC,180.0000",
+            time(START - 500_000)
+        )]],
+    );
+    fixture.config.live.as_mut().unwrap().warmup =
+        vec![uri(&fixture.scratch.root, &manifests[0].generation)];
 }
 pub fn change(text: &str, owner: &str, key: &str, value: &str) -> String {
     let fields: std::collections::BTreeMap<String, Box<serde_json::value::RawValue>> =
@@ -506,6 +538,34 @@ pub fn runtime_with_io(
         Box<dyn binary_alpha_app::broker::transport::Connector>,
     ) -> Box<dyn binary_alpha_app::broker::transport::Connector>,
 ) -> Result<live::Runtime, String> {
+    runtime_with_test_clock(
+        fixture,
+        mode,
+        recorded,
+        control,
+        edit,
+        wrap_market,
+        wrap_account,
+        recorded.clock(),
+    )
+}
+
+/// Keeps the recorded scheduler while injecting a shared deterministic owner/adapter clock.
+#[allow(clippy::too_many_arguments)]
+pub fn runtime_with_test_clock(
+    fixture: &Fixture,
+    mode: live::Mode,
+    recorded: &binary_alpha_app::broker::transport::RecordedConnector,
+    control: Box<dyn binary_alpha_app::live::control::Control>,
+    edit: impl FnOnce(&mut live::LiveDefinition),
+    wrap_market: impl FnOnce(
+        Box<dyn binary_alpha_app::broker::MarketDataBroker>,
+    ) -> Box<dyn binary_alpha_app::broker::MarketDataBroker>,
+    wrap_account: impl FnOnce(
+        Box<dyn binary_alpha_app::broker::transport::Connector>,
+    ) -> Box<dyn binary_alpha_app::broker::transport::Connector>,
+    clock: impl binary_alpha_app::broker::Clock + Clone + 'static,
+) -> Result<live::Runtime, String> {
     use binary_alpha_app::broker::{
         AccountIdentity,
         deriv::{DerivAccounts, DerivMarketData, DerivOptions},
@@ -514,13 +574,12 @@ pub fn runtime_with_io(
     let Broker::Deriv(settings) = &fixture.config.brokers[0] else {
         panic!("fixture broker")
     };
-    let clock = recorded.clock();
     let address =
         DerivAccounts::bootstrap(settings, &mut recorded.http(), "synthetic-no-credential")
             .unwrap();
     let account = AccountIdentity {
         broker: settings.id.clone(),
-        account: "a0".into(),
+        account: fixture.config.live.as_ref().unwrap().account.clone(),
         class: address.account_class,
         currency: address.currency.clone(),
     };
@@ -566,7 +625,7 @@ pub fn runtime_with_io(
         wrap_market(Box::new(market)),
         options,
         Box::new(clock.clone()),
-        Some(clock),
+        Some(recorded.clock()),
         mode,
     )
 }
