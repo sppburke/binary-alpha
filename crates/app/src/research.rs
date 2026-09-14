@@ -226,30 +226,12 @@ impl Study<'_> {
 
     /// The declared holdout references, in instrument order.
     fn holdout(&self) -> Vec<HoldoutRef> {
-        self.research
-            .instruments
-            .iter()
-            .zip(&self.research.holdout.inputs)
-            .map(|(instrument, manifest)| HoldoutRef {
-                instrument: instrument.instrument.clone(),
-                manifest: manifest.clone(),
-            })
-            .collect()
+        holdout_refs(self.research)
     }
 
     /// The complete sorted protected token set of the declared holdout populations.
     fn protected_tokens(&self) -> Result<Vec<String>, String> {
-        Ok(self
-            .declaration
-            .tokens(
-                self.research
-                    .holdout
-                    .inputs
-                    .iter()
-                    .map(ManifestUri::generation),
-            )?
-            .into_iter()
-            .collect())
+        protected_tokens(self.research, &self.declaration)
     }
 
     /// Every declared input in its declared role, checked as a permit before any read.
@@ -287,13 +269,13 @@ impl Study<'_> {
             for used in &intent.populations {
                 let exposed = used.role != DatasetRole::Holdout;
                 if let Some(population) = self.declaration.populations.iter().find(|population| {
-                    population.id == used.id
+                    (population.id == used.id
                         || population
                             .tokens
                             .iter()
-                            .any(|token| used.tokens.contains(token))
-                }) && (population.role != DatasetRole::Holdout) != exposed
-                {
+                            .any(|token| used.tokens.contains(token)))
+                        && (population.role != DatasetRole::Holdout) != exposed
+                }) {
                     return Err(format!(
                         "study.predecessors: attempt `{predecessor}` used population `{}` as `{}`, but the declaration now places `{}` on the other side of the protected boundary",
                         used.id, used.role, population.id
@@ -435,6 +417,46 @@ fn population_uses(
         )?;
     }
     Ok(used.into_values().collect())
+}
+
+/// The declared holdout references of a research table, in instrument order.
+fn holdout_refs(research: &Research) -> Vec<HoldoutRef> {
+    research
+        .instruments
+        .iter()
+        .zip(&research.holdout.inputs)
+        .map(|(instrument, manifest)| HoldoutRef {
+            instrument: instrument.instrument.clone(),
+            manifest: manifest.clone(),
+        })
+        .collect()
+}
+
+/// The complete sorted protected token set of the declared holdout populations.
+fn protected_tokens(research: &Research, declaration: &Declaration) -> Result<Vec<String>, String> {
+    Ok(declaration
+        .tokens(research.holdout.inputs.iter().map(ManifestUri::generation))?
+        .into_iter()
+        .collect())
+}
+
+/// Whether `grant` names exactly this run's frozen bundle, the declared holdout references, and
+/// the declaration identity, root, namespace, and complete protected token set the run was
+/// frozen under; the same comparison authorizes a run and verifies a certification.
+fn grant_binds(
+    grant: &Grant,
+    manifest: &RunManifest,
+    research: &Research,
+    declaration: &Declaration,
+    identity: &str,
+) -> Result<bool, String> {
+    Ok(grant.research == manifest.generation
+        && grant.bundle_sha256 == manifest.bundle_sha256()
+        && grant.holdout == holdout_refs(research)
+        && grant.declaration == identity
+        && grant.root == declaration.root
+        && grant.namespace == declaration.namespace
+        && grant.tokens == protected_tokens(research, declaration)?)
 }
 
 /// The claims one run creates over a token set, as created and as verified: one record per
@@ -1127,14 +1149,13 @@ fn validated_grant(study: &Study<'_>, manifest: &RunManifest) -> Result<Option<G
     let uri = study.governance.uri(&key);
     let grant = Grant::from_json(&read_key(&study.governance, &key)?)
         .map_err(|reason| format!("{uri}: {reason}"))?;
-    if grant.research != manifest.generation
-        || grant.bundle_sha256 != manifest.bundle_sha256()
-        || grant.holdout != study.holdout()
-        || grant.declaration != study.identity
-        || grant.root != study.declaration.root
-        || grant.namespace != study.declaration.namespace
-        || grant.tokens != study.protected_tokens()?
-    {
+    if !grant_binds(
+        &grant,
+        manifest,
+        study.research,
+        &study.declaration,
+        &study.identity,
+    )? {
         return Err(format!(
             "{uri} does not authorize this run's frozen bundle over the declared holdout population; no holdout was opened"
         ));
@@ -1217,6 +1238,7 @@ fn certify(
         destination,
         &manifest_key(&run.selection),
         &read_key(destination, &manifest_key(&run.selection))?,
+        access,
     )?;
     let scenarios = assess(
         study.config,
@@ -1557,7 +1579,7 @@ pub fn verify_run(
                 &run.descriptor.scenarios,
                 &research.scenarios,
                 &run.outer,
-                Access::ORDINARY,
+                access,
             )?;
             if verdict.passing() {
                 RunState::AwaitingHoldoutAuthorization
@@ -1621,6 +1643,10 @@ fn verified_children(
                 record.instrument
             ));
         }
+        // Every child restores through its own verifier before anything reuses it.
+        for generation in [&record.profile, &record.feature, &record.outcome] {
+            verify::run_with(&store.uri(&manifest_key(generation)), access)?;
+        }
         let profile = verified_profile(uri, store, &record.profile, &record.source)?;
         profiles.insert(record.source.clone(), profile.clone());
         let (feature_store, feature) =
@@ -1671,7 +1697,7 @@ fn verified_children(
             ));
         }
         let family_uri = store.uri(&manifest_key(&record.family));
-        let (family_manifest, family) = search::development_family(&family_uri)?;
+        let (family_manifest, family) = search::development_family(&family_uri, access)?;
         let expected = search_config(
             config,
             engine::search_table(
@@ -1717,6 +1743,7 @@ fn verified_children(
         store,
         &selection_key,
         &read_key(store, &selection_key)?,
+        access,
     )?;
     let expected = portfolio_config(config, selection_table(research, families, &profiles)?);
     if selected.config != expected {
@@ -1959,6 +1986,11 @@ pub fn verify_certification(
     // Under a declaration: the grant names this bundle, every protected claim is this run's,
     // and the receipt records exactly their consumption of the grant.
     let receipt = match access.declaration {
+        Some(declaration) if declaration.identity() != run.declaration => {
+            return Err(format!(
+                "{uri}: the configured declaration is not the one this run was frozen under"
+            ));
+        }
         Some(declaration) => {
             let grant_key = declaration.key(&engine::grant_key(&manifest.research));
             let governance = Store::open(&declaration.root)?;
@@ -1966,8 +1998,13 @@ pub fn verify_certification(
                 .map_err(|reason| format!("{}: {reason}", governance.uri(&grant_key)))?;
             let receipt_key = declaration.key(&engine::receipt_key(&grant.hash));
             if grant.hash != manifest.grant
-                || grant.research != manifest.research
-                || grant.bundle_sha256 != manifest.bundle_sha256
+                || !grant_binds(
+                    &grant,
+                    &run_manifest,
+                    research,
+                    declaration,
+                    &run.declaration,
+                )?
                 || manifest.receipt != receipt_key
             {
                 return Err(format!(
@@ -2040,6 +2077,7 @@ pub fn verify_certification(
         store,
         &selection_key,
         &read_key(store, &selection_key)?,
+        access,
     )?;
     let verdict = verify_scenarios(
         uri,

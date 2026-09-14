@@ -192,7 +192,7 @@ pub(crate) fn family(
         local,
         destination,
         true,
-        Access::ORDINARY,
+        access,
     )?;
     let references = read_references(&development)?;
     let codes = lowering_codes(
@@ -261,7 +261,7 @@ pub(crate) fn family(
                 local,
                 destination,
                 true,
-                Access::ORDINARY,
+                access,
             )?;
             let summary = published.engine.summary();
             let events = chunk_events(destination, &published.manifest)?;
@@ -396,7 +396,7 @@ pub(crate) fn family(
         None => manifest.to_json(),
     };
     let uri = destination.uri(&key);
-    let verified = verify_family(&uri, destination, &key, &committed)?;
+    let verified = verify_family(&uri, destination, &key, &committed, access)?;
     let temporary = import::temporary_path(local, &format!("manifest-{generation}"))?;
     fs::write(&temporary, &committed)
         .map_err(|error| format!("cannot write {}: {error}", temporary.display()))?;
@@ -488,11 +488,6 @@ fn bind_development(settings: &Search, access: Access<'_>) -> Result<Development
     }
     let outcome = OutcomeManifest::from_json(&bytes)
         .map_err(|error| format!("{}: {uri}: {error}", field("outcome_manifest")))?;
-    if outcome.role == DatasetRole::Holdout {
-        access
-            .protected(std::iter::once(outcome.tick_generation.as_str()))
-            .map_err(|reason| format!("{}: {uri}: {reason}", field("outcome_manifest")))?;
-    }
     if outcome.key() != outcome_key
         || outcome.role != DatasetRole::Development
         || outcome.tick_generation != bound.tick.generation
@@ -1012,10 +1007,16 @@ fn restored_definition(
 /// gate and rank recomputed by the engine owner, every group and split group against the
 /// verified summaries and the shared ledger projection, and every stability result recomputed
 /// from the verified settlement profits.
-pub fn verify_family(uri: &str, store: &Store, key: &str, bytes: &[u8]) -> Result<String, String> {
+pub fn verify_family(
+    uri: &str,
+    store: &Store,
+    key: &str,
+    bytes: &[u8],
+    access: Access<'_>,
+) -> Result<String, String> {
     let manifest = family_manifest(uri, key, bytes)?;
     let (family, family_bytes) = read_family(uri, store, &manifest)?;
-    let replayed = verify_read_family(uri, store, &manifest, &family)?;
+    let replayed = verify_read_family(uri, store, &manifest, &family, access)?;
     Ok(format!(
         "verified search generation {} members {} applicable {} replayed {replayed} passed {} objects 1 bytes {family_bytes}",
         manifest.generation,
@@ -1034,7 +1035,10 @@ pub fn verify_family(uri: &str, store: &Store, key: &str, bytes: &[u8]) -> Resul
 /// of another role, or member evaluation evidence before any referenced generation is followed;
 /// then the whole family verifies exactly as `data verify` does. Nothing is stripped to make an
 /// input acceptable.
-pub(crate) fn development_family(uri: &str) -> Result<(FamilyManifest, Family), String> {
+pub(crate) fn development_family(
+    uri: &str,
+    access: Access<'_>,
+) -> Result<(FamilyManifest, Family), String> {
     let (store, key) = verify::open(uri)?;
     let mut bytes = Vec::new();
     store.read_to(&key, None, &mut bytes)?;
@@ -1052,6 +1056,15 @@ pub(crate) fn development_family(uri: &str) -> Result<(FamilyManifest, Family), 
             "{uri}: input {} of {} is `{}`; a portfolio universe reads development-only families",
             input.tick_generation, input.instrument, input.role
         ));
+    }
+    // A declared holdout input is protected whatever the family's own labels say.
+    for input in &manifest.inputs {
+        access.lookup(&input.tick_generation).map_err(|reason| {
+            format!(
+                "{uri}: input {} of {}: {reason}",
+                input.tick_generation, input.instrument
+            )
+        })?;
     }
     let (family, _) = read_family(uri, &store, &manifest)?;
     let later = if family.search.evaluation.is_some() {
@@ -1074,7 +1087,7 @@ pub(crate) fn development_family(uri: &str) -> Result<(FamilyManifest, Family), 
             "{uri}: the family carries {what}; a portfolio universe reads development-only families"
         ));
     }
-    verify_read_family(uri, &store, &manifest, &family)?;
+    verify_read_family(uri, &store, &manifest, &family, access)?;
     Ok((manifest, family))
 }
 
@@ -1122,6 +1135,7 @@ fn verify_read_family(
     store: &Store,
     manifest: &FamilyManifest,
     family: &Family,
+    access: Access<'_>,
 ) -> Result<usize, String> {
     let settings = &family.search;
     settings
@@ -1160,7 +1174,7 @@ fn verify_read_family(
         }
     }
     // The bound development (and evaluation) generations are the manifest's inputs.
-    let development = bind_development(settings, Access::ORDINARY)?;
+    let development = bind_development(settings, access)?;
     if development.plan_identity != family.plan_identity
         || family.base_stream != settings.base_stream
     {
@@ -1170,7 +1184,7 @@ fn verify_read_family(
     }
     let mut inputs = vec![development.input.clone()];
     if settings.evaluation.is_some() {
-        inputs.push(bind_evaluation(settings, &development, Access::ORDINARY)?);
+        inputs.push(bind_evaluation(settings, &development, access)?);
     }
     if manifest.inputs != inputs {
         return Err(format!(
@@ -1196,7 +1210,7 @@ fn verify_read_family(
         {
             return Err(format!("{uri}: {chunk_uri} is not the recorded chunk"));
         }
-        replay::verify_replay(&chunk_uri, store, &chunk_key, &bytes, Access::ORDINARY)?;
+        replay::verify_replay(&chunk_uri, store, &chunk_key, &bytes, access)?;
         let events = chunk_events(store, &chunk_manifest)?;
         Ok((chunk_manifest, events))
     };

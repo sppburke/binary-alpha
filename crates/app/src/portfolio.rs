@@ -431,11 +431,14 @@ pub(crate) fn replay_ref(published: &replay::Published) -> ReplayRef {
 // ----------------------------------------------------------------------------------------------
 
 /// The verified families in declared order with their source-member records.
-fn families(settings: &Portfolio) -> Result<(Vec<Family>, Vec<FamilyRecord>), String> {
+fn families(
+    settings: &Portfolio,
+    access: Access<'_>,
+) -> Result<(Vec<Family>, Vec<FamilyRecord>), String> {
     let mut families = Vec::with_capacity(settings.families.len());
     let mut records = Vec::with_capacity(settings.families.len());
     for (index, uri) in settings.families.iter().enumerate() {
-        let (manifest, family) = search::development_family(&uri.to_string())
+        let (manifest, family) = search::development_family(&uri.to_string(), access)
             .map_err(|reason| format!("families[{index}]: {reason}"))?;
         records.push(FamilyRecord {
             generation: manifest.generation,
@@ -548,7 +551,7 @@ pub(crate) fn select(
     // 1. Every declared input on its manifest bytes, then the verified development-only
     //    families, the frozen logical universe, and every declared choice.
     let bound = bind(settings, access)?;
-    let (families, family_records) = families(settings)?;
+    let (families, family_records) = families(settings, access)?;
     let members = engine::logical_members(settings, &families)?;
     let mut choices = choices(settings, &members)?;
     let declared = engine::declared_count(settings)?;
@@ -784,7 +787,7 @@ pub(crate) fn select(
         None => manifest.to_json(),
     };
     let uri = destination.uri(&key);
-    let verified = verify_selection(&uri, destination, &key, &committed)?;
+    let verified = verify_selection(&uri, destination, &key, &committed, access)?;
     let temporary = import::temporary_path(local, &format!("manifest-{generation}"))?;
     fs::write(&temporary, &committed)
         .map_err(|error| format!("cannot write {}: {error}", temporary.display()))?;
@@ -853,8 +856,8 @@ fn recorded_feature(
     Ok((manifest, plan))
 }
 
-/// The recorded fit and application of one instrument, as replay input and plan; the applied
-/// generation opens under the caller's read permit.
+/// The recorded fit and application of one instrument, as replay input and plan, under the
+/// caller's read permit.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn recorded_input(
     uri: &str,
@@ -873,7 +876,7 @@ pub(crate) fn recorded_input(
         DatasetRole::Development,
         fit_input,
         None,
-        Access::ORDINARY,
+        access,
     )?;
     if applied.plan_identity != fit.plan_identity || applied.instrument != fit.instrument {
         return Err(format!(
@@ -910,9 +913,10 @@ fn configured_fit(
     entry: &FeatureInstrument,
     cutoff: i64,
     plan: &FeaturePlan,
+    access: Access<'_>,
 ) -> Result<(), String> {
-    let resolved = bind_fit(field, entry, cutoff, Access::ORDINARY)
-        .map_err(|reason| format!("{uri}: {reason}"))?;
+    let resolved =
+        bind_fit(field, entry, cutoff, access).map_err(|reason| format!("{uri}: {reason}"))?;
     if *resolved.plan() != plan.unfitted() {
         return Err(format!(
             "{uri}: {field} does not resolve to the recorded plan before its fit"
@@ -954,6 +958,7 @@ pub(crate) fn verified_selection(
     store: &Store,
     key: &str,
     bytes: &[u8],
+    access: Access<'_>,
 ) -> Result<(SelectionManifest, Selection, usize), String> {
     let manifest =
         SelectionManifest::from_json(bytes).map_err(|error| format!("{uri}: {error}"))?;
@@ -987,7 +992,7 @@ pub(crate) fn verified_selection(
         ));
     }
     // The universe: verified families, their records, the logical members, and every choice.
-    let (families, family_records) = families(settings)?;
+    let (families, family_records) = families(settings, access)?;
     if family_records != selection.families
         || manifest.families
             != family_records
@@ -1061,9 +1066,9 @@ pub(crate) fn verified_selection(
                 applied,
                 DatasetRole::Development,
                 &input.assessment_manifest,
-                Access::ORDINARY,
+                access,
             )?;
-            configured_fit(uri, &field, &input.fit, cutoff, &plan)?;
+            configured_fit(uri, &field, &input.fit, cutoff, &plan, access)?;
             plans.insert(instrument, plan);
             inputs.push(replay_input);
         }
@@ -1103,7 +1108,7 @@ pub(crate) fn verified_selection(
                         inputs.clone(),
                         None,
                     );
-                    let restored = recorded_replay(uri, store, replay, &table, Access::ORDINARY)?;
+                    let restored = recorded_replay(uri, store, replay, &table, access)?;
                     FoldResult {
                         inapplicable: None,
                         replay: Some(replay.clone()),
@@ -1167,7 +1172,7 @@ pub(crate) fn verified_selection(
                     DatasetRole::Development,
                     &entry.input_manifest,
                     None,
-                    Access::ORDINARY,
+                    access,
                 )?;
                 configured_fit(
                     uri,
@@ -1175,6 +1180,7 @@ pub(crate) fn verified_selection(
                     entry,
                     cutoff,
                     &plan,
+                    access,
                 )?;
                 plans.insert(record.instrument.clone(), plan);
             }
@@ -1232,7 +1238,7 @@ pub(crate) fn verified_selection(
                                     applied,
                                     DatasetRole::Evaluation,
                                     input,
-                                    Access::ORDINARY,
+                                    access,
                                 )?;
                                 inputs.push(replay_input);
                             }
@@ -1245,13 +1251,8 @@ pub(crate) fn verified_selection(
                                 inputs,
                                 evaluation.splits.clone(),
                             );
-                            let restored = recorded_replay(
-                                uri,
-                                store,
-                                &outer.replay,
-                                &table,
-                                Access::ORDINARY,
-                            )?;
+                            let restored =
+                                recorded_replay(uri, store, &outer.replay, &table, access)?;
                             let projection = engine::project(&restored.engine, &settings.gates)?;
                             if projection != outer.projection
                                 || restored.engine.summary().splits != outer.splits
@@ -1293,8 +1294,9 @@ pub fn verify_selection(
     store: &Store,
     key: &str,
     bytes: &[u8],
+    access: Access<'_>,
 ) -> Result<String, String> {
-    let (manifest, selection, bytes) = verified_selection(uri, store, key, bytes)?;
+    let (manifest, selection, bytes) = verified_selection(uri, store, key, bytes, access)?;
     Ok(format!(
         "verified portfolio generation {} declared {} rejected {} valid {} passing {} state {} objects 1 bytes {bytes}",
         manifest.generation,

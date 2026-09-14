@@ -268,6 +268,11 @@ fn bind(entry: &FeatureInstrument, access: Access<'_>) -> Result<Bound, String> 
             stream_manifest.generation, stream_manifest.role
         ));
     }
+    // The profile's source is protected by its declared role whatever the profile's own label
+    // says: refused before the profile object is opened.
+    access
+        .lookup(&stream_manifest.source_generation)
+        .map_err(|reason| format!("profile_manifest: {reason}"))?;
     let definition = &stream_manifest.definition;
     if definition.broker != input.broker
         || definition.provider_symbol != input.provider_symbol

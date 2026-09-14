@@ -81,10 +81,10 @@ pub fn run_with(uri: &str, access: Access<'_>) -> Result<String, String> {
             crate::replay::verify_replay(uri, &store, &manifest_key, &bytes, access)
         }
         Some(FAMILY_MANIFEST_KIND) => {
-            crate::search::verify_family(uri, &store, &manifest_key, &bytes)
+            crate::search::verify_family(uri, &store, &manifest_key, &bytes, access)
         }
         Some(SELECTION_MANIFEST_KIND) => {
-            crate::portfolio::verify_selection(uri, &store, &manifest_key, &bytes)
+            crate::portfolio::verify_selection(uri, &store, &manifest_key, &bytes, access)
         }
         Some(RUN_MANIFEST_KIND) => {
             crate::research::verify_run(uri, &store, &manifest_key, &bytes, access)

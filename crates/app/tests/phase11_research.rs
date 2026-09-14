@@ -33,6 +33,8 @@ const PLANTED: [u8; 4] = [0b0011_1111, 0b0000_0011, 0b0001_1111, 0b0000_1111];
 const LOSING: [u8; 4] = [0b0000_0011, 0b0000_0011, 0b0000_0111, 0b0000_0111];
 const PROTECTED: &str =
     "holdout data is protected; only the matching authorized certification context may open it";
+/// The distinct operator account the grant command runs under.
+const OPERATOR: &str = "synthetic-operator";
 
 #[derive(Clone, Copy)]
 struct Row {
@@ -151,6 +153,19 @@ fn cli(log: &Path, args: &[&str]) -> Result<String, String> {
         Command::new(env!("CARGO_BIN_EXE_binary-alpha"))
             .args(args)
             .env("BINARY_ALPHA_STORE_LOG", log)
+            .output()
+            .unwrap(),
+    )
+}
+
+/// `cli` under a distinct operator account: the grant command's simulated operator capability.
+fn cli_as(log: &Path, user: &str, args: &[&str]) -> Result<String, String> {
+    fs::write(log, []).unwrap();
+    output(
+        Command::new(env!("CARGO_BIN_EXE_binary-alpha"))
+            .args(args)
+            .env("BINARY_ALPHA_STORE_LOG", log)
+            .env("USER", user)
             .output()
             .unwrap(),
     )
@@ -369,8 +384,9 @@ impl Fixture {
     }
     fn grant(&self) -> (String, Grant) {
         let holdout = &self.config.research.as_ref().unwrap().holdout.inputs;
-        let text = cli(
+        let text = cli_as(
             &self.log(),
+            OPERATOR,
             &[
                 "holdout",
                 "grant",
@@ -409,22 +425,31 @@ impl Fixture {
                 .unwrap(),
         )
     }
+    /// The holdout generations and every object key they reference.
     fn protected(&self) -> Vec<String> {
+        self.keys_of(|d| d.role == DatasetRole::Holdout)
+    }
+    /// The evaluation generations and every object key they reference.
+    fn evaluation(&self) -> Vec<String> {
+        let inputs = &self.config.research.as_ref().unwrap().evaluation.inputs;
+        let keys = self.keys_of(|d| inputs.iter().any(|u| u.generation() == d.generation));
+        assert_eq!(
+            keys.iter()
+                .filter(|k| inputs.iter().any(|u| u.generation() == *k))
+                .count(),
+            inputs.len(),
+            "every evaluation generation is a fixture dataset"
+        );
+        keys
+    }
+    fn keys_of(&self, select: impl Fn(&GenerationManifest) -> bool) -> Vec<String> {
         self.datasets
             .iter()
-            .filter(|d| d.role == DatasetRole::Holdout)
-            .map(|d| d.generation.clone())
-            .collect()
-    }
-    fn evaluation(&self) -> Vec<String> {
-        self.config
-            .research
-            .as_ref()
-            .unwrap()
-            .evaluation
-            .inputs
-            .iter()
-            .map(|u| u.generation().into())
+            .filter(|d| select(d))
+            .flat_map(|d| {
+                std::iter::once(d.generation.clone())
+                    .chain(d.objects.iter().map(|object| object.key.clone()))
+            })
             .collect()
     }
     fn governance_path(&self, key: &str) -> PathBuf {
@@ -599,6 +624,7 @@ fn research_run_freezes_awaits_and_certifies() {
         format!("{expected}\n")
     );
     let (grant_line, grant) = fixture.grant();
+    assert_eq!(grant.operator, OPERATOR);
     assert_eq!(
         grant_line,
         format!(
@@ -707,6 +733,17 @@ fn research_run_freezes_awaits_and_certifies() {
         &record.scenarios[0].outer.features[0].generation,
     ] {
         assert!(fixture.verify(generation).unwrap_err().contains(PROTECTED));
+        // The public envelope is read; no object of it and no holdout dataset key is touched.
+        let log = logged(&fixture.log());
+        no_access(&log, &fixture.protected());
+        let objects: Vec<String> = fixture.manifest(generation)["objects"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|object| object["key"].as_str().unwrap().to_owned())
+            .collect();
+        assert!(!objects.is_empty());
+        no_access(&log, &objects);
     }
     let before = manifest_snapshot(&fixture.scratch.path("published"));
     assert!(fixture.run().unwrap().contains("(already published)"));
@@ -1488,8 +1525,9 @@ fn interrupted_runs_resume_to_identical_results() {
             fixture.run().unwrap();
             write(&fixture.grant_path(), &grant_bytes);
         }
-        // The run manifest is the run's last effect: the ready file can appear as the process
-        // exits, and a completed run resumes through the same path as an interrupted one.
+        // The run manifest is the last durable effect of the run at the destination: the ready
+        // file can appear as the process exits, and a completed run resumes through the same
+        // path as an interrupted one.
         let interrupted = kill_at(fixture, count, governance, frozen);
         assert!(
             interrupted || name == "run",
@@ -1507,6 +1545,29 @@ fn interrupted_runs_resume_to_identical_results() {
             (manifest.clone(), run.clone()),
             "{name}"
         );
+        if !matches!(name, "profile" | "family" | "selection") {
+            // A published frozen stage restores its children through their verifiers: nothing
+            // frozen is recomputed or republished after the freeze.
+            let frozen_children: Vec<String> = run
+                .instruments
+                .iter()
+                .flat_map(|record| {
+                    [
+                        record.profile.clone(),
+                        record.feature.clone(),
+                        record.outcome.clone(),
+                        record.family.clone(),
+                    ]
+                })
+                .chain(std::iter::once(run.selection.clone()))
+                .map(|generation| format!("put_new manifests/{generation}/ready.json"))
+                .collect();
+            let resumed = logged(&fixture.log());
+            assert!(
+                resumed.iter().all(|line| !frozen_children.contains(line)),
+                "{name}: a frozen child was republished"
+            );
+        }
         assert_eq!(
             fixture.object(&manifest.generation, "research.json"),
             run_bytes,
@@ -1676,6 +1737,44 @@ fn partial_claims_are_retained_and_conflicts_deny_protected_access() {
         );
         assert_eq!(count_files(&fixture.governance_path("phase11/receipts")), 0);
     }
+
+    // An altered frozen stage never reaches authorization: the run refuses to resume, the grant
+    // command refuses to create authority, and no holdout key is touched.
+    comparison.restart("altered-bundle", &awaiting);
+    let frozen_path = fixture
+        .scratch
+        .path("published")
+        .join(research::frozen_key(&fixture.generation()));
+    let mut altered = fs::read(&frozen_path).unwrap();
+    altered.push(b' ');
+    write(&frozen_path, &altered);
+    let error = fixture.run().unwrap_err();
+    assert!(error.contains("the frozen stage does not bind"), "{error}");
+    no_access(&logged(&fixture.log()), &fixture.protected());
+    let holdout = &fixture.config.research.as_ref().unwrap().holdout.inputs;
+    let error = cli_as(
+        &fixture.log(),
+        OPERATOR,
+        &[
+            "holdout",
+            "grant",
+            "create",
+            "--config",
+            fixture.path.to_str().unwrap(),
+            "--bundle-manifest",
+            &uri(&fixture.scratch.root, &fixture.generation()).to_string(),
+            "--holdout-manifest",
+            &holdout[0].to_string(),
+            "--holdout-manifest",
+            &holdout[1].to_string(),
+            "--reason",
+            "altered bundle",
+        ],
+    )
+    .unwrap_err();
+    assert!(error.contains("the frozen stage does not bind"), "{error}");
+    assert!(!fixture.grant_path().exists());
+    no_access(&logged(&fixture.log()), &fixture.protected());
 
     comparison.restart("second-attempt", &awaiting);
     let mut changed = fixture.config.clone();

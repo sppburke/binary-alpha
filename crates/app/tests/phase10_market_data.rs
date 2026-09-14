@@ -2197,6 +2197,17 @@ fn reused_history_is_published_to_the_current_destination() {
                 .any(|line| line == format!("read_to {}", manifest.key())),
             permitted
         );
+        if !permitted {
+            // The undeclared prior is discovered by the logged listing only: no metadata, read,
+            // or local-path operation names it.
+            assert!(
+                accesses
+                    .lines()
+                    .filter(|line| line.contains(&manifest.generation))
+                    .all(|line| line.starts_with("probe ")),
+                "{accesses}"
+            );
+        }
         if permitted {
             assert_eq!(
                 fs::read(destination.local_path(&manifest.key()).unwrap()).unwrap(),

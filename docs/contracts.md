@@ -1597,7 +1597,9 @@ paths. With a declaration (the configuration's `research.study`, supplied to `da
 `--config PATH`), the target generation must be declared and its declared role must be the role
 the reader expects; a holdout target requires the certification context that names it, and an
 undeclared target is refused. Without a declaration an ordinary reader keeps its existing
-post-read role guard and holdout is refused. A derived generation whose manifest carries the
+post-read role guard and holdout is refused. A ready manifest is the public reference envelope
+of its generation: a reader opens it to learn the role and references it must permit, and opens
+no object of a generation it may not read. A derived generation whose manifest carries the
 holdout role or whose declared input generation is holdout (a stream, feature, outcome, replay,
 or family of holdout data, whatever its own label says) is parsed, restored, or verified only
 within the certification context naming its dataset generations. Only the
@@ -1680,8 +1682,9 @@ run verifier, requires one `--holdout-manifest` per instrument in instrument ord
 declared holdout references,
 and creates `grants/RESEARCH.json` once: `schema_version`, `research`, `bundle_sha256`,
 `holdout` (instrument and exact ready-manifest location), `declaration`, `root`, `namespace`, the
-complete sorted protected `tokens` of the declared holdout populations, `operator` (the `USER`
-environment variable, or `unavailable`), `reason`, `created_at`, and `hash` (SHA-256 over
+complete sorted protected `tokens` of the declared holdout populations, `operator` (the local
+account that ran the command, from the `USER` environment variable, or `unavailable`; not an
+authenticated store principal), `reason`, `created_at`, and `hash` (SHA-256 over
 `binary-alpha holdout grant v1\n` and the record with an empty hash). It never opens a holdout
 object; an existing grant for the same bundle and population is reported, any other existing grant
 is refused, and the operator identity that creates grants must not be able to overwrite them. It
@@ -1717,7 +1720,8 @@ posterior probability, or execution proof.
 ### Verification
 
 `data verify` on a run generation checks the manifest against the record, re-lowers the recorded
-research configuration and compares it with every child: each instrument's profile (a development
+research configuration, restores every child through its own verifier, and compares each with the
+configuration: each instrument's profile (a development
 stream of its source), feature generation (the configured fit under that profile, resolved before
 its fit and compared with the recorded plan), outcome generation (the configured rule over that
 source and feature, by identity), and family (whose search table, child configuration hash, and

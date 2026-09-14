@@ -13,7 +13,7 @@ use std::path::Path;
 use std::time::Instant;
 
 use binary_alpha_engine::config::{Config, Replay, RunMode};
-use binary_alpha_engine::dataset::{DatasetRole, ObjectRecord, ObjectRole, manifest_key};
+use binary_alpha_engine::dataset::{ObjectRecord, ObjectRole, manifest_key};
 use binary_alpha_engine::execution::{
     ColumnSpec, EVENTS_OBJECT_PATH, Engine, EventKind, EventSource, FinancialEvent,
     HISTORICAL_AVAILABILITY, InstrumentBinding, Observation, REPLAY_MANIFEST_KIND,
@@ -129,11 +129,6 @@ fn bind_instrument(
             }
             let outcome = OutcomeManifest::from_json(&bytes)
                 .map_err(|error| format!("{}: {uri}: {error}", field("outcome_manifest")))?;
-            if outcome.role == DatasetRole::Holdout {
-                access
-                    .protected(std::iter::once(outcome.tick_generation.as_str()))
-                    .map_err(|reason| format!("{}: {uri}: {reason}", field("outcome_manifest")))?;
-            }
             if outcome.key() != outcome_key {
                 return Err(format!(
                     "{}: {uri} holds the manifest of generation {}",
