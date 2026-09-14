@@ -1,0 +1,1 @@
+0{"synthetic":true,"pingInterval":25000,"pingTimeout":20000}

@@ -2,22 +2,14 @@
 //! audit, feature builds, outcome builds, engine replay, candidate search, portfolio selection,
 //! verification, and the external adapters those commands need.
 
-mod archive;
-mod audit;
-mod features;
-mod import;
-mod outcomes;
-mod parallel;
-mod portfolio;
-mod replay;
-mod search;
-mod store;
-mod verify;
+use binary_alpha_app::{
+    audit, features, fetch, import, inspect, load_config, outcomes, portfolio, replay, search,
+    verify,
+};
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use binary_alpha_engine::config::Config;
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
@@ -33,6 +25,11 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Inspect a configured broker without purchasing.
+    Broker {
+        #[command(subcommand)]
+        command: BrokerCommand,
+    },
     /// Inspect configuration documents.
     #[command(disable_help_subcommand = true)]
     Config {
@@ -122,7 +119,20 @@ enum ConfigCommand {
 }
 
 #[derive(Subcommand)]
+enum BrokerCommand {
+    Inspect {
+        #[arg(long)]
+        config: PathBuf,
+    },
+}
+
+#[derive(Subcommand)]
 enum DataCommand {
+    /// Fetch and publish bounded broker tick history.
+    Fetch {
+        #[arg(long)]
+        config: PathBuf,
+    },
     /// Retain, publish, and commit every dataset the configuration declares.
     Import {
         /// Path of the TOML configuration document.
@@ -149,6 +159,12 @@ enum DataCommand {
 
 fn main() -> ExitCode {
     let result = match Cli::parse().command {
+        Command::Data {
+            command: DataCommand::Fetch { config },
+        } => fetch::run(&config, &mut std::io::stdout().lock()),
+        Command::Broker {
+            command: BrokerCommand::Inspect { config },
+        } => inspect::run(&config, &mut std::io::stdout().lock()),
         Command::Config {
             command: ConfigCommand::Validate { config },
         } => validate(&config).map(|report| print!("{report}")),
@@ -189,37 +205,4 @@ fn validate(path: &Path) -> Result<String, String> {
         config.content_hash(),
         config.canonical_toml()
     ))
-}
-
-/// The schema, run mode, and storage of a configuration with every table cleared: the base of
-/// a synthesized configuration whose hash and generations depend on nothing but the one table
-/// its caller adds.
-fn skeleton(config: &Config) -> Config {
-    Config {
-        import: None,
-        instruments: Vec::new(),
-        features: None,
-        outcomes: None,
-        replay: None,
-        accelerator: None,
-        search: None,
-        portfolio: None,
-        ..config.clone()
-    }
-}
-
-/// All configuration-path commands share parsing and build-capability checks.
-fn load_config(path: &Path) -> Result<Config, String> {
-    let source = std::fs::read_to_string(path)
-        .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
-    let config = Config::parse(&source).map_err(|error| error.to_string())?;
-    if !cfg!(feature = "cuda")
-        && config
-            .accelerator
-            .as_ref()
-            .is_some_and(|section| section.backend == binary_alpha_engine::config::Backend::Cuda)
-    {
-        return Err("accelerator.backend: `cuda` requested but this binary was built without the `cuda` feature".into());
-    }
-    Ok(config)
 }

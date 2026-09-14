@@ -175,7 +175,7 @@ fn verify_dataset(uri: &str, store: &Store, key: &str, bytes: &[u8]) -> Result<S
             (object.role, manifest.source_kind),
             (
                 ObjectRole::Normalized,
-                SourceKind::TickCsv | SourceKind::TickParquetDaily
+                SourceKind::TickCsv | SourceKind::TickParquetDaily | SourceKind::BrokerHistory
             ) | (ObjectRole::Source, SourceKind::BarParquet)
         );
         let (verified, local) = fetch(store, object, decode)?;
@@ -235,7 +235,7 @@ fn reconstruct(
 ) -> Result<(), String> {
     let data = match (manifest.source_kind, manifest.price_representation) {
         (
-            SourceKind::TickCsv | SourceKind::TickParquetDaily,
+            SourceKind::TickCsv | SourceKind::TickParquetDaily | SourceKind::BrokerHistory,
             PriceRepresentation::IntegerUnits { scale },
         ) => archive::read_ticks(path, scale)?,
         (SourceKind::BarParquet, PriceRepresentation::BinaryFloat64) => {

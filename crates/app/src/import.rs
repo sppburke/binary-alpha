@@ -12,7 +12,7 @@ use binary_alpha_engine::config::{PublicationUri, Source, relative_path};
 use binary_alpha_engine::dataset::{
     Capability, Coverage, DatasetRole, GenerationManifest, Input, IntervalContract,
     MANIFEST_SCHEMA_VERSION, NativeGranularity, ObjectRecord, ObjectRole, PriceRepresentation,
-    SourceKind, TimeUnit, generation_id, manifest_key, object_key,
+    SourceKind, TimeUnit, generation_id, object_key,
 };
 use binary_alpha_engine::market::{
     BrokerId, InstrumentId, PriceScale, ProviderSymbol, TICK_HEADER, Tick, parse_event_time_micros,
@@ -724,7 +724,6 @@ fn publish(
         scale,
         &objects,
     );
-    let key = manifest_key(&generation);
 
     let retaining = Instant::now();
     for (file, identity) in dataset.files.iter().zip(&identities) {
@@ -812,16 +811,6 @@ fn publish(
         };
     let validated = validating.elapsed();
 
-    let publishing = Instant::now();
-    let mut reused = 0;
-    for (object, identity) in objects.iter_mut().zip(&identities) {
-        let put = destination.put_new(&object.key, &retained_path(object), identity)?;
-        if let Put::Reused(_) = put {
-            reused += 1;
-        }
-        object.crc32c = put.object().crc32c;
-        object.generation = put.object().generation;
-    }
     let (first_event_time, last_event_time) = archive::coverage(&summary)?;
     let manifest = GenerationManifest {
         schema_version: MANIFEST_SCHEMA_VERSION,
@@ -855,20 +844,65 @@ fn publish(
         interval,
         objects,
     };
+    let publishing = Instant::now();
+    let published = publish_generation(manifest, &identities, local, destination)?;
+    let elapsed = publishing.elapsed();
     let report = format!(
-        "published {} {} generation {generation} rows {} objects {} reused {reused}",
+        "published {} {} generation {generation} rows {} objects {} reused {}",
         dataset.instrument,
         dataset.role,
-        manifest.row_count,
-        manifest.objects.len()
+        published.manifest.row_count,
+        published.manifest.objects.len(),
+        published.reused
     );
+    Ok(if published.already_published {
+        format!("{report} (already published)")
+    } else {
+        format!(
+            "{report} [hash {:.3}s retain {:.3}s validate {:.3}s publish {:.3}s]",
+            hashed.as_secs_f64(),
+            retained.as_secs_f64(),
+            validated.as_secs_f64(),
+            elapsed.as_secs_f64()
+        )
+    })
+}
+
+/// The shared immutable publication tail, after source normalization and local retention.
+pub(crate) struct Publication {
+    pub manifest: GenerationManifest,
+    pub reused: usize,
+    pub already_published: bool,
+}
+pub(crate) fn publish_generation(
+    mut manifest: GenerationManifest,
+    identities: &[ObjectIdentity],
+    local: &Store,
+    destination: &Store,
+) -> Result<Publication, String> {
+    if identities.len() != manifest.objects.len() {
+        return Err("publication: object identities are incomplete".into());
+    }
+    let mut reused = 0;
+    for (object, identity) in manifest.objects.iter_mut().zip(identities) {
+        let path = local
+            .local_path(&object.key)
+            .expect("retained folder is a filesystem store");
+        let put = destination.put_new(&object.key, &path, identity)?;
+        if matches!(put, Put::Reused(_)) {
+            reused += 1;
+        }
+        object.crc32c = put.object().crc32c;
+        object.generation = put.object().generation;
+    }
+    let key = manifest.key();
     let committed = match destination.head(&key)? {
         Some(_) => {
             let mut bytes = Vec::new();
             destination.read_to(&key, None, &mut bytes)?;
             let committed = GenerationManifest::from_json(&bytes)
                 .map_err(|error| format!("{}: {error}", destination.uri(&key)))?;
-            if !same_result(&committed, &manifest, &identities) {
+            if !same_result(&committed, &manifest, identities) {
                 return Err(format!(
                     "{} records a different generation, object set, row count, or coverage than this import produced",
                     destination.uri(&key)
@@ -878,7 +912,7 @@ fn publish(
         }
         None => manifest.to_json(),
     };
-    let temporary = temporary_path(local, &format!("manifest-{generation}"))?;
+    let temporary = temporary_path(local, &format!("manifest-{}", manifest.generation))?;
     fs::write(&temporary, &committed)
         .map_err(|error| format!("cannot write {}: {error}", temporary.display()))?;
     let identity = store::identify(&temporary)?;
@@ -886,17 +920,27 @@ fn publish(
     local.put_new(&key, &temporary, &identity)?;
     fs::remove_file(&temporary)
         .map_err(|error| format!("cannot remove {}: {error}", temporary.display()))?;
-    let published = publishing.elapsed();
-    Ok(match put {
-        Put::Reused(_) => format!("{report} (already published)"),
-        Put::Created(_) => format!(
-            "{report} [hash {:.3}s retain {:.3}s validate {:.3}s publish {:.3}s]",
-            hashed.as_secs_f64(),
-            retained.as_secs_f64(),
-            validated.as_secs_f64(),
-            published.as_secs_f64()
-        ),
+    Ok(Publication {
+        manifest: GenerationManifest::from_json(&committed)?,
+        reused,
+        already_published: matches!(put, Put::Reused(_)),
     })
+}
+
+/// Retains closed bytes under their content address before a ready manifest can refer to them.
+pub(crate) fn retain_bytes(
+    local: &Store,
+    bytes: &[u8],
+    name: &str,
+) -> Result<ObjectIdentity, String> {
+    let temporary = temporary_path(local, name)?;
+    fs::write(&temporary, bytes)
+        .map_err(|error| format!("cannot write {}: {error}", temporary.display()))?;
+    let identity = store::identify(&temporary)?;
+    local.put_new(&object_key(&identity.sha256), &temporary, &identity)?;
+    fs::remove_file(&temporary)
+        .map_err(|error| format!("cannot remove {}: {error}", temporary.display()))?;
+    Ok(identity)
 }
 
 /// A committed manifest describes this import's result when it names the same generation, role,

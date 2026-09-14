@@ -1,0 +1,8 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "WebSocket Public Upgrade (request)",
+  "description": "Request to upgrade the connection to a WebSocket streaming public market data. No authentication, OTP, or query parameters are required.",
+  "type": "object",
+  "properties": {},
+  "additionalProperties": false
+}

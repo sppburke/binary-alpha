@@ -219,7 +219,9 @@ pub(crate) fn feed_generation(
     push: &mut dyn FnMut(Observation) -> Result<(), String>,
 ) -> Result<(), String> {
     let data_role = match manifest.source_kind {
-        SourceKind::TickCsv | SourceKind::TickParquetDaily => ObjectRole::Normalized,
+        SourceKind::TickCsv | SourceKind::TickParquetDaily | SourceKind::BrokerHistory => {
+            ObjectRole::Normalized
+        }
         SourceKind::BarParquet => ObjectRole::Source,
     };
     for object in manifest

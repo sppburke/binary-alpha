@@ -1,0 +1,12 @@
+schema_version = 1
+run_mode = "research"
+[storage]
+historical_data_dir = "retained"
+publication_uri = "file:///tmp/phase10-fixture"
+[[brokers]]
+kind = "deriv"
+id = "deriv"
+public_endpoint = "ws://127.0.0.1/"
+bootstrap_endpoint = "http://127.0.0.1/"
+app_id = "SYNTHETIC"
+unexpected_option = true

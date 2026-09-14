@@ -34,21 +34,47 @@ fn help_names_every_command() {
 }
 
 #[test]
-fn checked_in_example_and_its_equivalent_produce_the_fixed_report() {
-    for path in [example(), fixture("equivalent.toml")] {
-        let output = validate(&path);
-        assert!(
-            output.status.success(),
-            "{path}: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        assert_eq!(
-            String::from_utf8(output.stdout).unwrap(),
-            EXPECTED_REPORT,
-            "{path}"
-        );
-        assert!(output.stderr.is_empty(), "{path}");
-    }
+fn existing_equivalent_preserves_the_fixed_report() {
+    let path = fixture("equivalent.toml");
+    let output = validate(&path);
+    assert!(
+        output.status.success(),
+        "{path}: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap(),
+        EXPECTED_REPORT,
+        "{path}"
+    );
+    assert!(output.stderr.is_empty(), "{path}");
+}
+
+#[test]
+fn checked_in_example_adds_validated_broker_history() {
+    let output = validate(&example());
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let config = binary_alpha_app::load_config(std::path::Path::new(&example())).unwrap();
+    assert_eq!(config.brokers.len(), 2);
+    assert_eq!(
+        config.history.as_ref().unwrap().instruments[0].as_str(),
+        "AEDCNY_otc"
+    );
+    let mut original = config;
+    original.brokers.clear();
+    original.history = None;
+    assert_eq!(
+        format!(
+            "# content-hash: {}\n{}",
+            original.content_hash(),
+            original.canonical_toml()
+        ),
+        EXPECTED_REPORT
+    );
 }
 
 #[test]
@@ -65,6 +91,16 @@ fn the_report_validates_to_itself() {
 #[test]
 fn invalid_documents_fail_with_field_specific_errors() {
     let cases = [
+        (
+            "phase10/history_unknown_broker.toml",
+            "history:",
+            "broker is not declared",
+        ),
+        (
+            "phase10/unknown_broker_field.toml",
+            "unexpected_option",
+            "unknown field `unexpected_option`",
+        ),
         (
             "missing_schema_version.toml",
             "schema_version",
