@@ -299,8 +299,8 @@ fn replay_publishes_reconstructs_and_reuses() {
             EventKind::Accepted {
                 command,
                 source,
-                entry_time_micros,
-                due_time_micros,
+                entry_time_micros: Some(entry_time_micros),
+                due_time_micros: Some(due_time_micros),
                 debit,
                 reservation,
                 ..
@@ -323,7 +323,7 @@ fn replay_publishes_reconstructs_and_reuses() {
                 profit: trade_profit,
                 discrepancy,
                 deficit,
-                path,
+                path: Some(path),
                 ..
             } => {
                 let due = accepted.remove(command).unwrap();
@@ -968,6 +968,8 @@ fn kinds(events: &[FinancialEvent]) -> Vec<&'static str> {
             EventKind::Signal { .. } => "signal",
             EventKind::Acknowledged { .. } => "acknowledged",
             EventKind::Accepted { .. } => "accepted",
+            EventKind::Confirmed { .. } => "confirmed",
+            EventKind::CashObserved { .. } => "cash_observed",
             EventKind::Released { .. } => "released",
             EventKind::PossiblySent { .. } => "possibly_sent",
             EventKind::Settled { .. } => "settled",
@@ -988,10 +990,10 @@ fn causality_settlement_and_gaps_follow_availability() {
     let events = live.simulate(103, vec![tick(100, 500), row(0, 100, 103, true)]);
     assert_eq!(kinds(&events), ["signal", "accepted"]);
     let EventKind::Accepted {
-        entry_time_micros,
-        due_time_micros,
-        price_time_micros,
-        entry_price_units,
+        entry_time_micros: Some(entry_time_micros),
+        due_time_micros: Some(due_time_micros),
+        price_time_micros: Some(price_time_micros),
+        entry_price_units: Some(entry_price_units),
         ..
     } = &events[1].kind
     else {
@@ -1015,7 +1017,7 @@ fn causality_settlement_and_gaps_follow_availability() {
         outcome,
         credit,
         profit,
-        path,
+        path: Some(path),
         ..
     } = &events[0].kind
     else {
@@ -1076,7 +1078,10 @@ fn causality_settlement_and_gaps_follow_availability() {
         vec![settlement("b1/110", 205, Outcome::Loss, "0", "0", 400)],
     );
     assert_eq!(kinds(&events), ["settled"]);
-    let EventKind::Settled { path, .. } = &events[0].kind else {
+    let EventKind::Settled {
+        path: Some(path), ..
+    } = &events[0].kind
+    else {
         unreachable!()
     };
     assert_eq!(
@@ -1396,7 +1401,10 @@ fn continuity_is_the_obligation_s_own_evidence() {
             settlement_price_units: 510,
         }],
     );
-    let EventKind::Settled { path, .. } = &events[0].kind else {
+    let EventKind::Settled {
+        path: Some(path), ..
+    } = &events[0].kind
+    else {
         panic!("{events:?}")
     };
     assert_eq!(
@@ -1415,7 +1423,12 @@ fn continuity_is_the_obligation_s_own_evidence() {
     live.simulate(103, vec![tick(100, 500), row(0, 100, 103, true)]);
     assert!(live.step(104, vec![tick(101, 520)]).is_empty());
     let events = live.simulate(113, vec![tick(113, 500)]);
-    let EventKind::Settled { outcome, path, .. } = &events[0].kind else {
+    let EventKind::Settled {
+        outcome,
+        path: Some(path),
+        ..
+    } = &events[0].kind
+    else {
         unreachable!()
     };
     assert_eq!(*outcome, Outcome::Tie);
@@ -1831,6 +1844,7 @@ fn fractional() -> RunDefinition {
             max_tie_terminal_fee: decimal("0.05"),
             min_winning_net_return: decimal("9.2"),
             settlement_rule: SettlementRule::PriceAtDueV1,
+            semantics: None,
         };
         replay.accounts[0].initial_cash = decimal("19");
     })
@@ -2858,7 +2872,12 @@ fn quote_envelopes_pauses_conversion_and_projections_are_exact() {
     let mut live = Live::new(definition(|_| {}));
     live.simulate(10, vec![tick(10, 0), row(0, 10, 10, true)]);
     let events = live.simulate(20, vec![tick(20, 7)]);
-    let EventKind::Settled { outcome, path, .. } = &events[0].kind else {
+    let EventKind::Settled {
+        outcome,
+        path: Some(path),
+        ..
+    } = &events[0].kind
+    else {
         unreachable!()
     };
     assert_eq!(
@@ -3004,7 +3023,10 @@ fn restored_engines_continue_byte_identically() {
             .map(FinancialEvent::to_line)
             .collect::<Vec<_>>()
     );
-    let EventKind::Settled { path, .. } = &expected[0].kind else {
+    let EventKind::Settled {
+        path: Some(path), ..
+    } = &expected[0].kind
+    else {
         unreachable!()
     };
     assert_eq!(
@@ -3839,9 +3861,9 @@ fn governed_reference_parity() {
             }
             EventKind::Accepted {
                 command,
-                entry_time_micros,
-                entry_price_units,
-                due_time_micros,
+                entry_time_micros: Some(entry_time_micros),
+                entry_price_units: Some(entry_price_units),
+                due_time_micros: Some(due_time_micros),
                 debit,
                 reservation,
                 ..
@@ -3860,11 +3882,11 @@ fn governed_reference_parity() {
             EventKind::Settled {
                 command,
                 settlement_time_micros,
-                settlement_price_units,
+                settlement_price_units: Some(settlement_price_units),
                 outcome,
                 credit,
                 release,
-                path,
+                path: Some(path),
                 ..
             } => {
                 cash = cash.checked_add(credit).unwrap();
@@ -4527,4 +4549,1329 @@ fn governed_reference_parity() {
         fixture.receipt.feature_engine_seconds
     );
     println!("test process peak resident {} kB", in_process_peak_kb());
+}
+
+mod broker_authoritative {
+    use super::*;
+    use binary_alpha_engine::execution::{
+        Block, BrokerLiability, CashAction, CashFact, ContractSemantics, Proposal,
+        REPLAY_SCHEMA_VERSION_BROKER, TerminalFact, TerminalStatus,
+    };
+
+    const PURCHASE: i64 = 1_789_347_036_000_000;
+    const SECOND: i64 = 1_000_000;
+
+    fn broker_definition() -> RunDefinition {
+        let mut definition = definition(|replay| {
+            replay.decision_start = "2026-09-13T00:00:00Z".into();
+            replay.decision_end = "2026-09-15T00:00:00Z".into();
+            replay.accounts[0].initial_cash = decimal("9954.57");
+            let terms = &mut replay.contracts[0];
+            terms.duration_micros = 15 * SECOND;
+            terms.stake = decimal("10");
+            terms.quoted_cost = decimal("10");
+            terms.win.gross_return = decimal("0");
+            terms.tie.gross_return = decimal("0");
+            terms.settlement.rule = SettlementRule::BrokerAuthoritativeV1;
+            terms.settlement.max_tick_gap_micros = 120 * SECOND;
+            terms.semantics = Some(ContractSemantics::RiseFallStrictV1);
+            let envelope = &mut replay.bindings[0].envelope;
+            envelope.settlement_rule = SettlementRule::BrokerAuthoritativeV1;
+            envelope.semantics = terms.semantics;
+            envelope.max_purchase_cost = decimal("10");
+            envelope.min_winning_net_return = decimal("8.83");
+            let policy = &mut replay.risk_policies[0];
+            policy.max_proposal_age_micros = Some(5 * SECOND);
+            policy.max_quote_age_micros = 120 * SECOND;
+            policy.max_feature_age_micros = 120 * SECOND;
+            policy.max_open_per_strategy = Some(3);
+        });
+        definition.schema_version = REPLAY_SCHEMA_VERSION_BROKER;
+        definition.instruments[0].price_scale = 4;
+        definition
+    }
+
+    fn quote(live: &Live, id: &str, at: i64, payout: &str) -> Proposal {
+        let mut terms = live.engine.definition().replay.contracts[0].clone();
+        terms.id = format!("1:{id}");
+        terms.win.gross_return = decimal(payout);
+        Proposal {
+            identity: terms.id.clone(),
+            request_identity: "a".repeat(64),
+            terms,
+            spot_units: 920_409,
+            spot_time_micros: at,
+            receipt_micros: at,
+            schema: "synthetic:proposal".into(),
+            payload_sha256: "b".repeat(64),
+        }
+    }
+
+    fn proposal(proposal: Proposal) -> Observation {
+        Observation::Proposal {
+            binding: "b1".into(),
+            source: source(&proposal.identity, proposal.receipt_micros),
+            proposal,
+        }
+    }
+
+    fn checked_step(
+        live: &mut Live,
+        at: i64,
+        observations: Vec<Observation>,
+    ) -> Vec<FinancialEvent> {
+        let events = live.step(at, observations);
+        let restored = live.restored();
+        assert_eq!(
+            restored.engine.summary().to_json(),
+            live.engine.summary().to_json()
+        );
+        events
+    }
+
+    fn prepared(mut definition: RunDefinition) -> (Live, String) {
+        definition.replay.risk_policies[0].max_proposal_age_micros = Some(120 * SECOND);
+        let mut live = Live::new(definition);
+        let quote = quote(&live, "quote", PURCHASE, "18.83");
+        let events = checked_step(
+            &mut live,
+            PURCHASE,
+            vec![
+                proposal(quote),
+                tick(PURCHASE, 920_409),
+                row(0, PURCHASE, PURCHASE, true),
+            ],
+        );
+        (live, Live::command(&events))
+    }
+
+    fn liability() -> BrokerLiability {
+        BrokerLiability {
+            contract_ref: "fixture-contract".into(),
+            transaction_ref: "fixture-buy".into(),
+            purchase_time_micros: PURCHASE,
+            expected_start_micros: Some(PURCHASE),
+            payout: decimal("18.83"),
+        }
+    }
+
+    fn purchase(command: &str, debit: &str) -> Observation {
+        Observation::Purchased {
+            command: command.into(),
+            source: source("purchase", PURCHASE),
+            debit: decimal(debit),
+            liability: liability(),
+        }
+    }
+
+    fn confirmed(
+        command: &str,
+        at: i64,
+        price: Option<i64>,
+        entry: Option<i64>,
+        start: Option<i64>,
+        expiry: Option<i64>,
+    ) -> Observation {
+        Observation::ContractUpdate {
+            command: command.into(),
+            source: source(&format!("confirmed:{at}:{price:?}"), at),
+            entry_price_units: price,
+            entry_time_micros: entry,
+            start_micros: start,
+            expiry_micros: expiry,
+        }
+    }
+
+    fn terminal(
+        command: &str,
+        status: TerminalStatus,
+        transaction: &str,
+        exit: Option<(i64, i64)>,
+    ) -> Observation {
+        Observation::Terminal {
+            command: command.into(),
+            source: source("terminal", PURCHASE + 16 * SECOND),
+            fact: TerminalFact {
+                status,
+                exit_price_units: exit.map(|pair| pair.0),
+                exit_time_micros: exit.map(|pair| pair.1),
+                transaction_ref: Some(transaction.into()),
+            },
+        }
+    }
+
+    fn cash(action: CashAction, amount: &str, transaction: &str, at: i64) -> Observation {
+        Observation::Cash {
+            source: source(&format!("cash:{transaction}"), at),
+            fact: CashFact {
+                account: "a".into(),
+                contract_ref: Some("fixture-contract".into()),
+                transaction_ref: transaction.into(),
+                action,
+                amount: decimal(amount),
+                time_micros: at,
+            },
+        }
+    }
+
+    #[test]
+    fn proposals_replace_expire_and_freeze_exact_economics() {
+        let mut live = Live::new(broker_definition());
+        assert_eq!(
+            dispositions(&checked_step(
+                &mut live,
+                PURCHASE,
+                vec![tick(PURCHASE, 920_409), row(0, PURCHASE, PURCHASE, true)]
+            )),
+            [Disposition::NoProposal]
+        );
+        let first = quote(&live, "first", PURCHASE, "19.54");
+        checked_step(&mut live, PURCHASE, vec![proposal(first)]);
+        let stale = PURCHASE + 5 * SECOND + 1;
+        assert_eq!(
+            dispositions(&checked_step(
+                &mut live,
+                stale,
+                vec![tick(stale, 919_315), row(0, stale, stale, true)]
+            )),
+            [Disposition::StaleProposal]
+        );
+        let later = quote(&live, "later", stale, "18.83");
+        checked_step(&mut live, stale, vec![proposal(later.clone())]);
+        let at = stale + 5 * SECOND;
+        let events = checked_step(&mut live, at, vec![tick(at, 920_252), row(0, at, at, true)]);
+        let EventKind::Signal {
+            proposal: Some(recorded),
+            reservation: Some(reservation),
+            ..
+        } = &events[0].kind
+        else {
+            panic!("{events:?}")
+        };
+        assert_eq!(*recorded, later);
+        assert_eq!(reservation.to_string(), "10.00");
+        assert_eq!(live.account("a").unresolved_loss.to_string(), "10.00");
+        let worse = quote(&live, "worse", at + 1, "18.82");
+        let events = checked_step(
+            &mut live,
+            at + 1,
+            vec![
+                proposal(worse),
+                tick(at + 1, 920_252),
+                row(0, at + 1, at + 1, true),
+            ],
+        );
+        assert_eq!(dispositions(&events), [Disposition::QuoteRejected]);
+        assert_eq!(live.account("a").reserved.to_string(), "10.00");
+        assert!(
+            live.lines
+                .iter()
+                .any(|line| String::from_utf8_lossy(line).contains("1:later"))
+        );
+        let mut stale_delivery = live.restored();
+        let current = quote(&stale_delivery, "current", at + 2, "18.83");
+        checked_step(&mut stale_delivery, at + 2, vec![proposal(current)]);
+        let old = quote(&stale_delivery, "old", at, "18.83");
+        assert!(
+            stale_delivery
+                .try_step(at + 2, vec![proposal(old)])
+                .unwrap_err()
+                .contains("precedes the installed")
+        );
+        // A loss/tie fee changes the strict semantic cash table and is rejected at the boundary.
+        for loss in [true, false] {
+            let mut invalid = live.restored();
+            let mut bad = quote(&invalid, "bad", at + 2, "18.83");
+            if loss {
+                bad.terms.loss.terminal_fee = decimal("0.01");
+            } else {
+                bad.terms.tie.terminal_fee = decimal("0.01");
+            }
+            assert!(
+                invalid
+                    .try_step(at + 2, vec![proposal(bad)])
+                    .unwrap_err()
+                    .contains("loss and tie cashflows must be zero")
+            );
+        }
+    }
+
+    #[test]
+    fn purchased_unknown_entry_confirmed_sparse_exit_and_cash_restore_exactly() {
+        let (mut live, command) = prepared(broker_definition());
+        let events = checked_step(&mut live, PURCHASE, vec![purchase(&command, "10")]);
+        assert!(matches!(
+            &events[0].kind,
+            EventKind::Accepted {
+                entry_time_micros: None,
+                entry_price_units: None,
+                due_time_micros: None,
+                liability: Some(_),
+                deficit: None,
+                discrepancy: false,
+                ..
+            }
+        ));
+        assert_eq!(
+            live.balances("a"),
+            (
+                "9944.57".into(),
+                "0.00".into(),
+                "10.00".into(),
+                "10.00".into(),
+                "0.00".into(),
+                1
+            )
+        );
+        let entry = PURCHASE + 2 * SECOND;
+        let expiry = PURCHASE + 15 * SECOND;
+        let timing = confirmed(&command, entry, None, None, Some(PURCHASE), Some(expiry));
+        checked_step(&mut live, entry, vec![timing.clone()]);
+        let entry_fact = confirmed(&command, entry, Some(920_252), Some(entry), None, None);
+        checked_step(&mut live, entry, vec![entry_fact.clone()]);
+        assert!(checked_step(&mut live, entry, vec![entry_fact, timing]).is_empty());
+        let mut contradiction = live.restored();
+        assert!(
+            contradiction
+                .try_step(
+                    entry,
+                    vec![confirmed(
+                        &command,
+                        entry,
+                        None,
+                        None,
+                        None,
+                        Some(expiry + 1)
+                    )]
+                )
+                .unwrap_err()
+                .contains("contradicts recorded")
+        );
+        assert!(checked_step(&mut live, expiry, vec![tick(expiry, 920_500)]).is_empty());
+        assert_eq!(live.account("a").open, 1);
+        let end = terminal(
+            &command,
+            TerminalStatus::Won,
+            "24655172099",
+            Some((920_308, PURCHASE + 14 * SECOND)),
+        );
+        let events = checked_step(&mut live, PURCHASE + 16 * SECOND, vec![end.clone()]);
+        assert!(matches!(
+            &events[0].kind,
+            EventKind::Unresolved {
+                reason: UnresolvedReason::AwaitingCash,
+                terminal: Some(_),
+                ..
+            }
+        ));
+        assert_eq!(live.account("a").paid_basis.to_string(), "10.00");
+        let posting = cash(
+            CashAction::Sell,
+            "18.83",
+            "24655172099",
+            PURCHASE + 16 * SECOND,
+        );
+        let mut restored = live.restored();
+        let events = checked_step(&mut live, PURCHASE + 16 * SECOND, vec![posting.clone()]);
+        let restored_events =
+            checked_step(&mut restored, PURCHASE + 16 * SECOND, vec![posting.clone()]);
+        assert_eq!(
+            events
+                .iter()
+                .map(FinancialEvent::to_line)
+                .collect::<Vec<_>>(),
+            restored_events
+                .iter()
+                .map(FinancialEvent::to_line)
+                .collect::<Vec<_>>()
+        );
+        let EventKind::Settled {
+            outcome,
+            credit,
+            profit,
+            path: Some(path),
+            discrepancy,
+            settlement_time_micros,
+            transaction_ref,
+            ..
+        } = &events[1].kind
+        else {
+            panic!("{events:?}")
+        };
+        assert_eq!(
+            (
+                *outcome,
+                credit.to_string(),
+                profit.to_string(),
+                *discrepancy
+            ),
+            (Outcome::Win, "18.83".into(), "8.83".into(), false)
+        );
+        assert_eq!(path.final_move_units, 56);
+        assert_eq!(*settlement_time_micros, PURCHASE + 14 * SECOND);
+        assert_eq!(transaction_ref.as_deref(), Some("24655172099"));
+        assert!(
+            checked_step(
+                &mut live,
+                PURCHASE + 17 * SECOND,
+                vec![posting, end, purchase(&command, "10")]
+            )
+            .is_empty()
+        );
+        assert_eq!(live.cash(), "9963.40");
+        assert_eq!(live.engine.summary().portfolio.unresolved, 0);
+        assert_eq!(live.account("a").open, 0);
+        // The ledger can stop after the cash fact and before its posting.
+        let mut interrupted = Live::from_lines(live.lines[..live.lines.len() - 1].to_vec());
+        let resumed = checked_step(&mut interrupted, PURCHASE + 16 * SECOND, vec![]);
+        assert_eq!(resumed[0].to_line(), events[1].to_line());
+        assert_eq!(interrupted.lines, live.lines);
+    }
+
+    #[test]
+    fn zero_credit_loss_and_missing_path_are_authoritative() {
+        for with_entry in [true, false] {
+            let mut definition = broker_definition();
+            definition.replay.contracts[0].direction = Direction::Sell;
+            let (mut live, command) = prepared(definition);
+            checked_step(&mut live, PURCHASE, vec![purchase(&command, "10")]);
+            if with_entry {
+                checked_step(
+                    &mut live,
+                    PURCHASE + 4 * SECOND,
+                    vec![confirmed(
+                        &command,
+                        PURCHASE + 4 * SECOND,
+                        Some(920_082),
+                        Some(PURCHASE + 4 * SECOND),
+                        Some(PURCHASE + 2 * SECOND),
+                        Some(PURCHASE + 17 * SECOND),
+                    )],
+                );
+            }
+            let exit = with_entry.then_some((920_232, PURCHASE + 16 * SECOND));
+            checked_step(
+                &mut live,
+                PURCHASE + 16 * SECOND,
+                vec![terminal(
+                    &command,
+                    TerminalStatus::Lost,
+                    "24655176019",
+                    exit,
+                )],
+            );
+            let events = checked_step(
+                &mut live,
+                PURCHASE + 18 * SECOND,
+                vec![cash(
+                    CashAction::Sell,
+                    "0",
+                    "24655176019",
+                    PURCHASE + 18 * SECOND,
+                )],
+            );
+            let EventKind::Settled {
+                outcome,
+                credit,
+                profit,
+                settlement_price_units,
+                path,
+                ..
+            } = &events[1].kind
+            else {
+                panic!("{events:?}")
+            };
+            assert_eq!(
+                (*outcome, credit.to_string(), profit.to_string()),
+                (Outcome::Loss, "0.00".into(), "-10.00".into())
+            );
+            assert_eq!(settlement_price_units.is_some(), with_entry);
+            assert_eq!(path.is_some(), with_entry);
+            if let Some(path) = path {
+                assert_eq!(path.final_move_units, -150);
+            }
+            assert_eq!(live.engine.summary().portfolio.ties, 0);
+        }
+    }
+
+    #[test]
+    fn excess_purchase_blocks_and_exact_reconciliation_lifts_without_posting() {
+        let (mut live, command) = prepared(broker_definition());
+        let events = checked_step(&mut live, PURCHASE, vec![purchase(&command, "10.50")]);
+        let EventKind::Accepted {
+            deficit: Some(deficit),
+            discrepancy: true,
+            debit,
+            ..
+        } = &events[0].kind
+        else {
+            panic!("{events:?}")
+        };
+        assert_eq!(
+            (debit.to_string(), deficit.to_string()),
+            ("10.50".into(), "0.50".into())
+        );
+        assert!(matches!(
+            live.account("a").blocked[&command],
+            Block::Purchased { .. }
+        ));
+        assert_eq!(live.account("a").unresolved_loss.to_string(), "10.50");
+        let at = PURCHASE + SECOND;
+        let quote = quote(&live, "another", at, "18.83");
+        assert_eq!(
+            dispositions(&checked_step(
+                &mut live,
+                at,
+                vec![proposal(quote), tick(at, 920_252), row(0, at, at, true)]
+            )),
+            [Disposition::AccountBlocked]
+        );
+        let before = live.cash();
+        let resolution = Resolution::Purchased {
+            debit: decimal("10.50"),
+            liability: liability(),
+        };
+        let events = checked_step(
+            &mut live,
+            at,
+            vec![reconciliation(&command, at, resolution)],
+        );
+        assert!(
+            matches!(&events[0].kind, EventKind::Reconciled { debit, credit, release, profit: None, .. } if debit.is_zero() && credit.is_zero() && release.is_zero())
+        );
+        assert_eq!(live.cash(), before);
+        assert!(live.account("a").blocked.is_empty());
+    }
+
+    #[test]
+    fn cash_order_unmatched_external_and_recovered_purchase_are_durable() {
+        let (mut live, command) = prepared(broker_definition());
+        let buy = cash(CashAction::Buy, "-10", "fixture-buy", PURCHASE);
+        checked_step(&mut live, PURCHASE, vec![buy.clone()]);
+        assert!(matches!(
+            live.account("a").blocked["transaction:fixture-buy"],
+            Block::UnmatchedCash { .. }
+        ));
+        checked_step(&mut live, PURCHASE, vec![purchase(&command, "10")]);
+        assert!(live.account("a").blocked.is_empty());
+        assert!(checked_step(&mut live, PURCHASE, vec![buy]).is_empty());
+        let at = PURCHASE + 16 * SECOND;
+        let sell = cash(CashAction::Sell, "18.83", "sell-before-terminal", at);
+        let events = checked_step(&mut live, at, vec![sell]);
+        assert!(
+            matches!(&events[0].kind, EventKind::CashObserved { matched: Some(found), .. } if found == &command)
+        );
+        assert_eq!(live.account("a").open, 1);
+        checked_step(
+            &mut live,
+            at,
+            vec![terminal(
+                &command,
+                TerminalStatus::Won,
+                "sell-before-terminal",
+                None,
+            )],
+        );
+        assert_eq!(live.cash(), "9963.40");
+        let external = cash(CashAction::Sell, "4.20", "external", at);
+        checked_step(&mut live, at, vec![external.clone()]);
+        assert!(!live.account("a").blocked.is_empty());
+        checked_step(
+            &mut live,
+            at,
+            vec![reconciliation(
+                "transaction:external",
+                at,
+                Resolution::External,
+            )],
+        );
+        assert!(live.account("a").blocked.is_empty());
+        assert!(checked_step(&mut live, at, vec![external]).is_empty());
+        assert_eq!(live.cash(), "9963.40");
+        let (mut unknown, command) = prepared(broker_definition());
+        checked_step(
+            &mut unknown,
+            PURCHASE,
+            vec![Observation::PossiblySent {
+                command: command.clone(),
+                source: source("uncertain", PURCHASE),
+            }],
+        );
+        checked_step(
+            &mut unknown,
+            PURCHASE + SECOND,
+            vec![reconciliation(
+                &command,
+                PURCHASE + SECOND,
+                Resolution::Purchased {
+                    debit: decimal("10"),
+                    liability: liability(),
+                },
+            )],
+        );
+        assert!(unknown.account("a").blocked.is_empty());
+        assert_eq!(unknown.account("a").open, 1);
+        assert_eq!(unknown.engine.summary().portfolio.unresolved, 0);
+    }
+
+    #[test]
+    fn sold_and_cancelled_close_without_directional_counts() {
+        for status in [TerminalStatus::Sold, TerminalStatus::Cancelled] {
+            let (mut live, command) = prepared(broker_definition());
+            checked_step(&mut live, PURCHASE, vec![purchase(&command, "10")]);
+            let at = PURCHASE + 16 * SECOND;
+            checked_step(
+                &mut live,
+                at,
+                vec![terminal(&command, status, "external-close", None)],
+            );
+            let events = checked_step(
+                &mut live,
+                at,
+                vec![cash(CashAction::Sell, "4.20", "external-close", at)],
+            );
+            assert!(
+                matches!(&events[1].kind, EventKind::Reconciled { resolution: Resolution::ExternallyClosed { .. }, credit, profit: Some(profit), .. } if credit.to_string() == "4.20" && profit.to_string() == "-5.80")
+            );
+            let group = &live.engine.summary().portfolio;
+            assert_eq!(
+                (
+                    group.externally_closed,
+                    group.settled,
+                    group.wins,
+                    group.losses,
+                    group.ties,
+                    group.unresolved
+                ),
+                (1, 0, 0, 0, 0, 0)
+            );
+            assert_eq!(live.cash(), "9948.77");
+            let events = live
+                .lines
+                .iter()
+                .map(|line| FinancialEvent::from_line(line).unwrap());
+            let projected = binary_alpha_engine::search::project_splits(events, "u");
+            let group = &projected["b1"]["none"];
+            assert_eq!(group.externally_closed, 1);
+            assert_eq!(group.unresolved, 0);
+            assert_eq!(group.profit["u"].unwrap().to_string(), "-5.80");
+        }
+    }
+
+    #[test]
+    fn version_guards_and_broker_request_validation() {
+        let mut old = broker_definition();
+        old.schema_version = REPLAY_SCHEMA_VERSION;
+        assert!(
+            Engine::new(old)
+                .err()
+                .unwrap()
+                .contains("schema_version 1 forbids")
+        );
+        let mut historical = Live::new(definition(|_| {}));
+        historical.simulate(10, vec![tick(10, 500), row(0, 10, 10, true)]);
+        historical.lines.push(
+            FinancialEvent {
+                sequence: historical.engine.sequence(),
+                time_micros: 10,
+                kind: EventKind::Confirmed {
+                    command: "b1/10".into(),
+                    source: source("invalid-v1", 10),
+                    entry_price_units: None,
+                    entry_time_micros: None,
+                    start_micros: None,
+                    expiry_micros: Some(20),
+                },
+            }
+            .to_line(),
+        );
+        assert!(
+            Engine::restore(historical.lines.into_iter().map(Ok))
+                .err()
+                .unwrap()
+                .contains("schema_version 1 cannot")
+        );
+        let mut bad = broker_definition();
+        bad.replay.contracts[0].win.gross_return = decimal("18.83");
+        assert!(
+            Engine::new(bad)
+                .err()
+                .unwrap()
+                .contains("its economics come from proposals")
+        );
+        let mut bad = broker_definition();
+        bad.replay.risk_policies[0].max_proposal_age_micros = None;
+        assert!(
+            Engine::new(bad)
+                .err()
+                .unwrap()
+                .contains("requires max_proposal_age_micros")
+        );
+        let mut bad = broker_definition();
+        bad.replay.bindings[0].envelope.semantics = None;
+        assert!(
+            Engine::new(bad)
+                .err()
+                .unwrap()
+                .contains("semantics must equal")
+        );
+    }
+    #[test]
+    fn shared_frame_sources_and_closed_contract_updates_are_idempotent() {
+        let (mut live, command) = prepared(broker_definition());
+        checked_step(&mut live, PURCHASE, vec![purchase(&command, "10")]);
+        let at = PURCHASE + 16 * SECOND;
+        let frame = source("one-terminal-frame", at);
+        let update = Observation::ContractUpdate {
+            command: command.clone(),
+            source: frame.clone(),
+            entry_price_units: Some(920_252),
+            entry_time_micros: Some(PURCHASE + 2 * SECOND),
+            start_micros: Some(PURCHASE),
+            expiry_micros: Some(PURCHASE + 15 * SECOND),
+        };
+        let end = Observation::Terminal {
+            command: command.clone(),
+            source: frame,
+            fact: TerminalFact {
+                status: TerminalStatus::Won,
+                exit_price_units: Some(920_308),
+                exit_time_micros: Some(PURCHASE + 14 * SECOND),
+                transaction_ref: Some("shared-frame-sell".into()),
+            },
+        };
+        let events = checked_step(&mut live, at, vec![update.clone(), end.clone()]);
+        assert_eq!(kinds(&events), ["confirmed", "unresolved"]);
+        let prefix = &live.lines[..live.lines.len() - 1];
+        let mut interrupted = Live::from_lines(prefix.to_vec());
+        checked_step(&mut interrupted, at, vec![update.clone(), end.clone()]);
+        assert_eq!(interrupted.lines, live.lines);
+        checked_step(
+            &mut live,
+            at,
+            vec![cash(CashAction::Sell, "18.83", "shared-frame-sell", at)],
+        );
+        let mut restored = live.restored();
+        assert!(checked_step(&mut restored, at + SECOND, vec![update, end]).is_empty());
+        assert_eq!(restored.cash(), "9963.40");
+        let bad = confirmed(
+            &command,
+            at + SECOND,
+            None,
+            None,
+            None,
+            Some(PURCHASE + 17 * SECOND),
+        );
+        assert!(
+            restored
+                .try_step(at + SECOND, vec![bad])
+                .unwrap_err()
+                .contains("contradicts its closed contract")
+        );
+    }
+
+    #[test]
+    fn mismatched_cash_stays_blocked_in_either_arrival_order() {
+        for terminal_first in [true, false] {
+            let (mut live, command) = prepared(broker_definition());
+            checked_step(&mut live, PURCHASE, vec![purchase(&command, "10")]);
+            let at = PURCHASE + 16 * SECOND;
+            let end = terminal(&command, TerminalStatus::Won, "right-sell", None);
+            if terminal_first {
+                checked_step(&mut live, at, vec![end.clone()]);
+            }
+            checked_step(
+                &mut live,
+                at,
+                vec![cash(CashAction::Sell, "1.00", "wrong-sell", at)],
+            );
+            if !terminal_first {
+                checked_step(&mut live, at, vec![end]);
+            }
+            assert!(
+                live.account("a")
+                    .blocked
+                    .contains_key("transaction:wrong-sell")
+            );
+            checked_step(
+                &mut live,
+                at,
+                vec![cash(CashAction::Sell, "18.83", "right-sell", at)],
+            );
+            assert_eq!(live.account("a").open, 0);
+            assert!(
+                live.account("a")
+                    .blocked
+                    .contains_key("transaction:wrong-sell")
+            );
+            assert_eq!(live.cash(), "9963.40");
+            checked_step(
+                &mut live,
+                at,
+                vec![reconciliation(
+                    "transaction:wrong-sell",
+                    at,
+                    Resolution::External,
+                )],
+            );
+            assert!(live.account("a").blocked.is_empty());
+        }
+        // Different accounts cannot establish each other's liabilities.
+        let mut definition = broker_definition();
+        let mut second = definition.replay.accounts[0].clone();
+        second.id = "other-account".into();
+        definition.replay.accounts.push(second);
+        let (mut live, command) = prepared(definition);
+        checked_step(&mut live, PURCHASE, vec![purchase(&command, "10")]);
+        let at = PURCHASE + 16 * SECOND;
+        let mut other_cash = cash(CashAction::Sell, "18.83", "other-account-cash", at);
+        if let Observation::Cash { fact, .. } = &mut other_cash {
+            fact.account = "other-account".into();
+        }
+        checked_step(
+            &mut live,
+            at,
+            vec![
+                other_cash,
+                terminal(&command, TerminalStatus::Won, "other-account-cash", None),
+            ],
+        );
+        assert_eq!(live.account("a").open, 1);
+        assert!(
+            live.account("other-account")
+                .blocked
+                .contains_key("transaction:other-account-cash")
+        );
+    }
+
+    #[test]
+    fn both_cash_actions_before_acceptance_survive_and_recovered_projection_agrees() {
+        let (mut live, command) = prepared(broker_definition());
+        checked_step(
+            &mut live,
+            PURCHASE,
+            vec![Observation::PossiblySent {
+                command: command.clone(),
+                source: source("uncertain", PURCHASE),
+            }],
+        );
+        let at = PURCHASE + 16 * SECOND;
+        checked_step(
+            &mut live,
+            at,
+            vec![
+                cash(CashAction::Buy, "-10", "fixture-buy", PURCHASE),
+                cash(CashAction::Sell, "18.83", "pre-acceptance-sell", at),
+            ],
+        );
+        assert_eq!(live.account("a").blocked.len(), 3);
+        checked_step(
+            &mut live,
+            at,
+            vec![reconciliation(
+                &command,
+                at,
+                Resolution::Purchased {
+                    debit: decimal("10"),
+                    liability: liability(),
+                },
+            )],
+        );
+        assert!(live.account("a").blocked.is_empty());
+        checked_step(
+            &mut live,
+            at,
+            vec![terminal(
+                &command,
+                TerminalStatus::Won,
+                "pre-acceptance-sell",
+                None,
+            )],
+        );
+        let projected = binary_alpha_engine::search::project_splits(
+            live.lines
+                .iter()
+                .map(|line| FinancialEvent::from_line(line).unwrap()),
+            "u",
+        );
+        assert_eq!(projected["b1"]["none"], live.engine.summary().portfolio);
+        assert_eq!(live.cash(), "9963.40");
+        assert!(
+            checked_step(
+                &mut live,
+                at,
+                vec![
+                    cash(CashAction::Buy, "-10.00", "fixture-buy", PURCHASE),
+                    cash(CashAction::Sell, "18.830", "pre-acceptance-sell", at)
+                ]
+            )
+            .is_empty()
+        );
+        let wrong = cash(CashAction::Sell, "18.82", "pre-acceptance-sell", at);
+        assert!(
+            live.try_step(at, vec![wrong])
+                .unwrap_err()
+                .contains("different cash fact")
+        );
+    }
+
+    #[test]
+    fn admitted_proposals_keep_separate_money_and_authoritative_reconciliation() {
+        let (mut live, first) = prepared(broker_definition());
+        let next = PURCHASE + SECOND;
+        let mut proposal_two = quote(&live, "two", next, "19.54");
+        proposal_two.terms.quoted_cost = decimal("9.50");
+        let events = checked_step(
+            &mut live,
+            next,
+            vec![
+                proposal(proposal_two),
+                tick(next, 919_315),
+                row(0, next, next, true),
+            ],
+        );
+        let second = Live::command(&events);
+        assert_eq!(live.account("a").reserved.to_string(), "19.50");
+        checked_step(&mut live, next, vec![purchase(&first, "10")]);
+        let mut second_liability = liability();
+        second_liability.contract_ref = "second-contract".into();
+        second_liability.transaction_ref = "second-buy".into();
+        second_liability.purchase_time_micros = next;
+        second_liability.payout = decimal("19.54");
+        let events = checked_step(
+            &mut live,
+            next,
+            vec![Observation::Purchased {
+                command: second.clone(),
+                source: source("second-purchase", next),
+                debit: decimal("9.50"),
+                liability: second_liability,
+            }],
+        );
+        assert!(matches!(
+            &events[0].kind,
+            EventKind::Accepted {
+                discrepancy: false,
+                ..
+            }
+        ));
+        assert_eq!(live.account("a").paid_basis.to_string(), "19.50");
+        checked_step(
+            &mut live,
+            next,
+            vec![reconciliation(
+                &first,
+                next,
+                Resolution::Settled {
+                    outcome: Outcome::Win,
+                    gross_return: decimal("18.83"),
+                    terminal_fee: decimal("0"),
+                },
+            )],
+        );
+        checked_step(
+            &mut live,
+            next,
+            vec![reconciliation(
+                &second,
+                next,
+                Resolution::Settled {
+                    outcome: Outcome::Loss,
+                    gross_return: decimal("0"),
+                    terminal_fee: decimal("0"),
+                },
+            )],
+        );
+        assert_eq!(live.account("a").completed_profit.to_string(), "-0.67");
+        let projected = binary_alpha_engine::search::project_splits(
+            live.lines
+                .iter()
+                .map(|line| FinancialEvent::from_line(line).unwrap()),
+            "u",
+        );
+        assert_eq!(projected["b1"]["none"], live.engine.summary().portfolio);
+    }
+
+    fn rejects_altered(live: &Live, mut edit: impl FnMut(&mut EventKind) -> bool, expected: &str) {
+        let mut events = live
+            .lines
+            .iter()
+            .map(|line| FinancialEvent::from_line(line).unwrap())
+            .collect::<Vec<_>>();
+        assert!(events.iter_mut().any(|event| edit(&mut event.kind)));
+        let error = Engine::restore(events.iter().map(|event| Ok(event.to_line())))
+            .err()
+            .unwrap();
+        assert!(error.contains(expected), "{error}");
+    }
+
+    #[test]
+    fn altered_broker_ledger_facts_and_postings_fail_restoration() {
+        let (mut live, command) = prepared(broker_definition());
+        checked_step(&mut live, PURCHASE, vec![purchase(&command, "10")]);
+        let at = PURCHASE + 16 * SECOND;
+        checked_step(
+            &mut live,
+            at,
+            vec![terminal(
+                &command,
+                TerminalStatus::Won,
+                "verified-sell",
+                None,
+            )],
+        );
+        checked_step(
+            &mut live,
+            at,
+            vec![cash(CashAction::Sell, "18.83", "verified-sell", at)],
+        );
+        rejects_altered(
+            &live,
+            |kind| {
+                if let EventKind::Signal {
+                    proposal: Some(proposal),
+                    ..
+                } = kind
+                {
+                    proposal.terms.quoted_cost = decimal("9.50");
+                    true
+                } else {
+                    false
+                }
+            },
+            "reservation",
+        );
+        rejects_altered(
+            &live,
+            |kind| {
+                if let EventKind::Signal {
+                    proposal: Some(proposal),
+                    ..
+                } = kind
+                {
+                    proposal.terms.direction = Direction::Sell;
+                    true
+                } else {
+                    false
+                }
+            },
+            "contract request",
+        );
+        rejects_altered(
+            &live,
+            |kind| {
+                if let EventKind::Accepted { debit, .. } = kind {
+                    *debit = decimal("10.50");
+                    true
+                } else {
+                    false
+                }
+            },
+            "acceptance postings",
+        );
+        rejects_altered(
+            &live,
+            |kind| {
+                if let EventKind::Unresolved {
+                    terminal: Some(fact),
+                    ..
+                } = kind
+                {
+                    fact.transaction_ref = Some("wrong-sell".into());
+                    true
+                } else {
+                    false
+                }
+            },
+            "matching disagrees",
+        );
+        rejects_altered(
+            &live,
+            |kind| {
+                if let EventKind::Settled { gross_return, .. } = kind {
+                    *gross_return = decimal("18.82");
+                    true
+                } else {
+                    false
+                }
+            },
+            "terminal and cash evidence",
+        );
+        rejects_altered(
+            &live,
+            |kind| {
+                if let EventKind::Settled {
+                    transaction_ref, ..
+                } = kind
+                {
+                    *transaction_ref = Some("wrong-sell".into());
+                    true
+                } else {
+                    false
+                }
+            },
+            "terminal and cash evidence",
+        );
+    }
+    #[test]
+    fn purchase_discrepancies_survive_settlement_and_external_closure() {
+        for purchase_first in [true, false] {
+            let (mut live, command) = prepared(broker_definition());
+            checked_step(&mut live, PURCHASE, vec![purchase(&command, "10.50")]);
+            let at = PURCHASE + 16 * SECOND;
+            checked_step(
+                &mut live,
+                at,
+                vec![
+                    terminal(&command, TerminalStatus::Won, "discrepant-sell", None),
+                    cash(CashAction::Sell, "18.82", "discrepant-sell", at),
+                ],
+            );
+            assert_eq!(live.account("a").blocked.len(), 2);
+            assert!(matches!(
+                live.account("a").blocked[&command],
+                Block::Purchased { .. }
+            ));
+            let before = live.cash();
+            let purchase = Resolution::Purchased {
+                debit: decimal("10.50"),
+                liability: liability(),
+            };
+            let settled = Resolution::Settled {
+                outcome: Outcome::Win,
+                gross_return: decimal("18.82"),
+                terminal_fee: decimal("0"),
+            };
+            let resolutions = if purchase_first {
+                [purchase, settled]
+            } else {
+                [settled, purchase]
+            };
+            for (index, resolution) in resolutions.into_iter().enumerate() {
+                checked_step(
+                    &mut live,
+                    at + index as i64,
+                    vec![reconciliation(&command, at + index as i64, resolution)],
+                );
+                assert_eq!(live.account("a").blocked.len(), 1 - index);
+                assert_eq!(live.cash(), before);
+            }
+        }
+        let (mut live, command) = prepared(broker_definition());
+        checked_step(&mut live, PURCHASE, vec![purchase(&command, "10.50")]);
+        let at = PURCHASE + 16 * SECOND;
+        checked_step(
+            &mut live,
+            at,
+            vec![
+                terminal(&command, TerminalStatus::Sold, "sold", None),
+                cash(CashAction::Sell, "4.20", "sold", at),
+            ],
+        );
+        assert!(matches!(
+            live.account("a").blocked[&command],
+            Block::Purchased { .. }
+        ));
+        checked_step(
+            &mut live,
+            at + 1,
+            vec![reconciliation(
+                &command,
+                at + 1,
+                Resolution::Purchased {
+                    debit: decimal("10.50"),
+                    liability: liability(),
+                },
+            )],
+        );
+        assert!(live.account("a").blocked.is_empty());
+        assert_eq!(live.cash(), "9948.27");
+    }
+
+    #[test]
+    fn partial_acceptance_clocks_are_optional_but_causal_on_restore() {
+        let (mut live, command) = prepared(broker_definition());
+        checked_step(&mut live, PURCHASE, vec![purchase(&command, "10")]);
+        let mut events = live
+            .lines
+            .iter()
+            .map(|line| FinancialEvent::from_line(line).unwrap())
+            .collect::<Vec<_>>();
+        if let EventKind::Accepted {
+            entry_price_units,
+            entry_time_micros,
+            due_time_micros,
+            ..
+        } = &mut events.last_mut().unwrap().kind
+        {
+            *entry_price_units = Some(920_252);
+            *entry_time_micros = Some(PURCHASE);
+            *due_time_micros = Some(PURCHASE + 15 * SECOND);
+        }
+        let restored = Engine::restore(events.iter().map(|event| Ok(event.to_line()))).unwrap();
+        assert_eq!(restored.accounts()[0].paid_basis.to_string(), "10.00");
+        rejects_altered(
+            &live,
+            |kind| {
+                if let EventKind::Accepted {
+                    entry_time_micros, ..
+                } = kind
+                {
+                    *entry_time_micros = Some(PURCHASE + SECOND);
+                    true
+                } else {
+                    false
+                }
+            },
+            "confirmed clocks",
+        );
+        rejects_altered(
+            &live,
+            |kind| {
+                if let EventKind::Accepted {
+                    price_time_micros, ..
+                } = kind
+                {
+                    *price_time_micros = Some(PURCHASE + SECOND);
+                    true
+                } else {
+                    false
+                }
+            },
+            "acceptance clocks",
+        );
+        let mut bad = live.restored();
+        assert!(
+            bad.try_step(
+                PURCHASE,
+                vec![confirmed(
+                    &command,
+                    PURCHASE,
+                    None,
+                    Some(PURCHASE + SECOND),
+                    None,
+                    None
+                )]
+            )
+            .unwrap_err()
+            .contains("confirmed clocks")
+        );
+        let mut wrong_purchase = Live::from_lines(live.lines[..live.lines.len() - 1].to_vec());
+        let mut late = liability();
+        late.purchase_time_micros = PURCHASE - 1;
+        assert!(
+            wrong_purchase
+                .try_step(
+                    PURCHASE,
+                    vec![Observation::Purchased {
+                        command,
+                        source: source("bad-clock", PURCHASE),
+                        debit: decimal("10"),
+                        liability: late
+                    }]
+                )
+                .unwrap_err()
+                .contains("acceptance clocks")
+        );
+    }
+
+    #[test]
+    fn historical_command_refuses_broker_settlement_before_reading_inputs() {
+        let scratch = Scratch::new("broker_replay_scope");
+        let mut config = Config::parse(&format!("{HEAD}{BASE}")).unwrap();
+        config.replay = Some(broker_definition().replay);
+        let path = scratch.path("broker.toml");
+        fs::write(&path, config.canonical_toml()).unwrap();
+        let error = common::command(&["replay", "--config", path.to_str().unwrap()]).unwrap_err();
+        assert!(error.contains("broker_authoritative_v1 settlement needs a broker; research and historical replay use price_at_due_v1"), "{error}");
+    }
+
+    #[test]
+    fn cash_ambiguity_resolves_without_leaving_a_consumed_transaction_blocked() {
+        let (mut live, command) = prepared(broker_definition());
+        checked_step(&mut live, PURCHASE, vec![purchase(&command, "10")]);
+        let at = PURCHASE + 16 * SECOND;
+        let mut end = terminal(&command, TerminalStatus::Won, "unused", None);
+        if let Observation::Terminal { fact, .. } = &mut end {
+            fact.transaction_ref = None;
+        }
+        checked_step(
+            &mut live,
+            at,
+            vec![
+                cash(CashAction::Sell, "18.83", "right", at),
+                cash(CashAction::Sell, "1", "wrong", at),
+                end,
+            ],
+        );
+        assert_eq!(live.account("a").blocked.len(), 2);
+        let mut restored = live.restored();
+        let events = checked_step(
+            &mut restored,
+            at,
+            vec![reconciliation(
+                "transaction:wrong",
+                at,
+                Resolution::External,
+            )],
+        );
+        assert_eq!(kinds(&events), ["reconciled", "settled"]);
+        assert!(restored.account("a").blocked.is_empty());
+        assert_eq!(restored.cash(), "9963.40");
+        assert_eq!(restored.account("a").open, 0);
+    }
+
+    #[test]
+    fn broker_ticks_record_diagnostics_and_equal_price_is_a_broker_loss() {
+        let (mut live, command) = prepared(broker_definition());
+        checked_step(&mut live, PURCHASE, vec![purchase(&command, "10")]);
+        checked_step(
+            &mut live,
+            PURCHASE,
+            vec![confirmed(
+                &command,
+                PURCHASE,
+                Some(920_252),
+                Some(PURCHASE),
+                Some(PURCHASE),
+                Some(PURCHASE + 15 * SECOND),
+            )],
+        );
+        checked_step(
+            &mut live,
+            PURCHASE + SECOND,
+            vec![tick(PURCHASE + SECOND, 920_409)],
+        );
+        let at = PURCHASE + 16 * SECOND;
+        checked_step(
+            &mut live,
+            at,
+            vec![terminal(
+                &command,
+                TerminalStatus::Lost,
+                "equal-loss",
+                Some((920_252, PURCHASE + 14 * SECOND)),
+            )],
+        );
+        let mut restored = live.restored();
+        let events = checked_step(
+            &mut restored,
+            at,
+            vec![cash(CashAction::Sell, "0", "equal-loss", at)],
+        );
+        let EventKind::Settled {
+            outcome,
+            profit,
+            path: Some(path),
+            ..
+        } = &events[1].kind
+        else {
+            panic!("{events:?}")
+        };
+        assert_eq!(*outcome, Outcome::Loss);
+        assert_eq!(profit.to_string(), "-10.00");
+        assert_eq!(path.final_move_units, 0);
+        assert_eq!(path.max_favorable_units, 157);
+        assert_eq!(restored.engine.summary().portfolio.ties, 0);
+    }
 }

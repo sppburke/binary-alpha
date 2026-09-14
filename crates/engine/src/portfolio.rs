@@ -17,7 +17,7 @@ use crate::config::{Config, FeatureInstrument, Portfolio, Replay, StreamKey};
 use crate::dataset::{DatasetRole, ObjectRecord};
 use crate::execution::{
     AccountSpec, Comparator, Condition, ContractTerms, Decimal, DeploymentBinding, Engine, Group,
-    ReplayInput, RiskPolicy, Split, StrategySpec, Threshold,
+    ReplayInput, RiskPolicy, SettlementRule, Split, StrategySpec, Threshold,
 };
 use crate::features::{FeaturePlan, FittedEncoding, ProjectionKind};
 use crate::market::{format_event_time_micros, parse_event_time_micros};
@@ -140,6 +140,13 @@ pub fn validate(portfolio: &Portfolio) -> Result<(), String> {
     for (index, binding) in portfolio.bindings.iter().enumerate() {
         for (position, alternative) in binding.alternatives.iter().enumerate() {
             let field = format!("bindings[{index}].alternatives[{position}].contract");
+            if alternative.contract.settlement.rule == SettlementRule::BrokerAuthoritativeV1
+                || alternative.envelope.settlement_rule == SettlementRule::BrokerAuthoritativeV1
+            {
+                return Err(format!(
+                    "{field}: broker_authoritative_v1 settlement needs a broker; research and historical replay use price_at_due_v1"
+                ));
+            }
             let required = alternative
                 .contract
                 .settlement_horizon()

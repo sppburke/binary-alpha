@@ -17,8 +17,8 @@ use binary_alpha_engine::dataset::{ObjectRecord, ObjectRole, manifest_key};
 use binary_alpha_engine::execution::{
     ColumnSpec, EVENTS_OBJECT_PATH, Engine, EventKind, EventSource, FinancialEvent,
     HISTORICAL_AVAILABILITY, InstrumentBinding, Observation, REPLAY_MANIFEST_KIND,
-    REPLAY_SCHEMA_VERSION, ReplayManifest, RunDefinition, SUMMARY_OBJECT_PATH, StreamColumns,
-    replay_generation_id,
+    REPLAY_SCHEMA_VERSION, REPLAY_SCHEMA_VERSION_BROKER, ReplayManifest, RunDefinition,
+    SUMMARY_OBJECT_PATH, SettlementRule, StreamColumns, replay_generation_id,
 };
 use binary_alpha_engine::features::{FeaturePlan, StreamPlan, Value};
 use binary_alpha_engine::market::parse_event_time_micros;
@@ -39,6 +39,16 @@ pub fn run(config_path: &Path, out: &mut dyn Write) -> Result<(), String> {
             "run_mode: a replay is research, not `{}`",
             config.run_mode
         ));
+    }
+    if config.replay.as_ref().is_some_and(|replay| {
+        replay.bindings.iter().any(|binding| {
+            replay.contracts.iter().any(|terms| {
+                terms.id == binding.contract
+                    && terms.settlement.rule == SettlementRule::BrokerAuthoritativeV1
+            })
+        })
+    }) {
+        return Err("replay: broker_authoritative_v1 settlement needs a broker; research and historical replay use price_at_due_v1".into());
     }
     let base = config_path.parent().unwrap_or(Path::new("."));
     let historical_dir = base.join(config.storage.historical_data_dir.as_path());
@@ -539,7 +549,16 @@ pub(crate) fn publish(
         .map(|index| bind_instrument(settings, index))
         .collect::<Result<Vec<_>, _>>()?;
     let definition = RunDefinition {
-        schema_version: REPLAY_SCHEMA_VERSION,
+        schema_version: if settings.bindings.iter().any(|binding| {
+            settings.contracts.iter().any(|terms| {
+                terms.id == binding.contract
+                    && terms.settlement.rule == SettlementRule::BrokerAuthoritativeV1
+            })
+        }) {
+            REPLAY_SCHEMA_VERSION_BROKER
+        } else {
+            REPLAY_SCHEMA_VERSION
+        },
         config_hash: config.content_hash(),
         code_revision: CODE_REVISION.to_string(),
         availability: HISTORICAL_AVAILABILITY.to_string(),
@@ -655,7 +674,7 @@ pub(crate) fn publish(
     }
     let manifest = ReplayManifest {
         kind: REPLAY_MANIFEST_KIND.to_string(),
-        schema_version: REPLAY_SCHEMA_VERSION,
+        schema_version: engine.definition().schema_version,
         generation: generation.clone(),
         role: settings.role,
         config_hash: config.content_hash(),
@@ -807,7 +826,8 @@ pub(crate) fn restore_verified(
         .map(|line| line.map_err(|error| format!("cannot read {ledger_location}: {error}")));
     let engine = Engine::restore(lines).map_err(|reason| format!("{ledger_location}: {reason}"))?;
     let definition = engine.definition();
-    if engine.sequence() != manifest.events
+    if definition.schema_version != manifest.schema_version
+        || engine.sequence() != manifest.events
         || engine.state_identity() != manifest.final_state_identity
         || engine.summary().identity() != manifest.summary_identity
         || definition.instruments != manifest.instruments
