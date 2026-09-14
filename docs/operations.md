@@ -150,10 +150,9 @@ change; source files, the retained copy, and published generations stay intact.
 
 ## Live runtime
 
-Phase 12 implements the [projection, journal, control, and authorization
-boundaries](contracts.md#live-runtime). The ordered application, compatibility receipt, recorded
-transports, deployment manifest, and live commands below are **design-specified** pending their
-consumers in this checkout (binding design 3.4–3.6, 4.3, and 5; command registration in section 3).
+Phase 12 implements the [ordered runtime, projection, journal, control, authorization,
+compatibility receipt, recorded transports, deployment manifest, and live
+commands](contracts.md#live-runtime).
 This procedure records the separately authorized rollout required by issue
 [#13](https://github.com/sppburke/binary-alpha/issues/13); it records no completed production action.
 
@@ -168,11 +167,13 @@ This procedure records the separately authorized rollout required by issue
    `MIGRATION_SQL`, with `binary-alpha live control schema v1` recorded as a comment on both
    tables; it adds no third table. Use the direct endpoint, or the documented session pooler when
    required by the deployment network, with supplied trusted roots and hostname verification.
-3. Deploy the binary inactive with approved secrets and a certified DeploymentBundle, then publish
-   its immutable deployment manifest. Do not enable real orders.
+3. Deploy the binary inactive with approved secrets and a certified DeploymentBundle. The next
+   authorized runtime start publishes its immutable deployment manifest after verification and
+   warm-up. Keep entries disabled until the exact entry authorization exists.
 4. Run immutable replay, paper mode, the complete Deriv demo workflow, and cause-specific cloud
    and lease checks. These observations and purchases each require their exact authorization.
-   Preserve the required account-class distinctions and frozen compatibility support.
+   Create the exact demo entry authorization below before demo purchases. Preserve the required
+   account-class distinctions and frozen compatibility support.
 5. Start the production instance observation-only. Warm features, replay its journal, reconcile
    transactions/open contracts/balance, and prove cloud publication.
 6. Initial migration from a non-cooperative legacy runtime uses a short per-account entry handoff:
@@ -180,15 +181,15 @@ This procedure records the separately authorized rollout required by issue
    dispatch, acquire the new lease, then keep the new owner observation-only. Existing accepted
    contracts continue to settlement. Deriv does not enforce the cooperative fencing token;
    stopping legacy submissions is an operator duty.
-7. After replay, demo, reconciliation, deployment, account, bundle, lease, and passing
-   execution-compatibility proof under the frozen account-class requirements, use the operator-only
-   command below to create the exact real-execution authorization immediately before enabling new
-   entries. Discover and validate the deterministic object before creating it so another agent can
+7. For a supported execution account, require replay, demo, reconciliation, deployment, account,
+   bundle, lease, and passing execution-compatibility proof under the frozen account-class
+   requirements. Use the operator-only command below to create the exact entry authorization
+   before enabling new entries. Discover and validate the deterministic object before creating it so another agent can
    resume after a lost response. Absence, conflict, or mismatch leaves observation, settlement,
    and reconciliation active but new entries disabled.
 8. Later target-to-target deploys transfer the account lease transactionally. The old owner stops
    new submissions before release and may continue observation; the new owner begins only after
-   lease, claims, broker state, and real-execution authorization are proven. Once release begins
+   lease, claims, broker state, and entry authorization are proven. Once release begins
    the old owner stays entry-disabled even if the response is lost. Resolve uncertain release by
    readback or expiry; the next acquisition has a greater fencing token.
 9. Checkpoint every command by deployment hash, migration version, lease fencing token, journal
@@ -210,7 +211,7 @@ This procedure records the separately authorized rollout required by issue
 
 No global service downtime is required. The only intended interruption is the shortest safe
 account-specific new-entry handoff; observation, reconciliation, and settlement remain active.
-Commands in steps 4 and 7 use the design-specified surfaces:
+Commands in steps 4 and 7:
 
 ```sh
 binary-alpha live replay --config PATH
@@ -221,9 +222,11 @@ binary-alpha live authorization create --deployment-manifest URI --bundle-manife
 `live replay` accepts `research` or `replay`; the filesystem publication boundary still requires
 `research`. It reads a recorded broker-event log and never connects to a broker or resolves its
 credential. `live run` accepts `paper` or `live`; paper keeps account observations but does not
-purchase. The operator's Google identity may create but not overwrite the authorization object;
-the runtime identity may read it but cannot create it. Repeat creation after response loss with
-the same bindings, operator, and reason. Any deployment/configuration/bundle/broker/account change
+purchase. Every `live` entry, including demo, requires the exact authorization object. The current
+options adapter permits proposals only for demo USD; a real account can supply observations but
+cannot obtain a supported purchase proposal. Configure the operator's Google identity to create
+but not overwrite authorization objects and the runtime identity to read them. Repeat creation
+after response loss with the same bindings, operator, and reason. Any deployment/configuration/bundle/broker/account change
 requires a new exact authorization. See the [command matrix](contracts.md#live-runtime),
 [authorization object](contracts.md#authorization), and
 [compatibility receipt](contracts.md#compatibility-receipt).
@@ -256,15 +259,15 @@ these connection and negative-certificate inputs:
 }
 ```
 
-Replace the example connection with the approved isolated endpoint; the credential value stays
-in the named environment variable. Certificate files contain trusted roots, not secrets. Use
+Replace the example connection with the approved isolated endpoint. The password is read from the
+environment variable named by `control.credential`; the JSON contains its name, never its value.
+Certificate files contain trusted roots, not secrets. Use
 absolute paths for reproducibility; the test passes these paths directly, without resolving them
 against the JSON file. The correct root and hostname must validate the endpoint. `wrong_host`
 must reach that same test server under a name its certificate excludes; the current negative
 assertion specifically expects `127.0.0.1`. The supplied incorrect root must fail issuer
 verification. The implemented wrapper does not read runtime owner or lease timing settings;
-it chooses those within its test cases. This differs from design 6's abbreviated example, which
-names `ControlSettings` and omits the required `wrong_host` field.
+it chooses those within its test cases.
 
 Record the isolated server/database/schema identity, schema comment/version, configuration
 identity, and clean code revision with the gate result. The wrapper has no separate schema field;

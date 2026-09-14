@@ -55,21 +55,19 @@ account ownership and prepared signal ──▶ app: PostgreSQL lease and dispat
 exact deployment bindings ──▶ app: immutable authorization through the existing artifact store
 ```
 
-The Phase 12 configuration, projection, journal, control, and authorization owners above are
-implemented. Their ordered application composition below is **design-specified** (binding design
-3.4–3.6, 4.3, and 5); the current `live.rs` exports the implemented support modules. The receipt,
-recorded transport, deployment-manifest, and live-command consumers remain to be reconciled with
-the checkout. This is the Phase 12 flow, with no additional feature or financial authority:
+The Phase 12 `live` owner composes configuration, projection, journal, control, authorization,
+receipt, recorded transports, deployment manifests, and command dispatch:
 
 ```text
-broker market/account tasks or recorded transports (input/output only)
+broker market/account workers or recorded transports (input/output only)
    ──▶ one ordered ingress lane: connection generation, receipt sequence, source clocks
    ──▶ one shared causal feature state: existing InstrumentStream and FeatureEngine per instrument
    ──▶ one Engine: ordered evaluation, capacity, risk, reservations, settlement, accounting
-   ──▶ one execution adapter: rate admission ─▶ committed dispatch claim ─▶ eligibility check/write
+   ──▶ one execution adapter: rate admission ─▶ committed dispatch claim ─▶ eligibility check
+   ──▶ queued write ──▶ account worker
    ──▶ typed broker observations ──▶ the same Engine
 
-every transition ──▶ one single-writer journal ──▶ one publisher through the existing store
+financial events and control records ──▶ one single-writer journal ──▶ existing artifact store
    ──▶ verified immutable closed segments, ledger, compatibility receipt
 verified bundle + exact configuration ──▶ immutable deployment manifest ──▶ exact entry authorization
 ```
@@ -77,14 +75,19 @@ verified bundle + exact configuration ──▶ immutable deployment manifest �
 One process owns one deployment bundle and one execution account across all configured instruments
 and strategies. Broker tasks may perform concurrent network input/output; they never evaluate a
 strategy or mutate financial state, and execute only prepared intents from the ordered owner.
-Each accepted market event enters the shared feature owner once; each available base row is
-evaluated once in frozen binding order. Keep synchronous broker/storage operations and lease
-renewal outside the ordered decision task; the remote dispatch-claim commit is the required
-pre-purchase durability boundary. This issue #13 requirement governs the inline broker/storage
-calls sketched in design 3.5; application task isolation still needs implementation proof.
-The same Engine restores the journal and applies authoritative
-account evidence. Entry disabling preserves account observation, settlement, reconciliation,
-journaling, and cloud retry. Contracts and implementation status are in
+Each accepted market event enters the shared feature owner once. Base rows wait for requested
+proposals and enter the Engine in queue order; bindings evaluate in frozen order. Stale queued
+rows expire under the instrument's greatest bound `max_feature_age_micros`. One proposal request
+per binding and one prepared dispatch are outstanding at a time. Market and account workers wait
+for owner acknowledgement after delivering ingress. The storage worker publishes closed segments,
+ledger, receipt, and final manifest. Production lease renewal uses a dedicated control connection;
+claim transactions, local journal writes, and health writes run on the ordered owner. Startup
+verification, warm-up, and deployment publication complete before these workers start.
+The same Engine restores financial state and applies authoritative account evidence. Restart
+rebuilds causal features from verified warm-up ticks; live ticks are not journaled. Every restart
+or market break requires a ready base row for each bound instrument before entries resume.
+Entry vetoes preserve account observation, settlement, reconciliation, journaling, and cloud retry.
+Contracts are in
 [Live runtime](contracts.md#live-runtime); separately authorized handoff is in
 [operations](operations.md#live-runtime).
 
@@ -155,10 +158,10 @@ it.
 | Two-table migration, lease/claim transactions, encrypted PostgreSQL connection, fake control | `binary-alpha-app`, module `live::control` | this checkout ([#13](https://github.com/sppburke/binary-alpha/issues/13)) |
 | Immutable authorization object, identity, creation and read validation | `binary-alpha-app`, module `live::authorization`, through the existing `store` | this checkout ([#13](https://github.com/sppburke/binary-alpha/issues/13)) |
 | Transport receipt provenance and purchase preparation/write boundary | `binary-alpha-app`, modules `broker` and `broker::deriv_options` | this checkout ([#13](https://github.com/sppburke/binary-alpha/issues/13)) |
-| One ingress lane, live definition, ordered runtime, recovery, entry gates, health, deployment manifest and publication | `binary-alpha-app`, module `live`, reusing `features`, `replay`, `research`, and `store` owners | Phase 12, design-specified pending application composition |
-| Deterministic execution-compatibility receipt | `binary-alpha-app`, module `live::receipt` | Phase 12, design-specified pending implementation |
-| Recorded broker transports and replay clock | `binary-alpha-app`, module `broker::transport` | Phase 12, design-specified pending implementation |
-| Live commands and operator authorization command | `binary-alpha-app`, `main` dispatch into `live` | Phase 12, design-specified pending registration |
+| One ingress lane, live definition, ordered runtime, recovery, entry gates, health, deployment manifest and publication | `binary-alpha-app`, modules `live`, `live::owner`, `live::workers`, reusing `features`, `replay`, `research`, and `store` owners | this checkout ([#13](https://github.com/sppburke/binary-alpha/issues/13)) |
+| Deterministic execution-compatibility receipt | `binary-alpha-app`, module `live::receipt` | this checkout ([#13](https://github.com/sppburke/binary-alpha/issues/13)) |
+| Recorded broker transports and replay clock | `binary-alpha-app`, module `broker::transport` | this checkout ([#13](https://github.com/sppburke/binary-alpha/issues/13)) |
+| Live commands and operator authorization command | `binary-alpha-app`, `main` dispatch into `live` | this checkout ([#13](https://github.com/sppburke/binary-alpha/issues/13)) |
 | Resumable account handoff and rollback | Authorized operator, [procedure](operations.md#live-runtime) | Phase 12; production execution requires separate authorization |
 
 The engine stays free of external effects so that development, evaluation, optimization,
