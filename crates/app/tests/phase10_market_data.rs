@@ -203,6 +203,50 @@ fn exact_wire_numbers_and_socket_io_subset() {
 }
 
 #[test]
+fn deriv_discovery_reads_plain_and_exponent_pip_sizes() {
+    let clock = FakeClock::at(1_789_348_000_000_000);
+    let (connector, _) = connector(
+        vec![vec![
+            frame("deriv-active_symbols-excerpt.json", 1),
+            Frame::Text(correlated(
+                &fixture("deriv-active_symbols-excerpt.json").replace("1e-05", "2e-05"),
+                2,
+            )),
+        ]],
+        &clock,
+    );
+    let mut broker =
+        DerivMarketData::connect(&deriv_settings(), connector, Box::new(clock)).unwrap();
+    let discovered = broker.discover().unwrap();
+    let precision: Vec<(&str, Option<u8>, Option<bool>)> = discovered
+        .iter()
+        .map(|instrument| {
+            (
+                instrument.symbol.as_str(),
+                instrument.precision,
+                instrument.open,
+            )
+        })
+        .collect();
+    assert_eq!(
+        precision,
+        vec![
+            ("R_100", Some(2), Some(true)),
+            ("R_50", Some(4), Some(true)),
+            ("frxEURUSD", Some(5), Some(true)),
+        ]
+    );
+    assert_eq!(discovered[2].display_name.as_deref(), Some("EUR/USD"));
+    // A pip size whose mantissa is not one is still unsupported, in either spelling.
+    assert!(
+        broker
+            .discover()
+            .unwrap_err()
+            .contains("unsupported pip_size precision")
+    );
+}
+
+#[test]
 fn deriv_market_correlation_precision_duplicates_cancellation_and_reconnect() {
     let clock = FakeClock::at(1_789_348_000_000_000);
     let first = vec![
