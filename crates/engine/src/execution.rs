@@ -24,8 +24,11 @@ use crate::market::{
     split_decimal,
 };
 
-/// The ledger and manifest schema written and accepted by this checkout.
+/// The preserved historical ledger and manifest schema.
 pub const REPLAY_SCHEMA_VERSION: u32 = 1;
+
+/// The schema for proposal-bound obligations and broker-authoritative cash.
+pub const REPLAY_SCHEMA_VERSION_BROKER: u32 = 2;
 
 /// The `kind` an engine replay ready manifest declares.
 pub const REPLAY_MANIFEST_KIND: &str = "engine_replay";
@@ -384,6 +387,14 @@ crate::string_enum! {
     /// contract window and the tick is not later than the maximum delay.
     SettlementRule "settlement_rule" {
         PriceAtDueV1 => "price_at_due_v1",
+        BrokerAuthoritativeV1 => "broker_authoritative_v1",
+    }
+}
+
+crate::string_enum! {
+    /// Strict Rise/Fall against entry; equality loses the stake.
+    ContractSemantics "contract_semantics" {
+        RiseFallStrictV1 => "rise_fall_strict_v1",
     }
 }
 
@@ -421,6 +432,8 @@ pub struct ContractTerms {
     pub loss: Cashflow,
     pub tie: Cashflow,
     pub settlement: Settlement,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub semantics: Option<ContractSemantics>,
 }
 
 crate::string_enum! {
@@ -501,6 +514,8 @@ pub struct Envelope {
     pub max_tie_terminal_fee: Decimal,
     pub min_winning_net_return: Decimal,
     pub settlement_rule: SettlementRule,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub semantics: Option<ContractSemantics>,
 }
 
 impl Envelope {
@@ -509,6 +524,7 @@ impl Envelope {
             Ok(value.compare(maximum)? != Ordering::Greater)
         };
         Ok(terms.settlement.rule == self.settlement_rule
+            && terms.semantics == self.semantics
             && within(terms.quoted_cost, self.max_purchase_cost)?
             && within(terms.entry_fee, self.max_entry_fee)?
             && within(terms.win.terminal_fee, self.max_win_terminal_fee)?
@@ -527,6 +543,7 @@ impl Envelope {
             max_tie_terminal_fee: self.max_tie_terminal_fee.normalized(),
             min_winning_net_return: self.min_winning_net_return.normalized(),
             settlement_rule: self.settlement_rule,
+            semantics: self.semantics,
         }
     }
 }
@@ -608,6 +625,8 @@ pub struct RiskPolicy {
     pub max_unresolved_loss_total: Option<Decimal>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pause: Option<Pause>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_proposal_age_micros: Option<i64>,
 }
 
 /// One supplied immutable conversion rate: reporting-currency units per source-currency unit.
@@ -640,6 +659,128 @@ pub struct ReplayInput {
     pub feature_manifest: ManifestUri,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub outcome_manifest: Option<ManifestUri>,
+}
+
+fn is_false(value: &bool) -> bool {
+    !value
+}
+fn is_zero(value: &u64) -> bool {
+    *value == 0
+}
+fn is_historical_terms(terms: &ContractTerms) -> bool {
+    terms.settlement.rule == SettlementRule::PriceAtDueV1
+}
+
+fn purchased_payload(debit: Decimal, liability: &BrokerLiability) -> String {
+    format!(
+        "purchased {} {} {} {} {:?} {}",
+        debit.normalized(),
+        liability.contract_ref,
+        liability.transaction_ref,
+        liability.purchase_time_micros,
+        liability.expected_start_micros,
+        liability.payout.normalized()
+    )
+}
+
+fn terminal_payload(fact: &TerminalFact) -> String {
+    format!(
+        "terminal {} {:?} {:?} {:?}",
+        fact.status, fact.exit_price_units, fact.exit_time_micros, fact.transaction_ref
+    )
+}
+
+fn check_source(source: &EventSource, now: i64) -> Result<(), String> {
+    if source.provider_time_micros > source.available_at_micros || source.available_at_micros > now
+    {
+        return Err(format!(
+            "external event `{}` is not available at {}",
+            source.id,
+            format_event_time_micros(now)
+        ));
+    }
+    Ok(())
+}
+
+impl CashFact {
+    fn key(&self) -> (String, String) {
+        (self.account.clone(), self.transaction_ref.clone())
+    }
+    fn block_key(&self) -> String {
+        format!("transaction:{}:{}", self.account, self.transaction_ref)
+    }
+}
+
+fn same_cash(a: &CashFact, b: &CashFact) -> Result<bool, String> {
+    Ok(a.account == b.account
+        && a.transaction_ref == b.transaction_ref
+        && a.contract_ref == b.contract_ref
+        && a.action == b.action
+        && a.time_micros == b.time_micros
+        && a.amount.compare(b.amount)? == Ordering::Equal)
+}
+
+fn same_liability(a: &BrokerLiability, b: &BrokerLiability) -> Result<bool, String> {
+    Ok(a.contract_ref == b.contract_ref
+        && a.transaction_ref == b.transaction_ref
+        && a.purchase_time_micros == b.purchase_time_micros
+        && a.expected_start_micros == b.expected_start_micros
+        && a.payout.compare(b.payout)? == Ordering::Equal)
+}
+
+fn same_optional_amount(a: Option<Decimal>, b: Option<Decimal>) -> Result<bool, String> {
+    match (a, b) {
+        (Some(a), Some(b)) => Ok(a.compare(b)? == Ordering::Equal),
+        _ => Ok(a.is_none() && b.is_none()),
+    }
+}
+
+fn identity_amount(amount: Decimal, normalize: bool) -> Decimal {
+    if normalize {
+        amount.normalized()
+    } else {
+        amount
+    }
+}
+
+fn reconciliation_payload(resolution: &Resolution, normalize: bool) -> String {
+    let mut resolution = resolution.clone();
+    if normalize {
+        match &mut resolution {
+            Resolution::Purchased { debit, liability } => {
+                *debit = debit.normalized();
+                liability.payout = liability.payout.normalized();
+            }
+            Resolution::Settled {
+                gross_return,
+                terminal_fee,
+                ..
+            }
+            | Resolution::ExternallyClosed {
+                gross_return,
+                terminal_fee,
+                ..
+            } => {
+                *gross_return = gross_return.normalized();
+                *terminal_fee = terminal_fee.normalized();
+            }
+            _ => {}
+        }
+    }
+    format!("reconciliation {resolution:?}")
+}
+
+fn matches_purchase(
+    fact: &CashFact,
+    account: &str,
+    debit: Decimal,
+    liability: &BrokerLiability,
+) -> Result<bool, String> {
+    Ok(fact.account == account
+        && fact.contract_ref.as_deref() == Some(&liability.contract_ref)
+        && fact.transaction_ref == liability.transaction_ref
+        && fact.action == CashAction::Buy
+        && Decimal::zero(0).checked_sub(fact.amount)?.compare(debit)? == Ordering::Equal)
 }
 
 fn identifier(field: &str, text: &str) -> Result<(), String> {
@@ -801,6 +942,31 @@ pub fn validate(replay: &Replay) -> Result<(), String> {
         if contract.duration_micros <= 0 {
             return Err(format!("{}: must be positive", field("duration_micros")));
         }
+        match contract.settlement.rule {
+            SettlementRule::BrokerAuthoritativeV1 => {
+                if contract.semantics.is_none() {
+                    return Err(format!(
+                        "contracts[{index}].semantics: broker_authoritative_v1 requires contract semantics"
+                    ));
+                }
+                if contract.quoted_cost.compare(contract.stake)? != Ordering::Equal
+                    || !contract.entry_fee.is_zero()
+                    || [contract.win, contract.loss, contract.tie]
+                        .iter()
+                        .any(|cash| !cash.gross_return.is_zero() || !cash.terminal_fee.is_zero())
+                {
+                    return Err(format!(
+                        "contracts[{index}]: a broker_authoritative_v1 contract declares its request (stake, direction, duration, currency, semantics); its economics come from proposals, so quoted_cost must equal stake and every fee and return must be zero"
+                    ));
+                }
+            }
+            SettlementRule::PriceAtDueV1 if contract.semantics.is_some() => {
+                return Err(format!(
+                    "contracts[{index}].semantics: price_at_due_v1 must not declare semantics"
+                ));
+            }
+            SettlementRule::PriceAtDueV1 => {}
+        }
         positive(&field("stake"), contract.stake)?;
         positive(&field("quoted_cost"), contract.quoted_cost)?;
         non_negative(&field("entry_fee"), contract.entry_fee)?;
@@ -846,6 +1012,12 @@ pub fn validate(replay: &Replay) -> Result<(), String> {
             if limit == Some(0) {
                 return Err(format!("{}: must be positive when present", field(name)));
             }
+        }
+        if policy.max_proposal_age_micros.is_some_and(|age| age < 0) {
+            return Err(format!(
+                "{}: must not be negative",
+                field("max_proposal_age_micros")
+            ));
         }
         if policy.max_feature_age_micros < 0 || policy.max_quote_age_micros < 0 {
             return Err(format!(
@@ -929,6 +1101,26 @@ pub fn validate(replay: &Replay) -> Result<(), String> {
                     binding.risk_policy
                 )
             })?;
+        if binding.envelope.settlement_rule != contract.settlement.rule {
+            return Err(format!(
+                "{}: settlement_rule must equal the contract's rule",
+                field("envelope")
+            ));
+        }
+        if contract.settlement.rule == SettlementRule::BrokerAuthoritativeV1 {
+            if binding.envelope.semantics != contract.semantics {
+                return Err(format!(
+                    "{}: semantics must equal the contract's semantics",
+                    field("envelope")
+                ));
+            }
+            if policy.max_proposal_age_micros.is_none() {
+                return Err(format!(
+                    "{}: broker_authoritative_v1 requires max_proposal_age_micros",
+                    field("risk_policy")
+                ));
+            }
+        }
         let (broker, _) = binding
             .instrument
             .split_once(':')
@@ -1216,10 +1408,154 @@ pub struct EventSource {
     pub simulated: bool,
 }
 
+/// One broker proposal with exact terms and source identity, bound to a normalized request.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct Proposal {
+    pub identity: String,
+    pub request_identity: String,
+    pub account: String,
+    pub instrument: String,
+    pub terms: ContractTerms,
+    pub spot_units: i64,
+    pub spot_time_micros: i64,
+    pub receipt_micros: i64,
+    pub schema: String,
+    pub payload_sha256: String,
+}
+
+impl Proposal {
+    /// Hashes the canonical request scope and terms, independently of the provider quote.
+    pub fn canonical_request_identity(&self) -> Result<String, String> {
+        let (broker, symbol) = self
+            .instrument
+            .split_once(':')
+            .ok_or("proposal.instrument must be BROKER:PROVIDER_SYMBOL")?;
+        let instrument = crate::market::InstrumentId {
+            broker: broker.to_string().try_into()?,
+            provider_symbol: symbol.to_string().try_into()?,
+        };
+        if self.terms.duration_micros % 1_000_000 != 0 {
+            return Err("proposal duration must be whole seconds".into());
+        }
+        let bytes = serde_json::to_vec(&(
+            &instrument.broker,
+            &self.account,
+            &instrument,
+            &self.terms.currency,
+            self.terms.direction,
+            self.terms.duration_micros / 1_000_000,
+            self.terms.stake.normalized(),
+            self.terms.semantics,
+        ))
+        .map_err(|_| "proposal: cannot encode normalized request")?;
+        Ok(crate::hex(&Sha256::digest(bytes)))
+    }
+
+    fn same_fact(&self, other: &Self) -> Result<bool, String> {
+        let a = &self.terms;
+        let b = &other.terms;
+        if self.identity != other.identity
+            || self.request_identity != other.request_identity
+            || self.account != other.account
+            || self.instrument != other.instrument
+            || self.spot_units != other.spot_units
+            || self.spot_time_micros != other.spot_time_micros
+            || self.receipt_micros != other.receipt_micros
+            || self.schema != other.schema
+            || self.payload_sha256 != other.payload_sha256
+            || a.id != b.id
+            || a.direction != b.direction
+            || a.duration_micros != b.duration_micros
+            || a.currency != b.currency
+            || a.settlement != b.settlement
+            || a.semantics != b.semantics
+        {
+            return Ok(false);
+        }
+        for (a, b) in [
+            (a.stake, b.stake),
+            (a.quoted_cost, b.quoted_cost),
+            (a.entry_fee, b.entry_fee),
+            (a.win.gross_return, b.win.gross_return),
+            (a.win.terminal_fee, b.win.terminal_fee),
+            (a.loss.gross_return, b.loss.gross_return),
+            (a.loss.terminal_fee, b.loss.terminal_fee),
+            (a.tie.gross_return, b.tie.gross_return),
+            (a.tie.terminal_fee, b.tie.terminal_fee),
+        ] {
+            if a.compare(b)? != Ordering::Equal {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+}
+
+/// A purchased liability whose entry and confirmed expiry may still be unavailable.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct BrokerLiability {
+    pub contract_ref: String,
+    pub transaction_ref: String,
+    pub purchase_time_micros: i64,
+    pub expected_start_micros: Option<i64>,
+    pub payout: Decimal,
+}
+
+crate::string_enum! {
+    /// The broker's terminal disposition, separate from its cash posting.
+    TerminalStatus "terminal_status" {
+        Won => "won",
+        Lost => "lost",
+        Sold => "sold",
+        Cancelled => "cancelled",
+    }
+}
+
+crate::string_enum! {
+    /// The account transaction's action, which does not determine the outcome.
+    CashAction "cash_action" {
+        Buy => "buy",
+        Sell => "sell",
+    }
+}
+
+/// One account-native cash transaction retained for matching and duplicate checks.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct CashFact {
+    pub account: String,
+    pub transaction_ref: String,
+    pub contract_ref: Option<String>,
+    pub action: CashAction,
+    pub amount: Decimal,
+    pub time_micros: i64,
+}
+
+/// Confirmed terminal status and optional exit diagnostics and cash linkage.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct TerminalFact {
+    pub status: TerminalStatus,
+    pub exit_price_units: Option<i64>,
+    pub exit_time_micros: Option<i64>,
+    pub transaction_ref: Option<String>,
+}
+
 /// What a reconciliation proves about a command.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(tag = "resolution", rename_all = "snake_case")]
 pub enum Resolution {
+    /// A recovered purchase, or confirmation of an already booked purchase discrepancy.
+    Purchased {
+        debit: Decimal,
+        liability: BrokerLiability,
+    },
+    /// An external sale or cancellation with its actual cashflow.
+    ExternallyClosed {
+        status: TerminalStatus,
+        gross_return: Decimal,
+        terminal_fee: Decimal,
+    },
+    /// An unmatched account transaction is outside this deployment's liabilities.
+    External,
     /// The broker never received the command: release everything.
     NotSent,
     /// The broker accepted it at these terms.
@@ -1238,7 +1574,34 @@ pub enum Resolution {
 
 /// One observation in availability order.
 #[derive(Debug, Clone, PartialEq)]
+#[allow(clippy::large_enum_variant)]
 pub enum Observation {
+    /// The current proposal for one deployment binding.
+    Proposal { binding: String, proposal: Proposal },
+    /// An actual purchase without assumed entry or confirmed expiry.
+    Purchased {
+        command: String,
+        source: EventSource,
+        debit: Decimal,
+        liability: BrokerLiability,
+    },
+    /// Monotonically confirmed contract details.
+    ContractUpdate {
+        command: String,
+        source: EventSource,
+        entry_price_units: Option<i64>,
+        entry_time_micros: Option<i64>,
+        start_micros: Option<i64>,
+        expiry_micros: Option<i64>,
+    },
+    /// Terminal status, which needs matching cash before closure.
+    Terminal {
+        command: String,
+        source: EventSource,
+        fact: TerminalFact,
+    },
+    /// An actual account transaction, including an explicit zero credit.
+    Cash { source: EventSource, fact: CashFact },
     /// A provider tick of one instrument.
     Tick {
         instrument: usize,
@@ -1313,9 +1676,21 @@ fn external_identity(command: &str, source: &EventSource, payload: String) -> (S
 }
 
 impl Observation {
-    fn external(&self) -> Option<(String, String)> {
+    fn external(&self, normalize: bool) -> Option<(String, String)> {
         match self {
-            Self::Tick { .. } | Self::Row { .. } => None,
+            Self::Tick { .. } | Self::Row { .. } | Self::Proposal { .. } => None,
+            Self::Purchased {
+                command,
+                source,
+                debit,
+                liability,
+            } => Some(external_identity(
+                command,
+                source,
+                purchased_payload(*debit, liability),
+            )),
+            // Updates may carry already-known fields; the emitted record carries only new facts.
+            Self::ContractUpdate { .. } | Self::Terminal { .. } | Self::Cash { .. } => None,
             Self::Acknowledged { command, source } => {
                 Some(external_identity(command, source, "acknowledged".into()))
             }
@@ -1350,7 +1725,9 @@ impl Observation {
                 command,
                 source,
                 format!(
-                    "settlement {outcome} {gross_return} {terminal_fee} {settlement_price_units}"
+                    "settlement {outcome} {} {} {settlement_price_units}",
+                    identity_amount(*gross_return, normalize),
+                    identity_amount(*terminal_fee, normalize)
                 ),
             )),
             Self::Reconciliation {
@@ -1360,7 +1737,7 @@ impl Observation {
             } => Some(external_identity(
                 command,
                 source,
-                format!("reconciliation {resolution:?}"),
+                reconciliation_payload(resolution, normalize),
             )),
         }
     }
@@ -1371,7 +1748,7 @@ impl Observation {
 // ---------------------------------------------------------------------------------------------
 
 crate::string_enum! {
-    /// Why a matching signal did or did not become a sent command, in check order.
+    /// Why a matching signal did or did not become a prepared command, in check order.
     Disposition "disposition" {
         Admitted => "admitted",
         SameEntryDuplicate => "same_entry_duplicate",
@@ -1381,6 +1758,8 @@ crate::string_enum! {
         StaleFeature => "stale_feature",
         StaleQuote => "stale_quote",
         GapAtEntry => "gap_at_entry",
+        NoProposal => "no_proposal",
+        StaleProposal => "stale_proposal",
         AccountPaused => "account_paused",
         AccountBlocked => "account_blocked",
         QuoteRejected => "quote_rejected",
@@ -1403,6 +1782,7 @@ crate::string_enum! {
         LateSettlement => "late_settlement",
         WindowExhausted => "window_exhausted",
         PossiblySent => "possibly_sent",
+        AwaitingCash => "awaiting_cash",
     }
 }
 
@@ -1486,10 +1866,11 @@ pub struct FinancialEvent {
 /// The tagged transition of one ledger record.
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
+#[allow(clippy::large_enum_variant)]
 pub enum EventKind {
     /// The complete resolved run, frozen identities, and initial state.
     RunDefinition { definition: Box<RunDefinition> },
-    /// One matching signal and its disposition; an admitted signal reserves and sends.
+    /// One matching signal and its disposition; admission reserves and prepares a command.
     Signal {
         instrument: String,
         binding: String,
@@ -1512,6 +1893,8 @@ pub enum EventKind {
         /// The rate identities a conversion used during admission.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         rates: Vec<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        proposal: Option<Proposal>,
     },
     /// The broker acknowledged receipt of a sent command; nothing is posted.
     Acknowledged {
@@ -1523,12 +1906,37 @@ pub enum EventKind {
     Accepted {
         command: String,
         source: EventSource,
-        entry_time_micros: i64,
-        entry_price_units: i64,
-        price_time_micros: i64,
-        due_time_micros: i64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        entry_time_micros: Option<i64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        entry_price_units: Option<i64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        price_time_micros: Option<i64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        due_time_micros: Option<i64>,
         debit: Decimal,
         reservation: Decimal,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        liability: Option<BrokerLiability>,
+        #[serde(default, skip_serializing_if = "is_false")]
+        discrepancy: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        deficit: Option<Decimal>,
+    },
+    /// New confirmed details of an accepted broker liability.
+    Confirmed {
+        command: String,
+        source: EventSource,
+        entry_price_units: Option<i64>,
+        entry_time_micros: Option<i64>,
+        start_micros: Option<i64>,
+        expiry_micros: Option<i64>,
+    },
+    /// Retained cash evidence; an unmatched transaction blocks its account.
+    CashObserved {
+        source: EventSource,
+        fact: CashFact,
+        matched: Option<String>,
     },
     /// A sent command was refused or proved never sent: everything is released without debit.
     Released {
@@ -1547,7 +1955,8 @@ pub enum EventKind {
         command: String,
         source: EventSource,
         settlement_time_micros: i64,
-        settlement_price_units: i64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        settlement_price_units: Option<i64>,
         outcome: Outcome,
         gross_return: Decimal,
         terminal_fee: Decimal,
@@ -1557,7 +1966,10 @@ pub enum EventKind {
         discrepancy: bool,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         deficit: Option<Decimal>,
-        path: PathMetrics,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        path: Option<PathMetrics>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        transaction_ref: Option<String>,
     },
     /// The declared rule could not settle the obligation; it stays open with its evidence.
     Unresolved {
@@ -1566,6 +1978,10 @@ pub enum EventKind {
         evidence: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         path: Option<PathMetrics>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        terminal: Option<TerminalFact>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        source: Option<EventSource>,
     },
     /// An authoritative reconciliation resolved an open command, or lifted the block a settled
     /// discrepancy left on its account.
@@ -1595,7 +2011,7 @@ pub enum EventKind {
 impl EventKind {
     /// The external identity a record establishes, so a redelivered observation is a no-op after
     /// generation and after restoration alike.
-    fn external(&self) -> Option<(String, String)> {
+    fn external(&self, normalize: bool) -> Option<(String, String)> {
         match self {
             Self::Acknowledged { command, source } => {
                 Some(external_identity(command, source, "acknowledged".into()))
@@ -1606,11 +2022,56 @@ impl EventKind {
                 entry_time_micros,
                 entry_price_units,
                 price_time_micros,
+                debit,
+                liability,
                 ..
             } => Some(external_identity(
                 command,
                 source,
-                format!("accepted {entry_time_micros} {entry_price_units} {price_time_micros}"),
+                match liability {
+                    Some(liability) => purchased_payload(*debit, liability),
+                    None => format!(
+                        "accepted {} {} {}",
+                        entry_time_micros.unwrap_or_default(),
+                        entry_price_units.unwrap_or_default(),
+                        price_time_micros.unwrap_or_default()
+                    ),
+                },
+            )),
+            Self::Confirmed {
+                command,
+                source,
+                entry_price_units,
+                entry_time_micros,
+                start_micros,
+                expiry_micros,
+            } => Some(external_identity(
+                &format!("{command}\nconfirmed"),
+                source,
+                format!(
+                    "confirmed {entry_price_units:?} {entry_time_micros:?} {start_micros:?} {expiry_micros:?}"
+                ),
+            )),
+            Self::CashObserved { source, fact, .. } => Some(external_identity(
+                &fact.block_key(),
+                source,
+                format!(
+                    "cash {:?}",
+                    CashFact {
+                        amount: fact.amount.normalized(),
+                        ..fact.clone()
+                    }
+                ),
+            )),
+            Self::Unresolved {
+                command,
+                terminal: Some(fact),
+                source: Some(source),
+                ..
+            } => Some(external_identity(
+                &format!("{command}\nterminal:{}", terminal_payload(fact)),
+                source,
+                terminal_payload(fact),
             )),
             Self::Released {
                 command,
@@ -1637,7 +2098,10 @@ impl EventKind {
                 command,
                 source,
                 format!(
-                    "settlement {outcome} {gross_return} {terminal_fee} {settlement_price_units}"
+                    "settlement {outcome} {} {} {}",
+                    identity_amount(*gross_return, normalize),
+                    identity_amount(*terminal_fee, normalize),
+                    settlement_price_units.map_or_else(|| "None".into(), |price| price.to_string())
                 ),
             )),
             Self::Reconciled {
@@ -1648,7 +2112,7 @@ impl EventKind {
             } => Some(external_identity(
                 command,
                 source,
-                format!("reconciliation {resolution:?}"),
+                reconciliation_payload(resolution, normalize),
             )),
             _ => None,
         }
@@ -1662,7 +2126,13 @@ impl EventKind {
             | Self::Released { source, .. }
             | Self::PossiblySent { source, .. }
             | Self::Settled { source, .. }
-            | Self::Reconciled { source, .. } => Some(source),
+            | Self::Reconciled { source, .. }
+            | Self::Confirmed { source, .. }
+            | Self::CashObserved { source, .. }
+            | Self::Unresolved {
+                source: Some(source),
+                ..
+            } => Some(source),
             _ => None,
         }
     }
@@ -1771,9 +2241,8 @@ pub struct AccountState {
     pub open: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub paused_until_micros: Option<i64>,
-    /// The commands whose reconciliation the account waits for, with why: possibly sent, or
-    /// settled with a discrepancy or deficit at the booked cashflow. New entries are blocked
-    /// while any remains.
+    /// Commands and unmatched transactions awaiting reconciliation. New entries stay blocked
+    /// until every uncertain liability and booked discrepancy is resolved.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub blocked: BTreeMap<String, Block>,
 }
@@ -1782,6 +2251,20 @@ pub struct AccountState {
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(tag = "reason", rename_all = "snake_case")]
 pub enum Block {
+    /// The actual purchase disagrees with its frozen price or winning payout.
+    Purchased {
+        debit: Decimal,
+        maximum: Decimal,
+        payout: Decimal,
+        expected_payout: Decimal,
+    },
+    /// The account transaction has no established deployment liability.
+    UnmatchedCash {
+        transaction_ref: String,
+        contract_ref: Option<String>,
+        action: CashAction,
+        amount: Decimal,
+    },
     PossiblySent,
     /// The terminal cashflow booked at settlement and the entry it followed; only a
     /// reconciliation that states the same settlement, with evidence no earlier than that entry,
@@ -1842,7 +2325,7 @@ struct Obligation {
     paid_basis: Decimal,
     worst_loss: Decimal,
     split: Option<String>,
-    /// The decision time the command was dispatched at.
+    /// The decision time the command was prepared at.
     sent_micros: i64,
     entry_time_micros: Option<i64>,
     entry_price_units: Option<i64>,
@@ -1860,13 +2343,26 @@ struct Obligation {
     /// again from the quote tick.
     #[serde(skip)]
     continuity_micros: Option<i64>,
+    #[serde(skip_serializing_if = "is_historical_terms")]
+    terms: ContractTerms,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    liability: Option<BrokerLiability>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    terminal: Option<TerminalFact>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    start_micros: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    terminal_source: Option<EventSource>,
 }
 
 impl Obligation {
     /// The earliest time settlement evidence can carry: the entry, or the dispatch while no
     /// acceptance is proved.
     fn evidence_bound(&self) -> i64 {
-        self.entry_time_micros.unwrap_or(self.sent_micros)
+        self.liability.as_ref().map_or_else(
+            || self.entry_time_micros.unwrap_or(self.sent_micros),
+            |liability| liability.purchase_time_micros,
+        )
     }
 }
 
@@ -1876,6 +2372,14 @@ struct SettlementPostings {
     credit: Decimal,
     profit: Decimal,
     release: Decimal,
+    discrepancy: bool,
+    deficit: Option<Decimal>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PurchasePostings {
+    debit: Decimal,
+    reservation: Decimal,
     discrepancy: bool,
     deficit: Option<Decimal>,
 }
@@ -1904,10 +2408,12 @@ pub struct Group {
     pub unresolved: u64,
     pub open: u64,
     pub profit: BTreeMap<String, Option<Decimal>>,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub externally_closed: u64,
 }
 
 impl Group {
-    fn add_profit(&mut self, currency: &Currency, profit: Decimal) {
+    pub(crate) fn add_profit(&mut self, currency: &str, profit: Decimal) {
         let entry = self
             .profit
             .entry(currency.to_string())
@@ -1915,14 +2421,14 @@ impl Group {
         *entry = entry.and_then(|total| total.checked_add(profit).ok());
     }
 
-    fn close(&mut self, unresolved: bool) {
+    pub(crate) fn close(&mut self, unresolved: bool) {
         self.open -= 1;
         if unresolved {
             self.unresolved -= 1;
         }
     }
 
-    fn outcome(&mut self, outcome: Outcome) {
+    pub(crate) fn outcome(&mut self, outcome: Outcome) {
         self.settled += 1;
         match outcome {
             Outcome::Win => self.wins += 1,
@@ -2051,6 +2557,21 @@ struct GroupKey {
     split: Option<String>,
 }
 
+struct TransactionRecord {
+    fact: CashFact,
+    pending: bool,
+    source: Option<EventSource>,
+}
+
+#[derive(Serialize)]
+struct ClosedContract {
+    evidence_bound_micros: i64,
+    confirmed: [Option<i64>; 4],
+    outcome: Option<Outcome>,
+    status: Option<TerminalStatus>,
+    transaction_ref: Option<String>,
+}
+
 /// The one chronological and financial owner.
 pub struct Engine {
     definition: RunDefinition,
@@ -2068,6 +2589,11 @@ pub struct Engine {
     instruments: Vec<InstrumentState>,
     accounts: Vec<AccountState>,
     obligations: BTreeMap<String, Obligation>,
+    proposals: Vec<Option<Proposal>>,
+    transactions: BTreeMap<(String, String), TransactionRecord>,
+    terminals: BTreeMap<String, TerminalFact>,
+    purchases: BTreeMap<String, (Decimal, BrokerLiability)>,
+    closed_confirmed: BTreeMap<String, ClosedContract>,
     open_by_binding: HashMap<usize, u32>,
     open_by_duration: HashMap<i64, u32>,
     open_by_instrument: HashMap<usize, u32>,
@@ -2098,11 +2624,23 @@ impl Engine {
     pub fn new(definition: RunDefinition) -> Result<Self, String> {
         let replay = &definition.replay;
         validate(replay)?;
-        if definition.schema_version != REPLAY_SCHEMA_VERSION {
+        if !matches!(
+            definition.schema_version,
+            REPLAY_SCHEMA_VERSION | REPLAY_SCHEMA_VERSION_BROKER
+        ) {
             return Err(format!(
-                "unsupported definition schema_version {}, expected {REPLAY_SCHEMA_VERSION}",
+                "unsupported definition schema_version {}, expected {REPLAY_SCHEMA_VERSION} or {REPLAY_SCHEMA_VERSION_BROKER}",
                 definition.schema_version
             ));
+        }
+        let broker = replay.bindings.iter().any(|binding| {
+            replay.contracts.iter().any(|terms| {
+                terms.id == binding.contract
+                    && terms.settlement.rule == SettlementRule::BrokerAuthoritativeV1
+            })
+        });
+        if broker != (definition.schema_version == REPLAY_SCHEMA_VERSION_BROKER) {
+            return Err("definition schema_version 1 forbids broker_authoritative_v1 bindings; schema_version 2 requires one".into());
         }
         if definition.instruments.len() != replay.inputs.len() {
             return Err(
@@ -2352,6 +2890,11 @@ impl Engine {
             instruments,
             accounts,
             obligations: BTreeMap::new(),
+            proposals: vec![None; replay.bindings.len()],
+            transactions: BTreeMap::new(),
+            terminals: BTreeMap::new(),
+            purchases: BTreeMap::new(),
+            closed_confirmed: BTreeMap::new(),
             open_by_binding: HashMap::new(),
             open_by_duration: HashMap::new(),
             open_by_instrument: HashMap::new(),
@@ -2468,12 +3011,43 @@ impl Engine {
             accounts: &'a [AccountState],
             obligations: &'a BTreeMap<String, Obligation>,
             open_total: u32,
+            #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+            pending_cash: BTreeMap<String, &'a CashFact>,
+            #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+            cash_seen: BTreeMap<String, &'a CashFact>,
+            #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+            cash_sources: BTreeMap<String, &'a EventSource>,
+            #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+            terminals: &'a BTreeMap<String, TerminalFact>,
+            #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+            purchases: &'a BTreeMap<String, (Decimal, BrokerLiability)>,
+            #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+            closed_confirmed: &'a BTreeMap<String, ClosedContract>,
         }
         let state = State {
             sequence: self.sequence,
             accounts: &self.accounts,
             obligations: &self.obligations,
             open_total: self.open_total,
+            pending_cash: self
+                .transactions
+                .values()
+                .filter(|r| r.pending)
+                .map(|r| (r.fact.block_key(), &r.fact))
+                .collect(),
+            cash_seen: self
+                .transactions
+                .values()
+                .map(|r| (r.fact.block_key(), &r.fact))
+                .collect(),
+            cash_sources: self
+                .transactions
+                .values()
+                .filter_map(|r| r.source.as_ref().map(|source| (r.fact.block_key(), source)))
+                .collect(),
+            terminals: &self.terminals,
+            purchases: &self.purchases,
+            closed_confirmed: &self.closed_confirmed,
         };
         let mut hasher = Sha256::new();
         hasher.update(STATE_DOMAIN_V1);
@@ -2523,7 +3097,7 @@ impl Engine {
             .ok_or_else(|| format!("{command} is not an open obligation"))?;
         let binding = &self.bindings[obligation.binding];
         Ok((
-            &self.definition.replay.contracts[binding.contract],
+            &obligation.terms,
             self.accounts[binding.account].scale,
             binding.account,
         ))
@@ -2562,8 +3136,16 @@ impl Engine {
         self.now = time;
         self.advance_pauses()?;
         let mut installed: Vec<(usize, usize)> = Vec::new();
-        for observation in observations {
-            if let Some((key, payload)) = observation.external() {
+        let mut observations = observations.into_iter();
+        loop {
+            // Also completes an interrupted evidence pair before a restored engine continues.
+            self.settle_pending()?;
+            let Some(observation) = observations.next() else {
+                break;
+            };
+            if let Some((key, payload)) =
+                observation.external(self.definition.schema_version == REPLAY_SCHEMA_VERSION_BROKER)
+            {
                 match self.externals.get(&key) {
                     Some(seen) if *seen == payload => continue,
                     Some(_) => {
@@ -2575,6 +3157,38 @@ impl Engine {
                 }
             }
             match observation {
+                Observation::Proposal { binding, proposal } => {
+                    self.observe_proposal(&binding, proposal)?
+                }
+                Observation::Purchased {
+                    command,
+                    source,
+                    debit,
+                    liability,
+                } => self.observe_purchased(command, source, debit, liability)?,
+                Observation::ContractUpdate {
+                    command,
+                    source,
+                    entry_price_units,
+                    entry_time_micros,
+                    start_micros,
+                    expiry_micros,
+                } => self.observe_confirmed(
+                    command,
+                    source,
+                    [
+                        entry_price_units,
+                        entry_time_micros,
+                        start_micros,
+                        expiry_micros,
+                    ],
+                )?,
+                Observation::Terminal {
+                    command,
+                    source,
+                    fact,
+                } => self.observe_terminal(command, source, fact)?,
+                Observation::Cash { source, fact } => self.observe_cash(source, fact)?,
                 Observation::Tick {
                     instrument,
                     provider_time_micros,
@@ -2717,7 +3331,9 @@ impl Engine {
         let commands: Vec<String> = self
             .obligations
             .iter()
-            .filter(|(_, obligation)| obligation.unresolved.is_none())
+            .filter(|(_, obligation)| {
+                obligation.unresolved.is_none() && is_historical_terms(&obligation.terms)
+            })
             .map(|(command, _)| command.clone())
             .collect();
         for command in commands {
@@ -2732,6 +3348,8 @@ impl Engine {
                         format_event_time_micros(self.now)
                     ),
                     path,
+                    terminal: None,
+                    source: None,
                 },
             )?;
         }
@@ -2818,6 +3436,19 @@ impl Engine {
         let Some(obligation) = self.obligations.get(command) else {
             return Ok(false);
         };
+        if obligation.terms.settlement.rule == SettlementRule::BrokerAuthoritativeV1 {
+            if obligation.unresolved.is_some() {
+                return Ok(false);
+            }
+            let Some(anchor) = obligation.continuity_micros else {
+                return Ok(false);
+            };
+            self.obligations
+                .get_mut(command)
+                .expect("present")
+                .continuity_micros = Some(time.max(anchor));
+            return Ok(true);
+        }
         let (Some(entry_time), Some(entry_price), Some(due), Some(mut path), Some(anchor), None) = (
             obligation.entry_time_micros,
             obligation.entry_price_units,
@@ -2828,8 +3459,7 @@ impl Engine {
         ) else {
             return Ok(false);
         };
-        let contract =
-            &self.definition.replay.contracts[self.bindings[obligation.binding].contract];
+        let contract = &obligation.terms;
         let settlement = contract.settlement;
         let direction = contract.direction;
         // Ticks at or before the entry are continuity evidence, not path evidence.
@@ -2859,6 +3489,8 @@ impl Engine {
                         settlement.max_tick_gap_micros
                     ),
                     path: Some(path),
+                    terminal: None,
+                    source: None,
                 },
             )?;
             return Ok(false);
@@ -2877,6 +3509,8 @@ impl Engine {
                         settlement.max_settlement_delay_micros
                     ),
                     path: Some(path),
+                    terminal: None,
+                    source: None,
                 },
             )?;
             return Ok(false);
@@ -2915,6 +3549,795 @@ impl Engine {
         Ok(false)
     }
 
+    fn validate_proposal(&self, index: usize, proposal: &Proposal, now: i64) -> Result<(), String> {
+        let binding = &self.bindings[index];
+        let template = &self.definition.replay.contracts[binding.contract];
+        let terms = &proposal.terms;
+        if proposal.account != self.accounts[binding.account].id
+            || proposal.instrument != self.definition.instruments[binding.instrument].instrument
+            || proposal.request_identity != proposal.canonical_request_identity()?
+            || template.settlement.rule != SettlementRule::BrokerAuthoritativeV1
+            || terms.id != proposal.identity
+            || terms.direction != template.direction
+            || terms.duration_micros != template.duration_micros
+            || terms.currency != template.currency
+            || terms.stake.compare(template.stake)? != Ordering::Equal
+            || terms.settlement != template.settlement
+            || terms.semantics != template.semantics
+        {
+            return Err(format!(
+                "{} proposal disagrees with its contract request",
+                binding.id
+            ));
+        }
+        identifier("proposal.identity", &proposal.identity)?;
+        positive("proposal.quoted_cost", terms.quoted_cost)?;
+        let scale = self.accounts[binding.account].scale;
+        for amount in [
+            terms.quoted_cost,
+            terms.entry_fee,
+            terms.win.gross_return,
+            terms.win.terminal_fee,
+            terms.loss.gross_return,
+            terms.loss.terminal_fee,
+            terms.tie.gross_return,
+            terms.tie.terminal_fee,
+        ] {
+            non_negative("proposal economics", amount)?;
+            amount.rescale(scale)?;
+        }
+        if [terms.loss, terms.tie]
+            .iter()
+            .any(|cash| !cash.gross_return.is_zero())
+        {
+            return Err(format!(
+                "{} rise_fall_strict_v1 loss and tie returns must be zero",
+                binding.id
+            ));
+        }
+        if proposal.spot_time_micros > proposal.receipt_micros || proposal.receipt_micros > now {
+            return Err(format!("{} proposal clocks are inconsistent", binding.id));
+        }
+        Ok(())
+    }
+
+    fn observe_proposal(&mut self, binding: &str, proposal: Proposal) -> Result<(), String> {
+        let index = *self
+            .binding_index
+            .get(binding)
+            .ok_or_else(|| format!("unknown binding `{binding}`"))?;
+        self.validate_proposal(index, &proposal, self.now)?;
+        if let Some(current) = &self.proposals[index] {
+            if current.same_fact(&proposal)? {
+                return Ok(());
+            }
+            if proposal.receipt_micros < current.receipt_micros {
+                return Err(format!(
+                    "{binding} proposal receipt precedes the installed proposal"
+                ));
+            }
+        }
+        self.proposals[index] = Some(proposal);
+        Ok(())
+    }
+
+    fn purchase_postings(
+        &self,
+        command: &str,
+        debit: Decimal,
+        liability: &BrokerLiability,
+    ) -> Result<PurchasePostings, String> {
+        let (terms, scale, _) = self.terms(command)?;
+        if terms.settlement.rule != SettlementRule::BrokerAuthoritativeV1 {
+            return Err(format!(
+                "{command} purchase requires broker_authoritative_v1"
+            ));
+        }
+        identifier("purchase.contract_ref", &liability.contract_ref)?;
+        identifier("purchase.transaction_ref", &liability.transaction_ref)?;
+        non_negative("purchase.debit", debit)?;
+        non_negative("purchase.payout", liability.payout)?;
+        liability.payout.rescale(scale)?;
+        let debit = debit.rescale(scale)?;
+        let expected = terms.purchase()?.rescale(scale)?;
+        let excess = debit.checked_sub(expected)?;
+        Ok(PurchasePostings {
+            debit,
+            reservation: terms.terminal_reserve()?.rescale(scale)?,
+            discrepancy: debit.compare(expected)? != Ordering::Equal
+                || liability.payout.compare(terms.win.gross_return)? != Ordering::Equal,
+            deficit: (excess.compare(Decimal::zero(scale))? == Ordering::Greater).then_some(excess),
+        })
+    }
+
+    fn observe_purchased(
+        &mut self,
+        command: String,
+        source: EventSource,
+        debit: Decimal,
+        liability: BrokerLiability,
+    ) -> Result<(), String> {
+        check_source(&source, self.now)?;
+        if let Some((known, existing)) = self.purchases.get(&command) {
+            return if known.compare(debit)? == Ordering::Equal
+                && same_liability(existing, &liability)?
+            {
+                Ok(())
+            } else {
+                Err(format!(
+                    "{command} purchase contradicts the recorded liability"
+                ))
+            };
+        }
+        let postings = self.purchase_postings(&command, debit, &liability)?;
+        self.require_unaccepted(&command)?;
+        self.emit(
+            self.now,
+            EventKind::Accepted {
+                command,
+                source,
+                entry_time_micros: None,
+                entry_price_units: None,
+                price_time_micros: None,
+                due_time_micros: None,
+                debit: postings.debit,
+                reservation: postings.reservation,
+                liability: Some(liability),
+                discrepancy: postings.discrepancy,
+                deficit: postings.deficit,
+            },
+        )
+    }
+
+    fn apply_purchase(
+        &mut self,
+        command: &str,
+        liability: &BrokerLiability,
+        postings: PurchasePostings,
+    ) -> Result<(), String> {
+        let obligation = &self.obligations[command];
+        // Provider purchase clocks carry whole seconds, so a purchase is causal when it is no
+        // earlier than the second the command was prepared in.
+        let dispatch_second = obligation.sent_micros - obligation.sent_micros.rem_euclid(1_000_000);
+        if liability.purchase_time_micros < dispatch_second
+            || liability.purchase_time_micros > self.now
+        {
+            return Err(format!(
+                "{command} acceptance clocks are inconsistent: purchase {}, dispatch {}, decision {}",
+                liability.purchase_time_micros, obligation.sent_micros, self.now
+            ));
+        }
+        let binding = obligation.binding;
+        let account_index = self.bindings[binding].account;
+        if self.purchases.iter().any(|(other, (_, known))| {
+            other != command
+                && self.command_account(other) == account_index
+                && known.transaction_ref == liability.transaction_ref
+        }) {
+            return Err(format!(
+                "{command} purchase transaction {} is already booked",
+                liability.transaction_ref
+            ));
+        }
+        if self.obligations.iter().any(|(other, obligation)| {
+            other != command
+                && self.bindings[obligation.binding].account == account_index
+                && obligation
+                    .liability
+                    .as_ref()
+                    .is_some_and(|known| known.contract_ref == liability.contract_ref)
+        }) {
+            return Err(format!(
+                "{command} contract {} already belongs to another obligation",
+                liability.contract_ref
+            ));
+        }
+        let account = &self.accounts[account_index];
+        if let Some(known) = self
+            .transactions
+            .get(&(account.id.clone(), liability.transaction_ref.clone()))
+            && !matches_purchase(&known.fact, &account.id, postings.debit, liability)?
+        {
+            return Err(format!(
+                "transaction {} contradicts the purchase",
+                liability.transaction_ref
+            ));
+        }
+        let worst = postings
+            .debit
+            .checked_add(obligation.terms.worst_terminal()?)?
+            .max(Decimal::zero(account.scale))?
+            .rescale(account.scale)?;
+        let delta = worst.checked_sub(obligation.worst_loss)?;
+        let maximum = obligation.terms.purchase()?.rescale(account.scale)?;
+        let expected_payout = obligation.terms.win.gross_return;
+        let release = obligation.reservation.checked_sub(postings.reservation)?;
+        let obligation = self.open_obligation(command)?;
+        let unresolved = obligation.unresolved.take().is_some();
+        obligation.state = ObligationState::Accepted;
+        obligation.paid_basis = postings.debit;
+        obligation.reservation = postings.reservation;
+        obligation.worst_loss = worst;
+        obligation.liability = Some(liability.clone());
+        let split = obligation.split.clone();
+        let account = &mut self.accounts[account_index];
+        account.cash = account.cash.checked_sub(postings.debit)?;
+        account.paid_basis = account.paid_basis.checked_add(postings.debit)?;
+        account.reserved = account.reserved.checked_sub(release)?;
+        account.unresolved_loss = account.unresolved_loss.checked_add(delta)?;
+        account.blocked.remove(command);
+        if postings.discrepancy || postings.deficit.is_some() {
+            account.blocked.insert(
+                command.to_string(),
+                Block::Purchased {
+                    debit: postings.debit,
+                    maximum,
+                    payout: liability.payout,
+                    expected_payout,
+                },
+            );
+        }
+        if let Some(record) = self
+            .transactions
+            .get_mut(&(account.id.clone(), liability.transaction_ref.clone()))
+        {
+            record.pending = false;
+            record.source = None;
+        }
+        account.blocked.remove(&format!(
+            "transaction:{}:{}",
+            account.id, liability.transaction_ref
+        ));
+        self.purchases
+            .insert(command.to_string(), (postings.debit, liability.clone()));
+        self.refresh_cash_blocks();
+        let key = self.keys(binding, split.as_deref());
+        for group in self.groups(&key) {
+            group.accepted += 1;
+            if unresolved {
+                group.unresolved -= 1;
+            }
+        }
+        Ok(())
+    }
+
+    fn confirmed_fields(
+        &self,
+        command: &str,
+        fields: [Option<i64>; 4],
+    ) -> Result<[Option<i64>; 4], String> {
+        let closed = self.closed_confirmed.get(command);
+        let (evidence_bound, known) = if let Some(closed) = closed {
+            (closed.evidence_bound_micros, closed.confirmed)
+        } else {
+            self.require(command, ObligationState::Accepted)?;
+            let obligation = &self.obligations[command];
+            (
+                obligation
+                    .liability
+                    .as_ref()
+                    .ok_or_else(|| format!("{command} has no broker liability"))?
+                    .purchase_time_micros,
+                [
+                    obligation.entry_price_units,
+                    obligation.entry_time_micros,
+                    obligation.start_micros,
+                    obligation.due_time_micros,
+                ],
+            )
+        };
+        let names = [
+            "entry_price_units",
+            "entry_time_micros",
+            "start_micros",
+            "expiry_micros",
+        ];
+        let mut learned = [None; 4];
+        for index in 0..4 {
+            match (fields[index], known[index]) {
+                (Some(new), Some(old)) if new != old => {
+                    let recorded = if closed.is_some() {
+                        "its closed contract: recorded"
+                    } else {
+                        "recorded"
+                    };
+                    return Err(format!(
+                        "{command} confirmed {} {new} contradicts {recorded} {old}",
+                        names[index]
+                    ));
+                }
+                (Some(new), None) => learned[index] = Some(new),
+                _ => {}
+            }
+        }
+        let entry = fields[1].or(known[1]);
+        let start = fields[2].or(known[2]);
+        let expiry = fields[3].or(known[3]);
+        if entry.is_some_and(|entry| entry < evidence_bound || entry > self.now)
+            || start.is_some_and(|start| start < evidence_bound || start > self.now)
+            || start
+                .zip(expiry)
+                .is_some_and(|(start, expiry)| expiry <= start)
+        {
+            return Err(format!(
+                "{command} confirmed clocks: update contradicts recorded purchase/dispatch {evidence_bound} or start {start:?}"
+            ));
+        }
+        Ok(if closed.is_some() { [None; 4] } else { learned })
+    }
+
+    fn observe_confirmed(
+        &mut self,
+        command: String,
+        source: EventSource,
+        fields: [Option<i64>; 4],
+    ) -> Result<(), String> {
+        check_source(&source, self.now)?;
+        let [
+            entry_price_units,
+            entry_time_micros,
+            start_micros,
+            expiry_micros,
+        ] = self.confirmed_fields(&command, fields)?;
+        if [
+            entry_price_units,
+            entry_time_micros,
+            start_micros,
+            expiry_micros,
+        ]
+        .iter()
+        .all(Option::is_none)
+        {
+            return Ok(());
+        }
+        self.emit(
+            self.now,
+            EventKind::Confirmed {
+                command,
+                source,
+                entry_price_units,
+                entry_time_micros,
+                start_micros,
+                expiry_micros,
+            },
+        )
+    }
+
+    fn apply_confirmed_fields(
+        &mut self,
+        command: &str,
+        fields: [Option<i64>; 4],
+    ) -> Result<(), String> {
+        let [
+            entry_price_units,
+            entry_time_micros,
+            start_micros,
+            expiry_micros,
+        ] = fields;
+        let obligation = self.open_obligation(command)?;
+        obligation.entry_price_units = entry_price_units.or(obligation.entry_price_units);
+        obligation.entry_time_micros = entry_time_micros.or(obligation.entry_time_micros);
+        obligation.start_micros = start_micros.or(obligation.start_micros);
+        obligation.due_time_micros = expiry_micros.or(obligation.due_time_micros);
+        if obligation.continuity_micros.is_none()
+            && let (Some(entry), Some(_)) =
+                (obligation.entry_time_micros, obligation.entry_price_units)
+        {
+            obligation.continuity_micros = Some(entry);
+            let binding = obligation.binding;
+            if obligation.unresolved.is_none() {
+                self.instruments[self.bindings[binding].instrument]
+                    .tracked
+                    .push(command.to_string());
+            }
+        }
+        Ok(())
+    }
+
+    fn merged_terminal(
+        &self,
+        command: &str,
+        source: &EventSource,
+        fact: &TerminalFact,
+    ) -> Result<TerminalFact, String> {
+        let evidence_bound = self
+            .closed_confirmed
+            .get(command)
+            .map_or_else(
+                || {
+                    self.purchases
+                        .get(command)
+                        .map(|(_, liability)| liability.purchase_time_micros)
+                },
+                |closed| Some(closed.evidence_bound_micros),
+            )
+            .ok_or_else(|| format!("{command} has no broker liability"))?;
+        if let Some(closed) = self.closed_confirmed.get(command) {
+            if let Some(outcome) = closed.outcome
+                && !matches!(
+                    (outcome, fact.status),
+                    (Outcome::Win, TerminalStatus::Won) | (Outcome::Loss, TerminalStatus::Lost)
+                )
+            {
+                return Err(format!(
+                    "{command} terminal {} contradicts recorded outcome {outcome}",
+                    fact.status
+                ));
+            }
+            if let Some(status) = closed.status
+                && status != fact.status
+            {
+                return Err(format!(
+                    "{command} terminal {} contradicts recorded status {status}",
+                    fact.status
+                ));
+            }
+            if let Some(reference) = &closed.transaction_ref
+                && fact
+                    .transaction_ref
+                    .as_ref()
+                    .is_some_and(|new| new != reference)
+            {
+                return Err(format!(
+                    "{command} terminal transaction_ref {:?} contradicts recorded cash transaction {reference}",
+                    fact.transaction_ref
+                ));
+            }
+        }
+        if let Some(known) = self.terminals.get(command) {
+            if known.status != fact.status {
+                return Err(format!(
+                    "{command} terminal {} contradicts recorded terminal status {}",
+                    fact.status, known.status
+                ));
+            }
+            for (name, new, old) in [
+                (
+                    "exit_price_units",
+                    fact.exit_price_units,
+                    known.exit_price_units,
+                ),
+                (
+                    "exit_time_micros",
+                    fact.exit_time_micros,
+                    known.exit_time_micros,
+                ),
+            ] {
+                if let (Some(new), Some(old)) = (new, old)
+                    && new != old
+                {
+                    return Err(format!(
+                        "{command} terminal {name} {new} contradicts recorded {old}"
+                    ));
+                }
+            }
+            if let (Some(new), Some(old)) = (&fact.transaction_ref, &known.transaction_ref)
+                && new != old
+            {
+                return Err(format!(
+                    "{command} terminal transaction_ref {new} contradicts recorded {old}"
+                ));
+            }
+        }
+        if fact
+            .exit_time_micros
+            .is_some_and(|exit| exit < evidence_bound || exit > source.provider_time_micros)
+        {
+            return Err(format!(
+                "{command} terminal clocks contradict recorded purchase/dispatch {evidence_bound} or source {}",
+                source.provider_time_micros
+            ));
+        }
+        let Some(known) = self.terminals.get(command) else {
+            return Ok(fact.clone());
+        };
+        Ok(TerminalFact {
+            status: known.status,
+            exit_price_units: known.exit_price_units.or(fact.exit_price_units),
+            exit_time_micros: known.exit_time_micros.or(fact.exit_time_micros),
+            transaction_ref: known
+                .transaction_ref
+                .clone()
+                .or_else(|| fact.transaction_ref.clone()),
+        })
+    }
+
+    fn observe_terminal(
+        &mut self,
+        command: String,
+        source: EventSource,
+        fact: TerminalFact,
+    ) -> Result<(), String> {
+        check_source(&source, self.now)?;
+        let fact = self.merged_terminal(&command, &source, &fact)?;
+        if self.terminals.get(&command) == Some(&fact) {
+            return Ok(());
+        }
+        let path = if self.obligations.contains_key(&command) {
+            self.broker_path(&command, &fact)?
+        } else {
+            None
+        };
+        let evidence = if self.terminals.contains_key(&command)
+            || self.closed_confirmed.contains_key(&command)
+        {
+            format!("terminal {} evidence updated", fact.status)
+        } else {
+            format!(
+                "terminal {} awaits the matching cash transaction",
+                fact.status
+            )
+        };
+        self.emit(
+            self.now,
+            EventKind::Unresolved {
+                command,
+                reason: UnresolvedReason::AwaitingCash,
+                evidence,
+                path,
+                terminal: Some(fact),
+                source: Some(source),
+            },
+        )
+    }
+
+    fn cash_command(&self, fact: &CashFact) -> Option<String> {
+        self.obligations
+            .iter()
+            .find(|(_, obligation)| self.matches_sell(obligation, fact))
+            .map(|(command, _)| command.clone())
+    }
+
+    fn matches_sell(&self, obligation: &Obligation, fact: &CashFact) -> bool {
+        fact.action == CashAction::Sell
+            && self.accounts[self.bindings[obligation.binding].account].id == fact.account
+            && obligation.liability.as_ref().is_some_and(|liability| {
+                fact.contract_ref.as_deref() == Some(&liability.contract_ref)
+            })
+            && obligation.terminal.as_ref().is_none_or(|terminal| {
+                terminal
+                    .transaction_ref
+                    .as_ref()
+                    .is_none_or(|reference| *reference == fact.transaction_ref)
+            })
+    }
+
+    fn check_cash(&self, source: &EventSource, fact: &CashFact) -> Result<usize, String> {
+        check_source(source, self.now)?;
+        let account = self
+            .accounts
+            .iter()
+            .position(|account| account.id == fact.account)
+            .ok_or_else(|| format!("unknown account `{}`", fact.account))?;
+        identifier("cash.transaction_ref", &fact.transaction_ref)?;
+        fact.amount.rescale(self.accounts[account].scale)?;
+        if fact.time_micros > source.provider_time_micros {
+            return Err(format!(
+                "transaction {} time is after its source",
+                fact.transaction_ref
+            ));
+        }
+        if fact.action == CashAction::Sell {
+            non_negative("cash sell amount", fact.amount)?;
+        }
+        Ok(account)
+    }
+
+    fn observe_cash(&mut self, source: EventSource, fact: CashFact) -> Result<(), String> {
+        self.check_cash(&source, &fact)?;
+        if let Some(known) = self.transactions.get(&fact.key()) {
+            return if same_cash(&known.fact, &fact)? {
+                Ok(())
+            } else {
+                Err(format!(
+                    "transaction {} arrived again with a different cash fact",
+                    fact.transaction_ref
+                ))
+            };
+        }
+        if self.check_purchase_cash(&fact)? {
+            return Ok(());
+        }
+        let matched = (fact.action == CashAction::Sell)
+            .then(|| self.cash_command(&fact))
+            .flatten();
+        self.emit(
+            self.now,
+            EventKind::CashObserved {
+                source,
+                fact,
+                matched,
+            },
+        )
+    }
+
+    fn command_account(&self, command: &str) -> usize {
+        let (binding, _) = command.rsplit_once('/').expect("prepared command");
+        self.bindings[self.binding_index[binding]].account
+    }
+
+    /// Purchase identity and debit prove a buy, without assuming its transaction clock.
+    fn check_purchase_cash(&self, fact: &CashFact) -> Result<bool, String> {
+        let Some((command, (debit, liability))) =
+            self.purchases.iter().find(|(command, (_, liability))| {
+                self.accounts[self.command_account(command)].id == fact.account
+                    && liability.transaction_ref == fact.transaction_ref
+            })
+        else {
+            return Ok(false);
+        };
+        let (binding, _) = command.rsplit_once('/').expect("prepared command");
+        let account = &self.accounts[self.bindings[self.binding_index[binding]].account];
+        if !matches_purchase(fact, &account.id, *debit, liability)? {
+            return Err(format!(
+                "transaction {} contradicts the recorded purchase",
+                fact.transaction_ref
+            ));
+        }
+        Ok(true)
+    }
+
+    fn matching_cash_of(&self, obligation: &Obligation) -> Option<(String, String)> {
+        let mut matches = self
+            .transactions
+            .values()
+            .filter(|record| record.pending)
+            .map(|record| &record.fact)
+            .filter(|cash| self.matches_sell(obligation, cash));
+        let first = matches.next()?;
+        matches.next().is_none().then(|| first.key())
+    }
+
+    /// A terminal reference establishes which pending sell belongs to this liability.
+    fn refresh_cash_blocks(&mut self) {
+        for fact in self
+            .transactions
+            .values()
+            .filter(|record| record.pending)
+            .map(|record| &record.fact)
+            .filter(|fact| fact.action == CashAction::Sell)
+        {
+            let command = self.cash_command(fact);
+            let matched = command.as_ref().is_some_and(|command| {
+                let obligation = &self.obligations[command];
+                obligation.terminal.is_none()
+                    || self.matching_cash_of(obligation).as_ref() == Some(&fact.key())
+            });
+            let account = self
+                .accounts
+                .iter_mut()
+                .find(|account| account.id == fact.account)
+                .expect("checked cash account");
+            let key = fact.block_key();
+            if matched {
+                account.blocked.remove(&key);
+            } else {
+                account.blocked.insert(
+                    key,
+                    Block::UnmatchedCash {
+                        transaction_ref: fact.transaction_ref.clone(),
+                        contract_ref: fact.contract_ref.clone(),
+                        action: fact.action,
+                        amount: fact.amount,
+                    },
+                );
+            }
+        }
+    }
+
+    fn matching_cash(&self, command: &str) -> Option<&CashFact> {
+        let transaction = self.matching_cash_of(self.obligations.get(command)?)?;
+        self.transactions
+            .get(&transaction)
+            .map(|record| &record.fact)
+    }
+
+    fn broker_source(&self, command: &str, cash: &CashFact) -> EventSource {
+        let obligation = &self.obligations[command];
+        let terminal = obligation.terminal.as_ref().expect("terminal matched");
+        let terminal_source = obligation
+            .terminal_source
+            .as_ref()
+            .expect("terminal recorded");
+        let cash_source = self.transactions[&cash.key()]
+            .source
+            .as_ref()
+            .expect("pending sell source");
+        EventSource {
+            id: format!("{}+{}", terminal_source.id, cash_source.id),
+            provider_time_micros: terminal.exit_time_micros.unwrap_or(cash.time_micros),
+            available_at_micros: self.now,
+            simulated: false,
+        }
+    }
+
+    fn broker_path(
+        &self,
+        command: &str,
+        terminal: &TerminalFact,
+    ) -> Result<Option<PathMetrics>, String> {
+        let obligation = &self.obligations[command];
+        let (Some(entry_price), Some(entry_time), Some(exit_price), Some(exit_time)) = (
+            obligation.entry_price_units,
+            obligation.entry_time_micros,
+            terminal.exit_price_units,
+            terminal.exit_time_micros,
+        ) else {
+            return Ok(None);
+        };
+        let mut path = PathMetrics::new(entry_time);
+        path.observe(
+            exit_time,
+            signed_move(entry_price, exit_price, obligation.terms.direction)?,
+        );
+        Ok(Some(path))
+    }
+
+    /// Completes recorded evidence pairs, including a restored prefix interrupted before posting.
+    fn settle_pending(&mut self) -> Result<(), String> {
+        let commands: Vec<String> = self
+            .obligations
+            .iter()
+            .filter(|(command, obligation)| {
+                obligation.terminal.is_some() && self.matching_cash(command).is_some()
+            })
+            .map(|(command, _)| command.clone())
+            .collect();
+        for command in commands {
+            let cash = self.matching_cash(&command).expect("matched").clone();
+            let fact = self.obligations[&command]
+                .terminal
+                .as_ref()
+                .expect("matched")
+                .clone();
+            let source = self.broker_source(&command, &cash);
+            let (_, _, account) = self.terms(&command)?;
+            match fact.status {
+                TerminalStatus::Won | TerminalStatus::Lost => {
+                    let outcome = if fact.status == TerminalStatus::Won {
+                        Outcome::Win
+                    } else {
+                        Outcome::Loss
+                    };
+                    let terminal_fee = Decimal::zero(cash.amount.scale());
+                    let postings =
+                        self.settlement_postings(&command, outcome, cash.amount, terminal_fee)?;
+                    let path = self.broker_path(&command, &fact)?;
+                    self.emit(
+                        self.now,
+                        EventKind::Settled {
+                            command,
+                            settlement_time_micros: source.provider_time_micros,
+                            source,
+                            settlement_price_units: fact.exit_price_units,
+                            outcome,
+                            gross_return: cash.amount,
+                            terminal_fee,
+                            credit: postings.credit,
+                            profit: postings.profit,
+                            release: postings.release,
+                            discrepancy: postings.discrepancy,
+                            deficit: postings.deficit,
+                            path,
+                            transaction_ref: Some(cash.transaction_ref),
+                        },
+                    )?;
+                    self.maybe_pause(account)?;
+                }
+                TerminalStatus::Sold | TerminalStatus::Cancelled => self.observe_reconciliation(
+                    command,
+                    source,
+                    Resolution::ExternallyClosed {
+                        status: fact.status,
+                        gross_return: cash.amount,
+                        terminal_fee: Decimal::zero(cash.amount.scale()),
+                    },
+                )?,
+            }
+        }
+        Ok(())
+    }
+
     fn require(&self, command: &str, state: ObligationState) -> Result<(), String> {
         match self.obligations.get(command) {
             Some(obligation) if obligation.state == state => Ok(()),
@@ -2945,6 +4368,11 @@ impl Engine {
         entry_time_micros: i64,
     ) -> Result<(Decimal, Decimal, i64), String> {
         let (contract, scale, _) = self.terms(command)?;
+        if contract.settlement.rule != SettlementRule::PriceAtDueV1 {
+            return Err(format!(
+                "{command} broker_authoritative_v1 requires a purchased liability"
+            ));
+        }
         Ok((
             contract.purchase()?.rescale(scale)?,
             contract.terminal_reserve()?.rescale(scale)?,
@@ -2969,12 +4397,15 @@ impl Engine {
             EventKind::Accepted {
                 command,
                 source,
-                entry_time_micros,
-                entry_price_units,
-                price_time_micros,
-                due_time_micros,
+                entry_time_micros: Some(entry_time_micros),
+                entry_price_units: Some(entry_price_units),
+                price_time_micros: Some(price_time_micros),
+                due_time_micros: Some(due_time_micros),
                 debit,
                 reservation,
+                liability: None,
+                discrepancy: false,
+                deficit: None,
             },
         )
     }
@@ -3062,7 +4493,7 @@ impl Engine {
                 command: command.to_string(),
                 source,
                 settlement_time_micros,
-                settlement_price_units,
+                settlement_price_units: Some(settlement_price_units),
                 outcome,
                 gross_return,
                 terminal_fee,
@@ -3071,7 +4502,8 @@ impl Engine {
                 release: postings.release,
                 discrepancy: postings.discrepancy,
                 deficit: postings.deficit,
-                path,
+                path: Some(path),
+                transaction_ref: None,
             },
         )?;
         self.maybe_pause(account)
@@ -3132,6 +4564,46 @@ impl Engine {
         let zero = Decimal::zero(scale);
         let accepted = obligation.state == ObligationState::Accepted;
         Ok(match resolution {
+            Resolution::External => {
+                return Err(format!(
+                    "{command} External requires an unmatched transaction block"
+                ));
+            }
+            Resolution::Purchased { debit, liability } => {
+                let postings = self.purchase_postings(command, *debit, liability)?;
+                if accepted {
+                    if !matches!(
+                        self.accounts[self.bindings[obligation.binding].account]
+                            .blocked
+                            .get(command),
+                        Some(Block::Purchased { .. })
+                    ) || postings.debit.compare(obligation.paid_basis)? != Ordering::Equal
+                        || !obligation
+                            .liability
+                            .as_ref()
+                            .map(|known| same_liability(known, liability))
+                            .transpose()?
+                            .unwrap_or(false)
+                    {
+                        return Err(format!(
+                            "{command} reconciliation contradicts the purchase already booked"
+                        ));
+                    }
+                    ReconciliationPostings {
+                        release: zero,
+                        debit: zero,
+                        credit: zero,
+                        profit: None,
+                    }
+                } else {
+                    ReconciliationPostings {
+                        release: obligation.reservation.checked_sub(postings.reservation)?,
+                        debit: postings.debit,
+                        credit: zero,
+                        profit: None,
+                    }
+                }
+            }
             Resolution::NotSent if accepted => {
                 return Err(format!("{command} was accepted and cannot be not sent"));
             }
@@ -3160,7 +4632,26 @@ impl Engine {
                 gross_return,
                 terminal_fee,
                 ..
+            }
+            | Resolution::ExternallyClosed {
+                gross_return,
+                terminal_fee,
+                ..
             } => {
+                self.check_closure_evidence(
+                    command,
+                    resolution,
+                    gross_return.checked_sub(*terminal_fee)?,
+                )?;
+                if let Resolution::ExternallyClosed { status, .. } = resolution
+                    && !matches!(status, TerminalStatus::Sold | TerminalStatus::Cancelled)
+                {
+                    return Err(format!(
+                        "{command} externally_closed requires sold or cancelled"
+                    ));
+                }
+                non_negative("reconciliation.gross_return", *gross_return)?;
+                non_negative("reconciliation.terminal_fee", *terminal_fee)?;
                 let credit = gross_return.checked_sub(*terminal_fee)?.rescale(scale)?;
                 let (debit, basis) = if accepted {
                     (zero, obligation.paid_basis)
@@ -3177,6 +4668,60 @@ impl Engine {
         })
     }
 
+    /// Reconciliation can fill missing facts, but cannot replace recorded terminal or cash evidence.
+    fn check_closure_evidence(
+        &self,
+        command: &str,
+        resolution: &Resolution,
+        net_credit: Decimal,
+    ) -> Result<(), String> {
+        let obligation = &self.obligations[command];
+        if let Some(terminal) = &obligation.terminal {
+            let agrees = match (terminal.status, resolution) {
+                (
+                    TerminalStatus::Won,
+                    Resolution::Settled {
+                        outcome: Outcome::Win,
+                        ..
+                    },
+                )
+                | (
+                    TerminalStatus::Lost,
+                    Resolution::Settled {
+                        outcome: Outcome::Loss,
+                        ..
+                    },
+                ) => true,
+                (
+                    TerminalStatus::Sold | TerminalStatus::Cancelled,
+                    Resolution::ExternallyClosed { status, .. },
+                ) => *status == terminal.status,
+                _ => false,
+            };
+            if !agrees {
+                return Err(format!(
+                    "{command} reconciliation contradicts recorded terminal {}",
+                    terminal.status
+                ));
+            }
+        }
+        for cash in self
+            .transactions
+            .values()
+            .filter(|record| record.pending)
+            .map(|record| &record.fact)
+            .filter(|cash| self.matches_sell(obligation, cash))
+        {
+            if net_credit.compare(cash.amount)? != Ordering::Equal {
+                return Err(format!(
+                    "{command} reconciliation contradicts the recorded cash transaction {} amount {}",
+                    cash.transaction_ref, cash.amount
+                ));
+            }
+        }
+        Ok(())
+    }
+
     /// The account a settled discrepancy or deficit left blocked on `command`, when the
     /// command is no longer open.
     fn blocked_by(&self, command: &str) -> Option<usize> {
@@ -3185,8 +4730,19 @@ impl Engine {
             .position(|account| account.blocked.contains_key(command))
     }
 
-    /// The postings of reconciling `command`: those of its resolution while it is open, or
-    /// nothing when only a settled discrepancy's block remains.
+    /// Simultaneous purchase and settlement discrepancies keep distinct visible blocks.
+    fn reconciliation_block_key(&self, command: &str, resolution: &Resolution) -> String {
+        let settlement = format!("{command}\nsettlement");
+        if matches!(resolution, Resolution::Settled { .. })
+            && self.blocked_by(&settlement).is_some()
+        {
+            settlement
+        } else {
+            command.to_string()
+        }
+    }
+
+    /// The postings while open, or zero postings confirming a booked discrepancy.
     fn reconciliation_of(
         &self,
         command: &str,
@@ -3200,12 +4756,13 @@ impl Engine {
                 obligation.evidence_bound(),
             ));
         }
-        let account = self.blocked_by(command).ok_or_else(|| {
+        let block_key = self.reconciliation_block_key(command, resolution);
+        let account = self.blocked_by(&block_key).ok_or_else(|| {
             format!("{command} is neither an open obligation nor a settled discrepancy")
         })?;
         // A settled discrepancy has booked its cashflow; only the same settlement lifts the
         // block, because no corrective posting exists.
-        let matches = match (&self.accounts[account].blocked[command], resolution) {
+        let matches = match (&self.accounts[account].blocked[&block_key], resolution) {
             (
                 Block::Settled {
                     outcome,
@@ -3223,6 +4780,35 @@ impl Engine {
                 && terminal_fee.compare(*stated_fee)? == Ordering::Equal =>
             {
                 Some(*entry_time_micros)
+            }
+            (
+                Block::UnmatchedCash {
+                    transaction_ref, ..
+                },
+                Resolution::External,
+            ) if command
+                == format!(
+                    "transaction:{}:{transaction_ref}",
+                    self.accounts[account].id
+                ) =>
+            {
+                Some(i64::MIN)
+            }
+            (
+                Block::Purchased { debit, .. },
+                Resolution::Purchased {
+                    debit: stated,
+                    liability,
+                },
+            ) if debit.compare(*stated)? == Ordering::Equal
+                && self
+                    .purchases
+                    .get(command)
+                    .map(|(_, known)| same_liability(known, liability))
+                    .transpose()?
+                    .unwrap_or(false) =>
+            {
+                Some(liability.purchase_time_micros)
             }
             _ => None,
         };
@@ -3360,7 +4946,9 @@ impl Engine {
         let first_only = policy.same_entry == SameEntry::First;
         let deduplicate = policy.deduplicate_signal_logic;
         let scale = self.accounts[binding.account].scale;
-        let reservation = contract.reservation()?.rescale(scale)?;
+        let proposal = self.proposals[binding_index].as_ref();
+        let terms = proposal.map_or(contract, |proposal| &proposal.terms);
+        let reservation = terms.reservation()?.rescale(scale)?;
         let stream =
             self.definition.instruments[binding.instrument].streams[strategy.base_stream].stream;
         let logic_identity = strategy.logic.clone();
@@ -3398,6 +4986,7 @@ impl Engine {
             command: admitted.then(|| format!("{}/{close}", binding.id)),
             reservation: admitted.then_some(reservation),
             rates,
+            proposal: admitted.then(|| proposal.cloned()).flatten(),
         };
         self.emit(self.now, event)
     }
@@ -3430,7 +5019,22 @@ impl Engine {
         {
             return blocked(Disposition::GapAtEntry);
         }
-        self.financial_admission(binding_index, reservation)
+        let terms = if contract.settlement.rule == SettlementRule::BrokerAuthoritativeV1 {
+            let Some(proposal) = &self.proposals[binding_index] else {
+                return blocked(Disposition::NoProposal);
+            };
+            if self
+                .now
+                .checked_sub(proposal.receipt_micros)
+                .is_none_or(|age| age > policy.max_proposal_age_micros.expect("validated"))
+            {
+                return blocked(Disposition::StaleProposal);
+            }
+            &proposal.terms
+        } else {
+            contract
+        };
+        self.financial_admission(binding_index, terms, reservation)
     }
 
     /// The state-based admission checks, in order: account pause and block, the envelope, every
@@ -3440,10 +5044,10 @@ impl Engine {
     fn financial_admission(
         &self,
         binding_index: usize,
+        contract: &ContractTerms,
         reservation: Decimal,
     ) -> Result<(Disposition, Vec<String>), String> {
         let binding = &self.bindings[binding_index];
-        let contract = &self.definition.replay.contracts[binding.contract];
         let policy = &self.definition.replay.risk_policies[binding.policy];
         let account = &self.accounts[binding.account];
         let blocked = |disposition| Ok((disposition, Vec::new()));
@@ -3540,17 +5144,12 @@ impl Engine {
             time_micros,
             kind,
         };
-        if let Some(source) = event.kind.source()
-            && (source.provider_time_micros > source.available_at_micros
-                || source.available_at_micros > time_micros)
-        {
-            return Err(format!(
-                "external event `{}` is not available at {}",
-                source.id,
-                format_event_time_micros(time_micros)
-            ));
+        if let Some(source) = event.kind.source() {
+            check_source(source, time_micros)?;
         }
-        let external = event.kind.external();
+        let external = event
+            .kind
+            .external(self.definition.schema_version == REPLAY_SCHEMA_VERSION_BROKER);
         if let Some((key, _)) = &external
             && self.externals.contains_key(key)
         {
@@ -3732,13 +5331,46 @@ impl Engine {
         &mut self,
         command: &str,
         credit: Decimal,
-        settled: Option<(Outcome, Decimal)>,
+        settled: Option<(Option<Outcome>, Decimal)>,
+        external_status: Option<TerminalStatus>,
     ) -> Result<(), String> {
         let obligation = self
             .obligations
             .remove(command)
             .ok_or_else(|| format!("{command} is not an open obligation"))?;
         let binding = obligation.binding;
+        let cash = self.matching_cash_of(&obligation);
+        if obligation.terms.settlement.rule == SettlementRule::BrokerAuthoritativeV1
+            && settled.is_some()
+        {
+            self.closed_confirmed.insert(
+                command.to_string(),
+                ClosedContract {
+                    evidence_bound_micros: obligation.evidence_bound(),
+                    confirmed: [
+                        obligation.entry_price_units,
+                        obligation.entry_time_micros,
+                        obligation.start_micros,
+                        obligation.due_time_micros,
+                    ],
+                    outcome: settled.and_then(|(outcome, _)| outcome),
+                    status: external_status
+                        .or(obligation.terminal.as_ref().map(|fact| fact.status)),
+                    transaction_ref: cash.as_ref().map(|(_, reference)| reference.clone()),
+                },
+            );
+        }
+        if let Some(cash) = cash {
+            let record = self.transactions.get_mut(&cash).expect("matched cash");
+            record.pending = false;
+            record.source = None;
+            self.accounts[self.bindings[binding].account]
+                .blocked
+                .remove(&record.fact.block_key());
+        }
+        self.instruments[self.bindings[binding].instrument]
+            .tracked
+            .retain(|tracked| tracked != command);
         let account = &mut self.accounts[self.bindings[binding].account];
         let currency = account.currency.clone();
         account.reserved = account.reserved.checked_sub(obligation.reservation)?;
@@ -3761,16 +5393,52 @@ impl Engine {
             group.close(obligation.unresolved.is_some());
             match settled {
                 Some((outcome, profit)) => {
-                    group.outcome(outcome);
-                    group.add_profit(&currency, profit);
+                    if let Some(outcome) = outcome {
+                        group.outcome(outcome);
+                    } else {
+                        group.externally_closed += 1;
+                    }
+                    group.add_profit(currency.as_str(), profit);
                 }
                 None => group.released += 1,
             }
         }
+        self.refresh_cash_blocks();
         Ok(())
     }
 
     fn apply(&mut self, event: &FinancialEvent) -> Result<(), String> {
+        if self.definition.schema_version == REPLAY_SCHEMA_VERSION
+            && matches!(
+                &event.kind,
+                EventKind::Signal {
+                    proposal: Some(_),
+                    ..
+                } | EventKind::Accepted {
+                    liability: Some(_),
+                    ..
+                } | EventKind::Confirmed { .. }
+                    | EventKind::CashObserved { .. }
+                    | EventKind::Unresolved {
+                        reason: UnresolvedReason::AwaitingCash,
+                        ..
+                    }
+                    | EventKind::Unresolved {
+                        terminal: Some(_),
+                        ..
+                    }
+                    | EventKind::Reconciled {
+                        resolution: Resolution::Purchased { .. }
+                            | Resolution::ExternallyClosed { .. }
+                            | Resolution::External,
+                        ..
+                    }
+            )
+        {
+            return Err(
+                "schema_version 1 cannot contain broker-authoritative ledger records".into(),
+            );
+        }
         match &event.kind {
             EventKind::RunDefinition { .. } => {}
             EventKind::Signal {
@@ -3788,6 +5456,7 @@ impl Engine {
                 command,
                 reservation,
                 rates,
+                proposal,
             } => {
                 let index = *self
                     .binding_index
@@ -3879,20 +5548,43 @@ impl Engine {
                 if slot.is_none() {
                     self.logic_seen.insert(logic_key);
                 }
+                if proposal.is_some() && !admitted {
+                    return Err("only an admitted broker signal carries a proposal".into());
+                }
                 if admitted {
+                    let contract = match (contract.settlement.rule, proposal) {
+                        (SettlementRule::BrokerAuthoritativeV1, Some(proposal)) => {
+                            self.validate_proposal(index, proposal, time)?;
+                            if time.checked_sub(proposal.receipt_micros).is_none_or(|age| {
+                                age > policy.max_proposal_age_micros.expect("validated")
+                            }) {
+                                return Err(format!("{binding} admitted a stale proposal"));
+                            }
+                            &proposal.terms
+                        }
+                        (SettlementRule::PriceAtDueV1, None) => contract,
+                        _ => {
+                            return Err(format!(
+                                "{binding} signal proposal disagrees with its settlement rule"
+                            ));
+                        }
+                    };
                     let (Some(command), Some(reservation)) = (command, reservation) else {
                         return Err(
                             "an admitted signal names its command and reservation".to_string()
                         );
                     };
+                    let reservation = reservation.rescale(scale)?;
                     if *command != format!("{}/{close_time_micros}", compiled.id)
-                        || *reservation != contract.reservation()?.rescale(scale)?
+                        || reservation.compare(contract.reservation()?.rescale(scale)?)?
+                            != Ordering::Equal
                     {
                         return Err(format!(
                             "{command} is not the command and reservation of its signal"
                         ));
                     }
-                    let (admissible, used) = self.financial_admission(index, *reservation)?;
+                    let (admissible, used) =
+                        self.financial_admission(index, contract, reservation)?;
                     if admissible != Disposition::Admitted || used != *rates {
                         return Err(format!(
                             "{command} is not admissible at this state: {admissible}"
@@ -3900,14 +5592,14 @@ impl Engine {
                     }
                     let worst = contract.worst_loss()?.rescale(scale)?;
                     let account = &mut self.accounts[compiled.account];
-                    account.reserved = account.reserved.checked_add(*reservation)?;
+                    account.reserved = account.reserved.checked_add(reservation)?;
                     account.unresolved_loss = account.unresolved_loss.checked_add(worst)?;
                     self.obligations.insert(
                         command.clone(),
                         Obligation {
                             binding: index,
                             state: ObligationState::Sent,
-                            reservation: *reservation,
+                            reservation,
                             paid_basis: Decimal::zero(scale),
                             worst_loss: worst,
                             split: split.clone(),
@@ -3919,6 +5611,11 @@ impl Engine {
                             path: None,
                             recorded_path: None,
                             continuity_micros: None,
+                            terms: contract.clone(),
+                            liability: None,
+                            terminal: None,
+                            start_micros: None,
+                            terminal_source: None,
                         },
                     );
                     self.open_delta(index, 1);
@@ -3947,34 +5644,148 @@ impl Engine {
                 due_time_micros,
                 debit,
                 reservation,
+                liability,
+                discrepancy,
+                deficit,
                 ..
             } => {
                 self.require_unaccepted(command)?;
-                if (*debit, *reservation, *due_time_micros)
-                    != self.acceptance_postings(command, *entry_time_micros)?
-                {
+                if let Some(liability) = liability {
+                    let postings = self.purchase_postings(command, *debit, liability)?;
+                    if postings.reservation.compare(*reservation)? != Ordering::Equal
+                        || postings.debit.compare(*debit)? != Ordering::Equal
+                        || postings.discrepancy != *discrepancy
+                        || !same_optional_amount(postings.deficit, *deficit)?
+                    {
+                        return Err(format!(
+                            "{command} acceptance postings disagree with its contract"
+                        ));
+                    }
+                    if price_time_micros.is_some_and(|price| price > self.now)
+                        || price_time_micros
+                            .zip(*entry_time_micros)
+                            .is_some_and(|(price, entry)| price > entry)
+                    {
+                        return Err(format!("{command} acceptance clocks are inconsistent"));
+                    }
+                    self.apply_purchase(command, liability, postings)?;
+                    let fields = [
+                        *entry_price_units,
+                        *entry_time_micros,
+                        None,
+                        *due_time_micros,
+                    ];
+                    self.confirmed_fields(command, fields)?;
+                    self.apply_confirmed_fields(command, fields)?;
+                } else {
+                    let (Some(entry), Some(price), Some(price_time), Some(due)) = (
+                        entry_time_micros,
+                        entry_price_units,
+                        price_time_micros,
+                        due_time_micros,
+                    ) else {
+                        return Err(format!(
+                            "{command} acceptance without liability requires all four clocks and price"
+                        ));
+                    };
+                    let (expected_debit, expected_reservation, expected_due) =
+                        self.acceptance_postings(command, *entry)?;
+                    if *discrepancy
+                        || deficit.is_some()
+                        || debit.compare(expected_debit)? != Ordering::Equal
+                        || reservation.compare(expected_reservation)? != Ordering::Equal
+                        || *due != expected_due
+                    {
+                        return Err(format!(
+                            "{command} acceptance postings disagree with its contract"
+                        ));
+                    }
+                    self.apply_acceptance(
+                        command,
+                        *entry,
+                        *price,
+                        *price_time,
+                        *due,
+                        expected_debit,
+                        expected_reservation,
+                    )?;
+                }
+            }
+            EventKind::Confirmed {
+                command,
+                entry_price_units,
+                entry_time_micros,
+                start_micros,
+                expiry_micros,
+                ..
+            } => {
+                let fields = [
+                    *entry_price_units,
+                    *entry_time_micros,
+                    *start_micros,
+                    *expiry_micros,
+                ];
+                let learned = self.confirmed_fields(command, fields)?;
+                if learned != fields || learned.iter().all(Option::is_none) {
                     return Err(format!(
-                        "{command} acceptance postings disagree with its contract"
+                        "{command} confirmed record must contain only newly learned fields"
                     ));
                 }
-                self.apply_acceptance(
-                    command,
-                    *entry_time_micros,
-                    *entry_price_units,
-                    *price_time_micros,
-                    *due_time_micros,
-                    *debit,
-                    *reservation,
-                )?;
+                self.apply_confirmed_fields(command, fields)?;
+            }
+            EventKind::CashObserved {
+                source,
+                fact,
+                matched,
+            } => {
+                let account = self.check_cash(source, fact)?;
+                if self.transactions.contains_key(&fact.key()) || self.check_purchase_cash(fact)? {
+                    return Err(format!(
+                        "transaction {} is already recorded",
+                        fact.transaction_ref
+                    ));
+                }
+                let expected = if fact.action == CashAction::Sell {
+                    self.cash_command(fact)
+                } else {
+                    None
+                };
+                if expected != *matched {
+                    return Err(format!(
+                        "transaction {} matching disagrees with the open liabilities",
+                        fact.transaction_ref
+                    ));
+                }
+                self.transactions.insert(
+                    fact.key(),
+                    TransactionRecord {
+                        fact: fact.clone(),
+                        pending: true,
+                        source: (fact.action == CashAction::Sell).then(|| source.clone()),
+                    },
+                );
+                if matched.is_none() {
+                    self.accounts[account].blocked.insert(
+                        fact.block_key(),
+                        Block::UnmatchedCash {
+                            transaction_ref: fact.transaction_ref.clone(),
+                            contract_ref: fact.contract_ref.clone(),
+                            action: fact.action,
+                            amount: fact.amount,
+                        },
+                    );
+                }
+                self.refresh_cash_blocks();
             }
             EventKind::Released {
                 command, release, ..
             } => {
                 self.require_unaccepted(command)?;
-                if self.obligations[command].reservation != *release {
+                if self.obligations[command].reservation.compare(*release)? != Ordering::Equal {
                     return Err(format!("{command} cannot release {release}"));
                 }
-                self.apply_closure(command, Decimal::zero(release.scale()), None)?;
+                let zero = Decimal::zero(self.obligations[command].reservation.scale());
+                self.apply_closure(command, zero, None, None)?;
             }
             EventKind::PossiblySent { command, .. } => {
                 self.require_unaccepted(command)?;
@@ -4006,26 +5817,64 @@ impl Engine {
                 release,
                 discrepancy,
                 deficit,
+                settlement_price_units,
+                path,
+                transaction_ref,
                 ..
             } => {
                 self.require(command, ObligationState::Accepted)?;
                 if *settlement_time_micros != source.provider_time_micros
-                    || Some(*settlement_time_micros) < self.obligations[command].entry_time_micros
+                    || *settlement_time_micros < self.obligations[command].evidence_bound()
                 {
                     return Err(format!(
                         "{command} settlement time disagrees with its source and entry"
                     ));
                 }
+                if self.obligations[command].terms.settlement.rule
+                    == SettlementRule::BrokerAuthoritativeV1
+                {
+                    let fact = self.obligations[command].terminal.as_ref().ok_or_else(|| {
+                        format!("{command} settlement requires matched terminal and cash facts")
+                    })?;
+                    let cash = self.matching_cash(command).ok_or_else(|| {
+                        format!("{command} settlement requires matched terminal and cash facts")
+                    })?;
+                    let expected_outcome = match fact.status {
+                        TerminalStatus::Won => Outcome::Win,
+                        TerminalStatus::Lost => Outcome::Loss,
+                        _ => {
+                            return Err(format!(
+                                "{command} external closure is not a directional settlement"
+                            ));
+                        }
+                    };
+                    if Some(&cash.transaction_ref) != transaction_ref.as_ref()
+                        || *source != self.broker_source(command, cash)
+                        || *outcome != expected_outcome
+                        || gross_return.compare(cash.amount)? != Ordering::Equal
+                        || !terminal_fee.is_zero()
+                        || *settlement_price_units != fact.exit_price_units
+                        || *path != self.broker_path(command, fact)?
+                    {
+                        return Err(format!(
+                            "{command} settlement disagrees with its terminal and cash evidence"
+                        ));
+                    }
+                } else if settlement_price_units.is_none()
+                    || path.is_none()
+                    || transaction_ref.is_some()
+                {
+                    return Err(format!(
+                        "{command} price_at_due_v1 settlement requires price and path without a transaction"
+                    ));
+                }
                 let postings =
                     self.settlement_postings(command, *outcome, *gross_return, *terminal_fee)?;
-                if postings
-                    != (SettlementPostings {
-                        credit: *credit,
-                        profit: *profit,
-                        release: *release,
-                        discrepancy: *discrepancy,
-                        deficit: *deficit,
-                    })
+                if postings.credit.compare(*credit)? != Ordering::Equal
+                    || postings.profit.compare(*profit)? != Ordering::Equal
+                    || postings.release.compare(*release)? != Ordering::Equal
+                    || postings.discrepancy != *discrepancy
+                    || !same_optional_amount(postings.deficit, *deficit)?
                 {
                     return Err(format!(
                         "{command} settlement postings disagree with its obligation and terms"
@@ -4034,10 +5883,23 @@ impl Engine {
                 let obligation = &self.obligations[command];
                 let account = self.bindings[obligation.binding].account;
                 let entry_time_micros = obligation.evidence_bound();
-                self.apply_closure(command, *credit, Some((*outcome, *profit)))?;
+                self.apply_closure(
+                    command,
+                    postings.credit,
+                    Some((Some(*outcome), postings.profit)),
+                    None,
+                )?;
                 if *discrepancy || deficit.is_some() {
+                    let key = if matches!(
+                        self.accounts[account].blocked.get(command),
+                        Some(Block::Purchased { .. })
+                    ) {
+                        format!("{command}\nsettlement")
+                    } else {
+                        command.clone()
+                    };
                     self.accounts[account].blocked.insert(
-                        command.clone(),
+                        key,
                         Block::Settled {
                             outcome: *outcome,
                             gross_return: *gross_return,
@@ -4051,25 +5913,73 @@ impl Engine {
                 command,
                 reason,
                 path,
+                terminal,
+                source,
                 ..
             } => {
+                if *reason == UnresolvedReason::AwaitingCash {
+                    let (Some(fact), Some(source)) = (terminal, source) else {
+                        return Err(format!(
+                            "{command} awaiting_cash requires terminal evidence and source"
+                        ));
+                    };
+                    let merged = self.merged_terminal(command, source, fact)?;
+                    if merged != *fact || self.terminals.get(command) == Some(fact) {
+                        return Err(format!(
+                            "{command} terminal record must monotonically add facts"
+                        ));
+                    }
+                    if !self.obligations.contains_key(command) {
+                        if path.is_some() {
+                            return Err(format!(
+                                "{command} closed terminal cannot add path diagnostics"
+                            ));
+                        }
+                        self.terminals.insert(command.clone(), fact.clone());
+                        return Ok(());
+                    }
+                    if *path != self.broker_path(command, fact)? {
+                        return Err(format!(
+                            "{command} terminal path disagrees with its recorded entry and exit"
+                        ));
+                    }
+                } else if terminal.is_some()
+                    || source.is_some()
+                    || self
+                        .obligations
+                        .get(command)
+                        .is_some_and(|obligation| !is_historical_terms(&obligation.terms))
+                {
+                    return Err(format!(
+                        "{command} broker obligations only become awaiting_cash on terminal evidence"
+                    ));
+                }
                 let obligation = self.open_obligation(command)?;
-                if obligation.unresolved.is_some() {
+                let newly_unresolved = obligation.unresolved.is_none();
+                if !newly_unresolved && *reason != UnresolvedReason::AwaitingCash {
                     return Err(format!("{command} is already unresolved"));
                 }
                 obligation.unresolved = Some(*reason);
                 obligation.path = *path;
                 obligation.recorded_path = *path;
+                obligation.terminal = terminal.clone();
+                obligation.terminal_source = source.clone();
                 let binding = obligation.binding;
                 let split = obligation.split.clone();
+                if let Some(fact) = terminal {
+                    self.terminals.insert(command.clone(), fact.clone());
+                }
                 let instrument = self.bindings[binding].instrument;
                 self.instruments[instrument]
                     .tracked
                     .retain(|tracked| tracked != command);
                 let key = self.keys(binding, split.as_deref());
-                for group in self.groups(&key) {
-                    group.unresolved += 1;
+                if newly_unresolved {
+                    for group in self.groups(&key) {
+                        group.unresolved += 1;
+                    }
                 }
+                self.refresh_cash_blocks();
             }
             EventKind::Reconciled {
                 command,
@@ -4082,29 +5992,64 @@ impl Engine {
             } => {
                 let (postings, account, evidence_bound) =
                     self.reconciliation_of(command, resolution)?;
-                if postings
-                    != (ReconciliationPostings {
-                        release: *release,
-                        debit: *debit,
-                        credit: *credit,
-                        profit: *profit,
-                    })
+                if postings.release.compare(*release)? != Ordering::Equal
+                    || postings.debit.compare(*debit)? != Ordering::Equal
+                    || postings.credit.compare(*credit)? != Ordering::Equal
+                    || !same_optional_amount(postings.profit, *profit)?
                 {
                     return Err(format!(
                         "{command} reconciliation postings disagree with its resolution"
                     ));
                 }
-                if matches!(resolution, Resolution::Settled { .. })
-                    && source.provider_time_micros < evidence_bound
+                if matches!(
+                    resolution,
+                    Resolution::Settled { .. } | Resolution::ExternallyClosed { .. }
+                ) && source.provider_time_micros < evidence_bound
                 {
                     return Err(format!(
                         "{command} settlement evidence precedes its entry or dispatch"
                     ));
                 }
+                let key = self.reconciliation_block_key(command, resolution);
+                let keep_purchase = matches!(
+                    self.accounts[account].blocked.get(&key),
+                    Some(Block::Purchased { .. })
+                ) && !matches!(resolution, Resolution::Purchased { .. });
+                if !keep_purchase {
+                    self.accounts[account].blocked.remove(&key);
+                }
                 if self.obligations.contains_key(command) {
                     match resolution {
+                        Resolution::Purchased {
+                            debit: actual,
+                            liability,
+                        } => {
+                            if self.obligations[command].state != ObligationState::Accepted {
+                                let postings =
+                                    self.purchase_postings(command, *actual, liability)?;
+                                self.apply_purchase(command, liability, postings)?;
+                            }
+                        }
+                        Resolution::ExternallyClosed { .. } | Resolution::Settled { .. } => {
+                            let outcome = match resolution {
+                                Resolution::Settled { outcome, .. } => Some(*outcome),
+                                _ => None,
+                            };
+                            let cash = &mut self.accounts[account].cash;
+                            *cash = cash.checked_sub(postings.debit)?;
+                            self.apply_closure(
+                                command,
+                                postings.credit,
+                                Some((outcome, postings.profit.expect("checked postings"))),
+                                match resolution {
+                                    Resolution::ExternallyClosed { status, .. } => Some(*status),
+                                    _ => None,
+                                },
+                            )?;
+                        }
+                        Resolution::External => unreachable!("checked resolution"),
                         Resolution::NotSent => {
-                            self.apply_closure(command, Decimal::zero(credit.scale()), None)?;
+                            self.apply_closure(command, postings.credit, None, None)?;
                         }
                         Resolution::Accepted {
                             entry_time_micros,
@@ -4119,19 +6064,21 @@ impl Engine {
                                 *entry_price_units,
                                 *price_time_micros,
                                 due_time_micros,
-                                *debit,
+                                postings.debit,
                                 reservation,
                             )?;
                         }
-                        Resolution::Settled { outcome, .. } => {
-                            let profit = profit.expect("checked against the postings");
-                            let cash = &mut self.accounts[account].cash;
-                            *cash = cash.checked_sub(*debit)?;
-                            self.apply_closure(command, *credit, Some((*outcome, profit)))?;
-                        }
                     }
                 }
-                self.accounts[account].blocked.remove(command);
+                if let Resolution::External = resolution {
+                    let record = self
+                        .transactions
+                        .values_mut()
+                        .find(|record| record.fact.block_key() == *command)
+                        .expect("checked transaction block");
+                    record.pending = false;
+                    record.source = None;
+                }
             }
             EventKind::RateAvailable { rate } => {
                 if self
@@ -4160,7 +6107,8 @@ impl Engine {
                 if state.paused_until_micros.is_some() {
                     return Err(format!("account `{account}` is already paused"));
                 }
-                if *drawdown != state.epoch_peak.checked_sub(state.completed_profit)?
+                if drawdown.compare(state.epoch_peak.checked_sub(state.completed_profit)?)?
+                    != Ordering::Equal
                     || !self.pause_due(index)?
                     || Some(*until_micros) != event.time_micros.checked_add(pause.duration_micros)
                 {
@@ -4295,9 +6243,12 @@ impl ReplayManifest {
                 manifest.kind
             ));
         }
-        if manifest.schema_version != REPLAY_SCHEMA_VERSION {
+        if !matches!(
+            manifest.schema_version,
+            REPLAY_SCHEMA_VERSION | REPLAY_SCHEMA_VERSION_BROKER
+        ) {
             return Err(format!(
-                "unsupported manifest schema_version {}, expected {REPLAY_SCHEMA_VERSION}",
+                "unsupported manifest schema_version {}, expected {REPLAY_SCHEMA_VERSION} or {REPLAY_SCHEMA_VERSION_BROKER}",
                 manifest.schema_version
             ));
         }
@@ -4485,6 +6436,7 @@ mod tests {
                 gross_return: decimal("9.50"),
                 terminal_fee: decimal("0"),
             },
+            semantics: None,
             settlement: Settlement {
                 rule: SettlementRule::PriceAtDueV1,
                 max_settlement_delay_micros: 0,
@@ -4509,6 +6461,7 @@ mod tests {
             max_tie_terminal_fee: decimal("0"),
             min_winning_net_return: decimal("9.2"),
             settlement_rule: SettlementRule::PriceAtDueV1,
+            semantics: None,
         };
         assert!(envelope.admits(&contract).unwrap(), "equality is allowed");
         let mut worse = contract.clone();

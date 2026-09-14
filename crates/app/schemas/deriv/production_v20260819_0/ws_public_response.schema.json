@@ -1,0 +1,30 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "WebSocket Public Upgrade (response)",
+  "description": "Raw HTTP 101 handshake returned when the connection is successfully upgraded to a WebSocket streaming public market data. There is no JSON body — a successful upgrade is signalled entirely through the status line and Upgrade/Connection headers.",
+  "type": "object",
+  "properties": {
+    "status": {
+      "type": "integer",
+      "description": "HTTP status code confirming the protocol switch.",
+      "example": 101
+    },
+    "headers": {
+      "type": "object",
+      "properties": {
+        "Upgrade": {
+          "type": "string",
+          "description": "Confirms the connection was upgraded to the WebSocket protocol.",
+          "example": "websocket"
+        },
+        "Connection": {
+          "type": "string",
+          "description": "Confirms the connection has been upgraded.",
+          "example": "Upgrade"
+        }
+      },
+      "required": ["Upgrade", "Connection"]
+    }
+  },
+  "required": ["status", "headers"]
+}

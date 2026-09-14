@@ -1,0 +1,11 @@
+schema_version = 1
+run_mode = "research"
+[storage]
+historical_data_dir = "retained"
+publication_uri = "file:///tmp/phase10-fixture"
+[history]
+broker = "absent"
+instruments = ["X"]
+role = "development"
+start = "2026-09-13T00:00:00Z"
+end = "2026-09-13T01:00:00Z"

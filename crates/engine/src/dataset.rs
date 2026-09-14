@@ -29,6 +29,7 @@ crate::string_enum! {
     /// The observed input a generation was built from.
     SourceKind "source_kind" {
         TickCsv => "tick_csv",
+        BrokerHistory => "broker_history",
         TickParquetDaily => "tick_parquet_daily",
         BarParquet => "bar_parquet",
     }
@@ -331,7 +332,7 @@ impl GenerationManifest {
             self.capabilities.as_slice(),
         ) {
             (
-                SourceKind::TickCsv | SourceKind::TickParquetDaily,
+                SourceKind::TickCsv | SourceKind::TickParquetDaily | SourceKind::BrokerHistory,
                 PriceRepresentation::IntegerUnits { scale },
                 NativeGranularity::Tick,
                 TimeUnit::Microsecond,
@@ -368,6 +369,17 @@ impl GenerationManifest {
                 "expected {expected} normalized object among {} objects, found {normalized}",
                 self.objects.len()
             ));
+        }
+        if self.source_kind == SourceKind::BrokerHistory
+            && (!self.objects.iter().any(|o| o.role == ObjectRole::Source)
+                || !self.objects.iter().any(|o| {
+                    o.role == ObjectRole::Provenance && o.path == "provenance/coverage.json"
+                })
+                || !self.objects.iter().any(|o| {
+                    o.role == ObjectRole::Normalized && o.path == "normalized/ticks.parquet"
+                }))
+        {
+            return Err("broker_history requires raw source pages, provenance/coverage.json, and normalized/ticks.parquet".into());
         }
         if generation_id(
             &instrument,

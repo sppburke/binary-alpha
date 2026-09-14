@@ -30,3 +30,26 @@ candles = [
   { duration_seconds = 5, offset_seconds = 0, min_observations = 9, hard_min_observations = 5 },
   { duration_seconds = 15, offset_seconds = 5, min_observations = 29, hard_min_observations = 15 },
 ]
+
+# Public Deriv data needs no credential. Authentication uses an environment-variable name.
+[[brokers]]
+id = "deriv"
+kind = "deriv"
+public_endpoint = "wss://api.derivws.com/trading/v1/options/ws/public"
+bootstrap_endpoint = "https://api.derivws.com/trading/v1/options"
+app_id = "APPLICATION-IDENTIFIER"
+
+[[brokers]]
+id = "pocket_option"
+kind = "pocket_option"
+endpoint = "wss://demo-api-eu.po.market/socket.io/?EIO=4&transport=websocket"
+credential = "BINARY_ALPHA_POCKET_AUTH"
+account_class = "demo"
+server_offset_minutes = 120
+
+[history]
+broker = "pocket_option"
+instruments = ["AEDCNY_otc"]
+role = "development"
+start = "2026-09-13T00:00:00Z"
+end = "2026-09-13T01:00:00Z"

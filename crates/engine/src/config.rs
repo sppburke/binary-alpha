@@ -45,6 +45,12 @@ pub struct Config {
     pub search: Option<Search>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub portfolio: Option<Portfolio>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub brokers: Vec<Broker>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub history: Option<History>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inspect: Option<Inspect>,
 }
 
 impl Config {
@@ -118,6 +124,7 @@ impl Config {
                 .validate()
                 .map_err(|reason| format!("portfolio.{reason}"))?;
         }
+        self.validate_brokers()?;
         let Some(import) = &self.import else {
             return Ok(());
         };
@@ -221,6 +228,352 @@ impl Config {
             .filter(mapped)
             .find(|instrument| instrument.native_granularity == native_granularity)
             .or_else(|| self.instruments.iter().find(mapped))
+    }
+}
+
+impl Config {
+    fn validate_brokers(&self) -> Result<(), String> {
+        for (index, broker) in self.brokers.iter().enumerate() {
+            broker
+                .validate(self.run_mode)
+                .map_err(|reason| format!("brokers[{index}]: {reason}"))?;
+            if self.brokers[..index]
+                .iter()
+                .any(|prior| prior.id() == broker.id())
+            {
+                return Err(format!(
+                    "brokers[{index}]: duplicate broker id {}",
+                    broker.id()
+                ));
+            }
+        }
+        if let Some(history) = &self.history {
+            history
+                .validate()
+                .map_err(|reason| format!("history: {reason}"))?;
+            let broker = self
+                .brokers
+                .iter()
+                .find(|broker| broker.id() == &history.broker)
+                .ok_or("history: broker is not declared under brokers")?;
+            if !broker.kind().capabilities().history {
+                return Err("history: broker has no history capability".into());
+            }
+            for (index, symbol) in history.instruments.iter().enumerate() {
+                if history.instruments[..index].contains(symbol) {
+                    return Err(format!("history: instruments[{index}] is listed twice"));
+                }
+                if !self.instruments.iter().any(|instrument| {
+                    instrument.broker == history.broker
+                        && instrument.provider_symbol == *symbol
+                        && instrument.native_granularity == NativeGranularity::Tick
+                }) {
+                    return Err(format!(
+                        "history: instruments[{index}] must name a declared tick instrument"
+                    ));
+                }
+            }
+        }
+        if let Some(inspect) = &self.inspect {
+            inspect
+                .validate()
+                .map_err(|reason| format!("inspect: {reason}"))?;
+            let history = self.history.as_ref().ok_or("inspect: requires history")?;
+            let broker = self
+                .brokers
+                .iter()
+                .find(|broker| broker.id() == &history.broker)
+                .ok_or("inspect: history broker is not declared")?;
+            if !broker.kind().capabilities().live {
+                return Err("inspect: broker has no live capability".into());
+            }
+            if inspect.proposal.is_some()
+                && (!broker.kind().capabilities().execution || broker.credential().is_none())
+            {
+                return Err(
+                    "inspect: proposal requires a Deriv broker with a credential reference".into(),
+                );
+            }
+        }
+        Ok(())
+    }
+}
+
+crate::string_enum! {
+    /// A statically compiled provider adapter.
+    BrokerKind "broker kind" { Deriv => "deriv", PocketOption => "pocket_option" }
+}
+
+/// Capabilities of each compiled adapter, checked before connection.
+#[derive(Debug, Clone, Copy)]
+pub struct Capabilities {
+    pub history: bool,
+    pub live: bool,
+    pub execution: bool,
+}
+impl BrokerKind {
+    pub fn capabilities(self) -> Capabilities {
+        Capabilities {
+            history: true,
+            live: true,
+            execution: self == Self::Deriv,
+        }
+    }
+}
+
+crate::string_enum! {
+    /// The account class the server must confirm.
+    AccountClass "account_class" { Demo => "demo", Real => "real" }
+}
+
+/// One provider connection, selected by its declared kind.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum Broker {
+    Deriv(DerivSettings),
+    PocketOption(PocketSettings),
+}
+
+/// Public and authenticated Deriv connection settings; credentials are environment names.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct DerivSettings {
+    pub id: BrokerId,
+    pub public_endpoint: String,
+    pub bootstrap_endpoint: String,
+    pub app_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credential: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_class: Option<AccountClass>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub budgets: Option<RateBudgets>,
+}
+
+/// Pocket Option's observed direct market interface and its declared source clock.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PocketSettings {
+    pub id: BrokerId,
+    pub endpoint: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin: Option<String>,
+    pub credential: String,
+    pub account_class: AccountClass,
+    pub server_offset_minutes: i32,
+}
+
+impl Broker {
+    pub fn id(&self) -> &BrokerId {
+        match self {
+            Self::Deriv(settings) => &settings.id,
+            Self::PocketOption(settings) => &settings.id,
+        }
+    }
+    pub fn kind(&self) -> BrokerKind {
+        match self {
+            Self::Deriv(_) => BrokerKind::Deriv,
+            Self::PocketOption(_) => BrokerKind::PocketOption,
+        }
+    }
+    pub fn credential(&self) -> Option<&str> {
+        match self {
+            Self::Deriv(settings) => settings.credential.as_deref(),
+            Self::PocketOption(settings) => Some(&settings.credential),
+        }
+    }
+    pub fn endpoint(&self) -> &str {
+        match self {
+            Self::Deriv(settings) => &settings.public_endpoint,
+            Self::PocketOption(settings) => &settings.endpoint,
+        }
+    }
+    pub fn validate(&self, mode: RunMode) -> Result<(), String> {
+        fn endpoint(text: &str, secure: &str, plain: &str, mode: RunMode) -> Result<(), String> {
+            let rest = text
+                .strip_prefix(secure)
+                .or_else(|| {
+                    (mode == RunMode::Research)
+                        .then(|| text.strip_prefix(plain))
+                        .flatten()
+                })
+                .ok_or_else(|| {
+                    format!("endpoint must use {secure}; {plain} requires run_mode research")
+                })?;
+            let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+            if authority.is_empty()
+                || authority.contains('@')
+                || text.chars().any(char::is_whitespace)
+                || text.contains('#')
+            {
+                return Err(
+                    "endpoint must have a host and no user information, whitespace, or fragment"
+                        .into(),
+                );
+            }
+            Ok(())
+        }
+        endpoint(self.endpoint(), "wss://", "ws://", mode)?;
+        if let Some(reference) = self.credential()
+            && (reference.is_empty()
+                || !reference.bytes().enumerate().all(|(i, b)| {
+                    b == b'_' || b.is_ascii_alphabetic() || (i > 0 && b.is_ascii_digit())
+                }))
+        {
+            return Err("credential must be an environment variable name".into());
+        }
+        match self {
+            Self::Deriv(settings) => {
+                endpoint(&settings.bootstrap_endpoint, "https://", "http://", mode)?;
+                if settings.app_id.is_empty()
+                    || settings.app_id.bytes().any(|b| b.is_ascii_control())
+                {
+                    return Err("app_id must be non-empty header text".into());
+                }
+                if settings.credential.is_some() && settings.account_class.is_none() {
+                    return Err("account_class is required with credential".into());
+                }
+                if let Some(budgets) = &settings.budgets {
+                    budgets.validate()?;
+                }
+            }
+            Self::PocketOption(settings) => {
+                if settings.origin.as_ref().is_some_and(|origin| {
+                    origin.is_empty() || origin.bytes().any(|b| b.is_ascii_control())
+                }) {
+                    return Err("origin must be non-empty header text".into());
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Both documented sliding windows for one Deriv request group.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RateLimit {
+    pub per_minute: u32,
+    pub per_hour: u32,
+}
+
+/// Request-group limits may be reduced from the documented maxima.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RateBudgets {
+    pub trade: RateLimit,
+    pub account: RateLimit,
+    pub portfolio: RateLimit,
+    pub other: RateLimit,
+}
+impl Default for RateBudgets {
+    fn default() -> Self {
+        Self {
+            trade: RateLimit {
+                per_minute: 360,
+                per_hour: 14_400,
+            },
+            account: RateLimit {
+                per_minute: 100,
+                per_hour: 2_000,
+            },
+            portfolio: RateLimit {
+                per_minute: 30,
+                per_hour: 1_500,
+            },
+            other: RateLimit {
+                per_minute: 220,
+                per_hour: 14_400,
+            },
+        }
+    }
+}
+impl RateBudgets {
+    pub fn validate(&self) -> Result<(), String> {
+        let maxima = Self::default();
+        for (name, limit, maximum) in [
+            ("trade", self.trade, maxima.trade),
+            ("account", self.account, maxima.account),
+            ("portfolio", self.portfolio, maxima.portfolio),
+            ("other", self.other, maxima.other),
+        ] {
+            if limit.per_minute == 0
+                || limit.per_hour == 0
+                || limit.per_minute > maximum.per_minute
+                || limit.per_hour > maximum.per_hour
+            {
+                return Err(format!(
+                    "budgets.{name}: limits must be positive and no greater than {} per minute and {} per hour",
+                    maximum.per_minute, maximum.per_hour
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Bounded tick acquisition, optionally repeated toward a new fixed end time each pass.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct History {
+    pub broker: BrokerId,
+    pub instruments: Vec<ProviderSymbol>,
+    pub role: DatasetRole,
+    pub start: String,
+    pub end: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refresh_interval_seconds: Option<u32>,
+}
+impl History {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.role == DatasetRole::Holdout {
+            return Err("role: holdout data is never a history input".into());
+        }
+        if self.instruments.is_empty() {
+            return Err("instruments: at least one instrument is required".into());
+        }
+        let start = crate::market::parse_event_time_micros(&self.start)
+            .map_err(|e| format!("start: {e}"))?;
+        let end =
+            crate::market::parse_event_time_micros(&self.end).map_err(|e| format!("end: {e}"))?;
+        if start >= end {
+            return Err("start must precede end".into());
+        }
+        if self.refresh_interval_seconds == Some(0) {
+            return Err("refresh_interval_seconds must be positive".into());
+        }
+        Ok(())
+    }
+}
+
+/// Finite market observations and optional non-purchasing proposal checks.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct Inspect {
+    pub live_observations: u32,
+    pub live_seconds: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proposal: Option<InspectProposal>,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct InspectProposal {
+    pub stake: Decimal,
+    pub duration_seconds: u32,
+}
+impl Inspect {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.live_observations == 0 || self.live_seconds == 0 {
+            return Err("live_observations and live_seconds must be positive".into());
+        }
+        if let Some(proposal) = &self.proposal
+            && (proposal.stake.is_zero()
+                || proposal.stake.is_negative()
+                || proposal.duration_seconds == 0)
+        {
+            return Err("proposal: stake and duration_seconds must be positive".into());
+        }
+        Ok(())
     }
 }
 

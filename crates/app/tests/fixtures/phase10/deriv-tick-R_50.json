@@ -1,0 +1,1 @@
+{"echo_req":{"req_id":5,"subscribe":1,"ticks":"R_50"},"msg_type":"tick","req_id":5,"subscription":{"id":"synthetic-subscription-1"},"tick":{"ask":91.8708,"bid":91.8508,"epoch":1789346764,"id":"synthetic-subscription-1","pip_size":4,"quote":91.8608,"symbol":"R_50"}}

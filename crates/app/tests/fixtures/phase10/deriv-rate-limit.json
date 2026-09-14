@@ -1,0 +1,1 @@
+{"echo_req":{"active_symbols":"full","req_id":1},"error":{"code":"RateLimit","message":"You have reached the rate limit for active_symbols."},"msg_type":"active_symbols","req_id":1}

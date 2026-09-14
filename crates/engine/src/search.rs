@@ -17,7 +17,7 @@ use crate::config::{Replay, Scope, Screen, Search, SearchCondition, SearchWindow
 use crate::dataset::{DatasetRole, ObjectRecord};
 use crate::execution::{
     AccountSpec, Condition, ContractTerms, Decimal, DeploymentBinding, Disposition, EventKind,
-    FinancialEvent, Group, StrategySpec, signal_logic_identity,
+    FinancialEvent, Group, Resolution, SettlementRule, StrategySpec, signal_logic_identity,
 };
 use crate::market::parse_event_time_micros;
 
@@ -38,6 +38,14 @@ const SAMPLER_DOMAIN_V1: &[u8] = b"binary-alpha search sampler v1\n";
 /// The rules of the `search` table a single field's deserializer cannot see; an error names the
 /// field. The synthesized replay tables are validated by the engine's own rules.
 pub fn validate(search: &Search) -> Result<(), String> {
+    if search.envelope.settlement_rule == SettlementRule::BrokerAuthoritativeV1
+        || search
+            .contracts
+            .iter()
+            .any(|contract| contract.settlement.rule == SettlementRule::BrokerAuthoritativeV1)
+    {
+        return Err("contracts/envelope: broker_authoritative_v1 settlement needs a broker; research and historical replay use price_at_due_v1".into());
+    }
     if search.chunk_size == 0 {
         return Err("chunk_size: must be positive".to_string());
     }
@@ -733,6 +741,9 @@ pub fn project_splits(
 ) -> BTreeMap<String, BTreeMap<String, Group>> {
     let mut groups: BTreeMap<String, BTreeMap<String, Group>> = BTreeMap::new();
     let mut commands: BTreeMap<String, (String, String)> = BTreeMap::new();
+    let mut open = std::collections::BTreeSet::new();
+    let mut accepted = std::collections::BTreeSet::new();
+    let mut unresolved = std::collections::BTreeSet::new();
     for event in events {
         match event.kind {
             EventKind::Signal {
@@ -756,17 +767,35 @@ pub fn project_splits(
                 if disposition == Disposition::Admitted
                     && let Some(command) = command
                 {
+                    group.open += 1;
+                    open.insert(command.clone());
                     commands.insert(command, (binding, split));
                 }
             }
-            EventKind::Accepted { command, .. } => {
-                if let Some(group) = group_of(&mut groups, &commands, &command) {
+            EventKind::Accepted { command, .. }
+            | EventKind::Reconciled {
+                command,
+                resolution: Resolution::Purchased { .. } | Resolution::Accepted { .. },
+                ..
+            } => {
+                if open.contains(&command)
+                    && accepted.insert(command.clone())
+                    && let Some(group) = group_of(&mut groups, &commands, &command)
+                {
                     group.accepted += 1;
-                    group.open += 1;
+                    group.unresolved -= u64::from(unresolved.remove(&command));
                 }
             }
-            EventKind::Released { command, .. } => {
-                if let Some(group) = group_of(&mut groups, &commands, &command) {
+            EventKind::Released { command, .. }
+            | EventKind::Reconciled {
+                command,
+                resolution: Resolution::NotSent,
+                ..
+            } => {
+                if open.remove(&command)
+                    && let Some(group) = group_of(&mut groups, &commands, &command)
+                {
+                    group.close(unresolved.remove(&command));
                     group.released += 1;
                 }
             }
@@ -775,25 +804,40 @@ pub fn project_splits(
                 outcome,
                 profit,
                 ..
+            }
+            | EventKind::Reconciled {
+                command,
+                resolution: Resolution::Settled { outcome, .. },
+                profit: Some(profit),
+                ..
             } => {
-                if let Some(group) = group_of(&mut groups, &commands, &command) {
-                    group.settled += 1;
-                    group.open -= 1;
-                    match outcome {
-                        crate::execution::Outcome::Win => group.wins += 1,
-                        crate::execution::Outcome::Loss => group.losses += 1,
-                        crate::execution::Outcome::Tie => group.ties += 1,
-                    }
-                    let entry = group
-                        .profit
-                        .entry(currency.to_string())
-                        .or_insert_with(|| Some(Decimal::zero(profit.scale())));
-                    *entry = entry.and_then(|total| total.checked_add(profit).ok());
+                if open.remove(&command)
+                    && let Some(group) = group_of(&mut groups, &commands, &command)
+                {
+                    group.close(unresolved.remove(&command));
+                    group.outcome(outcome);
+                    group.add_profit(currency, profit);
                 }
             }
-            EventKind::Unresolved { command, .. } => {
-                if let Some(group) = group_of(&mut groups, &commands, &command) {
-                    group.unresolved += 1;
+            EventKind::Reconciled {
+                command,
+                resolution: Resolution::ExternallyClosed { .. },
+                profit: Some(profit),
+                ..
+            } => {
+                if open.remove(&command)
+                    && let Some(group) = group_of(&mut groups, &commands, &command)
+                {
+                    group.externally_closed += 1;
+                    group.close(unresolved.remove(&command));
+                    group.add_profit(currency, profit);
+                }
+            }
+            EventKind::Unresolved { command, .. } | EventKind::PossiblySent { command, .. } => {
+                if open.contains(&command)
+                    && let Some(group) = group_of(&mut groups, &commands, &command)
+                {
+                    group.unresolved += u64::from(unresolved.insert(command));
                 }
             }
             _ => {}
@@ -1160,6 +1204,7 @@ mod tests {
                 gross_return: decimal(tie),
                 terminal_fee: decimal("0"),
             },
+            semantics: None,
             settlement: Settlement {
                 rule: SettlementRule::PriceAtDueV1,
                 max_settlement_delay_micros: 0,
