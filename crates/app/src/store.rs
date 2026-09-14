@@ -122,6 +122,33 @@ impl Store {
         }
     }
 
+    /// The generations whose ready manifests the filesystem implementation holds, in name order;
+    /// the Google implementation never lists.
+    pub fn list_manifests(&self) -> Result<Vec<String>, String> {
+        self.log("list", "manifests");
+        let Self::Filesystem { root } = self else {
+            return Err(format!("{} cannot be listed", self.uri("manifests")));
+        };
+        let root = root.join("manifests");
+        let entries = match fs::read_dir(&root) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => return Err(format!("cannot inspect {}: {error}", root.display())),
+        };
+        let mut generations = Vec::new();
+        for entry in entries {
+            let entry =
+                entry.map_err(|error| format!("cannot inspect {}: {error}", root.display()))?;
+            let name = entry.file_name().to_string_lossy().into_owned();
+            self.log("probe", &format!("manifests/{name}/ready.json"));
+            if entry.path().join("ready.json").is_file() {
+                generations.push(name);
+            }
+        }
+        generations.sort();
+        Ok(generations)
+    }
+
     /// The local path of a key, only for the filesystem implementation.
     pub fn local_path(&self, key: &str) -> Option<PathBuf> {
         self.log("local_path", key);

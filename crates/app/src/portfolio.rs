@@ -70,9 +70,10 @@ fn bind_fit(
     field: &str,
     entry: &FeatureInstrument,
     cutoff: i64,
+    access: Access<'_>,
 ) -> Result<features::Resolved, String> {
-    let resolved = features::resolve(entry, Access::ORDINARY)
-        .map_err(|reason| format!("{field}: {reason}"))?;
+    let resolved =
+        features::resolve(entry, access).map_err(|reason| format!("{field}: {reason}"))?;
     let coverage = &resolved.input().coverage.last_event_time;
     if parse_event_time_micros(coverage)? >= cutoff {
         return Err(format!(
@@ -118,20 +119,20 @@ struct Bound {
     refit: Vec<BoundInput>,
 }
 
-fn bind(settings: &Portfolio) -> Result<Bound, String> {
+fn bind(settings: &Portfolio, access: Access<'_>) -> Result<Bound, String> {
     let mut folds = Vec::with_capacity(settings.folds.len());
     for (index, fold) in settings.folds.iter().enumerate() {
         let cutoff = parse_event_time_micros(&fold.cutoff)?;
         let mut inputs = Vec::with_capacity(fold.inputs.len());
         for (position, input) in fold.inputs.iter().enumerate() {
             let field = format!("folds[{index}].inputs[{position}]");
-            let fit = bind_fit(&format!("{field}.fit"), &input.fit, cutoff)?;
+            let fit = bind_fit(&format!("{field}.fit"), &input.fit, cutoff, access)?;
             let (_, assessment, _) = outcomes::bind_tick(
                 &format!("{field}.assessment_manifest"),
                 DatasetRole::Development,
                 &input.assessment_manifest,
                 "a portfolio selection",
-                Access::ORDINARY,
+                access,
             )?;
             if assessment.instrument != fit.input().instrument {
                 return Err(format!(
@@ -164,7 +165,7 @@ fn bind(settings: &Portfolio) -> Result<Bound, String> {
         .iter()
         .enumerate()
         .map(|(position, entry)| {
-            let fit = bind_fit(&format!("refit.fits[{position}]"), entry, cutoff)?;
+            let fit = bind_fit(&format!("refit.fits[{position}]"), entry, cutoff, access)?;
             Ok(BoundInput {
                 instrument: fit.input().instrument.clone(),
                 entry: entry.clone(),
@@ -188,6 +189,7 @@ fn bind(settings: &Portfolio) -> Result<Bound, String> {
 fn bind_evaluation(
     settings: &Portfolio,
     evaluation: &Evaluation,
+    access: Access<'_>,
 ) -> Result<Vec<GenerationManifest>, String> {
     let manifests = evaluation
         .inputs
@@ -199,7 +201,7 @@ fn bind_evaluation(
                 DatasetRole::Evaluation,
                 uri,
                 "a portfolio selection",
-                Access::ORDINARY,
+                access,
             )
             .map(|(_, manifest, _)| manifest)
         })
@@ -328,6 +330,7 @@ fn fit_and_apply(
     bound: BoundInput,
     role: DatasetRole,
     input_manifest: &ManifestUri,
+    access: Access<'_>,
 ) -> Result<Applied, String> {
     let fitted = features::build(
         bound.fit,
@@ -343,7 +346,7 @@ fn fit_and_apply(
         input_manifest,
         &bound.entry,
         &fitted.manifest.generation,
-        Access::ORDINARY,
+        access,
     )?;
     Ok(Applied {
         input,
@@ -520,14 +523,20 @@ pub(crate) struct Selected {
 /// evaluate, publish, and verify one selection generation of the configuration's `portfolio`
 /// table, returning its report and verification lines.
 pub fn optimize(config: &Config, local: &Store, destination: &Store) -> Result<String, String> {
-    select(config, local, destination).map(|selected| selected.report)
+    let declaration = crate::research::declaration(config)?;
+    let access = Access {
+        declaration: declaration.as_ref(),
+        certification: None,
+    };
+    select(config, local, destination, access).map(|selected| selected.report)
 }
 
-/// `optimize` with its typed result.
+/// `optimize` with its typed result, under the caller's read permit.
 pub(crate) fn select(
     config: &Config,
     local: &Store,
     destination: &Store,
+    access: Access<'_>,
 ) -> Result<Selected, String> {
     let settings = config
         .portfolio
@@ -538,7 +547,7 @@ pub(crate) fn select(
 
     // 1. Every declared input on its manifest bytes, then the verified development-only
     //    families, the frozen logical universe, and every declared choice.
-    let bound = bind(settings)?;
+    let bound = bind(settings, access)?;
     let (families, family_records) = families(settings)?;
     let members = engine::logical_members(settings, &families)?;
     let mut choices = choices(settings, &members)?;
@@ -565,6 +574,7 @@ pub(crate) fn select(
                     bound,
                     DatasetRole::Development,
                     &input.assessment_manifest,
+                    access,
                 )
             })
             .collect::<Result<Vec<_>, _>>()?;
@@ -602,7 +612,7 @@ pub(crate) fn select(
                         None,
                         None,
                         &settings.gates,
-                        Access::ORDINARY,
+                        access,
                     )?;
                     FoldResult {
                         inapplicable: None,
@@ -651,8 +661,9 @@ pub(crate) fn select(
                     if let Some(evaluation) = &settings.evaluation {
                         let mut features = Vec::new();
                         let mut inputs = Vec::new();
-                        for (position, manifest) in
-                            bind_evaluation(settings, evaluation)?.iter().enumerate()
+                        for (position, manifest) in bind_evaluation(settings, evaluation, access)?
+                            .iter()
+                            .enumerate()
                         {
                             let (entry, fitted) = fits
                                 .iter()
@@ -666,7 +677,7 @@ pub(crate) fn select(
                                 &evaluation.inputs[position],
                                 entry,
                                 &fitted.generation,
-                                Access::ORDINARY,
+                                access,
                             )?;
                             features.push(applied);
                             inputs.push(input);
@@ -683,7 +694,7 @@ pub(crate) fn select(
                             evaluation.splits.clone(),
                             None,
                             &settings.gates,
-                            Access::ORDINARY,
+                            access,
                         )?;
                         if let Some(reason) = &projection.failure {
                             state = State::OuterRejected {
@@ -814,10 +825,11 @@ fn recorded_feature(
     role: DatasetRole,
     input: &ManifestUri,
     frozen_from: Option<&str>,
+    access: Access<'_>,
 ) -> Result<(FeatureManifest, FeaturePlan), String> {
     let key = manifest_key(&record.generation);
     let location = store.uri(&key);
-    let (feature_store, manifest) = features::feature_manifest(uri, &location)?;
+    let (feature_store, manifest) = features::feature_manifest(uri, &location, access)?;
     if manifest.role != role
         || manifest.instrument != record.instrument
         || manifest.input_generation != record.input_generation
@@ -841,7 +853,9 @@ fn recorded_feature(
     Ok((manifest, plan))
 }
 
-/// The recorded fit and application of one instrument, as replay input and plan.
+/// The recorded fit and application of one instrument, as replay input and plan; the applied
+/// generation opens under the caller's read permit.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn recorded_input(
     uri: &str,
     store: &Store,
@@ -850,8 +864,17 @@ pub(crate) fn recorded_input(
     applied: &FeatureRef,
     applied_role: DatasetRole,
     applied_input: &ManifestUri,
+    access: Access<'_>,
 ) -> Result<(String, FeaturePlan, ReplayInput), String> {
-    let (_, plan) = recorded_feature(uri, store, fit, DatasetRole::Development, fit_input, None)?;
+    let (_, plan) = recorded_feature(
+        uri,
+        store,
+        fit,
+        DatasetRole::Development,
+        fit_input,
+        None,
+        Access::ORDINARY,
+    )?;
     if applied.plan_identity != fit.plan_identity || applied.instrument != fit.instrument {
         return Err(format!(
             "{uri}: feature generation {} does not apply the fitted plan {} of {}",
@@ -865,6 +888,7 @@ pub(crate) fn recorded_input(
         applied_role,
         applied_input,
         Some(&fit.generation),
+        access,
     )?;
     Ok((
         fit.instrument.clone(),
@@ -887,7 +911,8 @@ fn configured_fit(
     cutoff: i64,
     plan: &FeaturePlan,
 ) -> Result<(), String> {
-    let resolved = bind_fit(field, entry, cutoff).map_err(|reason| format!("{uri}: {reason}"))?;
+    let resolved = bind_fit(field, entry, cutoff, Access::ORDINARY)
+        .map_err(|reason| format!("{uri}: {reason}"))?;
     if *resolved.plan() != plan.unfitted() {
         return Err(format!(
             "{uri}: {field} does not resolve to the recorded plan before its fit"
@@ -1036,6 +1061,7 @@ pub(crate) fn verified_selection(
                 applied,
                 DatasetRole::Development,
                 &input.assessment_manifest,
+                Access::ORDINARY,
             )?;
             configured_fit(uri, &field, &input.fit, cutoff, &plan)?;
             plans.insert(instrument, plan);
@@ -1141,6 +1167,7 @@ pub(crate) fn verified_selection(
                     DatasetRole::Development,
                     &entry.input_manifest,
                     None,
+                    Access::ORDINARY,
                 )?;
                 configured_fit(
                     uri,
@@ -1205,6 +1232,7 @@ pub(crate) fn verified_selection(
                                     applied,
                                     DatasetRole::Evaluation,
                                     input,
+                                    Access::ORDINARY,
                                 )?;
                                 inputs.push(replay_input);
                             }

@@ -1553,7 +1553,9 @@ analytic zero-profit benchmark on the same initial capital). Validation lowers t
 settings into the existing feature, outcome, search, and portfolio tables with the source
 manifests standing in for unpublished generations and applies their validators, under the
 evaluation window, under the holdout window, under the qualification gates, and under every
-scenario's alternatives. Omitting the table preserves every existing configuration identity; the
+scenario's alternatives, and checks each later window's own `splits` under the execution split
+rules, so no later structural rejection consumes a claim. Omitting the table preserves every
+existing configuration identity; the
 table follows `portfolio` and precedes `[[brokers]]` in canonical order. The command requires
 `run_mode = "research"`.
 
@@ -1596,21 +1598,27 @@ paths. With a declaration (the configuration's `research.study`, supplied to `da
 the reader expects; a holdout target requires the certification context that names it, and an
 undeclared target is refused. Without a declaration an ordinary reader keeps its existing
 post-read role guard and holdout is refused. A derived generation whose manifest carries the
-holdout role (a stream, feature, outcome, or replay of holdout data) is parsed, restored, or
-verified only within the certification context naming its dataset generations. Only the
+holdout role or whose declared input generation is holdout (a stream, feature, outcome, replay,
+or family of holdout data, whatever its own label says) is parsed, restored, or verified only
+within the certification context naming its dataset generations. Only the
 application research owner creates that context, from the matching run manifest, grant, and
-receipt; no configuration flag or role relabelling grants access. The fetch cache traversal reads
-only the declaration's generations of the fetched instrument and role when a declaration is
-present.
+receipt; no configuration flag or role relabelling grants access. The fetch cache traversal lists
+the mirror through the store, reads only the declaration's generations of the fetched instrument
+and role when a declaration is present, refuses a candidate location holding another
+generation's manifest, and verifies the selected prior under the same declaration.
 
 ### Stages and identities
 
 The run identity is SHA-256 over `binary-alpha research run v1\n`, the configuration hash, the
 code revision, and the declaration identity, each followed by a newline; it is computed before any
-work, and an existing run manifest of that identity resumes from its recorded state. Before any
-read the run permits every declared input in its declared role, checks every predecessor intent
-exists under the same study, root, and namespace (a changed governance root fails freshness rather
-than creating authority), and creates the intent (configuration hash, code revision, declaration,
+work; an existing run manifest of that identity passes the complete run verifier and then
+resumes from its recorded state, and an existing frozen stage of that identity restores every
+child through its verifier instead of recomputing it. Before any read the run permits every
+declared input in its declared role and for its declared instrument, checks every predecessor
+intent exists under the same study, root, and namespace (a changed governance root fails
+freshness rather than creating authority) and that every population it used keeps its side of
+the protected boundary in this declaration (an exposed token never becomes protected), and
+creates the intent (configuration hash, code revision, declaration,
 root, namespace, predecessors, changes, and the populations used with their roles and tokens); an
 attempt that already ran with another configuration is refused and must be declared as a new
 attempt with the old one as predecessor. Per instrument the run audits the source generation
@@ -1650,10 +1658,14 @@ selection generation, the descriptor carried unchanged, the claim keys, every sc
 verdict), and the `state` (`no_feasible_policy`, `refit_inapplicable` with its reason,
 `outer_rejected` with its verdict, or `awaiting_holdout_authorization`). In the awaiting state
 this record is the DeploymentBundle the future live consumer parses: it references immutable
-evidence rather than duplicating it, and it is not certified or executable. The ready manifest
+evidence rather than duplicating it, and it is not certified or executable: the engine's
+bundle-completeness check (`Run::complete_bundle`) proves the frozen stage, the version-one claim,
+and one passing result per frozen scenario and authorizes nothing, and live consumption
+additionally requires this run's verified `certified` certification manifest. The ready manifest
 records `kind` (`research_run`), `schema_version` (`1`), `generation`, `config_hash`,
 `code_revision`, `declaration`, `selection`, `state`, and `objects`; the bundle hash a grant
-binds is the object's SHA-256. The command writes every child owner's report lines, then
+binds is the object's SHA-256, and the manifest is published only after the run verifier accepts
+its exact bytes. The command writes every child owner's report lines, then
 `research generation GENERATION scenarios N` with `[bind S development S selection S outer S
 publish S] peak_rss_kb K` or `(already published)`, the verification line, and
 `research generation GENERATION state STATE selection SELECTION`; timings and memory are
@@ -1663,8 +1675,9 @@ receipts outside every identity.
 
 `binary-alpha holdout grant create --config PATH --bundle-manifest URI --holdout-manifest URI
 --reason TEXT` loads `research.study`, validates its declaration, requires the bundle manifest to
-be the run of this configuration and declaration in the awaiting state, requires one
-`--holdout-manifest` per instrument in instrument order equal to the declared holdout references,
+be the run of this configuration and declaration in the awaiting state and to pass the complete
+run verifier, requires one `--holdout-manifest` per instrument in instrument order equal to the
+declared holdout references,
 and creates `grants/RESEARCH.json` once: `schema_version`, `research`, `bundle_sha256`,
 `holdout` (instrument and exact ready-manifest location), `declaration`, `root`, `namespace`, the
 complete sorted protected `tokens` of the declared holdout populations, `operator` (the `USER`
@@ -1685,7 +1698,10 @@ claim is ever released. The certification context is created only from the match
 manifest, grant, and receipt, and permits only the grant's holdout generations. A completed
 certification of this run and grant is verified within that context and returned; otherwise the
 refit plans apply to the holdout generations and every scenario replays with `role = "holdout"`
-exactly as the outer assessment did, and the result is published: object `certification.json`
+exactly as the outer assessment did (the command writes `research scenario ID replay GENERATION`
+per scenario in place of the replay owner's report, so no support count leaves the evidence
+objects), and the result is published after the certification verifier accepts its exact bytes:
+object `certification.json`
 (run, bundle hash, frozen-stage identity, grant, receipt, claims, holdout references, every
 scenario result, and the verdict with its reason) and a ready manifest with `kind`
 (`research_certification`), `schema_version` (`1`), `generation` (SHA-256 over
@@ -1702,16 +1718,19 @@ posterior probability, or execution proof.
 
 `data verify` on a run generation checks the manifest against the record, re-lowers the recorded
 research configuration and compares it with every child: each instrument's profile (a development
-stream of its source), feature generation (the development fit under that profile), outcome
-generation (labelling that source and feature), and family (whose search table and child
-configuration hash equal the lowered search), the selection (through the selection verifier, whose
-recorded configuration must equal the lowered portfolio table), the frozen stage, the claims, and,
+stream of its source), feature generation (the configured fit under that profile, resolved before
+its fit and compared with the recorded plan), outcome generation (the configured rule over that
+source and feature, by identity), and family (whose search table, child configuration hash, and
+input instrument equal the lowered search), the selection (through the selection verifier, whose
+recorded configuration must equal the lowered portfolio table), the frozen stage, and, under the
+declaration the run was frozen under, the intent and every claim by exact reconstruction, and,
 for a selected policy, every scenario: each applied feature generation through the recorded refit,
 each replay restored and checked against the exact lowered table with its descriptor, the
 projection and verdict recomputed, and the aggregate state; it writes
 `verified research generation GENERATION state STATE instruments N scenarios M objects 1 bytes B`.
 On a certification generation without the matching context it checks the envelope (the run,
-bundle hash, and, with `--config`, the grant and receipt) without resolving a protected child and
+bundle hash, and, with `--config`, the grant, every protected claim by exact reconstruction, and
+the receipt's consumption of that grant) without resolving a protected child and
 writes `verified research certification GENERATION state STATE envelope only: protected evidence is
 verified within the authorized certification run`; within the matching context it re-derives every
 holdout scenario and writes
@@ -1719,6 +1738,7 @@ holdout scenario and writes
 
 Interruption at any point preserves every completed child, claim, and record; the rerun reuses each
 completed generation after its own verifier restores it, recreates nothing that exists, and reaches
-the same identities. The filesystem store appends `OPERATION KEY` to the file named by the
+the same identities. The filesystem store appends `OPERATION KEY` (`head`, `read_to`, `put_new`,
+`local_path`, `list`, and `probe` of a listed manifest) to the file named by the
 `BINARY_ALPHA_STORE_LOG` environment variable when it is set, as test instrumentation outside every
 identity.

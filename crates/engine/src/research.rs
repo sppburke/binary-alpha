@@ -795,6 +795,18 @@ pub fn validate(research: &Research) -> Result<(), String> {
             .validate()
             .map_err(|reason| format!("scenarios[{index}]: portfolio.{reason}"))?;
     }
+    // Each later window's own splits under the execution rules, before any claim is consumed.
+    for (name, window) in [
+        ("evaluation", &research.evaluation),
+        ("holdout", &research.holdout),
+    ] {
+        let start = crate::market::parse_event_time_micros(&window.decision_start)
+            .map_err(|reason| format!("{name}.decision_start: {reason}"))?;
+        let end = crate::market::parse_event_time_micros(&window.decision_end)
+            .map_err(|reason| format!("{name}.decision_end: {reason}"))?;
+        crate::execution::validate_splits(window.splits.as_deref().unwrap_or(&[]), start, end)
+            .map_err(|reason| format!("{name}.{reason}"))?;
+    }
     Ok(())
 }
 
@@ -1251,12 +1263,14 @@ impl Run {
         parse(bytes)
     }
 
-    /// The deployable contract a live consumer reads: only an awaiting run with its frozen
-    /// stage, version-one claim, and one passing result per frozen scenario in order.
-    pub fn deployable(&self) -> Result<(), String> {
+    /// The frozen bundle an awaiting run carries: its frozen stage, the version-one claim, and
+    /// one passing result per frozen scenario in order. Completeness alone authorizes nothing:
+    /// live consumption additionally requires this run's verified `certified` certification
+    /// manifest, and the same immutable run stays uncertified or rejected without one.
+    pub fn complete_bundle(&self) -> Result<(), String> {
         if self.state != RunState::AwaitingHoldoutAuthorization {
             return Err(format!(
-                "state `{}` is not a deployable bundle",
+                "state `{}` carries no frozen bundle",
                 self.state.status()
             ));
         }

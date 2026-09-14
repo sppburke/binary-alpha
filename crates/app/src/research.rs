@@ -21,11 +21,14 @@ use std::time::Instant;
 
 use binary_alpha_engine::config::{
     Config, Evaluation, ManifestUri, Portfolio, PublicationUri, Research, RunMode, Search,
+    Study as StudyTable,
 };
 use binary_alpha_engine::dataset::{DatasetRole, ObjectRecord, ObjectRole, manifest_key};
 use binary_alpha_engine::execution::ReplayInput;
 use binary_alpha_engine::market::format_event_time_micros;
-use binary_alpha_engine::outcomes::{OUTCOME_MANIFEST_KIND, OutcomeManifest};
+use binary_alpha_engine::outcomes::{
+    OUTCOME_MANIFEST_KIND, OutcomeManifest, OutcomeRule, outcome_generation_id,
+};
 use binary_alpha_engine::portfolio::{self as portfolio_engine, Outer, State};
 use binary_alpha_engine::research::{
     self as engine, Access, BASELINE_SCENARIO, CERTIFICATION_MANIFEST_KIND,
@@ -140,14 +143,16 @@ fn publish_object(
 }
 
 /// The ready manifest of a generation: the committed bytes when the destination already holds
-/// one that `same` accepts, else `fresh`; published to the destination and mirrored locally.
+/// one that `same` accepts, else `fresh`; verified by `verify` on those exact bytes before
+/// anything becomes ready, then published to the destination and mirrored locally.
 fn publish_manifest(
     local: &Store,
     destination: &Store,
     key: &str,
     fresh: Vec<u8>,
     same: impl FnOnce(&[u8]) -> Result<bool, String>,
-) -> Result<(Vec<u8>, Put), String> {
+    verify: impl FnOnce(&[u8]) -> Result<String, String>,
+) -> Result<(String, Put), String> {
     let committed = match destination.head(key)? {
         Some(_) => {
             let mut bytes = Vec::new();
@@ -162,6 +167,7 @@ fn publish_manifest(
         }
         None => fresh,
     };
+    let verified = verify(&committed)?;
     let temporary = import::temporary_path(local, &key.replace('/', "-"))?;
     fs::write(&temporary, &committed)
         .map_err(|error| format!("cannot write {}: {error}", temporary.display()))?;
@@ -170,7 +176,7 @@ fn publish_manifest(
     local.put_new(key, &temporary, &identity)?;
     fs::remove_file(&temporary)
         .map_err(|error| format!("cannot remove {}: {error}", temporary.display()))?;
-    Ok((committed, put))
+    Ok((verified, put))
 }
 
 fn read_key(store: &Store, key: &str) -> Result<Vec<u8>, String> {
@@ -246,85 +252,15 @@ impl Study<'_> {
             .collect())
     }
 
-    /// Every declared input in its declared role, checked as a permit before any read: the
-    /// development sources, fits, and assessments, the evaluation inputs, and the holdout
-    /// references (role only; never opened here).
+    /// Every declared input in its declared role, checked as a permit before any read.
     fn permit_inputs(&self) -> Result<Vec<PopulationUse>, String> {
-        let access = self.access();
-        let mut used: BTreeMap<&str, PopulationUse> = BTreeMap::new();
-        let mut note = |role: DatasetRole, uri: &ManifestUri, field: String| {
-            let generation = uri.generation();
-            let population = self.declaration.population(generation).ok_or_else(|| {
-                format!(
-                    "{field}: generation {generation} is not declared by the governance declaration"
-                )
-            })?;
-            if population.role != role {
-                return Err(format!(
-                    "{field}: generation {generation} is declared `{}`, not `{role}`",
-                    population.role
-                ));
-            }
-            if role != DatasetRole::Holdout {
-                access
-                    .permit(Some(role), generation)
-                    .map_err(|reason| format!("{field}: {reason}"))?;
-            }
-            used.entry(population.id.as_str())
-                .or_insert_with(|| PopulationUse {
-                    id: population.id.clone(),
-                    role,
-                    tokens: population.tokens.clone(),
-                });
-            Ok(())
-        };
-        for (index, instrument) in self.research.instruments.iter().enumerate() {
-            note(
-                DatasetRole::Development,
-                &instrument.source_manifest,
-                format!("instruments[{index}].source_manifest"),
-            )?;
-        }
-        for (index, fold) in self.research.folds.iter().enumerate() {
-            for (position, input) in fold.inputs.iter().enumerate() {
-                note(
-                    DatasetRole::Development,
-                    &input.fit_manifest,
-                    format!("folds[{index}].inputs[{position}].fit_manifest"),
-                )?;
-                note(
-                    DatasetRole::Development,
-                    &input.assessment_manifest,
-                    format!("folds[{index}].inputs[{position}].assessment_manifest"),
-                )?;
-            }
-        }
-        for (position, fit) in self.research.refit.fits.iter().enumerate() {
-            note(
-                DatasetRole::Development,
-                fit,
-                format!("refit.fits[{position}]"),
-            )?;
-        }
-        for (position, input) in self.research.evaluation.inputs.iter().enumerate() {
-            note(
-                DatasetRole::Evaluation,
-                input,
-                format!("evaluation.inputs[{position}]"),
-            )?;
-        }
-        for (position, input) in self.research.holdout.inputs.iter().enumerate() {
-            note(
-                DatasetRole::Holdout,
-                input,
-                format!("holdout.inputs[{position}]"),
-            )?;
-        }
-        Ok(used.into_values().collect())
+        population_uses(self.research, &self.declaration)
     }
 
-    /// Every predecessor attempt's intent exists under this study, root, and namespace: a
-    /// changed governance root fails freshness rather than creating new authority.
+    /// Every predecessor attempt's intent exists under this study, root, and namespace, and
+    /// every population it used keeps its side of the protected boundary in this declaration:
+    /// a changed governance root fails freshness rather than creating new authority, and an
+    /// exposed token never becomes protected again.
     fn check_predecessors(&self) -> Result<(), String> {
         let study = &self.research.study;
         for predecessor in &study.predecessors {
@@ -348,6 +284,22 @@ impl Study<'_> {
                     "study.predecessors: attempt `{predecessor}` ran under another study, governance root, or namespace; prior claims must be migrated before a fresh assessment"
                 ));
             }
+            for used in &intent.populations {
+                let exposed = used.role != DatasetRole::Holdout;
+                if let Some(population) = self.declaration.populations.iter().find(|population| {
+                    population.id == used.id
+                        || population
+                            .tokens
+                            .iter()
+                            .any(|token| used.tokens.contains(token))
+                }) && (population.role != DatasetRole::Holdout) != exposed
+                {
+                    return Err(format!(
+                        "study.predecessors: attempt `{predecessor}` used population `{}` as `{}`, but the declaration now places `{}` on the other side of the protected boundary",
+                        used.id, used.role, population.id
+                    ));
+                }
+            }
         }
         Ok(())
     }
@@ -363,37 +315,178 @@ impl Study<'_> {
         frozen: &str,
         grant: Option<&str>,
     ) -> Result<Vec<String>, String> {
-        let study = &self.research.study;
-        let mut keys = Vec::with_capacity(tokens.len());
-        let mut expected = Vec::with_capacity(tokens.len());
-        for token in tokens {
-            let claim = Claim {
-                schema_version: RECORD_SCHEMA_VERSION,
-                kind,
-                token: token.clone(),
-                study: study.study.clone(),
-                attempt: study.attempt.clone(),
-                research: self.generation.clone(),
-                frozen: frozen.to_string(),
-                declaration: self.identity.clone(),
-                tokens: tokens.to_vec(),
-                grant: grant.map(str::to_string),
-            };
-            let key = self.key(&engine::claim_key(kind, token));
-            let bytes = engine::to_json(&claim);
-            publish_record(local, &self.governance, &key, &bytes).map_err(|reason| {
+        let claims = Claims {
+            declaration: &self.declaration,
+            identity: &self.identity,
+            study: &self.research.study,
+            kind,
+            tokens,
+            research: &self.generation,
+            frozen,
+            grant,
+        };
+        for ((key, bytes), token) in claims.records().iter().zip(tokens) {
+            publish_record(local, &self.governance, key, bytes).map_err(|reason| {
                 format!("population token `{token}` is claimed by another assessment: {reason}")
             })?;
-            keys.push(key);
-            expected.push(bytes);
         }
-        for (key, bytes) in keys.iter().zip(&expected) {
-            if read_key(&self.governance, key)? != *bytes {
+        claims.verify(&self.governance)
+    }
+}
+
+/// Every declared input of a research table in its declared role and instrument, checked as a
+/// permit before any read: the development sources, fits, and assessments, the evaluation
+/// inputs, and the holdout references (role and instrument only; never opened here). The
+/// result is the intent's population record.
+fn population_uses(
+    research: &Research,
+    declaration: &Declaration,
+) -> Result<Vec<PopulationUse>, String> {
+    let access = Access {
+        declaration: Some(declaration),
+        certification: None,
+    };
+    let mut used: BTreeMap<&str, PopulationUse> = BTreeMap::new();
+    let mut note = |role: DatasetRole, instrument: &str, uri: &ManifestUri, field: String| {
+        let generation = uri.generation();
+        let population = declaration.population(generation).ok_or_else(|| {
+            format!(
+                "{field}: generation {generation} is not declared by the governance declaration"
+            )
+        })?;
+        if population.role != role {
+            return Err(format!(
+                "{field}: generation {generation} is declared `{}`, not `{role}`",
+                population.role
+            ));
+        }
+        if population.instrument != instrument {
+            return Err(format!(
+                "{field}: generation {generation} is declared for instrument `{}`, not `{instrument}`",
+                population.instrument
+            ));
+        }
+        if role != DatasetRole::Holdout {
+            access
+                .permit(Some(role), generation)
+                .map_err(|reason| format!("{field}: {reason}"))?;
+        }
+        used.entry(population.id.as_str())
+            .or_insert_with(|| PopulationUse {
+                id: population.id.clone(),
+                role,
+                tokens: population.tokens.clone(),
+            });
+        Ok(())
+    };
+    let instruments = || {
+        research
+            .instruments
+            .iter()
+            .map(|instrument| instrument.instrument.as_str())
+            .enumerate()
+    };
+    for (index, instrument) in instruments() {
+        note(
+            DatasetRole::Development,
+            instrument,
+            &research.instruments[index].source_manifest,
+            format!("instruments[{index}].source_manifest"),
+        )?;
+    }
+    for (index, fold) in research.folds.iter().enumerate() {
+        for ((position, instrument), input) in instruments().zip(&fold.inputs) {
+            note(
+                DatasetRole::Development,
+                instrument,
+                &input.fit_manifest,
+                format!("folds[{index}].inputs[{position}].fit_manifest"),
+            )?;
+            note(
+                DatasetRole::Development,
+                instrument,
+                &input.assessment_manifest,
+                format!("folds[{index}].inputs[{position}].assessment_manifest"),
+            )?;
+        }
+    }
+    for ((position, instrument), fit) in instruments().zip(&research.refit.fits) {
+        note(
+            DatasetRole::Development,
+            instrument,
+            fit,
+            format!("refit.fits[{position}]"),
+        )?;
+    }
+    for ((position, instrument), input) in instruments().zip(&research.evaluation.inputs) {
+        note(
+            DatasetRole::Evaluation,
+            instrument,
+            input,
+            format!("evaluation.inputs[{position}]"),
+        )?;
+    }
+    for ((position, instrument), input) in instruments().zip(&research.holdout.inputs) {
+        note(
+            DatasetRole::Holdout,
+            instrument,
+            input,
+            format!("holdout.inputs[{position}]"),
+        )?;
+    }
+    Ok(used.into_values().collect())
+}
+
+/// The claims one run creates over a token set, as created and as verified: one record per
+/// token in canonical order, every record naming the complete set.
+struct Claims<'a> {
+    declaration: &'a Declaration,
+    identity: &'a str,
+    study: &'a StudyTable,
+    kind: ClaimKind,
+    tokens: &'a [String],
+    research: &'a str,
+    frozen: &'a str,
+    grant: Option<&'a str>,
+}
+
+impl Claims<'_> {
+    /// Every claim's key and exact bytes, in token order.
+    fn records(&self) -> Vec<(String, Vec<u8>)> {
+        self.tokens
+            .iter()
+            .map(|token| {
+                let claim = Claim {
+                    schema_version: RECORD_SCHEMA_VERSION,
+                    kind: self.kind,
+                    token: token.clone(),
+                    study: self.study.study.clone(),
+                    attempt: self.study.attempt.clone(),
+                    research: self.research.to_string(),
+                    frozen: self.frozen.to_string(),
+                    declaration: self.identity.to_string(),
+                    tokens: self.tokens.to_vec(),
+                    grant: self.grant.map(str::to_string),
+                };
+                (
+                    self.declaration.key(&engine::claim_key(self.kind, token)),
+                    engine::to_json(&claim),
+                )
+            })
+            .collect()
+    }
+
+    /// Every claim exists beneath `governance` with exactly these bytes; the keys in order.
+    fn verify(&self, governance: &Store) -> Result<Vec<String>, String> {
+        let mut keys = Vec::with_capacity(self.tokens.len());
+        for (key, bytes) in self.records() {
+            if read_key(governance, &key)? != bytes {
                 return Err(format!(
-                    "{} changed after it was claimed",
-                    self.governance.uri(key)
+                    "{} is not this run's claim of the token",
+                    governance.uri(&key)
                 ));
             }
+            keys.push(key);
         }
         Ok(keys)
     }
@@ -480,8 +573,8 @@ fn existing_run(
         return Ok(None);
     }
     let uri = destination.uri(&key);
-    let manifest = RunManifest::from_json(&read_key(destination, &key)?)
-        .map_err(|error| format!("{uri}: {error}"))?;
+    let bytes = read_key(destination, &key)?;
+    let manifest = RunManifest::from_json(&bytes).map_err(|error| format!("{uri}: {error}"))?;
     if manifest.config_hash != study.config.content_hash()
         || manifest.code_revision != CODE_REVISION
         || manifest.declaration != study.identity
@@ -490,6 +583,9 @@ fn existing_run(
             "{uri} does not record this configuration, revision, and declaration"
         ));
     }
+    // The complete verifier before anything resumes on this run: a partial or altered bundle
+    // never reaches authorization.
+    verify_run(&uri, destination, &key, &bytes, study.access())?;
     let run = Run::from_json(&search::read_object(
         destination,
         &manifest.objects,
@@ -541,7 +637,19 @@ fn profile(
     if let Some(profile) = profiles.get(uri.generation()) {
         return Ok(profile.clone());
     }
-    let audited = audit::audit(config, &uri.to_string(), local, destination, access)?;
+    // The profile's identity carries the instrument table only: the research table names later
+    // observations that never enter a development identity.
+    let profile_config = Config {
+        instruments: config.instruments.clone(),
+        ..crate::skeleton(config)
+    };
+    let audited = audit::audit(
+        &profile_config,
+        &uri.to_string(),
+        local,
+        destination,
+        access,
+    )?;
     report(&audited.report)?;
     let profile = ready_uri(destination, &audited.generation)?;
     profiles.insert(uri.generation().to_string(), profile.clone());
@@ -602,9 +710,51 @@ fn develop(
     )?;
     clock.bind = started.elapsed().as_secs_f64();
 
-    // 2. Every instrument's development chain through the existing owners: the profile of
-    //    every development source, the family-source features and outcomes, and the family.
+    // 2. The frozen stage this run already published, restored through every child's verifier
+    //    instead of recomputed; else every instrument's development chain through the existing
+    //    owners: the profile of every development source, the family-source features and
+    //    outcomes, and the family.
     let developing = Instant::now();
+    let descriptor = engine::descriptor(research);
+    let frozen_key = engine::frozen_key(&study.generation);
+    if destination.head(&frozen_key)?.is_some() {
+        let uri = destination.uri(&frozen_key);
+        let frozen_bytes = read_key(destination, &frozen_key)?;
+        let stage = Frozen::from_json(&frozen_bytes).map_err(|error| format!("{uri}: {error}"))?;
+        if stage.research != study.generation
+            || stage.intent != intent_key
+            || stage.declaration != study.identity
+            || stage.scenarios != research.scenarios
+            || stage.descriptor != descriptor
+        {
+            return Err(format!(
+                "{uri} does not bind this run's identity, intent, declaration, scenarios, and descriptor"
+            ));
+        }
+        let selection = verified_children(
+            &uri,
+            destination,
+            config,
+            &stage.instruments,
+            &stage.selection,
+            access,
+        )?;
+        report(&format!(
+            "research generation {} frozen stage restored (already published)",
+            study.generation
+        ))?;
+        clock.development = developing.elapsed().as_secs_f64();
+        return finish(
+            study,
+            local,
+            destination,
+            stage,
+            frozen_bytes,
+            selection,
+            clock,
+            report,
+        );
+    }
     let mut profiles: BTreeMap<String, ManifestUri> = BTreeMap::new();
     let mut instruments = Vec::with_capacity(research.instruments.len());
     let mut families = Vec::with_capacity(research.instruments.len());
@@ -654,6 +804,7 @@ fn develop(
             ),
             local,
             destination,
+            access,
         )?;
         report(&searched.report)?;
         families.push(ready_uri(destination, &searched.generation)?);
@@ -687,36 +838,62 @@ fn develop(
     // 3. The existing portfolio owner selects with evaluation disabled.
     let selecting = Instant::now();
     let table = selection_table(research, families, &profiles)?;
-    let selected = portfolio::select(&portfolio_config(config, table), local, destination)?;
+    let selected = portfolio::select(&portfolio_config(config, table), local, destination, access)?;
     report(&selected.report)?;
-    let selection = selected.selection;
     clock.selection = selecting.elapsed().as_secs_f64();
 
     // 4. The frozen stage: published before any outer claim or read.
     let publishing = Instant::now();
-    let descriptor = engine::descriptor(research);
-    let frozen_bytes = Frozen {
+    let stage = Frozen {
         research: study.generation.clone(),
-        intent: intent_key.clone(),
+        intent: intent_key,
         declaration: study.identity.clone(),
-        instruments: instruments.clone(),
+        instruments,
         selection: selected.manifest.generation.clone(),
         scenarios: research.scenarios.clone(),
-        descriptor: descriptor.clone(),
-    }
-    .to_json();
-    let frozen_key = engine::frozen_key(&study.generation);
+        descriptor,
+    };
+    let frozen_bytes = stage.to_json();
     publish_record(local, destination, &frozen_key, &frozen_bytes)?;
-    let frozen = engine::digest(b"", &frozen_bytes);
     clock.publish = publishing.elapsed().as_secs_f64();
+    finish(
+        study,
+        local,
+        destination,
+        stage,
+        frozen_bytes,
+        selected.selection,
+        clock,
+        report,
+    )
+}
 
+/// The outer assessment and the run publication over one frozen stage: the outer claims, the
+/// refit plans applied to the evaluation generations, every scenario replayed once, and the
+/// run record and its ready manifest, verified before it becomes ready.
+#[allow(clippy::too_many_arguments)]
+fn finish(
+    study: &Study<'_>,
+    local: &Store,
+    destination: &Store,
+    stage: Frozen,
+    frozen_bytes: Vec<u8>,
+    selection: portfolio_engine::Selection,
+    mut clock: Clock,
+    report: &mut dyn FnMut(&str) -> Result<(), String>,
+) -> Result<(RunManifest, Run), String> {
+    let config = study.config;
+    let research = study.research;
+    let access = study.access();
+    let frozen = engine::digest(b"", &frozen_bytes);
+    let descriptor = stage.descriptor;
     let mut run = Run {
         config: config.clone(),
         declaration: study.identity.clone(),
-        intent: intent_key,
+        intent: stage.intent,
         frozen: Some(frozen.clone()),
-        instruments,
-        selection: selected.manifest.generation.clone(),
+        instruments: stage.instruments,
+        selection: stage.selection,
         descriptor: descriptor.clone(),
         claims: Vec::new(),
         outer: Vec::new(),
@@ -790,21 +967,27 @@ fn develop(
         objects: vec![object],
     };
     let key = manifest_key(&generation);
-    let fresh = manifest.to_json();
-    let (committed, put) = publish_manifest(local, destination, &key, fresh, |bytes| {
-        let committed = RunManifest::from_json(bytes)
-            .map_err(|error| format!("{}: {error}", destination.uri(&key)))?;
-        Ok(committed.generation == manifest.generation
-            && committed.selection == manifest.selection
-            && committed.state == manifest.state
-            && import::same_objects(
-                &committed.objects,
-                &manifest.objects,
-                std::slice::from_ref(&identity),
-            ))
-    })?;
     let uri = destination.uri(&key);
-    let verified = verify_run(&uri, destination, &key, &committed, access)?;
+    let fresh = manifest.to_json();
+    let (verified, put) = publish_manifest(
+        local,
+        destination,
+        &key,
+        fresh,
+        |bytes| {
+            let committed =
+                RunManifest::from_json(bytes).map_err(|error| format!("{uri}: {error}"))?;
+            Ok(committed.generation == manifest.generation
+                && committed.selection == manifest.selection
+                && committed.state == manifest.state
+                && import::same_objects(
+                    &committed.objects,
+                    &manifest.objects,
+                    std::slice::from_ref(&identity),
+                ))
+        },
+        |bytes| verify_run(&uri, destination, &key, bytes, access),
+    )?;
     clock.publish += publishing.elapsed().as_secs_f64();
     let scenarios = run.outer.len();
     let line = match put {
@@ -905,7 +1088,16 @@ fn assess(
             gates,
             access,
         )?;
-        report(&published.report)?;
+        if role == DatasetRole::Holdout {
+            // Protected support observations stay in the evidence objects the certification
+            // context alone opens; the command prints only the generation it created.
+            report(&format!(
+                "research scenario {id} replay {}",
+                published.manifest.generation
+            ))?;
+        } else {
+            report(&published.report)?;
+        }
         let verdict = engine::verdict(&projection, gates);
         results.push(ScenarioResult {
             scenario: id,
@@ -1074,19 +1266,25 @@ fn certify(
         objects: vec![object],
     };
     let fresh = certification_manifest.to_json();
-    let (committed, put) = publish_manifest(local, destination, &key, fresh, |bytes| {
-        let committed = CertificationManifest::from_json(bytes)
-            .map_err(|error| format!("{}: {error}", destination.uri(&key)))?;
-        Ok(committed.generation == certification_manifest.generation
-            && committed.state == certification_manifest.state
-            && import::same_objects(
-                &committed.objects,
-                &certification_manifest.objects,
-                std::slice::from_ref(&identity),
-            ))
-    })?;
     let uri = destination.uri(&key);
-    let verified = verify_certification(&uri, destination, &key, &committed, access)?;
+    let (verified, put) = publish_manifest(
+        local,
+        destination,
+        &key,
+        fresh,
+        |bytes| {
+            let committed = CertificationManifest::from_json(bytes)
+                .map_err(|error| format!("{uri}: {error}"))?;
+            Ok(committed.generation == certification_manifest.generation
+                && committed.state == certification_manifest.state
+                && import::same_objects(
+                    &committed.objects,
+                    &certification_manifest.objects,
+                    std::slice::from_ref(&identity),
+                ))
+        },
+        |bytes| verify_certification(&uri, destination, &key, bytes, access),
+    )?;
     let line = match put {
         Put::Reused(_) => format!(
             "research certification {generation} state {} (already published)",
@@ -1125,7 +1323,8 @@ pub fn grant(
         ));
     }
     let (store, key) = verify::open(bundle_manifest)?;
-    let manifest = RunManifest::from_json(&read_key(&store, &key)?)
+    let bytes = read_key(&store, &key)?;
+    let manifest = RunManifest::from_json(&bytes)
         .map_err(|error| format!("holdout grant: {bundle_manifest}: {error}"))?;
     if manifest.declaration != study.identity || manifest.config_hash != config.content_hash() {
         return Err(format!(
@@ -1138,6 +1337,9 @@ pub fn grant(
             manifest.state
         ));
     }
+    // The complete verifier before any authority is created over the bundle.
+    verify_run(bundle_manifest, &store, &key, &bytes, study.access())
+        .map_err(|reason| format!("holdout grant: {reason}"))?;
     let holdout = study.holdout();
     let declared: Vec<String> = holdout
         .iter()
@@ -1267,109 +1469,47 @@ pub fn verify_run(
             "{uri}: the frozen stage does not bind the run's identity, intent, children, selection, scenarios, and descriptor"
         ));
     }
-    // Every instrument's development chain, re-lowered from the configuration.
-    if run.instruments.len() != research.instruments.len() {
-        return Err(format!(
-            "{uri}: {} instrument records for {} configured instruments",
-            run.instruments.len(),
-            research.instruments.len()
-        ));
-    }
-    let mut profiles: BTreeMap<String, ManifestUri> = BTreeMap::new();
-    let mut families = Vec::with_capacity(run.instruments.len());
-    for (instrument, record) in research.instruments.iter().zip(&run.instruments) {
-        let source = &instrument.source_manifest;
-        if record.instrument != instrument.instrument || record.source != source.generation() {
+    // Under the declaration this run was frozen under: the attempt intent exists with exactly
+    // the populations, predecessors, and changes this configuration declares.
+    let governance = match access.declaration {
+        Some(declaration) if declaration.identity() != run.declaration => {
             return Err(format!(
-                "{uri}: instrument record {} is not the configured instrument and source",
-                record.instrument
+                "{uri}: the configured declaration is not the one this run was frozen under"
             ));
         }
-        let profile = verified_profile(uri, store, &record.profile, &record.source)?;
-        profiles.insert(record.source.clone(), profile.clone());
-        let (_, feature) =
-            features::feature_manifest(uri, &store.uri(&manifest_key(&record.feature)))?;
-        if feature.role != DatasetRole::Development
-            || feature.input_generation != record.source
-            || feature.profile_generation != record.profile
-            || feature.frozen_from.is_some()
-        {
-            return Err(format!(
-                "{uri}: feature generation {} is not the development fit of {} under its profile",
-                record.feature, record.source
+        Some(declaration) => {
+            let governance = Store::open(&declaration.root)?;
+            let intent_key = declaration.key(&engine::intent_key(
+                &research.study.study,
+                &research.study.attempt,
             ));
+            let intent = Intent {
+                schema_version: RECORD_SCHEMA_VERSION,
+                study: research.study.study.clone(),
+                attempt: research.study.attempt.clone(),
+                config_hash: manifest.config_hash.clone(),
+                code_revision: manifest.code_revision.clone(),
+                declaration: run.declaration.clone(),
+                root: declaration.root.clone(),
+                namespace: declaration.namespace.clone(),
+                predecessors: research.study.predecessors.clone(),
+                changes: research.study.changes.clone(),
+                populations: population_uses(research, declaration)?,
+            };
+            if run.intent != intent_key
+                || read_key(&governance, &intent_key)? != engine::to_json(&intent)
+            {
+                return Err(format!(
+                    "{uri}: {} is not the intent of this attempt",
+                    governance.uri(&intent_key)
+                ));
+            }
+            Some((declaration, governance))
         }
-        let outcome_key = manifest_key(&record.outcome);
-        let outcome_bytes = read_key(store, &outcome_key)?;
-        if verify::manifest_kind(&outcome_bytes)?.as_deref() != Some(OUTCOME_MANIFEST_KIND) {
-            return Err(format!(
-                "{uri}: {} is not an outcome generation",
-                record.outcome
-            ));
-        }
-        let outcome = OutcomeManifest::from_json(&outcome_bytes)
-            .map_err(|error| format!("{uri}: {error}"))?;
-        if outcome.role != DatasetRole::Development
-            || outcome.tick_generation != record.source
-            || outcome.feature_generation != record.feature
-        {
-            return Err(format!(
-                "{uri}: outcome generation {} does not label the recorded source and feature",
-                record.outcome
-            ));
-        }
-        let family_uri = store.uri(&manifest_key(&record.family));
-        let (family_manifest, family) = search::development_family(&family_uri)?;
-        let expected = search_config(
-            config,
-            engine::search_table(
-                instrument,
-                ReplayInput {
-                    tick_manifest: source.clone(),
-                    feature_manifest: ready_uri(store, &record.feature)?,
-                    outcome_manifest: Some(ready_uri(store, &record.outcome)?),
-                },
-            ),
-        );
-        if family_manifest.config_hash != expected.content_hash()
-            || family.search != *expected.search.as_ref().expect("set")
-        {
-            return Err(format!(
-                "{uri}: family generation {} is not the search this configuration lowers for {}",
-                record.family, record.instrument
-            ));
-        }
-        families.push(ready_uri(store, &record.family)?);
-    }
-    for fit in research
-        .folds
-        .iter()
-        .flat_map(|fold| fold.inputs.iter().map(|input| &input.fit_manifest))
-        .chain(research.refit.fits.iter())
-    {
-        if !profiles.contains_key(fit.generation()) {
-            let selection_uri = store.uri(&manifest_key(&run.selection));
-            let profile = recorded_fit_profile(&selection_uri, store, &run.selection, fit)?;
-            let profile = verified_profile(uri, store, &profile, fit.generation())?;
-            profiles.insert(fit.generation().to_string(), profile);
-        }
-    }
-    // The selection: the existing verifier, then its configuration equals the lowered table.
-    let selection_key = manifest_key(&run.selection);
-    let selection_uri = store.uri(&selection_key);
-    let (_, selection, _) = portfolio::verified_selection(
-        &selection_uri,
-        store,
-        &selection_key,
-        &read_key(store, &selection_key)?,
-    )?;
-    let expected = portfolio_config(config, selection_table(research, families, &profiles)?);
-    if selection.config != expected {
-        return Err(format!(
-            "{uri}: selection generation {} is not the selection this configuration lowers",
-            run.selection
-        ));
-    }
+        None => None,
+    };
+    let selection =
+        verified_children(uri, store, config, &run.instruments, &run.selection, access)?;
     // The state and, for a selected policy, the outer claims and every scenario.
     let expected_state = match &selection.state {
         State::NoFeasiblePolicy => RunState::NoFeasiblePolicy,
@@ -1380,31 +1520,30 @@ pub fn verify_run(
             return Err(format!("{uri}: the selection carries an outer result"));
         }
         State::Selected => {
-            let tokens = access
-                .declaration
-                .map(|declaration| {
-                    declaration.tokens(
+            if let Some((declaration, governance)) = &governance {
+                let tokens: Vec<String> = declaration
+                    .tokens(
                         research
                             .evaluation
                             .inputs
                             .iter()
                             .map(ManifestUri::generation),
-                    )
-                })
-                .transpose()?;
-            if let Some(tokens) = tokens {
-                let expected: Vec<String> = tokens
-                    .iter()
-                    .map(|token| {
-                        access
-                            .declaration
-                            .expect("present")
-                            .key(&engine::claim_key(ClaimKind::AssessmentUse, token))
-                    })
+                    )?
+                    .into_iter()
                     .collect();
-                if run.claims != expected {
+                let claims = Claims {
+                    declaration,
+                    identity: &run.declaration,
+                    study: &research.study,
+                    kind: ClaimKind::AssessmentUse,
+                    tokens: &tokens,
+                    research: &manifest.generation,
+                    frozen: run.frozen.as_deref().unwrap_or_default(),
+                    grant: None,
+                };
+                if claims.verify(governance)? != run.claims {
                     return Err(format!(
-                        "{uri}: the outer claims are not the declared evaluation tokens"
+                        "{uri}: the outer claims are not this run's claims of the declared evaluation tokens"
                     ));
                 }
             }
@@ -1435,7 +1574,7 @@ pub fn verify_run(
         ));
     }
     if run.state == RunState::AwaitingHoldoutAuthorization {
-        run.deployable()
+        run.complete_bundle()
             .map_err(|reason| format!("{uri}: {reason}"))?;
     }
     Ok(format!(
@@ -1446,6 +1585,146 @@ pub fn verify_run(
         run.outer.len(),
         run_bytes.len()
     ))
+}
+
+/// Every published child of one frozen stage re-derived from the recorded configuration: each
+/// instrument's profile, features (the configured fit before its cutoff), outcomes (the
+/// configured rule over the recorded source and features), and family, every one for the
+/// configured instrument; then the selection, whose configuration must equal the lowered
+/// table. Every child restores through its own verifier.
+fn verified_children(
+    uri: &str,
+    store: &Store,
+    config: &Config,
+    instruments: &[InstrumentRecord],
+    selection: &str,
+    access: Access<'_>,
+) -> Result<portfolio_engine::Selection, String> {
+    let research = config
+        .research
+        .as_ref()
+        .ok_or_else(|| format!("{uri}: the recorded configuration has no research table"))?;
+    if instruments.len() != research.instruments.len() {
+        return Err(format!(
+            "{uri}: {} instrument records for {} configured instruments",
+            instruments.len(),
+            research.instruments.len()
+        ));
+    }
+    let mut profiles: BTreeMap<String, ManifestUri> = BTreeMap::new();
+    let mut families = Vec::with_capacity(instruments.len());
+    for (instrument, record) in research.instruments.iter().zip(instruments) {
+        let source = &instrument.source_manifest;
+        if record.instrument != instrument.instrument || record.source != source.generation() {
+            return Err(format!(
+                "{uri}: instrument record {} is not the configured instrument and source",
+                record.instrument
+            ));
+        }
+        let profile = verified_profile(uri, store, &record.profile, &record.source)?;
+        profiles.insert(record.source.clone(), profile.clone());
+        let (feature_store, feature) =
+            features::feature_manifest(uri, &store.uri(&manifest_key(&record.feature)), access)?;
+        if feature.role != DatasetRole::Development
+            || feature.instrument != instrument.instrument
+            || feature.input_generation != record.source
+            || feature.profile_generation != record.profile
+            || feature.frozen_from.is_some()
+        {
+            return Err(format!(
+                "{uri}: feature generation {} is not the development fit of {} under its profile",
+                record.feature, record.source
+            ));
+        }
+        let plan = features::fitted_plan(uri, &feature_store, &feature)?;
+        let fit = engine::fit_entry(instrument, source, profile);
+        if *features::resolve(&fit, access)?.plan() != plan.unfitted() {
+            return Err(format!(
+                "{uri}: feature generation {} is not the configured fit of {}",
+                record.feature, record.instrument
+            ));
+        }
+        let outcome_key = manifest_key(&record.outcome);
+        let outcome_bytes = read_key(store, &outcome_key)?;
+        if verify::manifest_kind(&outcome_bytes)?.as_deref() != Some(OUTCOME_MANIFEST_KIND) {
+            return Err(format!(
+                "{uri}: {} is not an outcome generation",
+                record.outcome
+            ));
+        }
+        let outcome = OutcomeManifest::from_json(&outcome_bytes)
+            .map_err(|error| format!("{uri}: {error}"))?;
+        let rule = OutcomeRule::resolve(&engine::outcomes_table(
+            instrument,
+            source,
+            &ready_uri(store, &record.feature)?,
+        ))?;
+        if outcome.generation != record.outcome
+            || outcome.role != DatasetRole::Development
+            || outcome.tick_generation != record.source
+            || outcome.feature_generation != record.feature
+            || record.outcome != outcome_generation_id(&record.source, &record.feature, &rule)
+        {
+            return Err(format!(
+                "{uri}: outcome generation {} is not the configured rule over the recorded source and features",
+                record.outcome
+            ));
+        }
+        let family_uri = store.uri(&manifest_key(&record.family));
+        let (family_manifest, family) = search::development_family(&family_uri)?;
+        let expected = search_config(
+            config,
+            engine::search_table(
+                instrument,
+                ReplayInput {
+                    tick_manifest: source.clone(),
+                    feature_manifest: ready_uri(store, &record.feature)?,
+                    outcome_manifest: Some(ready_uri(store, &record.outcome)?),
+                },
+            ),
+        );
+        if family_manifest.config_hash != expected.content_hash()
+            || family.search != *expected.search.as_ref().expect("set")
+            || family_manifest
+                .inputs
+                .iter()
+                .any(|input| input.instrument != instrument.instrument)
+        {
+            return Err(format!(
+                "{uri}: family generation {} is not the search this configuration lowers for {}",
+                record.family, record.instrument
+            ));
+        }
+        families.push(ready_uri(store, &record.family)?);
+    }
+    let selection_key = manifest_key(selection);
+    let selection_uri = store.uri(&selection_key);
+    for fit in research
+        .folds
+        .iter()
+        .flat_map(|fold| fold.inputs.iter().map(|input| &input.fit_manifest))
+        .chain(research.refit.fits.iter())
+    {
+        if !profiles.contains_key(fit.generation()) {
+            let profile = recorded_fit_profile(&selection_uri, store, selection, fit)?;
+            let profile = verified_profile(uri, store, &profile, fit.generation())?;
+            profiles.insert(fit.generation().to_string(), profile);
+        }
+    }
+    // The selection: the existing verifier, then its configuration equals the lowered table.
+    let (_, selected, _) = portfolio::verified_selection(
+        &selection_uri,
+        store,
+        &selection_key,
+        &read_key(store, &selection_key)?,
+    )?;
+    let expected = portfolio_config(config, selection_table(research, families, &profiles)?);
+    if selected.config != expected {
+        return Err(format!(
+            "{uri}: selection generation {selection} is not the selection this configuration lowers"
+        ));
+    }
+    Ok(selected)
 }
 
 /// The stream manifest of `profile` describes `source` on development data.
@@ -1585,6 +1864,7 @@ fn verify_scenarios(
                 applied,
                 role,
                 input,
+                access,
             )?;
             inputs.push(replay_input);
         }
@@ -1665,21 +1945,63 @@ pub fn verify_certification(
             "{uri}: the research run does not carry the frozen bundle this certification names"
         ));
     }
-    if let Some(declaration) = access.declaration {
-        let grant_key = declaration.key(&engine::grant_key(&manifest.research));
-        let governance = Store::open(&declaration.root)?;
-        let grant = Grant::from_json(&read_key(&governance, &grant_key)?)
-            .map_err(|reason| format!("{}: {reason}", governance.uri(&grant_key)))?;
-        if grant.hash != manifest.grant
-            || grant.bundle_sha256 != manifest.bundle_sha256
-            || manifest.receipt != declaration.key(&engine::receipt_key(&grant.hash))
-            || governance.head(&manifest.receipt)?.is_none()
-        {
-            return Err(format!(
-                "{uri}: the grant and receipt do not authorize this certification"
-            ));
+    let run = Run::from_json(&search::read_object(
+        store,
+        &run_manifest.objects,
+        RUN_OBJECT_PATH,
+    )?)
+    .map_err(|error| format!("{uri}: {RUN_OBJECT_PATH}: {error}"))?;
+    let research = run
+        .config
+        .research
+        .as_ref()
+        .ok_or_else(|| format!("{uri}: the run records no research table"))?;
+    // Under a declaration: the grant names this bundle, every protected claim is this run's,
+    // and the receipt records exactly their consumption of the grant.
+    let receipt = match access.declaration {
+        Some(declaration) => {
+            let grant_key = declaration.key(&engine::grant_key(&manifest.research));
+            let governance = Store::open(&declaration.root)?;
+            let grant = Grant::from_json(&read_key(&governance, &grant_key)?)
+                .map_err(|reason| format!("{}: {reason}", governance.uri(&grant_key)))?;
+            let receipt_key = declaration.key(&engine::receipt_key(&grant.hash));
+            if grant.hash != manifest.grant
+                || grant.research != manifest.research
+                || grant.bundle_sha256 != manifest.bundle_sha256
+                || manifest.receipt != receipt_key
+            {
+                return Err(format!(
+                    "{uri}: the grant does not authorize this certification"
+                ));
+            }
+            let claims = Claims {
+                declaration,
+                identity: &grant.declaration,
+                study: &research.study,
+                kind: ClaimKind::HoldoutUse,
+                tokens: &grant.tokens,
+                research: &manifest.research,
+                frozen: run.frozen.as_deref().unwrap_or_default(),
+                grant: Some(&grant.hash),
+            };
+            let keys = claims.verify(&governance)?;
+            let receipt = Receipt::from_json(&read_key(&governance, &receipt_key)?)
+                .map_err(|reason| format!("{}: {reason}", governance.uri(&receipt_key)))?;
+            if receipt.grant != grant.hash
+                || receipt.research != manifest.research
+                || receipt.bundle_sha256 != grant.bundle_sha256
+                || receipt.holdout != grant.holdout
+                || receipt.claims != keys
+                || receipt.declaration != grant.declaration
+            {
+                return Err(format!(
+                    "{uri}: the receipt does not record this run's consumption of the grant"
+                ));
+            }
+            Some(receipt)
         }
-    }
+        None => None,
+    };
     let Some(certification) = access.certification.filter(|certification| {
         certification.run() == manifest.research
             && certification.grant() == manifest.grant
@@ -1694,21 +2016,11 @@ pub fn verify_certification(
     let record_bytes = search::read_object(store, &manifest.objects, CERTIFICATION_OBJECT_PATH)?;
     let record = CertificationRecord::from_json(&record_bytes)
         .map_err(|error| format!("{uri}: {CERTIFICATION_OBJECT_PATH}: {error}"))?;
-    let run = Run::from_json(&search::read_object(
-        store,
-        &run_manifest.objects,
-        RUN_OBJECT_PATH,
-    )?)
-    .map_err(|error| format!("{uri}: {RUN_OBJECT_PATH}: {error}"))?;
-    let research = run
-        .config
-        .research
-        .as_ref()
-        .ok_or_else(|| format!("{uri}: the run records no research table"))?;
     if record.research != manifest.research
         || record.bundle_sha256 != manifest.bundle_sha256
         || record.grant != manifest.grant
         || record.receipt != manifest.receipt
+        || receipt.is_some_and(|receipt| receipt.claims != record.claims)
         || run.frozen.as_deref() != Some(record.frozen.as_str())
         || record.verdict.passing() != (manifest.state == "certified")
         || !certification.covers(

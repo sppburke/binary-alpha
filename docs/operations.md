@@ -127,9 +127,10 @@ generation aliases, sorted stable conflict tokens, and exposure history; see
 or prior outcomes, and record an unknown mapping as unavailable. Declare the `[research]` table
 and run `binary-alpha research run --config PATH`. The command permits every declared input
 before any read, creates the attempt intent beneath the authoritative root, publishes every child
-through the same owners as the individual commands, publishes the frozen stage and the run record,
-and exits successfully awaiting holdout authorization; rerun it to resume the same identity after
-any interruption. Copy protected holdout objects to the approved bucket only under a separate
+through the same owners as the individual commands, publishes the frozen stage and, after
+verification, the run record, and exits successfully awaiting holdout authorization; rerun it to
+resume the same identity after any interruption (a published frozen stage or run is verified and
+restored, never recomputed). Copy protected holdout objects to the approved bucket only under a separate
 logged byte-transfer authorization that preserves bytes, hashes, and role. After the run reports
 its identity, an operator with a distinct identity that may create but not overwrite grant objects
 runs `binary-alpha holdout grant create --config PATH --bundle-manifest URI --holdout-manifest URI

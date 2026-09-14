@@ -822,6 +822,39 @@ fn time(field: &str, text: &str) -> Result<i64, String> {
     parse_event_time_micros(text).map_err(|reason| format!("{field}: {reason}"))
 }
 
+/// The reporting splits of one decision window: unique identifiers over nonempty, nonoverlapping
+/// half-open intervals inside `start..end`.
+pub fn validate_splits(splits: &[Split], start: i64, end: i64) -> Result<(), String> {
+    let mut intervals: Vec<(&str, i64, i64)> = Vec::new();
+    for (index, split) in splits.iter().enumerate() {
+        let field = |name: &str| format!("splits[{index}].{name}");
+        identifier(&field("name"), &split.name)?;
+        let split_start = time(&field("start"), &split.start)?;
+        let split_end = time(&field("end"), &split.end)?;
+        if split_start >= split_end || split_start < start || split_end > end {
+            return Err(format!(
+                "{}: {}..{} must be a nonempty interval inside the decision window",
+                field("start"),
+                split.start,
+                split.end
+            ));
+        }
+        if let Some((earlier, _, _)) =
+            intervals.iter().find(|(name, earlier_start, earlier_end)| {
+                *name == split.name || (*earlier_start < split_end && split_start < *earlier_end)
+            })
+        {
+            return Err(format!(
+                "{}: `{}` repeats or overlaps `{earlier}`",
+                field("name"),
+                split.name
+            ));
+        }
+        intervals.push((&split.name, split_start, split_end));
+    }
+    Ok(())
+}
+
 /// The rules of the `replay` table a single field's deserializer cannot see: unique identities,
 /// resolved references, exact and representable money, positive durations and thresholds,
 /// non-negative ages, agreeing splits, and one immutable shared policy per scope.
@@ -876,33 +909,7 @@ pub fn validate_with(replay: &Replay, access: Access<'_>) -> Result<(), String> 
             ));
         }
     }
-    let mut intervals: Vec<(&str, i64, i64)> = Vec::new();
-    for (index, split) in replay.splits.iter().flatten().enumerate() {
-        let field = |name: &str| format!("splits[{index}].{name}");
-        identifier(&field("name"), &split.name)?;
-        let split_start = time(&field("start"), &split.start)?;
-        let split_end = time(&field("end"), &split.end)?;
-        if split_start >= split_end || split_start < start || split_end > end {
-            return Err(format!(
-                "{}: {}..{} must be a nonempty interval inside the decision window",
-                field("start"),
-                split.start,
-                split.end
-            ));
-        }
-        if let Some((earlier, _, _)) =
-            intervals.iter().find(|(name, earlier_start, earlier_end)| {
-                *name == split.name || (*earlier_start < split_end && split_start < *earlier_end)
-            })
-        {
-            return Err(format!(
-                "{}: `{}` repeats or overlaps `{earlier}`",
-                field("name"),
-                split.name
-            ));
-        }
-        intervals.push((&split.name, split_start, split_end));
-    }
+    validate_splits(replay.splits.as_deref().unwrap_or(&[]), start, end)?;
     if replay.accounts.is_empty() {
         return Err("accounts: at least one account is required".to_string());
     }

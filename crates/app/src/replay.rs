@@ -13,7 +13,7 @@ use std::path::Path;
 use std::time::Instant;
 
 use binary_alpha_engine::config::{Config, Replay, RunMode};
-use binary_alpha_engine::dataset::{ObjectRecord, ObjectRole, manifest_key};
+use binary_alpha_engine::dataset::{DatasetRole, ObjectRecord, ObjectRole, manifest_key};
 use binary_alpha_engine::execution::{
     ColumnSpec, EVENTS_OBJECT_PATH, Engine, EventKind, EventSource, FinancialEvent,
     HISTORICAL_AVAILABILITY, InstrumentBinding, Observation, REPLAY_MANIFEST_KIND,
@@ -129,6 +129,11 @@ fn bind_instrument(
             }
             let outcome = OutcomeManifest::from_json(&bytes)
                 .map_err(|error| format!("{}: {uri}: {error}", field("outcome_manifest")))?;
+            if outcome.role == DatasetRole::Holdout {
+                access
+                    .protected(std::iter::once(outcome.tick_generation.as_str()))
+                    .map_err(|reason| format!("{}: {uri}: {reason}", field("outcome_manifest")))?;
+            }
             if outcome.key() != outcome_key {
                 return Err(format!(
                     "{}: {uri} holds the manifest of generation {}",
@@ -596,7 +601,12 @@ pub(crate) struct Published {
 /// generation of the configuration's `replay` table, returning its report and reconstruction
 /// lines.
 pub fn replay(config: &Config, local: &Store, destination: &Store) -> Result<String, String> {
-    publish(config, local, destination, false, Access::ORDINARY).map(|published| published.report)
+    let declaration = crate::research::declaration(config)?;
+    let access = Access {
+        declaration: declaration.as_ref(),
+        certification: None,
+    };
+    publish(config, local, destination, false, access).map(|published| published.report)
 }
 
 /// Binds, simulates, publishes, and reconstructs one replay generation. With `resume`, a
@@ -904,8 +914,14 @@ impl Restored {
 /// Verifies a replay generation: every object's bytes and hashes, the ledger restored record by
 /// record through the engine's one event-application function, and the restored sequence,
 /// final state, and summary against the manifest and the published summary bytes.
-pub fn verify_replay(uri: &str, store: &Store, key: &str, bytes: &[u8]) -> Result<String, String> {
-    restore_verified(uri, store, key, bytes, Access::ORDINARY).map(|restored| restored.line())
+pub fn verify_replay(
+    uri: &str,
+    store: &Store,
+    key: &str,
+    bytes: &[u8],
+    access: Access<'_>,
+) -> Result<String, String> {
+    restore_verified(uri, store, key, bytes, access).map(|restored| restored.line())
 }
 
 /// Restores and verifies a replay generation, returning the verified restored engine so that a

@@ -98,8 +98,11 @@ pub(crate) fn bind_inputs(
 ) -> Result<Bound, String> {
     let (tick_store, tick, scale) =
         bind_tick(&field("tick_manifest"), role, tick_manifest, what, access)?;
-    let (feature_store, feature) =
-        features::feature_manifest(&field("feature_manifest"), &feature_manifest.to_string())?;
+    let (feature_store, feature) = features::feature_manifest(
+        &field("feature_manifest"),
+        &feature_manifest.to_string(),
+        access,
+    )?;
     if feature.input_generation != tick.generation {
         return Err(format!(
             "{}: feature generation {} was computed from tick generation {}, not {}",

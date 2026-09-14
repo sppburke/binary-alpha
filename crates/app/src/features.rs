@@ -307,8 +307,14 @@ fn bind(entry: &FeatureInstrument, access: Access<'_>) -> Result<Bound, String> 
 }
 
 /// Reads the ready manifest of a completed feature generation, naming `field`, the
-/// configuration field that referenced it, in every refusal.
-pub(crate) fn feature_manifest(field: &str, uri: &str) -> Result<(Store, FeatureManifest), String> {
+/// configuration field that referenced it, in every refusal. A generation of holdout data
+/// resolves only within the certification context naming its input generation; nothing else
+/// of it is read first.
+pub(crate) fn feature_manifest(
+    field: &str,
+    uri: &str,
+    access: Access<'_>,
+) -> Result<(Store, FeatureManifest), String> {
     let (store, key) = verify::open(uri)?;
     let mut bytes = Vec::new();
     store.read_to(&key, None, &mut bytes)?;
@@ -324,6 +330,13 @@ pub(crate) fn feature_manifest(field: &str, uri: &str) -> Result<(Store, Feature
             "{field}: {uri} holds the manifest of generation {}",
             manifest.generation
         ));
+    }
+    if manifest.role == DatasetRole::Holdout
+        || access.lookup(&manifest.input_generation)? == Some(DatasetRole::Holdout)
+    {
+        access
+            .protected(std::iter::once(manifest.input_generation.as_str()))
+            .map_err(|reason| format!("{field}: {uri}: {reason}"))?;
     }
     Ok((store, manifest))
 }
@@ -440,7 +453,7 @@ pub(crate) fn resolve(entry: &FeatureInstrument, access: Access<'_>) -> Result<R
             )
         }
         Some(uri) => {
-            let (store, manifest) = feature_manifest("frozen_plan", &uri.to_string())?;
+            let (store, manifest) = feature_manifest("frozen_plan", &uri.to_string(), access)?;
             let plan = fitted_plan("frozen_plan", &store, &manifest)?;
             if plan.profile != reference {
                 return Err(

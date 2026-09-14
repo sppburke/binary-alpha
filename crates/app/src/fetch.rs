@@ -13,7 +13,7 @@ use binary_alpha_engine::market::{
     InstrumentId, PriceScale, Tick, TickSequence, format_event_time_micros as time_text,
     parse_event_time_micros as time,
 };
-use binary_alpha_engine::research::Declaration;
+use binary_alpha_engine::research::{Access, Declaration};
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::io::Write;
@@ -162,24 +162,12 @@ fn prior(
             .flat_map(|population| population.generations.iter())
             .map(|generation| manifest_key(generation))
             .collect(),
-        None => {
-            let root = local
-                .local_path("manifests")
-                .ok_or("fetch: local mirror must be a filesystem store")?;
-            let entries = match fs::read_dir(&root) {
-                Ok(entries) => entries,
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-                Err(error) => return Err(format!("cannot inspect {}: {error}", root.display())),
-            };
-            let mut keys = Vec::new();
-            for entry in entries {
-                let entry = entry.map_err(|error| format!("cannot inspect manifests: {error}"))?;
-                if entry.path().join("ready.json").is_file() {
-                    keys.push(manifest_key(&entry.file_name().to_string_lossy()));
-                }
-            }
-            keys
-        }
+        None => local
+            .list_manifests()
+            .map_err(|reason| format!("fetch: {reason}"))?
+            .iter()
+            .map(|generation| manifest_key(generation))
+            .collect(),
     };
     let mut selected: Option<Prior> = None;
     for key in candidates {
@@ -192,6 +180,13 @@ fn prior(
             continue;
         }
         let manifest = GenerationManifest::from_json(&bytes)?;
+        if manifest.key() != key {
+            return Err(format!(
+                "fetch: {} holds the manifest of generation {}",
+                local.uri(&key),
+                manifest.generation
+            ));
+        }
         if manifest.source_kind != SourceKind::BrokerHistory
             || manifest.instrument != instrument.to_string()
             || manifest.role != role
@@ -241,7 +236,13 @@ fn prior(
         }
     }
     if let Some(prior) = &selected {
-        verify::run(&local.uri(&prior.manifest.key()))?;
+        verify::run_with(
+            &local.uri(&prior.manifest.key()),
+            Access {
+                declaration,
+                certification: None,
+            },
+        )?;
     }
     Ok(selected)
 }

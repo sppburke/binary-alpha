@@ -78,7 +78,7 @@ pub fn run_with(uri: &str, access: Access<'_>) -> Result<String, String> {
             crate::outcomes::verify_outcome(uri, &store, &manifest_key, &bytes)
         }
         Some(REPLAY_MANIFEST_KIND) => {
-            crate::replay::verify_replay(uri, &store, &manifest_key, &bytes)
+            crate::replay::verify_replay(uri, &store, &manifest_key, &bytes, access)
         }
         Some(FAMILY_MANIFEST_KIND) => {
             crate::search::verify_family(uri, &store, &manifest_key, &bytes)
@@ -100,24 +100,29 @@ pub fn run_with(uri: &str, access: Access<'_>) -> Result<String, String> {
 /// `role` is holdout) resolves only within the certification context that names the dataset
 /// generations it was computed from; its children are never opened publicly.
 fn protected_envelope(uri: &str, bytes: &[u8], access: Access<'_>) -> Result<(), String> {
+    use binary_alpha_engine::dataset::DatasetRole;
     #[derive(Deserialize)]
     struct Envelope {
-        role: Option<binary_alpha_engine::dataset::DatasetRole>,
+        role: Option<DatasetRole>,
         source_generation: Option<String>,
         input_generation: Option<String>,
         tick_generation: Option<String>,
         #[serde(default)]
         instruments: Vec<BoundInstrument>,
+        #[serde(default)]
+        inputs: Vec<BoundInput>,
     }
     #[derive(Deserialize)]
     struct BoundInstrument {
         tick_generation: Option<String>,
     }
+    #[derive(Deserialize)]
+    struct BoundInput {
+        role: Option<String>,
+        tick_generation: Option<String>,
+    }
     let envelope: Envelope =
         serde_json::from_slice(bytes).map_err(|error| format!("{uri}: {error}"))?;
-    if envelope.role != Some(binary_alpha_engine::dataset::DatasetRole::Holdout) {
-        return Ok(());
-    }
     let bound: Vec<&str> = envelope
         .source_generation
         .iter()
@@ -129,11 +134,31 @@ fn protected_envelope(uri: &str, bytes: &[u8], access: Access<'_>) -> Result<(),
                 .iter()
                 .filter_map(|instrument| instrument.tick_generation.as_ref()),
         )
+        .chain(
+            envelope
+                .inputs
+                .iter()
+                .filter_map(|input| input.tick_generation.as_ref()),
+        )
         .map(String::as_str)
         .collect();
-    access
-        .protected(bound.iter().copied())
-        .map_err(|reason| format!("{uri}: {reason}"))
+    // A declared holdout source is protected whatever the derived manifest's own label says.
+    for generation in &bound {
+        access
+            .lookup(generation)
+            .map_err(|reason| format!("{uri}: {reason}"))?;
+    }
+    let labelled = envelope.role == Some(DatasetRole::Holdout)
+        || envelope
+            .inputs
+            .iter()
+            .any(|input| input.role.as_deref() == Some(DatasetRole::Holdout.as_str()));
+    if labelled {
+        access
+            .protected(bound.iter().copied())
+            .map_err(|reason| format!("{uri}: {reason}"))?;
+    }
+    Ok(())
 }
 
 /// The top-level `kind` a manifest declares; a dataset ready manifest declares none.

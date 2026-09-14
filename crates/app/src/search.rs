@@ -109,14 +109,25 @@ pub(crate) struct Searched {
 /// The typed search every caller uses: bind, lower, score, replay, evaluate, resample, publish,
 /// and verify one family generation of the configuration's `search` table.
 pub fn search(config: &Config, local: &Store, destination: &Store) -> Result<String, String> {
-    family(config, local, destination).map(|searched| searched.report)
+    let declaration = crate::research::declaration(config)?;
+    family(
+        config,
+        local,
+        destination,
+        Access {
+            declaration: declaration.as_ref(),
+            certification: None,
+        },
+    )
+    .map(|searched| searched.report)
 }
 
-/// `search` with its typed result.
+/// `search` with its typed result, under the caller's read permit.
 pub(crate) fn family(
     config: &Config,
     local: &Store,
     destination: &Store,
+    access: Access<'_>,
 ) -> Result<Searched, String> {
     let settings = config
         .search
@@ -130,7 +141,7 @@ pub(crate) fn family(
     let started = Instant::now();
 
     // 1. Bind the development input and enumerate the family before any allocation.
-    let development = bind_development(settings)?;
+    let development = bind_development(settings, access)?;
     let conditions = search::conditions(&settings.conditions);
     let candidates = search::candidates(
         &development.plan_identity,
@@ -294,7 +305,7 @@ pub(crate) fn family(
     // The development result is complete here; only now may evaluation objects be read.
     let mut inputs = vec![development.input.clone()];
     if let Some(window) = &settings.evaluation {
-        inputs.push(bind_evaluation(settings, &development)?);
+        inputs.push(bind_evaluation(settings, &development, access)?);
         let mut ordered = passed.clone();
         ordered.sort_unstable();
         run_chunks(
@@ -445,7 +456,7 @@ fn chunk_config(config: &Config, table: binary_alpha_engine::config::Replay) -> 
 }
 
 /// Binds the development input: the plan identity, instrument, and the outcome generation.
-fn bind_development(settings: &Search) -> Result<Development, String> {
+fn bind_development(settings: &Search, access: Access<'_>) -> Result<Development, String> {
     let input = &settings.development.inputs[0];
     let field = |name: &str| format!("development.inputs[0].{name}");
     let bound = bind_inputs(
@@ -454,7 +465,7 @@ fn bind_development(settings: &Search) -> Result<Development, String> {
         &input.tick_manifest,
         &input.feature_manifest,
         "a search",
-        Access::ORDINARY,
+        access,
     )?;
     let uri = input
         .outcome_manifest
@@ -477,6 +488,11 @@ fn bind_development(settings: &Search) -> Result<Development, String> {
     }
     let outcome = OutcomeManifest::from_json(&bytes)
         .map_err(|error| format!("{}: {uri}: {error}", field("outcome_manifest")))?;
+    if outcome.role == DatasetRole::Holdout {
+        access
+            .protected(std::iter::once(outcome.tick_generation.as_str()))
+            .map_err(|reason| format!("{}: {uri}: {reason}", field("outcome_manifest")))?;
+    }
     if outcome.key() != outcome_key
         || outcome.role != DatasetRole::Development
         || outcome.tick_generation != bound.tick.generation
@@ -506,7 +522,11 @@ fn bind_development(settings: &Search) -> Result<Development, String> {
 
 /// Binds the evaluation input after the development result is frozen: the same instrument
 /// applying the development plan unchanged.
-fn bind_evaluation(settings: &Search, development: &Development) -> Result<FamilyInput, String> {
+fn bind_evaluation(
+    settings: &Search,
+    development: &Development,
+    access: Access<'_>,
+) -> Result<FamilyInput, String> {
     let window = settings.evaluation.as_ref().expect("configured");
     let input = &window.inputs[0];
     let field = |name: &str| format!("evaluation.inputs[0].{name}");
@@ -516,7 +536,7 @@ fn bind_evaluation(settings: &Search, development: &Development) -> Result<Famil
         &input.tick_manifest,
         &input.feature_manifest,
         "a search",
-        Access::ORDINARY,
+        access,
     )?;
     if bound.tick.instrument != development.instrument {
         return Err(format!(
@@ -1140,7 +1160,7 @@ fn verify_read_family(
         }
     }
     // The bound development (and evaluation) generations are the manifest's inputs.
-    let development = bind_development(settings)?;
+    let development = bind_development(settings, Access::ORDINARY)?;
     if development.plan_identity != family.plan_identity
         || family.base_stream != settings.base_stream
     {
@@ -1150,7 +1170,7 @@ fn verify_read_family(
     }
     let mut inputs = vec![development.input.clone()];
     if settings.evaluation.is_some() {
-        inputs.push(bind_evaluation(settings, &development)?);
+        inputs.push(bind_evaluation(settings, &development, Access::ORDINARY)?);
     }
     if manifest.inputs != inputs {
         return Err(format!(
@@ -1176,7 +1196,7 @@ fn verify_read_family(
         {
             return Err(format!("{uri}: {chunk_uri} is not the recorded chunk"));
         }
-        replay::verify_replay(&chunk_uri, store, &chunk_key, &bytes)?;
+        replay::verify_replay(&chunk_uri, store, &chunk_key, &bytes, Access::ORDINARY)?;
         let events = chunk_events(store, &chunk_manifest)?;
         Ok((chunk_manifest, events))
     };
