@@ -488,17 +488,20 @@ Unhandled failures stop the caller; there is no automatic retry or endpoint fall
 `binary-alpha data fetch --config PATH` acquires each selected instrument sequentially. One pass
 freezes its requested end, anchors its first page there, pages backward, validates chronological rows, applies exact local
 `[start,end)` bounds and removes only identical page-boundary overlap. Within-page repeats remain
-source observations. Repairing a shortfall preserves the verified suffix: every overlapping row,
-including multiplicity, must agree, and a missing verified row or changed price stops publication.
+source observations. Every pass preserves all previously verified rows in normalized output and
+checks incoming overlap against them before resume-bound filtering, including multiplicity;
+a missing verified row or changed price stops publication, including after restart.
 Deriv requests 100 tick rows with its seconds anchor. Pocket `changeSymbol` requests period 1;
 `loadHistoryPeriod` uses the earliest provider-clock token, index, offset 200 and period 1, while
 matching the observed period-0 reply by asset and index. Initial replies must have period 1 and
 older replies period 0; other periods fail. Empty or non-progressing pages report an
 unresolved prefix, never historical exhaustion. An initially empty pass retains raw evidence and
-coverage but cannot publish a dataset manifest requiring actual first/last events. Verified coverage
-ends one microsecond after the last received observation, capped at the requested end; a received
-point at or beyond that end establishes the upper bound. An unreceived suffix remains `unresolved_tail` and is requested again from the verified
-end. If a prefix and tail are both unresolved, `shortfall` preserves the prefix and `tail_shortfall`
+coverage but cannot publish a dataset manifest requiring actual first/last events. Newly verified
+coverage ends one microsecond after the last received observation, capped at the requested end;
+a received point at or beyond that end establishes the upper bound. Connected prior and new
+verified ranges are united without shortening the prior end; restart selects the greatest verified
+end and, among equal ends, the earliest start. An unverified suffix remains `unresolved_tail` and
+is requested again from the merged verified end. If a prefix and tail are both unresolved, `shortfall` preserves the prefix and `tail_shortfall`
 records the tail; neither is skipped.
 
 The shared import publication owner retains and publishes immutable `broker_history` generations:

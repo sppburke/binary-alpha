@@ -2563,6 +2563,15 @@ struct TransactionRecord {
     source: Option<EventSource>,
 }
 
+#[derive(Serialize)]
+struct ClosedContract {
+    evidence_bound_micros: i64,
+    confirmed: [Option<i64>; 4],
+    outcome: Option<Outcome>,
+    status: Option<TerminalStatus>,
+    transaction_ref: Option<String>,
+}
+
 /// The one chronological and financial owner.
 pub struct Engine {
     definition: RunDefinition,
@@ -2584,7 +2593,7 @@ pub struct Engine {
     transactions: BTreeMap<(String, String), TransactionRecord>,
     terminals: BTreeMap<String, TerminalFact>,
     purchases: BTreeMap<String, (Decimal, BrokerLiability)>,
-    closed_confirmed: BTreeMap<String, [Option<i64>; 4]>,
+    closed_confirmed: BTreeMap<String, ClosedContract>,
     open_by_binding: HashMap<usize, u32>,
     open_by_duration: HashMap<i64, u32>,
     open_by_instrument: HashMap<usize, u32>,
@@ -3013,7 +3022,7 @@ impl Engine {
             #[serde(skip_serializing_if = "BTreeMap::is_empty")]
             purchases: &'a BTreeMap<String, (Decimal, BrokerLiability)>,
             #[serde(skip_serializing_if = "BTreeMap::is_empty")]
-            closed_confirmed: &'a BTreeMap<String, [Option<i64>; 4]>,
+            closed_confirmed: &'a BTreeMap<String, ClosedContract>,
         }
         let state = State {
             sequence: self.sequence,
@@ -3797,18 +3806,26 @@ impl Engine {
         command: &str,
         fields: [Option<i64>; 4],
     ) -> Result<[Option<i64>; 4], String> {
-        self.require(command, ObligationState::Accepted)?;
-        let obligation = &self.obligations[command];
-        let liability = obligation
-            .liability
-            .as_ref()
-            .ok_or_else(|| format!("{command} has no broker liability"))?;
-        let known = [
-            obligation.entry_price_units,
-            obligation.entry_time_micros,
-            obligation.start_micros,
-            obligation.due_time_micros,
-        ];
+        let closed = self.closed_confirmed.get(command);
+        let (evidence_bound, known) = if let Some(closed) = closed {
+            (closed.evidence_bound_micros, closed.confirmed)
+        } else {
+            self.require(command, ObligationState::Accepted)?;
+            let obligation = &self.obligations[command];
+            (
+                obligation
+                    .liability
+                    .as_ref()
+                    .ok_or_else(|| format!("{command} has no broker liability"))?
+                    .purchase_time_micros,
+                [
+                    obligation.entry_price_units,
+                    obligation.entry_time_micros,
+                    obligation.start_micros,
+                    obligation.due_time_micros,
+                ],
+            )
+        };
         let names = [
             "entry_price_units",
             "entry_time_micros",
@@ -3819,8 +3836,13 @@ impl Engine {
         for index in 0..4 {
             match (fields[index], known[index]) {
                 (Some(new), Some(old)) if new != old => {
+                    let recorded = if closed.is_some() {
+                        "its closed contract: recorded"
+                    } else {
+                        "recorded"
+                    };
                     return Err(format!(
-                        "{command} confirmed {} {new} contradicts recorded {old}",
+                        "{command} confirmed {} {new} contradicts {recorded} {old}",
                         names[index]
                     ));
                 }
@@ -3831,17 +3853,17 @@ impl Engine {
         let entry = fields[1].or(known[1]);
         let start = fields[2].or(known[2]);
         let expiry = fields[3].or(known[3]);
-        if entry.is_some_and(|entry| entry < liability.purchase_time_micros || entry > self.now)
-            || start.is_some_and(|start| start < liability.purchase_time_micros || start > self.now)
+        if entry.is_some_and(|entry| entry < evidence_bound || entry > self.now)
+            || start.is_some_and(|start| start < evidence_bound || start > self.now)
             || start
                 .zip(expiry)
                 .is_some_and(|(start, expiry)| expiry <= start)
         {
             return Err(format!(
-                "{command} confirmed clocks are inconsistent with its purchase and start"
+                "{command} confirmed clocks: update contradicts recorded purchase/dispatch {evidence_bound} or start {start:?}"
             ));
         }
-        Ok(learned)
+        Ok(if closed.is_some() { [None; 4] } else { learned })
     }
 
     fn observe_confirmed(
@@ -3851,27 +3873,6 @@ impl Engine {
         fields: [Option<i64>; 4],
     ) -> Result<(), String> {
         check_source(&source, self.now)?;
-        if let Some(known) = self.closed_confirmed.get(&command) {
-            let purchase = &self.purchases[&command].1;
-            let entry = fields[1].or(known[1]);
-            let start = fields[2].or(known[2]);
-            let expiry = fields[3].or(known[3]);
-            if fields
-                .iter()
-                .zip(known)
-                .any(|(new, old)| new.zip(*old).is_some_and(|(new, old)| new != old))
-                || entry.is_some_and(|time| time < purchase.purchase_time_micros || time > self.now)
-                || start.is_some_and(|time| time < purchase.purchase_time_micros || time > self.now)
-                || start
-                    .zip(expiry)
-                    .is_some_and(|(start, expiry)| expiry <= start)
-            {
-                return Err(format!(
-                    "{command} confirmed update contradicts its closed contract"
-                ));
-            }
-            return Ok(());
-        }
         let [
             entry_price_units,
             entry_time_micros,
@@ -3939,40 +3940,97 @@ impl Engine {
         source: &EventSource,
         fact: &TerminalFact,
     ) -> Result<TerminalFact, String> {
-        let liability = &self
-            .purchases
+        let evidence_bound = self
+            .closed_confirmed
             .get(command)
-            .ok_or_else(|| format!("{command} has no broker liability"))?
-            .1;
-        if fact.exit_time_micros.is_some_and(|exit| {
-            exit < liability.purchase_time_micros || exit > source.provider_time_micros
-        }) {
+            .map_or_else(
+                || {
+                    self.purchases
+                        .get(command)
+                        .map(|(_, liability)| liability.purchase_time_micros)
+                },
+                |closed| Some(closed.evidence_bound_micros),
+            )
+            .ok_or_else(|| format!("{command} has no broker liability"))?;
+        if let Some(closed) = self.closed_confirmed.get(command) {
+            if let Some(outcome) = closed.outcome
+                && !matches!(
+                    (outcome, fact.status),
+                    (Outcome::Win, TerminalStatus::Won) | (Outcome::Loss, TerminalStatus::Lost)
+                )
+            {
+                return Err(format!(
+                    "{command} terminal {} contradicts recorded outcome {outcome}",
+                    fact.status
+                ));
+            }
+            if let Some(status) = closed.status
+                && status != fact.status
+            {
+                return Err(format!(
+                    "{command} terminal {} contradicts recorded status {status}",
+                    fact.status
+                ));
+            }
+            if let Some(reference) = &closed.transaction_ref
+                && fact
+                    .transaction_ref
+                    .as_ref()
+                    .is_some_and(|new| new != reference)
+            {
+                return Err(format!(
+                    "{command} terminal transaction_ref {:?} contradicts recorded cash transaction {reference}",
+                    fact.transaction_ref
+                ));
+            }
+        }
+        if let Some(known) = self.terminals.get(command) {
+            if known.status != fact.status {
+                return Err(format!(
+                    "{command} terminal {} contradicts recorded terminal status {}",
+                    fact.status, known.status
+                ));
+            }
+            for (name, new, old) in [
+                (
+                    "exit_price_units",
+                    fact.exit_price_units,
+                    known.exit_price_units,
+                ),
+                (
+                    "exit_time_micros",
+                    fact.exit_time_micros,
+                    known.exit_time_micros,
+                ),
+            ] {
+                if let (Some(new), Some(old)) = (new, old)
+                    && new != old
+                {
+                    return Err(format!(
+                        "{command} terminal {name} {new} contradicts recorded {old}"
+                    ));
+                }
+            }
+            if let (Some(new), Some(old)) = (&fact.transaction_ref, &known.transaction_ref)
+                && new != old
+            {
+                return Err(format!(
+                    "{command} terminal transaction_ref {new} contradicts recorded {old}"
+                ));
+            }
+        }
+        if fact
+            .exit_time_micros
+            .is_some_and(|exit| exit < evidence_bound || exit > source.provider_time_micros)
+        {
             return Err(format!(
-                "{command} terminal clocks are inconsistent with its purchase and source"
+                "{command} terminal clocks contradict recorded purchase/dispatch {evidence_bound} or source {}",
+                source.provider_time_micros
             ));
         }
         let Some(known) = self.terminals.get(command) else {
             return Ok(fact.clone());
         };
-        if known.status != fact.status
-            || known
-                .exit_price_units
-                .zip(fact.exit_price_units)
-                .is_some_and(|(a, b)| a != b)
-            || known
-                .exit_time_micros
-                .zip(fact.exit_time_micros)
-                .is_some_and(|(a, b)| a != b)
-            || known
-                .transaction_ref
-                .as_ref()
-                .zip(fact.transaction_ref.as_ref())
-                .is_some_and(|(a, b)| a != b)
-        {
-            return Err(format!(
-                "{command} terminal contradicts the recorded terminal fact"
-            ));
-        }
         Ok(TerminalFact {
             status: known.status,
             exit_price_units: known.exit_price_units.or(fact.exit_price_units),
@@ -4000,12 +4058,22 @@ impl Engine {
         } else {
             None
         };
+        let evidence = if self.terminals.contains_key(&command)
+            || self.closed_confirmed.contains_key(&command)
+        {
+            format!("terminal {} evidence updated", fact.status)
+        } else {
+            format!(
+                "terminal {} awaits the matching cash transaction",
+                fact.status
+            )
+        };
         self.emit(
             self.now,
             EventKind::Unresolved {
                 command,
                 reason: UnresolvedReason::AwaitingCash,
-                evidence: format!("terminal {} evidence updated", fact.status),
+                evidence,
                 path,
                 terminal: Some(fact),
                 source: Some(source),
@@ -5264,24 +5332,35 @@ impl Engine {
         command: &str,
         credit: Decimal,
         settled: Option<(Option<Outcome>, Decimal)>,
+        external_status: Option<TerminalStatus>,
     ) -> Result<(), String> {
         let obligation = self
             .obligations
             .remove(command)
             .ok_or_else(|| format!("{command} is not an open obligation"))?;
         let binding = obligation.binding;
-        if obligation.liability.is_some() {
+        let cash = self.matching_cash_of(&obligation);
+        if obligation.terms.settlement.rule == SettlementRule::BrokerAuthoritativeV1
+            && settled.is_some()
+        {
             self.closed_confirmed.insert(
                 command.to_string(),
-                [
-                    obligation.entry_price_units,
-                    obligation.entry_time_micros,
-                    obligation.start_micros,
-                    obligation.due_time_micros,
-                ],
+                ClosedContract {
+                    evidence_bound_micros: obligation.evidence_bound(),
+                    confirmed: [
+                        obligation.entry_price_units,
+                        obligation.entry_time_micros,
+                        obligation.start_micros,
+                        obligation.due_time_micros,
+                    ],
+                    outcome: settled.and_then(|(outcome, _)| outcome),
+                    status: external_status
+                        .or(obligation.terminal.as_ref().map(|fact| fact.status)),
+                    transaction_ref: cash.as_ref().map(|(_, reference)| reference.clone()),
+                },
             );
         }
-        if let Some(cash) = self.matching_cash_of(&obligation) {
+        if let Some(cash) = cash {
             let record = self.transactions.get_mut(&cash).expect("matched cash");
             record.pending = false;
             record.source = None;
@@ -5706,7 +5785,7 @@ impl Engine {
                     return Err(format!("{command} cannot release {release}"));
                 }
                 let zero = Decimal::zero(self.obligations[command].reservation.scale());
-                self.apply_closure(command, zero, None)?;
+                self.apply_closure(command, zero, None, None)?;
             }
             EventKind::PossiblySent { command, .. } => {
                 self.require_unaccepted(command)?;
@@ -5808,6 +5887,7 @@ impl Engine {
                     command,
                     postings.credit,
                     Some((Some(*outcome), postings.profit)),
+                    None,
                 )?;
                 if *discrepancy || deficit.is_some() {
                     let key = if matches!(
@@ -5961,11 +6041,15 @@ impl Engine {
                                 command,
                                 postings.credit,
                                 Some((outcome, postings.profit.expect("checked postings"))),
+                                match resolution {
+                                    Resolution::ExternallyClosed { status, .. } => Some(*status),
+                                    _ => None,
+                                },
                             )?;
                         }
                         Resolution::External => unreachable!("checked resolution"),
                         Resolution::NotSent => {
-                            self.apply_closure(command, postings.credit, None)?;
+                            self.apply_closure(command, postings.credit, None, None)?;
                         }
                         Resolution::Accepted {
                             entry_time_micros,

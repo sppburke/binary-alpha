@@ -335,9 +335,6 @@ impl DerivOptions {
                 let update_time = c
                     .current_spot_time
                     .or(c.purchase_time)
-                    .or(c.entry_spot_time)
-                    .or(c.date_start)
-                    .or(c.date_expiry)
                     .map(micros)
                     .transpose()?
                     .unwrap_or(response.receipt_micros);

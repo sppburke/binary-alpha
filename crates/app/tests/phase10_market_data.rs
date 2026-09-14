@@ -2452,3 +2452,111 @@ fn received_upper_boundary_caps_coverage_without_publishing_out_of_range_rows() 
         );
     }
 }
+
+#[test]
+fn prefix_repair_preserves_verified_end_and_restart_rejects_changed_prefix() {
+    let scratch = Scratch::new("phase10_monotonic_repair");
+    let config = test_config(&scratch, "deriv", "ws://127.0.0.1/", false);
+    let (local, destination) = stores(&scratch);
+    let pass = |pages: &mut Pages| {
+        fetch::pass(
+            &config,
+            pages,
+            &local,
+            &destination,
+            (0, 10_000_000),
+            &mut Vec::new(),
+        )
+    };
+    pass(&mut Pages::new(vec![range_page(5, 8), page(&[])])).unwrap();
+    let manifests = read_manifests(&scratch);
+    let initial = read_coverage(&scratch, &manifests[0]);
+    assert_eq!(
+        initial.verified,
+        Some(fetch::Range {
+            start: time_text(5_000_000),
+            end: time_text(7_000_001)
+        })
+    );
+    assert_eq!(
+        initial.shortfall.unwrap().unresolved,
+        fetch::Range {
+            start: time_text(0),
+            end: time_text(5_000_000)
+        }
+    );
+    assert_eq!(
+        initial.tail_shortfall.unwrap().unresolved,
+        fetch::Range {
+            start: time_text(7_000_001),
+            end: time_text(10_000_000)
+        }
+    );
+    pass(&mut Pages::new(vec![range_page(0, 7)])).unwrap();
+    let manifests = read_manifests(&scratch);
+    assert_eq!(manifests.len(), 2);
+    let repaired = read_coverage(&scratch, &manifests[1]);
+    assert_eq!(
+        repaired.verified,
+        Some(fetch::Range {
+            start: time_text(0),
+            end: time_text(7_000_001)
+        })
+    );
+    assert_eq!(repaired.rows, 8);
+    assert_eq!(
+        common::read_normalized_ticks(&scratch.path("published"), &manifests[1]),
+        range_page(0, 8).rows
+    );
+    assert_eq!(
+        repaired.shortfall,
+        Some(fetch::Shortfall {
+            reason: "unresolved_tail".into(),
+            unresolved: fetch::Range {
+                start: time_text(7_000_001),
+                end: time_text(10_000_000)
+            }
+        })
+    );
+    assert!(repaired.tail_shortfall.is_none());
+    let before = scratch
+        .manifests("published")
+        .iter()
+        .map(|path| (path.clone(), fs::read(path).unwrap()))
+        .collect::<Vec<_>>();
+    // A new pass reloads prior generations: equal ends must choose the repaired start.
+    let mut changed = (0..10)
+        .map(|second| (second, 100_000 + second))
+        .collect::<Vec<_>>();
+    changed[2].1 = 999_999;
+    let error = pass(&mut Pages::new(vec![page(&changed)])).unwrap_err();
+    assert!(error.contains("reread of verified observations"), "{error}");
+    assert_eq!(read_manifests(&scratch).len(), 2);
+    for (path, bytes) in before {
+        assert_eq!(fs::read(path).unwrap(), bytes);
+    }
+    for manifest in &manifests {
+        assert!(
+            verify::run(&destination.uri(&manifest.key()))
+                .unwrap()
+                .starts_with("verified")
+        );
+    }
+    // Consistent overlap below the resume boundary remains accepted and retains every row.
+    pass(&mut Pages::new(vec![range_page(0, 11)])).unwrap();
+    let manifests = read_manifests(&scratch);
+    assert_eq!(manifests.len(), 3);
+    let complete = read_coverage(&scratch, &manifests[2]);
+    assert_eq!(
+        complete.verified,
+        Some(fetch::Range {
+            start: time_text(0),
+            end: time_text(10_000_000)
+        })
+    );
+    assert!(complete.shortfall.is_none());
+    assert_eq!(
+        common::read_normalized_ticks(&scratch.path("published"), &manifests[2]),
+        range_page(0, 10).rows
+    );
+}

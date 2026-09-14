@@ -2107,3 +2107,322 @@ fn proposal_receipt_uses_response_time_when_spot_changes_in_flight() {
         }
     ));
 }
+
+fn purchased_run() -> (Run, PreparedPurchase) {
+    let clock = FakeClock::at(PURCHASE);
+    let (mut options, _) = options(vec![frame("proposal-call", 1)], &clock);
+    let (mut run, prepared) = one_prepared(&mut options, &clock);
+    let (debit, liability) = purchase_fact(fixture("buy-call").as_bytes()).unwrap();
+    run.step(
+        clock.now_micros(),
+        vec![Observation::Purchased {
+            command: prepared.command.clone(),
+            source: source("buy", PURCHASE),
+            debit,
+            liability,
+        }],
+    );
+    (run, prepared)
+}
+
+fn assert_closed_terminal_contradiction(
+    run: &Run,
+    closed_lines: &[Vec<u8>],
+    prepared: &PreparedPurchase,
+    fact: execution::TerminalFact,
+    recorded: &str,
+) {
+    let at = PURCHASE + 16 * SECOND;
+    let mut restored = Engine::restore(closed_lines.iter().cloned().map(Ok)).unwrap();
+    let error = restored
+        .step(
+            at,
+            vec![Observation::Terminal {
+                command: prepared.command.clone(),
+                source: source("contradictory-terminal", at),
+                fact: fact.clone(),
+            }],
+        )
+        .unwrap_err();
+    assert!(error.contains(recorded), "{error}");
+    // Replace the final, valid enrichment record without changing its sequence or clocks.
+    let last = run.lines.len() - 1;
+    let altered = run.lines.iter().enumerate().map(|(index, line)| {
+        let mut event = FinancialEvent::from_line(line).unwrap();
+        if index == last {
+            let EventKind::Unresolved { terminal, .. } = &mut event.kind else {
+                panic!("expected the closing enrichment record")
+            };
+            *terminal = Some(fact.clone());
+        }
+        Ok(event.to_line())
+    });
+    let error = Engine::restore(altered)
+        .err()
+        .expect("contradictory closure restored");
+    assert!(error.contains(recorded), "{error}");
+}
+
+#[test]
+fn reconciled_closure_rejects_changed_terminal_status() {
+    use execution::{Outcome, TerminalFact, TerminalStatus};
+    for (resolution, status, contradictory, recorded) in [
+        (
+            Resolution::Settled {
+                outcome: Outcome::Win,
+                gross_return: decimal("18.83"),
+                terminal_fee: decimal("0"),
+            },
+            TerminalStatus::Won,
+            TerminalStatus::Lost,
+            "recorded outcome win",
+        ),
+        (
+            Resolution::ExternallyClosed {
+                status: TerminalStatus::Sold,
+                gross_return: decimal("18.83"),
+                terminal_fee: decimal("0"),
+            },
+            TerminalStatus::Sold,
+            TerminalStatus::Cancelled,
+            "recorded status sold",
+        ),
+        (
+            Resolution::ExternallyClosed {
+                status: TerminalStatus::Cancelled,
+                gross_return: decimal("10"),
+                terminal_fee: decimal("0"),
+            },
+            TerminalStatus::Cancelled,
+            TerminalStatus::Sold,
+            "recorded status cancelled",
+        ),
+    ] {
+        let (mut run, prepared) = purchased_run();
+        let at = PURCHASE + 16 * SECOND;
+        reconcile(&mut run, &prepared, resolution, at);
+        assert_eq!(run.account().open, 0);
+        let closed_lines = run.lines.clone();
+        let cash = run.account().cash;
+        let fact = TerminalFact {
+            status,
+            exit_price_units: Some(920_409),
+            exit_time_micros: Some(at),
+            transaction_ref: Some("sell".into()),
+        };
+        let events = run.step(
+            at,
+            vec![Observation::Terminal {
+                command: prepared.command.clone(),
+                source: source("late-terminal", at),
+                fact: fact.clone(),
+            }],
+        );
+        assert!(events.iter().all(|event| matches!(&event.kind, EventKind::Unresolved { evidence, .. } if evidence == &format!("terminal {status} evidence updated"))));
+        assert_eq!(run.account().cash, cash);
+        assert_eq!(run.account().open, 0);
+        assert!(run.account().blocked.is_empty());
+        assert_closed_terminal_contradiction(
+            &run,
+            &closed_lines,
+            &prepared,
+            TerminalFact {
+                status: contradictory,
+                ..fact
+            },
+            recorded,
+        );
+    }
+}
+
+#[test]
+fn settled_closure_rejects_changed_cash_reference() {
+    use execution::{TerminalFact, TerminalStatus};
+    let (mut run, prepared) = purchased_run();
+    let at = PURCHASE + 16 * SECOND;
+    let fact = TerminalFact {
+        status: TerminalStatus::Won,
+        exit_price_units: None,
+        exit_time_micros: None,
+        transaction_ref: None,
+    };
+    let terminal = |fact| Observation::Terminal {
+        command: prepared.command.clone(),
+        source: source("terminal", at),
+        fact,
+    };
+    let events = run.step(at, vec![terminal(fact.clone())]);
+    assert!(
+        matches!(&events[0].kind, EventKind::Unresolved { evidence, .. } if evidence == "terminal won awaits the matching cash transaction")
+    );
+    run.step(
+        at,
+        vec![Observation::Cash {
+            source: source("cash", at),
+            fact: execution::CashFact {
+                account: "a".into(),
+                transaction_ref: "S".into(),
+                contract_ref: Some(CALL.into()),
+                action: CashAction::Sell,
+                amount: decimal("18.83"),
+                time_micros: at,
+            },
+        }],
+    );
+    assert_eq!(run.account().open, 0);
+    let closed_lines = run.lines.clone();
+    let enriched = TerminalFact {
+        exit_price_units: Some(920_409),
+        exit_time_micros: Some(at),
+        transaction_ref: Some("S".into()),
+        ..fact
+    };
+    run.step(at, vec![terminal(enriched.clone())]);
+    assert!(run.step(at, vec![terminal(enriched.clone())]).is_empty());
+    assert_eq!(run.account().cash.to_string(), "9964.57");
+    assert!(run.account().blocked.is_empty());
+    assert_closed_terminal_contradiction(
+        &run,
+        &closed_lines,
+        &prepared,
+        TerminalFact {
+            transaction_ref: Some("T".into()),
+            ..enriched.clone()
+        },
+        "recorded cash transaction S",
+    );
+    // Previously supplied exit fields remain binding after consistent enrichment.
+    let mut restored = Engine::restore(run.lines.iter().cloned().map(Ok)).unwrap();
+    let error = restored
+        .step(
+            at,
+            vec![terminal(TerminalFact {
+                exit_price_units: Some(920_410),
+                ..enriched
+            })],
+        )
+        .unwrap_err();
+    assert!(
+        error.contains("exit_price_units") && error.contains("recorded 920409"),
+        "{error}"
+    );
+}
+
+#[test]
+fn partial_contract_update_uses_provider_clock_or_receipt_and_fills_expiry() {
+    for (extra, expected) in [
+        ("", None),
+        (",\"purchase_time\":1789347036", Some(PURCHASE)),
+        (
+            ",\"purchase_time\":1789347036,\"current_spot_time\":1789347037",
+            Some(PURCHASE + SECOND),
+        ),
+        (
+            ",\"entry_spot_time\":1789347036,\"date_start\":1789347036",
+            None,
+        ),
+    ] {
+        let (mut run, prepared) = purchased_run();
+        let clock = FakeClock::at(PURCHASE + 2 * SECOND);
+        let raw = format!(
+            r#"{{"msg_type":"proposal_open_contract","subscription":{{"id":"synthetic-partial"}},"proposal_open_contract":{{"contract_id":{CALL},"date_expiry":1789347051{extra}}}}}"#
+        );
+        let (mut options, _) = options(vec![response(&raw, 1)], &clock);
+        options.subscribe_contract(CALL).unwrap();
+        let event = options.next_account_event(SECOND).unwrap().unwrap();
+        assert!(
+            matches!(&event, AccountEvent::ContractUpdate { source, expiry_micros: Some(expiry), .. } if source.provider_time_micros == expected.unwrap_or(clock.now_micros()) && source.available_at_micros == clock.now_micros() && *expiry == PURCHASE + 15 * SECOND)
+        );
+        let observation = to_observation(
+            event,
+            &|_| Some(prepared.command.clone()),
+            clock.now_micros(),
+        )
+        .unwrap();
+        let events = run.step(clock.now_micros(), vec![observation]);
+        assert!(events.iter().any(|event| matches!(&event.kind,
+            EventKind::Confirmed { expiry_micros: Some(expiry), .. }
+                if *expiry == PURCHASE + 15 * SECOND)));
+        assert_eq!(run.account().open, 1);
+        assert_eq!(run.account().cash.to_string(), "9945.74");
+    }
+}
+
+#[test]
+fn closed_contract_known_fields_are_checked_during_generation_and_restore() {
+    let (mut run, prepared) = purchased_run();
+    let at = PURCHASE + 16 * SECOND;
+    let known = [920_409, PURCHASE, PURCHASE, PURCHASE + 15 * SECOND];
+    let update = |fields: [i64; 4]| Observation::ContractUpdate {
+        command: prepared.command.clone(),
+        source: source("confirmed", at),
+        entry_price_units: Some(fields[0]),
+        entry_time_micros: Some(fields[1]),
+        start_micros: Some(fields[2]),
+        expiry_micros: Some(fields[3]),
+    };
+    let confirmed = run.step(at, vec![update(known)]).remove(0);
+    reconcile(
+        &mut run,
+        &prepared,
+        Resolution::Settled {
+            outcome: execution::Outcome::Win,
+            gross_return: decimal("18.83"),
+            terminal_fee: decimal("0"),
+        },
+        at,
+    );
+    assert!(run.step(at, vec![update(known)]).is_empty());
+    for (index, name) in [
+        "entry_price_units",
+        "entry_time_micros",
+        "start_micros",
+        "expiry_micros",
+    ]
+    .iter()
+    .enumerate()
+    {
+        let mut fields = known;
+        fields[index] += 1;
+        let mut engine = Engine::restore(run.lines.iter().cloned().map(Ok)).unwrap();
+        let error = engine.step(at, vec![update(fields)]).unwrap_err();
+        assert!(
+            error.contains(name) && error.contains(&format!("recorded {}", known[index])),
+            "{error}"
+        );
+        let mut altered = confirmed.clone();
+        altered.sequence = run.engine.sequence();
+        let EventKind::Confirmed {
+            source,
+            entry_price_units,
+            entry_time_micros,
+            start_micros,
+            expiry_micros,
+            ..
+        } = &mut altered.kind
+        else {
+            panic!("confirmed update")
+        };
+        source.id = format!("late-confirmed-{index}");
+        [
+            entry_price_units,
+            entry_time_micros,
+            start_micros,
+            expiry_micros,
+        ][index]
+            .replace(fields[index]);
+        let error = Engine::restore(
+            run.lines
+                .iter()
+                .cloned()
+                .map(Ok)
+                .chain(std::iter::once(Ok(altered.to_line()))),
+        )
+        .err()
+        .expect("changed closure field restored");
+        assert!(
+            error.contains(name) && error.contains(&format!("recorded {}", known[index])),
+            "{error}"
+        );
+    }
+}

@@ -224,6 +224,33 @@ fn prior(
     Ok(selected)
 }
 
+fn check_verified_overlap(
+    instrument: &InstrumentId,
+    previous: &[Tick],
+    received: &[Tick],
+) -> Result<(), String> {
+    if let (Some(first), Some(last), Some(old_first), Some(old_last)) = (
+        received.first(),
+        received.last(),
+        previous.first(),
+        previous.last(),
+    ) {
+        let start = first.event_time_micros.max(old_first.event_time_micros);
+        let end = last.event_time_micros.min(old_last.event_time_micros);
+        let overlap = |row: &&Tick| row.event_time_micros >= start && row.event_time_micros <= end;
+        if !received
+            .iter()
+            .filter(overlap)
+            .eq(previous.iter().filter(overlap))
+        {
+            return Err(format!(
+                "fetch {instrument}: conflicting or inconsistent reread of verified observations"
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Removes only a proven page-boundary overlap; within-page repeated observations stay intact.
 pub fn prepend_page(mut older: Vec<Tick>, newer: Vec<Tick>) -> Vec<Tick> {
     let overlap = (1..=older.len().min(newer.len()))
@@ -331,6 +358,24 @@ pub fn pass(
             .as_ref()
             .map(|prior| prior.coverage.pages.clone())
             .unwrap_or_default();
+        let mut previous_rows = Vec::new();
+        if let Some(prior) = &prior {
+            let object = prior
+                .manifest
+                .objects
+                .iter()
+                .find(|o| o.role == ObjectRole::Normalized)
+                .expect("validated normalized object");
+            let (_, fetched) = verify::fetch(local, object, true)?;
+            archive::read_ticks_with(
+                &fetched.expect("decoded").path,
+                definition.price_scale,
+                |row| {
+                    previous_rows.push(row);
+                    Ok(())
+                },
+            )?;
+        }
         let mut earliest = None;
         let mut anchor = Some(requested.1);
         let mut received_end = None;
@@ -342,6 +387,7 @@ pub fn pass(
                     .accept(*row)
                     .map_err(|error| format!("fetch {instrument}: {error}"))?;
             }
+            check_verified_overlap(&instrument, &previous_rows, &page.rows)?;
             let first = page.rows.first().map(|row| row.event_time_micros);
             let last = page.rows.last().map(|row| row.event_time_micros);
             if let Some(last) = last.filter(|last| *last >= fetch_start) {
@@ -410,46 +456,7 @@ pub fn pass(
         };
         let new_count = rows.len();
 
-        let mut previous_rows = Vec::new();
-        let mut repeats_prior = false;
-        if let Some(prior) = &prior {
-            let object = prior
-                .manifest
-                .objects
-                .iter()
-                .find(|o| o.role == ObjectRole::Normalized)
-                .expect("validated normalized object");
-            let (_, fetched) = verify::fetch(local, object, true)?;
-            archive::read_ticks_with(
-                &fetched.expect("decoded").path,
-                definition.price_scale,
-                |row| {
-                    previous_rows.push(row);
-                    Ok(())
-                },
-            )?;
-            repeats_prior = rows == previous_rows;
-            if let (Some(first), Some(last), Some(old_first), Some(old_last)) = (
-                rows.first(),
-                rows.last(),
-                previous_rows.first(),
-                previous_rows.last(),
-            ) {
-                let start = first.event_time_micros.max(old_first.event_time_micros);
-                let end = last.event_time_micros.min(old_last.event_time_micros);
-                let overlap =
-                    |row: &&Tick| row.event_time_micros >= start && row.event_time_micros <= end;
-                if !rows
-                    .iter()
-                    .filter(overlap)
-                    .eq(previous_rows.iter().filter(overlap))
-                {
-                    return Err(format!(
-                        "fetch {instrument}: conflicting or inconsistent reread of verified observations"
-                    ));
-                }
-            }
-        }
+        let repeats_prior = rows == previous_rows;
         if let Some(last) = previous_rows.last() {
             let suffix = rows.split_off(
                 rows.partition_point(|row| row.event_time_micros <= last.event_time_micros),
@@ -465,26 +472,31 @@ pub fn pass(
             };
             rows = prepend_page(rows, suffix);
         }
-        let verified = if new_count == 0 {
-            prior
-                .as_ref()
-                .and_then(|prior| prior.coverage.verified.clone())
-        } else if shortfall.is_none() {
-            Some(Range::new(
-                requested.0,
+        let newly_verified = (new_count > 0).then(|| {
+            (
+                if shortfall.is_none() {
+                    fetch_start
+                } else {
+                    earliest
+                        .unwrap_or(requested.1)
+                        .max(fetch_start)
+                        .min(requested.1)
+                },
                 received_end.expect("received rows"),
-            ))
-        } else {
-            Some(Range::new(
-                earliest
-                    .unwrap_or(requested.1)
-                    .max(fetch_start)
-                    .min(requested.1),
-                received_end.expect("received rows"),
-            ))
+            )
+        });
+        let verified_bounds = match (previous_verified, newly_verified) {
+            (Some((old_start, old_end)), Some((start, end)))
+                if start <= old_end && old_start <= end =>
+            {
+                Some((old_start.min(start), old_end.max(end)))
+            }
+            (Some(prior), _) => Some(prior),
+            (None, new) => new,
         };
-        let tail = received_end
-            .or(previous_verified.map(|(_, end)| end))
+        let verified = verified_bounds.map(|(start, end)| Range::new(start, end));
+        let tail = verified_bounds
+            .map(|(_, end)| end)
             .filter(|end| *end < requested.1)
             .map(|end| Shortfall {
                 reason: "unresolved_tail".into(),
