@@ -466,6 +466,7 @@ fn bind_development(settings: &Search, access: Access<'_>) -> Result<Development
         &input.feature_manifest,
         "a search",
         access,
+        crate::outcomes::BindingMode::Historical,
     )?;
     let uri = input
         .outcome_manifest
@@ -532,6 +533,7 @@ fn bind_evaluation(
         &input.feature_manifest,
         "a search",
         access,
+        crate::outcomes::BindingMode::Historical,
     )?;
     if bound.tick.instrument != development.instrument {
         return Err(format!(

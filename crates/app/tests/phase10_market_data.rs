@@ -26,10 +26,10 @@ use common::Scratch;
 use common::broker::{FakeClock, FakeHttp, connector, correlated, fixture, replace};
 use serde::{Deserialize, de::DeserializeOwned};
 use serde_json::value::RawValue;
-use std::cell::RefCell;
 use std::collections::{BTreeMap, VecDeque};
 use std::fs;
-use std::rc::Rc;
+use std::sync::Arc;
+use std::sync::Mutex;
 
 fn hash(bytes: &[u8]) -> String {
     use sha2::{Digest, Sha256};
@@ -112,7 +112,7 @@ fn pocket_ids() -> Vec<InstrumentId> {
         id("pocket_option", "#AAPL_otc"),
     ]
 }
-fn pocket(frames: Vec<Frame>) -> (PocketMarketData, Rc<RefCell<Vec<Frame>>>) {
+fn pocket(frames: Vec<Frame>) -> (PocketMarketData, Arc<Mutex<Vec<Frame>>>) {
     let clock = FakeClock::at(1_789_348_000_000_000);
     let (connector, sent) = connector(vec![frames], &clock);
     (
@@ -317,7 +317,7 @@ fn deriv_market_correlation_precision_duplicates_cancellation_and_reconnect() {
     assert_eq!((row.generation, row.sequence), (1, 1));
     consumer.reconnect().unwrap();
     consumer.accept(&row).unwrap();
-    let requests = sent.borrow();
+    let requests = sent.lock().unwrap();
     assert!(requests.iter().any(|f| matches!(f, Frame::Text(t) if t.contains("\"count\":100") && t.contains("\"end\":\"latest\""))));
 }
 
@@ -482,14 +482,15 @@ fn pocket_retained_paging_live_cancellation_and_heartbeats() {
     assert!(broker.next_live(10_000_000).unwrap().is_none());
     assert_eq!(broker.received_counts()["#AAPL_otc"], 4);
     assert_eq!(broker.received_counts()["EURUSD_otc"], 23);
-    assert!(sent.borrow().contains(&Frame::Text("3".into())));
-    assert!(sent.borrow().contains(&Frame::Pong(vec![7, 8])));
+    assert!(sent.lock().unwrap().contains(&Frame::Text("3".into())));
+    assert!(sent.lock().unwrap().contains(&Frame::Pong(vec![7, 8])));
     assert!(
-        sent.borrow()
+        sent.lock()
+            .unwrap()
             .iter()
             .any(|f| matches!(f,Frame::Text(t) if t.contains("\"time\":1789354492.749")))
     );
-    assert!(sent.borrow().contains(&Frame::Text(
+    assert!(sent.lock().unwrap().contains(&Frame::Text(
         "42[\"unSubscribeSymbol\",\"#AAPL_otc\"]".into()
     )));
 }
@@ -648,9 +649,9 @@ fn authenticated_bootstrap_and_balance_are_exact_class_bound_and_non_purchasing(
         broker.balance().unwrap().amount,
         Decimal::parse("18.83").unwrap()
     );
-    assert_eq!(sent.borrow().len(), 1);
+    assert_eq!(sent.lock().unwrap().len(), 1);
     assert!(
-        matches!(&sent.borrow()[0],Frame::Text(t) if t.contains("\"balance\":1") && !t.contains("buy"))
+        matches!(&sent.lock().unwrap()[0],Frame::Text(t) if t.contains("\"balance\":1") && !t.contains("buy"))
     );
     for invalid in [
         r#"{"data":{"url":"ws://127.0.0.1/trading/v1/options/ws/real?otp=synthetic"}}"#,
@@ -1894,7 +1895,8 @@ fn explicit_pocket_reconnect_breaks_continuity_and_requires_resubscription() {
         Some(LiveEvent::Break { generation: 1, .. })
     ));
     assert_eq!(
-        sent.borrow()
+        sent.lock()
+            .unwrap()
             .iter()
             .filter(|frame| matches!(frame,Frame::Text(text) if text.contains("subscribeSymbol")))
             .count(),
@@ -1974,7 +1976,7 @@ fn deriv_resubscription_uses_the_new_subscription_identity() {
     assert_eq!(observation(broker.next_live(1000).unwrap()).sequence, 2);
     broker.unsubscribe(&instrument).unwrap();
     assert!(
-        matches!(sent.borrow().last().unwrap(), Frame::Text(text) if text.contains("\"forget\":\"synthetic-resubscribed\""))
+        matches!(sent.lock().unwrap().last().unwrap(), Frame::Text(text) if text.contains("\"forget\":\"synthetic-resubscribed\""))
     );
 }
 
@@ -2375,11 +2377,11 @@ fn concrete_deriv_tail_shortfall_is_requested_again() {
     .unwrap();
     assert_eq!(read_manifests(&scratch).len(), 1);
     assert_eq!(
-        sent.borrow().len(),
+        sent.lock().unwrap().len(),
         2,
         "the incomplete tail must request evidence again"
     );
-    for frame in sent.borrow().iter() {
+    for frame in sent.lock().unwrap().iter() {
         assert!(matches!(frame, Frame::Text(text) if text.contains("\"end\":\"10\"")));
     }
 }
@@ -2514,7 +2516,7 @@ fn concrete_adapters_resume_interrupted_publication_and_page_backward() {
         let rows = common::read_normalized_ticks(&scratch.path("published"), &manifest);
         if kind == "deriv" {
             assert_eq!(rows, expected_rows("history", "R_50"));
-            let requests = sent.borrow();
+            let requests = sent.lock().unwrap();
             let anchors = requests
                 .iter()
                 .filter_map(|frame| match frame {
@@ -2531,7 +2533,7 @@ fn concrete_adapters_resume_interrupted_publication_and_page_backward() {
             assert_eq!(rows.len(), 820);
             assert_eq!(rows.first().unwrap().event_time_micros, range.0);
             assert_eq!(rows.last().unwrap().event_time_micros, range.1 - 1);
-            assert!(sent.borrow().iter().any(|frame| matches!(frame, Frame::Text(text) if text.contains("\"time\":1789354293.216"))));
+            assert!(sent.lock().unwrap().iter().any(|frame| matches!(frame, Frame::Text(text) if text.contains("\"time\":1789354293.216"))));
         }
     }
 }

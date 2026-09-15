@@ -25,9 +25,13 @@ pub fn resolve_secret(reference: &str) -> Result<String, String> {
         .ok_or_else(|| format!("credential reference {reference} is unavailable"))
 }
 
-pub trait Clock {
+pub trait Clock: Send + Sync {
     fn now_micros(&self) -> i64;
     fn sleep(&mut self, micros: i64);
+    /// Wait for an absolute clock deadline; concurrent time advancement cannot move it.
+    fn sleep_until(&mut self, deadline_micros: i64) {
+        self.sleep(deadline_micros.saturating_sub(self.now_micros()).max(0));
+    }
 }
 pub struct SystemClock;
 impl Clock for SystemClock {
@@ -126,7 +130,7 @@ impl Continuity {
     }
 }
 
-pub trait MarketDataBroker {
+pub trait MarketDataBroker: Send {
     fn discover(&mut self) -> Result<Vec<DiscoveredInstrument>, String>;
     fn history_page(
         &mut self,
@@ -198,7 +202,7 @@ impl RateBudget {
                 window.requests.push_back(now);
                 return;
             }
-            clock.sleep(wait);
+            clock.sleep_until(now.saturating_add(wait));
         }
     }
 }
@@ -311,9 +315,11 @@ pub enum PurchaseOutcome {
     Accepted {
         debit: Decimal,
         liability: BrokerLiability,
+        receipt_micros: i64,
     },
     Rejected {
         code: String,
+        receipt_micros: i64,
     },
     ProvenNotSent {
         reason: String,
@@ -326,7 +332,10 @@ pub enum PurchaseOutcome {
 #[derive(Debug, Clone)]
 pub enum AccountEvent {
     TransactionAcknowledged,
-    Cash(CashFact),
+    Cash {
+        fact: CashFact,
+        receipt_micros: i64,
+    },
     ContractUpdate {
         contract_ref: String,
         source: EventSource,
@@ -352,4 +361,42 @@ pub struct OpenContract {
     pub expiry_micros: Option<i64>,
     pub instrument: String,
     pub direction: Direction,
+}
+
+#[cfg(test)]
+mod clock_api_regressions {
+    use super::Clock;
+    struct TimeOnly;
+    impl Clock for TimeOnly {
+        fn now_micros(&self) -> i64 {
+            1
+        }
+        fn sleep(&mut self, _: i64) {}
+    }
+    // Compile-time regression: these calls become ambiguous if scheduler lifecycle methods
+    // are added to Clock, even when those methods have default implementations.
+    trait SessionOwner {
+        fn complete(&self) {}
+        fn cancel(&self) {}
+        fn wake(&self, _: &str) {}
+        fn begin(&self, _: &str) {}
+        fn stalled(&self) -> bool {
+            false
+        }
+        fn failure(&self) -> Option<String> {
+            None
+        }
+    }
+    impl SessionOwner for TimeOnly {}
+    #[test]
+    fn clock_does_not_claim_session_lifecycle_methods() {
+        let clock = TimeOnly;
+        clock.complete();
+        clock.cancel();
+        clock.wake("account");
+        clock.begin("account");
+        assert!(!clock.stalled());
+        assert_eq!(clock.failure(), None);
+        assert_eq!(clock.now_micros(), 1);
+    }
 }

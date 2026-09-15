@@ -1,5 +1,7 @@
 //! Exercises `binary-alpha config validate` end to end against checked-in fixtures.
 
+mod common;
+
 use std::process::{Command, Output};
 
 const EXPECTED_REPORT: &str = "# content-hash: v3:sha256:69c7e52a379adf4c76edd6745a60b12cdccf6c56658afdaa37d6b2ecb7185c1b\nschema_version = 1\nrun_mode = \"research\"\n\n[storage]\nhistorical_data_dir = \"../historical_data\"\npublication_uri = \"gs://example-bucket/historical\"\n\n[[instruments]]\nbroker = \"pocket_option\"\nprovider_symbol = \"AEDCNY_otc\"\nbase_currency = \"AED\"\nquote_currency = \"CNY\"\nprice_scale = 6\n\n[instruments.native_granularity]\nkind = \"tick\"\n\n[instruments.gap]\nmax_seconds = 2\nreopen_seconds = 60\n\n[instruments.frozen]\nmin_observations = 10\nmin_seconds = 5\n\n[instruments.jump]\nmin_basis_points = 5\n\n[instruments.span]\nmin_percent = 75\n\n[[instruments.sessions]]\nname = \"week\"\nopen_seconds = 0\nclose_seconds = 604800\n\n[[instruments.candles]]\nduration_seconds = 5\noffset_seconds = 0\nmin_observations = 9\nhard_min_observations = 5\n\n[[instruments.candles]]\nduration_seconds = 15\noffset_seconds = 5\nmin_observations = 29\nhard_min_observations = 15\n";
@@ -370,4 +372,201 @@ fn omitted_research_and_scenario_preserve_canonical_bytes_and_hash() {
     let without = Config::parse(&legacy_replay).unwrap();
     assert_eq!(explicit.canonical_toml(), legacy_replay);
     assert_eq!(explicit.content_hash(), without.content_hash());
+}
+
+#[test]
+fn live_documents_validate_round_trip_and_bind_the_hash() {
+    use binary_alpha_engine::config::{Config, RunMode};
+    let source = std::fs::read_to_string(fixture("live.toml")).unwrap();
+    let original = Config::parse(&source).unwrap();
+    let mut without = original.clone();
+    without.live = None;
+    assert_ne!(original.content_hash(), without.content_hash());
+    for (name, config) in [
+        ("live-research", original.clone()),
+        ("without-live", without),
+    ] {
+        let output = validate_document(name, &config.canonical_toml());
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(output.stderr.is_empty());
+        assert_eq!(
+            String::from_utf8(output.stdout).unwrap(),
+            format!(
+                "# content-hash: {}\n{}",
+                config.content_hash(),
+                config.canonical_toml()
+            )
+        );
+    }
+    // Validation alone reads no broker credentials, certificate, event log, or bundle objects.
+    for mode in [
+        RunMode::Research,
+        RunMode::Replay,
+        RunMode::Paper,
+        RunMode::Live,
+    ] {
+        let mut config = original.clone();
+        config.run_mode = mode;
+        if matches!(mode, RunMode::Paper | RunMode::Live) {
+            config.live.as_mut().unwrap().replay = None;
+        }
+        let output = validate_document(&format!("live-mode-{mode}"), &config.canonical_toml());
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(output.stderr.is_empty());
+        let canonical = String::from_utf8(output.stdout).unwrap();
+        assert_eq!(Config::parse(&canonical).unwrap(), config);
+    }
+}
+
+#[test]
+fn live_mode_and_binding_rejections_name_the_exact_rule() {
+    use binary_alpha_engine::config::{Broker, Config, RunMode};
+    let source = std::fs::read_to_string(fixture("live.toml")).unwrap();
+    let original = Config::parse(&source).unwrap();
+    let mut cases = Vec::new();
+    let mut changed = original.clone();
+    changed.live.as_mut().unwrap().execution_contract = "other".into();
+    cases.push((changed, "live.execution_contract:"));
+    for mode in [RunMode::Paper, RunMode::Live] {
+        let mut changed = original.clone();
+        changed.run_mode = mode;
+        changed.live = None;
+        cases.push((changed, "live: is required for run_mode paper or live"));
+        let mut changed = original.clone();
+        changed.run_mode = mode;
+        cases.push((
+            changed,
+            "live.replay: must be absent for run_mode paper or live",
+        ));
+        for missing in ["credential", "account_class"] {
+            let mut changed = original.clone();
+            changed.run_mode = mode;
+            changed.live.as_mut().unwrap().replay = None;
+            let Broker::Deriv(broker) = &mut changed.brokers[0] else {
+                unreachable!()
+            };
+            if missing == "credential" {
+                broker.credential = None;
+            } else {
+                broker.account_class = None;
+            }
+            cases.push((
+                changed,
+                if missing == "credential" {
+                    "live.broker: credential is required for run_mode paper or live"
+                } else {
+                    "brokers[0]: account_class is required with credential"
+                },
+            ));
+        }
+    }
+    for mode in [RunMode::Research, RunMode::Replay] {
+        let mut changed = original.clone();
+        changed.run_mode = mode;
+        changed.live.as_mut().unwrap().replay = None;
+        cases.push((
+            changed,
+            "live.replay: is required for run_mode research or replay",
+        ));
+    }
+    let mut changed = original.clone();
+    changed.replay = research_fixture::replay_configuration(std::path::Path::new(
+        "/synthetic/config-only-never-opened",
+    ))
+    .replay;
+    cases.push((changed, "live: cannot be combined with [replay]"));
+    let mut changed = original.clone();
+    changed.live.as_mut().unwrap().broker = "undeclared".to_string().try_into().unwrap();
+    cases.push((
+        changed,
+        "live.broker: broker is not declared under [[brokers]]",
+    ));
+    let mut changed = original;
+    changed.run_mode = RunMode::Live;
+    changed.live.as_mut().unwrap().replay = None;
+    changed.storage.publication_uri = "file:///synthetic/publication".parse().unwrap();
+    cases.push((changed, "storage.publication_uri: a `file://` destination is the non-live test boundary and requires run_mode `research`, not `live`"));
+    for (index, (config, reason)) in cases.into_iter().enumerate() {
+        let output = validate_document(&format!("live-invalid-{index}"), &config.canonical_toml());
+        assert_eq!(output.status.code(), Some(1), "case {index}");
+        assert!(output.stdout.is_empty());
+        let error = String::from_utf8(output.stderr).unwrap();
+        assert!(error.starts_with(reason), "case {index}: {error}");
+    }
+}
+
+#[test]
+fn live_tables_reject_unknown_fields_and_invalid_measurement_bounds() {
+    use binary_alpha_engine::config::Config;
+    use serde_json::json;
+    let source = std::fs::read_to_string(fixture("live.toml")).unwrap();
+    for table in [
+        "live",
+        "live.compatibility",
+        "live.journal",
+        "live.control",
+        "live.replay",
+    ] {
+        let document = source.replace(
+            &format!("[{table}]\n"),
+            &format!("[{table}]\nunexpected_option = true\n"),
+        );
+        let output = validate_document(&format!("unknown-{table}"), &document);
+        assert_eq!(output.status.code(), Some(1));
+        assert!(output.stdout.is_empty());
+        assert!(
+            String::from_utf8(output.stderr)
+                .unwrap()
+                .contains("unknown field `unexpected_option`")
+        );
+    }
+    let original = serde_json::to_value(Config::parse(&source).unwrap()).unwrap();
+    for (index, (field, value)) in [
+        ("account", json!("")),
+        ("warmup", json!([])),
+        ("compatibility.observation_start", json!("not-a-time")),
+        (
+            "compatibility.observation_end",
+            json!("2026-01-05T00:00:00Z"),
+        ),
+        ("compatibility.min_samples", json!(0)),
+        ("journal.dir", json!("../journal")),
+        ("journal.segment_records", json!(0)),
+        ("journal.max_spool_bytes", json!(0)),
+        ("control.credential", json!("1INVALID")),
+        ("control.root_certificate", json!("/root.pem")),
+        ("control.lease_ttl_micros", json!(0)),
+        ("control.renewal_interval_micros", json!(0)),
+        ("control.renewal_interval_micros", json!(10_000_000)),
+        ("control.safety_margin_micros", json!(-1)),
+        ("control.safety_margin_micros", json!(8_000_000)),
+        ("control.safety_margin_micros", json!(i64::MAX)),
+        ("replay.broker_log", json!("../events.jsonl")),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let mut changed = original.clone();
+        let target = field
+            .split('.')
+            .fold(&mut changed["live"], |value, key| &mut value[key]);
+        *target = value;
+        let changed: Config = serde_json::from_value(changed).unwrap();
+        let output = validate_document(&format!("live-bound-{index}"), &changed.canonical_toml());
+        assert_eq!(output.status.code(), Some(1), "{field}");
+        assert!(output.stdout.is_empty());
+        let error = String::from_utf8(output.stderr).unwrap();
+        assert!(
+            error.starts_with(&format!("live.{field}:")),
+            "{field}: {error}"
+        );
+    }
 }

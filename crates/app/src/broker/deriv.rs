@@ -1,7 +1,7 @@
 #[path = "deriv_options.rs"]
 mod options;
 pub use options::{
-    DerivOptions, StatementRow, purchase_fact, purchase_observation, recover_purchase,
+    DerivOptions, Encoded, StatementRow, purchase_fact, purchase_observation, recover_purchase,
     to_observation,
 };
 
@@ -97,6 +97,7 @@ struct DerivConnection {
     url: String,
     next_id: u64,
     closed: bool,
+    last_rejection: Option<String>,
     continuity: Continuity,
     subscriptions: BTreeSet<String>,
     queued: VecDeque<Response>,
@@ -118,6 +119,7 @@ impl DerivConnection {
             url: url.to_string(),
             next_id: 1,
             closed: false,
+            last_rejection: None,
             continuity: Continuity::default(),
             subscriptions: BTreeSet::new(),
             queued: VecDeque::new(),
@@ -177,7 +179,9 @@ impl DerivConnection {
         self.transport.send(Frame::Text(text))?;
         let response = self.response(id, expected)?;
         if let Some(error) = &response.header.error {
-            return Err(format!("deriv {expected}: {}", error.code));
+            let reason = format!("deriv {expected}: {}", error.code);
+            self.last_rejection = Some(reason.clone());
+            return Err(reason);
         }
         Ok(response)
     }
@@ -186,6 +190,7 @@ impl DerivConnection {
         group: RateGroup,
         build: impl FnOnce(u64) -> T,
     ) -> Result<(u64, String), String> {
+        self.last_rejection = None;
         if self.closed {
             return Err("deriv: connection closed before write".into());
         }

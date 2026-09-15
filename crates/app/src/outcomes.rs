@@ -84,10 +84,14 @@ pub(crate) struct Bound {
     pub(crate) plan: FeaturePlan,
 }
 
-/// Reads and checks a tick ready manifest and its feature generation, then the feature plan,
-/// for a build of `role`; `field` names the input in errors and `what` names the build. A
-/// declared role, a holdout generation, a source without ticks, and a feature generation of
-/// another role, instrument, or tick generation are refused on the manifest bytes alone.
+/// The caller owns whether ticks and features are historical peers or a frozen live refit.
+#[derive(Clone, Copy)]
+pub(crate) enum BindingMode<'a> {
+    Historical,
+    Live { refit_generation: &'a str },
+}
+
+/// Reads and checks input scope, provenance and price scale before loading rows.
 pub(crate) fn bind_inputs(
     field: &dyn Fn(&str) -> String,
     role: DatasetRole,
@@ -95,6 +99,7 @@ pub(crate) fn bind_inputs(
     feature_manifest: &ManifestUri,
     what: &str,
     access: Access<'_>,
+    mode: BindingMode<'_>,
 ) -> Result<Bound, String> {
     let (tick_store, tick, scale) =
         bind_tick(&field("tick_manifest"), role, tick_manifest, what, access)?;
@@ -103,13 +108,21 @@ pub(crate) fn bind_inputs(
         &feature_manifest.to_string(),
         access,
     )?;
-    if feature.input_generation != tick.generation {
+    if matches!(mode, BindingMode::Historical) && feature.input_generation != tick.generation {
         return Err(format!(
             "{}: feature generation {} was computed from tick generation {}, not {}",
             field("feature_manifest"),
             feature.generation,
             feature.input_generation,
             tick.generation
+        ));
+    }
+    if let BindingMode::Live { refit_generation } = mode
+        && feature.generation != refit_generation
+    {
+        return Err(format!(
+            "{}: live refit generation mismatch",
+            field("feature_manifest")
         ));
     }
     if feature.role != tick.role
@@ -158,6 +171,7 @@ fn bind(settings: &Outcomes, access: Access<'_>) -> Result<Bound, String> {
         &settings.feature_manifest,
         "an outcome build",
         access,
+        BindingMode::Historical,
     )?;
     if u32::try_from(bound.tick.row_count).is_err() {
         return Err(format!(

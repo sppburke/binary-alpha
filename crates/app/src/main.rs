@@ -1,10 +1,11 @@
 //! The `binary-alpha` executable: configuration validation, historical-data import, instrument
 //! audit, feature builds, outcome builds, engine replay, candidate search, portfolio selection,
+//! research certification, ordered live execution and replay, immutable entry authorization,
 //! verification, and the external adapters those commands need.
 
 use binary_alpha_app::{
-    audit, features, fetch, import, inspect, load_config, outcomes, portfolio, replay, research,
-    search, verify,
+    audit, features, fetch, import, inspect, live, load_config, outcomes, portfolio, replay,
+    research, search, verify,
 };
 
 use std::path::{Path, PathBuf};
@@ -25,6 +26,11 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Run or replay the ordered broker runtime and manage entry authorization.
+    Live {
+        #[command(subcommand)]
+        command: LiveCommand,
+    },
     /// Inspect a configured broker without purchasing.
     Broker {
         #[command(subcommand)]
@@ -84,6 +90,38 @@ enum Command {
     Holdout {
         #[command(subcommand)]
         command: HoldoutCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum LiveCommand {
+    Run {
+        #[arg(long)]
+        config: PathBuf,
+    },
+    Replay {
+        #[arg(long)]
+        config: PathBuf,
+    },
+    Authorization {
+        #[command(subcommand)]
+        command: AuthorizationCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum AuthorizationCommand {
+    Create {
+        #[arg(long)]
+        deployment_manifest: String,
+        #[arg(long)]
+        bundle_manifest: String,
+        #[arg(long)]
+        broker: String,
+        #[arg(long)]
+        account: String,
+        #[arg(long)]
+        reason: String,
     },
 }
 
@@ -217,6 +255,32 @@ enum DataCommand {
 
 fn main() -> ExitCode {
     let result = match Cli::parse().command {
+        Command::Live {
+            command: LiveCommand::Run { config },
+        } => live::run(&config, &mut std::io::stdout().lock()),
+        Command::Live {
+            command: LiveCommand::Replay { config },
+        } => live::replay(&config, &mut std::io::stdout().lock()),
+        Command::Live {
+            command:
+                LiveCommand::Authorization {
+                    command:
+                        AuthorizationCommand::Create {
+                            deployment_manifest,
+                            bundle_manifest,
+                            broker,
+                            account,
+                            reason,
+                        },
+                },
+        } => live::authorize(
+            &deployment_manifest,
+            &bundle_manifest,
+            &broker,
+            &account,
+            &reason,
+            &mut std::io::stdout().lock(),
+        ),
         Command::Data {
             command: DataCommand::Fetch { config },
         } => fetch::run(&config, &mut std::io::stdout().lock()),

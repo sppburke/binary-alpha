@@ -28,7 +28,7 @@ use binary_alpha_engine::research::Access;
 use crate::archive::TableReader;
 use crate::features::{self, ROWS_MESSAGE};
 use crate::import::{self, CODE_REVISION};
-use crate::outcomes::{Bound, Temporary, bind_inputs, load_ticks};
+use crate::outcomes::{BindingMode, Bound, Temporary, bind_inputs, load_ticks};
 use crate::store::{self, ObjectIdentity, Put, Store};
 use crate::verify;
 
@@ -65,18 +65,19 @@ pub fn run(config_path: &Path, out: &mut dyn Write) -> Result<(), String> {
 }
 
 /// One instrument's bound inputs and its frozen binding.
-struct BoundInstrument {
-    inputs: Bound,
-    binding: InstrumentBinding,
+pub(crate) struct BoundInstrument {
+    pub(crate) inputs: Bound,
+    pub(crate) binding: InstrumentBinding,
 }
 
 /// Binds one input through the shared tick and feature binder, then refuses an outcome
 /// generation of other inputs and decision times outside the declared window on the manifest
 /// bytes alone.
-fn bind_instrument(
+pub(crate) fn bind_instrument(
     settings: &Replay,
     index: usize,
     access: Access<'_>,
+    mode: BindingMode<'_>,
 ) -> Result<BoundInstrument, String> {
     let input = &settings.inputs[index];
     let field = |name: &str| format!("inputs[{index}].{name}");
@@ -87,6 +88,7 @@ fn bind_instrument(
         &input.feature_manifest,
         "a replay",
         access,
+        mode,
     )?;
     let Bound {
         tick,
@@ -104,7 +106,7 @@ fn bind_instrument(
         ] {
             let Some(time) = time else { continue };
             let micros = parse_event_time_micros(time)?;
-            if micros < start || micros >= end {
+            if matches!(mode, BindingMode::Historical) && (micros < start || micros >= end) {
                 return Err(format!(
                     "{}: the {what} decision time {time} of stream {}s/{}s lies outside the declared decision window",
                     field("feature_manifest"),
@@ -620,7 +622,7 @@ pub(crate) fn publish(
         .ok_or("replay: the table is required")?;
     let loading = Instant::now();
     let bound = (0..settings.inputs.len())
-        .map(|index| bind_instrument(settings, index, access))
+        .map(|index| bind_instrument(settings, index, access, BindingMode::Historical))
         .collect::<Result<Vec<_>, _>>()?;
     let definition = RunDefinition {
         schema_version: if settings.bindings.iter().any(|binding| {

@@ -3,8 +3,9 @@
 These contracts bind every phase of Binary Alpha. The current checkout implements configuration,
 historical datasets, causal instrument streams, features and outcomes, the shared execution engine,
 NVIDIA CUDA kernels, candidate search and portfolio selection, and the Phase 10 broker adapters,
-history acquisition and non-purchasing inspection. It has no live, paper, or production execution
-runtime. Specification intent, checkout
+history acquisition and non-purchasing inspection, research and certification, and the Phase 12
+ordered live runtime, projection, journal, control, authorization, recorded replay, and compatibility
+receipts. Specification intent, checkout
 implementation, observed runtime state, immutable measured artifacts, and hosted Git state are
 distinct kinds of truth and are never substituted for one another.
 
@@ -242,7 +243,8 @@ no source or destination and mutates nothing.
 
 ### Deferred entries
 
-Live runtime settings and terminal certification grants remain deferred to their owning phases.
+Live runtime settings are defined in [Live runtime](#live-runtime); terminal certification grants
+are defined in [Research](#grant-claims-receipt-and-certification).
 Broker connections, funded accounts, features, contract terms, research splits, objectives, and
 risk policies already have implemented owners. New fields must retain neutral typed identifiers,
 explicit durations and clocks, exact currency-bearing amounts, credential references, and rejection
@@ -1094,7 +1096,7 @@ recorded for the obligation (empty at acceptance, then its unresolved record; th
 restored engine) followed by its own price at its provider time. A tick at a time already seen
 must repeat its price; another price at the same time fails. A confirmed cashflow that
 contradicts the frozen terms is a `discrepancy`; a net terminal debit beyond the remaining
-reservation is a `deficit`; either blocks the account pending reconciliation without fabricating
+reservation is a `deficit`; either blocks the account until reconciliation without fabricating
 the configured amount. A reconciliation resolves an open command as not sent, accepted (posting
 the purchase and keeping the terminal reserve), or settled with its actual cashflow, or lifts with
 zero postings the block a settled discrepancy left, and records the block that remains on the
@@ -1139,9 +1141,10 @@ spot/time, transport response receipt time, schema and payload digest. Serialize
 hash at installation and restored admission. New proposals replace the current binding quote;
 admitted signals freeze their own proposal and reservation. `max_proposal_age_micros` bounds age
 from receipt locally; spot time is not a quote issuance or valid-until clock. Before dispatch,
-Phase 12 must durably bind deployment and command identity, binding/account/instrument, full
-proposal/request/payload identity and economics, maximum purchase price and reservation in its
-claim. Phase 11 bundles bind settlement authority, semantic identity and all envelope bounds.
+the live runtime durably binds deployment, command, claim, fencing token, maximum proposal age,
+and the admitted signal in its dispatch claim. The signal carries binding/account/instrument,
+proposal/request/payload identity, economics, and reservation; the prepared maximum price is the
+proposal's quoted cost. Phase 11 bundles bind settlement authority, semantic identity and all envelope bounds.
 No Phase 10 application command purchases; the library refuses an empty dispatch claim, reports
 pre-write failure separately, and retains written claims and possibly-sent command identities.
 Changing the claim cannot permit another write for a possibly-sent command. Request ids provide
@@ -1564,7 +1567,7 @@ identifier `id`, and a non-negative `acceptance_delay_micros`. Every admitted co
 acceptance is scheduled at its checked decision time plus the delay, independently of later
 prices, and delivered only through its own instrument's evidence horizon, the availability of that
 instrument's last input tick, including equality; another instrument's later evidence cannot
-extend it. Pending responses merge with input observations by availability time: same-time ticks
+extend it. Queued responses merge with input observations by availability time: same-time ticks
 and rows precede the responses, which precede new decisions, in instrument and canonical command
 order. A delivered response is an `accepted` record whose entry time is the response time and
 whose entry price and price time are the instrument's latest causally available tick at that time;
@@ -1659,7 +1662,7 @@ selection generation, the descriptor carried unchanged, the claim keys, every sc
 (the applied feature generations, the replay reference, the projection with its splits, and the
 verdict), and the `state` (`no_feasible_policy`, `refit_inapplicable` with its reason,
 `outer_rejected` with its verdict, or `awaiting_holdout_authorization`). In the awaiting state
-this record is the DeploymentBundle the future live consumer parses: it references immutable
+this record is the DeploymentBundle the live consumer parses: it references immutable
 evidence rather than duplicating it, and it is not certified or executable: the engine's
 bundle-completeness check (`Run::complete_bundle`) proves the frozen stage, the version-one claim,
 and one passing result per frozen scenario and authorizes nothing, and live consumption
@@ -1746,3 +1749,488 @@ the same identities. The filesystem store appends `OPERATION KEY` (`head`, `read
 `local_path`, `list`, and `probe` of a listed manifest) to the file named by the
 `BINARY_ALPHA_STORE_LOG` environment variable when it is set, as test instrumentation outside every
 identity.
+
+## Live runtime
+
+Phase 12 runs one process per deployment bundle and execution account. The implemented boundaries
+are [configuration](../crates/engine/src/config.rs), the
+[pure projection](../crates/engine/src/research.rs), the
+[economic comparison](../crates/engine/src/execution.rs), and the application
+[journal](../crates/app/src/live/journal.rs), [control](../crates/app/src/live/control.rs), and
+[authorization](../crates/app/src/live/authorization.rs) modules. The
+[runtime](../crates/app/src/live.rs), [ordered ingress owner](../crates/app/src/live/owner.rs),
+[I/O workers](../crates/app/src/live/workers.rs), [receipt](../crates/app/src/live/receipt.rs),
+[recorded transports](../crates/app/src/broker/transport.rs), and
+[command dispatch](../crates/app/src/main.rs) compose these owners. No deployment or broker proof
+is implied. [Execution](#execution), [Broker access](#broker-access), and [Research](#research)
+retain their existing authorities.
+
+### Configuration
+
+The optional `[live]` table participates in the resolved configuration hash. Omission preserves
+existing configuration identities; the application `skeleton` clears it. Unknown fields are
+rejected in this table and its child tables. `[live]` and the historical `[replay]` table cannot
+coexist. A manifest uniform resource identifier (`URI`) uses the existing `ManifestUri` grammar:
+`file:///ROOT/manifests/GENERATION/ready.json` or
+`gs://BUCKET/PREFIX/manifests/GENERATION/ready.json`, where `GENERATION` is sixty-four lowercase
+hexadecimal digits. Relative paths are non-empty, have no leading slash, and contain no empty,
+`.` or `..` component.
+
+| Field | Rule |
+| --- | --- |
+| `live.execution_contract` | Exactly `historical_baseline_to_broker_v1`. |
+| `live.bundle_manifest` | Ready manifest of the awaiting research run carrying the complete DeploymentBundle. |
+| `live.certification_manifest` | Ready manifest of the matching certified generation; consumption reads only the public envelope. |
+| `live.broker` | Neutral broker identifier naming a `[[brokers]]` entry. |
+| `live.account` | Non-empty logical account identifier; projection requires the frozen portfolio's sole account. Provider login identifiers remain inside the adapter. |
+| `live.warmup` | One verified development tick generation per frozen instrument, in frozen order, with matching instrument and price scale. Its last event precedes the observation window; replayed row count and coverage must match its manifest. |
+| `live.compatibility` | Required measurement table below; frozen before observations. |
+| `live.compatibility.observation_start` | Inclusive start, parsed by the shared event-time parser. |
+| `live.compatibility.observation_end` | Exclusive end, strictly after the start. |
+| `live.compatibility.required_account_class` | `demo` or `real`; names the evidence required for promotion. |
+| `live.compatibility.min_samples` | Positive integer support required for every mandatory dimension. |
+| `live.journal` | Required local segment and spool settings below. |
+| `live.journal.dir` | Relative path under the configuration directory. |
+| `live.journal.segment_records` | Positive integer records per full segment. |
+| `live.journal.max_spool_bytes` | Positive measured bound in bytes for the open segment plus closed segments awaiting upload verification. Entries are disabled when `spool_bytes() >= max_spool_bytes`. |
+| `live.control` | Required encrypted database connection and lease settings below, including in recorded replay configurations; replay uses fake control. |
+| `live.control.host` | Endpoint hostname; connection address and verified certificate name are the same. |
+| `live.control.port` | Unsigned 16-bit endpoint port. |
+| `live.control.database` | Database name. |
+| `live.control.user` | Database user. |
+| `live.control.credential` | Environment variable name holding the password, never its value: letters or `_` first, then letters, digits or `_`. |
+| `live.control.root_certificate` | Relative path under the configuration directory to the supplied trusted root certificate in Privacy-Enhanced Mail (`PEM`) encoding. |
+| `live.control.owner` | This process's cooperative lease owner identity. |
+| `live.control.lease_ttl_micros` | Positive lease lifetime in microseconds. |
+| `live.control.renewal_interval_micros` | Positive microseconds, strictly below the lease lifetime. |
+| `live.control.safety_margin_micros` | Non-negative measured microseconds; checked interval plus margin must be strictly below the lifetime. |
+| `live.replay` | Required for `research`/`replay` with `[live]`; forbidden for `paper`/`live`. |
+| `live.replay.broker_log` | Relative path under the configuration directory to the [recorded broker-event log](#recorded-broker-event-log). |
+
+The loader implements the table/mode checks. Command dispatch and runtime mode checks reject
+conflicting command/mode combinations before external
+mutation. Existing [broker capability checks](#broker-access) still apply.
+
+| Command | `run_mode` | Input and execution | Publication |
+| --- | --- | --- | --- |
+| `live replay --config PATH` | `research` | Recorded broker frames, fake clock and control; no broker connection or broker credential resolution. | Filesystem or Google Cloud Storage. |
+| `live replay --config PATH` | `replay` | Same recorded broker semantics and fake transports. | Google Cloud Storage under its own authorization; filesystem publication is rejected. |
+| `live run --config PATH` | `paper` | Authorized feed and account observation; prepared intents become proven not sent, with no purchase claim or socket write. | Google Cloud Storage. |
+| `live run --config PATH` | `live` | Every entry requires the exact authorization below. The current adapter permits proposals only for demo USD. | Google Cloud Storage. |
+| `live authorization create …` | No run-mode argument | Operator-only creation from deployment and bundle manifests. | The deployment manifest's store root. |
+
+`paper` and `live` require `[live]` and a broker credential reference and account class. A broker
+credential reference in a replay configuration is allowed but remains unused by recorded replay.
+Paper observation still requires separate feed/account authorization. Real observation cannot
+prove unobserved purchases or settlements. `live replay` consumes the recorded log to exhaustion;
+`live run` requests shutdown at `observation_end`, after queued rows and dispatches drain.
+
+### Projection
+
+`research::live_policy` returns `LivePolicy`: the derived schema-2 `Replay` table, exact baseline
+terms, baseline acceptance delay `0`, refit references, and `LiveSource`. It implements these nine
+rules over already verified records; application reference verification remains a separate duty.
+
+1. `Run::complete_bundle` must pass; the run's frozen hash must equal the supplied frozen bytes,
+   and the manifest state must be `awaiting_holdout_authorization`. The application must supply
+   the verified selection named by the run; the pure function does not resolve that reference.
+2. The public certification must have state `certified` and match both the research generation
+   and bundle hash.
+3. `Selection::frozen` must contain a policy. The research portfolio has exactly one account with
+   the requested logical identifier and broker, and every selected binding references it.
+   A second account is refused even if no binding uses it; accounts and bindings are never pruned.
+4. Every selected risk policy already declares `max_proposal_age_micros`. Absence makes the
+   bundle ineligible; no deployment-time default is added.
+5. Every baseline contract uses `price_at_due_v1` with zero loss/tie gross return and zero loss/tie
+   terminal fee. Refund on equality is incompatible with `rise_fall_strict_v1`.
+6. Derive separate request templates preserving identifier, direction, duration, currency, stake,
+   and settlement bounds. Set quoted cost to stake, entry fee and all placeholder outcome cashflows
+   to zero, settlement to `broker_authoritative_v1`, and semantics to `rise_fall_strict_v1`.
+   Clone bindings in frozen order, changing only their envelope settlement authority and semantic
+   identity to match. Placeholders are request syntax, not assessed economics.
+7. Require one supplied input per frozen instrument and validate the resulting `Replay` through
+   the existing validator. It has development role, the configured observation window, no splits
+   or scenario, the assessed account, every frozen strategy/binding/risk policy, the frozen
+   reporting currency and scale, and the portfolio's conversion rates and freshness bound.
+8. Retain the original baseline contracts separately in their original order, with the same
+   refit references. The baseline scenario delay is zero.
+9. Bind `LiveSource.policy` to `Policy::identity()`, alongside the research, bundle, frozen-stage,
+   selection, and certification identities.
+
+`live::definition` verifies the run and public certification with
+ordinary access and no certification context, resolves selection/refit through their existing
+owners, and uses the existing replay binder to produce `RunDefinition`. Its input tick generation
+is `Frozen.instruments[i].source`; its feature generation is `Selection.refit[i].generation`.
+Warm-up references do not replace these source identities. The derived definition uses the
+existing [execution identity](#identities-and-records) owner and the full runtime configuration
+hash, `schema_version = 2`, and `availability = "ordered_broker_receipts_v1"`. Configured instrument
+definitions must equal the frozen refit definitions, including currency and price scale. Only the
+Deriv options adapter is accepted. Source bundle, frozen stage, scenarios, qualification, and
+certification bytes are read without mutation; no protected certification child is opened.
+
+`ContractTerms::same_economics` implements exact checked-decimal value comparison for direction,
+duration, currency, stake, quoted cost, entry fee, and every win/loss/tie gross return and terminal
+fee. Equal values with different decimal scales compare equal. A different payout, even a higher
+one, fails. Provider quote identity and derived settlement/semantic identity are checked
+separately; [Engine envelope and liability checks](#broker-authoritative-obligations) still apply.
+`Runtime::offer` withdraws the previous binding proposal before installing a replacement. It checks
+exact economics, settlement, semantics, proposal identity, and canonical request identity before
+reservation. A mismatch journals the complete refused proposal; a failed proposal request journals
+`proposal = null` and its reason. Dispatch rechecks economics, settlement, semantics, proposal age,
+and lease deadline before queuing the write to the account worker. It never widens an envelope,
+takes scenario extrema, interpolates, mixes bindings from scenarios, or chooses a scenario per command.
+
+The complete selected policy preserves fitted features, strategy order, risk, conversion policy,
+reporting currency, and economic capital. Startup entry admission requires broker balance to equal
+the Engine account's cash, preserving broker, currency, and scale; restart restores actual cash
+and obligations from journal and broker evidence instead of resetting historical initial cash.
+After startup recovery applies the recovered settlements, the runtime requests balance again.
+While the balance veto is set, each settlement requests another snapshot; equality with restored
+cash clears the veto. An outstanding pre-settlement read requires a subsequent snapshot.
+Unsupported broker, account class, instrument, currency, or duration remains rejected by the
+adapter. `empirical_policy_qualification_v1` retains its [historical meaning](#research); this
+projection adds no execution fidelity or new certification claim.
+
+### Journal
+
+The journal owner writes one JavaScript Object Notation (`JSON`) record per newline-delimited
+line. `schema_version` is not a field in each serialized record. The envelope contains `sequence`, `previous_sha256`, `time_micros`,
+`deployment`, and flattened `kind` fields. Sequence starts at 1 and increases across segments.
+`previous_sha256` is the lowercase SHA-256 (256-bit Secure Hash Algorithm) hash of the previous
+serialized record bytes, excluding the newline; the first record uses sixty-four zeroes.
+
+| `kind` | Payload |
+| --- | --- |
+| `started` | `config_hash`, `definition`, `code_revision`. |
+| `ledger` | One exact `FinancialEvent` as `event`; the runtime journals every drained Engine event in order. |
+| `refused` | `binding`, `proposal` (complete proposal or `null` on request failure), `reason`. |
+| `due_tick` | `command`, `provider_time_micros`, `price_units`; first subsequent tick at or after confirmed expiry for that command's instrument. |
+| `claimed` | `command`, `claim`, `token`; remote commit completed. |
+| `written` | `command`, `claim`; recorded before queuing the socket write, not proof of a write or acceptance. |
+| `lease` | `state` (`acquired`, `renewed`, `released`, `lost`) and `token`. |
+| `discontinuity` | Recovery `reason`. |
+
+`Journal::append` writes and synchronizes each line with `sync_data`. The sole open file is
+`<dir>/open.jsonl`; closed files are `<first>-<last>.jsonl`, with each sequence zero-padded to
+twenty digits. Rotation occurs only at `segment_records`; a partial open tail is never rotated
+or uploaded and stays local. `Journal::open` checks contiguous sequence, deployment, record hashes,
+complete lines, and filename ranges. It refuses malformed committed evidence. The newest open-tail record
+is unanchored until a successor exists; the open segment is not lossless under host or disk loss.
+
+Closed objects use `live/<deployment>/journal/<first>-<last>.jsonl`. The caller publishes through
+the existing [artifact owner](#artifacts), verifies the object identity with `put_new` and `head`,
+then calls `mark_uploaded`, which renames the local file with `.uploaded`. Only full uploaded
+segments are eligible for `remove_uploaded`. `restore` walks deterministic full-segment names
+from sequence 1 and restores cleaned files before `open`;
+the fetch callback must verify each cloud identity. `spool_bytes` counts the open file and closed
+files not marked uploaded, with checked addition. No duplicate event database is added.
+
+The storage worker uploads one closed segment at a time; the ordered owner marks and cleans it
+after byte/hash verification. Failed segments remain local and retry on the renewal cadence.
+Startup restores full archived segments before opening the journal. Entry disabling at
+`max_spool_bytes` preserves settlement, reconciliation, journaling, and publication retry.
+Shutdown stops and drains broker workers, stops renewal, disables entries, releases the lease,
+uploads and verifies full deterministic segments, then publishes the receipt and final manifest.
+Only deterministic `live replay` also publishes the existing
+[schema-2 ledger generation](#ledger-summary-and-replay-generations).
+The partial open tail stays local. Upload failure or a checkpoint interruption prevents final
+publication. Broker obligations are not synthetically settled.
+
+### Leases and dispatch claims
+
+`live/control.rs` owns exactly two PostgreSQL tables. `MIGRATION_SQL` is an idempotent Structured
+Query Language (`SQL`) migration: `CREATE TABLE IF NOT EXISTS` and the table comment
+`binary-alpha live control schema v1` on both tables. No schema-version table is added. Google
+Cloud Storage remains the immutable financial history owner.
+
+| `live_leases` column | Type and rule |
+| --- | --- |
+| `broker`, `account` | `text`; composite primary key, neutral broker and logical account. |
+| `owner`, `deployment` | Non-null `text`; cooperative owner identity and deployment hash. |
+| `token` | Non-null `bigint`; monotonically increasing fencing token. |
+| `acquired_at`, `expires_at`, `updated_at` | Non-null `timestamptz`; database acquisition, expiry, and update times. |
+
+| `live_dispatch_claims` column | Type and rule |
+| --- | --- |
+| `broker`, `account`, `command` | `text`; composite primary key using the existing neutral command identity. |
+| `claim`, `proposal`, `request` | Non-null `text`; dispatch claim and proposal/request correlation identities. |
+| `deployment` | Non-null `text`; originating deployment hash. |
+| `token` | Non-null `bigint`; originating fencing token. |
+| `payload` | Non-null `jsonb`; serialized `Claim`, described below. |
+| `state` | Non-null `text`; the Rust reader accepts `claimed`, `not_sent`, `possibly_sent`, `accepted`, `rejected`, or `reconciled`. The migration adds no SQL state constraint. |
+| `contract_ref`, `transaction_ref` | Nullable `text`; authoritative identities when known. |
+| `created_at`, `updated_at` | Non-null `timestamptz`, default `clock_timestamp()`. |
+
+`Claim` carries `command`, `claim`, `deployment`, `token`, `max_proposal_age_micros`, the exact
+admitted `signal: FinancialEvent`, `state`, `contract_ref`, and `transaction_ref`. The signal
+preserves binding, instrument, proposal identity and request, complete economic/semantic terms,
+spot and receipt clocks, and reservation; it is the existing recovery format, not a second terms
+model. Insertion checks admitted disposition, command, account, broker/instrument, reservation,
+and lease deployment/token. State and known references are read from their current columns over
+the original payload when recovering a row.
+
+Acquire, renew, release, claim, and claim update each run in one transaction, serializing on the
+same lease row through `LOCK_SQL`, ending in `FOR UPDATE`. After that statement returns,
+`CLOCK_SQL` executes `SELECT (EXTRACT(EPOCH FROM clock_timestamp()) * 1000000)::bigint`.
+Expiry comparisons use this post-lock signed Unix-epoch microsecond value.
+
+| Transaction | Effect |
+| --- | --- |
+| Acquire | Absent row: insert token 1, with a unique conflict returning no lease. Expired row: replace owner/deployment, increment token, and set acquisition, expiry, and update times. An unexpired row returns no lease. |
+| Renew | Require matching owner/token and expiry strictly after current database time. Set expiry to current time plus lifetime and update time; preserve the token. A renewal behind release cannot revive it. |
+| Release | Require matching owner/token; set expiry and update time to current database time. Preserve the row and token. Mismatch returns false. |
+| Claim | Require current owner/token and an unexpired lease, validate the claim binding, insert, and commit before purchase write. Unique conflict returns the existing claim as `Replay`; lease failure returns `LeaseLost`. |
+| Update claim | Require current unexpired owner/token; update state and supplied known references only when the row's originating token is no greater than the current token. The current owner can reconcile an older claim; a stale owner cannot mutate it. |
+
+Errors await rollback before returning. `unresolved` returns every state except `reconciled`,
+ordered by creation time then command. `delete_reconciled` is idempotent and deletes only a row
+already in that state; it does not itself verify cloud archival. `Runtime::finish` deletes a
+reconciled row only after its complete journal lifecycle lies in verified full segments, before
+publishing the ledger, receipt, and final manifest. A lifecycle in the open tail retains its claim
+until that segment fills and verifies. Unresolved claims are never removed; interruption around
+deletion resumes from the verified segments.
+
+`Postgres::connect` uses the configured trusted roots and hostname verification with encrypted
+connections required, through `tokio-postgres-rustls::MakeRustlsConnect::new`. Trust is local to
+that connection; no process-wide override is installed. Use Supabase's direct endpoint or its
+documented session pooler when the deployment network needs it; transaction pooling, Supabase
+Storage, Supabase Realtime, and additional control tables are outside this boundary. `FakeControl`
+shares in-memory rows and monotonic simulated database time between clones; scripted partition
+and lost-response faults support deterministic replay, not database proof.
+
+`lease_deadline` maps local send time `t0` and receive time `t1` from a successful acquire/renew
+response. Production uses an `Instant` anchor; recorded replay uses the shared replay clock:
+
+```text
+deadline_local = t0 + (expires_at_micros - server_now_micros)
+                - (t1 - t0) - safety_margin_micros
+```
+
+Production renewal runs on a dedicated control connection and returns typed lease ingress.
+Failed renewal disables entries; missing results reach the conservative local deadline. Recorded
+replay renews fake control on the ordered owner. Once shutdown release begins, entries remain
+disabled even if its response is lost. The next acquisition increments the token. Lease vetoes
+preserve account observation, settlement, reconciliation, journal commitment, and cloud retry;
+a renewal worker that exits after connection loss disables entries and preserves observation.
+Only a renewal worker panic is fatal.
+
+The broker adapter already splits rate admission/encoding (`prepare_purchase`) from write
+(`write_purchase`) with an opaque prepared-command token. Dispatch finishes
+rate admission, checks proposal age and lease deadline, commits the matching remote claim,
+then rechecks proposal age, prepared terms, and lease deadline before queuing the write.
+Prepared command, immutable bundle baseline, and remote
+claim must agree before write. Before claim commit no purchase write is allowed;
+loss can release only that non-external reservation and restart records a discontinuity. At or
+after commit, host loss is possibly sent until authoritative broker reconciliation proves the
+outcome. Proven pre-write expiry releases through the Engine; uncertain write is never retried.
+On a lost claim response, the running owner enters reconciliation and uses its own proof that it
+queued no write to resolve not sent. That proof does not transfer to a successor after host loss.
+An empty broker snapshot cannot prove unsent while the old dispatcher can resume. A process pause
+or queue delay after the last check may still permit a late write; retain the claim and block
+successor entries until dispatch uncertainty is resolved. Resolution requires broker evidence,
+this instance's own no-write proof, or an operator update of the durable row after confirming the
+predecessor cannot write: `not_sent`, or `accepted` with broker contract and transaction references.
+`Runtime::refresh_claims` consumes that update on the reconciliation cadence; accepted references
+still require matching broker purchase evidence. Row-lock order decides whether a claim commits before
+release or fails after it. Deriv does not enforce the fencing token; the
+[operator handoff](operations.md#live-runtime) excludes a non-cooperative legacy process.
+
+### Authorization
+
+`Authorization` is an immutable object with `schema_version = 1`, `deployment`, `configuration`,
+`bundle_sha256`, `broker`, `account`, `operator`, `reason`, and `hash`. Every binding must match;
+operator and reason must be non-empty. The content hash covers every field except `hash`, under
+`binary-alpha live authorization v1\n`. The deterministic key is
+`live/authorizations/<digest>.json`, where `digest` hashes that same domain plus deployment bytes.
+No timestamp enters the object. `create` uses the common `put_new` owner, with
+generation-match-zero in Google Cloud Storage and exact readback: identical creation reuses the
+object, while changed content at that key conflicts. `read` checks schema, deployment, and content
+integrity; the ordered ingress owner additionally validates all expected running bindings.
+
+The operator-only command:
+
+```text
+binary-alpha live authorization create --deployment-manifest URI --bundle-manifest URI --broker ID --account ID --reason TEXT
+```
+
+The command verifies deployment kind/schema/hash/key, the public research run, bundle hash,
+research generation, and broker/account agreement. It records local `USER` as operator, using
+`unavailable` when the variable is absent, and stages temporary publication files through
+`Store::filesystem(std::env::temp_dir())`, using the existing storage owner. Creation uses the deployment manifest's store root. Configure a distinct
+operator Google identity to create but not overwrite authorizations and the runtime identity to
+read them. Every `live` entry, including demo, checks deployment, resolved configuration, certified
+bundle hash, broker, and account. Replay and paper do not require this object. Missing, unreadable,
+or mismatched authorization leaves the process observation-only and is rechecked on the renewal
+cadence. Lost creation response is resolved by reading and validating the existing object.
+A changed binding requires a new exact
+authorization, not a mutable permission table or time gate. A compatibility receipt is not an
+authorization to connect or purchase.
+
+### Deployment manifest
+
+`DeploymentManifest` has `kind = "live_deployment"`, `schema_version = 1`,
+`execution_contract`, `research`, `bundle_sha256`,
+`frozen`, `selection`, `policy`, `certification`, `definition`, `config_hash`, `code_revision`,
+`broker`, `account`, and `hash`. `definition` is the existing `replay_generation_id` of the derived
+definition. `hash` covers every other field under `binary-alpha live deployment v1\n`.
+`live run`/`live replay` publish `live/deployments/<hash>.json` after warm-up validation and before
+journal restoration and lease acquisition through `put_new`, reusing identical content.
+`--deployment-manifest URI` names this object. It binds source
+qualification and policy references without creating another bundle or changing certification.
+
+### Compatibility receipt
+
+`live::receipt::compute` reads journaled facts and no clock. `RECEIPT_SCHEMA_VERSION = 1`.
+The serialized fields are `schema_version`, `deployment`, `definition`, `bundle_sha256`,
+`research`, `frozen`, `certification`, `execution_contract`, `broker`, `account_class`,
+`required_account_class`, `instruments`, `contracts`, `currency`, `observation`, `scenarios`,
+`clock_basis`, `min_samples`, `ledger`, `dimensions`, and `promotion`. `observation` contains
+`decision_start` and `decision_end`; records are selected by their application `time_micros` in
+that half-open window. `scenarios` contains frozen scenario identities followed by hashes of
+selected binding envelopes and configured alternative envelopes. `ledger` is the frozen definition
+identity. Journal segments and runtime measurements belong to the final manifest below.
+Publication is create-once at `live/<deployment>/receipts/<content-sha256>.json`.
+
+Each dimension carries `name`, `status`, `samples`, `required`, `bound`, and nullable `reason`.
+The three serialized statuses are `matched`, `outside_envelope`, and `unavailable`. `reason` is
+a string or `null`; accumulated details are separated by `; `. Missing facts produce `unavailable`
+unless an outside-envelope fact already takes precedence. An otherwise matched dimension below
+`min_samples` is `unavailable` with reason `<samples> of <required> required samples`.
+All six dimensions are mandatory, in this order:
+
+| Dimension | Evidence, bound, and failure |
+| --- | --- |
+| `economics_scope` | Samples count accepted liabilities and reconciled purchases. `bound` lists baseline contract identifiers separated by commas. Different proposal economics, accepted/settled discrepancy or deficit, different terminal return/fee, or external closure is outside the envelope. Missing signal or settlement baseline is unavailable. |
+| `offer_availability_rejection` | Samples count admitted signals and refused offers. Bound: `every admitted command accepted at the assessed terms, no rejections`. A refused offer or rejected release is outside the envelope; zero samples are unavailable with `no rejection-model evidence`. |
+| `quote_age_entry_price` | Samples count confirmed entry prices. Each must equal the signal quote price; decision minus quote time must be non-negative and at most that binding's `max_quote_age_micros`. `bound` lists each risk identifier, quote-age limit, and `entry_price_units=signal.quote_price_units`. Missing entry/quote facts are unavailable. |
+| `acceptance_delay` | Samples count accepted liabilities and reconciled purchases with a signal. Round decision time down to whole seconds; purchase time minus that value must be zero. Bound: `0 microseconds (whole-second resolution)`. Missing purchase time is unavailable. |
+| `contract_timing` | Samples count commands with confirmed entry and expiry. Bound: `expiry=entry_time+duration; exit_time=expiry; start=entry_time; exit_price=first_due_tick_price`. All four equalities and due-tick time at or after expiry must hold. Missing entry, start, expiry, terminal exit price/time, or due tick is unavailable. |
+| `funds_release` | Samples require confirmed expiry, terminal and matching cash availability, and Engine release. Bound: `expiry_to_evidence=0; evidence_to_application=0; total=0 microseconds`. Nonzero component intervals are outside the envelope; missing evidence or arithmetic overflow is unavailable. Per-command intervals are serialized in `reason`, including matched zero intervals. |
+
+Bounds come from the frozen assessment, not tolerances chosen after observation. Its baseline has
+one complete exact contract map, immediate synthetic acceptance, and historical settlement on the
+first eligible tick at or after entry plus duration. A stress scenario's fixed delay is not a
+certified interval, and scenarios cannot be combined per command. The runtime journals the first
+subsequent instrument tick at or after confirmed expiry as `due_tick`. Timing compares its price
+with the terminal exit price, start with entry, and exit time with expiry.
+
+`CLOCK_BASIS` is `unix_epoch_micros; provider seconds × 1_000_000`. Preserve provider
+timestamps, transport receipt/availability, decision, and Engine application time separately as in
+[Time](#time). For funds release, evidence availability is the maximum of terminal-source
+availability and the matching `CashObserved` source availability; application is the
+`Settled`/`Reconciled` financial record's `time_micros`. `expiry_to_evidence`,
+`evidence_to_application`, and `total` are reason-text measurements, not separate JSON fields.
+Zero credit still needs proved reconciliation.
+Duplicate or reordered facts cannot release before the last required fact or release twice.
+The implemented `AccountEvent::Cash`, purchase outcomes, and statement rows carry transport
+receipt time through normalization; dequeue time does not replace it. Runtime dispatch delays
+are recorded separately in the final manifest.
+
+Promotion is eligible only when every dimension is `matched`, every sample count meets the frozen
+`min_samples`, and actual account class equals `required_account_class`. `promotion` contains
+`eligible` and `reasons`; reasons list failing dimension names followed by `account_class` on
+mismatch. A matched dimension below minimum support still vetoes promotion.
+Demo and real evidence stay distinct. Without confirmed entry and purchase facts, quote/entry,
+fill, timing, and settlement dimensions remain unavailable. A passing synthetic fixture
+proves the contract path and still grants no real entry authority.
+
+A nonpassing mandatory dimension vetoes promotion. During observation, the first dimension in
+fixed order with status `outside_envelope` adds a persistent entry veto; `unavailable` or low
+support alone does not disable runtime entries. Observation, settlement, and reconciliation
+continue. A receipt cannot widen terms, change stake/risk/features, drop scenarios, amend
+certification, change the horizon, rerun holdout, or authorize another observation. A modeling
+mismatch needs separately reviewed development/protocol work and fresh eligible confirmation
+under the existing [holdout rules](#holdout). Retained Deriv timing and changed-payout fixtures
+are nonpassing evidence, never successful execution-fidelity evidence.
+
+### Recorded broker-event log
+
+`RecordedConnector`, `RecordedHttp`, and `ReplayClock` in `broker/transport.rs` feed the same
+normalizers and broker-authoritative Engine path as `live run`. Each JSON line is a received frame
+or optional expected send, in receipt order:
+
+```json
+{"session":"market","at":1000000,"frame":"<received text>"}
+{"session":"account","expect":"<text sent>"}
+{"session":"bootstrap","at":1000001,"frame":"<response text>"}
+```
+
+`session` is `market`, `account`, or `bootstrap`. A frame requires `at`; an expectation may also
+carry `at`. All supplied timestamps must be nondecreasing, including equal-time lines in file
+order. `ReplayClock` advances when the head record is consumed; a worker retains a received frame
+until its ordered result is delivered. An `expect` line requires an exact byte match after
+top-level `req_id` correlation. Correlation preserves decimal tokens and nested `echo_req`.
+Bootstrap expectations are `GET <url>` or `POST <url>`; headers are ignored. Without expectations,
+outbound requests bind response identifiers and subscription scope from the retained frames.
+Mismatches, decoding failures, and stalled logs fail before final publication. Replay uses fake
+control and no broker credential resolver or network transport. Restart validates the recorded
+`ledger`, `refused`, and `due_tick` prefix and reproduces the financial ledger and receipt; journal
+segments and final manifests can differ.
+
+### Final manifest and command output
+
+`FinalManifest` contains `deployment`, `definition` (the frozen run definition identity),
+`ledger` (optional ready-manifest URI), `ledger_generation` (optional generation identity),
+`receipt` (object URI), `journal_segments`, `open_tail`, and `measurements`. Only verified full
+segments are listed, each with `key`, `sha256`, and `bytes`. `open_tail` is `null` or the local
+tail's `first_sequence`, `last_sequence`, `sha256`, and `bytes`; it names no uploaded object.
+`measurements` maps command identifiers to `market_event_to_decision_micros`,
+`claim_to_socket_write_micros`, and `decision_to_acceptance_micros`; absent measurements are `null`.
+These measure market transport receipt to decision, claim completion to the worker's write-call
+start, and decision to the accepted write-call return. The final manifest is create-once at
+`live/<deployment>/final/<content-sha256>.json`; its hash includes segments and measurements.
+
+For `live run` in paper/live mode, the verified journal is the financial record. Finish publishes
+no `engine_replay` generation: `ledger` and `ledger_generation` are `null`, and the final manifest
+binds the verified full journal segments, local open-tail range and SHA-256, receipt URI, and
+definition identity. A continued run extends the journal and publishes a new final manifest
+without changing retained publications. Deterministic one-shot `live replay` still publishes
+through `replay::publish_ledger`; identical content reuses the generation key. The receipt's
+`ledger` field is the definition identity in both modes.
+
+Successful runtime commands print:
+
+```text
+live MODE deployment HASH receipt URI eligible BOOL
+live final manifest URI
+```
+
+`MODE` is `replay`, `paper`, or `live`; `BOOL` is `true` or `false`. Authorization creation prints
+`live authorization HASH at URI`.
+
+### Health
+
+The owner writes `<journal dir>/health.json` at startup, after state changes observed by its
+periodic pass, on the renewal cadence, and at finish or checkpoint interruption. Serialized fields:
+
+| Fields | Value |
+| --- | --- |
+| `bundle_sha256`, `broker`, `account`, `account_class` | Bundle and logical account bindings; class is `demo` or `real`. |
+| `lease_owner`, `fencing_token`, `lease_deadline_micros` | Cooperative owner, token, and conservative local deadline. |
+| `connection_generation`, `receipt_sequence` | Last accepted market generation and receipt sequence. |
+| `last_event_age_micros` | Clock minus last provider event time, updated on renewal cadence; `null` before an event. |
+| `warmup` | A ready base row has been observed for every bound instrument since startup or break. |
+| `journal_sequence` | Last appended journal sequence. |
+| `open_commands`, `uncertain_commands` | Engine open count; unresolved financial count plus claimed/possibly-sent rows not already counted as possibly sent. |
+| `cloud_pending_segments`, `cloud_failed_segments` | Closed segments awaiting verified upload; segments with upload errors. |
+| `pending_rows`, `pending_proposals` | Queued base rows and outstanding binding proposal requests. |
+| `balance_reconciled` | Latest returned broker balance equals Engine cash. |
+| `entries` | `{"state":"enabled"}` or `{"state":"disabled","reason":"..."}`; veto reasons are sorted and joined by `; `. |
+| `risk` | Current Engine `AccountState`: `id`, `currency`, `scale`, `cash`, `reserved`, `paid_basis`, `unresolved_loss`, `completed_profit`, `epoch_peak`, `lifetime_peak`, `max_drawdown`, `open`, optional `paused_until_micros`, and non-empty `blocked`. |
+
+`entries` reports runtime vetoes; `risk` carries Engine admission state separately.
+
+Startup verifies deployment/configuration and journal `started` bindings. Paper/live restore the
+Engine and claim-backed signals, rebuild causal features from warm-up, record restart discontinuity,
+and request broker reconciliation. Unclaimed, unwritten reservations release as not sent;
+journaled dispatches without control rows remain uncertain. Ambiguous predecessor claims stay
+possibly sent until matched broker evidence or an operator-proven `not_sent` row resolves them;
+an empty statement/portfolio or elapsed time never supplies that proof. Live ticks are not journaled.
+Incomplete warm-up, continuity loss, balance divergence, unresolved dispatch, liability
+discrepancy/deficit, spool bound, lease loss, missing live authorization, or outside-envelope
+compatibility disables entries. Engine risk and quote/proposal freshness checks also govern
+admission; stale queued rows are pruned. Accepted purchases without entry/due facts remain
+paid open exposure under [broker-authoritative obligations](#broker-authoritative-obligations).
+Account observation, settlement, reconciliation, journal, and cloud retry remain active; a market
+tick never settles a broker-authoritative obligation. No new monitoring service or Sentry
+integration is introduced.

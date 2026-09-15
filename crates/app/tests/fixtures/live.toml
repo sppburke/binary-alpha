@@ -1,0 +1,49 @@
+schema_version = 1
+run_mode = "research"
+
+[storage]
+historical_data_dir = "historical"
+publication_uri = "gs://example-bucket/historical"
+
+[[brokers]]
+kind = "deriv"
+id = "deriv"
+public_endpoint = "wss://example.invalid/websockets/v3"
+bootstrap_endpoint = "https://example.invalid/trading/v1/options/accounts"
+app_id = "synthetic"
+credential = "BINARY_ALPHA_SYNTHETIC_BROKER"
+account_class = "demo"
+
+[live]
+execution_contract = "historical_baseline_to_broker_v1"
+bundle_manifest = "gs://example-bucket/historical/manifests/1111111111111111111111111111111111111111111111111111111111111111/ready.json"
+certification_manifest = "gs://example-bucket/historical/manifests/2222222222222222222222222222222222222222222222222222222222222222/ready.json"
+broker = "deriv"
+account = "one"
+warmup = ["gs://example-bucket/historical/manifests/3333333333333333333333333333333333333333333333333333333333333333/ready.json"]
+
+[live.compatibility]
+observation_start = "2026-01-05T00:00:00Z"
+observation_end = "2026-01-05T01:00:00Z"
+required_account_class = "demo"
+min_samples = 1
+
+[live.journal]
+dir = "journal"
+segment_records = 100
+max_spool_bytes = 1048576
+
+[live.control]
+host = "db.example.invalid"
+port = 5432
+database = "synthetic"
+user = "runtime"
+credential = "BINARY_ALPHA_SYNTHETIC_CONTROL"
+root_certificate = "control/root.pem"
+owner = "fixture"
+lease_ttl_micros = 10000000
+renewal_interval_micros = 2000000
+safety_margin_micros = 1000000
+
+[live.replay]
+broker_log = "broker/events.jsonl"

@@ -447,6 +447,34 @@ crate::string_enum! {
 }
 
 impl ContractTerms {
+    /// The complete exact baseline economic tuple: direction, duration, currency, stake,
+    /// quoted cost, entry fee, and every outcome's return and fee. Provider identity,
+    /// settlement rule, and semantics are compared separately by the caller.
+    pub fn same_economics(&self, baseline: &Self) -> Result<bool, String> {
+        if self.direction != baseline.direction
+            || self.duration_micros != baseline.duration_micros
+            || self.currency != baseline.currency
+        {
+            return Ok(false);
+        }
+        for (actual, assessed) in [
+            (self.stake, baseline.stake),
+            (self.quoted_cost, baseline.quoted_cost),
+            (self.entry_fee, baseline.entry_fee),
+            (self.win.gross_return, baseline.win.gross_return),
+            (self.win.terminal_fee, baseline.win.terminal_fee),
+            (self.loss.gross_return, baseline.loss.gross_return),
+            (self.loss.terminal_fee, baseline.loss.terminal_fee),
+            (self.tie.gross_return, baseline.tie.gross_return),
+            (self.tie.terminal_fee, baseline.tie.terminal_fee),
+        ] {
+            if actual.compare(assessed)? != Ordering::Equal {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
     fn cashflow(&self, outcome: Outcome) -> Cashflow {
         match outcome {
             Outcome::Win => self.win,
@@ -2651,6 +2679,17 @@ pub struct Engine {
     failed: bool,
 }
 
+/// A value is ready when it is present, outside the declared unready labels, and every
+/// readiness flag is true. Callers resolve flag positions against their bound stream.
+pub fn value_ready(
+    value: Option<&Value>,
+    unready: &[String],
+    readiness: impl IntoIterator<Item = bool>,
+) -> bool {
+    value.is_some_and(|value| !matches!(value, Value::Text(text) if unready.iter().any(|label| label == text.as_ref())))
+        && readiness.into_iter().all(|ready| ready)
+}
+
 impl Engine {
     /// Compiles the definition against its own column lists and starts from the accounts'
     /// initial cash with no obligations. The definition record is the first ledger record.
@@ -3154,6 +3193,19 @@ impl Engine {
     // ------------------------------------------------------------------------------------------
     // Stepping: observations, then decisions, at one availability time
     // ------------------------------------------------------------------------------------------
+
+    /// Invalidates a cached offer before the owner requests its replacement.
+    pub fn withdraw_proposal(&mut self, binding: &str) -> Result<(), String> {
+        let index = self
+            .definition
+            .replay
+            .bindings
+            .iter()
+            .position(|item| item.id == binding)
+            .ok_or_else(|| format!("unknown proposal binding {binding}"))?;
+        self.proposals[index] = None;
+        Ok(())
+    }
 
     /// Applies every observation available at `time` in source order, then evaluates the base
     /// rows installed by them at decision time `time`. Times never decrease. A failed step
@@ -4914,23 +4966,20 @@ impl Engine {
         if row.close_time_micros > base_close {
             return false;
         }
-        if condition
-            .readiness
-            .iter()
-            .any(|flag| row.values[*flag] != Some(Value::Bool(true)))
-        {
-            return false;
-        }
-        let Some(value) = &row.values[condition.column] else {
-            return false;
-        };
         let spec = &self.definition.instruments[instrument].streams[condition.stream].columns
             [condition.column];
-        if let Value::Text(text) = value
-            && spec.unready.iter().any(|unready| unready == text.as_ref())
-        {
+        let value = row.values[condition.column].as_ref();
+        if !value_ready(
+            value,
+            &spec.unready,
+            condition
+                .readiness
+                .iter()
+                .map(|flag| row.values[*flag] == Some(Value::Bool(true))),
+        ) {
             return false;
         }
+        let value = value.expect("ready value");
         let label: Option<Cow<'_, str>> = spec
             .encoding
             .as_ref()
@@ -6476,6 +6525,41 @@ mod tests {
                 .unwrap_err()
                 .contains("zero entry price")
         );
+    }
+
+    #[test]
+    fn same_economics_equal_tuple() {
+        let baseline = contract();
+        let mut offer = baseline.clone();
+        offer.id = "provider-quote".into();
+        offer.settlement.rule = SettlementRule::BrokerAuthoritativeV1;
+        offer.semantics = Some(ContractSemantics::RiseFallStrictV1);
+        assert!(offer.same_economics(&baseline).unwrap());
+    }
+
+    #[test]
+    fn same_economics_higher_payout() {
+        let baseline = contract();
+        let mut offer = baseline.clone();
+        offer.win.gross_return = decimal("19.01");
+        assert!(!offer.same_economics(&baseline).unwrap());
+    }
+
+    #[test]
+    fn same_economics_different_tie_fee() {
+        let baseline = contract();
+        let mut offer = baseline.clone();
+        offer.tie.terminal_fee = decimal("0.01");
+        assert!(!offer.same_economics(&baseline).unwrap());
+    }
+
+    #[test]
+    fn same_economics_equal_value_different_scale() {
+        let mut baseline = contract();
+        baseline.win.gross_return = decimal("1.80");
+        let mut offer = baseline.clone();
+        offer.win.gross_return = decimal("1.800");
+        assert!(offer.same_economics(&baseline).unwrap());
     }
 
     fn contract() -> ContractTerms {

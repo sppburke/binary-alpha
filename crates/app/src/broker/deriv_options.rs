@@ -22,8 +22,26 @@ const MEASURED_CONTRACT_TYPES: [&str; 2] = ["CALL", "PUT"];
 
 #[derive(Debug, Clone)]
 pub struct StatementRow {
+    pub instrument: Option<String>,
+    pub direction: Option<Direction>,
     pub cash: CashFact,
     pub payout: Option<Decimal>,
+    /// Transport receipt time of the statement page carrying this row.
+    pub receipt_micros: i64,
+}
+
+/// One rate-admitted, encoded purchase, ready for the claimed socket-write boundary.
+#[derive(Debug, Clone)]
+pub struct Encoded {
+    prepared: PreparedPurchase,
+    id: u64,
+    text: String,
+}
+
+impl Encoded {
+    pub fn command(&self) -> &str {
+        &self.prepared.command
+    }
 }
 
 /// A statement buy row alone can recover the debit and purchased liability.
@@ -188,6 +206,8 @@ struct Statement {
 }
 #[derive(Deserialize)]
 struct StatementTransaction {
+    underlying_symbol: Option<String>,
+    contract_type: Option<String>,
     payout: Option<WireDecimal>,
     action_type: CashAction,
     amount: WireDecimal,
@@ -250,6 +270,12 @@ impl DerivOptions {
             events: VecDeque::new(),
         })
     }
+    pub fn rejected(&self, reason: &str) -> bool {
+        self.authenticated.connection.last_rejection.as_deref() == Some(reason)
+    }
+    pub fn now_micros(&self) -> i64 {
+        self.authenticated.connection.clock.now_micros()
+    }
     pub fn proposal_details(&self, identity: &str) -> Option<(&str, &str)> {
         self.proposals
             .get(identity)
@@ -278,20 +304,23 @@ impl DerivOptions {
                     self.events.push_back(AccountEvent::TransactionAcknowledged);
                 } else {
                     self.currency(&t.currency.ok_or("deriv transaction: currency missing")?)?;
-                    self.events.push_back(AccountEvent::Cash(CashFact {
-                        account: self.account.account.clone(),
-                        transaction_ref: identifier(
-                            &t.transaction_id
-                                .ok_or("deriv transaction: transaction identity missing")?,
-                        )?,
-                        contract_ref: t.contract_id.as_ref().map(identifier).transpose()?,
-                        action: t.action.ok_or("deriv transaction: action missing")?,
-                        amount: number(&t.amount.ok_or("deriv transaction: amount missing")?)?,
-                        time_micros: micros(
-                            t.transaction_time
-                                .ok_or("deriv transaction: time missing")?,
-                        )?,
-                    }));
+                    self.events.push_back(AccountEvent::Cash {
+                        fact: CashFact {
+                            account: self.account.account.clone(),
+                            transaction_ref: identifier(
+                                &t.transaction_id
+                                    .ok_or("deriv transaction: transaction identity missing")?,
+                            )?,
+                            contract_ref: t.contract_id.as_ref().map(identifier).transpose()?,
+                            action: t.action.ok_or("deriv transaction: action missing")?,
+                            amount: number(&t.amount.ok_or("deriv transaction: amount missing")?)?,
+                            time_micros: micros(
+                                t.transaction_time
+                                    .ok_or("deriv transaction: time missing")?,
+                            )?,
+                        },
+                        receipt_micros: response.receipt_micros,
+                    });
                 }
             }
             "proposal_open_contract" => {
@@ -581,7 +610,7 @@ impl DerivOptions {
         );
         Ok(proposal)
     }
-    pub fn purchase(&mut self, prepared: &PreparedPurchase) -> Result<PurchaseOutcome, String> {
+    fn check_purchase(&self, prepared: &PreparedPurchase) -> Result<(), String> {
         if prepared.dispatch_claim.is_empty() {
             return Err("deriv buy: dispatch claim is required".into());
         }
@@ -590,26 +619,48 @@ impl DerivOptions {
         {
             return Err("deriv buy: dispatch claim already written or possibly sent; reconcile before any retry".into());
         }
-        let encoded = (|| {
-            if prepared.command.is_empty() || prepared.maximum_price.coefficient() <= 0 {
-                return Err("deriv buy: invalid prepared command".into());
-            }
-            let proposal = self
-                .proposals
-                .get(&prepared.proposal_identity)
-                .ok_or("deriv buy: proposal is not from this connection")?;
-            self.authenticated
-                .connection
-                .prepare(RateGroup::Trade, |req_id| BuyRequest {
-                    buy: &proposal.provider_id,
-                    price: WireDecimal::from_decimal(prepared.maximum_price),
-                    req_id,
-                })
-        })();
-        let (id, text) = match encoded {
+        Ok(())
+    }
+
+    /// Checks the command and admits its request rate without writing a purchase.
+    pub fn prepare_purchase(&mut self, prepared: &PreparedPurchase) -> Result<Encoded, String> {
+        self.check_purchase(prepared)?;
+        if prepared.command.is_empty() || prepared.maximum_price.coefficient() <= 0 {
+            return Err("deriv buy: invalid prepared command".into());
+        }
+        let proposal = self
+            .proposals
+            .get(&prepared.proposal_identity)
+            .ok_or("deriv buy: proposal is not from this connection")?;
+        let (id, text) = self
+            .authenticated
+            .connection
+            .prepare(RateGroup::Trade, |req_id| BuyRequest {
+                buy: &proposal.provider_id,
+                price: WireDecimal::from_decimal(prepared.maximum_price),
+                req_id,
+            })?;
+        Ok(Encoded {
+            prepared: prepared.clone(),
+            id,
+            text,
+        })
+    }
+
+    /// Composes rate admission and socket write, preserving proven-unsent preparation errors.
+    pub fn purchase(&mut self, prepared: &PreparedPurchase) -> Result<PurchaseOutcome, String> {
+        self.check_purchase(prepared)?;
+        let encoded = match self.prepare_purchase(prepared) {
             Ok(encoded) => encoded,
             Err(reason) => return Ok(PurchaseOutcome::ProvenNotSent { reason }),
         };
+        self.write_purchase(encoded)
+    }
+
+    /// Marks the claim possibly sent before writing, then maps the broker's buy response.
+    pub fn write_purchase(&mut self, encoded: Encoded) -> Result<PurchaseOutcome, String> {
+        let Encoded { prepared, id, text } = encoded;
+        self.check_purchase(&prepared)?;
         self.written.insert(prepared.dispatch_claim.clone());
         self.possibly_sent.insert(prepared.command.clone());
         let response = self
@@ -624,12 +675,19 @@ impl DerivOptions {
         };
         if let Some(error) = response.header.error {
             self.possibly_sent.remove(&prepared.command);
-            return Ok(PurchaseOutcome::Rejected { code: error.code });
+            return Ok(PurchaseOutcome::Rejected {
+                code: error.code,
+                receipt_micros: response.receipt_micros,
+            });
         }
         Ok(match purchase_fact(&response.raw) {
             Ok((debit, liability)) => {
                 self.possibly_sent.remove(&prepared.command);
-                PurchaseOutcome::Accepted { debit, liability }
+                PurchaseOutcome::Accepted {
+                    debit,
+                    liability,
+                    receipt_micros: response.receipt_micros,
+                }
             }
             Err(reason) => PurchaseOutcome::PossiblySent { reason },
         })
@@ -662,16 +720,30 @@ impl DerivOptions {
         self.authenticated.connection.subscriptions.insert(id);
         Ok(())
     }
+    /// Drains facts already decoded by a completed synchronous request, without socket I/O.
+    pub fn queued_account_event(&mut self) -> Result<Option<AccountEvent>, String> {
+        while self.events.is_empty() {
+            let Some(response) = self.authenticated.connection.queued.pop_front() else {
+                break;
+            };
+            self.account_response(response)?;
+        }
+        Ok(self.events.pop_front())
+    }
     pub fn next_account_event(
         &mut self,
         timeout_micros: i64,
     ) -> Result<Option<AccountEvent>, String> {
-        if let Some(event) = self.events.pop_front() {
+        if let Some(event) = self.queued_account_event()? {
             return Ok(Some(event));
         }
         let Some(response) = self.authenticated.connection.next(timeout_micros)? else {
             return Ok(None);
         };
+        self.account_response(response)?;
+        Ok(self.events.pop_front())
+    }
+    fn account_response(&mut self, response: Response) -> Result<(), String> {
         if !response
             .header
             .subscription
@@ -680,8 +752,7 @@ impl DerivOptions {
         {
             return Err("deriv account: unknown subscription".into());
         }
-        self.decode_event(response)?;
-        Ok(self.events.pop_front())
+        self.decode_event(response)
     }
     pub fn open_contracts(&mut self) -> Result<Vec<OpenContract>, String> {
         let response =
@@ -754,6 +825,9 @@ impl DerivOptions {
                     return Err("deriv statement: transaction outside requested range".into());
                 }
                 facts.push(StatementRow {
+                    instrument: t.underlying_symbol,
+                    direction: t.contract_type.as_deref().map(direction).transpose()?,
+                    receipt_micros: response.receipt_micros,
                     payout: t.payout.as_ref().map(number).transpose()?,
                     cash: CashFact {
                         account: self.account.account.clone(),
@@ -805,15 +879,17 @@ pub fn purchase_fact(raw: &[u8]) -> Result<(Decimal, BrokerLiability), String> {
 pub fn to_observation(
     event: AccountEvent,
     command_of: &dyn Fn(&str) -> Option<String>,
-    receipt: i64,
 ) -> Option<execution::Observation> {
     Some(match event {
         AccountEvent::TransactionAcknowledged => return None,
-        AccountEvent::Cash(fact) => execution::Observation::Cash {
+        AccountEvent::Cash {
+            fact,
+            receipt_micros,
+        } => execution::Observation::Cash {
             source: source(
                 format!("deriv:transaction:{}", fact.transaction_ref),
                 fact.time_micros,
-                receipt,
+                receipt_micros,
             ),
             fact,
         },
@@ -852,19 +928,27 @@ pub fn purchase_observation(
 ) -> execution::Observation {
     let dispatch = source(format!("deriv:dispatch:{claim}"), receipt, receipt);
     match outcome {
-        PurchaseOutcome::Accepted { debit, liability } => execution::Observation::Purchased {
+        PurchaseOutcome::Accepted {
+            debit,
+            liability,
+            receipt_micros,
+        } => execution::Observation::Purchased {
             command: command.into(),
             source: source(
                 format!("deriv:buy:{}", liability.transaction_ref),
                 liability.purchase_time_micros,
-                receipt,
+                receipt_micros,
             ),
             debit,
             liability,
         },
-        PurchaseOutcome::Rejected { .. } => execution::Observation::Rejected {
+        PurchaseOutcome::Rejected { receipt_micros, .. } => execution::Observation::Rejected {
             command: command.into(),
-            source: dispatch,
+            source: source(
+                format!("deriv:dispatch:{claim}"),
+                receipt_micros,
+                receipt_micros,
+            ),
         },
         PurchaseOutcome::ProvenNotSent { .. } => execution::Observation::NotSent {
             command: command.into(),

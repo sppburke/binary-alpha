@@ -15,6 +15,7 @@ use crate::execution::{
     RateEvent, ReplayInput, RiskPolicy, Split, StrategySpec, Threshold,
 };
 use crate::market::{BrokerId, Currency, InstrumentId, PriceScale, ProviderSymbol};
+use crate::research::EXECUTION_CONTRACT_V1;
 
 /// Domain separator hashed before the canonical document; changing it or the canonical form
 /// increments the `v3` prefix rendered by [`Config::content_hash`].
@@ -53,6 +54,8 @@ pub struct Config {
     pub history: Option<History>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub inspect: Option<Inspect>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub live: Option<Live>,
 }
 
 impl Config {
@@ -111,6 +114,36 @@ impl Config {
                 .validate()
                 .map_err(|reason| format!("outcomes.{reason}"))?;
         }
+        if self.live.is_some() && self.replay.is_some() {
+            return Err("live: cannot be combined with [replay]".into());
+        }
+        if let Some(live) = &self.live {
+            live.validate().map_err(|reason| format!("live.{reason}"))?;
+            let broker = self
+                .brokers
+                .iter()
+                .find(|broker| broker.id() == &live.broker)
+                .ok_or("live.broker: broker is not declared under [[brokers]]")?;
+            match self.run_mode {
+                RunMode::Paper | RunMode::Live => {
+                    if live.replay.is_some() {
+                        return Err("live.replay: must be absent for run_mode paper or live".into());
+                    }
+                    if broker.credential().is_none() {
+                        return Err(
+                            "live.broker: credential is required for run_mode paper or live".into(),
+                        );
+                    }
+                }
+                RunMode::Research | RunMode::Replay => {
+                    if live.replay.is_none() {
+                        return Err(
+                            "live.replay: is required for run_mode research or replay".into()
+                        );
+                    }
+                }
+            }
+        }
         if let Some(replay) = &self.replay {
             replay
                 .validate()
@@ -144,6 +177,9 @@ impl Config {
             }
         }
         self.validate_brokers()?;
+        if self.live.is_none() && matches!(self.run_mode, RunMode::Paper | RunMode::Live) {
+            return Err("live: is required for run_mode paper or live".into());
+        }
         let Some(import) = &self.import else {
             return Ok(());
         };
@@ -353,6 +389,14 @@ pub enum Broker {
     PocketOption(PocketSettings),
 }
 
+fn credential_name(reference: &str) -> bool {
+    !reference.is_empty()
+        && reference
+            .bytes()
+            .enumerate()
+            .all(|(i, b)| b == b'_' || b.is_ascii_alphabetic() || (i > 0 && b.is_ascii_digit()))
+}
+
 /// Public and authenticated Deriv connection settings; credentials are environment names.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -434,10 +478,7 @@ impl Broker {
         }
         endpoint(self.endpoint(), "wss://", "ws://", mode)?;
         if let Some(reference) = self.credential()
-            && (reference.is_empty()
-                || !reference.bytes().enumerate().all(|(i, b)| {
-                    b == b'_' || b.is_ascii_alphabetic() || (i > 0 && b.is_ascii_digit())
-                }))
+            && !credential_name(reference)
         {
             return Err("credential must be an environment variable name".into());
         }
@@ -1306,6 +1347,158 @@ impl Outcomes {
     }
 }
 
+/// The optional live-runtime table. Absence preserves every existing configuration identity.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct Live {
+    /// Exactly `historical_baseline_to_broker_v1`.
+    pub execution_contract: String,
+    /// Ready manifest of the awaiting research run carrying the DeploymentBundle.
+    pub bundle_manifest: ManifestUri,
+    /// Ready manifest of the certification generation; only its public envelope is read.
+    pub certification_manifest: ManifestUri,
+    /// The configured broker that executes the frozen policy's one logical account.
+    pub broker: BrokerId,
+    /// The frozen policy's logical account id.
+    pub account: String,
+    /// One verified tick ready manifest per bundle instrument, in bundle instrument order.
+    pub warmup: Vec<ManifestUri>,
+    /// Measurement requirements frozen before observations.
+    pub compatibility: Compatibility,
+    /// Local journal segment and spool bounds.
+    pub journal: JournalSettings,
+    /// Cooperative account ownership and pre-dispatch durability.
+    pub control: ControlSettings,
+    /// Present only for `live replay`: the recorded broker-event log to drive.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replay: Option<LiveReplay>,
+}
+
+/// The frozen observation window, required account-class evidence, and sample support.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct Compatibility {
+    /// Inclusive event-time start, parsed by the shared market clock owner.
+    pub observation_start: String,
+    /// Exclusive event-time end.
+    pub observation_end: String,
+    /// The account-class evidence required for real promotion.
+    pub required_account_class: AccountClass,
+    /// Positive sample support required for every measured dimension.
+    pub min_samples: u32,
+}
+
+/// The local append-only journal's location and measured bounds.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct JournalSettings {
+    /// Relative path under the configuration directory.
+    pub dir: String,
+    /// Positive number of records per closed segment.
+    pub segment_records: u32,
+    /// Positive spool bound: open plus verified-but-unuploaded closed segment bytes.
+    pub max_spool_bytes: u64,
+}
+
+/// The encrypted control connection and cooperative lease timing contract.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ControlSettings {
+    /// Endpoint hostname, also used for certificate verification.
+    pub host: String,
+    /// Endpoint port.
+    pub port: u16,
+    /// Database name.
+    pub database: String,
+    /// Database user.
+    pub user: String,
+    /// Environment variable name holding the password, never the password itself.
+    pub credential: String,
+    /// Relative path of the endpoint's supplied trusted root certificate PEM file.
+    pub root_certificate: String,
+    /// This runtime's owner identity in the lease row.
+    pub owner: String,
+    /// Positive lease lifetime.
+    pub lease_ttl_micros: i64,
+    /// Positive renewal interval strictly below the lease lifetime.
+    pub renewal_interval_micros: i64,
+    /// Non-negative measured margin; interval plus margin must be below the lifetime.
+    pub safety_margin_micros: i64,
+}
+
+/// The recorded broker-event input for `live replay`.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct LiveReplay {
+    /// Relative path of the recorded broker-event log.
+    pub broker_log: String,
+}
+
+impl Live {
+    /// The rules a single field's deserializer cannot see; an error names the field.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.execution_contract != EXECUTION_CONTRACT_V1 {
+            return Err(format!(
+                "execution_contract: `{}` is not `{EXECUTION_CONTRACT_V1}`",
+                self.execution_contract
+            ));
+        }
+        if self.account.is_empty() {
+            return Err("account: must be non-empty".into());
+        }
+        if self.warmup.is_empty() {
+            return Err("warmup: at least one manifest is required".into());
+        }
+        let start = crate::market::parse_event_time_micros(&self.compatibility.observation_start)
+            .map_err(|reason| format!("compatibility.observation_start: {reason}"))?;
+        let end = crate::market::parse_event_time_micros(&self.compatibility.observation_end)
+            .map_err(|reason| format!("compatibility.observation_end: {reason}"))?;
+        if start >= end {
+            return Err("compatibility.observation_end: must be after observation_start".into());
+        }
+        if self.compatibility.min_samples == 0 {
+            return Err("compatibility.min_samples: must be positive".into());
+        }
+        relative_path(&self.journal.dir).map_err(|reason| format!("journal.dir: {reason}"))?;
+        if self.journal.segment_records == 0 {
+            return Err("journal.segment_records: must be positive".into());
+        }
+        if self.journal.max_spool_bytes == 0 {
+            return Err("journal.max_spool_bytes: must be positive".into());
+        }
+        if !credential_name(&self.control.credential) {
+            return Err("control.credential: must be an environment variable name".into());
+        }
+        relative_path(&self.control.root_certificate)
+            .map_err(|reason| format!("control.root_certificate: {reason}"))?;
+        if self.control.lease_ttl_micros <= 0 {
+            return Err("control.lease_ttl_micros: must be positive".into());
+        }
+        if self.control.renewal_interval_micros <= 0
+            || self.control.renewal_interval_micros >= self.control.lease_ttl_micros
+        {
+            return Err(
+                "control.renewal_interval_micros: must be positive and below lease_ttl_micros"
+                    .into(),
+            );
+        }
+        if self.control.safety_margin_micros < 0
+            || self
+                .control
+                .renewal_interval_micros
+                .checked_add(self.control.safety_margin_micros)
+                .is_none_or(|total| total >= self.control.lease_ttl_micros)
+        {
+            return Err("control.safety_margin_micros: must be non-negative and renewal_interval_micros plus margin must be below lease_ttl_micros".into());
+        }
+        if let Some(replay) = &self.replay {
+            relative_path(&replay.broker_log)
+                .map_err(|reason| format!("replay.broker_log: {reason}"))?;
+        }
+        Ok(())
+    }
+}
+
 /// The historical replay consumed only by `binary-alpha replay`: the declared role and half-open
 /// decision window, the verified inputs per instrument in tie-breaking order, optional reporting
 /// splits, the funded accounts, the strategies, the ordered deployment bindings, the contract
@@ -2027,14 +2220,27 @@ mod tests {
     const STORAGE: &str = "\n[storage]\nhistorical_data_dir = \"../historical_data\"\npublication_uri = \"gs://example-bucket/historical\"\n";
 
     #[test]
-    fn every_run_mode_has_one_canonical_form() {
-        for name in ["research", "replay", "paper", "live"] {
+    fn offline_run_modes_have_one_canonical_form() {
+        for name in ["research", "replay"] {
             let source = format!(
                 "# comment\nrun_mode = \"{name}\" # trailing\n\nschema_version=1\n{STORAGE}"
             );
             let canonical = format!("schema_version = 1\nrun_mode = \"{name}\"\n{STORAGE}");
             assert_eq!(Config::parse(&source).unwrap().canonical_toml(), canonical);
         }
+    }
+
+    #[test]
+    fn omitted_live_preserves_canonical_bytes_and_fixed_hash() {
+        // The expected hash is reproducible by hashing base commit 0ed8326's canonical bytes.
+        let canonical = format!("schema_version = 1\nrun_mode = \"research\"\n{STORAGE}");
+        let config = Config::parse(&canonical).unwrap();
+        assert!(config.live.is_none());
+        assert_eq!(config.canonical_toml(), canonical);
+        assert_eq!(
+            config.content_hash(),
+            "v3:sha256:b294efbf3afc5e2a6fcd779c2cd59b126f48a9bb6dedefeae3d5e7c3d4fe085e"
+        );
     }
 
     #[test]
