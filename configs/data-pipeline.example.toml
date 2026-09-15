@@ -3,7 +3,9 @@
 # table whose native_granularity, overlap_seconds, max_pages, and max_elapsed_seconds the pipeline
 # reads. Select one instrument per job, use run_mode = "research", omit [research] and foreground
 # refresh, and match history to the import's broker/ordinary role. Deriv uses ticks; Pocket uses
-# native five-second bars. Prepare the sibling core configs and non-secret evidence files first.
+# native five-second bars. Prepare the sibling core configs and non-secret evidence files first;
+# each evidence file is JSON whose source_identity names the broker source identity the archive
+# was collected under (bootstrap refuses a configured broker with a different identity).
 schema_version = 1
 local_root = "../historical_data"
 # Supply an existing study declaration when applicable; use its actual authorized location.

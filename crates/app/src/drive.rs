@@ -301,7 +301,7 @@ impl Drive {
     pub fn generate_ids(&mut self, count: usize) -> Result<Vec<String>, String> {
         let url = format!("{}/files/generateIds", self.api);
         let query = [("count", count.to_string()), ("space", "drive".into())];
-        let reply = self.send("generateIds", &|client| client.post(&url).query(&query))?;
+        let reply = self.send("generateIds", &|client| client.get(&url).query(&query))?;
         if reply.status != 200 {
             return Err(format!("drive generateIds: status {}", reply.status));
         }
@@ -311,6 +311,21 @@ impl Drive {
             return Err("drive generateIds: wrong identifier count".into());
         }
         Ok(generated.ids)
+    }
+
+    /// The archive root this transport writes beneath.
+    pub fn root(&self) -> &str {
+        &self.root
+    }
+
+    /// Confirms that the existing, untrashed file `id` carries `identity`, hashing its bytes
+    /// when Drive reports no checksum.
+    pub fn verify(&mut self, id: &str, identity: &ObjectIdentity) -> Result<RemoteFile, String> {
+        let remote = self
+            .metadata(id)?
+            .filter(|remote| !remote.trashed)
+            .ok_or_else(|| format!("drive: archived file {id} is missing or trashed"))?;
+        self.confirm(id, remote, identity)
     }
 
     /// The metadata of file `id`, or `None` when it does not exist.

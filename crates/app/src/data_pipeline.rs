@@ -258,6 +258,13 @@ fn publish(records: &Store, prefix: &str, value: &impl Serialize) -> Result<Stri
 // Job binding and the effective configuration
 // ----------------------------------------------------------------------------------------------
 
+/// The machine-checked part of the operator's source-binding evidence: the source identity the
+/// archive was collected under (see `broker::source_identity`). Other keys are free-form notes.
+#[derive(Deserialize)]
+struct EvidenceBinding {
+    source_identity: String,
+}
+
 /// The facts a job's core configuration must state before anything runs.
 struct Bound {
     core: Config,
@@ -369,6 +376,18 @@ fn bind(job: &Job, layout: &Layout) -> Result<Bound, String> {
         ));
     }
     let in_place = source_root == intake;
+    // The operator's evidence binds the archive to one source context; the configured broker
+    // must be that context, so a demo/real or endpoint switch is refused before admission.
+    let declared: EvidenceBinding = serde_json::from_slice(&evidence_bytes)
+        .map_err(|error| field(format!("evidence {}: {error}", evidence.display())))?;
+    let configured = broker::source_identity(settings);
+    if declared.source_identity != configured {
+        return Err(field(format!(
+            "evidence {} binds source identity {}, but the configured broker is {configured}",
+            evidence.display(),
+            declared.source_identity
+        )));
+    }
     let evidence_sha256 = sha256_hex(&evidence_bytes);
     Ok(Bound {
         core,
@@ -464,7 +483,8 @@ fn stage(bound: &Bound, layout: &Layout, job: &Job) -> Result<Staged, String> {
     for path in walk(&bound.intake)? {
         if path
             .file_name()
-            .is_some_and(|name| name.to_string_lossy().starts_with(".tmp-"))
+            .and_then(|name| name.to_str())
+            .is_some_and(store_scratch)
         {
             fs::remove_file(&path)
                 .map_err(|error| format!("cannot remove {}: {error}", path.display()))?;
@@ -508,6 +528,19 @@ fn stage(bound: &Bound, layout: &Layout, job: &Job) -> Result<Staged, String> {
     })
 }
 
+/// A create-once copy's scratch name, `.tmp-SHA256HEX-PID`, which no archive file carries.
+fn store_scratch(name: &str) -> bool {
+    name.strip_prefix(".tmp-")
+        .and_then(|rest| rest.split_once('-'))
+        .is_some_and(|(sha256, pid)| {
+            sha256.len() == 64
+                && sha256.bytes().all(|byte| byte.is_ascii_hexdigit())
+                && !pid.is_empty()
+                && pid.bytes().all(|byte| byte.is_ascii_digit())
+        })
+}
+
+/// Regular files beneath `root`; symbolic links are neither followed nor listed.
 fn walk(root: &Path) -> Result<Vec<PathBuf>, String> {
     let mut files = Vec::new();
     let mut pending = vec![root.to_path_buf()];
@@ -518,13 +551,14 @@ fn walk(root: &Path) -> Result<Vec<PathBuf>, String> {
             Err(error) => return Err(format!("cannot list {}: {error}", dir.display())),
         };
         for entry in entries {
-            let path = entry
-                .map_err(|error| format!("cannot list {}: {error}", dir.display()))?
-                .path();
-            if path.is_dir() {
-                pending.push(path);
-            } else {
-                files.push(path);
+            let entry = entry.map_err(|error| format!("cannot list {}: {error}", dir.display()))?;
+            let kind = entry
+                .file_type()
+                .map_err(|error| format!("cannot list {}: {error}", dir.display()))?;
+            if kind.is_dir() {
+                pending.push(entry.path());
+            } else if kind.is_file() {
+                files.push(entry.path());
             }
         }
     }
@@ -702,14 +736,6 @@ fn archive(
     let local = layout.store();
     let records = layout.records();
     let receipt_name = format!("{job}-catalog-{}-{}.json", &dataset[..16], &stream[..16]);
-    if records.head(&receipt_name)?.is_some() {
-        let mut bytes = Vec::new();
-        records.read_to(&receipt_name, None, &mut bytes)?;
-        let receipt: CatalogReceipt = serde_json::from_slice(&bytes)
-            .map_err(|error| format!("{}: {error}", records.uri(&receipt_name)))?;
-        confirm_remote(drive, &receipt.file_id, receipt.bytes, &receipt.sha256)?;
-        return Ok(receipt);
-    }
     let (dataset_manifest, dataset_bytes) = read_manifest(&local, dataset)?;
     let mut stream_bytes = Vec::new();
     local.read_to(&manifest_key(stream), None, &mut stream_bytes)?;
@@ -908,17 +934,16 @@ fn confirm_remote(
     bytes: u64,
     sha256: &str,
 ) -> Result<(), String> {
-    let remote = drive
-        .metadata(file_id)?
-        .filter(|remote| !remote.trashed)
-        .ok_or_else(|| format!("drive: archived file {file_id} is missing or trashed"))?;
-    let remote_sha256 = remote.sha256.as_deref().map(str::to_ascii_lowercase);
-    if remote.size != Some(bytes) || remote_sha256.is_some_and(|remote| remote != sha256) {
-        return Err(format!(
-            "drive: archived file {file_id} no longer carries {bytes} bytes with SHA-256 {sha256}"
-        ));
-    }
-    Ok(())
+    drive
+        .verify(
+            file_id,
+            &ObjectIdentity {
+                bytes,
+                sha256: sha256.to_string(),
+                crc32c: 0,
+            },
+        )
+        .map(|_| ())
 }
 
 fn read_manifest(local: &Store, generation: &str) -> Result<(GenerationManifest, Vec<u8>), String> {
@@ -1053,7 +1078,7 @@ fn bootstrap_job(
             base_config_hash: bound.core.content_hash(),
             effective_config_hash: config.content_hash(),
             evidence_sha256: bound.evidence_sha256.clone(),
-            archive_root: drive_root(&config, layout),
+            archive_root: drive.root().to_string(),
             cutoff: None,
             seeds: Vec::new(),
         },
@@ -1126,11 +1151,6 @@ fn bootstrap_job(
         catalog.file_id,
         catalog.sha256
     ))
-}
-
-fn drive_root(config: &Config, layout: &Layout) -> String {
-    let _ = config;
-    layout.store.display().to_string()
 }
 
 /// Audits and verifies one dataset generation in the managed store, returning its stream
@@ -1213,18 +1233,28 @@ fn update_job(
         vec![seed.clone()],
     )?;
     let binding = binding_hash(&config);
-    if let Some(pending) = &pending
-        && pending.effective_config_hash != binding
-    {
-        return Err(format!(
-            "job {}: intent {} is pending under configuration {}; the current effective configuration {binding} conflicts",
-            job.id, pending.intent, pending.effective_config_hash
-        ));
+    let records = layout.records();
+    if let Some(pending) = &pending {
+        if pending.effective_config_hash != binding {
+            return Err(format!(
+                "job {}: intent {} is pending under configuration {}; the current effective configuration {binding} conflicts",
+                job.id, pending.intent, pending.effective_config_hash
+            ));
+        }
+        let mut bytes = Vec::new();
+        records.read_to(&pending.intent, None, &mut bytes)?;
+        let opened: Intent = serde_json::from_slice(&bytes)
+            .map_err(|error| format!("{}: {error}", records.uri(&pending.intent)))?;
+        if opened.archive_root != drive.root() || opened.evidence_sha256 != bound.evidence_sha256 {
+            return Err(format!(
+                "job {}: intent {} is pending under archive root {} and evidence {}; the current archive root and evidence conflict",
+                job.id, pending.intent, opened.archive_root, opened.evidence_sha256
+            ));
+        }
     }
     let local = layout.store();
     // Seed binding and source context are checked before any credential is resolved.
     fetch::prepare(&config, &local, access.declaration)?;
-    let records = layout.records();
     let intent = match &pending {
         Some(pending) => pending.intent.clone(),
         None => publish(
@@ -1238,7 +1268,7 @@ fn update_job(
                 base_config_hash: bound.core.content_hash(),
                 effective_config_hash: config.content_hash(),
                 evidence_sha256: bound.evidence_sha256.clone(),
-                archive_root: drive_root(&config, layout),
+                archive_root: drive.root().to_string(),
                 cutoff: Some(time_text(cutoff)),
                 seeds: vec![seed],
             },
@@ -1543,6 +1573,18 @@ pub fn restore(
                 object.key
             ));
         }
+    }
+    if let Some(extra) = catalog.objects.iter().find(|entry| {
+        !dataset
+            .objects
+            .iter()
+            .chain(stream.objects.iter())
+            .any(|object| object.key == entry.key)
+    }) {
+        return Err(format!(
+            "catalog {catalog_id}: object {} is named by neither pinned manifest",
+            extra.key
+        ));
     }
     let mut installed = 0;
     let mut reused = 0;

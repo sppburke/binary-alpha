@@ -64,6 +64,10 @@ pub struct PageCoverage {
     pub rows: u64,
     pub first: Option<String>,
     pub last: Option<String>,
+    /// Local receipt time of the request that produced the page; absent in records written
+    /// before it was retained.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub receipt_time: Option<String>,
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Shortfall {
@@ -248,9 +252,6 @@ pub trait Row: Copy + PartialEq + std::fmt::Debug + Send {
     /// The first instant after the row is complete: the tick time plus one microsecond or the
     /// bar end.
     fn end(&self) -> i64;
-    /// Where the next acquisition starts before its overlap: the latest retained tick time or
-    /// the end of the latest complete bar.
-    fn frontier_of(granularity: NativeGranularity, last_time: i64) -> i64;
     /// Two rows at one event time that disagree.
     fn conflicts(&self, other: &Self) -> bool;
     fn accept(sequence: &mut Self::Sequence, row: Self) -> Result<(), String>;
@@ -278,9 +279,6 @@ impl Row for Tick {
     }
     fn end(&self) -> i64 {
         self.event_time_micros.saturating_add(1)
-    }
-    fn frontier_of(_: NativeGranularity, last_time: i64) -> i64 {
-        last_time
     }
     fn conflicts(&self, other: &Self) -> bool {
         self.event_time_micros == other.event_time_micros && self.price_units != other.price_units
@@ -325,14 +323,6 @@ impl Row for Bar {
     }
     fn end(&self) -> i64 {
         (self.start_unix_s + i64::from(self.period_s)) * 1_000_000
-    }
-    fn frontier_of(granularity: NativeGranularity, last_time: i64) -> i64 {
-        match granularity {
-            NativeGranularity::Bar { period_seconds } => {
-                last_time + i64::from(period_seconds) * 1_000_000
-            }
-            NativeGranularity::Tick => last_time,
-        }
     }
     fn conflicts(&self, other: &Self) -> bool {
         self.start_unix_s == other.start_unix_s && self != other
@@ -731,10 +721,14 @@ fn plan<'a>(
     Ok((plans, history, settings, source_identity))
 }
 
+/// The acquisition frontier a retained last row establishes: the row's time for ticks, the
+/// bar's end for bars.
 fn frontier(granularity: NativeGranularity, last_time: i64) -> i64 {
     match granularity {
-        NativeGranularity::Tick => Tick::frontier_of(granularity, last_time),
-        NativeGranularity::Bar { .. } => Bar::frontier_of(granularity, last_time),
+        NativeGranularity::Tick => last_time,
+        NativeGranularity::Bar { period_seconds } => {
+            last_time.saturating_add(i64::from(period_seconds) * 1_000_000)
+        }
     }
 }
 
@@ -887,13 +881,12 @@ fn carried_objects(baseline: &Baseline, local: &Store) -> Result<Vec<ObjectRecor
             .cloned()
             .collect());
     }
-    let (seed_store, _) = verify::open(&baseline.manifest.key_uri(local))?;
     let mut carried = Vec::with_capacity(baseline.manifest.objects.len() + 1);
     for object in &baseline.manifest.objects {
         if object.role == ObjectRole::Normalized {
             continue;
         }
-        let (_, fetched) = verify::fetch(&seed_store, object, true)?;
+        let (_, fetched) = verify::fetch(local, object, true)?;
         let fetched = fetched.expect("decoded objects have a local path");
         let identity = store::identify(&fetched.path)?;
         local.put_new(&object.key, &fetched.path, &identity)?;
@@ -910,15 +903,6 @@ fn carried_objects(baseline: &Baseline, local: &Store) -> Result<Vec<ObjectRecor
         &identity,
     ));
     Ok(carried)
-}
-
-trait KeyUri {
-    fn key_uri(&self, local: &Store) -> String;
-}
-impl KeyUri for GenerationManifest {
-    fn key_uri(&self, local: &Store) -> String {
-        local.uri(&self.key())
-    }
 }
 
 /// One pass over an explicit range without a budget or durable progress: the standalone
@@ -1100,6 +1084,7 @@ fn acquire_one<R: Row>(
     }
     let mut receipts = Vec::new();
     let mut earliest = None;
+    let floor = previous_verified.map_or(fetch_start, |(start, _)| start);
     let mut anchor = Some(requested.1);
     let mut received_end = None;
     let mut requests: u32 = 0;
@@ -1115,6 +1100,15 @@ fn acquire_one<R: Row>(
                 .map_err(|error| format!("cannot read {}: {error}", local.uri(&key)))?;
             let (symbol_id, decoded) =
                 broker.decode_history(instrument, &raw, native.scale, native.granularity)?;
+            if let Some(receipt_time) = &retained.receipt_time {
+                receipts.push(PageReceipt {
+                    anchor: retained.anchor.clone(),
+                    sha256: retained.sha256.clone(),
+                    bytes: retained.bytes,
+                    rows: retained.rows,
+                    receipt_time: receipt_time.clone(),
+                });
+            }
             (R::unpack(decoded)?, symbol_id, retained)
         } else {
             if bounds.max_pages.is_some_and(|limit| requests >= limit)
@@ -1159,6 +1153,7 @@ fn acquire_one<R: Row>(
                 rows: page_rows.len() as u64,
                 first: page_rows.first().map(|row| time_text(row.time())),
                 last: page_rows.last().map(|row| time_text(row.time())),
+                receipt_time: Some(time_text(page.receipt_micros)),
             };
             (page_rows, symbol_id, coverage_page)
         };
@@ -1177,13 +1172,21 @@ fn acquire_one<R: Row>(
             native.symbol_id = Some(symbol_id);
         }
         received_all = prepend_page(page_rows.clone(), received_all);
+        // A page contradicting the retained rows is never checkpointed. The oldest received
+        // time is excluded until the next page can complete its multiplicity.
+        let boundary = received_all
+            .first()
+            .map_or(floor, |row| row.time().saturating_add(1).max(floor));
+        check_verified_overlap(instrument, &previous_rows, &received_all, boundary)?;
         let first = page_rows.first().map(Row::time);
         if let Some(last_row) = page_rows.last().filter(|row| row.time() >= fetch_start) {
-            received_end = Some(
-                received_end
-                    .unwrap_or(i64::MIN)
-                    .max(last_row.end().min(requested.1)),
-            );
+            // Coverage ends at the last complete row, or where a row straddles the cutoff: a
+            // bar reaching past the cutoff proves nothing after its start.
+            let end = match page_rows.iter().find(|row| row.end() > requested.1) {
+                Some(beyond) => beyond.time().min(requested.1),
+                None => last_row.end(),
+            };
+            received_end = Some(received_end.unwrap_or(i64::MIN).max(end));
         }
         if !objects
             .iter()
@@ -1231,7 +1234,9 @@ fn acquire_one<R: Row>(
         earliest = Some(first);
         let kept = page_rows
             .into_iter()
-            .filter(|row| row.time() >= fetch_start && row.end() <= requested.1)
+            .filter(|row| {
+                row.time() >= fetch_start && row.time() < requested.1 && row.end() <= requested.1
+            })
             .collect();
         rows = prepend_page(kept, rows);
         if first <= fetch_start {
@@ -1239,7 +1244,6 @@ fn acquire_one<R: Row>(
         }
         anchor = Some(first);
     };
-    let floor = previous_verified.map_or(fetch_start, |(start, _)| start);
     check_verified_overlap(instrument, &previous_rows, &received_all, floor)?;
     let new_count = rows.len();
     let pending = shortfall

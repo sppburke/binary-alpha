@@ -204,8 +204,10 @@ bar collection keeps the original manifest and a separate selected intake projec
 bootstrap report and retain the immutable receipt and catalog identifier/digest.
 
 For each source, establish the broker/account class, selected instrument, seed provenance, and
-clock mapping from authorized evidence. A Pocket archive from a different account/source context
-must not be relabeled to match a demo endpoint. Configure Deriv tick history and Pocket
+clock mapping from authorized evidence, and record the resulting broker source identity in the
+job's evidence file (`{"source_identity": "…"}` plus notes); binding refuses a configured broker
+whose identity differs, and the refusal names both identities. A Pocket archive from a different
+account/source context must not be relabeled to match a demo endpoint. Configure Deriv tick history and Pocket
 five-second bar history with explicit positive overlap, page, and time limits and no foreground
 refresh. With exact broker and Drive authorization, run a bounded update:
 

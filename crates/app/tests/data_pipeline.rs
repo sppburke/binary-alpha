@@ -100,7 +100,6 @@ struct BrokerFaults {
     wrong_index: bool,
     wrong_period: bool,
     off_second: bool,
-    real_account: bool,
 }
 
 struct FakeBroker {
@@ -267,11 +266,7 @@ fn serve_broker(kind: Kind) -> FakeBroker {
                                     authenticated = true;
                                     replies.push(Message::Text(r#"42["successauth",{"synthetic":true}]"#.into()));
                                     replies.push(Message::Text(
-                                        format!(
-                                            r#"42["successupdateBalance",{{"isDemo":{},"synthetic":true}}]"#,
-                                            u8::from(!faults.real_account)
-                                        )
-                                        .into(),
+                                        r#"42["successupdateBalance",{"isDemo":1,"synthetic":true}]"#.into(),
                                     ));
                                     let mut row = vec![Value::Null; 19];
                                     row[0] = json!("synthetic");
@@ -292,9 +287,10 @@ fn serve_broker(kind: Kind) -> FakeBroker {
                                         pages += 1;
                                         let anchor = request["time"].as_f64().unwrap() as i64 - POCKET_OFFSET_S;
                                         let index = request["index"].as_u64().unwrap();
-                                        let last = anchor.div_euclid(5) * 5;
-                                        let first = (last - 200).max(*from);
-                                        let rows: Vec<Value> = (first..last.min(*to))
+                                        // Every candle starting before the anchor, including one
+                                        // still in progress when the anchor lies inside it.
+                                        let first = (anchor.div_euclid(5) * 5 - 200).max(*from);
+                                        let rows: Vec<Value> = (first..anchor.min(*to))
                                             .step_by(5)
                                             .map(|start| {
                                                 let [open, high, low, close, volume] = synthetic_bar(start);
@@ -501,13 +497,9 @@ fn read_request(stream: &mut TcpStream) -> Option<Request> {
     let mut parts = request_line.split(' ');
     let method = parts.next()?.to_string();
     let target = parts.next()?.to_string();
-    let (path, query_text) = target.split_once('?').unwrap_or((&target, ""));
-    let query = query_text
-        .split('&')
-        .filter(|pair| !pair.is_empty())
-        .filter_map(|pair| pair.split_once('='))
-        .map(|(key, value)| (key.to_string(), percent_decode(value)))
-        .collect();
+    let url = reqwest::Url::parse(&format!("http://fixture{target}")).ok()?;
+    let path = url.path().to_string();
+    let query = url.query_pairs().into_owned().collect();
     let headers: BTreeMap<String, String> = lines
         .filter_map(|line| line.split_once(':'))
         .map(|(name, value)| (name.trim().to_ascii_lowercase(), value.trim().to_string()))
@@ -520,35 +512,11 @@ fn read_request(stream: &mut TcpStream) -> Option<Request> {
     stream.read_exact(&mut body).ok()?;
     Some(Request {
         method,
-        path: path.to_string(),
+        path,
         query,
         headers,
         body,
     })
-}
-
-fn percent_decode(text: &str) -> String {
-    let bytes = text.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len());
-    let mut index = 0;
-    while index < bytes.len() {
-        match bytes[index] {
-            b'%' if index + 2 < bytes.len() + 1 => {
-                let hex = std::str::from_utf8(&bytes[index + 1..index + 3]).unwrap();
-                out.push(u8::from_str_radix(hex, 16).unwrap());
-                index += 3;
-            }
-            b'+' => {
-                out.push(b' ');
-                index += 1;
-            }
-            byte => {
-                out.push(byte);
-                index += 1;
-            }
-        }
-    }
-    String::from_utf8(out).unwrap()
 }
 
 fn respond(stream: &mut TcpStream, status: u16, extra: &[(&str, &str)], body: &[u8]) {
@@ -623,7 +591,7 @@ fn handle_http(mut stream: TcpStream, state: &Arc<Mutex<DriveState>>, base: &str
     }
     let faults = state.faults.clone();
     match (request.method.as_str(), request.path.as_str()) {
-        ("POST", "/drive/v3/files/generateIds") => {
+        ("GET", "/drive/v3/files/generateIds") => {
             let count: usize = request.query["count"].parse().unwrap();
             let ids: Vec<String> = (0..count)
                 .map(|_| {
@@ -964,7 +932,7 @@ fn pipeline_toml(
     ));
     for (id, config) in jobs {
         text.push_str(&format!(
-            "\n[[jobs]]\nid = \"{id}\"\nconfig = \"{config}\"\nintake_dir = \"raw_sources/{id}\"\nevidence = \"evidence/{id}.md\"\n"
+            "\n[[jobs]]\nid = \"{id}\"\nconfig = \"{config}\"\nintake_dir = \"raw_sources/{id}\"\nevidence = \"evidence/{id}.json\"\n"
         ));
     }
     text
@@ -1024,15 +992,27 @@ fn write_sources(scratch: &Scratch) {
     )
     .unwrap();
     fs::create_dir_all(scratch.path("evidence")).unwrap();
-    for job in ["deriv", "pocket"] {
-        fs::write(
-            scratch.path(&format!("evidence/{job}.md")),
-            format!(
-                "# Synthetic source binding for {job}\n\nLoopback fixture; no operator archive.\n"
-            ),
-        )
+}
+
+/// The operator's source-binding evidence for one job: the identity of the broker context the
+/// job's core configuration names, plus free-form notes.
+fn write_evidence(scratch: &Scratch, job: &str, core: &str) {
+    let config = binary_alpha_engine::config::Config::parse(core).unwrap();
+    let history = config.history.as_ref().unwrap();
+    let broker = config
+        .brokers
+        .iter()
+        .find(|broker| broker.id() == &history.broker)
         .unwrap();
-    }
+    fs::write(
+        scratch.path(&format!("evidence/{job}.json")),
+        json!({
+            "source_identity": binary_alpha_app::broker::source_identity(broker),
+            "statement": format!("Synthetic source binding for {job}: loopback fixture, no operator archive."),
+        })
+        .to_string(),
+    )
+    .unwrap();
 }
 
 fn fixture(name: &str) -> Fixture {
@@ -1057,6 +1037,12 @@ fn fixture(name: &str) -> Fixture {
         pocket_core(&pocket.url, "demo", BAR_GRANULARITY, 60, 50, 60),
     )
     .unwrap();
+    write_evidence(&scratch, "deriv", &deriv_core(&deriv.url, 60, 50, 60));
+    write_evidence(
+        &scratch,
+        "pocket",
+        &pocket_core(&pocket.url, "demo", BAR_GRANULARITY, 60, 50, 60),
+    );
     let pipeline = scratch.path("pipeline.toml");
     fs::write(
         &pipeline,
@@ -1841,7 +1827,7 @@ fn pipeline_recovery() {
         entry.bytes = bytes;
     }
     let conflict = pipeline("update", &pocket_only, &["--end", &end_2]).unwrap_err();
-    assert!(conflict.contains("no longer carries"), "{conflict}");
+    assert!(conflict.contains("nothing was replaced"), "{conflict}");
     {
         let mut state = f.drive.state.lock().unwrap();
         let entry = state.files.get_mut(&catalog_id).unwrap();
@@ -1850,17 +1836,76 @@ fn pipeline_recovery() {
         entry.bytes = bytes;
     }
 
+    // Transport drop after one retained page: the run fails, the page and its request receipt
+    // stay durable, and the resumed run (through one token refresh) closes at the same cutoff
+    // carrying that receipt.
+    let cutoff_3 = cutoff_2 + 150;
+    let end_3 = time_text(cutoff_3 * 1_000_000);
+    f.pocket.set(BrokerFaults {
+        drop_after_pages: Some(1),
+        ..Default::default()
+    });
+    let dropped = pipeline("update", &pocket_only, &["--end", &end_3]).unwrap_err();
+    assert!(dropped.contains("pipeline job pocket failed"), "{dropped}");
+    let pending = read_json(&state.join("pocket/progress.json"));
+    let retained = pending["progress"]["pages"].as_array().unwrap().clone();
+    assert_eq!(retained.len(), 1, "{dropped}\n{pending}");
+    assert!(retained[0]["receipt_time"].is_string(), "{pending}");
+    f.pocket.set(BrokerFaults::default());
+    f.drive.set(DriveFaults {
+        unauthorized_once: true,
+        ..Default::default()
+    });
+    let log_before = f.drive.log().len();
+    let resumed = pipeline("update", &pocket_only, &["--end", &end_3]).unwrap();
+    assert_eq!(
+        field(job_line(&resumed, "pocket"), "status"),
+        "archived",
+        "{resumed}"
+    );
+    assert_eq!(field(job_line(&resumed, "pocket"), "cutoff"), end_3);
+    assert!(!state.join("pocket/progress.json").exists());
+    assert_eq!(
+        f.drive.log()[log_before..]
+            .iter()
+            .filter(|line| line.starts_with("POST /token"))
+            .count(),
+        2,
+        "one refresh after the rejected token: {:?}",
+        &f.drive.log()[log_before..]
+    );
+    f.drive.set(DriveFaults::default());
+    let generation_3 = field(job_line(&resumed, "pocket"), "dataset").to_string();
+    assert_eq!(
+        bars(&store, &dataset(&store, &generation_3)),
+        expected_bars(POCKET_SEED_END, POCKET_SEED_END - 60, cutoff_3)
+    );
+    let newest = fs::read_dir(state.join("records"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| {
+            path.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("pocket-receipt-")
+        })
+        .max_by_key(|path| fs::metadata(path).unwrap().modified().unwrap())
+        .unwrap();
+    let receipt = read_json(&newest);
+    let requests = receipt["requests"].as_array().unwrap();
+    assert!(requests.len() >= 2, "{receipt}");
+    assert_eq!(requests[0]["sha256"], retained[0]["sha256"], "{receipt}");
+    assert_eq!(
+        requests[0]["receipt_time"], retained[0]["receipt_time"],
+        "{receipt}"
+    );
     // Conflicting overlap from the provider stops publication and keeps the prior generation.
     f.pocket.set(BrokerFaults {
         conflict_before: Some(cutoff_2),
         ..Default::default()
     });
-    let conflicting = pipeline(
-        "update",
-        &pocket_only,
-        &["--end", &time_text((cutoff_2 + 300) * 1_000_000)],
-    )
-    .unwrap_err();
+    let end_conflict = time_text((cutoff_2 + 300) * 1_000_000);
+    let conflicting = pipeline("update", &pocket_only, &["--end", &end_conflict]).unwrap_err();
     assert!(
         conflicting.contains("conflicting or inconsistent reread"),
         "{conflicting}"
@@ -1946,7 +1991,14 @@ fn pipeline_recovery() {
         .filter(|(_, entry)| entry.name.starts_with("object-"))
         .map(|(id, _)| id.clone())
         .collect();
-    f.drive.state.lock().unwrap().files.remove(&object_ids[0]);
+    let removed = f
+        .drive
+        .state
+        .lock()
+        .unwrap()
+        .files
+        .remove(&object_ids[0])
+        .unwrap();
     let other_root = f.scratch.path("consumer-2");
     let other = f.scratch.path("consumer-2.toml");
     fs::write(
@@ -1960,6 +2012,49 @@ fn pipeline_recovery() {
         "{missing}"
     );
     assert!(!other_root.join("store/manifests").exists());
+
+    // A pending intent whose retained pages were validated resumes at its pinned cutoff once the
+    // provider's data is consistent again; the conflicting page was never checkpointed.
+    let pending = read_json(&state.join("pocket/progress.json"));
+    assert_eq!(
+        pending["progress"]["cutoff"],
+        json!(end_conflict),
+        "{pending}"
+    );
+    assert_eq!(
+        pending["progress"]["pages"].as_array().unwrap().len(),
+        1,
+        "{pending}"
+    );
+    // Its closure carries the seed object deleted remotely above: archival re-confirms every
+    // reused transfer and refuses instead of reporting a cached success.
+    let missing = pipeline("update", &pocket_only, &[]).unwrap_err();
+    assert!(missing.contains("missing or trashed"), "{missing}");
+    assert!(!state.join("pocket/progress.json").exists());
+    f.drive
+        .state
+        .lock()
+        .unwrap()
+        .files
+        .insert(object_ids[0].clone(), removed);
+    let resumed = pipeline("update", &pocket_only, &["--end", &end_conflict]).unwrap();
+    assert_eq!(
+        field(job_line(&resumed, "pocket"), "cutoff"),
+        end_conflict,
+        "{resumed}"
+    );
+    assert_eq!(
+        field(job_line(&resumed, "pocket"), "status"),
+        "archived",
+        "{resumed}"
+    );
+    assert_eq!(
+        bars(
+            &store,
+            &dataset(&store, field(job_line(&resumed, "pocket"), "dataset"))
+        ),
+        expected_bars(POCKET_SEED_END, POCKET_SEED_END - 60, cutoff_2 + 300)
+    );
 }
 
 // ----------------------------------------------------------------------------------------------
@@ -2332,6 +2427,38 @@ fn pipeline_scope() {
     .unwrap_err();
     assert!(
         refused.contains("outside the pinned catalog closure"),
+        "{refused}"
+    );
+    assert!(
+        !f.drive.log()[log_before..]
+            .iter()
+            .any(|line| line.contains("fixture-id") && line.contains("alt=media")),
+        "no object fetched: {:?}",
+        &f.drive.log()[log_before..]
+    );
+    let (id, sha_extra) = tampered(&|catalog| {
+        let mut extra = catalog.objects[0].clone();
+        extra.key = format!("objects/{}", "e".repeat(64));
+        extra.sha256 = "e".repeat(64);
+        catalog.objects.push(extra);
+    });
+    let refused = pipeline(
+        "restore",
+        &consumer,
+        &[
+            "--catalog",
+            &id,
+            "--sha256",
+            &sha_extra,
+            "--broker",
+            "pocket_option",
+            "--symbol",
+            "AEDCNY_otc",
+        ],
+    )
+    .unwrap_err();
+    assert!(
+        refused.contains("named by neither pinned manifest"),
         "{refused}"
     );
     assert!(

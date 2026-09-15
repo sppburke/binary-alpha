@@ -461,7 +461,9 @@ The JavaScript Object Notation (JSON) coverage record remains schema version 1. 
 ranges (`start`, `end`), optional `actual` (`first`, `last`), `rows`, `pages`, and
 `shortfall`. Each page has `path`, `sha256`, `bytes`, optional `anchor`, `rows`, and optional
 `first`/`last`. Additions are `native_granularity` (absent means tick; tick is omitted when
-written) and optional `seed = { generation, source_identity }`. Each shortfall has `reason` and
+written), optional `seed = { generation, source_identity }`, and each page's optional
+`receipt_time` (the local receipt time of its request, which a resumed acquisition carries into
+its operation receipt). Each shortfall has `reason` and
 an `unresolved` range. Reasons include `empty_page`, `no_progress`, `budget`, and
 `unresolved_tail`; when a primary shortfall and a tail coexist, `tail_shortfall` records the
 tail separately. Missing optional additions are not synthesized into old immutable records.
@@ -544,7 +546,10 @@ empty). Unknown fields are rejected in the document, Drive settings, and jobs. R
 - `config`: the core configuration path relative to the pipeline document.
 - `intake_dir`: a path under `raw_sources/`, relative to `local_root`.
 - `evidence`: a readable non-secret source-binding evidence file relative to the pipeline
-  document; its bytes are hashed into the intent.
+  document. It is a JSON document whose `source_identity` names the broker source identity
+  (see [broker access](#broker-access)) the archive was collected under; other keys are
+  free-form notes. Binding refuses a job whose configured broker has a different identity, and
+  the file's bytes are hashed into the intent.
 
 All three job paths must be relative, without empty, `.`, or `..` segments. Each core
 configuration must use `run_mode = "research"`, exactly one import source selecting one
@@ -589,11 +594,19 @@ Under `pipeline_state/`:
   `JOB/bootstrap.json` holds the bootstrap binding, generations, source identity, and catalog.
 - `JOB/progress.json` holds a pending intent name, effective configuration binding, and
   `progress` with `baseline`, `start`, `cutoff`, and retained `pages`. Pages are retained
-  before this checkpoint advances; resumption decodes them and continues backward.
+  before this checkpoint advances; resumption decodes them and continues backward. A page whose
+  rows contradict the retained rows fails the run before it is checkpointed, so a resumed
+  intent never replays a conflicting page; removing `JOB/progress.json` abandons a pending
+  intent (its retained pages stay as unreferenced diagnostics) so a later update may pin a new
+  cutoff.
 - `JOB/transfers.json` maps object/manifest/catalog keys to `file_id`, optional secret
   `session`, and `done`. Session status supplies the acknowledged upload offset on resume.
 - `downloads/` holds temporary `FILE_ID.catalog`, `GENERATION.manifest`, and
   `SHA256HEX.partial` downloads.
+
+A pending intent binds the archive root and the evidence digest it was opened under as well;
+a resumed invocation whose `drive.root_folder_id` or evidence file differs fails with the pending
+intent identity.
 
 Mutable checkpoints use flushed atomic replacement. Completed records and store objects use
 create-once publication; different content at an existing key is a conflict.
@@ -671,9 +684,10 @@ reading back and hashing when Drive supplies no checksum. Different content is n
 Objects upload before manifests, and the catalog uploads last after those transfers confirm.
 The local catalog receipt is then published.
 
-Reuse checks require an existing non-trashed remote file with matching size and, when supplied,
-matching checksum. Reusing a catalog receipt checks that catalog's remote metadata; it does not
-read back the whole archived closure. Drive is not provider-enforced immutable storage.
+Every reused transfer, including a previously archived closure, is confirmed again through the
+same owner as a completed upload: an existing non-trashed remote file with the recorded size and
+SHA-256, hashing the bytes read back when Drive supplies no checksum. Drive is not
+provider-enforced immutable storage.
 Refresh/access tokens, response bodies that might echo them, and resumable session locations
 are not printed.
 
@@ -696,7 +710,8 @@ and uses that catalog's finite set of manifests and objects as its allowset. A s
 read and checks the stream generation. Without a declaration, ordinary metadata classification
 still rejects holdout before child-object reads. The dataset manifest must describe the ordinary
 catalog generation, and the stream must derive from it with the same role. Every dependency must
-match a catalog object key, hash, and size before object downloads. A catalog pin cannot override
+match a catalog object key, hash, and size, and every catalog object must be named by one of the
+two manifests, before object downloads. A catalog pin cannot override
 a declaration's denial; supply any known study binding.
 
 Partial downloads resume by byte range and require the final byte count and SHA-256. A corrupt
