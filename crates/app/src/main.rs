@@ -4,8 +4,8 @@
 //! verification, and the external adapters those commands need.
 
 use binary_alpha_app::{
-    audit, features, fetch, import, inspect, live, load_config, outcomes, portfolio, replay,
-    research, search, verify,
+    audit, data_pipeline, features, fetch, import, inspect, live, load_config, outcomes, portfolio,
+    replay, research, search, verify,
 };
 
 use std::path::{Path, PathBuf};
@@ -251,6 +251,58 @@ enum DataCommand {
         #[arg(long)]
         config: Option<PathBuf>,
     },
+    /// Stage, import, extend, archive, list, and restore research market data through one
+    /// managed local store and a private Drive archive.
+    #[command(disable_help_subcommand = true)]
+    Pipeline {
+        #[command(subcommand)]
+        command: PipelineCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum PipelineCommand {
+    /// Stage every job's selected originals, import, audit, verify, and archive them without
+    /// broker contact.
+    Bootstrap {
+        /// Path of the TOML pipeline document.
+        #[arg(long)]
+        config: PathBuf,
+    },
+    /// Extend every bootstrapped job from its bound seed to one pinned cutoff within its
+    /// budget, then audit, verify, and archive the result.
+    Update {
+        #[arg(long)]
+        config: PathBuf,
+        /// The pinned cutoff as `YYYY-MM-DDTHH:MM:SS[.ffffff]Z`; absent means now.
+        #[arg(long)]
+        end: Option<String>,
+    },
+    /// List every archived catalog of one instrument.
+    List {
+        #[arg(long)]
+        config: PathBuf,
+        #[arg(long)]
+        broker: String,
+        #[arg(long)]
+        symbol: String,
+    },
+    /// Install exactly one catalog's dataset and stream closure into this document's managed
+    /// store and print their local ready-manifest locations.
+    Restore {
+        #[arg(long)]
+        config: PathBuf,
+        /// The catalog's Drive file identifier.
+        #[arg(long)]
+        catalog: String,
+        /// The catalog's expected SHA-256.
+        #[arg(long)]
+        sha256: String,
+        #[arg(long)]
+        broker: String,
+        #[arg(long)]
+        symbol: String,
+    },
 }
 
 fn main() -> ExitCode {
@@ -299,6 +351,35 @@ fn main() -> ExitCode {
         Command::Data {
             command: DataCommand::Verify { manifest, config },
         } => verify::run_configured(config.as_deref(), &manifest).map(|line| println!("{line}")),
+        Command::Data {
+            command: DataCommand::Pipeline { command },
+        } => match command {
+            PipelineCommand::Bootstrap { config } => {
+                data_pipeline::bootstrap(&config, &mut std::io::stdout().lock())
+            }
+            PipelineCommand::Update { config, end } => {
+                data_pipeline::update(&config, end.as_deref(), &mut std::io::stdout().lock())
+            }
+            PipelineCommand::List {
+                config,
+                broker,
+                symbol,
+            } => data_pipeline::list(&config, &broker, &symbol, &mut std::io::stdout().lock()),
+            PipelineCommand::Restore {
+                config,
+                catalog,
+                sha256,
+                broker,
+                symbol,
+            } => data_pipeline::restore(
+                &config,
+                &catalog,
+                &sha256,
+                &broker,
+                &symbol,
+                &mut std::io::stdout().lock(),
+            ),
+        },
         Command::Features {
             command: FeaturesCommand::Build { config },
         } => features::run(&config, &mut std::io::stdout().lock()),

@@ -61,11 +61,14 @@ crate::string_enum! {
 }
 
 /// The native granularity of the source.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum NativeGranularity {
+    #[default]
     Tick,
-    Bar { period_seconds: u16 },
+    Bar {
+        period_seconds: u16,
+    },
 }
 
 impl<'de> Deserialize<'de> for NativeGranularity {
@@ -90,6 +93,20 @@ impl<'de> Deserialize<'de> for NativeGranularity {
             (kind, _) => Err(serde::de::Error::custom(format!(
                 "unknown kind `{kind}`, expected one of `tick`, `bar`"
             ))),
+        }
+    }
+}
+
+impl NativeGranularity {
+    pub fn is_tick(&self) -> bool {
+        *self == Self::Tick
+    }
+
+    /// The normalized data object a broker-history generation of this granularity carries.
+    pub fn normalized_object_path(self) -> &'static str {
+        match self {
+            Self::Tick => "normalized/ticks.parquet",
+            Self::Bar { .. } => "normalized/bars.parquet",
         }
     }
 }
@@ -144,6 +161,34 @@ pub struct IntervalContract {
 }
 
 impl IntervalContract {
+    /// The one contract this checkout admits, observed under `provenance`.
+    pub fn five_second(provenance: &str) -> Self {
+        Self {
+            closed: "left".into(),
+            frequency: "5s".into(),
+            interval: "[timestamp,timestamp+5s)".into(),
+            label: "left".into(),
+            offset_seconds: 0,
+            origin: "unix_epoch_utc".into(),
+            timestamp_semantics: "bar_start".into(),
+            provenance: provenance.into(),
+        }
+    }
+
+    /// The key-value pairs a bar file embeds for this contract; provenance is recorded by the
+    /// manifest, never by the file.
+    pub fn metadata(&self) -> [(&'static str, String); 7] {
+        [
+            ("closed", self.closed.clone()),
+            ("frequency", self.frequency.clone()),
+            ("interval", self.interval.clone()),
+            ("label", self.label.clone()),
+            ("offset_seconds", self.offset_seconds.to_string()),
+            ("origin", self.origin.clone()),
+            ("timestamp_semantics", self.timestamp_semantics.clone()),
+        ]
+    }
+
     /// The exact contract this checkout admits: left-closed five-second bars whose timestamp is
     /// the bar start on the Unix epoch grid, with a non-empty provenance.
     pub fn validate(&self) -> Result<(), String> {
@@ -200,7 +245,7 @@ pub struct ObjectRecord {
     pub generation: Option<i64>,
 }
 
-fn is_hex64(text: &str) -> bool {
+pub(crate) fn is_hex64(text: &str) -> bool {
     text.len() == 64
         && text
             .bytes()
@@ -323,7 +368,9 @@ impl GenerationManifest {
                 self.instrument
             ));
         }
-        let scale = match (
+        // Imported bar archives keep their listed files as the data objects; every other
+        // admitted combination normalizes into exactly one object.
+        let (scale, expected) = match (
             self.source_kind,
             self.price_representation,
             self.native_granularity,
@@ -338,7 +385,7 @@ impl GenerationManifest {
                 TimeUnit::Microsecond,
                 false,
                 [Capability::Ticks],
-            ) => Some(scale),
+            ) => (Some(scale), 1),
             (
                 SourceKind::BarParquet,
                 PriceRepresentation::BinaryFloat64,
@@ -346,7 +393,15 @@ impl GenerationManifest {
                 TimeUnit::Second,
                 true,
                 [Capability::Bars],
-            ) => None,
+            ) => (None, 0),
+            (
+                SourceKind::BrokerHistory,
+                PriceRepresentation::BinaryFloat64,
+                NativeGranularity::Bar { period_seconds: 5 },
+                TimeUnit::Second,
+                true,
+                [Capability::Bars],
+            ) => (None, 1),
             _ => {
                 return Err(format!(
                     "source kind {}, price representation, granularity, time unit, interval, and capabilities disagree",
@@ -363,23 +418,26 @@ impl GenerationManifest {
             .iter()
             .filter(|object| object.role == ObjectRole::Normalized)
             .count();
-        let expected = usize::from(scale.is_some());
         if normalized != expected || self.objects.len() == normalized {
             return Err(format!(
                 "expected {expected} normalized object among {} objects, found {normalized}",
                 self.objects.len()
             ));
         }
+        let normalized_path = self.native_granularity.normalized_object_path();
         if self.source_kind == SourceKind::BrokerHistory
             && (!self.objects.iter().any(|o| o.role == ObjectRole::Source)
                 || !self.objects.iter().any(|o| {
                     o.role == ObjectRole::Provenance && o.path == "provenance/coverage.json"
                 })
-                || !self.objects.iter().any(|o| {
-                    o.role == ObjectRole::Normalized && o.path == "normalized/ticks.parquet"
-                }))
+                || !self
+                    .objects
+                    .iter()
+                    .any(|o| o.role == ObjectRole::Normalized && o.path == normalized_path))
         {
-            return Err("broker_history requires raw source pages, provenance/coverage.json, and normalized/ticks.parquet".into());
+            return Err(format!(
+                "broker_history requires raw source pages, provenance/coverage.json, and {normalized_path}"
+            ));
         }
         if generation_id(
             &instrument,
@@ -572,6 +630,55 @@ mod tests {
         assert_eq!(
             manifest().generation,
             "c81fe40d17a4bd2914e0b941bdc895147ef9f21cc713e7e1d910e652dbab867e"
+        );
+    }
+
+    #[test]
+    fn broker_history_bars_require_one_normalized_bar_object_and_an_interval() {
+        let mut valid = manifest();
+        valid.source_kind = SourceKind::BrokerHistory;
+        valid.objects[0].path = "provenance/coverage.json".to_string();
+        valid.objects.push(object(
+            ObjectRole::Normalized,
+            "normalized/bars.parquet",
+            "cc",
+        ));
+        let instrument = InstrumentId {
+            broker: valid.broker.clone(),
+            provider_symbol: valid.provider_symbol.clone(),
+        };
+        valid.generation = generation_id(
+            &instrument,
+            valid.source_kind,
+            valid.role,
+            None,
+            &valid.objects,
+        );
+        assert_eq!(
+            GenerationManifest::from_json(&valid.to_json()).unwrap(),
+            valid
+        );
+
+        let mut wrong_path = valid.clone();
+        wrong_path.objects[2].path = "normalized/ticks.parquet".to_string();
+        assert_eq!(
+            GenerationManifest::from_json(&wrong_path.to_json()).unwrap_err(),
+            "broker_history requires raw source pages, provenance/coverage.json, and normalized/bars.parquet"
+        );
+        let mut two_normalized = valid.clone();
+        two_normalized.objects.push(object(
+            ObjectRole::Normalized,
+            "normalized/extra.parquet",
+            "dd",
+        ));
+        assert_eq!(
+            GenerationManifest::from_json(&two_normalized.to_json()).unwrap_err(),
+            "expected 1 normalized object among 4 objects, found 2"
+        );
+        valid.interval = None;
+        assert_eq!(
+            GenerationManifest::from_json(&valid.to_json()).unwrap_err(),
+            "source kind broker_history, price representation, granularity, time unit, interval, and capabilities disagree"
         );
     }
 

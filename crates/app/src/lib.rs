@@ -1,5 +1,7 @@
 pub mod archive;
 pub mod audit;
+pub mod data_pipeline;
+pub mod drive;
 pub mod features;
 pub mod import;
 pub mod live;

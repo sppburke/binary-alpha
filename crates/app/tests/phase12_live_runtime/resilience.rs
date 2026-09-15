@@ -822,8 +822,18 @@ impl MarketDataBroker for MarketProbe {
         id: &InstrumentId,
         scale: PriceScale,
         before: Option<i64>,
+        granularity: binary_alpha_engine::dataset::NativeGranularity,
     ) -> Result<broker::HistoryPage, String> {
-        self.inner.history_page(id, scale, before)
+        self.inner.history_page(id, scale, before, granularity)
+    }
+    fn decode_history(
+        &self,
+        id: &InstrumentId,
+        raw: &[u8],
+        scale: PriceScale,
+        granularity: binary_alpha_engine::dataset::NativeGranularity,
+    ) -> Result<(Option<i32>, broker::HistoryRows), String> {
+        self.inner.decode_history(id, raw, scale, granularity)
     }
     fn subscribe(&mut self, id: &InstrumentId, scale: PriceScale) -> Result<(), String> {
         if let Some((started, release)) = self.subscribe_gate.take() {

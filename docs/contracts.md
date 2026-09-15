@@ -98,8 +98,9 @@ with distinct authorizations; none implies the next.
 
 ## Configuration
 
-The configuration document is TOML. The engine package owns its meaning, validation, canonical form,
-and content hash; the application package owns reading it from a path.
+The configuration document uses Tom's Obvious, Minimal Language (TOML). The engine package owns its
+meaning, validation, canonical form, and content hash; the application package owns reading it
+from a path.
 
 ### Schema version 1
 
@@ -108,7 +109,7 @@ and content hash; the application package owns reading it from a path.
 | `schema_version` | integer | `1` |
 | `run_mode` | string | `research`, `replay`, `paper`, `live` |
 | `storage.historical_data_dir` | string | a non-empty path of the retained historical-data folder; a relative path resolves against the configuration file's directory |
-| `storage.publication_uri` | string | `gs://BUCKET` or `gs://BUCKET/PREFIX` in every run mode; `file:///ABSOLUTE/DIR` only with `run_mode = "research"`, as the non-live test boundary |
+| `storage.publication_uri` | string | `gs://BUCKET` or `gs://BUCKET/PREFIX` in every run mode; `file:///ABSOLUTE/DIR` only with `run_mode = "research"`, for non-live tests and the research data pipeline |
 | `import.sources` | array of tables | optional; consumed only by `data import`, which requires at least one entry |
 | `instruments` | array of tables | optional; maps audit generations and selected broker history/live instruments |
 | `features.instruments` | array of tables | optional; consumed only by `features build`, which requires at least one entry |
@@ -138,7 +139,27 @@ Credentials are environment-variable names, never their values.
 (`development` or `evaluation`; `holdout` is rejected), `start`, `end`, and optional positive
 `refresh_interval_seconds`. Start and end are universal-time text forming a nonempty half-open
 range. Every selection must resolve to a declared broker and a matching `[[instruments]]` entry
-with tick native granularity. `inspect` declares positive `live_observations` and `live_seconds`,
+with the same native granularity. The additional history fields are:
+
+- `native_granularity`: `{ kind = "tick" }` by default, or
+  `{ kind = "bar", period_seconds = N }` with a positive unsigned 16-bit period. No other keys
+  are accepted; `period_seconds` is required for bars and forbidden for ticks. Fetch admits only
+  five-second bars.
+- `seeds`: an empty list by default. Each entry contains `provider_symbol`, `manifest` (a
+  `file://` or `gs://` ready-manifest location), and `source_identity` (exactly sixty-four
+  lowercase hexadecimal digits). The symbol must occur in `history.instruments` and may have
+  only one seed. The binding is checked against the configured broker before broker connection;
+  a digest alone does not establish that an operator's archive came from that source context.
+- `overlap_seconds`, `max_pages`, and `max_elapsed_seconds`: optional positive unsigned 32-bit
+  integers with no configured default. The pipeline requires all three and uses them for
+  frontier overlap and per-invocation acquisition limits. Standalone `data fetch` retains its
+  explicit-range, foreground behavior without these page/time limits.
+
+Canonical output omits tick `native_granularity`, empty `seeds`, and absent overlap/page/time
+limits. A seed entry rejects unknown keys. Existing configurations that omit these fields keep
+their canonical form.
+
+`inspect` declares positive `live_observations` and `live_seconds`,
 then optional `proposal = { stake = "10", duration_seconds = 15 }` with positive exact stake and
 duration. Proposal inspection requires the history broker to support execution and have a
 credential reference. Capability checks run in `Config::validate`, before connection. `ws://` and
@@ -157,7 +178,12 @@ configuration file's directory), `broker`, and `role` (`development` or `evaluat
 rejected). Kind `tick_csv` names one native tick file and also declares `provider_symbol`,
 `source_symbol` (the symbol text every row must carry), and `price_scale` (`0` to `18`). Kind
 `bar_parquet_collection` names one collection root and also declares `manifest` (the collection
-manifest inside that root) and an optional `provenance` list of further files inside that root.
+manifest inside that root), an optional `provenance` list of further files inside that root, and
+optional `instruments` containing collection asset names. An absent selection imports every
+listed asset and is omitted from canonical output. A present selection must be nonempty, contain
+unique nonempty names without ASCII (American Standard Code for Information Interchange) control
+characters, and name assets present in the collection. Configuration validates the names and
+duplicates; import checks membership and filters before opening unselected asset trees.
 Kind `tick_parquet_daily` names one daily tick archive root and also declares `price_scale` and
 `instruments`, a non-empty list of unique directory names beneath that root. `manifest` and
 `provenance` entries contain only normal path components; each `instruments` entry is one normal
@@ -314,8 +340,9 @@ then one line `ROLE`, tab, `PATH`, tab, `SHA256HEX`, tab, `BYTES`, line feed per
 by path, where `ROLE` is `source` or `provenance` and `PATH` is the object's path relative to its
 dataset root. Normalized outputs are not part of the identity, so equal inputs always name the same
 generation. Its ready manifest lives at `manifests/GENERATION/ready.json` beneath the same two roots
-and is the sole publication record; there is no other catalog or authority. Object paths, broker, and
-provider symbol contain no ASCII control character.
+and is the dataset's publication record. The research data pipeline's archive catalog references
+these original ready manifests without changing them. Object paths, broker, and provider symbol
+contain no ASCII control character.
 
 ### Ready manifest
 
@@ -375,7 +402,8 @@ generation. Archive bytes are never re-encoded.
 
 ### Bar sources
 
-A collection manifest lists assets; each asset root lies inside the collection root and holds
+A collection manifest lists assets; an optional source `instruments` selection limits the assets
+opened. Each selected asset root lies inside the collection root and holds
 `dataset/` with the listed monthly Parquet files. Every listed file must carry exactly the archive
 schema (symbol, symbol identifier, timestamp, Unix seconds, server seconds, five doubles, period)
 with Zstandard column chunks. Embedded interval metadata, when present, must equal the declared
@@ -394,6 +422,67 @@ The collection manifest must declare exactly the approved contract (left-closed,
 manifest, and the declared `provenance` files follow as `provenance` objects, the collection-level
 ones at `collection/NAME`. Symbolic links anywhere in the declared inventory are rejected. Parquet
 bytes are never re-encoded. A bar generation provides only `bars`.
+
+### Broker-history bars and coverage
+
+A native broker-history bar generation admits exactly `source_kind = "broker_history"`,
+`price_representation = { kind = "binary_float64" }`,
+`native_granularity = { kind = "bar", period_seconds = 5 }`, `time_unit = "second"`, the
+five-second interval contract, and `capabilities = ["bars"]`. It contains source objects,
+`provenance/coverage.json`, and exactly one normalized object, `normalized/bars.parquet`.
+Tick generations keep `normalized/ticks.parquet` and their existing representation.
+
+`write_bars` writes Zstandard Parquet with these eleven optional columns, populated without nulls:
+
+| Column | Physical type and annotation | Value |
+| --- | --- | --- |
+| `symbol` | byte array, UTF8 (Unicode Transformation Format, 8-bit) | provider symbol |
+| `symbol_id` | int32, signed 32-bit | constant provider identifier |
+| `timestamp_utc` | int64, `TIMESTAMP(MICROS,true)` | bar start in Unix microseconds |
+| `unix_utc_s` | int64, signed 64-bit | bar start in Unix seconds |
+| `server_time_s` | int64, signed 64-bit | bar start plus configured server offset in seconds |
+| `open`, `high`, `low`, `close`, `volume` | double | provider bar values |
+| `period_s` | int32, unsigned 16-bit | `5` |
+
+Embedded metadata is `closed = left`, `frequency = 5s`,
+`interval = [timestamp,timestamp+5s)`, `label = left`, `offset_seconds = 0`,
+`origin = unix_epoch_utc`, and `timestamp_semantics = bar_start`. Interval provenance is
+`parquet_metadata` in the ready manifest; it is not an extra file-metadata key. Only complete
+bars with start at or after the acquisition start and end at or before the cutoff enter the
+new rows. Volume remains the provider's value; first/last tick times are not invented.
+
+Matched history-page bytes are retained before row decoding. Validated pages appear as source
+objects at logical paths `raw/SHA256HEX.json`, stored under `objects/SHA256HEX`. A matched
+response whose rows fail validation remains a retained diagnostic without a ready manifest naming
+it. Envelope mismatches fail before this retention.
+
+The JavaScript Object Notation (JSON) coverage record remains schema version 1. It records
+`source_identity`, `broker`, `provider_symbol`, `role`, `requested` and optional `verified`
+ranges (`start`, `end`), optional `actual` (`first`, `last`), `rows`, `pages`, and
+`shortfall`. Each page has `path`, `sha256`, `bytes`, optional `anchor`, `rows`, and optional
+`first`/`last`. Additions are `native_granularity` (absent means tick; tick is omitted when
+written) and optional `seed = { generation, source_identity }`. Each shortfall has `reason` and
+an `unresolved` range. Reasons include `empty_page`, `no_progress`, `budget`, and
+`unresolved_tail`; when a primary shortfall and a tail coexist, `tail_shortfall` records the
+tail separately. Missing optional additions are not synthesized into old immutable records.
+
+For pipeline advances, the acquisition frontier is the latest retained tick time or the end of
+the latest complete bar. A new acquisition starts at
+`max(history.start, frontier - overlap_seconds)`, even when older seed coverage has gaps.
+A pending acquisition instead keeps its pinned baseline, start, cutoff, and retained pages.
+The seed's original manifest is retained as `seed/ready.json`, with its raw/provenance objects
+beneath `seed/`; lineage uses generation and source identity without a producer-location
+dependency. Seeds must match instrument, role, native representation, and source identity.
+A seeded lineage is never narrowed: a later `history.start` than its first retained row or a
+cutoff before its retained frontier fails before broker connection. Retained rows are not clipped.
+An older inherited gap remains in the retained data and provenance; frontier advancement does
+not establish continuous coverage or repair history outside the overlap.
+
+If a reread adds no rows and leaves verified coverage and shortfalls unchanged, fetch reuses the
+prior dataset and its original manifest. New request receipts still record `anchor`, `sha256`,
+`bytes`, `rows`, and local `receipt_time` in the pipeline operation receipt; identical raw
+bytes do not require duplicate objects or a new dataset. Coverage page counts are retained page
+entries, not a count of all requests.
 
 ### Commands
 
@@ -433,6 +522,194 @@ permits the target before it is opened and refuses an undeclared dataset (see
 write nothing further to standard output, write one diagnostic to standard error, and exit with
 status 1. None removes source files, retained objects, or published objects.
 
+## Data pipeline
+
+The application-owned research pipeline imports selected originals, extends Deriv ticks or Pocket
+Option five-second bars, and archives a dataset plus its matching instrument stream in private
+Google Drive. Local filesystem publication is supported for this workflow. Google Cloud Storage
+retains production, certification, and holdout authority. Catalogs cover only dataset and stream
+ready manifests and their object dependencies, including raw data, provenance, normalized data,
+profiles, and candles. They do not archive feature/model, outcome, replay, research, or
+certification generations, and introduce no Google Drive artifact-store address scheme.
+
+### Pipeline document
+
+The separate Tom's Obvious, Minimal Language (TOML) document has `schema_version = 1`, a required
+nonempty `local_root`, required `drive`, optional `governance_manifest`, and `jobs` (default
+empty). Unknown fields are rejected in the document, Drive settings, and jobs. Relative
+`local_root` resolves against this document's directory. Each job requires:
+
+- `id`: unique, nonempty ASCII (American Standard Code for Information Interchange) letters,
+  digits, underscores, or hyphens.
+- `config`: the core configuration path relative to the pipeline document.
+- `intake_dir`: a path under `raw_sources/`, relative to `local_root`.
+- `evidence`: a readable non-secret source-binding evidence file relative to the pipeline
+  document; its bytes are hashed into the intent.
+
+All three job paths must be relative, without empty, `.`, or `..` segments. Each core
+configuration must use `run_mode = "research"`, exactly one import source selecting one
+instrument, and one matching history instrument with the same broker and ordinary role.
+The core `research` table is rejected; supply an existing declaration through the pipeline's
+`governance_manifest` instead. The pipeline requires tick history for Deriv and five-second bar
+history for Pocket Option, positive `overlap_seconds`, `max_pages`, and `max_elapsed_seconds`,
+and no `refresh_interval_seconds`. It replaces storage paths with `local_root/store` in an
+effective configuration, and supplies the bootstrapped seed and update cutoff without editing the
+operator's core file. Consumer-only configurations may omit jobs; bootstrap/update require them.
+List/restore need no broker credentials.
+
+The `drive` table requires `root_folder_id` (nonempty, with no ASCII control characters, slash,
+or single quote), `chunk_bytes` (a positive unsigned 64-bit multiple of `262144`),
+`request_timeout_seconds`, and `max_attempts` (positive unsigned 32-bit integers). There are no
+default transfer limits. Operator mode also requires `credential`, an environment-variable name
+containing only letters, digits, and underscores, with no leading digit. The process variable
+holds user OAuth (Open Authorization) refresh credentials as a JSON (JavaScript Object Notation)
+object with string `client_id`, `client_secret`, and `refresh_token` fields. Operator transport
+uses Google's fixed secure web endpoints. Optional `loopback_endpoint` is a test fixture only:
+a literal `http://127.0.0.1:PORT` or `http://[::1]:PORT` base without whitespace or trailing
+slash, with `credential` absent and synthetic credentials supplied internally. It never resolves
+operator credentials. See [the example](../configs/data-pipeline.example.toml).
+
+### Local state and commands
+
+The managed root separates `store/` (retained and published objects), `raw_sources/` (selected
+intake), and `pipeline_state/`. State and per-job state directories have mode `0700`.
+Bootstrap/update hold the nonblocking `pipeline_state/writer.lock` for the producer run;
+list/restore do not take that lock. Use one writer host per archive root.
+
+Under `pipeline_state/`:
+
+- `records/JOB-intent-HASH32.json` and `records/JOB-receipt-HASH32.json` are immutable,
+  content-named records; `HASH32` is the first 32 hexadecimal digits of the record's SHA-256
+  (Secure Hash Algorithm, 256-bit). Intents retain command/job, configuration hashes, evidence
+  digest, and update cutoff/seed binding. Receipts retain status, generations, coverage, request
+  receipts, copied-file/byte counts, catalog receipt, and pending state.
+- `records/JOB-catalog-DATASET16-STREAM16.json` records the catalog's `file_id`, `sha256`,
+  and `bytes`; the generation prefixes are 16 hexadecimal digits.
+- `JOB/bootstrap.toml` and `JOB/update.toml` hold effective core configurations.
+  `JOB/bootstrap.json` holds the bootstrap binding, generations, source identity, and catalog.
+- `JOB/progress.json` holds a pending intent name, effective configuration binding, and
+  `progress` with `baseline`, `start`, `cutoff`, and retained `pages`. Pages are retained
+  before this checkpoint advances; resumption decodes them and continues backward.
+- `JOB/transfers.json` maps object/manifest/catalog keys to `file_id`, optional secret
+  `session`, and `done`. Session status supplies the acknowledged upload offset on resume.
+- `downloads/` holds temporary `FILE_ID.catalog`, `GENERATION.manifest`, and
+  `SHA256HEX.partial` downloads.
+
+Mutable checkpoints use flushed atomic replacement. Completed records and store objects use
+create-once publication; different content at an existing key is a conflict.
+
+```text
+binary-alpha data pipeline bootstrap --config PIPELINE
+binary-alpha data pipeline update --config PIPELINE [--end END]
+binary-alpha data pipeline list --config PIPELINE --broker BROKER --symbol SYMBOL
+binary-alpha data pipeline restore --config PIPELINE --catalog FILE_ID --sha256 SHA256 --broker BROKER --symbol SYMBOL
+```
+
+Bootstrap stages only selected files, imports, audits, verifies dataset and stream, and archives
+without broker contact. Identical intake files are reused; conflicting files are not replaced.
+An already local intake can be used in place. For copied bar collections, a separate
+`NAME.intake.json` projection uses selected relative asset paths and retains the original
+collection manifest as provenance.
+
+Update requires the bootstrap binding; `END` is `YYYY-MM-DDTHH:MM:SS[.ffffff]Z`. Each job
+acquires a bounded extension, audits and verifies its result, and archives it independently.
+A pending acquisition keeps its original cutoff, baseline, start, and pages on rerun, even after
+a partial snapshot was archived. A conflicting `--end` or effective configuration fails with the
+pending intent identity. Page/time budgets are excluded from that configuration binding and may
+change for a resumed invocation. For a job with no pending acquisition, `--end` supplies the
+cutoff or, if omitted, the job samples the clock. Reaching the acquisition start or a terminal
+provider shortfall closes acquisition; it does not certify complete historical coverage.
+
+Producer output includes the existing import/fetch/audit lines and these pipeline lines:
+
+```text
+pipeline bootstrap JOB INSTRUMENT dataset G stream S rows N copied F files B bytes catalog FILE_ID sha256 HASH
+pipeline update JOB INSTRUMENT cutoff END status STATUS requested START END verified START END shortfall REASON dataset G stream S catalog FILE_ID sha256 HASH
+pipeline job JOB failed: REASON
+```
+
+Missing verified bounds are `none none`; missing shortfall, generations, or catalog fields are
+`none`. Update status is `pending` while acquisition remains open, `no_data` when closed
+without a catalog, `archived_with_gaps` when a catalog exists with a primary shortfall other than
+`unresolved_tail`, and `archived` otherwise. A tail alone can therefore be `archived`;
+read coverage and provenance to assess gaps. A pending or archived-with-gaps update line appears
+inside `pipeline job JOB failed: pipeline update ...`. Other jobs still run. Successful commands
+exit 0; operation failures exit 1 with a diagnostic on standard error, including
+`pipeline: N job(s) failed: JOB, ...` for per-job failures. `no_data` is a successful command
+outcome, not evidence of acquired data.
+
+### Archive catalog and transfer
+
+A catalog is pretty-printed JSON with a trailing newline and every field below:
+
+| Field | Meaning |
+| --- | --- |
+| `schema_version` | `1` |
+| `job` | producer job identifier |
+| `broker`, `provider_symbol`, `instrument` | dataset source identifiers |
+| `role` | dataset role, development or evaluation for this workflow |
+| `source_kind`, `native_granularity` | original dataset kind and native representation |
+| `coverage` | `first_event_time`, `last_event_time` from the dataset |
+| `row_count` | dataset rows |
+| `dataset`, `stream` | each has `generation`, `key`, `sha256`, `bytes`, `file_id` |
+| `objects` | unique dependencies, each with `key`, `sha256`, `bytes`, `file_id` |
+
+The manifest keys are `manifests/GENERATION/ready.json`; object keys are
+`objects/SHA256HEX`. Catalog coverage describes actual endpoints; detailed acquisition coverage
+remains in the dataset's provenance object. The remote catalog name is
+`catalog-DATASET16-STREAM16.json`, objects are named `object-SHA256HEX`, and manifests
+`manifest-GENERATION.json`. Names are not unique authority: retain the catalog file identifier
+and expected digest.
+
+The producer derives the closure from validated dataset/stream manifests and checks their source
+generation, instrument, and role linkage. It persists pre-generated Drive file identifiers before
+uploading. Resumable sessions are checkpointed before sending bytes; resumed sessions query status
+for their acknowledged offset. Expired sessions restart under the same file identifier; an
+ambiguous completion or status 409 reconciles that identifier. Transport/rate/server retries and
+session restarts are limited by `max_attempts`. Upload completion compares size and SHA-256,
+reading back and hashing when Drive supplies no checksum. Different content is never replaced.
+Objects upload before manifests, and the catalog uploads last after those transfers confirm.
+The local catalog receipt is then published.
+
+Reuse checks require an existing non-trashed remote file with matching size and, when supplied,
+matching checksum. Reusing a catalog receipt checks that catalog's remote metadata; it does not
+read back the whole archived closure. Drive is not provider-enforced immutable storage.
+Refresh/access tokens, response bodies that might echo them, and resumable session locations
+are not printed.
+
+### List and restore
+
+List follows archive-root catalog listing pages to completion, requires each catalog's remote size
+and checksum, downloads and validates the catalog documents, filters by broker/symbol, and sorts
+the resulting lines. It reads no market-data objects. The line is:
+
+```text
+catalog FILE_ID sha256 HASH INSTRUMENT ROLE NATIVE dataset G stream S coverage FIRST LAST rows N bytes B
+```
+
+`NATIVE` is `tick` or `5-second bar`; bytes sum unique catalog objects and both ready
+manifests, excluding the catalog itself.
+
+Restore pins one catalog file identifier and expected SHA-256, checks broker/symbol assertions,
+and uses that catalog's finite set of manifests and objects as its allowset. A supplied
+`governance_manifest` is loaded first; its declaration permits the dataset before its manifest
+read and checks the stream generation. Without a declaration, ordinary metadata classification
+still rejects holdout before child-object reads. The dataset manifest must describe the ordinary
+catalog generation, and the stream must derive from it with the same role. Every dependency must
+match a catalog object key, hash, and size before object downloads. A catalog pin cannot override
+a declaration's denial; supply any known study binding.
+
+Partial downloads resume by byte range and require the final byte count and SHA-256. A corrupt
+partial is discarded once and downloaded afresh. Identical completed local objects are reused;
+conflicts are not replaced. Objects install first, original manifests last, then the existing
+`data verify` owner verifies both dataset and stream. Producer paths are not needed and
+manifest bytes and generation identities do not change. The output supplies local uniform
+resource identifiers (URIs) for a new consumer configuration:
+
+```text
+restored INSTRUMENT ROLE dataset DATASET_URI stream STREAM_URI objects N installed I reused R
+```
+
 ## Broker access
 
 `crates/app/src/broker` owns synchronous market-data and options method groups over the shared
@@ -441,7 +718,7 @@ WebSocket transport. Engine records remain neutral; only app wire readers know p
 | Adapter | History | Live market data | Options execution contract |
 | --- | --- | --- | --- |
 | `deriv` | raw ticks | ticks, acknowledged cancellation | proposals, claimed purchases, account transactions, contract facts, portfolio and statement |
-| `pocket_option` | raw ticks | streams, cancellation sent without acknowledgement | unsupported |
+| `pocket_option` | raw ticks and native five-second bars | streams, cancellation sent without acknowledgement | unsupported |
 
 The Deriv public connection supplies discovery, tick history and subscriptions. Authenticated
 connections first GET `{bootstrap_endpoint}/accounts` with a resolved bearer credential and
@@ -466,6 +743,18 @@ resolved from the named environment variable. Fresh `successauth` and
 `successupdateBalance.isDemo` matching the declared class precede market commands; selected symbols
 must occur in the observed 19-element `updateAssets` rows. Incomplete attachments never become
 observations. The adapter does not log authentication, renew credentials or generate chart points.
+
+For candle history, Pocket Option sends `loadHistoryPeriod` with `asset`, incrementing
+`index`, a provider-clock `time` anchor, `offset = 200`, and `period = 5`. It accepts
+`loadHistoryPeriodFast` only with matching asset, index, and period. Row objects carry
+`symbol_id`, `time`, `open`, `high`, `low`, `close`, and `volume`; unknown row keys fail.
+Price text converts to exact integer units at the configured scale, and its persisted double
+must round-trip to those units. The configured provider offset is subtracted before checking a
+whole-second bar start on the five-second grid. Prices and volume must be finite, volume
+non-negative, price bounds consistent, and time strictly increasing. The symbol identifier must
+be constant within pages and across the retained lineage. These checks do not independently
+establish the operator's clock/source mapping. This research pipeline acquires no Pocket ticks
+and makes no tick subscription or order request.
 
 Live records retain provider event time, local receipt time, the same full source identity as fetch, connection
 generation, receipt sequence and payload SHA-256. Neither pinned provider has a durable tick
@@ -510,16 +799,19 @@ is requested again from the merged verified end. If a prefix and tail are both u
 records the tail; neither is skipped.
 
 The shared import publication owner retains and publishes immutable `broker_history` generations:
-raw response objects, `normalized/ticks.parquet`, and `provenance/coverage.json`. The coverage
-record's version 1 separates requested range, verified range, actual first/last times, row count,
+raw response objects, `normalized/ticks.parquet` (or `normalized/bars.parquet` for native bars),
+and `provenance/coverage.json`. The coverage record's version 1 separates requested range,
+verified range, actual first/last times, row count,
 page hashes/anchors and shortfalls. The `broker_history` dataset manifest stays at schema version 1
-with the versioned `provenance/coverage.json` object. The source kind requires tick capability and
-those objects. Only ready publication advances verified progress.
+with the versioned `provenance/coverage.json` object. The source kind requires the native capability
+and corresponding objects described under [Historical datasets](#historical-datasets).
+Only ready publication advances verified progress.
 Interrupted objects remain reusable; restarting repairs an unresolved prefix before extending the
 suffix. A refresh interval completes the initial range, then waits between sequential passes whose
 new end is sampled once. Unchanged content/coverage reuses the generation and ensures its objects
-and manifest exist at the current destination, without refetching a completed range. No scheduler
-or service is introduced.
+and manifest exist at the current destination, without refetching a completed range. Standalone
+fetch stays in the foreground; the research pipeline's optional weekly service is described in
+[operations](operations.md#data-pipeline).
 
 Each instrument reports
 `fetch ROLE INSTRUMENT generation G requested START END verified START END rows N pages P objects O reused R shortfall REASON [fetch S publish S]`,

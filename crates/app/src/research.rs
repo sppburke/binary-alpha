@@ -85,14 +85,17 @@ pub fn declaration(config: &Config) -> Result<Option<Declaration>, String> {
     let Some(research) = &config.research else {
         return Ok(None);
     };
-    let uri = &research.study.governance_manifest;
-    let (store, key) = open_object(uri)
-        .map_err(|reason| format!("research.study.governance_manifest: {reason}"))?;
+    load_declaration(&research.study.governance_manifest)
+        .map(Some)
+        .map_err(|reason| format!("research.study.governance_manifest: {reason}"))
+}
+
+/// The governance declaration at `uri`, read and validated before any other target is opened.
+pub fn load_declaration(uri: &str) -> Result<Declaration, String> {
+    let (store, key) = open_object(uri)?;
     let mut bytes = Vec::new();
     store.read_to(&key, None, &mut bytes)?;
-    Declaration::from_json(&bytes)
-        .map(Some)
-        .map_err(|reason| format!("research.study.governance_manifest: {uri}: {reason}"))
+    Declaration::from_json(&bytes).map_err(|reason| format!("{uri}: {reason}"))
 }
 
 /// One record published beneath a store by conditional creation and confirmed by exact

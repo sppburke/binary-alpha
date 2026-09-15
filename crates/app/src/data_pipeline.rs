@@ -1,0 +1,1593 @@
+//! `binary-alpha data pipeline`: the research market-data coordinator. It stages selected
+//! archives into an intake, imports and audits them through the existing owners into one
+//! managed local store, extends them by bounded native-history acquisition from explicitly
+//! bound seeds, archives each dataset and stream closure privately in Google Drive under an
+//! immutable catalog published last, and restores one exact catalog into a fresh store. Every
+//! mutable step is resumable from `pipeline_state/`; every completed record is immutable.
+
+use std::collections::BTreeMap;
+use std::fs::{self, File};
+use std::io::Write;
+use std::path::{Path, PathBuf};
+
+use binary_alpha_engine::config::{
+    Config, ConfigPath, ManifestUri, PublicationUri, RunMode, Seed, Source, relative_path,
+};
+use binary_alpha_engine::dataset::{
+    Coverage, DatasetRole, GenerationManifest, NativeGranularity, ObjectRecord, SourceKind,
+    manifest_key,
+};
+use binary_alpha_engine::market::{
+    format_event_time_micros as time_text, parse_event_time_micros as time,
+};
+use binary_alpha_engine::research::{Access, Declaration};
+use binary_alpha_engine::stream::StreamManifest;
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+
+use crate::audit;
+use crate::broker::{self, Clock, SystemClock};
+use crate::drive::{Drive, DriveSettings};
+use crate::fetch::{self, Bounds, PageReceipt, Progress, Requested};
+use crate::import;
+use crate::research;
+use crate::store::{self, ObjectIdentity, Store};
+use crate::verify;
+
+pub const PIPELINE_SCHEMA_VERSION: u32 = 1;
+pub const CATALOG_SCHEMA_VERSION: u32 = 1;
+const STORE_DIR: &str = "store";
+const RAW_SOURCES_DIR: &str = "raw_sources";
+const STATE_DIR: &str = "pipeline_state";
+const CATALOG_PREFIX: &str = "catalog-";
+
+// ----------------------------------------------------------------------------------------------
+// Configuration
+// ----------------------------------------------------------------------------------------------
+
+/// The application-owned pipeline document: one managed local root, one private archive, and
+/// the jobs whose core configurations name their sources and history.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PipelineConfig {
+    pub schema_version: u32,
+    /// The managed root holding `store/`, `raw_sources/`, and `pipeline_state/`; a relative
+    /// path resolves against this document's directory.
+    pub local_root: PathBuf,
+    /// An existing governance declaration every read applies; a standalone catalog never
+    /// overrides its denial.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub governance_manifest: Option<String>,
+    pub drive: DriveSettings,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub jobs: Vec<Job>,
+}
+
+/// One producer job: a core configuration declaring exactly one imported source and one
+/// matching history instrument, its intake beneath `raw_sources/`, and the non-secret
+/// evidence binding the imported archive to the configured broker context.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct Job {
+    pub id: String,
+    pub config: PathBuf,
+    pub intake_dir: PathBuf,
+    pub evidence: PathBuf,
+}
+
+impl PipelineConfig {
+    pub fn parse(text: &str) -> Result<Self, String> {
+        let config: Self = toml::from_str(text).map_err(|error| error.to_string())?;
+        config.validate()?;
+        Ok(config)
+    }
+
+    fn validate(&self) -> Result<(), String> {
+        if self.schema_version != PIPELINE_SCHEMA_VERSION {
+            return Err(format!(
+                "unsupported schema_version {}, expected {PIPELINE_SCHEMA_VERSION}",
+                self.schema_version
+            ));
+        }
+        if self.local_root.as_os_str().is_empty() {
+            return Err("local_root: expected a non-empty path".into());
+        }
+        self.drive
+            .validate()
+            .map_err(|reason| format!("drive.{reason}"))?;
+        for (index, job) in self.jobs.iter().enumerate() {
+            let field = |name: &str| format!("jobs[{index}].{name}");
+            if job.id.is_empty()
+                || !job
+                    .id
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
+            {
+                return Err(format!(
+                    "{}: must be letters, digits, `_`, or `-`",
+                    field("id")
+                ));
+            }
+            if self.jobs[..index]
+                .iter()
+                .any(|earlier| earlier.id == job.id)
+            {
+                return Err(format!("{}: {} is listed twice", field("id"), job.id));
+            }
+            for (name, path) in [
+                ("config", &job.config),
+                ("intake_dir", &job.intake_dir),
+                ("evidence", &job.evidence),
+            ] {
+                relative_path(&path.to_string_lossy())
+                    .map_err(|reason| format!("{}: {reason}", field(name)))?;
+            }
+            if !job.intake_dir.starts_with(RAW_SOURCES_DIR) {
+                return Err(format!(
+                    "{}: must lie beneath {RAW_SOURCES_DIR}/",
+                    field("intake_dir")
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// The resolved managed root and its fixed children.
+struct Layout {
+    base: PathBuf,
+    root: PathBuf,
+    store: PathBuf,
+    state: PathBuf,
+}
+
+impl Layout {
+    fn open(config_path: &Path, config: &PipelineConfig) -> Result<Self, String> {
+        let base = config_path.parent().unwrap_or(Path::new(".")).to_path_buf();
+        let root = absolute(&base.join(&config.local_root))?;
+        let store = root.join(STORE_DIR);
+        let state = root.join(STATE_DIR);
+        for dir in [&store, &state, &root.join(RAW_SOURCES_DIR)] {
+            fs::create_dir_all(dir)
+                .map_err(|error| format!("cannot create {}: {error}", dir.display()))?;
+        }
+        private(&state)?;
+        Ok(Self {
+            base,
+            root,
+            store,
+            state,
+        })
+    }
+
+    fn store(&self) -> Store {
+        Store::filesystem(&self.store)
+    }
+
+    /// Immutable intents, receipts, and catalog receipts live in their own record store.
+    fn records(&self) -> Store {
+        Store::filesystem(self.state.join("records"))
+    }
+
+    fn job_state(&self, job: &str) -> Result<PathBuf, String> {
+        let dir = self.state.join(job);
+        fs::create_dir_all(&dir)
+            .map_err(|error| format!("cannot create {}: {error}", dir.display()))?;
+        private(&dir)?;
+        Ok(dir)
+    }
+
+    fn manifest_uri(&self, generation: &str) -> String {
+        self.store().uri(&manifest_key(generation))
+    }
+}
+
+/// Creates the directory chain and canonicalizes the result.
+fn absolute(path: &Path) -> Result<PathBuf, String> {
+    fs::create_dir_all(path)
+        .map_err(|error| format!("cannot create {}: {error}", path.display()))?;
+    path.canonicalize()
+        .map_err(|error| format!("cannot resolve {}: {error}", path.display()))
+}
+
+fn private(dir: &Path) -> Result<(), String> {
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(dir, fs::Permissions::from_mode(0o700))
+        .map_err(|error| format!("cannot restrict {}: {error}", dir.display()))
+}
+
+/// Replaces a mutable checkpoint atomically: written and flushed beside its target, then
+/// renamed over it.
+fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    let temporary = path.with_extension("tmp");
+    let mut file = File::create(&temporary)
+        .map_err(|error| format!("cannot create {}: {error}", temporary.display()))?;
+    file.write_all(bytes)
+        .and_then(|()| file.sync_all())
+        .map_err(|error| format!("cannot write {}: {error}", temporary.display()))?;
+    fs::rename(&temporary, path)
+        .map_err(|error| format!("cannot replace {}: {error}", path.display()))
+}
+
+fn read_json<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<Option<T>, String> {
+    match fs::read(path) {
+        Ok(bytes) => serde_json::from_slice(&bytes)
+            .map(Some)
+            .map_err(|error| format!("{} is malformed: {error}", path.display())),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(format!("cannot read {}: {error}", path.display())),
+    }
+}
+
+fn json_bytes(value: &impl Serialize) -> Result<Vec<u8>, String> {
+    fetch::json_bytes(value)
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    binary_alpha_engine::hex(&Sha256::digest(bytes))
+}
+
+/// The one local writer of an archive root: producer commands hold this nonblocking lock for
+/// their whole run; consumer commands never take it.
+fn writer_lock(layout: &Layout) -> Result<File, String> {
+    let path = layout.state.join("writer.lock");
+    let file = File::create(&path)
+        .map_err(|error| format!("cannot create {}: {error}", path.display()))?;
+    match file.try_lock() {
+        Ok(()) => Ok(file),
+        Err(std::fs::TryLockError::WouldBlock) => Err(format!(
+            "pipeline: another producer holds {}",
+            path.display()
+        )),
+        Err(std::fs::TryLockError::Error(error)) => {
+            Err(format!("cannot lock {}: {error}", path.display()))
+        }
+    }
+}
+
+/// An immutable record beneath the record store, named by its own content hash; an identical
+/// record is reused and different content at the same name is a conflict.
+fn publish(records: &Store, prefix: &str, value: &impl Serialize) -> Result<String, String> {
+    let bytes = json_bytes(value)?;
+    let name = format!("{prefix}-{}.json", &sha256_hex(&bytes)[..32]);
+    research::publish_record(records, records, &name, &bytes)?;
+    Ok(name)
+}
+
+// ----------------------------------------------------------------------------------------------
+// Job binding and the effective configuration
+// ----------------------------------------------------------------------------------------------
+
+/// The facts a job's core configuration must state before anything runs.
+struct Bound {
+    core: Config,
+    /// The one history instrument the job extends.
+    symbol: String,
+    intake: PathBuf,
+    /// The intake is the declared source itself: nothing is copied and no manifest projected.
+    in_place: bool,
+    evidence_sha256: String,
+}
+
+fn bind(job: &Job, layout: &Layout) -> Result<Bound, String> {
+    let core = crate::load_config(&layout.base.join(&job.config))
+        .map_err(|reason| format!("job {}: {reason}", job.id))?;
+    let field = |reason: String| format!("job {}: {reason}", job.id);
+    if core.run_mode != RunMode::Research {
+        return Err(field("run_mode must be research".into()));
+    }
+    if core.research.is_some() {
+        return Err(field(
+            "a job core configuration declares no research study; supply governance_manifest"
+                .into(),
+        ));
+    }
+    let sources = core
+        .import
+        .as_ref()
+        .map(|import| import.sources.as_slice())
+        .unwrap_or_default();
+    let [source] = sources else {
+        return Err(field(
+            "import.sources must declare exactly one source".into(),
+        ));
+    };
+    let selected = match source {
+        Source::TickParquetDaily { instruments, .. } => instruments.len(),
+        Source::BarParquetCollection { instruments, .. } => {
+            instruments.as_ref().map_or(0, Vec::len)
+        }
+        Source::TickCsv { .. } => 1,
+    };
+    if selected != 1 {
+        return Err(field(
+            "the imported source must select exactly one instrument".into(),
+        ));
+    }
+    let history = core
+        .history
+        .as_ref()
+        .ok_or_else(|| field("history is required".into()))?;
+    let [symbol] = history.instruments.as_slice() else {
+        return Err(field(
+            "history.instruments must name exactly one instrument".into(),
+        ));
+    };
+    let symbol = symbol.to_string();
+    if history.role != source.role() || history.broker != *source.broker() {
+        return Err(field(
+            "history and the imported source must share one broker and role".into(),
+        ));
+    }
+    if history.refresh_interval_seconds.is_some() {
+        return Err(field(
+            "history.refresh_interval_seconds must be absent".into(),
+        ));
+    }
+    if history.overlap_seconds.is_none()
+        || history.max_pages.is_none()
+        || history.max_elapsed_seconds.is_none()
+    {
+        return Err(field(
+            "history.overlap_seconds, max_pages, and max_elapsed_seconds are required".into(),
+        ));
+    }
+    let settings = core
+        .brokers
+        .iter()
+        .find(|broker| broker.id() == &history.broker)
+        .ok_or_else(|| field("history.broker is not declared".into()))?;
+    let required = match settings.kind() {
+        broker::BrokerKind::Deriv => NativeGranularity::Tick,
+        broker::BrokerKind::PocketOption => NativeGranularity::Bar { period_seconds: 5 },
+    };
+    if history.native_granularity != required {
+        return Err(field(format!(
+            "history.native_granularity must be {required} for a {} broker",
+            settings.kind()
+        )));
+    }
+    let evidence = layout.base.join(&job.evidence);
+    let evidence_bytes = fs::read(&evidence).map_err(|error| {
+        field(format!(
+            "evidence {} is unreadable: {error}",
+            evidence.display()
+        ))
+    })?;
+    let intake = absolute(&layout.root.join(&job.intake_dir))?;
+    let source_root = layout
+        .base
+        .join(&job.config)
+        .parent()
+        .unwrap_or(Path::new("."))
+        .join(source.path())
+        .canonicalize()
+        .map_err(|error| field(format!("source {}: {error}", source.path().display())))?;
+    if source_root.starts_with(&layout.store) || intake.starts_with(&layout.store) {
+        return Err(field(
+            "the source and the intake must lie outside the managed store".into(),
+        ));
+    }
+    let in_place = source_root == intake;
+    let evidence_sha256 = sha256_hex(&evidence_bytes);
+    Ok(Bound {
+        core,
+        symbol,
+        in_place,
+        intake,
+        evidence_sha256,
+    })
+}
+
+/// What a pending intent binds: the effective configuration without its per-invocation page
+/// and time budgets, which every resumption may set afresh.
+fn binding_hash(config: &Config) -> String {
+    let mut binding = config.clone();
+    if let Some(history) = binding.history.as_mut() {
+        history.max_pages = None;
+        history.max_elapsed_seconds = None;
+    }
+    binding.content_hash()
+}
+
+/// The effective core configuration of a job: the managed store as both retained folder and
+/// publication root, the import source moved to its verified intake (with its projected manifest
+/// when one was staged), and, for an update, the seed binding and pinned cutoff.
+fn effective(
+    bound: &Bound,
+    layout: &Layout,
+    projection: Option<&str>,
+    cutoff: Option<i64>,
+    seeds: Vec<Seed>,
+) -> Result<Config, String> {
+    let mut config = bound.core.clone();
+    config.storage.historical_data_dir =
+        ConfigPath::try_from(layout.store.clone()).expect("an absolute store path");
+    config.storage.publication_uri = PublicationUri::Filesystem(layout.store.clone());
+    let source = &mut config
+        .import
+        .as_mut()
+        .expect("bound configuration imports one source")
+        .sources[0];
+    let intake = ConfigPath::try_from(bound.intake.clone()).expect("an absolute intake path");
+    match source {
+        Source::TickCsv { path, .. } | Source::TickParquetDaily { path, .. } => *path = intake,
+        Source::BarParquetCollection {
+            path,
+            manifest,
+            provenance,
+            ..
+        } => {
+            *path = intake;
+            if let Some(projection) = projection {
+                let original = std::mem::replace(manifest, PathBuf::from(projection));
+                provenance.get_or_insert_with(Vec::new).insert(0, original);
+            }
+        }
+    }
+    let history = config
+        .history
+        .as_mut()
+        .expect("bound configuration has history");
+    if let Some(cutoff) = cutoff {
+        history.end = time_text(cutoff);
+    }
+    history.seeds = seeds;
+    // The effective document is parsed again so every cross-field rule applies to it.
+    Config::parse(&config.canonical_toml())
+        .map_err(|error| format!("effective configuration: {error}"))
+}
+
+// ----------------------------------------------------------------------------------------------
+// Intake
+// ----------------------------------------------------------------------------------------------
+
+/// The result of staging one job's selected source files.
+struct Staged {
+    projection: Option<String>,
+    copied: usize,
+    bytes: u64,
+}
+
+/// Copies exactly the selected source files into the intake through the create-once store
+/// owner (identical existing files are reused, different ones stop the intake), writes the
+/// projected collection manifest beside the retained original, and removes only this
+/// pipeline's own scratch leftovers.
+fn stage(bound: &Bound, layout: &Layout, job: &Job) -> Result<Staged, String> {
+    if bound.in_place {
+        return Ok(Staged {
+            projection: None,
+            copied: 0,
+            bytes: 0,
+        });
+    }
+    for path in walk(&bound.intake)? {
+        if path
+            .file_name()
+            .is_some_and(|name| name.to_string_lossy().starts_with(".tmp-"))
+        {
+            fs::remove_file(&path)
+                .map_err(|error| format!("cannot remove {}: {error}", path.display()))?;
+        }
+    }
+    let source = &bound.core.import.as_ref().expect("bound").sources[0];
+    let base = layout
+        .base
+        .join(&job.config)
+        .parent()
+        .unwrap_or(Path::new("."))
+        .to_path_buf();
+    let plan = import::intake_plan(source, &base)?;
+    let intake = Store::filesystem(&bound.intake);
+    let mut copied = 0;
+    let mut bytes = 0;
+    for file in &plan.files {
+        let identity = store::identify(&file.source)?;
+        if let store::Put::Created(_) = intake.put_new(&file.relative, &file.source, &identity)? {
+            copied += 1;
+            bytes += identity.bytes;
+        }
+    }
+    let projection = match plan.projection {
+        Some((name, content)) => {
+            let scratch = layout.state.join(format!(".projection-{}", job.id));
+            fs::write(&scratch, &content)
+                .map_err(|error| format!("cannot write {}: {error}", scratch.display()))?;
+            let identity = store::identify(&scratch)?;
+            intake.put_new(&name, &scratch, &identity)?;
+            fs::remove_file(&scratch)
+                .map_err(|error| format!("cannot remove {}: {error}", scratch.display()))?;
+            Some(name)
+        }
+        None => None,
+    };
+    Ok(Staged {
+        projection,
+        copied,
+        bytes,
+    })
+}
+
+fn walk(root: &Path) -> Result<Vec<PathBuf>, String> {
+    let mut files = Vec::new();
+    let mut pending = vec![root.to_path_buf()];
+    while let Some(dir) = pending.pop() {
+        let entries = match fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(format!("cannot list {}: {error}", dir.display())),
+        };
+        for entry in entries {
+            let path = entry
+                .map_err(|error| format!("cannot list {}: {error}", dir.display()))?
+                .path();
+            if path.is_dir() {
+                pending.push(path);
+            } else {
+                files.push(path);
+            }
+        }
+    }
+    Ok(files)
+}
+
+// ----------------------------------------------------------------------------------------------
+// Records
+// ----------------------------------------------------------------------------------------------
+
+/// The immutable binding of one invocation before any external request.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct Intent {
+    schema_version: u32,
+    command: String,
+    job: String,
+    pipeline_config_hash: String,
+    base_config_hash: String,
+    effective_config_hash: String,
+    evidence_sha256: String,
+    archive_root: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    cutoff: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    seeds: Vec<Seed>,
+}
+
+/// What a completed bootstrap binds for every later update of the job.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct BootstrapReceipt {
+    intent: String,
+    dataset_generation: String,
+    stream_generation: String,
+    provider_symbol: String,
+    /// The configured broker's source identity at bootstrap: every update must present it.
+    source_identity: String,
+    effective_config_hash: String,
+    catalog: CatalogReceipt,
+}
+
+/// The pending acquisition of one job.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct Pending {
+    intent: String,
+    effective_config_hash: String,
+    progress: Progress,
+}
+
+/// One finished invocation of one job.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct Receipt {
+    schema_version: u32,
+    command: String,
+    job: String,
+    intent: String,
+    status: String,
+    dataset_generation: Option<String>,
+    stream_generation: Option<String>,
+    coverage: Option<fetch::HistoryCoverage>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    requests: Vec<PageReceipt>,
+    copied_files: usize,
+    copied_bytes: u64,
+    catalog: Option<CatalogReceipt>,
+    pending: bool,
+}
+
+/// The local record of one published catalog.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CatalogReceipt {
+    pub file_id: String,
+    pub sha256: String,
+    pub bytes: u64,
+}
+
+// ----------------------------------------------------------------------------------------------
+// Catalog and archive
+// ----------------------------------------------------------------------------------------------
+
+/// One archived ready manifest.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ManifestEntry {
+    pub generation: String,
+    pub key: String,
+    pub sha256: String,
+    pub bytes: u64,
+    pub file_id: String,
+}
+
+/// One archived object of the closure.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ObjectEntry {
+    pub key: String,
+    pub sha256: String,
+    pub bytes: u64,
+    pub file_id: String,
+}
+
+/// The immutable description of one dataset generation and its matching stream generation in
+/// the archive: derived from the two validated ready manifests, published only after every
+/// listed file was confirmed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Catalog {
+    pub schema_version: u32,
+    pub job: String,
+    pub broker: String,
+    pub provider_symbol: String,
+    pub instrument: String,
+    pub role: DatasetRole,
+    pub source_kind: SourceKind,
+    pub native_granularity: NativeGranularity,
+    pub coverage: Coverage,
+    pub row_count: u64,
+    pub dataset: ManifestEntry,
+    pub stream: ManifestEntry,
+    pub objects: Vec<ObjectEntry>,
+}
+
+impl Catalog {
+    pub fn from_json(bytes: &[u8]) -> Result<Self, String> {
+        let catalog: Self = serde_json::from_slice(bytes).map_err(|error| error.to_string())?;
+        if catalog.schema_version != CATALOG_SCHEMA_VERSION {
+            return Err(format!(
+                "unsupported catalog schema_version {}, expected {CATALOG_SCHEMA_VERSION}",
+                catalog.schema_version
+            ));
+        }
+        if catalog.dataset.key != manifest_key(&catalog.dataset.generation)
+            || catalog.stream.key != manifest_key(&catalog.stream.generation)
+        {
+            return Err("catalog manifest keys do not name their generations".into());
+        }
+        for (index, object) in catalog.objects.iter().enumerate() {
+            if object.key != binary_alpha_engine::dataset::object_key(&object.sha256)
+                || catalog.objects[..index]
+                    .iter()
+                    .any(|earlier| earlier.key == object.key)
+            {
+                return Err(format!(
+                    "catalog object `{}` is not content-addressed once",
+                    object.key
+                ));
+            }
+        }
+        Ok(catalog)
+    }
+}
+
+/// The durable transfer index of one job: every file identity pre-generated for a local
+/// object, its open session, and whether Drive confirmed it.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct Transfers {
+    files: BTreeMap<String, Transfer>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct Transfer {
+    file_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    session: Option<String>,
+    done: bool,
+}
+
+/// Archives one dataset generation and its stream generation from the managed store: every
+/// object once, then both manifests, then the catalog. A catalog receipt already recorded for
+/// the pair is reused after its remote file is confirmed.
+fn archive(
+    drive: &mut Drive,
+    layout: &Layout,
+    job: &str,
+    dataset: &str,
+    stream: &str,
+) -> Result<CatalogReceipt, String> {
+    let local = layout.store();
+    let records = layout.records();
+    let receipt_name = format!("{job}-catalog-{}-{}.json", &dataset[..16], &stream[..16]);
+    if records.head(&receipt_name)?.is_some() {
+        let mut bytes = Vec::new();
+        records.read_to(&receipt_name, None, &mut bytes)?;
+        let receipt: CatalogReceipt = serde_json::from_slice(&bytes)
+            .map_err(|error| format!("{}: {error}", records.uri(&receipt_name)))?;
+        confirm_remote(drive, &receipt.file_id, receipt.bytes, &receipt.sha256)?;
+        return Ok(receipt);
+    }
+    let (dataset_manifest, dataset_bytes) = read_manifest(&local, dataset)?;
+    let mut stream_bytes = Vec::new();
+    local.read_to(&manifest_key(stream), None, &mut stream_bytes)?;
+    let stream_manifest =
+        StreamManifest::from_json(&stream_bytes).map_err(|error| format!("{stream}: {error}"))?;
+    if stream_manifest.source_generation != dataset_manifest.generation
+        || stream_manifest.instrument != dataset_manifest.instrument
+        || stream_manifest.role != dataset_manifest.role
+        || dataset_manifest.role == DatasetRole::Holdout
+    {
+        return Err(format!(
+            "pipeline {job}: stream {stream} does not derive from ordinary dataset {dataset}"
+        ));
+    }
+    let state = layout.job_state(job)?;
+    let transfers_path = state.join("transfers.json");
+    let mut transfers: Transfers = read_json(&transfers_path)?.unwrap_or_default();
+    let mut closure: Vec<&ObjectRecord> = Vec::new();
+    for object in dataset_manifest
+        .objects
+        .iter()
+        .chain(stream_manifest.objects.iter())
+    {
+        if !closure.iter().any(|known| known.key == object.key) {
+            closure.push(object);
+        }
+    }
+    // Every file identity is fixed before any upload so ambiguity reconciles by identity.
+    let mut wanted: Vec<String> = closure
+        .iter()
+        .map(|object| object.key.clone())
+        .chain([
+            dataset_manifest.key(),
+            stream_manifest.key(),
+            format!("catalog/{dataset}/{stream}"),
+        ])
+        .filter(|key| !transfers.files.contains_key(key))
+        .collect();
+    if !wanted.is_empty() {
+        let ids = drive.generate_ids(wanted.len())?;
+        for (key, file_id) in wanted.drain(..).zip(ids) {
+            transfers.files.insert(
+                key,
+                Transfer {
+                    file_id,
+                    session: None,
+                    done: false,
+                },
+            );
+        }
+        write_atomic(&transfers_path, &json_bytes(&transfers)?)?;
+    }
+    let mut objects = Vec::with_capacity(closure.len());
+    for object in &closure {
+        let path = local
+            .local_path(&object.key)
+            .expect("the managed store is local");
+        let identity = store::identify(&path)?;
+        if identity.bytes != object.bytes || identity.sha256 != object.sha256 {
+            return Err(format!(
+                "pipeline {job}: {} does not carry its recorded identity",
+                local.uri(&object.key)
+            ));
+        }
+        let file_id = transfer(
+            drive,
+            &mut transfers,
+            &transfers_path,
+            &object.key,
+            &format!("object-{}", object.sha256),
+            &path,
+            &identity,
+        )?;
+        objects.push(ObjectEntry {
+            key: object.key.clone(),
+            sha256: object.sha256.clone(),
+            bytes: object.bytes,
+            file_id,
+        });
+    }
+    let mut manifests = Vec::with_capacity(2);
+    for (generation, key, bytes) in [
+        (dataset, dataset_manifest.key(), &dataset_bytes),
+        (stream, stream_manifest.key(), &stream_bytes),
+    ] {
+        let scratch = state.join(format!(".manifest-{generation}"));
+        fs::write(&scratch, bytes)
+            .map_err(|error| format!("cannot write {}: {error}", scratch.display()))?;
+        let identity = store::identify(&scratch)?;
+        let file_id = transfer(
+            drive,
+            &mut transfers,
+            &transfers_path,
+            &key,
+            &format!("manifest-{generation}.json"),
+            &scratch,
+            &identity,
+        )?;
+        fs::remove_file(&scratch)
+            .map_err(|error| format!("cannot remove {}: {error}", scratch.display()))?;
+        manifests.push(ManifestEntry {
+            generation: generation.to_string(),
+            key,
+            sha256: identity.sha256,
+            bytes: identity.bytes,
+            file_id,
+        });
+    }
+    let stream_entry = manifests.pop().expect("stream entry");
+    let dataset_entry = manifests.pop().expect("dataset entry");
+    let catalog = Catalog {
+        schema_version: CATALOG_SCHEMA_VERSION,
+        job: job.to_string(),
+        broker: dataset_manifest.broker.to_string(),
+        provider_symbol: dataset_manifest.provider_symbol.to_string(),
+        instrument: dataset_manifest.instrument.clone(),
+        role: dataset_manifest.role,
+        source_kind: dataset_manifest.source_kind,
+        native_granularity: dataset_manifest.native_granularity,
+        coverage: dataset_manifest.coverage.clone(),
+        row_count: dataset_manifest.row_count,
+        dataset: dataset_entry,
+        stream: stream_entry,
+        objects,
+    };
+    let bytes = json_bytes(&catalog)?;
+    let scratch = state.join(format!(".catalog-{}", &dataset[..16]));
+    fs::write(&scratch, &bytes)
+        .map_err(|error| format!("cannot write {}: {error}", scratch.display()))?;
+    let identity = store::identify(&scratch)?;
+    let file_id = transfer(
+        drive,
+        &mut transfers,
+        &transfers_path,
+        &format!("catalog/{dataset}/{stream}"),
+        &format!("{CATALOG_PREFIX}{}-{}.json", &dataset[..16], &stream[..16]),
+        &scratch,
+        &identity,
+    )?;
+    fs::remove_file(&scratch)
+        .map_err(|error| format!("cannot remove {}: {error}", scratch.display()))?;
+    let receipt = CatalogReceipt {
+        file_id,
+        sha256: identity.sha256,
+        bytes: identity.bytes,
+    };
+    research::publish_record(&records, &records, &receipt_name, &json_bytes(&receipt)?)?;
+    Ok(receipt)
+}
+
+/// Uploads one local file under its pre-generated identity unless the index already confirms
+/// it, persisting every session change before bytes flow.
+fn transfer(
+    drive: &mut Drive,
+    transfers: &mut Transfers,
+    transfers_path: &Path,
+    key: &str,
+    name: &str,
+    path: &Path,
+    identity: &ObjectIdentity,
+) -> Result<String, String> {
+    let entry = transfers
+        .files
+        .get(key)
+        .cloned()
+        .expect("every key has a pre-generated identity");
+    if entry.done {
+        confirm_remote(drive, &entry.file_id, identity.bytes, &identity.sha256)?;
+        return Ok(entry.file_id);
+    }
+    let file_id = entry.file_id.clone();
+    let mut checkpoint = |session: Option<&str>| -> Result<(), String> {
+        let entry = transfers.files.get_mut(key).expect("indexed");
+        entry.session = session.map(str::to_string);
+        write_atomic(transfers_path, &json_bytes(&*transfers)?)
+    };
+    drive.upload(
+        &file_id,
+        name,
+        path,
+        identity,
+        entry.session,
+        &mut checkpoint,
+    )?;
+    let entry = transfers.files.get_mut(key).expect("indexed");
+    entry.session = None;
+    entry.done = true;
+    write_atomic(transfers_path, &json_bytes(&*transfers)?)?;
+    Ok(file_id)
+}
+
+/// A remote file the index claims complete still carries exactly the local identity.
+fn confirm_remote(
+    drive: &mut Drive,
+    file_id: &str,
+    bytes: u64,
+    sha256: &str,
+) -> Result<(), String> {
+    let remote = drive
+        .metadata(file_id)?
+        .filter(|remote| !remote.trashed)
+        .ok_or_else(|| format!("drive: archived file {file_id} is missing or trashed"))?;
+    let remote_sha256 = remote.sha256.as_deref().map(str::to_ascii_lowercase);
+    if remote.size != Some(bytes) || remote_sha256.is_some_and(|remote| remote != sha256) {
+        return Err(format!(
+            "drive: archived file {file_id} no longer carries {bytes} bytes with SHA-256 {sha256}"
+        ));
+    }
+    Ok(())
+}
+
+fn read_manifest(local: &Store, generation: &str) -> Result<(GenerationManifest, Vec<u8>), String> {
+    let mut bytes = Vec::new();
+    local.read_to(&manifest_key(generation), None, &mut bytes)?;
+    let manifest =
+        GenerationManifest::from_json(&bytes).map_err(|error| format!("{generation}: {error}"))?;
+    Ok((manifest, bytes))
+}
+
+// ----------------------------------------------------------------------------------------------
+// Producer commands
+// ----------------------------------------------------------------------------------------------
+
+/// The declaration a pipeline applies to every read, when it names one.
+fn declaration(config: &PipelineConfig) -> Result<Option<Declaration>, String> {
+    config
+        .governance_manifest
+        .as_deref()
+        .map(research::load_declaration)
+        .transpose()
+        .map_err(|reason| format!("governance_manifest: {reason}"))
+}
+
+fn load(config_path: &Path) -> Result<(PipelineConfig, Layout, String), String> {
+    let text = fs::read_to_string(config_path)
+        .map_err(|error| format!("cannot read {}: {error}", config_path.display()))?;
+    let config = PipelineConfig::parse(&text)?;
+    let layout = Layout::open(config_path, &config)?;
+    let hash = sha256_hex(text.as_bytes());
+    Ok((config, layout, hash))
+}
+
+/// `data pipeline bootstrap`: stage, import, audit, verify, and archive every job without
+/// any broker contact.
+pub fn bootstrap(config_path: &Path, out: &mut dyn Write) -> Result<(), String> {
+    let (config, layout, hash) = load(config_path)?;
+    run_jobs(&config, &layout, out, |job, bound, drive, access, out| {
+        bootstrap_job(job, bound, &layout, &hash, drive, access, out)
+    })
+}
+
+/// `data pipeline update`: extend every bootstrapped job from its bound seed to one pinned
+/// cutoff within its budget, then audit, verify, and archive the result.
+pub fn update(config_path: &Path, end: Option<&str>, out: &mut dyn Write) -> Result<(), String> {
+    update_with(config_path, end, &mut SystemClock, out)
+}
+
+/// `update` under an explicit clock: the cutoff and the invocation deadline come from it.
+pub fn update_with(
+    config_path: &Path,
+    end: Option<&str>,
+    clock: &mut dyn Clock,
+    out: &mut dyn Write,
+) -> Result<(), String> {
+    let (config, layout, hash) = load(config_path)?;
+    let end = end.map(time).transpose()?;
+    run_jobs(&config, &layout, out, |job, bound, drive, access, out| {
+        update_job(job, bound, &layout, &hash, drive, access, end, clock, out)
+    })
+}
+
+/// Runs every job independently under the writer lock; one failed job never masks another
+/// and the command fails when any job did.
+fn run_jobs(
+    config: &PipelineConfig,
+    layout: &Layout,
+    out: &mut dyn Write,
+    mut run: impl FnMut(&Job, Bound, &mut Drive, Access<'_>, &mut dyn Write) -> Result<String, String>,
+) -> Result<(), String> {
+    if config.jobs.is_empty() {
+        return Err("pipeline: the configuration declares no jobs".into());
+    }
+    let _lock = writer_lock(layout)?;
+    let declaration = declaration(config)?;
+    let access = Access {
+        declaration: declaration.as_ref(),
+        certification: None,
+    };
+    let mut drive = Drive::open(&config.drive)?;
+    let mut failures = Vec::new();
+    for job in &config.jobs {
+        let result = bind(job, layout).and_then(|bound| run(job, bound, &mut drive, access, out));
+        match result {
+            Ok(line) => writeln!(out, "{line}")
+                .and_then(|()| out.flush())
+                .map_err(|error| format!("cannot write the report: {error}"))?,
+            Err(reason) => {
+                writeln!(out, "pipeline job {} failed: {reason}", job.id)
+                    .map_err(|error| format!("cannot write the report: {error}"))?;
+                failures.push(job.id.clone());
+            }
+        }
+    }
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "pipeline: {} job(s) failed: {}",
+            failures.len(),
+            failures.join(", ")
+        ))
+    }
+}
+
+fn bootstrap_job(
+    job: &Job,
+    bound: Bound,
+    layout: &Layout,
+    pipeline_hash: &str,
+    drive: &mut Drive,
+    access: Access<'_>,
+    out: &mut dyn Write,
+) -> Result<String, String> {
+    let staged = stage(&bound, layout, job)?;
+    let config = effective(
+        &bound,
+        layout,
+        staged.projection.as_deref(),
+        None,
+        Vec::new(),
+    )?;
+    let records = layout.records();
+    let intent = publish(
+        &records,
+        &format!("{}-intent", job.id),
+        &Intent {
+            schema_version: PIPELINE_SCHEMA_VERSION,
+            command: "bootstrap".into(),
+            job: job.id.clone(),
+            pipeline_config_hash: pipeline_hash.to_string(),
+            base_config_hash: bound.core.content_hash(),
+            effective_config_hash: config.content_hash(),
+            evidence_sha256: bound.evidence_sha256.clone(),
+            archive_root: drive_root(&config, layout),
+            cutoff: None,
+            seeds: Vec::new(),
+        },
+    )?;
+    let state = layout.job_state(&job.id)?;
+    write_atomic(
+        &state.join("bootstrap.toml"),
+        config.canonical_toml().as_bytes(),
+    )?;
+    let local = layout.store();
+    let published = import::publish_all(&config, &layout.root, out)?;
+    let [publication] = published.as_slice() else {
+        return Err(format!(
+            "job {}: the source published {} generations, expected one",
+            job.id,
+            published.len()
+        ));
+    };
+    let dataset = &publication.manifest;
+    if dataset.provider_symbol.as_str() != bound.symbol {
+        return Err(format!(
+            "job {}: the imported generation is {}, but history names {}",
+            job.id, dataset.instrument, bound.symbol
+        ));
+    }
+    let stream = finish(&config, layout, &local, &dataset.generation, access, out)?;
+    let catalog = archive(drive, layout, &job.id, &dataset.generation, &stream)?;
+    let settings = config
+        .brokers
+        .iter()
+        .find(|broker| broker.id() == &config.history.as_ref().expect("bound").broker)
+        .expect("bound broker");
+    let receipt = BootstrapReceipt {
+        intent: intent.clone(),
+        dataset_generation: dataset.generation.clone(),
+        stream_generation: stream.clone(),
+        provider_symbol: bound.symbol.clone(),
+        source_identity: broker::source_identity(settings),
+        effective_config_hash: config.content_hash(),
+        catalog: catalog.clone(),
+    };
+    write_atomic(&state.join("bootstrap.json"), &json_bytes(&receipt)?)?;
+    publish(
+        &records,
+        &format!("{}-receipt", job.id),
+        &Receipt {
+            schema_version: PIPELINE_SCHEMA_VERSION,
+            command: "bootstrap".into(),
+            job: job.id.clone(),
+            intent,
+            status: "archived".into(),
+            dataset_generation: Some(dataset.generation.clone()),
+            stream_generation: Some(stream.clone()),
+            coverage: None,
+            requests: Vec::new(),
+            copied_files: staged.copied,
+            copied_bytes: staged.bytes,
+            catalog: Some(catalog.clone()),
+            pending: false,
+        },
+    )?;
+    Ok(format!(
+        "pipeline bootstrap {} {} dataset {} stream {stream} rows {} copied {} files {} bytes catalog {} sha256 {}",
+        job.id,
+        dataset.instrument,
+        dataset.generation,
+        dataset.row_count,
+        staged.copied,
+        staged.bytes,
+        catalog.file_id,
+        catalog.sha256
+    ))
+}
+
+fn drive_root(config: &Config, layout: &Layout) -> String {
+    let _ = config;
+    layout.store.display().to_string()
+}
+
+/// Audits and verifies one dataset generation in the managed store, returning its stream
+/// generation.
+fn finish(
+    config: &Config,
+    layout: &Layout,
+    local: &Store,
+    dataset: &str,
+    access: Access<'_>,
+    out: &mut dyn Write,
+) -> Result<String, String> {
+    let uri = layout.manifest_uri(dataset);
+    let audited = audit::audit(config, &uri, local, local, access)?;
+    writeln!(out, "{}", audited.report)
+        .map_err(|error| format!("cannot write the report: {error}"))?;
+    verify::run_with(&uri, access)?;
+    verify::run_with(&layout.manifest_uri(&audited.generation), access)?;
+    Ok(audited.generation)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn update_job(
+    job: &Job,
+    bound: Bound,
+    layout: &Layout,
+    pipeline_hash: &str,
+    drive: &mut Drive,
+    access: Access<'_>,
+    end: Option<i64>,
+    clock: &mut dyn Clock,
+    out: &mut dyn Write,
+) -> Result<String, String> {
+    let state = layout.job_state(&job.id)?;
+    let bootstrap: BootstrapReceipt =
+        read_json(&state.join("bootstrap.json"))?.ok_or_else(|| {
+            format!(
+                "job {}: bootstrap first; no seed binding is recorded",
+                job.id
+            )
+        })?;
+    let pending_path = state.join("progress.json");
+    let pending: Option<Pending> = read_json(&pending_path)?;
+    let cutoff = match (&pending, end) {
+        (Some(pending), Some(end)) if time(&pending.progress.cutoff)? != end => {
+            return Err(format!(
+                "job {}: intent {} is pending at cutoff {}; the requested cutoff {} conflicts",
+                job.id,
+                pending.intent,
+                pending.progress.cutoff,
+                time_text(end)
+            ));
+        }
+        (Some(pending), _) => time(&pending.progress.cutoff)?,
+        (None, Some(end)) => end,
+        (None, None) => clock.now_micros(),
+    };
+    let staged = if bound.in_place {
+        None
+    } else {
+        Some(stage(&bound, layout, job)?)
+    };
+    let projection = staged.as_ref().and_then(|staged| staged.projection.clone());
+    let seed = Seed {
+        provider_symbol: bound
+            .symbol
+            .clone()
+            .try_into()
+            .expect("a bound symbol is a provider symbol"),
+        manifest: layout
+            .manifest_uri(&bootstrap.dataset_generation)
+            .parse::<ManifestUri>()?,
+        source_identity: bootstrap.source_identity.clone(),
+    };
+    let config = effective(
+        &bound,
+        layout,
+        projection.as_deref(),
+        Some(cutoff),
+        vec![seed.clone()],
+    )?;
+    let binding = binding_hash(&config);
+    if let Some(pending) = &pending
+        && pending.effective_config_hash != binding
+    {
+        return Err(format!(
+            "job {}: intent {} is pending under configuration {}; the current effective configuration {binding} conflicts",
+            job.id, pending.intent, pending.effective_config_hash
+        ));
+    }
+    let local = layout.store();
+    // Seed binding and source context are checked before any credential is resolved.
+    fetch::prepare(&config, &local, access.declaration)?;
+    let records = layout.records();
+    let intent = match &pending {
+        Some(pending) => pending.intent.clone(),
+        None => publish(
+            &records,
+            &format!("{}-intent", job.id),
+            &Intent {
+                schema_version: PIPELINE_SCHEMA_VERSION,
+                command: "update".into(),
+                job: job.id.clone(),
+                pipeline_config_hash: pipeline_hash.to_string(),
+                base_config_hash: bound.core.content_hash(),
+                effective_config_hash: config.content_hash(),
+                evidence_sha256: bound.evidence_sha256.clone(),
+                archive_root: drive_root(&config, layout),
+                cutoff: Some(time_text(cutoff)),
+                seeds: vec![seed],
+            },
+        )?,
+    };
+    write_atomic(
+        &state.join("update.toml"),
+        config.canonical_toml().as_bytes(),
+    )?;
+    let history = config.history.as_ref().expect("bound history");
+    let deadline = clock
+        .now_micros()
+        .saturating_add(i64::from(history.max_elapsed_seconds.expect("bound")) * 1_000_000);
+    let intent_name = intent.clone();
+    let mut persist = |progress: &Progress| -> Result<(), String> {
+        write_atomic(
+            &pending_path,
+            &json_bytes(&Pending {
+                intent: intent_name.clone(),
+                effective_config_hash: binding.clone(),
+                progress: progress.clone(),
+            })?,
+        )
+    };
+    let mut adapter = broker::connect(&config)?;
+    let outcomes = {
+        let mut bounds = Bounds {
+            max_pages: history.max_pages,
+            deadline_micros: Some(deadline),
+            clock: &*clock,
+            declaration: access.declaration,
+            resume: pending.map(|pending| pending.progress),
+            persist: Some(&mut persist),
+        };
+        fetch::acquire(
+            &config,
+            adapter.market(),
+            &local,
+            &local,
+            Requested::Advance { cutoff },
+            &mut bounds,
+            out,
+        )?
+    };
+    let [outcome] = outcomes.as_slice() else {
+        return Err(format!("job {}: expected one acquisition outcome", job.id));
+    };
+    if !outcome.pending {
+        // The intent closed: reaching its start or a terminal provider shortfall.
+        match fs::remove_file(&pending_path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(format!("cannot remove {}: {error}", pending_path.display())),
+        }
+    }
+    let (stream, catalog) = match &outcome.generation {
+        Some(dataset) => {
+            let stream = finish(&config, layout, &local, dataset, access, out)?;
+            let catalog = archive(drive, layout, &job.id, dataset, &stream)?;
+            (Some(stream), Some(catalog))
+        }
+        None => (None, None),
+    };
+    // A provider tail before the cutoff is ordinary; a shortfall on the start side of the
+    // acquisition leaves a gap the archive must report.
+    let gaps = outcome
+        .coverage
+        .shortfall
+        .as_ref()
+        .is_some_and(|shortfall| shortfall.reason != fetch::TAIL_SHORTFALL);
+    let status = match (outcome.pending, gaps, &catalog) {
+        (true, _, _) => "pending",
+        (false, _, None) => "no_data",
+        (false, true, Some(_)) => "archived_with_gaps",
+        (false, false, Some(_)) => "archived",
+    };
+    publish(
+        &records,
+        &format!("{}-receipt", job.id),
+        &Receipt {
+            schema_version: PIPELINE_SCHEMA_VERSION,
+            command: "update".into(),
+            job: job.id.clone(),
+            intent: intent.clone(),
+            status: status.into(),
+            dataset_generation: outcome.generation.clone(),
+            stream_generation: stream.clone(),
+            coverage: Some(outcome.coverage.clone()),
+            requests: outcome.receipts.clone(),
+            copied_files: staged.as_ref().map_or(0, |staged| staged.copied),
+            copied_bytes: staged.as_ref().map_or(0, |staged| staged.bytes),
+            catalog: catalog.clone(),
+            pending: outcome.pending,
+        },
+    )?;
+    let line = format!(
+        "pipeline update {} {} cutoff {} status {status} requested {} {} verified {} shortfall {} dataset {} stream {} catalog {} sha256 {}",
+        job.id,
+        outcome.instrument,
+        time_text(cutoff),
+        outcome.coverage.requested.start,
+        outcome.coverage.requested.end,
+        outcome
+            .coverage
+            .verified
+            .as_ref()
+            .map_or("none none".to_string(), |range| format!(
+                "{} {}",
+                range.start, range.end
+            )),
+        outcome
+            .coverage
+            .shortfall
+            .as_ref()
+            .map_or("none", |shortfall| shortfall.reason.as_str()),
+        outcome.generation.as_deref().unwrap_or("none"),
+        stream.as_deref().unwrap_or("none"),
+        catalog
+            .as_ref()
+            .map_or("none", |catalog| catalog.file_id.as_str()),
+        catalog
+            .as_ref()
+            .map_or("none", |catalog| catalog.sha256.as_str()),
+    );
+    if status == "archived" || status == "no_data" && !outcome.pending {
+        Ok(line)
+    } else {
+        // A pending acquisition or remaining gaps are reported, never passed silently.
+        Err(line)
+    }
+}
+
+// ----------------------------------------------------------------------------------------------
+// Consumer commands
+// ----------------------------------------------------------------------------------------------
+
+/// `data pipeline list`: every catalog of one instrument in the archive root, read from the
+/// catalog files alone.
+pub fn list(
+    config_path: &Path,
+    broker: &str,
+    symbol: &str,
+    out: &mut dyn Write,
+) -> Result<(), String> {
+    let (config, layout, _) = load(config_path)?;
+    let mut drive = Drive::open(&config.drive)?;
+    let scratch = layout.state.join("downloads");
+    let mut lines = Vec::new();
+    for file in drive.list(CATALOG_PREFIX)? {
+        let (Some(size), Some(sha256)) = (file.size, file.sha256.as_deref()) else {
+            return Err(format!(
+                "drive: catalog {} reports no size or checksum",
+                file.id
+            ));
+        };
+        let partial = scratch.join(format!("{}.catalog", file.id));
+        drive.download(
+            &file.id,
+            &partial,
+            &ObjectIdentity {
+                bytes: size,
+                sha256: sha256.to_ascii_lowercase(),
+                crc32c: 0,
+            },
+        )?;
+        let bytes = fs::read(&partial).map_err(|error| error.to_string())?;
+        fs::remove_file(&partial).map_err(|error| error.to_string())?;
+        let catalog =
+            Catalog::from_json(&bytes).map_err(|error| format!("{}: {error}", file.id))?;
+        if catalog.broker != broker || catalog.provider_symbol != symbol {
+            continue;
+        }
+        let transfer: u64 = catalog
+            .objects
+            .iter()
+            .map(|object| object.bytes)
+            .sum::<u64>()
+            + catalog.dataset.bytes
+            + catalog.stream.bytes;
+        lines.push(format!(
+            "catalog {} sha256 {} {} {} {} dataset {} stream {} coverage {} {} rows {} bytes {transfer}",
+            file.id,
+            sha256.to_ascii_lowercase(),
+            catalog.instrument,
+            catalog.role,
+            catalog.native_granularity,
+            catalog.dataset.generation,
+            catalog.stream.generation,
+            catalog.coverage.first_event_time,
+            catalog.coverage.last_event_time,
+            catalog.row_count
+        ));
+    }
+    lines.sort();
+    for line in lines {
+        writeln!(out, "{line}").map_err(|error| format!("cannot write the report: {error}"))?;
+    }
+    Ok(())
+}
+
+/// `data pipeline restore`: install exactly one catalog's dataset and stream closure into this
+/// configuration's managed store, verify both, and print their local ready-manifest locations.
+pub fn restore(
+    config_path: &Path,
+    catalog_id: &str,
+    sha256: &str,
+    broker: &str,
+    symbol: &str,
+    out: &mut dyn Write,
+) -> Result<(), String> {
+    let (config, layout, _) = load(config_path)?;
+    let declaration = declaration(&config)?;
+    let access = Access {
+        declaration: declaration.as_ref(),
+        certification: None,
+    };
+    let mut drive = Drive::open(&config.drive)?;
+    let downloads = layout.state.join("downloads");
+    let expected = sha256.to_ascii_lowercase();
+    let remote = drive
+        .metadata(catalog_id)?
+        .filter(|remote| !remote.trashed)
+        .ok_or_else(|| format!("drive: catalog {catalog_id} is missing or trashed"))?;
+    let size = remote
+        .size
+        .ok_or_else(|| format!("drive: catalog {catalog_id} reports no size"))?;
+    let partial = downloads.join(format!("{catalog_id}.catalog"));
+    drive.download(
+        catalog_id,
+        &partial,
+        &ObjectIdentity {
+            bytes: size,
+            sha256: expected.clone(),
+            crc32c: 0,
+        },
+    )?;
+    let bytes = fs::read(&partial).map_err(|error| error.to_string())?;
+    fs::remove_file(&partial).map_err(|error| error.to_string())?;
+    let catalog =
+        Catalog::from_json(&bytes).map_err(|error| format!("catalog {catalog_id}: {error}"))?;
+    if catalog.broker != broker || catalog.provider_symbol != symbol {
+        return Err(format!(
+            "catalog {catalog_id} describes {}, not {broker}:{symbol}",
+            catalog.instrument
+        ));
+    }
+    // The pinned catalog is the finite allowset: a declared target is permitted before its
+    // manifest is read, and nothing outside the closure is ever fetched.
+    access.permit(None, &catalog.dataset.generation)?;
+    access.lookup(&catalog.stream.generation)?;
+    let local = layout.store();
+    let fetch_entry = |drive: &mut Drive, entry: &ManifestEntry| -> Result<Vec<u8>, String> {
+        let partial = downloads.join(format!("{}.manifest", entry.generation));
+        drive.download(
+            &entry.file_id,
+            &partial,
+            &ObjectIdentity {
+                bytes: entry.bytes,
+                sha256: entry.sha256.clone(),
+                crc32c: 0,
+            },
+        )?;
+        let bytes = fs::read(&partial).map_err(|error| error.to_string())?;
+        fs::remove_file(&partial).map_err(|error| error.to_string())?;
+        Ok(bytes)
+    };
+    let dataset_bytes = fetch_entry(&mut drive, &catalog.dataset)?;
+    let dataset = GenerationManifest::from_json(&dataset_bytes)
+        .map_err(|error| format!("catalog {catalog_id} dataset manifest: {error}"))?;
+    if dataset.key() != catalog.dataset.key
+        || dataset.instrument != catalog.instrument
+        || dataset.role != catalog.role
+        || dataset.role == DatasetRole::Holdout
+    {
+        return Err(format!(
+            "catalog {catalog_id}: the dataset manifest does not describe ordinary generation {}",
+            catalog.dataset.generation
+        ));
+    }
+    access.permit(Some(dataset.role), &dataset.generation)?;
+    let stream_bytes = fetch_entry(&mut drive, &catalog.stream)?;
+    let stream = StreamManifest::from_json(&stream_bytes)
+        .map_err(|error| format!("catalog {catalog_id} stream manifest: {error}"))?;
+    if stream.key() != catalog.stream.key
+        || stream.source_generation != dataset.generation
+        || stream.role != dataset.role
+    {
+        return Err(format!(
+            "catalog {catalog_id}: the stream manifest does not derive from dataset {}",
+            dataset.generation
+        ));
+    }
+    let allowed = |object: &ObjectRecord| {
+        catalog.objects.iter().any(|entry| {
+            entry.key == object.key && entry.sha256 == object.sha256 && entry.bytes == object.bytes
+        })
+    };
+    for object in dataset.objects.iter().chain(stream.objects.iter()) {
+        if !allowed(object) {
+            return Err(format!(
+                "catalog {catalog_id}: object {} lies outside the pinned catalog closure",
+                object.key
+            ));
+        }
+    }
+    let mut installed = 0;
+    let mut reused = 0;
+    for entry in &catalog.objects {
+        let identity = ObjectIdentity {
+            bytes: entry.bytes,
+            sha256: entry.sha256.clone(),
+            crc32c: 0,
+        };
+        if local.head(&entry.key)?.is_some() {
+            let path = local.local_path(&entry.key).expect("local store");
+            let existing = store::identify(&path)?;
+            if existing.bytes != entry.bytes || existing.sha256 != entry.sha256 {
+                return Err(format!(
+                    "{} already holds different content; nothing was replaced",
+                    local.uri(&entry.key)
+                ));
+            }
+            reused += 1;
+            continue;
+        }
+        let partial = downloads.join(format!("{}.partial", entry.sha256));
+        drive.download(&entry.file_id, &partial, &identity)?;
+        let identity = store::identify(&partial)?;
+        local.put_new(&entry.key, &partial, &identity)?;
+        fs::remove_file(&partial).map_err(|error| error.to_string())?;
+        installed += 1;
+    }
+    // Manifests last, through the same create-once owner.
+    for (key, bytes) in [
+        (dataset.key(), &dataset_bytes),
+        (stream.key(), &stream_bytes),
+    ] {
+        research::publish_record(&local, &local, &key, bytes)?;
+    }
+    let dataset_uri = layout.manifest_uri(&dataset.generation);
+    let stream_uri = layout.manifest_uri(&stream.generation);
+    verify::run_with(&dataset_uri, access)?;
+    verify::run_with(&stream_uri, access)?;
+    writeln!(
+        out,
+        "restored {} {} dataset {dataset_uri} stream {stream_uri} objects {} installed {installed} reused {reused}",
+        dataset.instrument,
+        dataset.role,
+        catalog.objects.len()
+    )
+    .map_err(|error| format!("cannot write the report: {error}"))
+}

@@ -7,8 +7,8 @@ use binary_alpha_app::broker::pocket_option::{PocketMarketData, provider_token, 
 use binary_alpha_app::broker::transport::{Connector, Frame, WebSocketConnector};
 use binary_alpha_app::broker::wire::WireDecimal;
 use binary_alpha_app::broker::{
-    Adapter, Cancellation, Clock, Continuity, HistoryPage, LiveEvent, MarketDataBroker, RateBudget,
-    RateGroup,
+    Adapter, Cancellation, Clock, Continuity, HistoryPage, HistoryRows, LiveEvent,
+    MarketDataBroker, RateBudget, RateGroup,
 };
 use binary_alpha_app::store::Store;
 use binary_alpha_app::{broker, fetch, verify};
@@ -282,10 +282,23 @@ fn deriv_market_correlation_precision_duplicates_cancellation_and_reconnect() {
             .all(|contract| contract.barriers.decimal().unwrap() == Decimal::parse("1").unwrap())
     );
     let page = broker
-        .history_page(&id("deriv", "R_50"), scale(4), None)
+        .history_page(
+            &id("deriv", "R_50"),
+            scale(4),
+            None,
+            NativeGranularity::Tick,
+        )
         .unwrap();
-    assert_eq!(page.rows.len(), 100);
-    assert_eq!(page.rows[0].price_units, 920242);
+    let (_, rows) = broker
+        .decode_history(
+            &id("deriv", "R_50"),
+            &page.raw,
+            scale(4),
+            NativeGranularity::Tick,
+        )
+        .unwrap();
+    assert_eq!(rows.len(), 100);
+    assert_eq!(rows.ticks().unwrap()[0].price_units, 920242);
     broker.subscribe(&id("deriv", "R_50"), scale(4)).unwrap();
     broker.subscribe(&id("deriv", "R_100"), scale(2)).unwrap();
     let first = observation(broker.next_live(100).unwrap());
@@ -349,9 +362,21 @@ fn deriv_rejects_malformed_missing_fields_wrong_types_and_wrong_request_ids() {
         let (connector, _) = connector(vec![vec![Frame::Text(body)]], &clock);
         let mut broker =
             DerivMarketData::connect(&deriv_settings(), connector, Box::new(clock)).unwrap();
+        // Envelope faults fail the request; body faults fail the decode of the matched page.
         assert!(
             broker
-                .history_page(&id("deriv", "R_50"), scale(4), None)
+                .history_page(
+                    &id("deriv", "R_50"),
+                    scale(4),
+                    None,
+                    NativeGranularity::Tick
+                )
+                .and_then(|page| broker.decode_history(
+                    &id("deriv", "R_50"),
+                    &page.raw,
+                    scale(4),
+                    NativeGranularity::Tick
+                ))
                 .unwrap_err()
                 .contains(expected),
             "{expected}"
@@ -363,7 +388,12 @@ fn deriv_rejects_malformed_missing_fields_wrong_types_and_wrong_request_ids() {
         DerivMarketData::connect(&deriv_settings(), connector, Box::new(clock)).unwrap();
     assert!(
         broker
-            .history_page(&id("deriv", "R_50"), scale(4), None)
+            .history_page(
+                &id("deriv", "R_50"),
+                scale(4),
+                None,
+                NativeGranularity::Tick
+            )
             .unwrap_err()
             .contains("req_id mismatch")
     );
@@ -431,27 +461,49 @@ fn pocket_retained_paging_live_cancellation_and_heartbeats() {
     let (mut broker, sent) = pocket(frames);
     assert_eq!(broker.discover().unwrap().len(), 2);
     let instrument = id("pocket_option", "EURUSD_otc");
-    let initial = broker.history_page(&instrument, scale(5), None).unwrap();
-    assert_eq!(initial.rows.len(), 1478);
-    assert_eq!(initial.rows[0].event_time_micros, 1_789_347_292_749_000);
+    let decode = |broker: &PocketMarketData, page: &HistoryPage| {
+        broker
+            .decode_history(&instrument, &page.raw, scale(5), NativeGranularity::Tick)
+            .unwrap()
+            .1
+    };
+    let initial = broker
+        .history_page(&instrument, scale(5), None, NativeGranularity::Tick)
+        .unwrap();
+    let initial_rows = decode(&broker, &initial);
+    assert_eq!(initial_rows.len(), 1478);
+    assert_eq!(
+        initial_rows.ticks().unwrap()[0].event_time_micros,
+        1_789_347_292_749_000
+    );
     let older = broker
         .history_page(
             &instrument,
             scale(5),
-            initial.rows.first().map(|row| row.event_time_micros),
+            initial_rows.first_time_micros(),
+            NativeGranularity::Tick,
         )
         .unwrap();
-    assert_eq!(older.rows.len(), 413);
+    let older_rows = decode(&broker, &older);
+    assert_eq!(older_rows.len(), 413);
     assert_eq!(older.anchor_token.as_deref(), Some("1789354492.749"));
     let oldest = broker
         .history_page(
             &instrument,
             scale(5),
-            older.rows.first().map(|row| row.event_time_micros),
+            older_rows.first_time_micros(),
+            NativeGranularity::Tick,
         )
         .unwrap();
-    assert_eq!(oldest.rows.len(), 409);
-    let rows = fetch::prepend_page(oldest.rows, fetch::prepend_page(older.rows, initial.rows));
+    let oldest_rows = decode(&broker, &oldest);
+    assert_eq!(oldest_rows.len(), 409);
+    let rows = fetch::prepend_page(
+        oldest_rows.into_ticks().unwrap(),
+        fetch::prepend_page(
+            older_rows.into_ticks().unwrap(),
+            initial_rows.into_ticks().unwrap(),
+        ),
+    );
     assert_eq!(rows.len(), 2297);
     assert!(
         rows.windows(2)
@@ -603,6 +655,11 @@ fn test_config(scratch: &Scratch, kind: &str, endpoint: &str, two: bool) -> Conf
         start: time_text(0),
         end: time_text(10_000_000),
         refresh_interval_seconds: None,
+        native_granularity: NativeGranularity::Tick,
+        seeds: Vec::new(),
+        overlap_seconds: None,
+        max_pages: None,
+        max_elapsed_seconds: None,
     });
     config.inspect = Some(binary_alpha_engine::config::Inspect {
         live_observations: 2,
@@ -902,9 +959,30 @@ impl MarketDataBroker for Pages {
         _: &InstrumentId,
         _: PriceScale,
         before: Option<i64>,
+        _: NativeGranularity,
     ) -> Result<HistoryPage, String> {
         self.anchors.push(before);
         self.pages.pop_front().ok_or("unexpected page request")?
+    }
+    fn decode_history(
+        &self,
+        _: &InstrumentId,
+        raw: &[u8],
+        _: PriceScale,
+        _: NativeGranularity,
+    ) -> Result<(Option<i32>, HistoryRows), String> {
+        let rows: Vec<(i64, i64)> = serde_json::from_slice(raw).map_err(|e| e.to_string())?;
+        Ok((
+            None,
+            HistoryRows::Ticks(
+                rows.iter()
+                    .map(|&(t, p)| Tick {
+                        event_time_micros: t,
+                        price_units: p,
+                    })
+                    .collect(),
+            ),
+        ))
     }
     fn subscribe(&mut self, _: &InstrumentId, _: PriceScale) -> Result<(), String> {
         Err("unused subscribe".into())
@@ -922,23 +1000,36 @@ impl MarketDataBroker for Pages {
         &self.continuity
     }
 }
+/// A synthetic page of `(seconds, units)` rows; the fake adapter decodes it back exactly.
 fn page(rows: &[(i64, i64)]) -> HistoryPage {
-    // Synthetic deterministic provider rows, with integer prices already normalized by the fake adapter.
-    let raw = serde_json::to_vec(&rows).unwrap();
-    HistoryPage {
-        raw,
-        anchor_token: None,
-        rows: rows
+    page_micros(
+        &rows
             .iter()
-            .map(|&(t, p)| Tick {
-                event_time_micros: t * 1_000_000,
-                price_units: p,
-            })
-            .collect(),
+            .map(|&(t, p)| (t * 1_000_000, p))
+            .collect::<Vec<_>>(),
+    )
+}
+/// A synthetic page of `(microseconds, units)` rows.
+fn page_micros(rows: &[(i64, i64)]) -> HistoryPage {
+    HistoryPage {
+        raw: serde_json::to_vec(&rows).unwrap(),
+        anchor_token: None,
+        receipt_micros: 0,
     }
 }
+fn rows_of(rows: &[(i64, i64)]) -> Vec<Tick> {
+    rows.iter()
+        .map(|&(t, p)| Tick {
+            event_time_micros: t * 1_000_000,
+            price_units: p,
+        })
+        .collect()
+}
+fn range_rows(start: i64, end: i64) -> Vec<(i64, i64)> {
+    (start..end).map(|i| (i, 100_000 + i)).collect()
+}
 fn range_page(start: i64, end: i64) -> HistoryPage {
-    page(&(start..end).map(|i| (i, 100_000 + i)).collect::<Vec<_>>())
+    page(&range_rows(start, end))
 }
 fn stores(scratch: &Scratch) -> (Store, Store) {
     (
@@ -2060,7 +2151,7 @@ fn prefix_repair_preserves_verified_rows_and_repeats() {
             let manifest = manifests.last().unwrap();
             assert_eq!(manifest.row_count, 5);
             let rows = common::read_normalized_ticks(&scratch.path("published"), manifest);
-            assert_eq!(rows, page(&repair).rows);
+            assert_eq!(rows, rows_of(&repair));
             assert!(
                 verify::run(&destination.uri(&manifest.key()))
                     .unwrap()
@@ -2164,11 +2255,9 @@ fn reused_history_is_published_to_the_current_destination() {
         let destination =
             Store::filesystem(scratch.path(if permitted { "permitted" } else { "undeclared" }));
         config.storage.publication_uri = destination.uri("").parse().unwrap();
-        let refreshed = page(
-            &(0..10)
-                .map(|second| (second, 200_000 + second))
-                .collect::<Vec<_>>(),
-        );
+        let refreshed_rows: Vec<(i64, i64)> =
+            (0..10).map(|second| (second, 200_000 + second)).collect();
+        let refreshed = page(&refreshed_rows);
         let mut pages = Pages::new(if permitted {
             vec![]
         } else {
@@ -2237,7 +2326,7 @@ fn reused_history_is_published_to_the_current_destination() {
             assert_ne!(fresh.generation, manifest.generation);
             assert_eq!(
                 common::read_normalized_ticks(&destination.local_path("").unwrap(), &fresh),
-                refreshed.rows
+                rows_of(&refreshed_rows)
             );
             assert!(
                 verify::run(&destination.uri(&fresh.key()))
@@ -2312,7 +2401,7 @@ fn pocket_period_pins_and_retained_anchor_text_are_exact() {
         frames.extend(attachment(event, fixture(file)));
         let (mut broker, _) = pocket(frames);
         let error = broker
-            .history_page(&pocket_ids()[0], scale(5), anchor)
+            .history_page(&pocket_ids()[0], scale(5), anchor, NativeGranularity::Tick)
             .unwrap_err();
         assert!(
             error.contains(event) && error.contains("period 60"),
@@ -2612,8 +2701,7 @@ fn received_upper_boundary_caps_coverage_without_publishing_out_of_range_rows() 
         let scratch = Scratch::new(&format!("phase10_received_upper_bound_{last}"));
         let config = test_config(&scratch, "deriv", "ws://127.0.0.1/", false);
         let (local, destination) = stores(&scratch);
-        let mut input = page(&[(0, 1), (4, 1), (10, 1)]);
-        input.rows.last_mut().unwrap().event_time_micros = last;
+        let input = page_micros(&[(0, 1), (4_000_000, 1), (last, 1)]);
         let mut pages = Pages::new(vec![input]);
         fetch::pass(
             &config,
@@ -2762,7 +2850,7 @@ fn prefix_repair_preserves_verified_end_and_restart_rejects_changed_prefix() {
     assert_eq!(repaired.rows, 8);
     assert_eq!(
         common::read_normalized_ticks(&scratch.path("published"), &manifests[1]),
-        range_page(0, 8).rows
+        rows_of(&range_rows(0, 8))
     );
     assert_eq!(
         repaired.shortfall,
@@ -2813,6 +2901,6 @@ fn prefix_repair_preserves_verified_end_and_restart_rejects_changed_prefix() {
     assert!(complete.shortfall.is_none());
     assert_eq!(
         common::read_normalized_ticks(&scratch.path("published"), &manifests[2]),
-        range_page(0, 10).rows
+        rows_of(&range_rows(0, 10))
     );
 }

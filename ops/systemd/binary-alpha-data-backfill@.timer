@@ -1,0 +1,12 @@
+[Unit]
+Description=Saturday 06:00 America/Chicago market-data backfill for %i
+
+[Timer]
+OnCalendar=Sat *-*-* 06:00:00 America/Chicago
+# One catch-up activation after downtime; the application receipt, not this timer, proves completion.
+Persistent=true
+AccuracySec=1s
+Unit=binary-alpha-data-backfill@%i.service
+
+[Install]
+WantedBy=timers.target

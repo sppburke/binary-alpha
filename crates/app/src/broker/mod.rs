@@ -9,11 +9,12 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use binary_alpha_engine::config::{AccountClass, Broker, Config, RateBudgets, RateLimit};
 pub use binary_alpha_engine::config::{BrokerKind, Capabilities};
+use binary_alpha_engine::dataset::NativeGranularity;
 use binary_alpha_engine::execution::{
     BrokerLiability, CashFact, ContractSemantics, Decimal, Direction, EventSource, Settlement,
     TerminalFact,
 };
-use binary_alpha_engine::market::{BrokerId, Currency, InstrumentId, PriceScale, Tick};
+use binary_alpha_engine::market::{Bar, BrokerId, Currency, InstrumentId, PriceScale, Tick};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
@@ -67,12 +68,58 @@ pub enum LiveEvent {
     Break { generation: u64, reason: String },
 }
 
-/// One raw provider page and its directly normalized rows in provider order.
+/// The rows one history page decodes to, at the granularity the request named.
+#[derive(Debug, Clone, PartialEq)]
+pub enum HistoryRows {
+    Ticks(Vec<Tick>),
+    Bars(Vec<Bar>),
+}
+impl HistoryRows {
+    pub fn len(&self) -> usize {
+        match self {
+            Self::Ticks(rows) => rows.len(),
+            Self::Bars(rows) => rows.len(),
+        }
+    }
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+    /// The tick rows of a tick page.
+    pub fn ticks(&self) -> Option<&[Tick]> {
+        match self {
+            Self::Ticks(rows) => Some(rows),
+            Self::Bars(_) => None,
+        }
+    }
+    pub fn into_ticks(self) -> Option<Vec<Tick>> {
+        match self {
+            Self::Ticks(rows) => Some(rows),
+            Self::Bars(_) => None,
+        }
+    }
+    /// The provider event time of the first row: the tick time or the bar start.
+    pub fn first_time_micros(&self) -> Option<i64> {
+        match self {
+            Self::Ticks(rows) => rows.first().map(|row| row.event_time_micros),
+            Self::Bars(rows) => rows.first().map(|row| row.start_unix_s * 1_000_000),
+        }
+    }
+    pub fn last_time_micros(&self) -> Option<i64> {
+        match self {
+            Self::Ticks(rows) => rows.last().map(|row| row.event_time_micros),
+            Self::Bars(rows) => rows.last().map(|row| row.start_unix_s * 1_000_000),
+        }
+    }
+}
+
+/// One raw provider page whose envelope matched the request, with its local receipt; the
+/// caller retains the bytes before `decode_history` can reject their rows.
 #[derive(Debug, Clone)]
 pub struct HistoryPage {
     pub raw: Vec<u8>,
     pub anchor_token: Option<String>,
-    pub rows: Vec<Tick>,
+    /// Local receipt time of the response on the adapter's clock.
+    pub receipt_micros: i64,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Cancellation {
@@ -132,12 +179,25 @@ impl Continuity {
 
 pub trait MarketDataBroker: Send {
     fn discover(&mut self) -> Result<Vec<DiscoveredInstrument>, String>;
+    /// One bounded page of native history ending before `before_micros` (the latest page when
+    /// absent) at the requested granularity, returned once its envelope matches the request; an
+    /// adapter refuses a granularity it cannot serve before it sends anything.
     fn history_page(
         &mut self,
         instrument: &InstrumentId,
         scale: PriceScale,
         before_micros: Option<i64>,
+        granularity: NativeGranularity,
     ) -> Result<HistoryPage, String>;
+    /// Decodes and validates the rows of a page's bytes, returning the provider's numeric
+    /// instrument identifier when its rows carry one; pure, so retained pages replay exactly.
+    fn decode_history(
+        &self,
+        instrument: &InstrumentId,
+        raw: &[u8],
+        scale: PriceScale,
+        granularity: NativeGranularity,
+    ) -> Result<(Option<i32>, HistoryRows), String>;
     fn subscribe(&mut self, instrument: &InstrumentId, scale: PriceScale) -> Result<(), String>;
     fn next_live(&mut self, timeout_micros: i64) -> Result<Option<LiveEvent>, String>;
     fn unsubscribe(&mut self, instrument: &InstrumentId) -> Result<Cancellation, String>;

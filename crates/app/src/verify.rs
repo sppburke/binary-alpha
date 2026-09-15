@@ -345,9 +345,10 @@ fn reconstruct(
             SourceKind::TickCsv | SourceKind::TickParquetDaily | SourceKind::BrokerHistory,
             PriceRepresentation::IntegerUnits { scale },
         ) => archive::read_ticks(path, scale)?,
-        (SourceKind::BarParquet, PriceRepresentation::BinaryFloat64) => {
-            archive::validate_bar_file(path, &bar_expectation(manifest)?)?.data
-        }
+        (
+            SourceKind::BarParquet | SourceKind::BrokerHistory,
+            PriceRepresentation::BinaryFloat64,
+        ) => archive::validate_bar_file(path, &bar_expectation(manifest)?)?.data,
         _ => {
             return Err(
                 "manifest combines a source kind, price representation, and granularity this checkout cannot decode"

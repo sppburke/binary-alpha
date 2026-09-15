@@ -312,24 +312,29 @@ pub fn observe(
         let definition = config
             .instrument(instrument, NativeGranularity::Tick)
             .ok_or("inspect: instrument is not declared")?;
-        report.check(
-            "history",
-            Some(instrument.to_string()),
-            adapter
-                .market()
-                .history_page(instrument, definition.price_scale, None)
-                .map(|page| InspectionDetail::History {
-                    rows: page.rows.len(),
-                    first: page
-                        .rows
-                        .first()
-                        .map(|row| format_event_time_micros(row.event_time_micros)),
-                    last: page
-                        .rows
-                        .last()
-                        .map(|row| format_event_time_micros(row.event_time_micros)),
-                }),
-        );
+        report.check("history", Some(instrument.to_string()), {
+            let market = adapter.market();
+            market
+                .history_page(
+                    instrument,
+                    definition.price_scale,
+                    None,
+                    NativeGranularity::Tick,
+                )
+                .and_then(|page| {
+                    market.decode_history(
+                        instrument,
+                        &page.raw,
+                        definition.price_scale,
+                        NativeGranularity::Tick,
+                    )
+                })
+                .map(|(_, rows)| InspectionDetail::History {
+                    rows: rows.len(),
+                    first: rows.first_time_micros().map(format_event_time_micros),
+                    last: rows.last_time_micros().map(format_event_time_micros),
+                })
+        });
     }
     let mut subscribed = Vec::new();
     for instrument in &instruments {

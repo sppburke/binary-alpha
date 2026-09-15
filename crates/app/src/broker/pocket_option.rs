@@ -2,12 +2,15 @@ use super::socket_io::{self, Packet};
 use super::transport::{Connector, Frame, Transport};
 use super::wire::WireDecimal;
 use super::{
-    Cancellation, Clock, Continuity, DiscoveredInstrument, HistoryPage, LiveEvent, LiveObservation,
-    MarketDataBroker, payload_hash,
+    Cancellation, Clock, Continuity, DiscoveredInstrument, HistoryPage, HistoryRows, LiveEvent,
+    LiveObservation, MarketDataBroker, payload_hash,
 };
 use binary_alpha_engine::config::{AccountClass, PocketSettings};
+use binary_alpha_engine::dataset::NativeGranularity;
 use binary_alpha_engine::execution::Decimal;
-use binary_alpha_engine::market::{InstrumentId, PriceScale, Tick};
+use binary_alpha_engine::market::{
+    Bar, BarSequence, InstrumentId, PriceScale, Tick, float_price_units,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::value::RawValue;
 use std::collections::{BTreeMap, VecDeque};
@@ -41,17 +44,15 @@ struct BalanceClass {
     #[serde(rename = "isDemo")]
     is_demo: u8,
 }
+/// The row bodies decoded from retained pages; their envelopes were matched on receipt.
 #[derive(Deserialize)]
 struct InitialHistory {
     asset: String,
-    period: WireDecimal,
     history: Vec<[WireDecimal; 2]>,
 }
 #[derive(Deserialize)]
 struct OlderHistory {
     asset: String,
-    index: u64,
-    period: WireDecimal,
     data: Vec<PageRow>,
 }
 #[derive(Deserialize)]
@@ -60,6 +61,39 @@ struct PageRow {
     time: WireDecimal,
     price: WireDecimal,
 }
+/// The envelopes checked before a page is retained; rows are decoded afterwards.
+#[derive(Deserialize)]
+struct InitialEnvelope {
+    asset: String,
+    period: WireDecimal,
+}
+#[derive(Deserialize)]
+struct OlderEnvelope {
+    asset: String,
+    index: u64,
+    period: WireDecimal,
+}
+/// The observed `loadHistoryPeriodFast` candle page: the same envelope as older tick history
+/// with one row object per provider bar.
+#[derive(Deserialize)]
+struct CandleHistory {
+    asset: String,
+    period: WireDecimal,
+    data: Vec<CandleRow>,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CandleRow {
+    symbol_id: i32,
+    time: WireDecimal,
+    open: WireDecimal,
+    close: WireDecimal,
+    high: WireDecimal,
+    low: WireDecimal,
+    volume: WireDecimal,
+}
+/// The only provider bar period this checkout admits, in seconds.
+const BAR_PERIOD_S: u16 = 5;
 #[derive(Serialize)]
 struct Change<'a> {
     asset: &'a str,
@@ -358,85 +392,8 @@ impl PocketMarketData {
     pub fn received_counts(&self) -> &BTreeMap<String, u64> {
         &self.received_counts
     }
-}
-impl MarketDataBroker for PocketMarketData {
-    fn discover(&mut self) -> Result<Vec<DiscoveredInstrument>, String> {
-        Ok(self.discovered.clone())
-    }
-    fn history_page(
-        &mut self,
-        instrument: &InstrumentId,
-        scale: PriceScale,
-        before_micros: Option<i64>,
-    ) -> Result<HistoryPage, String> {
-        self.check_instrument(instrument)?;
-        let (event, raw_rows, anchor_token) = match before_micros {
-            None => {
-                self.send(
-                    "changeSymbol",
-                    &Change {
-                        asset: instrument.provider_symbol.as_str(),
-                        period: 1,
-                    },
-                )?;
-                let event = self.wait_event("updateHistoryNewFast")?;
-                let response: InitialHistory = serde_json::from_slice(&event.raw)
-                    .map_err(|_| "pocket_option: malformed initial history or row shape")?;
-                if response.asset != instrument.provider_symbol.as_str() {
-                    return Err("pocket_option: initial history asset mismatch".into());
-                }
-                let period = response.period.require_number()?;
-                if period.compare(Decimal::parse("1")?)? != std::cmp::Ordering::Equal {
-                    return Err(format!(
-                        "pocket_option updateHistoryNewFast: unsupported period {period}"
-                    ));
-                }
-                (
-                    event,
-                    response
-                        .history
-                        .into_iter()
-                        .map(|[time, price]| PageRow { time, price })
-                        .collect::<Vec<_>>(),
-                    None,
-                )
-            }
-            Some(before) => {
-                let time = provider_token(before, self.settings.server_offset_minutes)?;
-                let anchor_token = Some(time.token()?.into_owned());
-                let index = self.next_index;
-                self.next_index = index
-                    .checked_add(1)
-                    .ok_or("pocket_option: history index overflow")?;
-                self.send(
-                    "loadHistoryPeriod",
-                    &OlderRequest {
-                        asset: instrument.provider_symbol.as_str(),
-                        index,
-                        time,
-                        offset: 200,
-                        period: 1,
-                    },
-                )?;
-                let event = self.wait_event("loadHistoryPeriod")?;
-                let response: OlderHistory = serde_json::from_slice(&event.raw)
-                    .map_err(|_| "pocket_option: malformed older history or row shape")?;
-                if response.asset != instrument.provider_symbol.as_str() || response.index != index
-                {
-                    return Err("pocket_option: history asset or index mismatch".into());
-                }
-                // Request period 1 produced response period 0 in both retained older pages.
-                let period = response.period.require_number()?;
-                if !period.is_zero() {
-                    return Err(format!(
-                        "pocket_option loadHistoryPeriod: unsupported period {period}"
-                    ));
-                }
-                (event, response.data, anchor_token)
-            }
-        };
-        let rows = raw_rows
-            .iter()
+    fn tick_rows(&self, rows: &[PageRow], scale: PriceScale) -> Result<Vec<Tick>, String> {
+        rows.iter()
             .map(|row| {
                 row.price.require_number()?;
                 Ok(Tick {
@@ -447,12 +404,217 @@ impl MarketDataBroker for PocketMarketData {
                     price_units: row.price.price_units(scale)?,
                 })
             })
-            .collect::<Result<Vec<_>, String>>()?;
+            .collect()
+    }
+    /// Decodes one candle page: the asset must match, the period must be the admitted five
+    /// seconds, every row must carry one constant provider
+    /// identifier, whole-second grid-aligned starts and finite consistent prices, and every
+    /// price must convert exactly to units at `scale` both as decimal text and as the archive's
+    /// binary floating point.
+    fn decode_candles(
+        &self,
+        instrument: &InstrumentId,
+        raw: &[u8],
+        scale: PriceScale,
+    ) -> Result<(i32, Vec<Bar>), String> {
+        let response: CandleHistory = serde_json::from_slice(raw)
+            .map_err(|_| "pocket_option: malformed candle history or row shape")?;
+        if response.asset != instrument.provider_symbol.as_str() {
+            return Err("pocket_option: candle history asset mismatch".into());
+        }
+        let period = response.period.require_number()?;
+        if period.compare(Decimal::parse(&BAR_PERIOD_S.to_string())?)? != std::cmp::Ordering::Equal
+        {
+            return Err(format!(
+                "pocket_option loadHistoryPeriodFast: unsupported period {period}"
+            ));
+        }
+        let exact = |token: &WireDecimal| -> Result<f64, String> {
+            let units = token.price_units(scale)?;
+            let value: f64 = token
+                .token()?
+                .parse()
+                .map_err(|_| "pocket_option: candle price is not a number".to_string())?;
+            if float_price_units(value, scale)? != units {
+                return Err(format!(
+                    "pocket_option: candle price {} does not round-trip at price scale {}",
+                    token.token()?,
+                    scale.digits()
+                ));
+            }
+            Ok(value)
+        };
+        let mut symbol_id = None;
+        let mut sequence = BarSequence::default();
+        let mut bars = Vec::with_capacity(response.data.len());
+        for row in &response.data {
+            match symbol_id {
+                Some(id) if id != row.symbol_id => {
+                    return Err(
+                        "pocket_option: candle rows carry different symbol identifiers".into(),
+                    );
+                }
+                Some(_) => {}
+                None => symbol_id = Some(row.symbol_id),
+            }
+            let start_micros = universal_micros(&row.time, self.settings.server_offset_minutes)?;
+            if start_micros % 1_000_000 != 0 {
+                return Err("pocket_option: candle start is not a whole second".into());
+            }
+            let bar = Bar {
+                start_unix_s: start_micros / 1_000_000,
+                open: exact(&row.open)?,
+                high: exact(&row.high)?,
+                low: exact(&row.low)?,
+                close: exact(&row.close)?,
+                volume: row
+                    .volume
+                    .token()?
+                    .parse()
+                    .map_err(|_| "pocket_option: candle volume is not a number".to_string())?,
+                period_s: BAR_PERIOD_S,
+            };
+            bar.validate(BAR_PERIOD_S)
+                .map_err(|reason| format!("pocket_option: {reason}"))?;
+            sequence
+                .accept(bar.start_unix_s)
+                .map_err(|reason| format!("pocket_option: {reason}"))?;
+            bars.push(bar);
+        }
+        let symbol_id = symbol_id.ok_or("pocket_option: candle history page holds no rows")?;
+        Ok((symbol_id, bars))
+    }
+}
+impl MarketDataBroker for PocketMarketData {
+    fn discover(&mut self) -> Result<Vec<DiscoveredInstrument>, String> {
+        Ok(self.discovered.clone())
+    }
+    fn history_page(
+        &mut self,
+        instrument: &InstrumentId,
+        _: PriceScale,
+        before_micros: Option<i64>,
+        granularity: NativeGranularity,
+    ) -> Result<HistoryPage, String> {
+        self.check_instrument(instrument)?;
+        let symbol = instrument.provider_symbol.as_str();
+        let period = match granularity {
+            NativeGranularity::Tick => 1,
+            NativeGranularity::Bar {
+                period_seconds: BAR_PERIOD_S,
+            } => BAR_PERIOD_S as u8,
+            NativeGranularity::Bar { .. } => {
+                return Err(format!(
+                    "pocket_option: {granularity} history is not supported; only ticks and {BAR_PERIOD_S}-second bars are"
+                ));
+            }
+        };
+        let Some(before) = before_micros else {
+            // The anchor-free page exists only for ticks; the evidenced candle family is the
+            // indexed older-history request answered as `loadHistoryPeriodFast`.
+            if period != 1 {
+                return Err("pocket_option: bar history requires an anchor".into());
+            }
+            self.send(
+                "changeSymbol",
+                &Change {
+                    asset: symbol,
+                    period: 1,
+                },
+            )?;
+            let event = self.wait_event("updateHistoryNewFast")?;
+            let envelope: InitialEnvelope = serde_json::from_slice(&event.raw)
+                .map_err(|_| "pocket_option: malformed initial history")?;
+            if envelope.asset != symbol {
+                return Err("pocket_option: initial history asset mismatch".into());
+            }
+            let period = envelope.period.require_number()?;
+            if period.compare(Decimal::parse("1")?)? != std::cmp::Ordering::Equal {
+                return Err(format!(
+                    "pocket_option updateHistoryNewFast: unsupported period {period}"
+                ));
+            }
+            return Ok(HistoryPage {
+                raw: event.raw,
+                anchor_token: None,
+                receipt_micros: event.receipt_micros,
+            });
+        };
+        let time = provider_token(before, self.settings.server_offset_minutes)?;
+        let anchor_token = Some(time.token()?.into_owned());
+        let index = self.next_index;
+        self.next_index = index
+            .checked_add(1)
+            .ok_or("pocket_option: history index overflow")?;
+        self.send(
+            "loadHistoryPeriod",
+            &OlderRequest {
+                asset: symbol,
+                index,
+                time,
+                offset: 200,
+                period,
+            },
+        )?;
+        let (event_name, expected_period) = if period == 1 {
+            // Request period 1 produced response period 0 in both retained older pages.
+            ("loadHistoryPeriod", 0)
+        } else {
+            ("loadHistoryPeriodFast", i64::from(period))
+        };
+        let event = self.wait_event(event_name)?;
+        let envelope: OlderEnvelope = serde_json::from_slice(&event.raw)
+            .map_err(|_| format!("pocket_option: malformed {event_name} history"))?;
+        if envelope.asset != symbol || envelope.index != index {
+            return Err("pocket_option: history asset or index mismatch".into());
+        }
+        let response_period = envelope.period.require_number()?;
+        if response_period.compare(Decimal::parse(&expected_period.to_string())?)?
+            != std::cmp::Ordering::Equal
+        {
+            return Err(format!(
+                "pocket_option {event_name}: unsupported period {response_period}"
+            ));
+        }
         Ok(HistoryPage {
             raw: event.raw,
             anchor_token,
-            rows,
+            receipt_micros: event.receipt_micros,
         })
+    }
+    fn decode_history(
+        &self,
+        instrument: &InstrumentId,
+        raw: &[u8],
+        scale: PriceScale,
+        granularity: NativeGranularity,
+    ) -> Result<(Option<i32>, HistoryRows), String> {
+        if granularity != NativeGranularity::Tick {
+            let (symbol_id, rows) = self.decode_candles(instrument, raw, scale)?;
+            return Ok((Some(symbol_id), HistoryRows::Bars(rows)));
+        }
+        // A retained tick page is the older shape when it carries `data`, else the initial one.
+        let rows = match serde_json::from_slice::<OlderHistory>(raw) {
+            Ok(response) => {
+                if response.asset != instrument.provider_symbol.as_str() {
+                    return Err("pocket_option: history asset mismatch".into());
+                }
+                response.data
+            }
+            Err(_) => {
+                let response: InitialHistory = serde_json::from_slice(raw)
+                    .map_err(|_| "pocket_option: malformed retained history page")?;
+                if response.asset != instrument.provider_symbol.as_str() {
+                    return Err("pocket_option: history asset mismatch".into());
+                }
+                response
+                    .history
+                    .into_iter()
+                    .map(|[time, price]| PageRow { time, price })
+                    .collect()
+            }
+        };
+        Ok((None, HistoryRows::Ticks(self.tick_rows(&rows, scale)?)))
     }
     fn subscribe(&mut self, instrument: &InstrumentId, scale: PriceScale) -> Result<(), String> {
         self.check_instrument(instrument)?;

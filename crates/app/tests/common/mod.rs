@@ -275,6 +275,90 @@ pub fn write_collection(root: &Path, assets: &[AssetSpec]) -> PathBuf {
     manifest
 }
 
+/// The exact schema of one daily tick archive file.
+pub const DAILY_SCHEMA: &str = "message schema {
+  OPTIONAL INT64 datetime_utc (TIMESTAMP(NANOS,true));
+  OPTIONAL DOUBLE price;
+}
+";
+
+/// Writes one Snappy daily archive file of `(nanoseconds, price)` rows; `null_row` leaves both
+/// cells of that row null.
+pub fn write_daily_file(path: &Path, rows: &[(i64, f64)], null_row: Option<usize>) {
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let schema = Arc::new(parse_message_type(DAILY_SCHEMA).unwrap());
+    let properties = Arc::new(
+        WriterProperties::builder()
+            .set_compression(Compression::SNAPPY)
+            .build(),
+    );
+    let mut writer =
+        SerializedFileWriter::new(File::create(path).unwrap(), schema, properties).unwrap();
+    let mut group = writer.next_row_group().unwrap();
+    let present: Vec<&(i64, f64)> = rows
+        .iter()
+        .enumerate()
+        .filter(|(row, _)| Some(*row) != null_row)
+        .map(|(_, cells)| cells)
+        .collect();
+    let levels: Vec<i16> = (0..rows.len())
+        .map(|row| i16::from(Some(row) != null_row))
+        .collect();
+    let times: Vec<i64> = present.iter().map(|(nanos, _)| *nanos).collect();
+    let prices: Vec<f64> = present.iter().map(|(_, price)| *price).collect();
+    let mut column = group.next_column().unwrap().unwrap();
+    if let ColumnWriter::Int64ColumnWriter(typed) = column.untyped() {
+        typed.write_batch(&times, Some(&levels), None).unwrap();
+    }
+    column.close().unwrap();
+    let mut column = group.next_column().unwrap().unwrap();
+    if let ColumnWriter::DoubleColumnWriter(typed) = column.untyped() {
+        typed.write_batch(&prices, Some(&levels), None).unwrap();
+    }
+    column.close().unwrap();
+    group.close().unwrap();
+    writer.close().unwrap();
+}
+
+/// The metadata document of one archive day, with every field the observed archive records.
+pub fn daily_metadata(symbol: &str, date: &str, ticks: u64) -> String {
+    json!({
+        "symbol": symbol,
+        "date": date,
+        "calendar": "UTC",
+        "ticks": ticks,
+        "windows_requested": 96,
+        "windows_skipped_closed": 0,
+        "gaps": [],
+        "clipped_by_retention": false,
+        "clipped_by_now": false,
+        "market_closed": false,
+        "complete": true,
+        "written_at": "2026-08-10T07:18:42.882488+00:00"
+    })
+    .to_string()
+}
+
+/// Writes one listed directory: a metadata file per day and a Parquet file for each day with
+/// rows.
+pub fn write_daily_directory(dir: &Path, name: &str, symbol: &str, days: &[(&str, &[(i64, f64)])]) {
+    fs::create_dir_all(dir).unwrap();
+    for (date, rows) in days {
+        fs::write(
+            dir.join(format!("{name}_{date}_ticks.meta.json")),
+            daily_metadata(symbol, date, rows.len() as u64),
+        )
+        .unwrap();
+        if !rows.is_empty() {
+            write_daily_file(
+                &dir.join(format!("{name}_{date}_ticks.parquet")),
+                rows,
+                None,
+            );
+        }
+    }
+}
+
 pub fn write_ticks(path: &Path, rows: &[&str]) {
     fs::create_dir_all(path.parent().unwrap()).unwrap();
     let mut text = String::from("time_utc,symbol,price\n");

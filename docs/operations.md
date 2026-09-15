@@ -23,6 +23,14 @@ state. Broker `credential` fields name process environment variables. Deriv reso
 Pocket Option resolves the complete opaque JSON authentication object. Keep values out of
 configuration, logs and evidence. Credential renewal is an operator action.
 
+For Google Drive, `drive.credential` names a process environment variable holding user OAuth
+(Open Authorization) refresh credentials as a JavaScript Object Notation (JSON) object with string
+`client_id`, `client_secret`, and `refresh_token` fields. Only the variable name enters the
+pipeline configuration. Refresh tokens, access tokens, and resumable session locations are never
+printed. Keep the service's values in the private
+`/etc/binary-alpha/data-pipeline/<instance>.env` environment file; do not copy it into evidence.
+The session checkpoint is also private state, not a report.
+
 ## Artifact ownership
 
 Google Cloud Storage owns immutable bulk data and artifacts. Supabase owns only a proved
@@ -30,13 +38,17 @@ transactional control or metadata need and stores references, never duplicate bu
 truth. Writes and operator procedures are resumable, so a second agent can continue from the last
 checkpoint. A completed evidence identity is never overwritten.
 
+The research pipeline may archive ordinary development/evaluation market datasets and their
+stream outputs privately in Google Drive under immutable catalogs and publish them locally.
+Google Cloud Storage retains every production, certification, and holdout authority.
+
 ## Historical data
 
 `storage.historical_data_dir` names the retained local copy shared by `data import` and `data fetch`; `storage.publication_uri` names the durable destination (see
 [docs/contracts.md](contracts.md), section "Historical datasets"). The Google client resolves
 Application Default Credentials from the process environment; the configuration carries only the
-bucket and prefix. A `file://` destination is the non-live test boundary, accepted only under
-`run_mode = "research"`, and is never production truth.
+bucket and prefix. A `file://` destination is accepted only under `run_mode = "research"` for
+non-live tests and the research data pipeline, and is never production truth.
 
 Import: configure the folder, the destination, and the explicit `import.sources` inventory, then run
 `binary-alpha data import --config PATH`. Sources may live anywhere outside the folder and the
@@ -147,6 +159,136 @@ regions first; create nothing in a region whose name begins `us-west`; provision
 least-privilege identity that can read and create objects but not create or delete buckets, outside
 the application; then run the import above. Rollback reverts the application and configuration
 change; source files, the retained copy, and published generations stay intact.
+
+## Data pipeline
+
+Use [the pipeline example](../configs/data-pipeline.example.toml) and
+[the implemented contracts](contracts.md#data-pipeline) to prepare the non-secret pipeline
+document, sibling core configurations, selected source inventory, and source-binding evidence.
+Keep `local_root/store/` separate from `local_root/raw_sources/`. Use one writer host per
+Google Drive archive root and the same managed root for manual and timer producers.
+Bootstrap/update hold `pipeline_state/writer.lock`; a second producer fails immediately.
+Consumers do not acquire that lock.
+
+### Consent and credentials
+
+Initial user OAuth (Open Authorization) consent is an operator task using supported Google
+tooling. Obtain refresh credentials with `https://www.googleapis.com/auth/drive.file` scope for
+an app-created or explicitly granted archive root; a folder identifier alone grants nothing.
+Keep the archive private and check the actual grant before unattended operation. See
+[Google Drive scopes](https://developers.google.com/workspace/drive/api/guides/api-specific-auth).
+An external OAuth app left in Testing issues refresh tokens that expire after seven days when
+requesting this scope. Complete the appropriate consent setup before weekly use; see
+[Google's token lifetime rules](https://developers.google.com/identity/protocols/oauth2#expiration).
+
+Place the pipeline configuration at `/etc/binary-alpha/data-pipeline/<instance>.toml` and
+credential environment values at `/etc/binary-alpha/data-pipeline/<instance>.env`, with private
+permissions (mode `0600` for the environment file). The instance name is the existing non-root
+operating-system user. The service manager reads the environment file; manual commands need those
+variables in their own process environment. Core configurations and evidence paths resolve
+relative to the pipeline file; use an absolute managed `local_root` for an installed service.
+Supply any known study declaration as `governance_manifest`; a pinned catalog never overrides
+its denial. The core job configuration must omit its `research` table.
+
+### Bootstrap, update, list, and restore
+
+After authorization for the exact Drive action, run:
+
+```text
+binary-alpha data pipeline bootstrap --config PIPELINE
+```
+
+Bootstrap stages selected originals without altering them, imports into the managed store, audits
+and verifies the dataset and stream, and archives their closure without broker contact. A copied
+bar collection keeps the original manifest and a separate selected intake projection. Confirm the
+bootstrap report and retain the immutable receipt and catalog identifier/digest.
+
+For each source, establish the broker/account class, selected instrument, seed provenance, and
+clock mapping from authorized evidence. A Pocket archive from a different account/source context
+must not be relabeled to match a demo endpoint. Configure Deriv tick history and Pocket
+five-second bar history with explicit positive overlap, page, and time limits and no foreground
+refresh. With exact broker and Drive authorization, run a bounded update:
+
+```text
+binary-alpha data pipeline update --config PIPELINE [--end END]
+```
+
+`END` uses `YYYY-MM-DDTHH:MM:SS[.ffffff]Z`. With no pending acquisition, omission samples the
+current time for each job. Rerun the same command to resume interruption: pending intent preserves
+its cutoff, baseline, start, and retained pages even if a partial snapshot was archived.
+A conflicting `--end` or effective core configuration fails with the pending intent identity.
+Page/time budgets may change on resume. Preserve `pipeline_state/`, intake, and the managed
+store; transfer sessions and pre-generated file identifiers reconcile interrupted uploads.
+After acquisition closes, a later update can select a new cutoff.
+
+Read every job's report and receipt. `pending` leaves acquisition open, possibly with an archived
+partial snapshot. `archived_with_gaps` records a catalog with a primary shortfall other than
+`unresolved_tail`. Both fail the job and appear inside `pipeline job JOB failed: ...`.
+`archived` means the closure was archived under the implemented checks; a provider tail alone
+can have this status, and inherited gaps may remain outside the overlap. `no_data` means closed
+without a catalog and exits successfully. Neither exit 0 nor an archive status establishes
+complete market coverage. Exit 1 means an operation failed or at least one job remained pending
+or had the reported gaps; another job's successful archive remains usable.
+
+List catalog metadata for an exact broker and provider symbol, then restore a chosen identifier
+and SHA-256 (Secure Hash Algorithm, 256-bit) digest into a consumer configuration:
+
+```text
+binary-alpha data pipeline list --config PIPELINE --broker BROKER --symbol SYMBOL
+binary-alpha data pipeline restore --config CONSUMER --catalog FILE_ID --sha256 SHA256 --broker BROKER --symbol SYMBOL
+```
+
+For example, the initial selectors are `deriv`/`frxEURUSD` and
+`pocket_option`/`AEDCNY_otc`; the job identifier `pocket` is not the broker selector.
+The consumer may omit jobs and needs no broker credentials. Choose its `local_root` explicitly.
+List reports catalog identifier/digest, instrument, role, native kind, dataset/stream generations,
+actual coverage endpoints, rows, and closure bytes. Restore downloads only the pinned catalog
+closure, installs objects then original manifests, verifies both generations through `data verify`,
+and prints their local manifest locations. Use those locations in a new consumer configuration;
+leave frozen configurations and manifest bytes unchanged. Rerun the same restore to resume partial
+downloads or reuse identical installed objects.
+
+### Weekly activation and rollback
+
+Real Drive acceptance evidence is not yet retained: it is unavailable, not passing. Finalization
+of a zero-byte object upload against real Drive is unverified. Before enabling real operation,
+retain a finite source update and small archive/restore acceptance with the actual authorized
+credentials, root, source context, and cutoff. Report source acceptance separately from transfer
+correctness. The four synthetic `data_pipeline` gates cover selected intake/roundtrip, recovery,
+scope denial, and schedule/checkpoint behavior; they do not establish external acceptance.
+
+Timer installation is a later, separately authorized operator action. Install the executable at
+`/usr/local/bin/binary-alpha`, prepare the instance files above, and ensure the configured local
+storage is mounted. The service requires `local-fs.target` and orders after it and
+`network-online.target`; network ordering does not prove broker or Drive reachability.
+Then copy the shipped templates and activate the timer, replacing `<user>` with the instance user:
+
+```sh
+sudo cp ops/systemd/binary-alpha-data-backfill@.service \
+  ops/systemd/binary-alpha-data-backfill@.timer /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now 'binary-alpha-data-backfill@<user>.timer'
+```
+
+The service is `Type=oneshot`, `User=%i`, `UMask=0077`, with the private environment file and
+`ExecStart=/usr/local/bin/binary-alpha data pipeline update --config /etc/binary-alpha/data-pipeline/%i.toml`.
+The timer specifies `OnCalendar=Sat *-*-* 06:00:00 America/Chicago`, `Persistent=true`,
+`AccuracySec=1s`, and `WantedBy=timers.target`. Persistent activation catches a missed calendar
+event only. It does not retry failed application work or prove completion. There is no automatic
+service restart loop. Resume manually with the same command or
+`sudo systemctl start 'binary-alpha-data-backfill@<user>.service'`.
+
+Rollback disables only this timer with
+`sudo systemctl disable --now 'binary-alpha-data-backfill@<user>.timer'` and stops the producer
+before another request or transfer. Disabling the timer does not stop an already running service;
+stop that instance too if active. Retain partial state, receipts, source archives, and completed
+local/remote objects. Select the prior verified catalog, compatible dataset/configuration, and
+executable. Unrelated readers need no quiescence. Older binaries may reject native bar-history
+manifests; keep their prior compatible generations.
+
+Production operator tasks for this research infrastructure: none. Real source/Drive acceptance
+and timer installation above require separate exact authorization. Linked matching Sentry issues:
+none.
 
 ## Live runtime
 
@@ -342,7 +484,9 @@ every governance record (intent, claim, grant, receipt) are
 immutable and are never deleted by rollback; a research rollback selects the last certified
 bundle or disables promotion and never deletes a rejected bundle, grant, receipt, source object,
 or prior generation; the retained historical-data folder and the original
-source files stay intact, and a consumer selects the prior generation by its identity. Phase 12
+source files stay intact, and a consumer selects the prior generation by its identity. Pipeline
+rollback also retains catalogs and partial state and disables its timer as described in
+[Data pipeline](#data-pipeline). Phase 12
 implements the control schema and broker durability boundaries; production state exists only
 after separately authorized operation. Its account-specific verification and rollback are recorded
 in [Live runtime](#live-runtime), including preservation of journal, authorization, and dispatch

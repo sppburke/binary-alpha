@@ -8,10 +8,11 @@ pub use options::{
 use super::transport::{Connector, Frame, Http, Transport};
 use super::wire::WireDecimal;
 use super::{
-    Cancellation, Clock, Continuity, DiscoveredInstrument, HistoryPage, LiveEvent, LiveObservation,
-    MarketDataBroker, RateBudget, RateGroup, payload_hash,
+    Cancellation, Clock, Continuity, DiscoveredInstrument, HistoryPage, HistoryRows, LiveEvent,
+    LiveObservation, MarketDataBroker, RateBudget, RateGroup, payload_hash,
 };
 use binary_alpha_engine::config::{AccountClass, DerivSettings, RateBudgets};
+use binary_alpha_engine::dataset::NativeGranularity;
 use binary_alpha_engine::execution::Decimal;
 use binary_alpha_engine::market::{BrokerId, Currency, InstrumentId, PriceScale, Tick};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -502,8 +503,14 @@ impl MarketDataBroker for DerivMarketData {
         instrument: &InstrumentId,
         scale: PriceScale,
         before_micros: Option<i64>,
+        granularity: NativeGranularity,
     ) -> Result<HistoryPage, String> {
         self.check_instrument(instrument)?;
+        if granularity != NativeGranularity::Tick {
+            return Err(format!(
+                "deriv history: {granularity} history is not supported; only ticks are"
+            ));
+        }
         let end = before_micros.map_or_else(
             || "latest".to_string(),
             |t| t.div_euclid(1_000_000).to_string(),
@@ -518,7 +525,26 @@ impl MarketDataBroker for DerivMarketData {
                 count: 100,
                 req_id,
             })?;
-        let body: HistoryResponse = decode(&response.raw, "history")?;
+        let _ = scale;
+        Ok(HistoryPage {
+            raw: response.raw,
+            anchor_token: before_micros.map(|t| t.div_euclid(1_000_000).to_string()),
+            receipt_micros: response.receipt_micros,
+        })
+    }
+    fn decode_history(
+        &self,
+        _: &InstrumentId,
+        raw: &[u8],
+        scale: PriceScale,
+        granularity: NativeGranularity,
+    ) -> Result<(Option<i32>, HistoryRows), String> {
+        if granularity != NativeGranularity::Tick {
+            return Err(format!(
+                "deriv history: {granularity} history is not supported; only ticks are"
+            ));
+        }
+        let body: HistoryResponse = decode(raw, "history")?;
         precision(&body.pip_size, scale)?;
         if body.history.prices.len() != body.history.times.len() {
             return Err("deriv history: ragged prices and times arrays".into());
@@ -536,11 +562,7 @@ impl MarketDataBroker for DerivMarketData {
                 })
             })
             .collect::<Result<Vec<_>, String>>()?;
-        Ok(HistoryPage {
-            raw: response.raw,
-            anchor_token: before_micros.map(|t| t.div_euclid(1_000_000).to_string()),
-            rows,
-        })
+        Ok((None, HistoryRows::Ticks(rows)))
     }
     fn subscribe(&mut self, instrument: &InstrumentId, scale: PriceScale) -> Result<(), String> {
         self.check_instrument(instrument)?;

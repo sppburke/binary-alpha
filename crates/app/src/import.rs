@@ -8,7 +8,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-use binary_alpha_engine::config::{PublicationUri, Source, relative_path};
+use binary_alpha_engine::config::{Config, PublicationUri, Source, relative_path};
 use binary_alpha_engine::dataset::{
     Capability, Coverage, DatasetRole, GenerationManifest, Input, IntervalContract,
     MANIFEST_SCHEMA_VERSION, NativeGranularity, ObjectRecord, ObjectRole, PriceRepresentation,
@@ -87,6 +87,17 @@ struct Dataset {
 pub fn run(config_path: &Path, out: &mut dyn Write) -> Result<(), String> {
     let config = crate::load_config(config_path)?;
     let base = config_path.parent().unwrap_or(Path::new("."));
+    publish_all(&config, base, out).map(|_| ())
+}
+
+/// Plans, retains, validates, publishes, and commits every dataset `config` declares, with
+/// relative paths resolved against `base`; writes one report line per dataset and returns each
+/// publication in declared order.
+pub fn publish_all(
+    config: &Config,
+    base: &Path,
+    out: &mut dyn Write,
+) -> Result<Vec<Publication>, String> {
     let sources = config
         .import
         .as_ref()
@@ -121,13 +132,145 @@ pub fn run(config_path: &Path, out: &mut dyn Write) -> Result<(), String> {
     let local = Store::filesystem(&historical_dir);
     let destination = Store::open(&config.storage.publication_uri)?;
     let config_hash = config.content_hash();
+    let mut published = Vec::with_capacity(datasets.len());
     for dataset in &datasets {
-        let line = publish(dataset, &local, &destination, &config_hash)?;
+        let (line, publication) = publish(dataset, &local, &destination, &config_hash)?;
         writeln!(out, "{line}")
             .and_then(|()| out.flush())
             .map_err(|error| format!("cannot write the report: {error}"))?;
+        published.push(publication);
     }
-    Ok(())
+    Ok(published)
+}
+
+/// One file a bootstrap stages: its source and its path beneath the intake root.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IntakeFile {
+    pub source: PathBuf,
+    pub relative: String,
+}
+
+/// What a bootstrap stages for one declared source: exactly the selected files the importer
+/// would open, at intake paths that keep the importer's layout, and, for a bar collection, a
+/// projected manifest whose selected asset roots are relative to the intake root.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Intake {
+    pub files: Vec<IntakeFile>,
+    /// The projected collection manifest's file name and bytes.
+    pub projection: Option<(String, Vec<u8>)>,
+}
+
+/// Plans the intake of `source` resolved against `base` through the importer's own inventory:
+/// nothing outside the selected instruments is opened.
+pub fn intake_plan(source: &Source, base: &Path) -> Result<Intake, String> {
+    let root = canonical(&base.join(source.path()))?;
+    let datasets = plan(source, &root, &[])?;
+    let mut files: Vec<IntakeFile> = Vec::new();
+    let mut push = |source: &Path, relative: String| {
+        if !files.iter().any(|file| file.relative == relative) {
+            files.push(IntakeFile {
+                source: source.to_path_buf(),
+                relative,
+            });
+        }
+    };
+    let Source::BarParquetCollection { manifest, .. } = source else {
+        for dataset in &datasets {
+            for file in &dataset.files {
+                let relative = file.absolute.strip_prefix(&root).map_err(|_| {
+                    format!(
+                        "{} lies outside {}",
+                        file.absolute.display(),
+                        root.display()
+                    )
+                })?;
+                push(&file.absolute, relative.to_string_lossy().into_owned());
+            }
+        }
+        return Ok(Intake {
+            files,
+            projection: None,
+        });
+    };
+    // Collection-level files keep their manifest-relative names; each selected asset tree is
+    // staged beneath its asset name, wherever the manifest's absolute root pointed.
+    for dataset in &datasets {
+        let asset = dataset.instrument.provider_symbol.as_str();
+        for file in &dataset.files {
+            let relative = match file.path.strip_prefix("collection/") {
+                Some(name) => name.to_string(),
+                None => format!("{asset}/{}", file.path),
+            };
+            push(&file.absolute, relative);
+        }
+    }
+    let manifest_path = contained_file(&root, manifest, &[])?;
+    let text = fs::read(&manifest_path)
+        .map_err(|error| format!("cannot read {}: {error}", manifest_path.display()))?;
+    let mut projected: serde_json::Value = serde_json::from_slice(&text)
+        .map_err(|error| format!("{} is not JSON: {error}", manifest_path.display()))?;
+    let assets = projected
+        .get_mut("assets")
+        .and_then(serde_json::Value::as_object_mut)
+        .ok_or_else(|| format!("{} lists no assets", manifest_path.display()))?;
+    let selected: Vec<String> = datasets
+        .iter()
+        .map(|dataset| dataset.instrument.provider_symbol.to_string())
+        .collect();
+    let mut mapping = serde_json::Map::new();
+    assets.retain(|name, _| selected.contains(name));
+    for (name, asset) in assets.iter_mut() {
+        let Some(asset) = asset.as_object_mut() else {
+            continue;
+        };
+        let asset_root = asset
+            .get("asset_root")
+            .and_then(serde_json::Value::as_str)
+            .map(PathBuf::from)
+            .ok_or_else(|| format!("{name}: the collection manifest records no asset root"))?;
+        let dataset_root = asset
+            .get("dataset_root")
+            .and_then(serde_json::Value::as_str)
+            .map(PathBuf::from)
+            .ok_or_else(|| format!("{name}: the collection manifest records no dataset root"))?;
+        let dataset_suffix = canonical(&root.join(&dataset_root))?
+            .strip_prefix(canonical(&root.join(&asset_root))?)
+            .map_err(|_| format!("{name}: dataset root lies outside its asset root"))?
+            .to_path_buf();
+        mapping.insert(
+            name.clone(),
+            serde_json::json!({ "asset_root": asset_root, "dataset_root": dataset_root }),
+        );
+        asset.insert("asset_root".into(), serde_json::Value::String(name.clone()));
+        asset.insert(
+            "dataset_root".into(),
+            serde_json::Value::String(
+                Path::new(name)
+                    .join(dataset_suffix)
+                    .to_string_lossy()
+                    .into_owned(),
+            ),
+        );
+    }
+    projected["binary_alpha_intake"] = serde_json::json!({
+        "original_manifest": manifest.to_string_lossy(),
+        "original_manifest_sha256": binary_alpha_engine::hex(&sha2::Sha256::digest(&text)),
+        "selected": selected,
+        "original_roots": mapping,
+    });
+    let mut bytes = serde_json::to_vec_pretty(&projected).map_err(|error| error.to_string())?;
+    bytes.push(b'\n');
+    let name = format!(
+        "{}.intake.json",
+        manifest
+            .file_stem()
+            .ok_or("collection manifest has no file name")?
+            .to_string_lossy()
+    );
+    Ok(Intake {
+        files,
+        projection: Some((name, bytes)),
+    })
 }
 
 fn canonical(path: &Path) -> Result<PathBuf, String> {
@@ -219,6 +362,7 @@ fn plan(source: &Source, root: &Path, protected: &[PathBuf]) -> Result<Vec<Datas
             role,
             manifest,
             provenance,
+            instruments,
             ..
         } => plan_collection(
             root,
@@ -226,6 +370,7 @@ fn plan(source: &Source, root: &Path, protected: &[PathBuf]) -> Result<Vec<Datas
             *role,
             manifest,
             provenance.as_deref().unwrap_or(&[]),
+            instruments.as_deref(),
             protected,
         ),
         Source::TickParquetDaily {
@@ -272,6 +417,7 @@ fn plan_collection(
     role: DatasetRole,
     manifest: &Path,
     provenance: &[PathBuf],
+    instruments: Option<&[String]>,
     protected: &[PathBuf],
 ) -> Result<Vec<Dataset>, String> {
     let manifest_path = contained_file(root, manifest, protected)?;
@@ -284,6 +430,17 @@ fn plan_collection(
             manifest_path.display()
         )
     })?;
+    // A selection is checked against the listed names before any asset tree is opened.
+    if let Some(instruments) = instruments {
+        for name in instruments {
+            if !collection.assets.contains_key(name) {
+                return Err(format!(
+                    "{} lists no asset `{name}`",
+                    manifest_path.display()
+                ));
+            }
+        }
+    }
     let mut collection_files = Vec::new();
     for relative in std::iter::once(manifest).chain(provenance.iter().map(PathBuf::as_path)) {
         let absolute = contained_file(root, relative, protected)?;
@@ -294,7 +451,10 @@ fn plan_collection(
         });
     }
     let mut datasets = Vec::with_capacity(collection.assets.len());
-    for asset in collection.assets.values() {
+    for (name, asset) in &collection.assets {
+        if instruments.is_some_and(|instruments| !instruments.contains(name)) {
+            continue;
+        }
         let asset_root = contained_dir(root, &asset.asset_root, protected)?;
         let dataset_root = canonical(&root.join(&asset.dataset_root))?;
         let dataset_prefix = dataset_root.strip_prefix(&asset_root).map_err(|_| {
@@ -683,7 +843,7 @@ fn publish(
     local: &Store,
     destination: &Store,
     config_hash: &str,
-) -> Result<String, String> {
+) -> Result<(String, Publication), String> {
     let started = Instant::now();
     let mut identities: Vec<ObjectIdentity> =
         parallel::map(&dataset.files, |file| store::identify(&file.absolute))
@@ -855,7 +1015,7 @@ fn publish(
         published.manifest.objects.len(),
         published.reused
     );
-    Ok(if published.already_published {
+    let line = if published.already_published {
         format!("{report} (already published)")
     } else {
         format!(
@@ -865,11 +1025,12 @@ fn publish(
             validated.as_secs_f64(),
             elapsed.as_secs_f64()
         )
-    })
+    };
+    Ok((line, published))
 }
 
 /// The shared immutable publication tail, after source normalization and local retention.
-pub(crate) struct Publication {
+pub struct Publication {
     pub manifest: GenerationManifest,
     pub reused: usize,
     pub already_published: bool,
@@ -1120,7 +1281,8 @@ fn validate_bars(
 mod tests {
     use super::*;
     use binary_alpha_engine::dataset::Coverage;
-    use binary_alpha_engine::market::{BrokerId, ProviderSymbol};
+    use binary_alpha_engine::market::{Bar, BrokerId, ProviderSymbol};
+    use binary_alpha_engine::stream::Observation;
 
     /// A tick manifest with one source object carrying the given destination metadata.
     fn manifest(crc32c: Option<u32>, generation: Option<i64>) -> GenerationManifest {
@@ -1158,6 +1320,96 @@ mod tests {
                 generation,
             }],
         }
+    }
+
+    fn publish_broker_bars(local: &Store, destination: &Store, bars: &[Bar]) -> GenerationManifest {
+        let mut manifest = manifest(None, None);
+        let instrument = InstrumentId {
+            broker: manifest.broker.clone(),
+            provider_symbol: manifest.provider_symbol.clone(),
+        };
+        let path = temporary_path(local, "feed-bars").unwrap();
+        let summary =
+            archive::write_bars(&path, "s", 538, 7_200, bars.iter().copied().map(Ok)).unwrap();
+        let normalized = fs::read(&path).unwrap();
+        fs::remove_file(&path).unwrap();
+        manifest.objects.clear();
+        let mut identities = Vec::new();
+        for (role, path, bytes) in [
+            (ObjectRole::Source, "source/page.json", b"{}".as_slice()),
+            (
+                ObjectRole::Provenance,
+                "provenance/coverage.json",
+                b"{}".as_slice(),
+            ),
+            (
+                ObjectRole::Normalized,
+                archive::BAR_OBJECT_PATH,
+                normalized.as_slice(),
+            ),
+        ] {
+            let identity = retain_bytes(local, bytes, "feed-object").unwrap();
+            manifest.objects.push(record(role, path, &identity));
+            identities.push(identity);
+        }
+        manifest.source_kind = SourceKind::BrokerHistory;
+        manifest.native_granularity = NativeGranularity::Bar { period_seconds: 5 };
+        manifest.time_unit = TimeUnit::Second;
+        manifest.price_representation = PriceRepresentation::BinaryFloat64;
+        manifest.capabilities = vec![Capability::Bars];
+        manifest.interval = Some(IntervalContract::five_second("parquet_metadata"));
+        manifest.row_count = summary.rows;
+        (
+            manifest.coverage.first_event_time,
+            manifest.coverage.last_event_time,
+        ) = archive::coverage(&summary).unwrap();
+        manifest.generation = generation_id(
+            &instrument,
+            manifest.source_kind,
+            manifest.role,
+            None,
+            &manifest.objects,
+        );
+        publish_generation(manifest, &identities, local, destination)
+            .unwrap()
+            .manifest
+    }
+
+    #[test]
+    fn published_broker_bars_feed_normalized_observations_in_order() {
+        let dir = std::env::temp_dir().join(format!(
+            "binary-alpha-import-feed-bars-{}",
+            std::process::id()
+        ));
+        let local = Store::filesystem(dir.join("retained"));
+        let destination = Store::filesystem(dir.join("published"));
+        let bars = [0, 5, 15].map(|start_unix_s| Bar {
+            start_unix_s,
+            open: 1.25,
+            high: 1.5,
+            low: 1.0,
+            close: 1.375,
+            volume: start_unix_s as f64,
+            period_s: 5,
+        });
+        let published = publish_broker_bars(&local, &destination, &bars);
+        let mut bytes = Vec::new();
+        destination
+            .read_to(&published.key(), None, &mut bytes)
+            .unwrap();
+        let manifest = GenerationManifest::from_json(&bytes).unwrap();
+        let scale = PriceScale::try_from(3).unwrap();
+        let mut observations = Vec::new();
+        crate::audit::feed_generation(&destination, &manifest, scale, &mut |observation| {
+            observations.push(observation);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(
+            observations,
+            bars.map(|bar| Observation::from_bar(&bar, scale).unwrap())
+        );
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

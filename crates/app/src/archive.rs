@@ -27,6 +27,9 @@ use parquet::schema::printer::print_schema;
 /// The path of the normalized tick object inside a tick generation.
 pub const TICK_OBJECT_PATH: &str = "normalized/ticks.parquet";
 
+/// The path of the normalized bar object inside a broker bar generation.
+pub const BAR_OBJECT_PATH: &str = "normalized/bars.parquet";
+
 /// Rows per normalized row group.
 const ROW_GROUP_ROWS: usize = 1 << 20;
 
@@ -213,6 +216,124 @@ pub fn write_ticks(
     Ok(summary)
 }
 
+/// Writes validated native bars as one Zstandard Parquet object in the exact archive shape,
+/// embedding the approved interval contract, and returns what was written. The sequence rules
+/// (strictly increasing starts on the period grid) are applied here; `server_offset_s` is the
+/// declared provider clock offset recorded beside every Unix start.
+pub fn write_bars(
+    path: &Path,
+    symbol: &str,
+    symbol_id: i32,
+    server_offset_s: i64,
+    bars: impl Iterator<Item = Result<Bar, String>>,
+) -> Result<DataSummary, String> {
+    let schema = Arc::new(parse_message_type(BAR_SCHEMA).map_err(|error| error.to_string())?);
+    let metadata = IntervalContract::five_second("parquet_metadata")
+        .metadata()
+        .into_iter()
+        .map(|(key, value)| KeyValue::new(key.to_string(), value))
+        .collect();
+    let properties = Arc::new(
+        WriterProperties::builder()
+            .set_compression(Compression::ZSTD(
+                ZstdLevel::try_new(3).map_err(|error| error.to_string())?,
+            ))
+            .set_key_value_metadata(Some(metadata))
+            .build(),
+    );
+    let file =
+        File::create(path).map_err(|error| format!("cannot create {}: {error}", path.display()))?;
+    let mut writer =
+        SerializedFileWriter::new(file, schema, properties).map_err(|error| error.to_string())?;
+    let mut sequence = BarSequence::default();
+    let mut summary = DataSummary::default();
+    let mut rows: Vec<Bar> = Vec::new();
+    let flush = |writer: &mut SerializedFileWriter<File>,
+                 rows: &mut Vec<Bar>|
+     -> Result<(), String> {
+        let levels = vec![1i16; rows.len()];
+        let mut group = writer.next_row_group().map_err(|error| error.to_string())?;
+        let mut index = 0;
+        while let Some(mut column) = group.next_column().map_err(|error| error.to_string())? {
+            let written = match column.untyped() {
+                ColumnWriter::ByteArrayColumnWriter(typed) => typed.write_batch(
+                    &vec![ByteArray::from(symbol); rows.len()],
+                    Some(&levels),
+                    None,
+                ),
+                ColumnWriter::Int32ColumnWriter(typed) => typed.write_batch(
+                    &rows
+                        .iter()
+                        .map(|bar| {
+                            if index == 1 {
+                                symbol_id
+                            } else {
+                                i32::from(bar.period_s)
+                            }
+                        })
+                        .collect::<Vec<_>>(),
+                    Some(&levels),
+                    None,
+                ),
+                ColumnWriter::Int64ColumnWriter(typed) => typed.write_batch(
+                    &rows
+                        .iter()
+                        .map(|bar| match index {
+                            2 => bar.start_unix_s * 1_000_000,
+                            3 => bar.start_unix_s,
+                            _ => bar.start_unix_s + server_offset_s,
+                        })
+                        .collect::<Vec<_>>(),
+                    Some(&levels),
+                    None,
+                ),
+                ColumnWriter::DoubleColumnWriter(typed) => typed.write_batch(
+                    &rows
+                        .iter()
+                        .map(|bar| [bar.open, bar.high, bar.low, bar.close, bar.volume][index - 5])
+                        .collect::<Vec<_>>(),
+                    Some(&levels),
+                    None,
+                ),
+                _ => unreachable!("the archive schema has no other column type"),
+            };
+            written.map_err(|error| error.to_string())?;
+            column.close().map_err(|error| error.to_string())?;
+            index += 1;
+        }
+        group.close().map_err(|error| error.to_string())?;
+        rows.clear();
+        Ok(())
+    };
+    for bar in bars {
+        let bar = bar?;
+        bar.validate(bar.period_s)?;
+        sequence.accept(bar.start_unix_s)?;
+        let start_micros = bar
+            .start_unix_s
+            .checked_mul(1_000_000)
+            .filter(|_| bar.start_unix_s.checked_add(server_offset_s).is_some())
+            .ok_or_else(|| {
+                format!(
+                    "bar at {} lies outside the representable time range",
+                    bar.start_unix_s
+                )
+            })?;
+        summary.observe(start_micros);
+        rows.push(bar);
+        if rows.len() == ROW_GROUP_ROWS {
+            flush(&mut writer, &mut rows)?;
+        }
+    }
+    if !rows.is_empty() {
+        flush(&mut writer, &mut rows)?;
+    }
+    let file = writer.into_inner().map_err(|error| error.to_string())?;
+    file.sync_all()
+        .map_err(|error| format!("cannot close {}: {error}", path.display()))?;
+    Ok(summary)
+}
+
 /// Reads a normalized tick object back, re-applying the schema and sequence rules.
 pub fn read_ticks(path: &Path, scale: PriceScale) -> Result<DataSummary, String> {
     read_ticks_with(path, scale, |_| Ok(()))
@@ -343,6 +464,8 @@ pub struct BarExpectation {
 pub struct BarFileSummary {
     pub data: DataSummary,
     pub embedded_interval: bool,
+    /// The one provider identifier every row carried, absent for an empty file.
+    pub symbol_id: Option<i32>,
 }
 
 /// Validates one archive file row by row without rewriting it.
@@ -487,6 +610,7 @@ pub fn validate_bar_file_with(
     Ok(BarFileSummary {
         data: summary,
         embedded_interval,
+        symbol_id,
     })
 }
 
@@ -1314,6 +1438,59 @@ mod tests {
     use super::*;
     use binary_alpha_engine::market::{BrokerId, ProviderSymbol};
     use parquet::record::RowAccessor;
+
+    #[test]
+    fn bars_round_trip_through_parquet_with_source_and_interval_metadata() {
+        let dir =
+            std::env::temp_dir().join(format!("binary-alpha-archive-bars-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("bars.parquet");
+        let bars = [0, 5, 15].map(|start_unix_s| Bar {
+            start_unix_s,
+            open: 1.25,
+            high: 1.5,
+            low: 1.0,
+            close: 1.375,
+            volume: start_unix_s as f64,
+            period_s: 5,
+        });
+        let written = write_bars(&path, "S", 538, 7_200, bars.into_iter().map(Ok)).unwrap();
+        let expectation = BarExpectation {
+            symbol: "S".to_string(),
+            symbol_id: Some(538),
+            period_s: 5,
+            server_offset_s: Some(7_200),
+            interval: IntervalContract::five_second("parquet_metadata"),
+            metadata_required: true,
+        };
+        let mut decoded = Vec::new();
+        let read = validate_bar_file_with(&path, &expectation, |bar| {
+            decoded.push(bar);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(decoded, bars);
+        assert_eq!(read.data, written);
+        assert_eq!(read.symbol_id, Some(538));
+        assert!(read.embedded_interval);
+        let reader = open(&path).unwrap();
+        for row in reader.get_row_iter(None).unwrap() {
+            let row = row.unwrap();
+            assert_eq!(row.get_string(0).unwrap(), "S");
+            assert_eq!(row.get_int(1).unwrap(), 538);
+            assert_eq!(row.get_long(4).unwrap() - row.get_long(3).unwrap(), 7_200);
+        }
+        let pairs = reader
+            .metadata()
+            .file_metadata()
+            .key_value_metadata()
+            .unwrap();
+        assert_eq!(
+            embedded_interval(pairs, "parquet_metadata").unwrap(),
+            expectation.interval
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 
     #[test]
     fn ticks_round_trip_through_parquet() {

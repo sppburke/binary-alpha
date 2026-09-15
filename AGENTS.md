@@ -44,6 +44,8 @@ Distinguish not sent, sent, acknowledged, accepted, rejected, partially filled o
 
 Google Cloud Storage owns immutable bulk data and artifacts. Supabase owns only a proved transactional control or metadata need and stores references rather than duplicate bulk or execution truth. Writes and operator procedures are resumable. Do not prescribe buffering, fallback, retention, or recovery until the implementing issue or current checkout proves the failure model.
 
+A private Google Drive archive owned by this research pipeline may hold ordinary development/evaluation market datasets and their stream outputs under immutable catalogs, and local filesystem publication is supported for that research workflow. Google Cloud Storage retains every production, certification, and holdout authority.
+
 ## Rust and NVIDIA CUDA
 
 Design idiomatic Rust from contracts rather than translating legacy files. First-party production, replay, command-line, and test paths remain Rust. Isolate required unsafe or foreign-function code behind the smallest reviewed safe boundary. NVIDIA CUDA requires a deterministic central-processor reference and declared parity; never label central-processor evidence as graphics-processor evidence.
