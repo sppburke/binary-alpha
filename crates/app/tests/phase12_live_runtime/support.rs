@@ -316,8 +316,7 @@ impl Fixture {
         )
     }
     pub fn definition(&self) -> live::LiveDefinition {
-        let (local, destination) = self.stores();
-        live::definition(&self.config, &local, &destination).unwrap()
+        live::definition(&self.config).unwrap()
     }
     pub fn log(&self) -> PathBuf {
         self.scratch.path("access.log")
@@ -636,8 +635,7 @@ fn runtime_with_clocks(
         panic!("fixture broker")
     };
     let address =
-        DerivAccounts::bootstrap(settings, &mut recorded.http(), "synthetic-no-credential")
-            .unwrap();
+        DerivAccounts::bootstrap(settings, &mut recorded.http(), "synthetic-no-credential")?;
     let account = AccountIdentity {
         broker: settings.id.clone(),
         account: fixture.config.live.as_ref().unwrap().account.clone(),
@@ -1050,4 +1048,43 @@ pub fn two_matching_log() -> String {
         second(&one[11], 66),
     ]);
     result.iter().map(|row| format!("{row}\n")).collect()
+}
+
+pub fn authorize(fixture: &Fixture) {
+    let definition = fixture.definition();
+    let manifest = definition.manifest;
+    let (local, destination) = fixture.stores();
+    live::authorization::create(
+        &destination,
+        &local,
+        live::authorization::Authorization {
+            schema_version: 1,
+            deployment: manifest.hash,
+            configuration: manifest.config_hash,
+            bundle_sha256: manifest.bundle_sha256,
+            broker: manifest.broker,
+            account: manifest.account,
+            operator: "synthetic-operator".into(),
+            reason: "synthetic runtime regression".into(),
+            hash: String::new(),
+        },
+    )
+    .unwrap();
+}
+
+/// Snapshots immutable fixture publications before a continued run.
+pub fn published_snapshot(fixture: &Fixture) -> std::collections::BTreeMap<PathBuf, Vec<u8>> {
+    fn visit(root: &Path, out: &mut std::collections::BTreeMap<PathBuf, Vec<u8>>) {
+        for entry in fs::read_dir(root).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                visit(&path, out);
+            } else {
+                out.insert(path.clone(), fs::read(&path).unwrap());
+            }
+        }
+    }
+    let mut out = std::collections::BTreeMap::new();
+    visit(&fixture.scratch.path("published"), &mut out);
+    out
 }

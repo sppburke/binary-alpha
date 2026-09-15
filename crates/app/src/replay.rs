@@ -28,7 +28,7 @@ use binary_alpha_engine::research::Access;
 use crate::archive::TableReader;
 use crate::features::{self, ROWS_MESSAGE};
 use crate::import::{self, CODE_REVISION};
-use crate::outcomes::{Bound, Temporary, bind_source_inputs, load_ticks};
+use crate::outcomes::{BindingMode, Bound, Temporary, bind_inputs, load_ticks};
 use crate::store::{self, ObjectIdentity, Put, Store};
 use crate::verify;
 
@@ -77,21 +77,18 @@ pub(crate) fn bind_instrument(
     settings: &Replay,
     index: usize,
     access: Access<'_>,
+    mode: BindingMode<'_>,
 ) -> Result<BoundInstrument, String> {
     let input = &settings.inputs[index];
     let field = |name: &str| format!("inputs[{index}].{name}");
-    let broker = settings
-        .contracts
-        .iter()
-        .any(|terms| terms.settlement.rule == SettlementRule::BrokerAuthoritativeV1);
-    let inputs = bind_source_inputs(
+    let inputs = bind_inputs(
         &field,
         settings.role,
         &input.tick_manifest,
         &input.feature_manifest,
         "a replay",
         access,
-        broker,
+        mode,
     )?;
     let Bound {
         tick,
@@ -109,7 +106,7 @@ pub(crate) fn bind_instrument(
         ] {
             let Some(time) = time else { continue };
             let micros = parse_event_time_micros(time)?;
-            if !broker && (micros < start || micros >= end) {
+            if matches!(mode, BindingMode::Historical) && (micros < start || micros >= end) {
                 return Err(format!(
                     "{}: the {what} decision time {time} of stream {}s/{}s lies outside the declared decision window",
                     field("feature_manifest"),
@@ -625,7 +622,7 @@ pub(crate) fn publish(
         .ok_or("replay: the table is required")?;
     let loading = Instant::now();
     let bound = (0..settings.inputs.len())
-        .map(|index| bind_instrument(settings, index, access))
+        .map(|index| bind_instrument(settings, index, access, BindingMode::Historical))
         .collect::<Result<Vec<_>, _>>()?;
     let definition = RunDefinition {
         schema_version: if settings.bindings.iter().any(|binding| {

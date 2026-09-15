@@ -1881,9 +1881,12 @@ and lease deadline before queuing the write to the account worker. It never wide
 takes scenario extrema, interpolates, mixes bindings from scenarios, or chooses a scenario per command.
 
 The complete selected policy preserves fitted features, strategy order, risk, conversion policy,
-reporting currency, and economic capital. Startup requires broker balance to equal the Engine
-account's cash, preserving broker, currency, and scale; restart restores actual cash and obligations
-from journal and broker evidence instead of resetting historical initial cash.
+reporting currency, and economic capital. Startup entry admission requires broker balance to equal
+the Engine account's cash, preserving broker, currency, and scale; restart restores actual cash
+and obligations from journal and broker evidence instead of resetting historical initial cash.
+After startup recovery applies the recovered settlements, the runtime requests balance again.
+While the balance veto is set, each settlement requests another snapshot; equality with restored
+cash clears the veto. An outstanding pre-settlement read requires a subsequent snapshot.
 Unsupported broker, account class, instrument, currency, or duration remains rejected by the
 adapter. `empirical_policy_qualification_v1` retains its [historical meaning](#research); this
 projection adds no execution fidelity or new certification claim.
@@ -1891,8 +1894,7 @@ projection adds no execution fidelity or new certification claim.
 ### Journal
 
 The journal owner writes one JavaScript Object Notation (`JSON`) record per newline-delimited
-line. The record-format constant is `RECORD_SCHEMA_VERSION = 1`; `schema_version` is not a field
-in each serialized record. The envelope contains `sequence`, `previous_sha256`, `time_micros`,
+line. `schema_version` is not a field in each serialized record. The envelope contains `sequence`, `previous_sha256`, `time_micros`,
 `deployment`, and flattened `kind` fields. Sequence starts at 1 and increases across segments.
 `previous_sha256` is the lowercase SHA-256 (256-bit Secure Hash Algorithm) hash of the previous
 serialized record bytes, excluding the newline; the first record uses sixty-four zeroes.
@@ -1907,7 +1909,6 @@ serialized record bytes, excluding the newline; the first record uses sixty-four
 | `written` | `command`, `claim`; recorded before queuing the socket write, not proof of a write or acceptance. |
 | `lease` | `state` (`acquired`, `renewed`, `released`, `lost`) and `token`. |
 | `discontinuity` | Recovery `reason`. |
-| `segment` | `closed` sequence marker; supported by the record format, not emitted by the runtime. |
 
 `Journal::append` writes and synchronizes each line with `sync_data`. The sole open file is
 `<dir>/open.jsonl`; closed files are `<first>-<last>.jsonl`, with each sequence zero-padded to
@@ -1929,8 +1930,9 @@ after byte/hash verification. Failed segments remain local and retry on the rene
 Startup restores full archived segments before opening the journal. Entry disabling at
 `max_spool_bytes` preserves settlement, reconciliation, journaling, and publication retry.
 Shutdown stops and drains broker workers, stops renewal, disables entries, releases the lease,
-uploads and verifies full deterministic segments, then publishes the existing
-[schema-2 ledger generation](#ledger-summary-and-replay-generations), receipt, and final manifest.
+uploads and verifies full deterministic segments, then publishes the receipt and final manifest.
+Only deterministic `live replay` also publishes the existing
+[schema-2 ledger generation](#ledger-summary-and-replay-generations).
 The partial open tail stays local. Upload failure or a checkpoint interruption prevents final
 publication. Broker obligations are not synthetically settled.
 
@@ -2009,7 +2011,8 @@ Failed renewal disables entries; missing results reach the conservative local de
 replay renews fake control on the ordered owner. Once shutdown release begins, entries remain
 disabled even if its response is lost. The next acquisition increments the token. Lease vetoes
 preserve account observation, settlement, reconciliation, journal commitment, and cloud retry;
-an exited renewal worker terminates the run with an error.
+a renewal worker that exits after connection loss disables entries and preserves observation.
+Only a renewal worker panic is fatal.
 
 The broker adapter already splits rate admission/encoding (`prepare_purchase`) from write
 (`write_purchase`) with an opaque prepared-command token. Dispatch finishes
@@ -2052,8 +2055,8 @@ binary-alpha live authorization create --deployment-manifest URI --bundle-manife
 
 The command verifies deployment kind/schema/hash/key, the public research run, bundle hash,
 research generation, and broker/account agreement. It records local `USER` as operator, using
-`unavailable` when the variable is absent, and stages under `target/live-authorization` in the
-working directory. Creation uses the deployment manifest's store root. Configure a distinct
+`unavailable` when the variable is absent, and stages temporary publication files through
+`Store::filesystem(std::env::temp_dir())`, using the existing storage owner. Creation uses the deployment manifest's store root. Configure a distinct
 operator Google identity to create but not overwrite authorizations and the runtime identity to
 read them. Every `live` entry, including demo, checks deployment, resolved configuration, certified
 bundle hash, broker, and account. Replay and paper do not require this object. Missing, unreadable,
@@ -2084,8 +2087,8 @@ The serialized fields are `schema_version`, `deployment`, `definition`, `bundle_
 `clock_basis`, `min_samples`, `ledger`, `dimensions`, and `promotion`. `observation` contains
 `decision_start` and `decision_end`; records are selected by their application `time_micros` in
 that half-open window. `scenarios` contains frozen scenario identities followed by hashes of
-selected binding envelopes and configured alternative envelopes. `ledger` is the published ledger
-generation. Journal segments and runtime measurements belong to the final manifest below.
+selected binding envelopes and configured alternative envelopes. `ledger` is the frozen definition
+identity. Journal segments and runtime measurements belong to the final manifest below.
 Publication is create-once at `live/<deployment>/receipts/<content-sha256>.json`.
 
 Each dimension carries `name`, `status`, `samples`, `required`, `bound`, and nullable `reason`.
@@ -2166,7 +2169,8 @@ segments and final manifests can differ.
 
 ### Final manifest and command output
 
-`FinalManifest` contains `deployment`, `ledger` (ready-manifest URI), `ledger_generation`,
+`FinalManifest` contains `deployment`, `definition` (the frozen run definition identity),
+`ledger` (optional ready-manifest URI), `ledger_generation` (optional generation identity),
 `receipt` (object URI), `journal_segments`, `open_tail`, and `measurements`. Only verified full
 segments are listed, each with `key`, `sha256`, and `bytes`. `open_tail` is `null` or the local
 tail's `first_sequence`, `last_sequence`, `sha256`, and `bytes`; it names no uploaded object.
@@ -2175,6 +2179,14 @@ tail's `first_sequence`, `last_sequence`, `sha256`, and `bytes`; it names no upl
 These measure market transport receipt to decision, claim completion to the worker's write-call
 start, and decision to the accepted write-call return. The final manifest is create-once at
 `live/<deployment>/final/<content-sha256>.json`; its hash includes segments and measurements.
+
+For `live run` in paper/live mode, the verified journal is the financial record. Finish publishes
+no `engine_replay` generation: `ledger` and `ledger_generation` are `null`, and the final manifest
+binds the verified full journal segments, local open-tail range and SHA-256, receipt URI, and
+definition identity. A continued run extends the journal and publishes a new final manifest
+without changing retained publications. Deterministic one-shot `live replay` still publishes
+through `replay::publish_ledger`; identical content reuses the generation key. The receipt's
+`ledger` field is the definition identity in both modes.
 
 Successful runtime commands print:
 

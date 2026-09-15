@@ -379,13 +379,18 @@ impl RecordedState {
     fn can_progress(&self, now: i64) -> bool {
         let local_now = std::time::Instant::now();
         self.in_flight.is_some()
-            || self.pending.values().any(|pending| *pending != 0)
             || ["market", "account"]
                 .iter()
                 .any(|session| match self.parked.get(*session) {
                     None => true,
                     // A timed wait can expire before its worker reacquires the mutex too.
-                    Some(wait) if wait.until.is_some_and(|until| local_now >= until) => true,
+                    Some(wait)
+                        if wait.until.is_some_and(|until| local_now >= until)
+                            || (wait.until.is_some()
+                                && self.pending.get(*session).copied().unwrap_or(0) != 0) =>
+                    {
+                        true
+                    }
                     Some(Parked {
                         reason: RecordedWait::Rate(deadline),
                         ..
@@ -393,7 +398,7 @@ impl RecordedState {
                     Some(Parked {
                         reason: RecordedWait::Idle,
                         ..
-                    }) => false,
+                    }) => self.pending.get(*session).copied().unwrap_or(0) != 0,
                     Some(Parked {
                         reason: RecordedWait::Read,
                         ..
@@ -601,6 +606,9 @@ impl RecordedConnector {
                 ));
                 return Ok(None);
             };
+            if self.session == "bootstrap" && record.session != "bootstrap" {
+                return Err("recorded bootstrap: expected bootstrap response before market or account frames".into());
+            }
             let ready = state.ready(record);
             if state.in_flight.is_none() && record.session == self.session && ready {
                 state.parked.remove(&self.session);
@@ -716,6 +724,22 @@ impl Transport for RecordedConnector {
 pub struct RecordedHttp(RecordedConnector);
 impl RecordedHttp {
     fn request(&mut self, method: &str, url: &str) -> Result<Vec<u8>, String> {
+        if self
+            .0
+            .clock
+            .schedule
+            .0
+            .lock()
+            .unwrap()
+            .frames
+            .front()
+            .is_some_and(|record| record.session != "bootstrap")
+        {
+            return Err(
+                "recorded bootstrap: expected bootstrap response before market or account frames"
+                    .into(),
+            );
+        }
         self.0.session = "bootstrap".into();
         self.0.send_text(&format!("{method} {url}"))?;
         let result = self

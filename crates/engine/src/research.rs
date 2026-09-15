@@ -1026,7 +1026,6 @@ pub struct LivePolicy {
     pub source: LiveSource,
     pub replay: Replay,
     pub baseline: Vec<ContractTerms>,
-    pub scenario_delay_micros: i64,
     pub refit: Vec<FeatureRef>,
 }
 
@@ -1179,7 +1178,6 @@ pub fn live_policy(
         },
         replay,
         baseline: policy.contracts.clone(),
-        scenario_delay_micros: 0,
         refit: selection.refit.clone(),
     })
 }
@@ -1891,7 +1889,6 @@ mod tests {
         assert_eq!(live.replay.decision_end, "2026-01-06T01:00:00Z");
         assert_eq!(live.replay.splits, None);
         assert_eq!(live.replay.scenario, None);
-        assert_eq!(live.scenario_delay_micros, 0);
         assert_eq!(live.refit, fixture.selection.refit);
         assert_eq!(
             live.replay

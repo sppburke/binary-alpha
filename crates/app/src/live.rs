@@ -122,12 +122,26 @@ pub struct LiveDefinition {
     plans: Vec<FeaturePlan>,
 }
 
+impl LiveDefinition {
+    fn instruments(&self) -> Result<Vec<(InstrumentId, PriceScale)>, String> {
+        self.definition
+            .instruments
+            .iter()
+            .map(|i| {
+                Ok((
+                    InstrumentId {
+                        broker: i.broker.clone(),
+                        provider_symbol: i.provider_symbol.clone(),
+                    },
+                    i.price_scale.try_into()?,
+                ))
+            })
+            .collect()
+    }
+}
+
 /// Reads the verified research run, frozen selection, and public certification envelope.
-pub fn definition(
-    config: &Config,
-    _local: &Store,
-    _destination: &Store,
-) -> Result<LiveDefinition, String> {
+pub fn definition(config: &Config) -> Result<LiveDefinition, String> {
     let settings = config.live.as_ref().ok_or("live: the table is required")?;
     let uri = settings.bundle_manifest.to_string();
     let (source, key) = crate::verify::open(&uri)?;
@@ -203,7 +217,16 @@ pub fn definition(
         return Err("live: only the current Deriv options adapter is supported".into());
     }
     let bound = (0..policy.replay.inputs.len())
-        .map(|i| crate::replay::bind_instrument(&policy.replay, i, Access::ORDINARY))
+        .map(|i| {
+            crate::replay::bind_instrument(
+                &policy.replay,
+                i,
+                Access::ORDINARY,
+                crate::outcomes::BindingMode::Live {
+                    refit_generation: &policy.refit[i].generation,
+                },
+            )
+        })
         .collect::<Result<Vec<_>, _>>()?;
     for (index, instrument) in bound.iter().enumerate() {
         if instrument.binding.plan_identity != policy.refit[index].plan_identity {
@@ -351,8 +374,9 @@ pub enum Checkpoint {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FinalManifest {
     pub deployment: String,
-    pub ledger: String,
-    pub ledger_generation: String,
+    pub definition: String,
+    pub ledger: Option<String>,
+    pub ledger_generation: Option<String>,
     pub receipt: String,
     pub journal_segments: Vec<receipt::Segment>,
     pub open_tail: Option<journal::OpenTail>,
@@ -408,6 +432,8 @@ pub struct Runtime {
     upload_errors: BTreeMap<String, String>,
     authorization_pending: bool,
     balance_pending: bool,
+    balance_refresh_due: bool,
+    recovering_commands: BTreeSet<String>,
     failure: Option<String>,
     recovery_open: Option<Vec<OpenContract>>,
     recovery_pending: bool,
@@ -687,6 +713,8 @@ impl Runtime {
             upload_errors: BTreeMap::new(),
             authorization_pending: false,
             balance_pending: true,
+            balance_refresh_due: false,
+            recovering_commands: BTreeSet::new(),
             failure: None,
             recovery_open: None,
             recovery_pending: false,
@@ -781,7 +809,7 @@ impl Runtime {
                 runtime.check_replay_progress(generation)?;
             }
         }
-        for (id, scale) in runtime.instruments()? {
+        for (id, scale) in runtime.definition.instruments()? {
             if let Some(scheduler) = &runtime.scheduler {
                 scheduler.wake("market");
             }
@@ -870,22 +898,6 @@ impl Runtime {
         }
         self.interrupted
     }
-    fn instruments(&self) -> Result<Vec<(InstrumentId, PriceScale)>, String> {
-        self.definition
-            .definition
-            .instruments
-            .iter()
-            .map(|i| {
-                Ok((
-                    InstrumentId {
-                        broker: i.broker.clone(),
-                        provider_symbol: i.provider_symbol.clone(),
-                    },
-                    i.price_scale.try_into()?,
-                ))
-            })
-            .collect()
-    }
     fn check_authorization(&mut self) -> Result<(), String> {
         if self.mode == Mode::Live
             && !self.authorization_pending
@@ -935,6 +947,36 @@ impl Runtime {
             self.record(RecordKind::Ledger {
                 event: event.clone(),
             })?;
+            if let EventKind::Settled { command, .. }
+            | EventKind::Released { command, .. }
+            | EventKind::Reconciled {
+                command,
+                resolution:
+                    Resolution::Settled { .. }
+                    | Resolution::ExternallyClosed { .. }
+                    | Resolution::NotSent,
+                ..
+            } = &event.kind
+            {
+                let recovered = self.recovering_commands.remove(command);
+                let recovery_complete = recovered && self.recovering_commands.is_empty();
+                let settlement = matches!(
+                    event.kind,
+                    EventKind::Settled { .. }
+                        | EventKind::Reconciled {
+                            resolution: Resolution::Settled { .. }
+                                | Resolution::ExternallyClosed { .. },
+                            ..
+                        }
+                );
+                // An initial read already covers a synchronous unsent release. A settlement
+                // can change cash after an outstanding read, so require its successor snapshot.
+                if (recovery_complete && (!self.balance_pending || settlement))
+                    || (settlement && !self.health.balance_reconciled)
+                {
+                    self.balance_refresh_due = true;
+                }
+            }
             match &event.kind {
                 EventKind::Signal {
                     command: Some(_), ..
@@ -1024,7 +1066,16 @@ impl Runtime {
         if changed && self.prefix_at == self.replay_prefix.len() {
             self.compatibility()?;
         }
+        self.refresh_balance()?;
         Ok(signals)
+    }
+    fn refresh_balance(&mut self) -> Result<(), String> {
+        if self.balance_refresh_due && !self.balance_pending && !self.draining {
+            self.balance_refresh_due = false;
+            self.balance_pending = true;
+            self.send(Intent::Balance)?;
+        }
+        Ok(())
     }
     fn compatibility(&mut self) -> Result<(), String> {
         let events: Vec<_> = self
@@ -1200,6 +1251,7 @@ impl Runtime {
                 _ => {}
             }
         }
+        self.recovering_commands = open.clone();
         for command in open
             .iter()
             .filter(|command| !self.claims.contains_key(*command))
@@ -1335,7 +1387,7 @@ impl Runtime {
                 if self.draining {
                     return Ok(());
                 }
-                for (id, scale) in self.instruments()? {
+                for (id, scale) in self.definition.instruments()? {
                     if let Some(scheduler) = &self.scheduler {
                         scheduler.wake("market");
                     }
@@ -1952,7 +2004,7 @@ impl Runtime {
             self.check_replay_progress(generation)?;
         }
     }
-    /// Releases ownership, verifies closed segments, and publishes the restored ledger and receipt.
+    /// Releases ownership, verifies closed segments, and publishes the receipt and final manifest.
     pub fn finish(&mut self) -> Result<Completed, String> {
         self.check_archival_interruption()?;
         if self.prefix_at < self.replay_prefix.len() {
@@ -2054,15 +2106,19 @@ impl Runtime {
                 }
             })
             .collect::<Vec<_>>();
-        self.workers
-            .storage
-            .send(Storage::Ledger(events.clone()))
-            .map_err(|e| e.to_string())?;
-        while self.ledger_result.is_none() {
-            self.receive()?;
-            self.check_archival_interruption()?;
-        }
-        let ledger = self.ledger_result.take().unwrap()?;
+        let ledger = if self.mode == Mode::Replay {
+            self.workers
+                .storage
+                .send(Storage::Ledger(events.clone()))
+                .map_err(|e| e.to_string())?;
+            while self.ledger_result.is_none() {
+                self.receive()?;
+                self.check_archival_interruption()?;
+            }
+            Some(self.ledger_result.take().unwrap()?)
+        } else {
+            None
+        };
         let observation = Window {
             decision_start: self.settings.compatibility.observation_start.clone(),
             decision_end: self.settings.compatibility.observation_end.clone(),
@@ -2077,14 +2133,17 @@ impl Runtime {
             observation: &observation,
             min_samples: self.settings.compatibility.min_samples,
             scenarios: &self.definition.scenarios,
-            ledger: &ledger.generation,
+            ledger: &self.definition.manifest.definition,
             events: &events,
             refusals: &self.records,
         });
         let final_manifest = FinalManifest {
             deployment: self.definition.deployment.clone(),
-            ledger: format!("{}{}", self.destination_uri, ledger.key()),
-            ledger_generation: ledger.generation.clone(),
+            definition: self.definition.manifest.definition.clone(),
+            ledger: ledger
+                .as_ref()
+                .map(|ledger| format!("{}{}", self.destination_uri, ledger.key())),
+            ledger_generation: ledger.as_ref().map(|ledger| ledger.generation.clone()),
             receipt: format!("{}{}", self.destination_uri, receipt.key()),
             journal_segments: self.segments.clone(),
             open_tail: self.journal.open_tail()?,
@@ -2142,7 +2201,8 @@ impl Runtime {
         for record in &self.records {
             let related = match &record.kind {
                 RecordKind::Ledger { event } => match &event.kind {
-                    EventKind::Settled { command: id, .. }
+                    EventKind::Released { command: id, .. }
+                    | EventKind::Settled { command: id, .. }
                     | EventKind::Reconciled {
                         command: id,
                         resolution:
@@ -2160,7 +2220,6 @@ impl Runtime {
                     | EventKind::Acknowledged { command: id, .. }
                     | EventKind::Accepted { command: id, .. }
                     | EventKind::Confirmed { command: id, .. }
-                    | EventKind::Released { command: id, .. }
                     | EventKind::PossiblySent { command: id, .. }
                     | EventKind::Unresolved { command: id, .. }
                     | EventKind::Reconciled { command: id, .. }
@@ -2250,7 +2309,7 @@ impl Drop for Runtime {
 }
 
 pub struct Completed {
-    pub ledger: ReplayManifest,
+    pub ledger: Option<ReplayManifest>,
     pub receipt: receipt::Receipt,
     pub manifest: FinalManifest,
     pub manifest_uri: String,
@@ -2351,7 +2410,7 @@ pub fn replay(config_path: &Path, out: &mut dyn Write) -> Result<(), String> {
         .ok_or("live replay: live.replay is required")?;
     let base = config_path.parent().unwrap_or(Path::new("."));
     let (local, destination) = stores(&config, base)?;
-    let definition = definition(&config, &local, &destination)?;
+    let definition = definition(&config)?;
     let Broker::Deriv(broker) = config
         .brokers
         .iter()
@@ -2372,20 +2431,7 @@ pub fn replay(config_path: &Path, out: &mut dyn Write) -> Result<(), String> {
         class: address.account_class,
         currency: address.currency.clone(),
     };
-    let instruments = definition
-        .definition
-        .instruments
-        .iter()
-        .map(|i| {
-            Ok((
-                InstrumentId {
-                    broker: i.broker.clone(),
-                    provider_symbol: i.provider_symbol.clone(),
-                },
-                i.price_scale.try_into()?,
-            ))
-        })
-        .collect::<Result<Vec<_>, String>>()?;
+    let instruments = definition.instruments()?;
     let options = DerivOptions::connect(
         address,
         account,
@@ -2413,18 +2459,8 @@ pub fn replay(config_path: &Path, out: &mut dyn Write) -> Result<(), String> {
         Some(clock.clone()),
         Mode::Replay,
     )?;
-    let mut exhausted_at = None;
     let completed = runtime
-        .drive(|health| {
-            if recorded.exhausted() {
-                // Two idle polls drain an update/terminal pair decoded from the final frame.
-                if exhausted_at == Some(health.journal_sequence) {
-                    return Ok(true);
-                }
-                exhausted_at = Some(health.journal_sequence);
-            }
-            Ok(false)
-        })?
+        .drive(|_| Ok(recorded.exhausted()))?
         .ok_or("live replay: interrupted")?;
     report(
         Mode::Replay,
@@ -2444,7 +2480,7 @@ pub fn run(config_path: &Path, out: &mut dyn Write) -> Result<(), String> {
     };
     let base = config_path.parent().unwrap_or(Path::new("."));
     let (local, destination) = stores(&config, base)?;
-    let definition = definition(&config, &local, &destination)?;
+    let definition = definition(&config)?;
     let settings = config.live.as_ref().expect("definition requires live");
     let Broker::Deriv(broker) = config
         .brokers
@@ -2462,20 +2498,7 @@ pub fn run(config_path: &Path, out: &mut dyn Write) -> Result<(), String> {
         class: address.account_class,
         currency: address.currency.clone(),
     };
-    let instruments = definition
-        .definition
-        .instruments
-        .iter()
-        .map(|i| {
-            Ok((
-                InstrumentId {
-                    broker: i.broker.clone(),
-                    provider_symbol: i.provider_symbol.clone(),
-                },
-                i.price_scale.try_into()?,
-            ))
-        })
-        .collect::<Result<Vec<_>, String>>()?;
+    let instruments = definition.instruments()?;
     let options = DerivOptions::connect(
         address,
         account,
@@ -2545,11 +2568,7 @@ pub fn authorize(
     {
         return Err("live authorization: deployment, bundle, broker, or account mismatch".into());
     }
-    let local = Store::filesystem(
-        std::env::current_dir()
-            .map_err(|error| error.to_string())?
-            .join("target/live-authorization"),
-    );
+    let local = Store::filesystem(std::env::temp_dir());
     let (authorization, _) = authorization::create(
         &destination,
         &local,
@@ -2578,13 +2597,19 @@ fn row_ready(
     stream: &binary_alpha_engine::execution::StreamColumns,
     values: &[Option<binary_alpha_engine::features::Value>],
 ) -> bool {
-    use binary_alpha_engine::features::Value;
+    use binary_alpha_engine::{execution::value_ready, features::Value};
     stream.columns.iter().zip(values).all(|(column, value)| {
-        value.as_ref().is_some_and(|value| {
-            !matches!(value, Value::Text(text) if column.unready.iter().any(|unready| unready == text.as_ref()))
-        }) && column.readiness.iter().all(|flag| {
-            stream.columns.iter().position(|c| c.name == *flag).is_some_and(|i| values[i] == Some(Value::Bool(true)))
-        })
+        value_ready(
+            value.as_ref(),
+            &column.unready,
+            column.readiness.iter().map(|flag| {
+                stream
+                    .columns
+                    .iter()
+                    .position(|c| c.name == *flag)
+                    .is_some_and(|i| values[i] == Some(Value::Bool(true)))
+            }),
+        )
     })
 }
 

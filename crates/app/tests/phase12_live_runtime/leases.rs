@@ -236,6 +236,16 @@ fn two_runtimes_one_submits_both_observe() {
         rows.push(scenario_tick(START + second * 1_000_000, "180.0000"));
     }
     rows.extend_from_slice(&source[8..]);
+    // Recovery completes after the startup balance, so the owner reads cash again.
+    rows.push(account_row(
+        START + 5_000_000,
+        &crate::common::broker::replace(
+            &change(&frame("balance-before"), "balance", "balance", "10008.83"),
+            "req_id",
+            "90",
+        ),
+    ));
+
     for second in 6..=20 {
         rows.push(scenario_tick(START + second * 1_000_000, "180.0002"));
     }

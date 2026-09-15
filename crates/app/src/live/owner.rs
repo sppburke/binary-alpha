@@ -142,14 +142,16 @@ impl Runtime {
             )?,
             ReplyValue::Balance(balance) => {
                 self.balance_pending = false;
-                self.health.balance_reconciled =
-                    balance.compare(self.engine.accounts()[0].cash)? == std::cmp::Ordering::Equal;
+                self.health.balance_reconciled = !self.balance_refresh_due
+                    && balance.compare(self.engine.accounts()[0].cash)?
+                        == std::cmp::Ordering::Equal;
                 self.veto(
                     "broker balance differs from assessed or restored cash",
                     !self.health.balance_reconciled,
                 );
                 // A returned mismatch is a completed startup read, not a reason to poll forever.
                 self.veto("balance unavailable", false);
+                self.refresh_balance()?;
             }
             ReplyValue::OpenContracts(contracts) => {
                 if self.recovery_pending {

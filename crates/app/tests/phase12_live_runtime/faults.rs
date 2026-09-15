@@ -5,6 +5,10 @@
 //! These cases add destructive open-tail loss, statement-only evidence, the write
 //! checkpoints, interrupted archival, and the real-control reuse below.
 use super::support::{self, Fixture, START, change, frame, matching_log};
+use super::support::{
+    account_row as account, authorize, ledger_events as ledger, scenario_log as log,
+    scenario_rows as rows,
+};
 use binary_alpha_app::{
     broker::{self, Clock, transport::RecordedConnector},
     live::{
@@ -20,21 +24,10 @@ use binary_alpha_engine::execution::{
 use serde_json::{Value, json};
 use std::{fs, sync::Arc};
 
-fn rows(log: &str) -> Vec<Value> {
-    log.lines()
-        .map(|line| serde_json::from_str(line).unwrap())
-        .collect()
-}
-fn log(rows: &[Value]) -> String {
-    rows.iter().map(|row| format!("{row}\n")).collect()
-}
-fn account(at: i64, frame: Value) -> Value {
-    json!({"session":"account","at":at,"frame":frame.to_string()})
-}
 fn portfolio(at: i64) -> Value {
     account(
         at,
-        json!({"msg_type":"portfolio","req_id":71,"portfolio":{"contracts":[]}}),
+        &json!({"msg_type":"portfolio","req_id":71,"portfolio":{"contracts":[]}}).to_string(),
     )
 }
 fn statement(at: i64, purchased: bool) -> Value {
@@ -47,8 +40,9 @@ fn statement(at: i64, purchased: bool) -> Value {
     };
     account(
         at,
-        json!({"msg_type":"statement","req_id":72,"statement":{
-        "count":transactions.as_array().unwrap().len(),"transactions":transactions}}),
+        &json!({"msg_type":"statement","req_id":72,"statement":{
+        "count":transactions.as_array().unwrap().len(),"transactions":transactions}})
+        .to_string(),
     )
 }
 fn startup(at: i64, reconcile: bool, purchased: bool, cash: &str) -> Vec<Value> {
@@ -61,19 +55,10 @@ fn startup(at: i64, reconcile: bool, purchased: bool, cash: &str) -> Vec<Value> 
     if reconcile {
         input.push(statement(at, purchased));
     }
+    input.push(account(at, &frame("transaction-ack")));
     input.push(account(
         at,
-        serde_json::from_str(&frame("transaction-ack")).unwrap(),
-    ));
-    input.push(account(
-        at,
-        serde_json::from_str(&change(
-            &frame("balance-before"),
-            "balance",
-            "balance",
-            cash,
-        ))
-        .unwrap(),
+        &change(&frame("balance-before"), "balance", "balance", cash),
     ));
     input
 }
@@ -123,16 +108,7 @@ fn key(fixture: &Fixture) -> LeaseKey<'_> {
 fn decimal(value: &str) -> Decimal {
     Decimal::parse(value).unwrap()
 }
-fn ledger(owner: &live::Runtime) -> Vec<FinancialEvent> {
-    owner
-        .records()
-        .iter()
-        .filter_map(|record| match &record.kind {
-            RecordKind::Ledger { event } => Some(event.clone()),
-            _ => None,
-        })
-        .collect()
-}
+
 fn kinds(owner: &live::Runtime) -> Vec<String> {
     ledger(owner)
         .iter()
@@ -161,27 +137,7 @@ fn balances(owner: &live::Runtime, cash: &str, reserved: &str, paid: &str, loss:
     assert_eq!(owner.health().risk, *state);
     assert_eq!(owner.health().open_commands, open);
 }
-fn authorize(fixture: &Fixture) {
-    let definition = fixture.definition();
-    let manifest = definition.manifest;
-    let (local, destination) = fixture.stores();
-    live::authorization::create(
-        &destination,
-        &local,
-        live::authorization::Authorization {
-            schema_version: 1,
-            deployment: manifest.hash,
-            configuration: manifest.config_hash,
-            bundle_sha256: manifest.bundle_sha256,
-            broker: manifest.broker,
-            account: manifest.account,
-            operator: "synthetic-fault-operator".into(),
-            reason: "deterministic fake broker fixture".into(),
-            hash: String::new(),
-        },
-    )
-    .unwrap();
-}
+
 fn run(
     fixture: &Fixture,
     mode: live::Mode,
@@ -426,9 +382,7 @@ pub fn statement_recovery_scenario(
     inspect: &mut dyn Control,
     original: &Claim,
 ) {
-    // Preserve completed observation-only publication so the extended ledger has a new
-    // local fixture publication surface; journal/cloud recovery evidence remains intact.
-    preserve_ledger_manifest(fixture, "ambiguous");
+    let retained = support::published_snapshot(fixture);
     let source = rows(&matching_log());
     let mut input = startup(START, true, true, "9990");
     input.extend([source[4].clone(), source[7].clone(), source[5].clone()]);
@@ -526,20 +480,21 @@ pub fn statement_recovery_scenario(
     );
     let restored = Engine::restore(ledger(&owner).iter().map(|e| Ok(e.to_line()))).unwrap();
     assert_eq!(restored.accounts(), owner.engine().accounts());
-}
-fn preserve_ledger_manifest(fixture: &Fixture, name: &str) {
-    let id = fixture.definition().manifest.definition;
-    for store in ["local", "published"] {
-        let path = fixture.scratch.path(store).join("manifests").join(&id);
-        if path.exists() {
-            fs::rename(
-                &path,
-                fixture
-                    .scratch
-                    .path(&format!("{name}-{store}-ledger-manifest")),
-            )
-            .unwrap();
-        }
+    assert!(completed.ledger.is_none());
+    assert!(completed.manifest.ledger.is_none());
+    assert!(completed.manifest.ledger_generation.is_none());
+    assert_eq!(
+        completed.manifest.definition,
+        owner.definition.manifest.definition
+    );
+    assert_eq!(completed.receipt.ledger, completed.manifest.definition);
+    for (path, bytes) in retained {
+        assert_eq!(
+            fs::read(&path).unwrap(),
+            bytes,
+            "retained publication {}",
+            path.display()
+        );
     }
 }
 
@@ -1574,4 +1529,289 @@ fn malformed_journal_tail_refuses_recovery_without_mutating_the_claim() {
         assert_eq!(buys(&restarted), 0);
     }
     fs::write(path, original).unwrap();
+}
+
+#[test]
+fn continued_live_finish_extends_verified_journal_and_retains_publications() {
+    let mut fixture = Fixture::new("continued-live-finish");
+    fixture
+        .config
+        .live
+        .as_mut()
+        .unwrap()
+        .journal
+        .segment_records = 8;
+    let mut control = FakeControl::new(START);
+    let claim = checkpoint_recovery_scenario(
+        &fixture,
+        Box::new(control.clone()),
+        Box::new(control.clone()),
+        &mut control,
+        Checkpoint::AfterClaimBeforeWrite,
+    );
+    let finals = fixture
+        .scratch
+        .path("published/live")
+        .join(&claim.deployment)
+        .join("final");
+    let first_path = fs::read_dir(&finals)
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    let first_bytes = fs::read(&first_path).unwrap();
+    let first: live::FinalManifest = serde_json::from_slice(&first_bytes).unwrap();
+    assert!(first.ledger.is_none());
+    assert!(
+        !fixture
+            .scratch
+            .path("published")
+            .join(binary_alpha_engine::dataset::manifest_key(
+                &first.definition
+            ))
+            .exists()
+    );
+    statement_recovery_scenario(&fixture, Box::new(control.clone()), &mut control, &claim);
+    let second_path = fs::read_dir(&finals)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .find(|p| p != &first_path)
+        .unwrap();
+    let second: live::FinalManifest =
+        serde_json::from_slice(&fs::read(second_path).unwrap()).unwrap();
+    assert!(second.journal_segments.len() > first.journal_segments.len());
+    assert!(
+        first
+            .journal_segments
+            .iter()
+            .all(|segment| second.journal_segments.contains(segment))
+    );
+    assert_eq!(first.definition, second.definition);
+    assert_eq!(fs::read(first_path).unwrap(), first_bytes);
+    for segment in &second.journal_segments {
+        let bytes = fs::read(fixture.scratch.path("published").join(&segment.key)).unwrap();
+        assert_eq!(
+            binary_alpha_engine::research::digest(b"", &bytes),
+            segment.sha256
+        );
+    }
+    if let Some(tail) = &second.open_tail {
+        let bytes = fs::read(fixture.scratch.path("journal/open.jsonl")).unwrap();
+        assert_eq!(
+            binary_alpha_engine::research::digest(b"", &bytes),
+            tail.sha256
+        );
+        let records: Vec<Record> = bytes
+            .split(|b| *b == b'\n')
+            .filter(|l| !l.is_empty())
+            .map(|l| serde_json::from_slice(l).unwrap())
+            .collect();
+        assert_eq!(records.first().unwrap().sequence, tail.first_sequence);
+        assert_eq!(records.last().unwrap().sequence, tail.last_sequence);
+    }
+}
+
+fn offline_settlement_scenario(name: &str, refreshed_balance: &str) {
+    let fixture = Fixture::new(name);
+    let mut control = FakeControl::new(START);
+    let recorded = RecordedConnector::from_jsonl(&matching_log()).unwrap();
+    let mut predecessor = run(
+        &fixture,
+        live::Mode::Replay,
+        &recorded,
+        Box::new(control.clone()),
+    );
+    stop_at(&mut predecessor, Checkpoint::AfterAcknowledgement);
+    let token = predecessor.health().fencing_token;
+    balances(&predecessor, "9990", "0", "10", "10", 1);
+    drop(predecessor);
+    assert!(
+        control
+            .release(key(&fixture), "synthetic-owner", token)
+            .unwrap()
+    );
+    authorize(&fixture);
+    let divergent = refreshed_balance != "10008.83";
+    let at = if divergent { START } else { START + 5_000_000 };
+    let source = rows(&matching_log());
+    let mut input = startup(at, true, true, "10008.83");
+    if divergent {
+        input.push(source[4].clone());
+    }
+    // Startup sees the offline credit before the contract subscription returns terminal evidence.
+    for i in [7, 9, 10, 11] {
+        let mut row = source[i].clone();
+        row["at"] = json!(if divergent {
+            row["at"].as_i64().unwrap()
+        } else {
+            at
+        });
+        input.push(row);
+        if divergent && i == 7 {
+            input.push(source[5].clone());
+            for second in 1..=5 {
+                input.push(tick(START + second * 1_000_000, "180.0001"));
+            }
+        }
+    }
+    let balance = change(
+        &frame("balance-before"),
+        "balance",
+        "balance",
+        refreshed_balance,
+    );
+    input.push(support::account_row(
+        START + 5_000_000,
+        &crate::common::broker::replace(&balance, "req_id", "90"),
+    ));
+    if divergent {
+        for second in 6..=20 {
+            input.push(tick(
+                START + second * 1_000_000,
+                if second == 20 { "180.0000" } else { "180.0001" },
+            ));
+        }
+        input.push(proposal(START + 20_000_000));
+    }
+    let recorded = RecordedConnector::from_jsonl(&log(&input)).unwrap();
+    let mut owner = run(&fixture, live::Mode::Live, &recorded, Box::new(control));
+    assert!(!owner.health().balance_reconciled);
+    assert!(
+        matches!(&owner.health().entries, Entries::Disabled(r) if r.contains("broker balance differs"))
+    );
+    assert_eq!(owner.engine().accounts()[0].cash, decimal("9990.00"));
+    owner.run_until(|_| recorded.exhausted()).unwrap().unwrap();
+    balances(&owner, "10008.83", "0", "0", "0", 0);
+    if divergent {
+        assert!(owner.health().warmup);
+        assert!(ledger(&owner).iter().any(|e| matches!(&e.kind, EventKind::Released { source, .. } if source.id.starts_with("entry-disabled:"))));
+        assert!(
+            ledger(&owner)
+                .iter()
+                .filter(|e| matches!(e.kind, EventKind::Signal { .. }))
+                .count()
+                >= 2
+        );
+    }
+    assert_eq!(
+        owner.health().balance_reconciled,
+        refreshed_balance == "10008.83"
+    );
+    assert_eq!(
+        matches!(&owner.health().entries, Entries::Disabled(r) if r.contains("broker balance differs")),
+        refreshed_balance != "10008.83"
+    );
+    assert_eq!(
+        ledger(&owner)
+            .iter()
+            .filter(|e| matches!(e.kind, EventKind::Settled { .. }))
+            .count(),
+        1
+    );
+    assert_eq!(
+        recorded
+            .writes()
+            .iter()
+            .filter(|(_, s)| s.contains("\"balance\":"))
+            .count(),
+        2
+    );
+    assert_eq!(buys(&recorded), 0);
+}
+
+#[test]
+fn offline_settlement_refreshes_balance_and_clears_recovery_veto() {
+    offline_settlement_scenario("offline-settlement-balance", "10008.83");
+}
+
+#[test]
+fn startup_balance_divergence_vetoes_entries_while_settlement_continues() {
+    offline_settlement_scenario("startup-balance-divergence", "10009.83");
+}
+
+#[test]
+fn released_rejected_and_proven_unsent_claims_delete_only_after_verified_full_segments() {
+    for (rejected, segment_records) in [(false, 1), (true, 1), (false, 1024), (true, 1024)] {
+        let mut fixture = Fixture::new(&format!("released-archive-{rejected}-{segment_records}"));
+        fixture
+            .config
+            .live
+            .as_mut()
+            .unwrap()
+            .journal
+            .segment_records = segment_records;
+        let mut input = rows(&matching_log())[..if rejected { 7 } else { 6 }].to_vec();
+        if rejected {
+            input[6]["frame"] = json!(
+                r#"{"msg_type":"buy","req_id":5,"error":{"code":"PriceMoved","message":"synthetic rejected purchase"}}"#
+            );
+        }
+        let recorded = RecordedConnector::from_jsonl(&log(&input)).unwrap();
+        let offset = crate::common::broker::FakeClock::at(0);
+        let clock = OffsetClock {
+            recorded: recorded.clock(),
+            offset: offset.clone(),
+        };
+        let mut control = FakeControl::new(START);
+        let mut owner = support::runtime_with_test_clock(
+            &fixture,
+            live::Mode::Replay,
+            &recorded,
+            Box::new(control.clone()),
+            |_| {},
+            |m| m,
+            |a| a,
+            clock,
+        )
+        .unwrap();
+        let cloud = fixture
+            .scratch
+            .path("published/live")
+            .join(&owner.definition.deployment)
+            .join("journal");
+        fs::create_dir_all(cloud.parent().unwrap()).unwrap();
+        fs::write(&cloud, b"unavailable until terminal lifecycle is retained").unwrap();
+        owner.hook = Some(Box::new(move |at| {
+            if !rejected && at == Checkpoint::AfterClaimBeforeWrite {
+                offset.clone().sleep(1_000_001);
+            }
+            false
+        }));
+        let mut saw_terminal_row = false;
+        owner
+            .run_until(|health| {
+                if recorded.exhausted() && health.open_commands == 0 {
+                    let retained = control.retained_claims(key(&fixture)).unwrap();
+                    assert_eq!(retained.len(), 1);
+                    assert_eq!(retained[0].state, ClaimState::Reconciled);
+                    saw_terminal_row = true;
+                    fs::remove_file(&cloud).unwrap();
+                    true
+                } else {
+                    false
+                }
+            })
+            .unwrap()
+            .unwrap();
+        assert!(saw_terminal_row);
+        assert!(ledger(&owner).iter().any(
+            |e| matches!(e.kind, EventKind::Released { rejected: actual, .. } if actual == rejected)
+        ));
+        assert_eq!(
+            control.retained_claims(key(&fixture)).unwrap().is_empty(),
+            segment_records == 1
+        );
+        assert_eq!(buys(&recorded), usize::from(rejected));
+        let terminal = owner.records().iter().find(|r| matches!(&r.kind, RecordKind::Ledger { event } if matches!(event.kind, EventKind::Released { .. }))).unwrap();
+        let key = format!("{:020}-{:020}.jsonl", terminal.sequence, terminal.sequence);
+        if segment_records == 1 {
+            assert_eq!(
+                fs::read(cloud.join(key)).unwrap(),
+                journal_bytes(std::slice::from_ref(terminal))
+            );
+        } else {
+            assert!(!cloud.exists());
+        }
+    }
 }

@@ -2679,6 +2679,17 @@ pub struct Engine {
     failed: bool,
 }
 
+/// A value is ready when it is present, outside the declared unready labels, and every
+/// readiness flag is true. Callers resolve flag positions against their bound stream.
+pub fn value_ready(
+    value: Option<&Value>,
+    unready: &[String],
+    readiness: impl IntoIterator<Item = bool>,
+) -> bool {
+    value.is_some_and(|value| !matches!(value, Value::Text(text) if unready.iter().any(|label| label == text.as_ref())))
+        && readiness.into_iter().all(|ready| ready)
+}
+
 impl Engine {
     /// Compiles the definition against its own column lists and starts from the accounts'
     /// initial cash with no obligations. The definition record is the first ledger record.
@@ -4955,23 +4966,20 @@ impl Engine {
         if row.close_time_micros > base_close {
             return false;
         }
-        if condition
-            .readiness
-            .iter()
-            .any(|flag| row.values[*flag] != Some(Value::Bool(true)))
-        {
-            return false;
-        }
-        let Some(value) = &row.values[condition.column] else {
-            return false;
-        };
         let spec = &self.definition.instruments[instrument].streams[condition.stream].columns
             [condition.column];
-        if let Value::Text(text) = value
-            && spec.unready.iter().any(|unready| unready == text.as_ref())
-        {
+        let value = row.values[condition.column].as_ref();
+        if !value_ready(
+            value,
+            &spec.unready,
+            condition
+                .readiness
+                .iter()
+                .map(|flag| row.values[*flag] == Some(Value::Bool(true))),
+        ) {
             return false;
         }
+        let value = value.expect("ready value");
         let label: Option<Cow<'_, str>> = spec
             .encoding
             .as_ref()

@@ -1,5 +1,7 @@
+use super::support::{self, Fixture, START, change, frame, matching_log, runtime, runtime_with};
 use super::support::{
-    self, Fixture, START, change, frame, log_line, matching_log, runtime, runtime_with,
+    account_row as account, authorize, ledger_events as ledger, scenario_log as log,
+    scenario_rows as rows,
 };
 use binary_alpha_app::{
     broker::{self, MarketDataBroker, transport::RecordedConnector},
@@ -10,7 +12,7 @@ use binary_alpha_app::{
     },
 };
 use binary_alpha_engine::{
-    execution::{EventKind, FinancialEvent, Resolution},
+    execution::{EventKind, Resolution},
     market::{InstrumentId, PriceScale},
 };
 use serde_json::{Value, json};
@@ -22,17 +24,6 @@ use std::{
     },
 };
 
-fn rows(log: &str) -> Vec<Value> {
-    log.lines()
-        .map(|s| serde_json::from_str(s).unwrap())
-        .collect()
-}
-fn log(rows: &[Value]) -> String {
-    rows.iter().map(|r| format!("{r}\n")).collect()
-}
-fn account(at: i64, text: &str) -> Value {
-    serde_json::from_str(&log_line("account", at, text)).unwrap()
-}
 fn portfolio(at: i64, contracts: Value) -> Value {
     account(
         at,
@@ -63,16 +54,7 @@ fn refusal(at: i64) -> Value {
         &json!({"msg_type":"proposal","req_id":9844+(at-START).max(0),"error":{"code":"RateLimit"}}).to_string(),
     )
 }
-fn ledger(runtime: &live::Runtime) -> Vec<FinancialEvent> {
-    runtime
-        .records()
-        .iter()
-        .filter_map(|r| match &r.kind {
-            RecordKind::Ledger { event } => Some(event.clone()),
-            _ => None,
-        })
-        .collect()
-}
+
 fn key() -> LeaseKey<'static> {
     LeaseKey {
         broker: "deriv",
@@ -139,28 +121,6 @@ fn startup(at: i64, contracts: Value, reconcile: bool, cash: &str) -> Vec<Value>
     result
 }
 
-fn authorize(fixture: &Fixture) {
-    let definition = fixture.definition();
-    let manifest = definition.manifest;
-    let (local, destination) = fixture.stores();
-    live::authorization::create(
-        &destination,
-        &local,
-        live::authorization::Authorization {
-            schema_version: 1,
-            deployment: manifest.hash,
-            configuration: manifest.config_hash,
-            bundle_sha256: manifest.bundle_sha256,
-            broker: manifest.broker,
-            account: manifest.account,
-            operator: "synthetic-operator".into(),
-            reason: "synthetic runtime regression".into(),
-            hash: String::new(),
-        },
-    )
-    .unwrap();
-}
-
 #[test]
 fn restored_nonbaseline_refusal_vetoes_an_eligible_authorized_purchase() {
     let fixture = Fixture::new("restored-refusal-veto");
@@ -179,16 +139,7 @@ fn restored_nonbaseline_refusal_vetoes_an_eligible_authorized_purchase() {
         &recorded,
         FakeControl::new(START),
     );
-    let completed = first.run_until(|_| recorded.exhausted()).unwrap().unwrap();
-    for store in ["published", "local"] {
-        fs::rename(
-            fixture.scratch.path(store).join(completed.ledger.key()),
-            fixture
-                .scratch
-                .path(&format!("refusal-{store}-ledger-manifest.json")),
-        )
-        .unwrap();
-    }
+    first.run_until(|_| recorded.exhausted()).unwrap().unwrap();
     let cut = first
         .records()
         .iter()
@@ -1863,7 +1814,10 @@ fn partial_tail_stays_local_and_retains_claim_for_host_loss_recovery() {
     assert_eq!(tail.bytes, bytes.len() as u64);
     assert_eq!(
         completed.manifest.ledger_generation,
-        completed.ledger.generation
+        completed
+            .ledger
+            .as_ref()
+            .map(|ledger| ledger.generation.clone())
     );
     assert_eq!(
         control.retained_claims(key()).unwrap()[0].state,
@@ -1883,15 +1837,6 @@ fn partial_tail_stays_local_and_retains_claim_for_host_loss_recovery() {
         fixture.scratch.path("lost-host-journal"),
     )
     .unwrap();
-    for store in ["published", "local"] {
-        fs::rename(
-            fixture.scratch.path(store).join(completed.ledger.key()),
-            fixture
-                .scratch
-                .path(&format!("before-host-loss-{store}-manifest.json")),
-        )
-        .unwrap();
-    }
     let (_, destination) = fixture.stores();
     assert_eq!(
         Journal::restore(

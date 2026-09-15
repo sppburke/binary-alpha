@@ -11,8 +11,6 @@ use binary_alpha_engine::execution::{FinancialEvent, Proposal};
 use binary_alpha_engine::research::digest;
 use serde::{Deserialize, Serialize};
 
-pub const RECORD_SCHEMA_VERSION: u32 = 1;
-
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Record {
     pub sequence: u64,
@@ -69,9 +67,6 @@ pub enum RecordKind {
     },
     Discontinuity {
         reason: String,
-    },
-    Segment {
-        closed: u64,
     },
 }
 

@@ -156,7 +156,7 @@ fn live_replay_drives_recorded_log_to_receipt_and_final_manifest() {
         }
     }
     let ledger_manifest: binary_alpha_engine::execution::ReplayManifest =
-        serde_json::from_slice(&read_uri(&final_manifest.ledger)).unwrap();
+        serde_json::from_slice(&read_uri(final_manifest.ledger.as_deref().unwrap())).unwrap();
     let ledger = object(
         &fixture.scratch.root,
         &ledger_manifest.generation,
@@ -217,7 +217,10 @@ fn live_replay_drives_recorded_log_to_receipt_and_final_manifest() {
         assert_eq!(records.last().unwrap().sequence, tail.last_sequence);
         journal.extend(records);
     }
-    assert_eq!(final_manifest.ledger_generation, ledger_manifest.generation);
+    assert_eq!(
+        final_manifest.ledger_generation.as_deref(),
+        Some(ledger_manifest.generation.as_str())
+    );
     journal.sort_by_key(|r| r.sequence);
     let cut=journal.iter().position(|r|matches!(&r.kind,live::journal::RecordKind::Ledger{event} if matches!(event.kind,binary_alpha_engine::execution::EventKind::Accepted{..}))).unwrap()+1;
     // Preserve completed synthetic evidence, then simulate a separate process whose durable tail
@@ -352,8 +355,7 @@ fn projection_refuses_ineligible_bundles() {
             serde_json::to_vec(&value_json).unwrap(),
         )
         .unwrap();
-        let (local, destination) = fixture.stores();
-        assert_eq!(live::definition(&fixture.config,&local,&destination).err().unwrap(),expected,"{field}");
+        assert_eq!(live::definition(&fixture.config).err().unwrap(),expected,"{field}");
     }
     fs::write(cert_path.strip_prefix("file://").unwrap(), cert_bytes).unwrap();
     let recorded = RecordedConnector::from_jsonl(&matching_log()).unwrap();
@@ -663,6 +665,26 @@ fn authorization_cli_enables_the_same_live_owner() {
         "--reason",
         "synthetic operator approval",
     ];
+    // A non-directory target path makes the former cwd/target staging impossible.
+    write(
+        &fixture.scratch.path("target"),
+        b"target must remain untouched",
+    );
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_binary-alpha"))
+        .args(args)
+        .current_dir(&fixture.scratch.root)
+        .env("USER", "synthetic-operator")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        fs::read(fixture.scratch.path("target")).unwrap(),
+        b"target must remain untouched"
+    );
     let authorization = cli(&fixture.log(), &args).unwrap();
     assert_eq!(cli(&fixture.log(), &args).unwrap(), authorization);
     assert!(authorization.starts_with("live authorization "));
@@ -699,6 +721,10 @@ fn paper_owner_observes_without_a_dispatch_claim_or_write() {
         .unwrap()
         .unwrap();
     assert!(!completed.receipt.promotion.eligible);
+    assert!(completed.ledger.is_none());
+    assert!(completed.manifest.ledger.is_none());
+    assert!(completed.manifest.ledger_generation.is_none());
+    assert_eq!(completed.receipt.ledger, completed.manifest.definition);
     assert!(runtime.records().iter().any(|r|matches!(&r.kind,live::journal::RecordKind::Ledger{event} if matches!(&event.kind,binary_alpha_engine::execution::EventKind::Released{source,rejected:false,..} if source.id.starts_with("paper:")))));
     assert!(runtime.engine().accounts()[0].reserved.is_zero());
     assert_eq!(runtime.engine().accounts()[0].cash.to_string(), "10000.00");
@@ -1220,4 +1246,226 @@ fn stalled_recorded_log_fails_without_final_publication() {
             .join("final")
             .exists()
     );
+}
+
+#[test]
+fn unused_broker_template_preserves_historical_provenance_and_window_checks() {
+    use binary_alpha_engine::execution::{Engine, SettlementRule};
+    let fixture = Fixture::new("unused-broker-template");
+    let bytes = object(
+        &fixture.scratch.root,
+        &fixture.run.outer[0].outer.replay.generation,
+        "ledger/events.jsonl",
+    );
+    let engine = Engine::restore(
+        bytes
+            .split(|b| *b == b'\n')
+            .filter(|l| !l.is_empty())
+            .map(|l| Ok(l.to_vec())),
+    )
+    .unwrap();
+    let mut config = fixture.config.clone();
+    config.live = None;
+    config.replay = Some(engine.definition().replay.clone());
+    let replay = config.replay.as_mut().unwrap();
+    let mut unused = fixture.definition().policy.replay.contracts[0].clone();
+    unused.id = "unused-broker-template".into();
+    assert_eq!(
+        unused.settlement.rule,
+        SettlementRule::BrokerAuthoritativeV1
+    );
+    assert!(
+        replay
+            .contracts
+            .iter()
+            .all(|c| c.settlement.rule == SettlementRule::PriceAtDueV1)
+    );
+    replay.contracts.push(unused);
+    let path = fixture.scratch.path("historical-unused.toml");
+    write(&path, config.canonical_toml());
+    binary_alpha_app::replay::run(&path, &mut Vec::new()).unwrap();
+    let mut mismatched = config.clone();
+    let replay = mismatched.replay.as_mut().unwrap();
+    let alternative = crate::fixture_config::import_ticks(
+        &fixture.scratch.root,
+        "other-historical-input",
+        replay.role,
+        "deriv",
+        &["R_50"],
+        &[4],
+        &[crate::fixture_config::ticks_at_scale(
+            crate::fixture_config::BASE + 3 * crate::fixture_config::HOUR + 1_000_000,
+            &crate::fixture_config::recipe(PLANTED),
+            4,
+        )],
+    );
+    replay.inputs[0].tick_manifest =
+        crate::fixture_config::uri(&fixture.scratch.root, &alternative[0].generation);
+    write(&path, mismatched.canonical_toml());
+    let error = binary_alpha_app::replay::run(&path, &mut Vec::new()).unwrap_err();
+    assert!(
+        error.contains("was computed from tick generation"),
+        "{error}"
+    );
+    let replay = config.replay.as_mut().unwrap();
+    replay.splits = None;
+    replay.decision_start = replay.decision_end.clone();
+    replay.decision_end = crate::fixture_config::time(
+        binary_alpha_engine::market::parse_event_time_micros(&replay.decision_start).unwrap()
+            + 20_000_000,
+    );
+    write(&path, config.canonical_toml());
+    let error = binary_alpha_app::replay::run(&path, &mut Vec::new()).unwrap_err();
+    assert!(
+        error.contains("lies outside the declared decision window"),
+        "{error}"
+    );
+}
+
+#[test]
+fn market_before_bootstrap_or_transaction_ack_fails_immediately() {
+    let fixture = Fixture::new("impossible-startup-order");
+    let source = scenario_rows(&matching_log());
+    for (name, input, expected) in [
+        (
+            "bootstrap",
+            vec![source[4].clone(), source[0].clone(), source[1].clone()],
+            "recorded bootstrap: expected bootstrap response before market or account frames",
+        ),
+        (
+            "transaction-ack",
+            vec![
+                source[0].clone(),
+                source[1].clone(),
+                source[4].clone(),
+                source[2].clone(),
+                source[3].clone(),
+            ],
+            "live replay: recorded log stalled before all frames and expected writes were consumed",
+        ),
+    ] {
+        write(&fixture.scratch.path("broker.jsonl"), scenario_log(&input));
+        let error = cli(
+            &fixture.log(),
+            &["live", "replay", "--config", fixture.path.to_str().unwrap()],
+        )
+        .unwrap_err();
+        assert_eq!(error, expected, "{name}");
+        assert!(
+            !fixture
+                .scratch
+                .path("published/live")
+                .join(fixture.definition().deployment)
+                .join("final")
+                .exists()
+        );
+    }
+}
+
+#[test]
+fn authenticated_broker_or_account_mismatch_is_refused_at_start() {
+    let fixture = Fixture::new("authenticated-binding-mismatch");
+    for field in ["broker", "account"] {
+        let recorded = RecordedConnector::from_jsonl(&matching_log()).unwrap();
+        let error = runtime_with(
+            &fixture,
+            live::Mode::Replay,
+            &recorded,
+            Box::new(live::control::FakeControl::new(START)),
+            |definition| {
+                let account = &mut definition.definition.replay.accounts[0];
+                if field == "broker" {
+                    account.broker = serde_json::from_value(json!("other")).unwrap();
+                } else {
+                    account.id = "other".into();
+                }
+            },
+            |m| m,
+        )
+        .err()
+        .unwrap();
+        assert_eq!(error, "live: broker account binding mismatch", "{field}");
+        assert!(!fixture.scratch.path("journal").exists());
+        assert!(
+            !recorded
+                .writes()
+                .iter()
+                .any(|(_, text)| text.contains("\"buy\":"))
+        );
+    }
+}
+
+#[test]
+fn stale_quote_at_decision_uses_engine_disposition_without_dispatch() {
+    use binary_alpha_engine::execution::{Disposition, EventKind};
+    let fixture = Fixture::new("runtime-stale-quote");
+    let mut input = scenario_rows(&matching_log())[..6].to_vec();
+    // The feature closes on this tick; its receipt and decision are later than provider time.
+    input[4]["at"] = json!(START + 100_001);
+    input[5]["at"] = json!(START + 100_001);
+    let recorded = RecordedConnector::from_jsonl(&scenario_log(&input)).unwrap();
+    let mut owner = runtime_with(
+        &fixture,
+        live::Mode::Replay,
+        &recorded,
+        Box::new(live::control::FakeControl::new(START)),
+        |definition| {
+            for replay in [
+                &mut definition.definition.replay,
+                &mut definition.policy.replay,
+            ] {
+                replay.risk_policies[0].max_quote_age_micros = 100_000;
+            }
+        },
+        |m| m,
+    )
+    .unwrap();
+    owner.run_until(|_| recorded.exhausted()).unwrap().unwrap();
+    assert!(
+        ledger_events(&owner).iter().any(|event| matches!(
+            event.kind,
+            EventKind::Signal {
+                disposition: Disposition::StaleQuote,
+                command: None,
+                ..
+            }
+        )),
+        "{:?}",
+        ledger_events(&owner)
+    );
+    assert_eq!(owner.engine().accounts()[0].cash.to_string(), "10000.00");
+    assert!(
+        !owner
+            .records()
+            .iter()
+            .any(|r| matches!(r.kind, live::journal::RecordKind::Claimed { .. }))
+    );
+    assert!(
+        !recorded
+            .writes()
+            .iter()
+            .any(|(_, text)| text.contains("\"buy\":"))
+    );
+}
+
+#[test]
+fn shared_value_readiness_rejects_false_flags_missing_values_and_unready_labels() {
+    use binary_alpha_engine::{execution::value_ready, features::Value};
+    let unready = vec!["not_ready".into()];
+    assert!(!value_ready(
+        Some(&Value::Text("up".into())),
+        &unready,
+        [false]
+    ));
+    assert!(!value_ready(
+        Some(&Value::Text("not_ready".into())),
+        &unready,
+        [true]
+    ));
+    assert!(!value_ready(None, &unready, [true]));
+    assert!(value_ready(
+        Some(&Value::Text("up".into())),
+        &unready,
+        [true]
+    ));
 }
