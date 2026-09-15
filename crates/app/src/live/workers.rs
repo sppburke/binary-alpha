@@ -159,6 +159,11 @@ impl Workers {
                         match market.subscribe(&id, scale) {
                             Ok(()) => subscribed = true,
                             Err(reason) => {
+                                // Cancellation may interrupt the initial subscription just as
+                                // it interrupts an ordinary poll; shutdown is not an adapter fault.
+                                if stopped.load(Ordering::SeqCst) {
+                                    return;
+                                }
                                 if !deliver(
                                     &tx,
                                     &market_done,
@@ -174,8 +179,9 @@ impl Workers {
                 if !subscribed {
                     if let Some(clock) = &market_clock {
                         clock.idle("market");
+                    } else {
+                        std::thread::park_timeout(Duration::from_micros(POLL_MICROS as u64));
                     }
-                    std::thread::park_timeout(Duration::from_micros(POLL_MICROS as u64));
                     continue;
                 }
                 let event = match market.next_live(POLL_MICROS) {
@@ -317,8 +323,9 @@ impl Workers {
                     if !initialized || failed {
                         if let Some(clock) = &account_clock {
                             clock.idle("account");
+                        } else {
+                            std::thread::park_timeout(Duration::from_micros(POLL_MICROS as u64));
                         }
-                        std::thread::park_timeout(Duration::from_micros(POLL_MICROS as u64));
                         continue;
                     }
                     let event = match options.next_account_event(POLL_MICROS) {

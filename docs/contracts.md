@@ -1911,16 +1911,16 @@ serialized record bytes, excluding the newline; the first record uses sixty-four
 
 `Journal::append` writes and synchronizes each line with `sync_data`. The sole open file is
 `<dir>/open.jsonl`; closed files are `<first>-<last>.jsonl`, with each sequence zero-padded to
-twenty digits. Automatic rotation occurs at `segment_records`; explicit rotation can close a
-partial tail. `Journal::open` checks contiguous sequence, deployment, record hashes, complete
-lines, and filename ranges. It refuses malformed committed evidence. The newest open-tail record
+twenty digits. Rotation occurs only at `segment_records`; a partial open tail is never rotated
+or uploaded and stays local. `Journal::open` checks contiguous sequence, deployment, record hashes,
+complete lines, and filename ranges. It refuses malformed committed evidence. The newest open-tail record
 is unanchored until a successor exists; the open segment is not lossless under host or disk loss.
 
 Closed objects use `live/<deployment>/journal/<first>-<last>.jsonl`. The caller publishes through
 the existing [artifact owner](#artifacts), verifies the object identity with `put_new` and `head`,
 then calls `mark_uploaded`, which renames the local file with `.uploaded`. Only full uploaded
-segments are eligible for `remove_uploaded`; a published partial tail stays local. `restore`
-walks deterministic full-segment names from sequence 1 and restores cleaned files before `open`;
+segments are eligible for `remove_uploaded`. `restore` walks deterministic full-segment names
+from sequence 1 and restores cleaned files before `open`;
 the fetch callback must verify each cloud identity. `spool_bytes` counts the open file and closed
 files not marked uploaded, with checked addition. No duplicate event database is added.
 
@@ -1929,9 +1929,10 @@ after byte/hash verification. Failed segments remain local and retry on the rene
 Startup restores full archived segments before opening the journal. Entry disabling at
 `max_spool_bytes` preserves settlement, reconciliation, journaling, and publication retry.
 Shutdown stops and drains broker workers, stops renewal, disables entries, releases the lease,
-closes/uploads the tail, then publishes the existing
+uploads and verifies full deterministic segments, then publishes the existing
 [schema-2 ledger generation](#ledger-summary-and-replay-generations), receipt, and final manifest.
-Upload failure prevents final publication. Broker obligations are not synthetically settled.
+The partial open tail stays local. Upload failure or a checkpoint interruption prevents final
+publication. Broker obligations are not synthetically settled.
 
 ### Leases and dispatch claims
 
@@ -1981,10 +1982,11 @@ Expiry comparisons use this post-lock signed Unix-epoch microsecond value.
 
 Errors await rollback before returning. `unresolved` returns every state except `reconciled`,
 ordered by creation time then command. `delete_reconciled` is idempotent and deletes only a row
-already in that state; it does not itself verify cloud archival. `Runtime::finish` verifies closed
-segments, publishes the ledger and receipt, and verifies final-manifest publication before deleting
-reconciled rows. Unresolved claims are never removed; interruption around deletion resumes
-from those immutable identities.
+already in that state; it does not itself verify cloud archival. `Runtime::finish` deletes a
+reconciled row only after its complete journal lifecycle lies in verified full segments, before
+publishing the ledger, receipt, and final manifest. A lifecycle in the open tail retains its claim
+until that segment fills and verifies. Unresolved claims are never removed; interruption around
+deletion resumes from the verified segments.
 
 `Postgres::connect` uses the configured trusted roots and hostname verification with encrypted
 connections required, through `tokio-postgres-rustls::MakeRustlsConnect::new`. Trust is local to
@@ -2011,8 +2013,9 @@ an exited renewal worker terminates the run with an error.
 
 The broker adapter already splits rate admission/encoding (`prepare_purchase`) from write
 (`write_purchase`) with an opaque prepared-command token. Dispatch finishes
-rate admission, commits the matching remote claim, then rechecks proposal age, prepared terms,
-and lease deadline before queuing the write. Prepared command, immutable bundle baseline, and remote
+rate admission, checks proposal age and lease deadline, commits the matching remote claim,
+then rechecks proposal age, prepared terms, and lease deadline before queuing the write.
+Prepared command, immutable bundle baseline, and remote
 claim must agree before write. Before claim commit no purchase write is allowed;
 loss can release only that non-external reservation and restart records a discontinuity. At or
 after commit, host loss is possibly sent until authoritative broker reconciliation proves the
@@ -2021,7 +2024,11 @@ On a lost claim response, the running owner enters reconciliation and uses its o
 queued no write to resolve not sent. That proof does not transfer to a successor after host loss.
 An empty broker snapshot cannot prove unsent while the old dispatcher can resume. A process pause
 or queue delay after the last check may still permit a late write; retain the claim and block
-successor entries until dispatch uncertainty is resolved. Row-lock order decides whether a claim commits before
+successor entries until dispatch uncertainty is resolved. Resolution requires broker evidence,
+this instance's own no-write proof, or an operator update of the durable row after confirming the
+predecessor cannot write: `not_sent`, or `accepted` with broker contract and transaction references.
+`Runtime::refresh_claims` consumes that update on the reconciliation cadence; accepted references
+still require matching broker purchase evidence. Row-lock order decides whether a claim commits before
 release or fails after it. Deriv does not enforce the fencing token; the
 [operator handoff](operations.md#live-runtime) excludes a non-cooperative legacy process.
 
@@ -2084,8 +2091,9 @@ Publication is create-once at `live/<deployment>/receipts/<content-sha256>.json`
 Each dimension carries `name`, `status`, `samples`, `required`, `bound`, and nullable `reason`.
 The three serialized statuses are `matched`, `outside_envelope`, and `unavailable`. `reason` is
 a string or `null`; accumulated details are separated by `; `. Missing facts produce `unavailable`
-unless an outside-envelope fact already takes precedence. All six dimensions are mandatory, in this
-order:
+unless an outside-envelope fact already takes precedence. An otherwise matched dimension below
+`min_samples` is `unavailable` with reason `<samples> of <required> required samples`.
+All six dimensions are mandatory, in this order:
 
 | Dimension | Evidence, bound, and failure |
 | --- | --- |
@@ -2158,8 +2166,10 @@ segments and final manifests can differ.
 
 ### Final manifest and command output
 
-`FinalManifest` contains `deployment`, `ledger` (ready-manifest URI), `receipt` (object URI),
-`journal_segments`, and `measurements`. Each segment contains `key`, `sha256`, and `bytes`.
+`FinalManifest` contains `deployment`, `ledger` (ready-manifest URI), `ledger_generation`,
+`receipt` (object URI), `journal_segments`, `open_tail`, and `measurements`. Only verified full
+segments are listed, each with `key`, `sha256`, and `bytes`. `open_tail` is `null` or the local
+tail's `first_sequence`, `last_sequence`, `sha256`, and `bytes`; it names no uploaded object.
 `measurements` maps command identifiers to `market_event_to_decision_micros`,
 `claim_to_socket_write_micros`, and `decision_to_acceptance_micros`; absent measurements are `null`.
 These measure market transport receipt to decision, claim completion to the worker's write-call

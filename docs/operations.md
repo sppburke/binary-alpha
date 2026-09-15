@@ -181,6 +181,12 @@ This procedure records the separately authorized rollout required by issue
    dispatch, acquire the new lease, then keep the new owner observation-only. Existing accepted
    contracts continue to settlement. Deriv does not enforce the cooperative fencing token;
    stopping legacy submissions is an operator duty.
+   Resolve an ambiguous predecessor dispatch only from broker evidence, the dispatching instance's
+   own no-write proof, or an operator update after confirming the predecessor cannot write.
+   For the exact broker/account/command row in `live_dispatch_claims`, record `state = not_sent`
+   when confirmed unsent, or `state = accepted` with verified `contract_ref` and `transaction_ref`.
+   Read back the row and retain the confirming evidence. The runtime consumes the update on its
+   reconciliation cadence; accepted references still require matching broker purchase evidence.
 7. For a supported execution account, require replay, demo, reconciliation, deployment, account,
    bundle, lease, and passing execution-compatibility proof under the frozen account-class
    requirements. Use the operator-only command below to create the exact entry authorization
@@ -202,11 +208,15 @@ This procedure records the separately authorized rollout required by issue
     delays on the deployment host, separately from decision-to-acceptance delay; verify bounded
     queues and no sustained growth. A refused incompatible receipt is refusal proof, not a passing
     execution-fidelity result.
+    Only full deterministic journal segments upload, verify, and clean. Partial open segments
+    remain local without rotation or upload. Verify the final manifest's full segments, published
+    ledger generation, and local open-tail range and hash.
 11. Rollback stops new entries, continues settlement/reconciliation, resolves ambiguous dispatches,
     transfers the lease only when safe, and restores the previous binary and certified bundle.
     Never delete legacy data or evidence during cutover. Retain unresolved claims; remove a
-    reconciled terminal claim only after its complete journal lifecycle and final manifest
-    references are verified in Google Cloud Storage. If the previous binary/bundle cannot satisfy
+    reconciled terminal claim only after its complete journal lifecycle is in verified full
+    segments in Google Cloud Storage. A claim with lifecycle records in the open tail stays until
+    that segment fills and verifies. If the previous binary/bundle cannot satisfy
     current bindings, keep entries disabled.
 
 No global service downtime is required. The only intended interruption is the shortest safe

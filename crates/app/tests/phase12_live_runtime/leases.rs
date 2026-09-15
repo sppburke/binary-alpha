@@ -448,6 +448,7 @@ fn lease_deadline_mapping_and_uncertain_renewal_stop_entries_not_settlement() {
     }
     rows.extend_from_slice(&source[8..]);
     rows.push(scenario_tick(START + 6_000_000, "180.0002"));
+    rows.push(scenario_tick(START + 8_000_000, "180.0002"));
     let recorded = RecordedConnector::from_jsonl(&scenario_log(&rows)).unwrap();
     let db = FakeControl::new(START);
     let mut control = ScenarioControl::new(db.clone(), "first");
@@ -462,49 +463,56 @@ fn lease_deadline_mapping_and_uncertain_renewal_stop_entries_not_settlement() {
         |m| m,
     )
     .unwrap();
-    let mut snapshots = Vec::new();
-    let mut settled_while_disabled = false;
+    let mut renewed_entries = None;
+    let mut renewal_veto_with_exposure = false;
     owner
         .run_until(|health| {
-            if [3, 5, 7].contains(&health.receipt_sequence)
-                && snapshots
-                    .last()
-                    .is_none_or(|(sequence, _, _)| *sequence != health.receipt_sequence)
-            {
-                snapshots.push((
-                    health.receipt_sequence,
-                    health.entries.clone(),
-                    health.risk.open,
-                ));
-            }
-            if health.receipt_sequence == 6 && health.risk.open == 0 {
-                settled_while_disabled = matches!(&health.entries, live::Entries::Disabled(reason) if reason.contains("lease renewal unavailable or lost"));
+            renewal_veto_with_exposure |= health.risk.open == 1
+                && matches!(&health.entries, live::Entries::Disabled(reason)
+                    if reason.contains("lease renewal unavailable or lost"));
+            if renewals.lock().unwrap().len() >= 3 {
+                renewed_entries = Some(health.entries.clone());
             }
             recorded.exhausted()
         })
         .unwrap()
         .unwrap();
-    assert_eq!(snapshots.len(), 3);
-    assert_eq!(snapshots[0].2, 1);
-    assert_eq!(snapshots[1].2, 1);
-    for (_, entries, _) in &snapshots[..2] {
-        assert!(
-            matches!(entries, live::Entries::Disabled(r) if r.contains("lease renewal unavailable or lost"))
-        );
-    }
-    assert_eq!(snapshots[2].1, live::Entries::Enabled);
-    assert!(settled_while_disabled);
-    assert_eq!(snapshots[2].2, 0);
+    assert!(renewal_veto_with_exposure);
+    assert_eq!(renewed_entries, Some(live::Entries::Enabled));
+    // Observe the financial owner's journal order, independent of worker polling:
+    // settlement occurs after lease loss and before a successful renewal.
+    let records = owner.records();
+    let settled = records
+        .iter()
+        .position(|r| {
+            matches!(&r.kind,
+                RecordKind::Ledger { event } if matches!(event.kind, EventKind::Settled { .. })
+            )
+        })
+        .unwrap();
+    assert_eq!(
+        records[..settled].iter().rev().find_map(|r| match r.kind {
+            RecordKind::Lease { state, .. } => Some(state),
+            _ => None,
+        }),
+        Some(LeaseState::Lost)
+    );
+    assert!(records[settled + 1..].iter().any(|r| matches!(
+        r.kind,
+        RecordKind::Lease {
+            state: LeaseState::Renewed,
+            ..
+        }
+    )));
     let renewed = renewals.lock().unwrap();
     assert_eq!(renewed[0], Err("response lost".into()));
     assert_eq!(renewed[1], Err("partition".into()));
+    let lease = renewed[2].as_ref().unwrap().as_ref().unwrap();
+    assert_eq!(lease.token, 1);
+    assert!((START + 6_000_000..=START + 8_000_000).contains(&lease.server_now_micros));
     assert_eq!(
-        renewed[2],
-        Ok(Some(Lease {
-            token: 1,
-            server_now_micros: START + 6_000_000,
-            expires_at_micros: START + 66_000_000
-        }))
+        lease.expires_at_micros,
+        lease.server_now_micros + 60_000_000
     );
     assert_eq!(owner.health().fencing_token, 1);
     assert_eq!(owner.engine().accounts()[0].cash.to_string(), "10008.83");
@@ -678,7 +686,9 @@ fn release_ordering() {
     assert_eq!(states(&owner).last(), Some(&(LeaseState::Lost, 1)));
     assert_eq!(
         owner.health().entries,
-        live::Entries::Disabled("shutdown: lease release begun".into())
+        live::Entries::Disabled(
+            "shutdown: draining observations; shutdown: lease release begun".into()
+        )
     );
     assert_eq!(owner.engine().accounts()[0].cash.to_string(), "10008.83");
     assert!(result.receipt.promotion.eligible);
@@ -695,6 +705,8 @@ fn release_ordering() {
     assert_eq!(next.token, 2);
     assert_eq!(
         owner.health().entries,
-        live::Entries::Disabled("shutdown: lease release begun".into())
+        live::Entries::Disabled(
+            "shutdown: draining observations; shutdown: lease release begun".into()
+        )
     );
 }

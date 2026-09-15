@@ -599,6 +599,13 @@ pub fn compute(inputs: &Inputs<'_>) -> Receipt {
                 "no measured samples"
             });
         }
+        if dimension.samples < dimension.required && dimension.status == Status::Matched {
+            dimension.status = Status::Unavailable;
+            dimension.reason = Some(format!(
+                "{} of {} required samples",
+                dimension.samples, dimension.required
+            ));
+        }
     }
     let mut reasons: Vec<String> = dimensions
         .iter()
@@ -781,6 +788,11 @@ mod tests {
         let insufficient = measured(&events, 2);
         assert!(!insufficient.promotion.eligible);
         assert_eq!(insufficient.promotion.reasons.len(), 6);
+        for dimension in &insufficient.dimensions {
+            assert_eq!(dimension.status, Status::Unavailable);
+            assert_eq!((dimension.samples, dimension.required), (1, 2));
+            assert_eq!(dimension.reason.as_deref(), Some("1 of 2 required samples"));
+        }
         assert_eq!(receipt.to_json(), measured(&events, 1).to_json());
     }
     #[test]

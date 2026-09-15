@@ -230,25 +230,23 @@ impl super::Clock for ReplayClock {
         self.time.load(Ordering::SeqCst)
     }
     fn sleep(&mut self, micros: i64) {
-        let deadline = self
-            .time
-            .load(Ordering::SeqCst)
-            .saturating_add(micros.max(0));
+        self.sleep_until(
+            self.time
+                .load(Ordering::SeqCst)
+                .saturating_add(micros.max(0)),
+        );
+    }
+    fn sleep_until(&mut self, deadline: i64) {
         self.complete();
         let mut state = self.schedule.0.lock().unwrap();
         let session = state.sessions.get(&std::thread::current().id()).cloned();
         while self.time.load(Ordering::SeqCst) < deadline && state.failure.is_none() {
-            if let Some(session) = &session {
-                state.waiting.insert(session.clone());
-                state.requests_waiting.insert(session.clone());
-                state.rate_waiting.insert(session.clone(), deadline);
-            }
-            state = self.schedule.1.wait(state).unwrap();
-        }
-        if let Some(session) = session {
-            state.waiting.remove(&session);
-            state.requests_waiting.remove(&session);
-            state.rate_waiting.remove(&session);
+            state = self.park(
+                state,
+                session.as_deref(),
+                RecordedWait::Rate(deadline),
+                None,
+            );
         }
         if state.failure.is_some() {
             self.advance_to(deadline);
@@ -256,63 +254,87 @@ impl super::Clock for ReplayClock {
     }
 }
 impl ReplayClock {
+    /// Registration and release of the mutex are atomic with respect to the stall query.
+    fn park<'a>(
+        &self,
+        mut state: std::sync::MutexGuard<'a, RecordedState>,
+        session: Option<&str>,
+        reason: RecordedWait,
+        timeout: Option<Duration>,
+    ) -> std::sync::MutexGuard<'a, RecordedState> {
+        if let Some(session) = session {
+            state.parked.insert(
+                session.into(),
+                Parked {
+                    reason,
+                    until: timeout.map(|duration| std::time::Instant::now() + duration),
+                },
+            );
+        }
+        state = match timeout {
+            Some(timeout) => self.schedule.1.wait_timeout(state, timeout).unwrap().0,
+            None => self.schedule.1.wait(state).unwrap(),
+        };
+        if let Some(session) = session {
+            state.parked.remove(session);
+        }
+        state
+    }
+    fn notify(&self, state: &mut RecordedState) {
+        // A notified worker is runnable even before it reacquires this mutex.
+        state.parked.clear();
+        self.schedule.1.notify_all();
+    }
     pub fn complete(&self) {
         let mut state = self.schedule.0.lock().unwrap();
         if state.in_flight == Some(std::thread::current().id()) {
             state.in_flight = None;
-            self.schedule.1.notify_all();
+            state.generation += 1;
+            self.notify(&mut state);
         }
     }
     pub fn wake(&self, session: &str) {
         let mut state = self.schedule.0.lock().unwrap();
         *state.pending.entry(session.into()).or_default() += 1;
-        state.waiting.remove(session);
-        self.schedule.1.notify_all();
+        state.generation += 1;
+        self.notify(&mut state);
     }
     pub fn begin(&self, session: &str) {
         let mut state = self.schedule.0.lock().unwrap();
         let pending = state.pending.entry(session.into()).or_default();
         *pending = pending.saturating_sub(1);
-        state.waiting.remove(session);
-        state.inactive.remove(session);
+        state.parked.remove(session);
+        state.generation += 1;
         state
             .sessions
             .insert(std::thread::current().id(), session.into());
     }
-    /// Marks a session without a subscription as unable to consume log input.
+    /// A session without a subscription blocks here until the owner queues an intent.
     pub fn idle(&self, session: &str) {
         let mut state = self.schedule.0.lock().unwrap();
-        state.waiting.insert(session.into());
-        state.inactive.insert(session.into());
+        while state.pending.get(session).copied().unwrap_or(0) == 0 && state.failure.is_none() {
+            state = self.park(state, Some(session), RecordedWait::Idle, None);
+        }
     }
-    pub fn stalled(&self) -> bool {
+    /// Capture before servicing owner ingress and periodic work.
+    pub fn generation(&self) -> u64 {
+        self.schedule.0.lock().unwrap().generation
+    }
+    pub fn stalled(&self, owner_generation: u64) -> bool {
         let state = self.schedule.0.lock().unwrap();
-        state.frames.front().is_some_and(|record| {
-            !state.ready(record)
-                || state
-                    .rate_waiting
-                    .get(&record.session)
-                    .is_some_and(|deadline| self.time.load(Ordering::SeqCst) < *deadline)
-                || state.inactive.contains(&record.session)
-        }) && state.in_flight.is_none()
-            && ["market", "account"].iter().all(|session| {
-                state.waiting.contains(*session)
-                    && !state
-                        .rate_waiting
-                        .get(*session)
-                        .is_some_and(|deadline| self.time.load(Ordering::SeqCst) >= *deadline)
-                    && (state.pending.get(*session).copied().unwrap_or(0) == 0
-                        || state.requests_waiting.contains(*session))
-            })
+        // Any intervening progress requires an owner pass at the new state, including
+        // equal-time frames. A timeout or repeated observation is not evidence of a stall.
+        state.generation == owner_generation
+            && state.failure.is_none()
+            && !state.frames.is_empty()
+            && !state.can_progress(self.time.load(Ordering::SeqCst))
     }
     pub fn cancel(&self) {
-        self.schedule
-            .0
-            .lock()
-            .unwrap()
+        let mut state = self.schedule.0.lock().unwrap();
+        state
             .failure
             .get_or_insert("recorded transport stopped".into());
-        self.schedule.1.notify_all();
+        self.notify(&mut state);
     }
     pub fn failure(&self) -> Option<String> {
         self.schedule.0.lock().unwrap().failure.clone()
@@ -334,15 +356,60 @@ struct RecordedState {
     subscriptions: std::collections::BTreeMap<(String, String), u64>,
     in_flight: Option<std::thread::ThreadId>,
     failure: Option<String>,
-    waiting: std::collections::BTreeSet<String>,
-    requests_waiting: std::collections::BTreeSet<String>,
-    rate_waiting: std::collections::BTreeMap<String, i64>,
-    inactive: std::collections::BTreeSet<String>,
+    parked: std::collections::BTreeMap<String, Parked>,
+    generation: u64,
     pending: std::collections::BTreeMap<String, usize>,
     sessions: std::collections::HashMap<std::thread::ThreadId, String>,
 }
 
+struct Parked {
+    reason: RecordedWait,
+    until: Option<std::time::Instant>,
+}
+
+#[derive(Clone, Copy)]
+enum RecordedWait {
+    Idle,
+    Read,
+    Write,
+    Rate(i64),
+}
+
 impl RecordedState {
+    fn can_progress(&self, now: i64) -> bool {
+        let local_now = std::time::Instant::now();
+        self.in_flight.is_some()
+            || self.pending.values().any(|pending| *pending != 0)
+            || ["market", "account"]
+                .iter()
+                .any(|session| match self.parked.get(*session) {
+                    None => true,
+                    // A timed wait can expire before its worker reacquires the mutex too.
+                    Some(wait) if wait.until.is_some_and(|until| local_now >= until) => true,
+                    Some(Parked {
+                        reason: RecordedWait::Rate(deadline),
+                        ..
+                    }) => now >= *deadline,
+                    Some(Parked {
+                        reason: RecordedWait::Idle,
+                        ..
+                    }) => false,
+                    Some(Parked {
+                        reason: RecordedWait::Read,
+                        ..
+                    }) => self
+                        .frames
+                        .front()
+                        .is_some_and(|record| record.session == *session && self.ready(record)),
+                    Some(Parked {
+                        reason: RecordedWait::Write,
+                        ..
+                    }) => self
+                        .frames
+                        .front()
+                        .is_some_and(|record| record.session == *session),
+                })
+    }
     fn ready(&self, record: &RecordedLine) -> bool {
         record.frame.as_ref().is_some_and(|text| {
             let Ok(value) = serde_json::from_str::<serde_json::Value>(text) else {
@@ -431,19 +498,14 @@ impl RecordedConnector {
         self.clock.schedule.0.lock().unwrap().writes.clone()
     }
     pub fn fail(&self, reason: String) {
-        self.clock
-            .schedule
-            .0
-            .lock()
-            .unwrap()
-            .failure
-            .get_or_insert(reason);
-        self.clock.schedule.1.notify_all();
+        let mut state = self.clock.schedule.0.lock().unwrap();
+        state.failure.get_or_insert(reason);
+        self.clock.notify(&mut state);
     }
     fn send_text(&mut self, text: &str) -> Result<(), String> {
         self.clock.complete();
         let mut state = self.clock.schedule.0.lock().unwrap();
-        state.waiting.remove(&self.session);
+        state.parked.remove(&self.session);
         state
             .sessions
             .insert(std::thread::current().id(), self.session.clone());
@@ -463,9 +525,9 @@ impl RecordedConnector {
             if let Some(error) = &state.failure {
                 return Err(error.clone());
             }
-            state.waiting.insert(self.session.clone());
-            state = self.clock.schedule.1.wait(state).unwrap();
-            state.waiting.remove(&self.session);
+            state = self
+                .clock
+                .park(state, Some(&self.session), RecordedWait::Write, None);
         }
         if let Some(record) = state.frames.front()
             && record.session == self.session
@@ -519,7 +581,8 @@ impl RecordedConnector {
                 .insert((self.session.clone(), scope), actual);
         }
         state.writes.push((self.session.clone(), text.into()));
-        self.clock.schedule.1.notify_all();
+        state.generation += 1;
+        self.clock.notify(&mut state);
         Ok(())
     }
     fn receive_text(&mut self, timeout: i64) -> Result<Option<String>, String> {
@@ -530,24 +593,21 @@ impl RecordedConnector {
                 return Err(error.clone());
             }
             let Some(record) = state.frames.front() else {
-                let (next, _) = self
-                    .clock
-                    .schedule
-                    .1
-                    .wait_timeout(
-                        state,
-                        Duration::from_micros(timeout.clamp(0, 10_000) as u64),
-                    )
-                    .unwrap();
-                drop(next);
+                drop(self.clock.park(
+                    state,
+                    Some(&self.session),
+                    RecordedWait::Read,
+                    Some(Duration::from_micros(timeout.clamp(0, 10_000) as u64)),
+                ));
                 return Ok(None);
             };
             let ready = state.ready(record);
             if state.in_flight.is_none() && record.session == self.session && ready {
-                state.waiting.remove(&self.session);
+                state.parked.remove(&self.session);
                 let record = state.frames.pop_front().unwrap();
                 self.clock.advance_to(record.at.unwrap());
                 state.in_flight = Some(std::thread::current().id());
+                state.generation += 1;
                 let text = record.frame.unwrap();
                 let value: Option<serde_json::Value> = serde_json::from_str(&text).ok();
                 let id = value.as_ref().and_then(|v| {
@@ -565,24 +625,21 @@ impl RecordedConnector {
                     None => text,
                 }));
             }
-            state.waiting.insert(self.session.clone());
-            if timeout > 10_000 {
-                state.requests_waiting.insert(self.session.clone());
-            }
             if timeout <= 10_000 {
-                let (mut next, _) = self
-                    .clock
-                    .schedule
-                    .1
-                    .wait_timeout(state, Duration::from_micros(timeout.max(0) as u64))
-                    .unwrap();
-                next.waiting.remove(&self.session);
-                drop(next);
+                // A queued intent is runnable as soon as this ordinary poll returns.
+                if state.pending.get(&self.session).copied().unwrap_or(0) == 0 {
+                    drop(self.clock.park(
+                        state,
+                        Some(&self.session),
+                        RecordedWait::Read,
+                        Some(Duration::from_micros(timeout.max(0) as u64)),
+                    ));
+                }
                 return Ok(None);
             }
-            state = self.clock.schedule.1.wait(state).unwrap();
-            state.waiting.remove(&self.session);
-            state.requests_waiting.remove(&self.session);
+            state = self
+                .clock
+                .park(state, Some(&self.session), RecordedWait::Read, None);
         }
     }
 }
@@ -777,6 +834,31 @@ mod recorded_tests {
 mod scheduler_regressions {
     use super::*;
     use crate::broker::Clock;
+
+    fn blocked_scheduler() -> ReplayClock {
+        RecordedConnector::from_jsonl(r#"{"session":"account","at":0,"frame":"{\"req_id\":1}"}"#)
+            .unwrap()
+            .clock()
+    }
+
+    struct CancelOnDrop<'a>(&'a ReplayClock);
+    impl Drop for CancelOnDrop<'_> {
+        fn drop(&mut self) {
+            self.0.cancel();
+        }
+    }
+
+    fn wait_for_parked(clock: &ReplayClock) {
+        let limit = std::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            if clock.schedule.0.lock().unwrap().parked.len() == 2 {
+                return;
+            }
+            assert!(std::time::Instant::now() < limit, "workers did not park");
+            std::thread::yield_now();
+        }
+    }
+
     #[test]
     fn rate_wait_with_subscribed_head_is_stalled() {
         let recorded = RecordedConnector::from_jsonl(r#"{"session":"account","at":0,"frame":"{\"msg_type\":\"transaction\",\"req_id\":1,\"subscription\":{\"id\":\"tx\"}}"}"#).unwrap();
@@ -785,26 +867,196 @@ mod scheduler_regressions {
             .send_text(r#"{"transaction":1,"subscribe":1,"req_id":1}"#)
             .unwrap();
         let scheduler = recorded.clock();
-        scheduler.idle("market");
-        {
-            let state = scheduler.schedule.0.lock().unwrap();
-            assert!(state.ready(state.frames.front().unwrap()));
-        }
-        let mut clock = scheduler.clone();
-        let worker = std::thread::spawn(move || {
-            clock.begin("account");
-            clock.sleep(3_600_000_000);
+        std::thread::scope(|scope| {
+            let _cancel = CancelOnDrop(&scheduler);
+            scope.spawn(|| scheduler.idle("market"));
+            scope.spawn(|| {
+                let mut clock = scheduler.clone();
+                clock.begin("account");
+                clock.sleep_until(3_600_000_000);
+            });
+            wait_for_parked(&scheduler);
+            let stalled = scheduler.stalled(scheduler.generation());
+            scheduler.cancel();
+            assert!(
+                stalled,
+                "rate-waiting session cannot consume its subscribed head frame"
+            );
         });
-        let limit = std::time::Instant::now() + Duration::from_secs(2);
-        while !scheduler.stalled() && std::time::Instant::now() < limit {
-            std::thread::yield_now();
+    }
+
+    #[test]
+    fn notified_workers_are_progress_before_they_reacquire_the_mutex() {
+        let scheduler = blocked_scheduler();
+        std::thread::scope(|scope| {
+            let _cancel = CancelOnDrop(&scheduler);
+            scope.spawn(|| scheduler.idle("market"));
+            scope.spawn(|| scheduler.idle("account"));
+            wait_for_parked(&scheduler);
+            assert!(scheduler.stalled(scheduler.generation()));
+            {
+                let mut state = scheduler.schedule.0.lock().unwrap();
+                scheduler.notify(&mut state);
+                // Both workers are still unable to run: this thread retains the mutex.
+                assert!(state.can_progress(0));
+            }
+            wait_for_parked(&scheduler);
+            let generation = scheduler.generation();
+            scheduler.wake("account");
+            assert!(!scheduler.stalled(generation));
+            assert!(!scheduler.stalled(scheduler.generation()));
+            scheduler.cancel();
+        });
+    }
+
+    #[test]
+    fn owner_must_service_the_generation_that_is_declared_stalled() {
+        let recorded = RecordedConnector::from_jsonl(
+            "{\"session\":\"market\",\"at\":0,\"frame\":\"tick\"}\n{\"session\":\"market\",\"expect\":\"unrequested\"}"
+        ).unwrap();
+        let scheduler = recorded.clock();
+        let generation = scheduler.generation();
+        std::thread::scope(|scope| {
+            let _cancel = CancelOnDrop(&scheduler);
+            scope.spawn(|| scheduler.idle("account"));
+            scope.spawn(|| {
+                let mut market = recorded.session("market").unwrap();
+                assert_eq!(market.receive_text(0).unwrap(), Some("tick".into()));
+                // A consumed frame belongs to the worker until its owner handoff completes.
+                assert!(!scheduler.stalled(scheduler.generation()));
+                scheduler.complete();
+                scheduler.idle("market");
+            });
+            wait_for_parked(&scheduler);
+            assert!(!scheduler.stalled(generation));
+            assert!(scheduler.stalled(scheduler.generation()));
+            scheduler.cancel();
+        });
+    }
+
+    #[test]
+    fn rate_admission_keeps_its_deadline_when_replay_advances_before_waiting() {
+        struct AdvancingClock {
+            clock: ReplayClock,
+            advance_on_read: std::sync::atomic::AtomicBool,
         }
-        let stalled = scheduler.stalled();
-        scheduler.cancel();
-        worker.join().unwrap();
+        impl Clock for AdvancingClock {
+            fn now_micros(&self) -> i64 {
+                let now = self.clock.now_micros();
+                if self.advance_on_read.swap(false, Ordering::SeqCst) {
+                    let _state = self.clock.schedule.0.lock().unwrap();
+                    self.clock.advance_to(now + 1_000_000);
+                }
+                now
+            }
+            fn sleep(&mut self, micros: i64) {
+                self.clock.sleep(micros);
+            }
+            fn sleep_until(&mut self, deadline: i64) {
+                self.clock.sleep_until(deadline);
+            }
+        }
+        let scheduler = blocked_scheduler();
+        let mut clock = AdvancingClock {
+            clock: scheduler.clone(),
+            advance_on_read: false.into(),
+        };
+        let mut budget = crate::broker::RateBudget::new(binary_alpha_engine::config::RateBudgets {
+            trade: binary_alpha_engine::config::RateLimit {
+                per_minute: 1,
+                per_hour: 1,
+            },
+            ..Default::default()
+        })
+        .unwrap();
+        budget.admit(crate::broker::RateGroup::Trade, &mut clock);
+        {
+            let _state = scheduler.schedule.0.lock().unwrap();
+            scheduler.advance_to(20_000_000);
+        }
+        clock.advance_on_read.store(true, Ordering::SeqCst);
+        std::thread::scope(|scope| {
+            let _cancel = CancelOnDrop(&scheduler);
+            scope.spawn(|| scheduler.idle("market"));
+            let account = scope.spawn(move || {
+                clock.clock.begin("account");
+                budget.admit(crate::broker::RateGroup::Trade, &mut clock);
+                assert_eq!(clock.now_micros(), 3_600_000_000);
+            });
+            wait_for_parked(&scheduler);
+            let correct_deadline = {
+                let mut state = scheduler.schedule.0.lock().unwrap();
+                assert_eq!(scheduler.now_micros(), 21_000_000);
+                let correct = matches!(
+                    state.parked.get("account"),
+                    Some(Parked {
+                        reason: RecordedWait::Rate(3_600_000_000),
+                        ..
+                    })
+                );
+                scheduler.advance_to(3_600_000_000);
+                scheduler.notify(&mut state);
+                correct
+            };
+            if !correct_deadline {
+                scheduler.cancel();
+            }
+            account.join().unwrap();
+            scheduler.cancel();
+            assert!(
+                correct_deadline,
+                "replay must not add the elapsed second to the rate deadline"
+            );
+        });
+    }
+
+    #[test]
+    fn ready_head_and_elapsed_rate_wait_are_progress_in_the_locked_snapshot() {
+        let scheduler = blocked_scheduler();
+        std::thread::scope(|scope| {
+            let _cancel = CancelOnDrop(&scheduler);
+            scope.spawn(|| scheduler.idle("market"));
+            scope.spawn(|| {
+                let mut clock = scheduler.clone();
+                clock.begin("account");
+                clock.sleep_until(100);
+            });
+            wait_for_parked(&scheduler);
+            {
+                let mut state = scheduler.schedule.0.lock().unwrap();
+                assert!(!state.can_progress(0));
+                // Another session can advance replay time before the sleeper is notified.
+                scheduler.advance_to(100);
+                assert!(state.can_progress(100));
+                scheduler.notify(&mut state);
+            }
+            scheduler.cancel();
+        });
+        let recorded =
+            RecordedConnector::from_jsonl(r#"{"session":"market","at":0,"frame":"tick"}"#).unwrap();
+        let mut state = recorded.clock.schedule.0.lock().unwrap();
+        state.parked.insert(
+            "market".into(),
+            Parked {
+                reason: RecordedWait::Read,
+                until: None,
+            },
+        );
+        state.parked.insert(
+            "account".into(),
+            Parked {
+                reason: RecordedWait::Idle,
+                until: None,
+            },
+        );
+        assert!(state.can_progress(0));
+        state.frames.front_mut().unwrap().expect = Some("unrequested".into());
+        state.frames.front_mut().unwrap().frame = None;
+        assert!(!state.can_progress(0));
+        state.parked.get_mut("market").unwrap().until = Some(std::time::Instant::now());
         assert!(
-            stalled,
-            "rate-waiting session cannot consume its subscribed head frame"
+            state.can_progress(0),
+            "an expired poll is runnable before reacquiring the mutex"
         );
     }
 }

@@ -866,11 +866,24 @@ pub fn postgres_control() {
             &mut inspect,
             &original,
         );
+        // This lifecycle is in the partial open segment. Reconciliation changes
+        // the durable state but cannot delete the row before that segment verifies.
+        let rows = runtime
+            .block_on(client.query(TEST_ROWS_SQL, &[&account, &original.command]))
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].get::<_, &str>(1), "reconciled");
+        assert_eq!(rows[0].get::<_, Option<&str>>(2), Some("12859891379"));
+        assert_eq!(rows[0].get::<_, Option<&str>>(3), Some("24655144239"));
+        assert_eq!(rows[0].get::<_, i64>(4), original.token as i64);
+        assert!(fixture.scratch.path("journal/open.jsonl").is_file());
         assert!(
-            runtime
-                .block_on(client.query(TEST_ROWS_SQL, &[&account, &original.command]))
-                .unwrap()
-                .is_empty()
+            !fixture
+                .scratch
+                .path("published/live")
+                .join(&original.deployment)
+                .join("journal")
+                .exists()
         );
     }
 }

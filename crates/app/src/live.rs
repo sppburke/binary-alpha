@@ -774,9 +774,11 @@ impl Runtime {
         while (runtime.balance_pending || runtime.authorization_pending)
             && runtime.failure.is_none()
         {
+            let generation = runtime.scheduler.as_ref().map(ReplayClock::generation);
             runtime.receive()?;
             if runtime.balance_pending || runtime.authorization_pending {
                 runtime.check_progress()?;
+                runtime.check_replay_progress(generation)?;
             }
         }
         for (id, scale) in runtime.instruments()? {
@@ -1578,6 +1580,17 @@ impl Runtime {
         let max_age = risk
             .max_proposal_age_micros
             .expect("projection requires bound");
+        if self
+            .clock
+            .now_micros()
+            .checked_sub(proposal.receipt_micros)
+            .is_none_or(|age| age > max_age)
+            || self.local_now() >= self.deadline
+        {
+            self.not_sent(command, "claim-boundary-expired")?;
+            self.veto(&format!("proposal unavailable: {binding}"), true);
+            return Ok(());
+        }
         let claim = Claim {
             command: command.to_string(),
             claim: prepared.dispatch_claim.clone(),
@@ -1928,16 +1941,20 @@ impl Runtime {
             if stop(&self.health)? && self.pending_rows.is_empty() && self.dispatches.is_empty() {
                 return self.finish().map(Some);
             }
+            let generation = self.scheduler.as_ref().map(ReplayClock::generation);
             self.receive()?;
             if self.interrupted {
                 continue;
             }
             self.check_progress()?;
             self.periodic()?;
+            // Due reconciliation can make the next recorded response ready.
+            self.check_replay_progress(generation)?;
         }
     }
     /// Releases ownership, verifies closed segments, and publishes the restored ledger and receipt.
     pub fn finish(&mut self) -> Result<Completed, String> {
+        self.check_archival_interruption()?;
         if self.prefix_at < self.replay_prefix.len() {
             return Err(
                 "live replay: recorded log ended before the journal prefix reproduced".into(),
@@ -1960,9 +1977,11 @@ impl Runtime {
         let joined = self.workers.join_brokers();
         while let Ok(event) = self.workers.ingress.try_recv() {
             self.ingress(event)?;
+            self.check_archival_interruption()?;
         }
         joined?;
         self.rows_ready()?;
+        self.check_archival_interruption()?;
         if let Some(error) = &self.failure {
             return Err(error.clone());
         }
@@ -1989,19 +2008,41 @@ impl Runtime {
             }
         }
         self.upload()?;
-        if self.interrupted {
-            return Err("live: archival interrupted before final publication".into());
-        }
+        self.check_archival_interruption()?;
         while !self.uploads.is_empty() {
             self.receive()?;
+            self.check_archival_interruption()?;
             if self.uploads.is_empty() && self.upload_errors.is_empty() {
                 self.upload()?;
+                self.check_archival_interruption()?;
             }
         }
         if let Some(error) = self.upload_errors.values().next().cloned() {
             return Err(error);
         }
         self.segments.sort_by(|a, b| a.key.cmp(&b.key));
+        // Verified full segments own the complete lifecycle before its claim is removed.
+        // Keep deletion checkpoints before any final publication.
+        for command in self
+            .claims
+            .values()
+            .filter(|c| c.state == ClaimState::Reconciled && self.claim_archived(&c.command))
+            .map(|c| c.command.clone())
+            .collect::<Vec<_>>()
+        {
+            self.checkpoint(Checkpoint::BeforeClaimDeletion);
+            self.check_archival_interruption()?;
+            self.control.advance_to(self.clock.now_micros());
+            self.control.delete_reconciled(
+                LeaseKey {
+                    broker: &self.health.broker,
+                    account: &self.health.account,
+                },
+                &command,
+            )?;
+            self.checkpoint(Checkpoint::AfterClaimDeletion);
+            self.check_archival_interruption()?;
+        }
         let events = self
             .records
             .iter()
@@ -2019,6 +2060,7 @@ impl Runtime {
             .map_err(|e| e.to_string())?;
         while self.ledger_result.is_none() {
             self.receive()?;
+            self.check_archival_interruption()?;
         }
         let ledger = self.ledger_result.take().unwrap()?;
         let observation = Window {
@@ -2060,32 +2102,10 @@ impl Runtime {
             .map_err(|e| e.to_string())?;
         while self.publication_result.is_none() {
             self.receive()?;
+            self.check_archival_interruption()?;
         }
         let manifest_uri = self.publication_result.take().unwrap()?;
         self.workers.join_storage()?;
-        // Deletion is strictly after the verified final manifest. Unresolved rows are retained.
-        for command in self
-            .claims
-            .values()
-            .filter(|c| c.state == ClaimState::Reconciled && self.claim_archived(&c.command))
-            .map(|c| c.command.clone())
-            .collect::<Vec<_>>()
-        {
-            if self.checkpoint(Checkpoint::BeforeClaimDeletion) {
-                break;
-            }
-            self.control.advance_to(self.clock.now_micros());
-            self.control.delete_reconciled(
-                LeaseKey {
-                    broker: &self.health.broker,
-                    account: &self.health.account,
-                },
-                &command,
-            )?;
-            if self.checkpoint(Checkpoint::AfterClaimDeletion) {
-                break;
-            }
-        }
         self.write_health()?;
         Ok(Completed {
             ledger,
@@ -2093,6 +2113,12 @@ impl Runtime {
             manifest: final_manifest,
             manifest_uri,
         })
+    }
+    fn check_archival_interruption(&self) -> Result<(), String> {
+        if self.interrupted {
+            return Err("live: archival interrupted before final publication".into());
+        }
+        Ok(())
     }
     fn claim_archived(&self, command: &str) -> bool {
         let mut through = 0;

@@ -740,16 +740,16 @@ fn rate_wait_expiry_is_detected_before_claim() {
     assert_eq!(clock.now_micros() - START, 60_000_000);
     assert_eq!(buys(&recorded), 0);
     assert_eq!(recorded.writes().len(), 6);
-    // PRIMARY: Runtime::prepared commits the claim before checking proposal age.
-    // One proposal uses the 1/minute trade budget; purchase preparation advances
-    // 60s against a 1s proposal bound, yet a Claimed row and Claimed journal record
-    // already exist. The age check must precede control.claim and release via NotSent.
     assert_eq!(
-        control.unresolved(key(&fixture)).unwrap(),
+        control.retained_claims(key(&fixture)).unwrap(),
         [],
         "rate-expired preparation must not commit a dispatch claim"
     );
     assert!(result.is_some());
+    assert!(!owner.records().iter().any(|record| matches!(
+        record.kind,
+        RecordKind::Claimed { .. } | RecordKind::Written { .. }
+    )));
     assert_eq!(kinds(&owner), ["run_definition", "signal", "released"]);
     balances(&owner, "10000", "0", "0", "0", 0);
 }
@@ -1052,7 +1052,9 @@ fn duplicate_and_reordered_account_messages_are_idempotent() {
     assert_eq!(buys(&recorded), 1);
     let state = owner.engine().accounts().to_vec();
     drop(owner);
-    let mut restart = startup(START + 6_000_000, false, false, "10008.83");
+    // The terminal lifecycle is still in the open tail, so its retained claim
+    // causes both portfolio and statement reconciliation on restart.
+    let mut restart = startup(START + 6_000_000, true, false, "10008.83");
     let mut terminal = source[10].clone();
     terminal["at"] = json!(START + 6_000_000);
     restart.extend([terminal.clone(), terminal]);
@@ -1134,29 +1136,29 @@ fn assert_segments(fixture: &Fixture, completed: &live::Completed) {
             .filter(|r| !r.is_empty())
             .map(|r| serde_json::from_slice::<Record>(r).unwrap())
             .collect::<Vec<_>>();
-        if records.len()
-            == fixture
+        assert_eq!(
+            records.len(),
+            fixture
                 .config
                 .live
                 .as_ref()
                 .unwrap()
                 .journal
                 .segment_records as usize
-        {
-            let name = std::path::Path::new(&segment.key)
-                .file_name()
-                .unwrap()
-                .to_str()
-                .unwrap();
-            assert!(!fixture.scratch.path("journal").join(name).exists());
-            assert!(
-                !fixture
-                    .scratch
-                    .path("journal")
-                    .join(format!("{name}.uploaded"))
-                    .exists()
-            );
-        }
+        );
+        let name = std::path::Path::new(&segment.key)
+            .file_name()
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert!(!fixture.scratch.path("journal").join(name).exists());
+        assert!(
+            !fixture
+                .scratch
+                .path("journal")
+                .join(format!("{name}.uploaded"))
+                .exists()
+        );
         collected.extend(records);
     }
     collected.sort_by_key(|r| r.sequence);
@@ -1258,7 +1260,8 @@ fn cloud_outage_full_spool_and_restart_with_pending_uploads() {
     fs::rename(&cloud, fixture.scratch.path("cloud-outage-marker")).unwrap();
     fs::create_dir_all(&cloud).unwrap();
     let source = rows(&matching_log());
-    let mut input = startup(START + 20_000_000, false, false, "10008.83");
+    // Failed archival retains terminal claims, including their statement readback.
+    let mut input = startup(START + 20_000_000, true, false, "10008.83");
     let mut terminal = source[10].clone();
     terminal["at"] = json!(START + 20_000_000);
     input.push(terminal);
@@ -1294,7 +1297,7 @@ fn terminal_claim_archival_interrupted() {
             .as_mut()
             .unwrap()
             .journal
-            .segment_records = 1024;
+            .segment_records = 3;
         // The first contract settles; the second remains paid/open throughout archival.
         let two = rows(&support::two_matching_log());
         let recorded = RecordedConnector::from_jsonl(&log(&two[..17])).unwrap();
@@ -1305,6 +1308,15 @@ fn terminal_claim_archival_interrupted() {
             &recorded,
             Box::new(control.clone()),
         );
+        let final_dir = fixture
+            .scratch
+            .path("published/live")
+            .join(&owner.definition.deployment)
+            .join("final");
+        let cloud_dir = final_dir.parent().unwrap().join("journal");
+        fs::create_dir_all(cloud_dir.parent().unwrap()).unwrap();
+        // Leave full segments pending until finish; never rotate the partial tail.
+        fs::write(&cloud_dir, b"synthetic unavailable cloud destination").unwrap();
         let armed = Arc::new(AtomicBool::new(false));
         let hook = armed.clone();
         owner.hook = Some(Box::new(move |at| {
@@ -1314,10 +1326,16 @@ fn terminal_claim_archival_interrupted() {
             let done = recorded.exhausted()
                 && health.risk.cash == decimal("9998.83")
                 && health.open_commands == 1;
-            armed.store(done, Ordering::SeqCst);
+            if done && !armed.swap(true, Ordering::SeqCst) {
+                fs::remove_file(&cloud_dir).unwrap();
+            }
             done
         });
         assert!(owner.interrupted(), "{name}");
+        assert_eq!(
+            result.err().unwrap(),
+            "live: archival interrupted before final publication"
+        );
         balances(&owner, "9998.83", "0", "10", "10", 1);
         assert_eq!(buys(&recorded), 2);
         let unresolved = control.unresolved(key(&fixture)).unwrap();
@@ -1349,19 +1367,46 @@ fn terminal_claim_archival_interrupted() {
             transaction_ref: None,
         };
         let records = owner.records().to_vec();
-        let final_dir = fixture
-            .scratch
-            .path("published/live")
-            .join(&owner.definition.deployment)
-            .join("final");
-        let cloud_dir = final_dir.parent().unwrap().join("journal");
+        assert!(!final_dir.exists(), "{name}: final manifest published");
+        assert_eq!(
+            fs::read(fixture.scratch.path("journal/open.jsonl")).unwrap(),
+            journal_bytes(&records[records.len() / 3 * 3..])
+        );
+        assert!(!final_dir.parent().unwrap().join("receipts").exists());
+        let ledger_bytes = events
+            .iter()
+            .flat_map(|event| {
+                let mut bytes = event.to_line();
+                if !bytes.ends_with(b"\n") {
+                    bytes.push(b'\n');
+                }
+                bytes
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            !fixture
+                .scratch
+                .path("published")
+                .join(binary_alpha_engine::dataset::object_key(
+                    &binary_alpha_engine::research::digest(b"", &ledger_bytes)
+                ))
+                .exists(),
+            "{name}: ledger bytes published"
+        );
+        let generation = binary_alpha_engine::execution::replay_generation_id(
+            &owner.definition.definition.config_hash,
+            &owner.definition.definition.instruments,
+        );
+        assert!(
+            !fixture
+                .scratch
+                .path("published")
+                .join(binary_alpha_engine::dataset::manifest_key(&generation))
+                .exists(),
+            "{name}: ledger published"
+        );
         if point == Checkpoint::BeforeUpload {
-            assert_eq!(
-                result.err().unwrap(),
-                "live: archival interrupted before final publication"
-            );
             assert!(!cloud_dir.exists());
-            assert!(!final_dir.exists());
         } else if point == Checkpoint::AfterUploadVerification {
             assert_eq!(fs::read_dir(&cloud_dir).unwrap().count(), 1);
             let path = fs::read_dir(&cloud_dir)
@@ -1370,22 +1415,17 @@ fn terminal_claim_archival_interrupted() {
                 .unwrap()
                 .unwrap()
                 .path();
-            assert_eq!(fs::read(path).unwrap(), journal_bytes(&records));
-            // PRIMARY: finish does not recheck interrupted after receiving Uploaded.
-            // AfterUploadVerification returns true with the full lifecycle verified,
-            // but finish still publishes the ledger, receipt and final manifest.
-            assert!(
-                !final_dir.exists(),
-                "AfterUploadVerification interruption must stop before final publication"
-            );
+            assert_eq!(fs::read(path).unwrap(), journal_bytes(&records[..3]));
         } else {
-            let completed = result.unwrap().unwrap();
-            assert!(final_dir.is_dir());
-            assert_eq!(
-                fs::read(completed.manifest_uri.strip_prefix("file://").unwrap()).unwrap(),
-                serde_json::to_vec(&completed.manifest).unwrap()
-            );
-            assert_segments(&fixture, &completed);
+            assert_eq!(fs::read_dir(&cloud_dir).unwrap().count(), records.len() / 3);
+            for chunk in records.as_chunks::<3>().0 {
+                let name = format!("{:020}-{:020}.jsonl", chunk[0].sequence, chunk[2].sequence);
+                assert_eq!(
+                    fs::read(cloud_dir.join(&name)).unwrap(),
+                    journal_bytes(chunk)
+                );
+                assert!(!fixture.scratch.path("journal").join(name).exists());
+            }
         }
         drop(owner);
         // Probe the actual row via the public unique-conflict path after reacquiring.

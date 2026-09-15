@@ -228,6 +228,14 @@ fn accepted_money_with_missing_entry_facts_is_paid_exposure() {
             "{command}: missing confirmed entry price or signal quote"
         ))
     );
+    assert_eq!(receipt.dimensions[4].status, Status::Unavailable);
+    assert_eq!(
+        receipt.dimensions[4].reason,
+        Some(format!(
+            "{command}: missing confirmed entry, start, expiry, terminal exit price/time, or due tick"
+        ))
+    );
+    assert!(!receipt.promotion.eligible);
     assert_eq!(receipt.dimensions[5].status, Status::Unavailable);
     assert_eq!(
         receipt.dimensions[5].reason,
@@ -236,14 +244,92 @@ fn accepted_money_with_missing_entry_facts_is_paid_exposure() {
         ))
     );
     assert_eq!(buys(&recorded), 1);
-    // PRIMARY: a successful purchase with no start/entry/expiry facts leaves entries Enabled.
-    // Runtime::drain only vetoes Engine blocks or OutsideEnvelope; mandatory Unavailable
-    // quote/timing/release evidence never enters the veto set (live.rs::compatibility).
-    assert!(
-        matches!(owner.health().entries, live::Entries::Disabled(_)),
-        "missing entry facts must veto entries: {:?}",
-        owner.health().entries
-    );
+    assert_eq!(owner.health().entries, live::Entries::Enabled);
+    // A second signal follows the frozen capacity rule; missing entry facts do not
+    // veto its dispatch when capacity is available.
+    for limit in [1, 2] {
+        let fixture = Fixture::two(&format!("t2-missing-entry-capacity-{limit}"));
+        let mut rows = scenario_rows(&two_matching_log());
+        rows.truncate(if limit == 1 { 9 } else { 11 });
+        rows[8]["frame"] = json!(change(
+            rows[8]["frame"].as_str().unwrap(),
+            "buy",
+            "start_time",
+            "null"
+        ));
+        if limit == 2 {
+            let mut entry = rows[9]["frame"].as_str().unwrap().to_string();
+            for field in ["entry_spot", "entry_spot_time", "date_start", "date_expiry"] {
+                entry = change(&entry, "proposal_open_contract", field, "null");
+            }
+            rows[9]["frame"] = json!(entry);
+        }
+        let recorded = RecordedConnector::from_jsonl(&scenario_log(&rows)).unwrap();
+        let mut owner = runtime_with(
+            &fixture,
+            live::Mode::Replay,
+            &recorded,
+            Box::new(FakeControl::new(START)),
+            |definition| {
+                constrained(definition);
+                for risk in &mut definition.policy.replay.risk_policies {
+                    risk.max_open_total = Some(limit);
+                }
+                definition.definition.replay = definition.policy.replay.clone();
+            },
+            |market| market,
+        )
+        .unwrap();
+        let mut acknowledged = 0;
+        owner.hook = Some(Box::new(move |point| {
+            if point == live::Checkpoint::AfterAcknowledgement {
+                acknowledged += 1;
+            }
+            acknowledged == limit
+        }));
+        assert!(owner.run_until(|_| false).unwrap().is_none());
+        assert_eq!(owner.health().entries, live::Entries::Enabled);
+        let events = ledger_events(&owner);
+        let dispositions = events
+            .iter()
+            .filter_map(|event| match event.kind {
+                EventKind::Signal { disposition, .. } => Some(disposition),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            dispositions,
+            [
+                Disposition::Admitted,
+                if limit == 1 {
+                    Disposition::CapacityTotal
+                } else {
+                    Disposition::Admitted
+                }
+            ]
+        );
+        assert_eq!(buys(&recorded), limit as usize);
+        assert_eq!(
+            financial(&owner.engine().accounts()[0]),
+            if limit == 1 {
+                expected("9990.00", "10.00", "10.00", 1)
+            } else {
+                expected("9980.00", "20.00", "20.00", 2)
+            }
+        );
+        let command = commands(&events)[0].clone();
+        let receipt = scenario_receipt(&fixture, &owner);
+        for i in [2, 4] {
+            assert_eq!(receipt.dimensions[i].status, Status::Unavailable);
+            assert!(
+                receipt.dimensions[i]
+                    .reason
+                    .as_ref()
+                    .unwrap()
+                    .contains(&command)
+            );
+        }
+    }
 }
 
 #[test]
@@ -266,6 +352,9 @@ fn changing_proposal_terms_are_refused_and_recorded() {
         &(START / 1_000_000 + 5).to_string(),
     );
     proposal = change(&proposal, "proposal", "spot", "180.0000");
+    // This is the first proposal request; keep the later quote's economics only.
+    let original: Value = serde_json::from_str(rows[5]["frame"].as_str().unwrap()).unwrap();
+    proposal = crate::common::broker::replace(&proposal, "req_id", &original["req_id"].to_string());
     rows[5]["frame"] = json!(proposal);
     let (owner, completed, recorded) = run(&fixture, &rows);
     let binding = &owner.definition.policy.replay.bindings[0];
@@ -403,7 +492,8 @@ fn loss_or_tie_only_deterioration_and_debit_deficit() {
     ] {
         let variant = isolated_fixture(&fixture, &format!("unsupported-{i}"));
         let rows = scenario_rows(&matching_log());
-        let recorded = RecordedConnector::from_jsonl(&scenario_log(&rows[..4])).unwrap();
+        // Supply the initial market subscription response before shutdown drains workers.
+        let recorded = RecordedConnector::from_jsonl(&scenario_log(&rows[..5])).unwrap();
         let mut owner = runtime(
             &variant,
             live::Mode::Replay,
@@ -440,7 +530,10 @@ fn loss_or_tie_only_deterioration_and_debit_deficit() {
             expected("10000.00", "0.00", "0.00", 0)
         );
         assert_eq!(buys(&recorded), 0);
-        assert_eq!(ledger_events(&owner).len(), 1);
+        assert!(!ledger_events(&owner).iter().any(|event| matches!(
+            event.kind,
+            EventKind::Accepted { .. } | EventKind::PossiblySent { .. }
+        )));
         assert_eq!(result.receipt.dimensions[1].status, Status::OutsideEnvelope);
         assert_eq!(result.receipt.dimensions[1].samples, 1);
     }
@@ -479,8 +572,10 @@ fn receipt_vetoes_missing_support_account_class_and_incomparable_rejection_model
             reasons: vec!["account_class".into()]
         }
     );
-    let empty = isolated_fixture(&fixture, "no-admitted-commands");
-    let (_, empty, recorded) = run(&empty, &scenario_rows(&matching_log())[..4]);
+    let mut empty = isolated_fixture(&fixture, "no-admitted-commands");
+    short_warmup(&mut empty);
+    // Finish the market subscription with an unready row and no admitted command.
+    let (_, empty, recorded) = run(&empty, &scenario_rows(&matching_log())[..5]);
     assert_eq!(empty.receipt.dimensions[1].status, Status::Unavailable);
     assert_eq!(empty.receipt.dimensions[1].samples, 0);
     assert_eq!(
@@ -503,14 +598,13 @@ fn receipt_vetoes_missing_support_account_class_and_incomparable_rejection_model
     );
     for dimension in &low.receipt.dimensions {
         assert_eq!((dimension.samples, dimension.required), (1, 2));
+        assert_eq!(dimension.reason.as_deref(), Some("1 of 2 required samples"));
     }
     assert_eq!(source_hashes(&fixture), before);
     assert_eq!(
         financial(&owner.engine().accounts()[0]),
         expected("10008.83", "0.00", "0.00", 0)
     );
-    // PRIMARY: receipt::compute leaves 1/2 supported dimensions Matched; only promotion
-    // reasons record insufficient support. The requested mandatory classification is Unavailable.
     assert_eq!(
         low.receipt
             .dimensions

@@ -854,6 +854,7 @@ struct MarketProbe {
     panic: bool,
     gate: Option<(Arc<AtomicBool>, i64)>,
     consumed: Option<Arc<AtomicBool>>,
+    subscribe_gate: Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>,
     dropped: Arc<AtomicBool>,
 }
 impl Drop for MarketProbe {
@@ -874,6 +875,12 @@ impl MarketDataBroker for MarketProbe {
         self.inner.history_page(id, scale, before)
     }
     fn subscribe(&mut self, id: &InstrumentId, scale: PriceScale) -> Result<(), String> {
+        if let Some((started, release)) = self.subscribe_gate.take() {
+            started.send(()).unwrap();
+            release
+                .recv_timeout(std::time::Duration::from_secs(3))
+                .unwrap();
+        }
         self.inner.subscribe(id, scale)
     }
     fn next_live(&mut self, timeout: i64) -> Result<Option<broker::LiveEvent>, String> {
@@ -931,6 +938,7 @@ fn market_panic_is_an_error_and_brokers_join_before_publication() {
                     panic,
                     gate: None,
                     consumed: None,
+                    subscribe_gate: None,
                     dropped: probe,
                 })
             },
@@ -952,6 +960,57 @@ fn market_panic_is_an_error_and_brokers_join_before_publication() {
         }
         assert!(dropped.load(Ordering::SeqCst));
     }
+}
+
+#[test]
+fn shutdown_during_initial_subscription_is_not_a_replay_failure() {
+    let fixture = Fixture::new("r5-subscription-shutdown");
+    let recorded = RecordedConnector::from_jsonl(&matching_log()).unwrap();
+    let (started_tx, started_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let mut owner = runtime_with(
+        &fixture,
+        live::Mode::Replay,
+        &recorded,
+        Box::new(FakeControl::new(START)),
+        |_| {},
+        move |inner| {
+            Box::new(MarketProbe {
+                inner,
+                panic: false,
+                gate: None,
+                consumed: None,
+                subscribe_gate: Some((started_tx, release_rx)),
+                dropped: Arc::new(AtomicBool::new(false)),
+            })
+        },
+    )
+    .unwrap();
+    started_rx
+        .recv_timeout(std::time::Duration::from_secs(3))
+        .unwrap();
+    std::thread::scope(|scope| {
+        scope.spawn(|| {
+            let clock = recorded.clock();
+            let limit = std::time::Instant::now() + std::time::Duration::from_secs(3);
+            while clock.failure().is_none() {
+                assert!(
+                    std::time::Instant::now() < limit,
+                    "owner did not cancel replay"
+                );
+                std::thread::yield_now();
+            }
+            release_tx.send(()).unwrap();
+        });
+        owner.finish().unwrap();
+    });
+    assert!(!owner.records().iter().any(|record| matches!(
+        &record.kind, RecordKind::Discontinuity { reason } if reason == "recorded transport stopped"
+    )));
+    assert!(!ledger(&owner).iter().any(|event| matches!(
+        event.kind,
+        EventKind::Accepted { .. } | EventKind::PossiblySent { .. }
+    )));
 }
 
 #[test]
@@ -1354,6 +1413,7 @@ fn failed_segment_retries_on_cadence_and_owner_claim_updates_finish_before_relea
                 panic: false,
                 gate: Some((gate, START + 5_000_000)),
                 consumed: None,
+                subscribe_gate: None,
                 dropped,
             })
         },
@@ -1531,6 +1591,7 @@ fn shutdown_applies_a_consumed_base_row_without_new_broker_work() {
                 panic: false,
                 gate: Some((gate, START)),
                 consumed: Some(seen),
+                subscribe_gate: None,
                 dropped: joined,
             })
         },

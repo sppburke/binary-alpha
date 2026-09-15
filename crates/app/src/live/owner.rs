@@ -317,15 +317,24 @@ impl Runtime {
         {
             return Err(error);
         }
-        if !self.authorization_pending && self.scheduler.as_ref().is_some_and(ReplayClock::stalled)
-        {
-            return Err("live replay: recorded log stalled before all frames and expected writes were consumed".into());
-        }
         if renewal_finished(&mut self.renewal)? {
             self.lease(
                 self.local_now(),
                 Err("lease renewal connection ended".into()),
             )?;
+        }
+        Ok(())
+    }
+    pub(super) fn check_replay_progress(&self, generation: Option<u64>) -> Result<(), String> {
+        if !self.authorization_pending
+            && self.uploads.is_empty()
+            && self
+                .scheduler
+                .as_ref()
+                .zip(generation)
+                .is_some_and(|(clock, generation)| clock.stalled(generation))
+        {
+            return Err("live replay: recorded log stalled before all frames and expected writes were consumed".into());
         }
         Ok(())
     }

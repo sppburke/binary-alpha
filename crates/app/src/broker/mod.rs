@@ -28,6 +28,10 @@ pub fn resolve_secret(reference: &str) -> Result<String, String> {
 pub trait Clock: Send + Sync {
     fn now_micros(&self) -> i64;
     fn sleep(&mut self, micros: i64);
+    /// Wait for an absolute clock deadline; concurrent time advancement cannot move it.
+    fn sleep_until(&mut self, deadline_micros: i64) {
+        self.sleep(deadline_micros.saturating_sub(self.now_micros()).max(0));
+    }
 }
 pub struct SystemClock;
 impl Clock for SystemClock {
@@ -198,7 +202,7 @@ impl RateBudget {
                 window.requests.push_back(now);
                 return;
             }
-            clock.sleep(wait);
+            clock.sleep_until(now.saturating_add(wait));
         }
     }
 }

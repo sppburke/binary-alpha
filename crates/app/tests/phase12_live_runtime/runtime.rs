@@ -482,7 +482,14 @@ fn command_and_mode_boundaries() {
 
 #[test]
 fn retained_deriv_fixtures_produce_a_nonpassing_receipt() {
-    let fixture = Fixture::new("live-retained");
+    let mut fixture = Fixture::new("live-retained");
+    fixture
+        .config
+        .live
+        .as_mut()
+        .unwrap()
+        .compatibility
+        .min_samples = 2;
     let before = object(
         &fixture.scratch.root,
         &fixture.bundle.generation,
@@ -569,8 +576,11 @@ fn retained_deriv_fixtures_produce_a_nonpassing_receipt() {
         )
     );
     let dimensions = &completed.receipt.dimensions;
-    assert_eq!(dimensions[0].status, live::receipt::Status::Matched);
-    assert_eq!(dimensions[0].reason, None);
+    assert_eq!(dimensions[0].status, live::receipt::Status::Unavailable);
+    assert_eq!(
+        dimensions[0].reason.as_deref(),
+        Some("1 of 2 required samples")
+    );
     assert_eq!(dimensions[2].status, live::receipt::Status::OutsideEnvelope);
     assert_eq!(
         dimensions[2].reason,
