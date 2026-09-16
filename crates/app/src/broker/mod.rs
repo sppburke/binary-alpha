@@ -342,16 +342,16 @@ pub fn connect(config: &Config) -> Result<Adapter, String> {
             let credential = match resolve_secret(&settings.credential) {
                 Ok(credential) => credential,
                 Err(reason) => match &settings.credential_command {
-                    Some(command) => renew_credential(command)?,
+                    Some(command) => renew_credential(command, None)?,
                     None => return Err(reason),
                 },
             };
-            match attempt(credential) {
+            match attempt(credential.clone()) {
                 Ok(adapter) => Ok(Adapter::PocketOption(adapter)),
                 // A rejected or stale session is renewed once through the operator's command;
                 // any other failure of the fresh session is reported as is.
                 Err(reason) => match &settings.credential_command {
-                    Some(command) => attempt(renew_credential(command)?)
+                    Some(command) => attempt(renew_credential(command, Some(&credential))?)
                         .map(Adapter::PocketOption)
                         .map_err(|renewed| {
                             format!("{renewed} (after credential renewal; first attempt: {reason})")
@@ -365,12 +365,18 @@ pub fn connect(config: &Config) -> Result<Adapter, String> {
 
 /// Runs the operator's credential command and returns the authentication object it printed,
 /// without letting the value into any diagnostic.
-pub fn renew_credential(command: &[String]) -> Result<String, String> {
-    // Parallel jobs of one broker renew one at a time; a browser login must not race itself.
-    static RENEWAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    let _serial = RENEWAL
+pub fn renew_credential(command: &[String], stale: Option<&str>) -> Result<String, String> {
+    // Sibling jobs reuse the fresh session instead of rotating it out from under each other.
+    static RENEWAL: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+    let mut renewed = RENEWAL
         .lock()
         .map_err(|_| "credential_command: renewal lock poisoned")?;
+    if let Some(credential) = renewed
+        .as_ref()
+        .filter(|value| Some(value.as_str()) != stale)
+    {
+        return Ok(credential.clone());
+    }
     let (program, arguments) = command
         .split_first()
         .ok_or("credential_command must name a program")?;
@@ -391,6 +397,7 @@ pub fn renew_credential(command: &[String]) -> Result<String, String> {
     if credential.is_empty() {
         return Err(format!("credential_command {program}: printed nothing"));
     }
+    *renewed = Some(credential.clone());
     Ok(credential)
 }
 

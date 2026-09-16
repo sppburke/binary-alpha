@@ -455,10 +455,14 @@ fn interrupted_runs_resume_without_duplicates_or_early_ready_state() {
     fs::remove_file(scratch.path("published").join(&normalized_key)).unwrap();
     fs::remove_file(scratch.path("retained").join(&normalized_key)).unwrap();
     remove_manifests(&scratch, &before, true);
-    fs::write(scratch.path("retained/objects/.tmp-leftover-1"), b"partial").unwrap();
+    fs::write(
+        scratch.path("retained/objects/.tmp-leftover-1-0"),
+        b"partial",
+    )
+    .unwrap();
     fs::write(
         scratch.path(&format!(
-            "retained/objects/.tmp-{}-1",
+            "retained/objects/.tmp-{}-1-1",
             generation(&lines[0])
         )),
         b"partial normalized",

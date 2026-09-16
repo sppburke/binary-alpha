@@ -103,6 +103,8 @@ struct BrokerFaults {
     off_second: bool,
     /// Reject the next authentication as a stale session, once.
     reject_auth_once: bool,
+    /// Reject the synthetic environment session until the fixture renewal command replaces it.
+    reject_initial_session: bool,
 }
 
 struct FakeBroker {
@@ -110,6 +112,7 @@ struct FakeBroker {
     requests: Arc<Mutex<Vec<String>>>,
     forbidden: Arc<Mutex<Vec<String>>>,
     faults: Arc<Mutex<BrokerFaults>>,
+    rejected_auths: Arc<AtomicUsize>,
     stop: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
 }
@@ -160,6 +163,8 @@ fn serve_broker(kind: Kind) -> FakeBroker {
     let requests = Arc::new(Mutex::new(Vec::new()));
     let forbidden = Arc::new(Mutex::new(Vec::new()));
     let faults = Arc::new(Mutex::new(BrokerFaults::default()));
+    let rejected_auths = Arc::new(AtomicUsize::new(0));
+    let rejected_auths_ = Arc::clone(&rejected_auths);
     let stop = Arc::new(AtomicBool::new(false));
     let (requests_, forbidden_, faults_, stop_) = (
         Arc::clone(&requests),
@@ -265,8 +270,10 @@ fn serve_broker(kind: Kind) -> FakeBroker {
                                 panic!("unexpected client framing: {text}")
                             };
                             match name.as_str() {
-                                "auth" if faults.reject_auth_once => {
+                                "auth" if faults.reject_auth_once || (faults.reject_initial_session
+                                    && serde_json::from_slice::<Value>(&argument).unwrap()["renewed"] != true) => {
                                     faults_.lock().unwrap().reject_auth_once = false;
+                                    rejected_auths_.fetch_add(1, Ordering::SeqCst);
                                     replies.push(Message::Text(r#"42["error","synthetic session rejected"]"#.into()));
                                 }
                                 "auth" => {
@@ -354,6 +361,7 @@ fn serve_broker(kind: Kind) -> FakeBroker {
         requests,
         forbidden,
         faults,
+        rejected_auths,
         stop,
         thread: Some(thread),
     }
@@ -1165,6 +1173,8 @@ fn run(args: &[&str]) -> Result<String, String> {
     let output = Command::new(env!("CARGO_BIN_EXE_binary-alpha"))
         .args(args)
         .env("PIPELINE_SYNTHETIC_AUTH", "{\"synthetic\":true}")
+        .env_remove("PIPELINE_UNSET_AUTH")
+        .env_remove("PIPELINE_UNSET_DRIVE_AUTH")
         .output()
         .unwrap();
     let stdout = String::from_utf8(output.stdout).unwrap();
@@ -1389,8 +1399,8 @@ fn pipeline_roundtrip() {
     // while Pocket publishes its first descendant and catalog.
     assert!(first.contains("pipeline update pocket "), "{first}");
     assert!(
-        f.drive.activity.uploads.high_water.load(Ordering::SeqCst) >= 2,
-        "closure object uploads must overlap"
+        (2..=3).contains(&f.drive.activity.uploads.high_water.load(Ordering::SeqCst)),
+        "closure object uploads must overlap within the three-worker limit"
     );
     let pocket_line = job_line(&first, "pocket");
     assert_eq!(field(pocket_line, "status"), "archived");
@@ -1601,8 +1611,8 @@ fn pipeline_roundtrip() {
     .unwrap();
     let dataset_uri = field(&restored, "dataset").to_string();
     assert!(
-        f.drive.activity.downloads.high_water.load(Ordering::SeqCst) >= 2,
-        "closure object downloads must overlap"
+        (2..=3).contains(&f.drive.activity.downloads.high_water.load(Ordering::SeqCst)),
+        "closure object downloads must overlap within the three-worker limit"
     );
     let stream_uri = field(&restored, "stream").to_string();
     let consumer_store = f.scratch.path("elsewhere/consumer/store");
@@ -1843,11 +1853,18 @@ fn pipeline_recovery() {
     // until the seed overlap is reached, archiving partial snapshots without closing the intent.
     let cutoff = POCKET_SEED_END + 362;
     let end = time_text(cutoff * 1_000_000);
-    let requests_before = f.pocket.requests().len();
     let mut statuses = Vec::new();
     let mut generations = Vec::new();
+    let mut resumed_anchor = cutoff;
     for _ in 0..6 {
-        match pipeline("update", &pocket_only, &["--end", &end]) {
+        let requests_before = f.pocket.requests().len();
+        let result = pipeline("update", &pocket_only, &["--end", &end]);
+        let request: Value = serde_json::from_str(&f.pocket.requests()[requests_before]).unwrap();
+        assert_eq!(
+            request["time"].as_i64().unwrap() - POCKET_OFFSET_S,
+            resumed_anchor
+        );
+        match result {
             Ok(report) => {
                 let line = job_line(&report, "pocket");
                 statuses.push(field(line, "status").to_string());
@@ -1861,6 +1878,12 @@ fn pipeline_recovery() {
                 let pending = read_json(&state.join("pocket/progress.json"));
                 assert_eq!(pending["progress"]["cutoff"], json!(end));
                 assert_eq!(pending["progress"]["baseline"], json!(baseline));
+                let pages = pending["progress"]["pages"].as_array().unwrap();
+                resumed_anchor = binary_alpha_engine::market::parse_event_time_micros(
+                    pages.last().unwrap()["first"].as_str().unwrap(),
+                )
+                .unwrap()
+                    / 1_000_000;
             }
         }
     }
@@ -1883,19 +1906,6 @@ fn pipeline_recovery() {
         bars(&store, &dataset(&store, final_generation)),
         expected_bars(POCKET_SEED_END, POCKET_SEED_END - 60, cutoff)
     );
-    let requests: Vec<Value> = f.pocket.requests()[requests_before..]
-        .iter()
-        .map(|request| serde_json::from_str(request).unwrap())
-        .collect();
-    let anchors: Vec<i64> = requests
-        .iter()
-        .map(|request| request["time"].as_f64().unwrap() as i64 - POCKET_OFFSET_S)
-        .collect();
-    assert_eq!(anchors[0], cutoff);
-    assert!(
-        anchors.windows(2).all(|pair| pair[1] < pair[0]),
-        "{anchors:?}"
-    );
     let receipts: Vec<PathBuf> = fs::read_dir(state.join("records"))
         .unwrap()
         .map(|entry| entry.unwrap().path())
@@ -1907,6 +1917,25 @@ fn pipeline_recovery() {
         })
         .collect();
     assert!(receipts.len() >= statuses.len(), "{receipts:?}");
+    // Receipts record consumed pages in acquisition order, including retained pages replayed
+    // after a restart. Unconsumed look-ahead requests may legitimately repeat across runs.
+    let receipt = receipts
+        .iter()
+        .map(|path| read_json(path))
+        .find(|receipt| receipt["dataset_generation"] == json!(final_generation))
+        .unwrap();
+    let anchors: Vec<i64> = receipt["requests"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|page| page["anchor"].as_str().unwrap().parse::<i64>().unwrap() - POCKET_OFFSET_S)
+        .collect();
+    assert!(anchors.len() >= statuses.len(), "{receipt}");
+    assert_eq!(anchors[0], cutoff);
+    assert!(
+        anchors.windows(2).all(|pair| pair[1] < pair[0]),
+        "{anchors:?}"
+    );
     // The same cutoff again: byte-identical pages, new request receipts, the dataset reused.
     let repeat = pipeline("update", &pocket_only, &["--end", &end]).unwrap();
     assert_eq!(
@@ -2269,6 +2298,29 @@ fn pipeline_recovery() {
 fn pipeline_scope() {
     let f = fixture("pipeline_scope");
     let producer = f.scratch.path("producer");
+    // Drive session failures belong to each job's report, even when all jobs fail to open.
+    let unavailable_drive = f.scratch.path("unavailable-drive.toml");
+    fs::write(
+        &unavailable_drive,
+        fs::read_to_string(&f.pipeline).unwrap().replace(
+            &format!("loopback_endpoint = \"{}\"", f.drive.base),
+            "credential = \"PIPELINE_UNSET_DRIVE_AUTH\"",
+        ),
+    )
+    .unwrap();
+    let refused = pipeline("update", &unavailable_drive, &[]).unwrap_err();
+    for job in ["deriv", "pocket"] {
+        assert!(
+            refused.contains(&format!("pipeline job {job} failed:")),
+            "{refused}"
+        );
+    }
+    assert!(
+        refused.contains("2 job(s) failed: deriv, pocket"),
+        "{refused}"
+    );
+    assert!(refused.contains("PIPELINE_UNSET_DRIVE_AUTH"), "{refused}");
+    assert!(f.pocket.requests().is_empty() && f.deriv.requests().is_empty());
     let write_pocket = |text: String| fs::write(f.scratch.path("pocket.toml"), text).unwrap();
     let pocket_only = f.scratch.path("pocket-only.toml");
     fs::write(
@@ -2913,6 +2965,53 @@ fn pipeline_scope() {
         refused.contains("credential_command") && refused.contains("exited"),
         "{refused}"
     );
+
+    // Both parallel jobs reject the same environment session. Only the first rejection
+    // rotates it; its sibling must authenticate with the cached replacement.
+    let parallel = fixture("pipeline_scope_parallel_renewal");
+    import(&parallel.scratch.path("pocket-import.toml")).unwrap();
+    let marker = parallel.scratch.path("renewals.log");
+    let renew = parallel.scratch.path("renew.sh");
+    fs::write(&renew, format!(
+        "#!/bin/sh\necho renewed >> '{}'\nprintf '%s' '{{\"synthetic\":true,\"renewed\":true}}'\n",
+        marker.display(),
+    )).unwrap();
+    fs::set_permissions(&renew, fs::Permissions::from_mode(0o700)).unwrap();
+    let core = pocket_core(&parallel.pocket.url, "demo", BAR_GRANULARITY, 60, 50, 60).replace(
+        "credential = \"PIPELINE_SYNTHETIC_AUTH\"",
+        &format!(
+            "credential = \"PIPELINE_SYNTHETIC_AUTH\"\ncredential_command = [\"{}\"]",
+            renew.display()
+        ),
+    );
+    fs::write(parallel.scratch.path("pocket.toml"), &core).unwrap();
+    write_evidence(&parallel.scratch, "sibling", &core);
+    fs::write(
+        &parallel.pipeline,
+        pipeline_toml(
+            &parallel.scratch.path("producer"),
+            &parallel.drive.base,
+            &[("pocket", "pocket.toml"), ("sibling", "pocket.toml")],
+            None,
+            3,
+        ),
+    )
+    .unwrap();
+    parallel.pocket.set(BrokerFaults {
+        reject_initial_session: true,
+        ..Default::default()
+    });
+    let renewed = pipeline("update", &parallel.pipeline, &["--end", &renewed_end]).unwrap();
+    for job in ["pocket", "sibling"] {
+        assert_eq!(
+            field(job_line(&renewed, job), "status"),
+            "archived",
+            "{renewed}"
+        );
+    }
+    assert_eq!(parallel.pocket.rejected_auths.load(Ordering::SeqCst), 2);
+    assert_eq!(fs::read_to_string(&marker).unwrap().lines().count(), 1);
+    assert!(!renewed.contains("synthetic\":true"), "{renewed}");
 }
 
 fn seed_unchanged(store: &Path, generation: &str) -> bool {

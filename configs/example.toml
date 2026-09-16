@@ -47,6 +47,8 @@ origin = "https://pocketoption.com"
 credential = "BINARY_ALPHA_POCKET_AUTH"
 account_class = "demo"
 server_offset_minutes = 120
+# Measured 2026-09-16: K=1 ~4.0 pages/s; K=4 16.6 pages/s; K=8 32.9 pages/s (~0.24 s/batch).
+history_pages_in_flight = 8
 
 [history]
 broker = "pocket_option"

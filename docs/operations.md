@@ -219,7 +219,11 @@ job's evidence file (`{"source_identity": "…"}` plus notes); binding refuses a
 whose identity differs, and the refusal names both identities. A Pocket archive from a different
 account/source context must not be relabeled to match a demo endpoint. Configure Deriv tick history and Pocket
 five-second bar history with explicit positive overlap, page, and time limits and no foreground
-refresh. With exact broker and Drive authorization, run a bounded update:
+refresh. Pocket Option candle pages cover a fixed 200 seconds (40 five-second bars); the
+2026-09-16 real-account measurement was about 4.0, 16.6, and 32.9 pages/s with 1, 4, and 8
+requests in flight, respectively (about 0.24 seconds per batch).
+Set the Pocket broker's `history_pages_in_flight` to a positive count (default 8) to control
+candle-page prefetch on each connection. With exact broker and Drive authorization, run a bounded update:
 
 ```text
 binary-alpha data pipeline update --config PIPELINE [--end END]

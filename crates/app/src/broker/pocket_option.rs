@@ -14,6 +14,18 @@ use binary_alpha_engine::market::{
 use serde::{Deserialize, Serialize};
 use serde_json::value::RawValue;
 use std::collections::{BTreeMap, VecDeque};
+use std::hash::{DefaultHasher, Hash, Hasher};
+
+fn history_index_seed(now_micros: i64) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    (
+        now_micros,
+        std::process::id(),
+        format!("{:?}", std::thread::current().id()),
+    )
+        .hash(&mut hasher);
+    hasher.finish() & i64::MAX as u64
+}
 
 /// Converts the declared provider clock directly to universal integer microseconds.
 pub fn universal_micros(token: &WireDecimal, offset_minutes: i32) -> Result<i64, String> {
@@ -116,6 +128,17 @@ struct CandleRow {
 }
 /// The only provider bar period this checkout admits, in seconds.
 const BAR_PERIOD_S: u16 = 5;
+const HISTORY_PAGE_MICROS: i64 = 200_000_000;
+
+#[derive(Default)]
+struct CandleHistoryBuffer {
+    asset: String,
+    pages: BTreeMap<i64, PrefetchedPage>,
+}
+struct PrefetchedPage {
+    index: Option<u64>,
+    page: Option<HistoryPage>,
+}
 #[derive(Serialize)]
 struct Change<'a> {
     asset: &'a str,
@@ -141,6 +164,7 @@ pub struct PocketMarketData {
     discovered: Vec<DiscoveredInstrument>,
     subscribed: BTreeMap<String, (InstrumentId, PriceScale)>,
     next_index: u64,
+    candle_history: CandleHistoryBuffer,
     continuity: Continuity,
     events: VecDeque<LiveEvent>,
     received_counts: BTreeMap<String, u64>,
@@ -169,8 +193,7 @@ impl PocketMarketData {
             .map(|value| vec![("Origin".into(), value.clone())])
             .unwrap_or_default();
         let transport = connector.connect(&settings.endpoint, &headers)?;
-        let next_index = u64::try_from(clock.now_micros())
-            .map_err(|_| "pocket_option: negative history index clock")?;
+        let next_index = history_index_seed(clock.now_micros());
         let mut broker = Self {
             settings: settings.clone(),
             instruments: instruments.to_vec(),
@@ -182,6 +205,7 @@ impl PocketMarketData {
             discovered: Vec::new(),
             subscribed: BTreeMap::new(),
             next_index,
+            candle_history: CandleHistoryBuffer::default(),
             continuity: Continuity::default(),
             events: VecDeque::new(),
             received_counts: BTreeMap::new(),
@@ -417,12 +441,89 @@ impl PocketMarketData {
             }
         }
     }
+    fn send_history_request(
+        &mut self,
+        symbol: &str,
+        before: i64,
+        period: u8,
+    ) -> Result<u64, String> {
+        let time = provider_token(before, self.settings.server_offset_minutes)?;
+        let index = self.next_index;
+        self.next_index = index
+            .checked_add(1)
+            .ok_or("pocket_option: history index overflow")?;
+        self.send(
+            "loadHistoryPeriod",
+            &OlderRequest {
+                asset: symbol,
+                index,
+                time,
+                offset: 200,
+                period,
+            },
+        )?;
+        Ok(index)
+    }
+    fn prefetch_candles(&mut self, symbol: &str, before: i64, period: u8) -> Result<(), String> {
+        let limit = usize::from(self.settings.history_pages_in_flight.unwrap_or(8));
+        if limit == 0 {
+            return Err("history_pages_in_flight must be positive".into());
+        }
+        // Skipping an unconsumed anchor is a gap even if an older buffered anchor matches.
+        if self.candle_history.asset != symbol
+            || self
+                .candle_history
+                .pages
+                .last_key_value()
+                .map(|(anchor, _)| *anchor)
+                != Some(before)
+        {
+            self.candle_history = CandleHistoryBuffer {
+                asset: symbol.into(),
+                pages: BTreeMap::new(),
+            };
+        }
+        // A reconnect keeps received pages and invalidates only outstanding request indexes.
+        let resend: Vec<_> = self
+            .candle_history
+            .pages
+            .iter()
+            .rev()
+            .filter_map(|(&anchor, entry)| {
+                (entry.index.is_none() && entry.page.is_none()).then_some(anchor)
+            })
+            .collect();
+        for anchor in resend {
+            let index = self.send_history_request(symbol, anchor, period)?;
+            self.candle_history.pages.get_mut(&anchor).unwrap().index = Some(index);
+        }
+        while self.candle_history.pages.len() < limit {
+            let anchor = match self.candle_history.pages.first_key_value() {
+                Some((anchor, _)) => anchor
+                    .checked_sub(HISTORY_PAGE_MICROS)
+                    .ok_or("pocket_option: history anchor overflow")?,
+                None => before,
+            };
+            let index = self.send_history_request(symbol, anchor, period)?;
+            self.candle_history.pages.insert(
+                anchor,
+                PrefetchedPage {
+                    index: Some(index),
+                    page: None,
+                },
+            );
+        }
+        Ok(())
+    }
     fn request_history_page(
         &mut self,
         symbol: &str,
         before_micros: Option<i64>,
         period: u8,
     ) -> Result<HistoryPage, ReceiveError> {
+        if period == 1 {
+            self.candle_history = CandleHistoryBuffer::default();
+        }
         let Some(before) = before_micros else {
             // The anchor-free page exists only for ticks; the evidenced candle family is the
             // indexed older-history request answered as `loadHistoryPeriodFast`.
@@ -456,22 +557,17 @@ impl PocketMarketData {
                 receipt_micros: event.receipt_micros,
             });
         };
-        let time = provider_token(before, self.settings.server_offset_minutes)?;
-        let anchor_token = Some(time.token()?.into_owned());
-        let index = self.next_index;
-        self.next_index = index
-            .checked_add(1)
-            .ok_or("pocket_option: history index overflow")?;
-        self.send(
-            "loadHistoryPeriod",
-            &OlderRequest {
-                asset: symbol,
-                index,
-                time,
-                offset: 200,
-                period,
-            },
-        )?;
+        let index = if period == 1 {
+            self.send_history_request(symbol, before, period)?
+        } else {
+            self.prefetch_candles(symbol, before, period)?;
+            let entry = self.candle_history.pages.get_mut(&before).unwrap();
+            if let Some(page) = entry.page.take() {
+                self.candle_history.pages.remove(&before);
+                return Ok(page);
+            }
+            entry.index.unwrap()
+        };
         let (event_name, expected_period) = if period == 1 {
             // Request period 1 produced response period 0 in both retained older pages.
             ("loadHistoryPeriod", 0)
@@ -503,10 +599,21 @@ impl PocketMarketData {
             };
             let envelope: OlderEnvelope = serde_json::from_slice(&event.raw)
                 .map_err(|_| format!("pocket_option: malformed {} history", event.name))?;
-            if envelope.asset != symbol || envelope.index != index {
+            let anchor = if period == 1 {
+                (envelope.index == index).then_some(before)
+            } else {
+                self.candle_history
+                    .pages
+                    .iter()
+                    .find_map(|(&anchor, entry)| {
+                        (entry.index == Some(envelope.index) && entry.page.is_none())
+                            .then_some(anchor)
+                    })
+            };
+            let Some(anchor) = anchor.filter(|_| envelope.asset == symbol) else {
                 self.foreign_history_responses += 1;
                 continue;
-            }
+            };
             if event.name != event_name {
                 continue;
             }
@@ -519,11 +626,20 @@ impl PocketMarketData {
                 )
                 .into());
             }
-            return Ok(HistoryPage {
+            let page = HistoryPage {
                 raw: event.raw,
-                anchor_token,
+                anchor_token: Some(
+                    provider_token(anchor, self.settings.server_offset_minutes)?
+                        .token()?
+                        .into_owned(),
+                ),
                 receipt_micros: event.receipt_micros,
-            });
+            };
+            if envelope.index == index {
+                self.candle_history.pages.remove(&anchor);
+                return Ok(page);
+            }
+            self.candle_history.pages.get_mut(&anchor).unwrap().page = Some(page);
         }
     }
     /// All configured symbols observed on the wire, including a cancelled symbol, for inspection.
@@ -771,13 +887,17 @@ impl MarketDataBroker for PocketMarketData {
             .unwrap_or_default();
         self.transport = self.connector.connect(&self.settings.endpoint, &headers)?;
         self.pending = None;
+        for entry in self.candle_history.pages.values_mut() {
+            if entry.page.is_none() {
+                entry.index = None;
+            }
+        }
         self.subscribed.clear();
         self.discovered.clear();
         self.events.clear();
-        self.next_index = self.next_index.max(
-            u64::try_from(self.clock.now_micros())
-                .map_err(|_| "pocket_option: negative history index clock")?,
-        );
+        self.next_index = self
+            .next_index
+            .max(history_index_seed(self.clock.now_micros()));
         let generation = self.continuity.reconnect()?;
         self.handshake()?;
         self.events.push_back(LiveEvent::Break {

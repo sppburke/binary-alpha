@@ -540,8 +540,12 @@ impl MarketDataBroker for DerivMarketData {
                 .to_string()
         });
         let mut backoff_micros = INITIAL_BACKOFF_MICROS;
-        let mut waited_micros = 0;
+        let mut deadline = None;
+        let exhausted = || "deriv history: RateLimit (retried for 120 s)".to_string();
         let response = loop {
+            if deadline.is_some_and(|end| self.connection.clock.now_micros() >= end) {
+                return Err(exhausted());
+            }
             let (req_id, text) =
                 self.connection
                     .prepare(RateGroup::Other, |req_id| HistoryRequest {
@@ -554,8 +558,15 @@ impl MarketDataBroker for DerivMarketData {
                         count: HISTORY_PAGE_TICKS,
                         req_id,
                     })?;
+            if deadline.is_some_and(|end| self.connection.clock.now_micros() >= end) {
+                return Err(exhausted());
+            }
             self.connection.transport.send(Frame::Text(text))?;
-            let response = self.connection.response(req_id, "history")?;
+            let response = self.connection.response(req_id, "history");
+            if deadline.is_some_and(|end| self.connection.clock.now_micros() >= end) {
+                return Err(exhausted());
+            }
+            let response = response?;
             let Some(error) = &response.header.error else {
                 break response;
             };
@@ -564,12 +575,10 @@ impl MarketDataBroker for DerivMarketData {
             if error.code != "RateLimit" {
                 return Err(reason);
             }
-            if waited_micros == BACKOFF_BUDGET_MICROS {
-                return Err("deriv history: RateLimit (retried for 120 s)".into());
-            }
-            let wait_micros = backoff_micros.min(BACKOFF_BUDGET_MICROS - waited_micros);
+            let now = self.connection.clock.now_micros();
+            let end = *deadline.get_or_insert_with(|| now.saturating_add(BACKOFF_BUDGET_MICROS));
+            let wait_micros = backoff_micros.min(end.saturating_sub(now));
             self.connection.clock.sleep(wait_micros);
-            waited_micros += wait_micros;
             backoff_micros = (backoff_micros * 2).min(MAX_BACKOFF_MICROS);
         };
         let _ = scale;

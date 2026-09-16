@@ -920,8 +920,6 @@ fn run_jobs(
         declaration: declaration.as_ref(),
         certification: None,
     };
-    // Credentials and the archive root are checked once before any worker starts.
-    drop(Drive::open(&config.drive)?);
     let workers = usize::try_from(config.parallel_jobs.unwrap_or(1))
         .unwrap_or(1)
         .min(config.jobs.len())
@@ -934,10 +932,10 @@ fn run_jobs(
     );
     let report = std::sync::Mutex::new((Vec::<u8>::new(), Vec::<usize>::new()));
     let one = |job: &Job| -> Result<String, String> {
-        let mut drive = Drive::open(&config.drive)?;
         let mut lines = Vec::new();
-        let result =
-            bind(job, layout).and_then(|bound| run(job, bound, &mut drive, access, &mut lines));
+        let result = Drive::open(&config.drive).and_then(|mut drive| {
+            bind(job, layout).and_then(|bound| run(job, bound, &mut drive, access, &mut lines))
+        });
         let mut report = report
             .lock()
             .map_err(|_| "pipeline: report lock poisoned")?;

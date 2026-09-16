@@ -4,7 +4,7 @@ mod research_fixture;
 
 use binary_alpha_app::broker::deriv::{DerivAccounts, DerivAuthenticated, DerivMarketData};
 use binary_alpha_app::broker::pocket_option::{PocketMarketData, provider_token, universal_micros};
-use binary_alpha_app::broker::transport::{Connector, Frame, WebSocketConnector};
+use binary_alpha_app::broker::transport::{Connector, Frame, Transport, WebSocketConnector};
 use binary_alpha_app::broker::wire::WireDecimal;
 use binary_alpha_app::broker::{
     Adapter, Cancellation, Clock, Continuity, HistoryPage, HistoryRows, LiveEvent,
@@ -105,6 +105,7 @@ fn pocket_settings() -> PocketSettings {
         credential_command: None,
         account_class: binary_alpha_engine::config::AccountClass::Demo,
         server_offset_minutes: 120,
+        history_pages_in_flight: Some(1),
     }
 }
 fn pocket_ids() -> Vec<InstrumentId> {
@@ -115,7 +116,7 @@ fn pocket_ids() -> Vec<InstrumentId> {
 }
 fn pocket(frames: Vec<Frame>) -> (PocketMarketData, Arc<Mutex<Vec<Frame>>>) {
     let clock = FakeClock::at(1_789_348_000_000_000);
-    let (connector, sent) = connector(vec![frames], &clock);
+    let (connector, sent) = pocket_connector(vec![frames], &clock);
     (
         PocketMarketData::connect(
             &pocket_settings(),
@@ -416,7 +417,7 @@ fn deriv_history_rate_limits_exhaust_the_page_waiting_budget() {
     assert_eq!(error, "deriv history: RateLimit (retried for 120 s)");
     assert_eq!(clock.now_micros(), 120_000_000);
     // 1 + 2 + 4 + fourteen 8-second waits + the final 1-second remainder.
-    assert_eq!(sent.lock().unwrap().len(), 19);
+    assert_eq!(sent.lock().unwrap().len(), 18);
 }
 
 fn deriv_history_error(req_id: u64, code: &str) -> Frame {
@@ -436,6 +437,111 @@ fn deriv_history_error(req_id: u64, code: &str) -> Frame {
         })
         .to_string(),
     )
+}
+
+#[test]
+fn deriv_history_rate_limit_deadline_includes_rate_admission() {
+    let clock = FakeClock::default();
+    let (connector, sent) = connector(
+        vec![vec![
+            deriv_history_error(1, "RateLimit"),
+            deriv_history_error(2, "RateLimit"),
+            frame("deriv-history-R_50.json", 3),
+        ]],
+        &FakeClock::default(),
+    );
+    let mut settings = deriv_settings();
+    let mut limits = RateBudgets::default();
+    limits.other.per_minute = 1;
+    settings.budgets = Some(limits);
+    let mut broker =
+        DerivMarketData::connect(&settings, connector, Box::new(clock.clone())).unwrap();
+    let error = broker
+        .history_page(
+            &id("deriv", "R_50"),
+            scale(4),
+            Some(1_789_348_000_000_000),
+            NativeGranularity::Tick,
+        )
+        .unwrap_err();
+    assert_eq!(error, "deriv history: RateLimit (retried for 120 s)");
+    assert_eq!(clock.now_micros(), 120_000_000);
+    assert_eq!(
+        sent.lock().unwrap().len(),
+        2,
+        "expired rate admission must not send another request"
+    );
+}
+
+#[test]
+fn deriv_history_rate_limit_deadline_includes_response_latency() {
+    struct DelayedConnector {
+        inner: Box<dyn Connector>,
+        clock: FakeClock,
+    }
+    struct DelayedTransport {
+        inner: Box<dyn Transport>,
+        clock: FakeClock,
+    }
+    impl Connector for DelayedConnector {
+        fn connect(
+            &mut self,
+            url: &str,
+            headers: &[(String, String)],
+        ) -> Result<Box<dyn Transport>, String> {
+            Ok(Box::new(DelayedTransport {
+                inner: self.inner.connect(url, headers)?,
+                clock: self.clock.clone(),
+            }))
+        }
+    }
+    impl Transport for DelayedTransport {
+        fn send(&mut self, frame: Frame) -> Result<(), String> {
+            self.inner.send(frame)
+        }
+        fn receive(&mut self, timeout: i64) -> Result<Option<Frame>, String> {
+            self.clock.sleep(17_000_000);
+            self.inner.receive(timeout)
+        }
+        fn close(&mut self) -> Result<(), String> {
+            self.inner.close()
+        }
+    }
+    for successful_last in [false, true] {
+        let clock = FakeClock::default();
+        let (inner, sent) = connector(
+            vec![
+                (1..=7)
+                    .map(|index| {
+                        if index == 7 && successful_last {
+                            frame("deriv-history-R_50.json", index)
+                        } else {
+                            deriv_history_error(index, "RateLimit")
+                        }
+                    })
+                    .collect(),
+            ],
+            &FakeClock::default(),
+        );
+        let connector = Box::new(DelayedConnector {
+            inner,
+            clock: clock.clone(),
+        });
+        let mut broker =
+            DerivMarketData::connect(&deriv_settings(), connector, Box::new(clock.clone()))
+                .unwrap();
+        let error = broker
+            .history_page(
+                &id("deriv", "R_50"),
+                scale(4),
+                Some(1_789_348_000_000_000),
+                NativeGranularity::Tick,
+            )
+            .unwrap_err();
+        assert_eq!(error, "deriv history: RateLimit (retried for 120 s)");
+        assert_eq!(sent.lock().unwrap().len(), 7);
+        assert_eq!(clock.now_micros(), 150_000_000);
+    }
 }
 
 #[test]
@@ -550,19 +656,11 @@ fn pocket_retained_paging_live_cancellation_and_heartbeats() {
     ));
     frames.extend(attachment(
         "loadHistoryPeriod",
-        replace(
-            &fixture("pocket-history-older-1.json"),
-            "index",
-            "1789348000000000",
-        ),
+        replace(&fixture("pocket-history-older-1.json"), "index", "0"),
     ));
     frames.extend(attachment(
         "loadHistoryPeriod",
-        replace(
-            &fixture("pocket-history-older-2.json"),
-            "index",
-            "1789348000000001",
-        ),
+        replace(&fixture("pocket-history-older-2.json"), "index", "1"),
     ));
     for line in [6, 7, 10, 11, 13, 14, 15, 16].into_iter().chain(18..=36) {
         frames.extend(attachment(
@@ -742,6 +840,55 @@ fn pocket_candle_page(index: u64, starts: &[i64]) -> String {
     .to_string()
 }
 
+#[test]
+fn pocket_parallel_connections_use_distinct_increasing_positive_indexes() {
+    let indexes = std::thread::scope(|scope| {
+        let jobs: Vec<_> = (0..2)
+            .map(|_| {
+                scope.spawn(|| {
+                    let mut frames = handshake();
+                    for ordinal in 0..2 {
+                        frames.extend(attachment(
+                            "loadHistoryPeriodFast",
+                            pocket_candle_page(ordinal, &[5]),
+                        ));
+                    }
+                    let (mut adapter, sent) = pocket(frames);
+                    for _ in 0..2 {
+                        adapter
+                            .history_page(
+                                &pocket_ids()[0],
+                                scale(5),
+                                Some(10_000_000),
+                                NativeGranularity::Bar { period_seconds: 5 },
+                            )
+                            .unwrap();
+                    }
+                    let indexes: Vec<_> = pocket_sent_events(&sent, "loadHistoryPeriod")
+                        .iter()
+                        .map(|request| request["index"].as_u64().unwrap())
+                        .collect();
+                    assert_eq!(indexes.len(), 2);
+                    assert!(
+                        indexes
+                            .iter()
+                            .all(|index| *index > 0 && *index <= i64::MAX as u64)
+                    );
+                    assert_eq!(indexes[1], indexes[0] + 1);
+                    indexes
+                })
+            })
+            .collect();
+        jobs.into_iter()
+            .map(|job| job.join().unwrap())
+            .collect::<Vec<_>>()
+    });
+    assert!(
+        indexes[0].iter().all(|index| !indexes[1].contains(index)),
+        "{indexes:?}"
+    );
+}
+
 fn pocket_sent_events(sent: &Mutex<Vec<Frame>>, name: &str) -> Vec<serde_json::Value> {
     sent.lock()
         .unwrap()
@@ -750,7 +897,7 @@ fn pocket_sent_events(sent: &Mutex<Vec<Frame>>, name: &str) -> Vec<serde_json::V
             let Frame::Text(text) = frame else {
                 return None;
             };
-            match broker::socket_io::decode(text).unwrap() {
+            match broker::socket_io::decode(text).ok()? {
                 broker::socket_io::Packet::Event {
                     name: event,
                     argument,
@@ -761,11 +908,430 @@ fn pocket_sent_events(sent: &Mutex<Vec<Frame>>, name: &str) -> Vec<serde_json::V
         .collect()
 }
 
+// Scripted Pocket pages use zero-based request ordinals. Echo the actual wire index without
+// coupling fixtures to the adapter's seed; an ordinal with no request remains foreign.
+fn pocket_response(raw: &str, sent: &Mutex<Vec<Frame>>) -> String {
+    let value: serde_json::Value = serde_json::from_str(raw).unwrap();
+    let Some(ordinal) = value["index"]
+        .as_u64()
+        .and_then(|n| usize::try_from(n).ok())
+    else {
+        return raw.to_string();
+    };
+    let requests = pocket_sent_events(sent, "loadHistoryPeriod");
+    let index = requests
+        .get(ordinal)
+        .map_or(u64::MAX, |request| request["index"].as_u64().unwrap());
+    replace(raw, "index", &index.to_string())
+}
+
+struct IndexedConnector {
+    inner: Box<dyn Connector>,
+    sent: Arc<Mutex<Vec<Frame>>>,
+}
+impl Connector for IndexedConnector {
+    fn connect(
+        &mut self,
+        url: &str,
+        headers: &[(String, String)],
+    ) -> Result<Box<dyn Transport>, String> {
+        Ok(Box::new(IndexedTransport {
+            inner: self.inner.connect(url, headers)?,
+            sent: Arc::clone(&self.sent),
+        }))
+    }
+}
+struct IndexedTransport {
+    inner: Box<dyn Transport>,
+    sent: Arc<Mutex<Vec<Frame>>>,
+}
+impl Transport for IndexedTransport {
+    fn send(&mut self, frame: Frame) -> Result<(), String> {
+        self.inner.send(frame)
+    }
+    fn receive(&mut self, timeout: i64) -> Result<Option<Frame>, String> {
+        Ok(self.inner.receive(timeout)?.map(|frame| match frame {
+            Frame::Binary(raw) => Frame::Binary(
+                pocket_response(std::str::from_utf8(&raw).unwrap(), &self.sent).into_bytes(),
+            ),
+            other => other,
+        }))
+    }
+    fn close(&mut self) -> Result<(), String> {
+        self.inner.close()
+    }
+}
+fn pocket_connector(
+    sessions: Vec<Vec<Frame>>,
+    clock: &FakeClock,
+) -> (Box<dyn Connector>, Arc<Mutex<Vec<Frame>>>) {
+    let (inner, sent) = connector(sessions, clock);
+    (
+        Box::new(IndexedConnector {
+            inner,
+            sent: Arc::clone(&sent),
+        }),
+        sent,
+    )
+}
+
+#[derive(Clone)]
+struct CandleTrace {
+    sent: Arc<Mutex<Vec<Frame>>>,
+    // Request index -> (requests sent before receipt, actual receipt clock).
+    arrivals: Arc<Mutex<BTreeMap<u64, (usize, i64)>>>,
+    clock: FakeClock,
+}
+struct CandleConnector {
+    inner: Box<dyn Connector>,
+    trace: CandleTrace,
+}
+impl Connector for CandleConnector {
+    fn connect(
+        &mut self,
+        url: &str,
+        headers: &[(String, String)],
+    ) -> Result<Box<dyn Transport>, String> {
+        Ok(Box::new(CandleTransport {
+            inner: self.inner.connect(url, headers)?,
+            trace: self.trace.clone(),
+        }))
+    }
+}
+struct CandleTransport {
+    inner: Box<dyn Transport>,
+    trace: CandleTrace,
+}
+impl Transport for CandleTransport {
+    fn send(&mut self, frame: Frame) -> Result<(), String> {
+        self.inner.send(frame)
+    }
+    fn receive(&mut self, timeout: i64) -> Result<Option<Frame>, String> {
+        let frame = self.inner.receive(timeout)?;
+        if let Some(Frame::Binary(raw)) = &frame {
+            let value: serde_json::Value = serde_json::from_slice(raw).unwrap();
+            if let Some(index) = value["index"].as_u64() {
+                self.trace.arrivals.lock().unwrap().insert(
+                    index,
+                    (
+                        pocket_sent_events(&self.trace.sent, "loadHistoryPeriod").len(),
+                        self.trace.clock.now_micros(),
+                    ),
+                );
+            }
+        }
+        Ok(frame)
+    }
+    fn close(&mut self) -> Result<(), String> {
+        self.inner.close()
+    }
+}
+fn candle_adapter(
+    sessions: Vec<Vec<Frame>>,
+    clock: &FakeClock,
+    limit: Option<u16>,
+) -> (PocketMarketData, CandleTrace) {
+    let (inner, sent) = pocket_connector(sessions, clock);
+    let trace = CandleTrace {
+        sent,
+        arrivals: Arc::default(),
+        clock: clock.clone(),
+    };
+    let settings = PocketSettings {
+        history_pages_in_flight: limit,
+        ..pocket_settings()
+    };
+    let adapter = PocketMarketData::connect(
+        &settings,
+        &pocket_ids(),
+        Box::new(CandleConnector {
+            inner,
+            trace: trace.clone(),
+        }),
+        Box::new(clock.clone()),
+        "{}".into(),
+    )
+    .unwrap();
+    (adapter, trace)
+}
+fn full_candle_page(index: u64, anchor: i64) -> String {
+    pocket_candle_page(
+        index,
+        &(anchor - 200..anchor).step_by(5).collect::<Vec<_>>(),
+    )
+}
+fn assert_candle_page(
+    adapter: &PocketMarketData,
+    page: &HistoryPage,
+    instrument: &InstrumentId,
+    anchor: i64,
+    first: i64,
+) {
+    use binary_alpha_engine::market::Bar;
+    assert_eq!(page.anchor_token, Some((anchor + 7200).to_string()));
+    let (symbol_id, rows) = adapter
+        .decode_history(
+            instrument,
+            &page.raw,
+            scale(5),
+            NativeGranularity::Bar { period_seconds: 5 },
+        )
+        .unwrap();
+    assert_eq!(symbol_id, Some(7));
+    let HistoryRows::Bars(rows) = rows else {
+        panic!("expected candles")
+    };
+    assert_eq!(
+        rows,
+        (first..first + 200)
+            .step_by(5)
+            .map(|start_unix_s| Bar {
+                start_unix_s,
+                open: 1.25,
+                high: 1.5,
+                low: 1.0,
+                close: 1.375,
+                volume: 2.0,
+                period_s: 5,
+            })
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn pocket_candle_prefetch_walk_batches_requests_and_preserves_each_page() {
+    let clock = FakeClock::at(1_789_348_000_000_000);
+    let index = 0;
+    let mut frames = handshake();
+    let raw: Vec<_> = (0..5)
+        .map(|n| full_candle_page(index + n, 2000 - n as i64 * 200))
+        .collect();
+    for page in &raw {
+        frames.extend(attachment("loadHistoryPeriodFast", page.clone()));
+    }
+    let (mut adapter, trace) = candle_adapter(vec![frames], &clock, Some(3));
+    let instrument = &pocket_ids()[0];
+    let granularity = NativeGranularity::Bar { period_seconds: 5 };
+    let mut anchor = 2_000_000_000;
+    for (n, raw) in raw.iter().enumerate() {
+        let page = adapter
+            .history_page(instrument, scale(5), Some(anchor), granularity)
+            .unwrap();
+        assert_candle_page(
+            &adapter,
+            &page,
+            instrument,
+            anchor / 1_000_000,
+            anchor / 1_000_000 - 200,
+        );
+        assert_eq!(page.raw, pocket_response(raw, &trace.sent).as_bytes());
+        let request_index = pocket_sent_events(&trace.sent, "loadHistoryPeriod")[n]["index"]
+            .as_u64()
+            .unwrap();
+        let (sent_before_receipt, receipt) = trace.arrivals.lock().unwrap()[&request_index];
+        assert_eq!(sent_before_receipt, 3 + n);
+        assert_eq!(page.receipt_micros, receipt);
+        assert_eq!(receipt, clock.now_micros());
+        // Follow the fetch owner's cursor, derived from the returned rows.
+        anchor = adapter
+            .decode_history(instrument, &page.raw, scale(5), granularity)
+            .unwrap()
+            .1
+            .first_time_micros()
+            .unwrap();
+    }
+    let requests = pocket_sent_events(&trace.sent, "loadHistoryPeriod");
+    assert_eq!(requests.len(), 7);
+    for (n, request) in requests.iter().enumerate() {
+        assert_eq!(
+            *request,
+            serde_json::json!({
+                "asset": "EURUSD_otc", "index": requests[0]["index"].as_u64().unwrap() + n as u64,
+                "time": 9200 - n * 200, "offset": 200, "period": 5,
+            })
+        );
+    }
+}
+
+#[test]
+fn pocket_candle_prefetch_out_of_order_keeps_original_receipt_and_default_window() {
+    let mut clock = FakeClock::at(1_789_348_000_000_000);
+    let index = 0;
+    let mut frames = handshake();
+    let first = full_candle_page(index, 2000);
+    let second = full_candle_page(index + 1, 1800);
+    frames.extend(attachment("loadHistoryPeriodFast", second.clone()));
+    frames.extend(attachment("loadHistoryPeriodFast", first.clone()));
+    let (mut adapter, trace) = candle_adapter(vec![frames], &clock, None);
+    let instrument = &pocket_ids()[0];
+    let granularity = NativeGranularity::Bar { period_seconds: 5 };
+    let first_page = adapter
+        .history_page(instrument, scale(5), Some(2_000_000_000), granularity)
+        .unwrap();
+    assert_eq!(
+        first_page.raw,
+        pocket_response(&first, &trace.sent).as_bytes()
+    );
+    assert_candle_page(&adapter, &first_page, instrument, 2000, 1800);
+    clock.sleep(1000);
+    let second_page = adapter
+        .history_page(instrument, scale(5), Some(1_800_000_000), granularity)
+        .unwrap();
+    assert_eq!(
+        second_page.raw,
+        pocket_response(&second, &trace.sent).as_bytes()
+    );
+    assert_candle_page(&adapter, &second_page, instrument, 1800, 1600);
+    let requests = pocket_sent_events(&trace.sent, "loadHistoryPeriod");
+    let index = requests[0]["index"].as_u64().unwrap();
+    let arrivals = trace.arrivals.lock().unwrap();
+    assert_eq!(arrivals[&index], (8, first_page.receipt_micros));
+    assert_eq!(arrivals[&(index + 1)], (8, second_page.receipt_micros));
+    assert!(second_page.receipt_micros < first_page.receipt_micros);
+    assert!(second_page.receipt_micros < clock.now_micros());
+    assert_eq!(
+        pocket_sent_events(&trace.sent, "loadHistoryPeriod").len(),
+        9
+    );
+    assert_eq!(adapter.foreign_history_responses(), 0);
+}
+
+#[test]
+fn pocket_candle_prefetch_gap_discards_skipped_anchors_and_stale_responses() {
+    let clock = FakeClock::at(1_789_348_000_000_000);
+    let index = 0;
+    let mut frames = handshake();
+    for (n, page_anchor) in [2000, 1800, 1400, 1400, 1200, 1200].into_iter().enumerate() {
+        // Third request is anchored at 1600 but its first bar is 1200: a 400-second gap.
+        frames.extend(attachment(
+            "loadHistoryPeriodFast",
+            full_candle_page(index + n as u64, page_anchor),
+        ));
+    }
+    let (mut adapter, trace) = candle_adapter(vec![frames], &clock, Some(3));
+    let instrument = &pocket_ids()[0];
+    let granularity = NativeGranularity::Bar { period_seconds: 5 };
+    let mut anchor = 2_000_000_000;
+    for first in [1800, 1600, 1200, 1000] {
+        let page = adapter
+            .history_page(instrument, scale(5), Some(anchor), granularity)
+            .unwrap();
+        assert_candle_page(&adapter, &page, instrument, anchor / 1_000_000, first);
+        anchor = adapter
+            .decode_history(instrument, &page.raw, scale(5), granularity)
+            .unwrap()
+            .1
+            .first_time_micros()
+            .unwrap();
+    }
+    let requests = pocket_sent_events(&trace.sent, "loadHistoryPeriod");
+    assert_eq!(requests.len(), 8);
+    assert_eq!(requests[4]["time"], 8400);
+    assert_eq!(requests[5]["time"], 8400);
+    let index = requests[0]["index"].as_u64().unwrap();
+    assert_eq!(requests[5]["index"], index + 5);
+    assert_eq!(trace.arrivals.lock().unwrap()[&(index + 5)].0, 8);
+    assert_eq!(adapter.foreign_history_responses(), 2);
+}
+
+#[test]
+fn pocket_candle_prefetch_reconnect_resends_only_outstanding_pages() {
+    let clock = FakeClock::at(1_789_348_000_000_000);
+    let index = 0;
+    let mut first = handshake();
+    let buffered = full_candle_page(index + 1, 1800);
+    first.extend(attachment("loadHistoryPeriodFast", buffered.clone()));
+    first.push(Frame::Text("41".into()));
+    let reconnected_index = 3;
+    let mut second = handshake();
+    for (index, anchor) in [(reconnected_index, 2000), (reconnected_index + 1, 1600)] {
+        second.extend(attachment(
+            "loadHistoryPeriodFast",
+            full_candle_page(index, anchor),
+        ));
+    }
+    let (mut adapter, trace) = candle_adapter(vec![first, second], &clock, Some(3));
+    let instrument = &pocket_ids()[0];
+    let granularity = NativeGranularity::Bar { period_seconds: 5 };
+    for anchor in [2000, 1800, 1600] {
+        let page = adapter
+            .history_page(instrument, scale(5), Some(anchor * 1_000_000), granularity)
+            .unwrap();
+        assert_candle_page(&adapter, &page, instrument, anchor, anchor - 200);
+        if anchor == 1800 {
+            assert_eq!(page.raw, pocket_response(&buffered, &trace.sent).as_bytes());
+            let index = pocket_sent_events(&trace.sent, "loadHistoryPeriod")[0]["index"]
+                .as_u64()
+                .unwrap();
+            assert_eq!(
+                page.receipt_micros,
+                trace.arrivals.lock().unwrap()[&(index + 1)].1
+            );
+            assert!(page.receipt_micros < clock.now_micros());
+        }
+    }
+    let requests = pocket_sent_events(&trace.sent, "loadHistoryPeriod");
+    assert_eq!(requests.len(), 7);
+    assert_eq!(requests[3]["time"], 9200);
+    assert!(
+        requests
+            .windows(2)
+            .all(|pair| pair[0]["index"].as_u64() < pair[1]["index"].as_u64())
+    );
+    assert_eq!(requests[4]["time"], 8800);
+    assert_eq!(
+        requests[4]["index"].as_u64().unwrap(),
+        requests[3]["index"].as_u64().unwrap() + 1
+    );
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|request| request["time"] == 9000)
+            .count(),
+        1
+    );
+    assert_eq!(adapter.history_reconnects(), 1);
+    assert_eq!(adapter.foreign_history_responses(), 0);
+}
+
+#[test]
+fn pocket_candle_prefetch_instrument_change_discards_buffered_and_outstanding_pages() {
+    let clock = FakeClock::at(1_789_348_000_000_000);
+    let index = 0;
+    let mut frames = handshake();
+    for (n, anchor) in [(1, 1800), (0, 2000), (2, 1600)] {
+        frames.extend(attachment(
+            "loadHistoryPeriodFast",
+            full_candle_page(index + n, anchor),
+        ));
+    }
+    let other = replace(&full_candle_page(index + 3, 1800), "asset", "\"#AAPL_otc\"");
+    frames.extend(attachment("loadHistoryPeriodFast", other.clone()));
+    let (mut adapter, trace) = candle_adapter(vec![frames], &clock, Some(3));
+    let ids = pocket_ids();
+    let granularity = NativeGranularity::Bar { period_seconds: 5 };
+    adapter
+        .history_page(&ids[0], scale(5), Some(2_000_000_000), granularity)
+        .unwrap();
+    let page = adapter
+        .history_page(&ids[1], scale(5), Some(1_800_000_000), granularity)
+        .unwrap();
+    assert_eq!(page.raw, pocket_response(&other, &trace.sent).as_bytes());
+    assert_candle_page(&adapter, &page, &ids[1], 1800, 1600);
+    let requests = pocket_sent_events(&trace.sent, "loadHistoryPeriod");
+    assert_eq!(requests.len(), 6);
+    for (n, request) in requests[3..].iter().enumerate() {
+        assert_eq!(request["asset"], "#AAPL_otc");
+        assert_eq!(request["time"], 9000 - n * 200);
+    }
+    assert_eq!(adapter.foreign_history_responses(), 1);
+}
+
 #[test]
 fn pocket_candle_history_reconnects_after_second_page_and_preserves_rows() {
     use binary_alpha_engine::market::Bar;
     let clock = FakeClock::at(1_789_348_000_000_000);
-    let first_index = u64::try_from(clock.now_micros()).unwrap();
+    let first_index = 0;
     let mut first = handshake();
     first.extend(attachment(
         "loadHistoryPeriodFast",
@@ -776,14 +1342,14 @@ fn pocket_candle_history_reconnects_after_second_page_and_preserves_rows() {
         pocket_candle_page(first_index + 1, &[10, 15]),
     ));
     first.push(Frame::Text("41".into()));
-    // The scripted transport advances this clock by ten microseconds per frame.
-    let second_index = first_index + first.len() as u64 * 10;
+    // The fourth request retries the outstanding page after reconnect.
+    let second_index = 3;
     let mut second = handshake();
     second.extend(attachment(
         "loadHistoryPeriodFast",
         pocket_candle_page(second_index, &[0, 5]),
     ));
-    let (connector, sent) = connector(vec![first, second], &clock);
+    let (connector, sent) = pocket_connector(vec![first, second], &clock);
     let mut adapter = PocketMarketData::connect(
         &pocket_settings(),
         &pocket_ids(),
@@ -833,16 +1399,16 @@ fn pocket_candle_history_reconnects_after_second_page_and_preserves_rows() {
     );
     let requests = pocket_sent_events(&sent, "loadHistoryPeriod");
     assert_eq!(requests.len(), 4);
-    for (request, (index, anchor)) in requests.iter().zip([
-        (first_index, 7230),
-        (first_index + 1, 7220),
-        (first_index + 2, 7210),
-        (second_index, 7210),
-    ]) {
+    assert!(
+        requests
+            .windows(2)
+            .all(|pair| pair[0]["index"].as_u64() < pair[1]["index"].as_u64())
+    );
+    for (request, anchor) in requests.iter().zip([7230, 7220, 7210, 7210]) {
         assert_eq!(
             *request,
             serde_json::json!({
-                "asset": "EURUSD_otc", "index": index, "time": anchor, "offset": 200, "period": 5,
+                "asset": "EURUSD_otc", "index": request["index"], "time": anchor, "offset": 200, "period": 5,
             })
         );
     }
@@ -866,7 +1432,7 @@ fn pocket_history_skips_foreign_assets_and_indexes_without_extending_deadline() 
     ] {
         for matching in [true, false] {
             let clock = FakeClock::at(1_789_348_000_000_000);
-            let index = u64::try_from(clock.now_micros()).unwrap();
+            let index = 0;
             let (name, raw) = if granularity == NativeGranularity::Tick {
                 (
                     "loadHistoryPeriod",
@@ -888,12 +1454,21 @@ fn pocket_history_skips_foreign_assets_and_indexes_without_extending_deadline() 
                 "loadHistoryPeriod",
                 replace(&raw, "index", &(index + 99).to_string()),
             ));
+            if granularity != NativeGranularity::Tick {
+                frames.extend(attachment(
+                    "loadHistoryPeriodFast",
+                    full_candle_page(index + 1, -190),
+                ));
+            }
             if matching {
                 frames.extend(attachment(name, raw.clone()));
             }
-            let (connector, sent) = connector(vec![frames], &clock);
+            let (connector, sent) = pocket_connector(vec![frames], &clock);
             let mut adapter = PocketMarketData::connect(
-                &pocket_settings(),
+                &PocketSettings {
+                    history_pages_in_flight: Some(3),
+                    ..pocket_settings()
+                },
                 &pocket_ids(),
                 connector,
                 Box::new(clock.clone()),
@@ -905,7 +1480,7 @@ fn pocket_history_skips_foreign_assets_and_indexes_without_extending_deadline() 
                 adapter.history_page(&pocket_ids()[0], scale(5), Some(10_000_000), granularity);
             if matching {
                 let page = result.unwrap();
-                assert_eq!(page.raw, raw.as_bytes());
+                assert_eq!(page.raw, pocket_response(&raw, &sent).as_bytes());
                 let (symbol_id, rows) = adapter
                     .decode_history(&pocket_ids()[0], &page.raw, scale(5), granularity)
                     .unwrap();
@@ -926,7 +1501,14 @@ fn pocket_history_skips_foreign_assets_and_indexes_without_extending_deadline() 
             }
             assert_eq!(adapter.foreign_history_responses(), 2);
             assert_eq!(adapter.history_reconnects(), 0);
-            assert_eq!(pocket_sent_events(&sent, "loadHistoryPeriod").len(), 1);
+            assert_eq!(
+                pocket_sent_events(&sent, "loadHistoryPeriod").len(),
+                if granularity == NativeGranularity::Tick {
+                    1
+                } else {
+                    3
+                }
+            );
         }
     }
 }
@@ -941,7 +1523,7 @@ fn pocket_history_stops_after_three_namespace_reconnects_for_one_page() {
             frames
         })
         .collect();
-    let (connector, sent) = connector(sessions, &clock);
+    let (connector, sent) = pocket_connector(sessions, &clock);
     let mut adapter = PocketMarketData::connect(
         &pocket_settings(),
         &pocket_ids(),
@@ -985,7 +1567,7 @@ fn pocket_history_stops_after_three_namespace_reconnects_for_one_page() {
 #[test]
 fn pocket_history_namespace_reconnect_limit_persists_across_pages() {
     let clock = FakeClock::at(1_789_348_000_000_000);
-    let mut index = u64::try_from(clock.now_micros()).unwrap();
+    let mut index = 0;
     let mut sessions = Vec::new();
     for session in 0..=20 {
         let mut frames = handshake();
@@ -996,10 +1578,10 @@ fn pocket_history_namespace_reconnect_limit_persists_across_pages() {
             ));
         }
         frames.push(Frame::Text("41".into()));
-        index += frames.len() as u64 * 10;
+        index += if session == 0 { 1 } else { 2 };
         sessions.push(frames);
     }
-    let (connector, sent) = connector(sessions, &clock);
+    let (connector, sent) = pocket_connector(sessions, &clock);
     let mut adapter = PocketMarketData::connect(
         &pocket_settings(),
         &pocket_ids(),
@@ -2866,10 +3448,7 @@ fn pocket_period_pins_and_retained_anchor_text_are_exact() {
         ),
     ] {
         let mut frames = handshake();
-        frames.extend(attachment(
-            event,
-            replace(&fixture(file), "index", "1789348000000000"),
-        ));
+        frames.extend(attachment(event, replace(&fixture(file), "index", "0")));
         let (mut broker, _) = pocket(frames);
         let error = broker
             .history_page(&pocket_ids()[0], scale(5), anchor, NativeGranularity::Tick)
@@ -2978,16 +3557,8 @@ fn concrete_adapters_resume_interrupted_publication_and_page_backward() {
                 raw_pages,
             )
         } else {
-            let first = replace(
-                &fixture("pocket-history-older-1.json"),
-                "index",
-                "1789348010000000",
-            );
-            let second = replace(
-                &fixture("pocket-history-older-2.json"),
-                "index",
-                "1789348010000001",
-            );
+            let first = replace(&fixture("pocket-history-older-1.json"), "index", "0");
+            let second = replace(&fixture("pocket-history-older-2.json"), "index", "1");
             let mut frames = attachment("loadHistoryPeriod", first.clone());
             frames.extend(attachment("loadHistoryPeriod", second.clone()));
             (
@@ -3006,7 +3577,11 @@ fn concrete_adapters_resume_interrupted_publication_and_page_backward() {
                 vec![]
             };
             frames.extend(history_frames.clone());
-            let (connector, sent) = connector(vec![frames], &clock);
+            let (connector, sent) = if kind == "pocket_option" {
+                pocket_connector(vec![frames], &clock)
+            } else {
+                connector(vec![frames], &clock)
+            };
             let adapter = if kind == "deriv" {
                 Adapter::Deriv(
                     DerivMarketData::connect(&deriv_settings(), connector, Box::new(clock.clone()))
@@ -3026,11 +3601,10 @@ fn concrete_adapters_resume_interrupted_publication_and_page_backward() {
             };
             (adapter, sent)
         };
-        let failed_object = scratch
-            .path("published/objects")
-            .join(hash(raw_pages.last().unwrap().as_bytes()));
-        fs::create_dir_all(&failed_object).unwrap();
-        let (mut first, _) = create();
+        let failed_object = scratch.path("published/objects");
+        fs::create_dir_all(scratch.path("published")).unwrap();
+        fs::write(&failed_object, b"synthetic interrupted publication").unwrap();
+        let (mut first, first_sent) = create();
         assert!(
             fetch::pass(
                 &config,
@@ -3043,13 +3617,23 @@ fn concrete_adapters_resume_interrupted_publication_and_page_backward() {
             .is_err()
         );
         assert!(read_manifests(&scratch).is_empty());
+        let raw_pages: Vec<_> = raw_pages
+            .iter()
+            .map(|raw| {
+                if kind == "pocket_option" {
+                    pocket_response(raw, &first_sent)
+                } else {
+                    raw.clone()
+                }
+            })
+            .collect();
         let retained = fs::read(
             scratch
                 .path("retained/objects")
                 .join(hash(raw_pages[0].as_bytes())),
         )
         .unwrap();
-        fs::remove_dir(&failed_object).unwrap();
+        fs::remove_file(&failed_object).unwrap();
         let (mut resumed, sent) = create();
         fetch::pass(
             &config,

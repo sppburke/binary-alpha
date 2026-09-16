@@ -450,6 +450,9 @@ pub struct PocketSettings {
     pub credential_command: Option<Vec<String>>,
     pub account_class: AccountClass,
     pub server_offset_minutes: i32,
+    /// Maximum unconsumed candle pages, including outstanding requests; defaults to eight.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub history_pages_in_flight: Option<u16>,
 }
 
 impl Broker {
@@ -524,6 +527,9 @@ impl Broker {
                 }
             }
             Self::PocketOption(settings) => {
+                if settings.history_pages_in_flight == Some(0) {
+                    return Err("history_pages_in_flight must be positive".into());
+                }
                 if let Some(command) = &settings.credential_command
                     && command.first().is_none_or(String::is_empty)
                 {
@@ -2364,6 +2370,34 @@ mod tests {
                 .unwrap()
                 .content_hash(),
             config.content_hash()
+        );
+    }
+
+    #[test]
+    fn pocket_settings_history_prefetch_round_trip_and_validation() {
+        let source = "kind = \"pocket_option\"\nid = \"pocket_option\"\nendpoint = \"wss://example.invalid\"\norigin = \"https://example.invalid\"\ncredential = \"POCKET_AUTH\"\ncredential_command = [\"auth-helper\"]\naccount_class = \"demo\"\nserver_offset_minutes = 120\n";
+        let broker: Broker = toml::from_str(source).unwrap();
+        broker.validate(RunMode::Research).unwrap();
+        let Broker::PocketOption(settings) = &broker else {
+            panic!("expected Pocket settings")
+        };
+        assert_eq!(settings.history_pages_in_flight, None);
+        assert_eq!(toml::to_string(&broker).unwrap(), source);
+        for count in [1, 3, 8, u16::MAX] {
+            let explicit = format!("{source}history_pages_in_flight = {count}\n");
+            let broker: Broker = toml::from_str(&explicit).unwrap();
+            broker.validate(RunMode::Research).unwrap();
+            let Broker::PocketOption(settings) = &broker else {
+                panic!("expected Pocket settings")
+            };
+            assert_eq!(settings.history_pages_in_flight, Some(count));
+            assert_eq!(toml::to_string(&broker).unwrap(), explicit);
+        }
+        let broker: Broker =
+            toml::from_str(&format!("{source}history_pages_in_flight = 0\n")).unwrap();
+        assert_eq!(
+            broker.validate(RunMode::Research).unwrap_err(),
+            "history_pages_in_flight must be positive"
         );
     }
 

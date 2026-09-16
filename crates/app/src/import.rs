@@ -6,6 +6,7 @@ use std::collections::BTreeMap;
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 use binary_alpha_engine::config::{Config, PublicationUri, Source, relative_path};
@@ -1026,11 +1027,16 @@ pub(crate) fn record(role: ObjectRole, path: &str, identity: &ObjectIdentity) ->
     }
 }
 
-/// A process-specific scratch path inside the retained folder's object directory; a leftover
-/// from an interrupted run is ignored by every reader and overwritten by the same process id.
+/// A unique scratch path per call inside the retained folder's object directory; leftovers
+/// from interrupted runs are ignored by every reader.
 pub(crate) fn temporary_path(local: &Store, name: &str) -> Result<PathBuf, String> {
+    static SEQUENCE: AtomicU64 = AtomicU64::new(0);
+    let sequence = SEQUENCE.fetch_add(1, Ordering::Relaxed);
     let path = local
-        .local_path(&format!("objects/.tmp-{name}-{}", std::process::id()))
+        .local_path(&format!(
+            "objects/.tmp-{name}-{}-{sequence}",
+            std::process::id()
+        ))
         .expect("the retained folder is a filesystem store");
     let parent = path.parent().expect("objects directory");
     fs::create_dir_all(parent)
@@ -1153,6 +1159,37 @@ mod tests {
     use binary_alpha_engine::dataset::Coverage;
     use binary_alpha_engine::market::{Bar, BrokerId, ProviderSymbol};
     use binary_alpha_engine::stream::Observation;
+
+    #[test]
+    fn concurrent_pages_retain_their_own_bytes() {
+        let dir = std::env::temp_dir().join(format!(
+            "binary-alpha-import-parallel-{}",
+            std::process::id()
+        ));
+        let barrier = std::sync::Barrier::new(8);
+        std::thread::scope(|scope| {
+            for job in 0..8 {
+                let dir = &dir;
+                let barrier = &barrier;
+                scope.spawn(move || {
+                    let local = Store::filesystem(dir.clone());
+                    // Keep all same-name scratch files present to make aliasing observable.
+                    let path = temporary_path(&local, "history-page").unwrap();
+                    let bytes = format!("page for job {job}");
+                    fs::write(&path, &bytes).unwrap();
+                    barrier.wait();
+                    assert_eq!(fs::read(&path).unwrap(), bytes.as_bytes());
+                    let identity = retain_bytes(&local, bytes.as_bytes(), "history-page").unwrap();
+                    let mut retained = Vec::new();
+                    local
+                        .read_to(&object_key(&identity.sha256), None, &mut retained)
+                        .unwrap();
+                    assert_eq!(retained, bytes.as_bytes());
+                });
+            }
+        });
+        fs::remove_dir_all(dir).unwrap();
+    }
 
     /// A tick manifest with one source object carrying the given destination metadata.
     fn manifest(crc32c: Option<u32>, generation: Option<i64>) -> GenerationManifest {
