@@ -12,7 +12,7 @@ use std::net::{TcpListener, TcpStream};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
@@ -422,9 +422,38 @@ struct DriveState {
     faults: DriveFaults,
 }
 
+#[derive(Default)]
+struct RequestCount {
+    in_flight: AtomicUsize,
+    high_water: AtomicUsize,
+}
+
+impl RequestCount {
+    fn enter(&self) -> InFlight<'_> {
+        let count = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+        self.high_water.fetch_max(count, Ordering::SeqCst);
+        InFlight(self)
+    }
+}
+
+struct InFlight<'a>(&'a RequestCount);
+
+impl Drop for InFlight<'_> {
+    fn drop(&mut self) {
+        self.0.in_flight.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+#[derive(Default)]
+struct DriveActivity {
+    uploads: RequestCount,
+    downloads: RequestCount,
+}
+
 struct FakeDrive {
     base: String,
     state: Arc<Mutex<DriveState>>,
+    activity: Arc<DriveActivity>,
     stop: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
 }
@@ -455,6 +484,8 @@ fn serve_drive() -> FakeDrive {
     listener.set_nonblocking(true).unwrap();
     let base = format!("http://{}", listener.local_addr().unwrap());
     let state = Arc::new(Mutex::new(DriveState::default()));
+    let activity = Arc::new(DriveActivity::default());
+    let activity_ = Arc::clone(&activity);
     let stop = Arc::new(AtomicBool::new(false));
     let (state_, stop_, base_) = (Arc::clone(&state), Arc::clone(&stop), base.clone());
     let thread = std::thread::spawn(move || {
@@ -463,8 +494,9 @@ fn serve_drive() -> FakeDrive {
                 Ok((stream, _)) => {
                     stream.set_nonblocking(false).unwrap();
                     let state = Arc::clone(&state_);
+                    let activity = Arc::clone(&activity_);
                     let base = base_.clone();
-                    std::thread::spawn(move || handle_http(stream, &state, &base));
+                    std::thread::spawn(move || handle_http(stream, &state, &activity, &base));
                 }
                 Err(_) => std::thread::sleep(Duration::from_millis(20)),
             }
@@ -473,6 +505,7 @@ fn serve_drive() -> FakeDrive {
     FakeDrive {
         base,
         state,
+        activity,
         stop,
         thread: Some(thread),
     }
@@ -562,10 +595,32 @@ fn file_json(id: &str, entry: &RemoteEntry, omit_sha256: bool) -> Vec<u8> {
     value.to_string().into_bytes()
 }
 
-fn handle_http(mut stream: TcpStream, state: &Arc<Mutex<DriveState>>, base: &str) {
+fn handle_http(
+    mut stream: TcpStream,
+    state: &Arc<Mutex<DriveState>>,
+    activity: &DriveActivity,
+    base: &str,
+) {
     let Some(request) = read_request(&mut stream) else {
         return;
     };
+    let in_flight = if request.method == "PUT"
+        && request.path.starts_with("/upload/session/")
+        && !request.body.is_empty()
+    {
+        Some(activity.uploads.enter())
+    } else if request.method == "GET"
+        && request.path.starts_with("/drive/v3/files/")
+        && request.query.get("alt").map(String::as_str) == Some("media")
+    {
+        Some(activity.downloads.enter())
+    } else {
+        None
+    };
+    if in_flight.is_some() {
+        // Model transfer latency outside the state lock so concurrent requests can overlap.
+        std::thread::sleep(Duration::from_millis(50));
+    }
     let mut state = state.lock().unwrap();
     state.log.push(format!(
         "{} {} {} {}",
@@ -932,7 +987,7 @@ fn pipeline_toml(
     max_attempts: u32,
 ) -> String {
     let mut text = format!(
-        "schema_version = 1\nlocal_root = \"{}\"\n",
+        "schema_version = 1\nlocal_root = \"{}\"\nparallel_transfers = 3\n",
         local_root.display()
     );
     if let Some(uri) = governance {
@@ -1333,6 +1388,10 @@ fn pipeline_roundtrip() {
     // The pinned Pocket cutoff precedes Deriv's seed, so Deriv refuses the narrower range
     // while Pocket publishes its first descendant and catalog.
     assert!(first.contains("pipeline update pocket "), "{first}");
+    assert!(
+        f.drive.activity.uploads.high_water.load(Ordering::SeqCst) >= 2,
+        "closure object uploads must overlap"
+    );
     let pocket_line = job_line(&first, "pocket");
     assert_eq!(field(pocket_line, "status"), "archived");
     let pocket_first = field(pocket_line, "dataset").to_string();
@@ -1359,6 +1418,7 @@ fn pipeline_roundtrip() {
     );
     assert!(pocket_coverage.pages.len() >= 2, "{pocket_coverage:?}");
     let pocket_manifest = dataset(&store, &pocket_first);
+    assert!(pocket_manifest.objects.len() > 3);
     assert!(
         pocket_manifest
             .objects
@@ -1540,6 +1600,10 @@ fn pipeline_roundtrip() {
     )
     .unwrap();
     let dataset_uri = field(&restored, "dataset").to_string();
+    assert!(
+        f.drive.activity.downloads.high_water.load(Ordering::SeqCst) >= 2,
+        "closure object downloads must overlap"
+    );
     let stream_uri = field(&restored, "stream").to_string();
     let consumer_store = f.scratch.path("elsewhere/consumer/store");
     assert_eq!(
@@ -2008,8 +2072,8 @@ fn pipeline_recovery() {
             .iter()
             .filter(|line| line.starts_with("POST /token"))
             .count(),
-        2,
-        "one refresh after the rejected token: {:?}",
+        2 + 3,
+        "one caller refresh after the rejected token, plus three worker sessions: {:?}",
         &f.drive.log()[log_before..]
     );
     f.drive.set(DriveFaults::default());
@@ -2073,9 +2137,11 @@ fn pipeline_recovery() {
     );
     let consumer = f.scratch.path("consumer.toml");
     let consumer_root = f.scratch.path("consumer");
+    // Keep the interruption on the first object so the retained partial is deterministic.
     fs::write(
         &consumer,
-        pipeline_toml(&consumer_root, &f.drive.base, &[], None, 1),
+        pipeline_toml(&consumer_root, &f.drive.base, &[], None, 1)
+            .replace("parallel_transfers = 3", "parallel_transfers = 1"),
     )
     .unwrap();
     let restore_args = [
@@ -2779,6 +2845,23 @@ fn pipeline_scope() {
     let refused = pipeline("update", &zero, &["--end", &end]).unwrap_err();
     assert!(
         refused.contains("parallel_jobs must be positive"),
+        "{refused}"
+    );
+    fs::write(
+        &zero,
+        pipeline_toml(
+            &producer,
+            &f.drive.base,
+            &[("pocket", "pocket.toml")],
+            None,
+            3,
+        )
+        .replace("parallel_transfers = 3", "parallel_transfers = 0"),
+    )
+    .unwrap();
+    let refused = pipeline("update", &zero, &["--end", &end]).unwrap_err();
+    assert!(
+        refused.contains("parallel_transfers must be positive"),
         "{refused}"
     );
 

@@ -5,10 +5,11 @@
 //! immutable catalog published last, and restores one exact catalog into a fresh store. Every
 //! mutable step is resumable from `pipeline_state/`; every completed record is immutable.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::fs::{self, File};
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 
 use binary_alpha_engine::config::{
     Config, ConfigPath, ManifestUri, PublicationUri, RunMode, Seed, relative_path,
@@ -61,6 +62,10 @@ pub struct PipelineConfig {
     /// broker connection and Drive session; the writer lock still admits one producer process.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parallel_jobs: Option<u32>,
+    /// How many object uploads or downloads one job runs at a time (default 8), each worker
+    /// with its own Drive session.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parallel_transfers: Option<u32>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub jobs: Vec<Job>,
 }
@@ -86,6 +91,9 @@ impl PipelineConfig {
     fn validate(&self) -> Result<(), String> {
         if self.parallel_jobs == Some(0) {
             return Err("parallel_jobs must be positive".into());
+        }
+        if self.parallel_transfers == Some(0) {
+            return Err("parallel_transfers must be positive".into());
         }
         if self.schema_version != PIPELINE_SCHEMA_VERSION {
             return Err(format!(
@@ -520,6 +528,7 @@ struct Transfer {
 /// object once, then both manifests, then the catalog. A catalog receipt already recorded for
 /// the pair is reused after its remote file is confirmed.
 fn archive(
+    config: &PipelineConfig,
     drive: &mut Drive,
     layout: &Layout,
     job: &str,
@@ -581,8 +590,8 @@ fn archive(
         }
         write_atomic(&transfers_path, &json_bytes(&transfers)?)?;
     }
-    let mut objects = Vec::with_capacity(closure.len());
-    for object in &closure {
+    let transfers = Mutex::new(transfers);
+    let objects = run_pool(config, &closure, |object, drive| {
         let path = local
             .local_path(&object.key)
             .expect("the managed store is local");
@@ -595,20 +604,20 @@ fn archive(
         }
         let file_id = transfer(
             drive,
-            &mut transfers,
+            &transfers,
             &transfers_path,
             &object.key,
             &format!("object-{}", object.sha256),
             &path,
             &identity,
         )?;
-        objects.push(ObjectEntry {
+        Ok(ObjectEntry {
             key: object.key.clone(),
             sha256: object.sha256.clone(),
             bytes: object.bytes,
             file_id,
-        });
-    }
+        })
+    })?;
     let mut manifests = Vec::with_capacity(2);
     for (generation, key, bytes) in [
         (dataset, dataset_manifest.key(), &dataset_bytes),
@@ -620,7 +629,7 @@ fn archive(
         let identity = store::identify(&scratch)?;
         let file_id = transfer(
             drive,
-            &mut transfers,
+            &transfers,
             &transfers_path,
             &key,
             &format!("manifest-{generation}.json"),
@@ -661,7 +670,7 @@ fn archive(
     let identity = store::identify(&scratch)?;
     let file_id = transfer(
         drive,
-        &mut transfers,
+        &transfers,
         &transfers_path,
         &format!("catalog/{dataset}/{stream}"),
         &format!("{CATALOG_PREFIX}{}-{}.json", &dataset[..16], &stream[..16]),
@@ -683,7 +692,7 @@ fn archive(
 /// it, persisting every session change before bytes flow.
 fn transfer(
     drive: &mut Drive,
-    transfers: &mut Transfers,
+    transfers: &Mutex<Transfers>,
     transfers_path: &Path,
     key: &str,
     name: &str,
@@ -691,6 +700,8 @@ fn transfer(
     identity: &ObjectIdentity,
 ) -> Result<String, String> {
     let entry = transfers
+        .lock()
+        .map_err(|_| "pipeline: transfers lock poisoned")?
         .files
         .get(key)
         .cloned()
@@ -701,6 +712,9 @@ fn transfer(
     }
     let file_id = entry.file_id.clone();
     let mut checkpoint = |session: Option<&str>| -> Result<(), String> {
+        let mut transfers = transfers
+            .lock()
+            .map_err(|_| "pipeline: transfers lock poisoned")?;
         let entry = transfers.files.get_mut(key).expect("indexed");
         entry.session = session.map(str::to_string);
         write_atomic(transfers_path, &json_bytes(&*transfers)?)
@@ -713,11 +727,70 @@ fn transfer(
         entry.session,
         &mut checkpoint,
     )?;
+    let mut transfers = transfers
+        .lock()
+        .map_err(|_| "pipeline: transfers lock poisoned")?;
     let entry = transfers.files.get_mut(key).expect("indexed");
     entry.session = None;
     entry.done = true;
     write_atomic(transfers_path, &json_bytes(&*transfers)?)?;
     Ok(file_id)
+}
+
+/// Transfers objects with one Drive session per worker. A failure stops new work; in-flight
+/// transfers finish and checkpoint before results (including failures) return in input order.
+fn run_pool<T: Sync, R: Send>(
+    config: &PipelineConfig,
+    items: &[T],
+    work: impl Fn(&T, &mut Drive) -> Result<R, String> + Sync,
+) -> Result<Vec<R>, String> {
+    let workers = usize::try_from(config.parallel_transfers.unwrap_or(8))
+        .unwrap_or(8)
+        .min(items.len());
+    let queue = Mutex::new(items.iter().enumerate().collect::<VecDeque<_>>());
+    std::thread::scope(|scope| {
+        let handles: Vec<_> = (0..workers)
+            .map(|_| {
+                scope.spawn(|| {
+                    let mut drive = None;
+                    let mut results = Vec::new();
+                    loop {
+                        let Some((index, item)) =
+                            queue.lock().expect("transfer queue lock").pop_front()
+                        else {
+                            break;
+                        };
+                        let result = (|| {
+                            // Opening after reservation binds any session failure to this item.
+                            if drive.is_none() {
+                                drive = Some(Drive::open(&config.drive)?);
+                            }
+                            work(item, drive.as_mut().expect("worker Drive session"))
+                        })();
+                        let failed = result.is_err();
+                        if failed {
+                            queue.lock().expect("transfer queue lock").clear();
+                        }
+                        results.push((index, result));
+                        if failed {
+                            break;
+                        }
+                    }
+                    results
+                })
+            })
+            .collect();
+        let mut results = Vec::with_capacity(items.len());
+        for handle in handles {
+            results.extend(
+                handle
+                    .join()
+                    .map_err(|_| "pipeline: transfer worker panicked")?,
+            );
+        }
+        results.sort_unstable_by_key(|(index, _)| *index);
+        results.into_iter().map(|(_, result)| result).collect()
+    })
 }
 
 /// A remote file the index claims complete still carries exactly the local identity.
@@ -818,7 +891,9 @@ pub fn update_with(
     let (config, layout, hash) = load(config_path)?;
     let end = end.map(time).transpose()?;
     run_jobs(&config, &layout, out, &|job, bound, drive, access, out| {
-        update_job(job, bound, &layout, &hash, drive, access, end, clock, out)
+        update_job(
+            &config, job, bound, &layout, &hash, drive, access, end, clock, out,
+        )
     })
 }
 
@@ -935,6 +1010,7 @@ fn finish(
 
 #[allow(clippy::too_many_arguments)]
 fn update_job(
+    pipeline: &PipelineConfig,
     job: &Job,
     bound: Bound,
     layout: &Layout,
@@ -1081,7 +1157,7 @@ fn update_job(
     let (stream, catalog) = match &outcome.generation {
         Some(dataset) => {
             let stream = finish(&config, layout, &local, dataset, access, out)?;
-            let catalog = archive(drive, layout, &job.id, dataset, &stream)?;
+            let catalog = archive(pipeline, drive, layout, &job.id, dataset, &stream)?;
             (Some(stream), Some(catalog))
         }
         None => (None, None),
@@ -1387,9 +1463,7 @@ pub fn restore(
             extra.key
         ));
     }
-    let mut installed = 0;
-    let mut reused = 0;
-    for entry in &catalog.objects {
+    let installed = run_pool(&config, &catalog.objects, |entry, drive| {
         let identity = ObjectIdentity {
             bytes: entry.bytes,
             sha256: entry.sha256.clone(),
@@ -1404,16 +1478,19 @@ pub fn restore(
                     local.uri(&entry.key)
                 ));
             }
-            reused += 1;
-            continue;
+            return Ok(false);
         }
         let partial = downloads.join(format!("{}.partial", entry.sha256));
         drive.download(&entry.file_id, &partial, &identity)?;
         let identity = store::identify(&partial)?;
         local.put_new(&entry.key, &partial, &identity)?;
         fs::remove_file(&partial).map_err(|error| error.to_string())?;
-        installed += 1;
-    }
+        Ok(true)
+    })?
+    .into_iter()
+    .filter(|installed| *installed)
+    .count();
+    let reused = catalog.objects.len() - installed;
     // Manifests last, through the same create-once owner.
     for (key, bytes) in [
         (dataset.key(), &dataset_bytes),

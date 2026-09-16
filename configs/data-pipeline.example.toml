@@ -10,6 +10,8 @@ schema_version = 1
 local_root = "../historical_data"
 # Instruments worked on concurrently by one producer run; raise gradually (provider rate limits).
 parallel_jobs = 2
+# Object uploads or downloads per job, each worker with its own Drive session (default 8).
+parallel_transfers = 8
 # Supply an existing study declaration when applicable; use its actual authorized location.
 # governance_manifest = "file:///absolute/path/to/declaration.json"
 

@@ -234,6 +234,8 @@ After acquisition closes, a later update can select a new cutoff. Set `parallel_
 pipeline document to work several instruments at once (one connection each); raise it gradually,
 because provider rate limits per connection and per application identifier are not published,
 and the measured single-connection rate on Deriv is about 1.3 pages of 1000 ticks per second.
+Set `parallel_transfers` (default 8) to bound concurrent object uploads or downloads within each
+job; manifests and the catalog are still published last.
 
 Read every job's report and receipt. `pending` leaves acquisition open, possibly with an archived
 partial snapshot. `archived_with_gaps` records a catalog with a primary shortfall other than

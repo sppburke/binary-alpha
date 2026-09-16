@@ -545,7 +545,9 @@ The separate Tom's Obvious, Minimal Language (TOML) document has `schema_version
 nonempty `local_root`, required `drive`, optional `governance_manifest`, optional positive
 `parallel_jobs` (default 1: how many jobs one producer run works on at a time, each with its own
 broker connection and Drive session; per-job report lines stay contiguous and the failure summary
-keeps document order), and `jobs` (default empty). Unknown fields are rejected in the document, Drive settings, and jobs. Relative
+keeps document order), optional positive `parallel_transfers` (default 8: concurrent object uploads
+or downloads per job, each worker with its own Drive session), and `jobs` (default empty).
+Unknown fields are rejected in the document, Drive settings, and jobs. Relative
 `local_root` resolves against this document's directory. Each job requires:
 
 - `id`: unique, nonempty ASCII (American Standard Code for Information Interchange) letters,
