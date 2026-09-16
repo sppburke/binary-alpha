@@ -850,7 +850,7 @@ fn pocket_parallel_connections_use_distinct_increasing_positive_indexes() {
                     for ordinal in 0..2 {
                         frames.extend(attachment(
                             "loadHistoryPeriodFast",
-                            pocket_candle_page(ordinal, &[5]),
+                            full_candle_page(ordinal, 10),
                         ));
                     }
                     let (mut adapter, sent) = pocket(frames);
@@ -1057,7 +1057,7 @@ fn candle_adapter(
 fn full_candle_page(index: u64, anchor: i64) -> String {
     pocket_candle_page(
         index,
-        &(anchor - 200..anchor).step_by(5).collect::<Vec<_>>(),
+        &(anchor - 195..=anchor).step_by(5).collect::<Vec<_>>(),
     )
 }
 fn assert_candle_page(
@@ -1065,7 +1065,21 @@ fn assert_candle_page(
     page: &HistoryPage,
     instrument: &InstrumentId,
     anchor: i64,
-    first: i64,
+) {
+    assert_candle_rows(
+        adapter,
+        page,
+        instrument,
+        anchor,
+        &(anchor - 195..=anchor).step_by(5).collect::<Vec<_>>(),
+    );
+}
+fn assert_candle_rows(
+    adapter: &PocketMarketData,
+    page: &HistoryPage,
+    instrument: &InstrumentId,
+    anchor: i64,
+    starts: &[i64],
 ) {
     use binary_alpha_engine::market::Bar;
     assert_eq!(page.anchor_token, Some((anchor + 7200).to_string()));
@@ -1083,9 +1097,9 @@ fn assert_candle_page(
     };
     assert_eq!(
         rows,
-        (first..first + 200)
-            .step_by(5)
-            .map(|start_unix_s| Bar {
+        starts
+            .iter()
+            .map(|&start_unix_s| Bar {
                 start_unix_s,
                 open: 1.25,
                 high: 1.5,
@@ -1104,7 +1118,7 @@ fn pocket_candle_prefetch_walk_batches_requests_and_preserves_each_page() {
     let index = 0;
     let mut frames = handshake();
     let raw: Vec<_> = (0..5)
-        .map(|n| full_candle_page(index + n, 2000 - n as i64 * 200))
+        .map(|n| full_candle_page(index + n, 2000 - n as i64 * 195))
         .collect();
     for page in &raw {
         frames.extend(attachment("loadHistoryPeriodFast", page.clone()));
@@ -1117,13 +1131,7 @@ fn pocket_candle_prefetch_walk_batches_requests_and_preserves_each_page() {
         let page = adapter
             .history_page(instrument, scale(5), Some(anchor), granularity)
             .unwrap();
-        assert_candle_page(
-            &adapter,
-            &page,
-            instrument,
-            anchor / 1_000_000,
-            anchor / 1_000_000 - 200,
-        );
+        assert_candle_page(&adapter, &page, instrument, anchor / 1_000_000);
         assert_eq!(page.raw, pocket_response(raw, &trace.sent).as_bytes());
         let request_index = pocket_sent_events(&trace.sent, "loadHistoryPeriod")[n]["index"]
             .as_u64()
@@ -1147,7 +1155,7 @@ fn pocket_candle_prefetch_walk_batches_requests_and_preserves_each_page() {
             *request,
             serde_json::json!({
                 "asset": "EURUSD_otc", "index": requests[0]["index"].as_u64().unwrap() + n as u64,
-                "time": 9200 - n * 200, "offset": 200, "period": 5,
+                "time": 9200 - n * 195, "offset": 200, "period": 5,
             })
         );
     }
@@ -1159,7 +1167,7 @@ fn pocket_candle_prefetch_out_of_order_keeps_original_receipt_and_default_window
     let index = 0;
     let mut frames = handshake();
     let first = full_candle_page(index, 2000);
-    let second = full_candle_page(index + 1, 1800);
+    let second = full_candle_page(index + 1, 1805);
     frames.extend(attachment("loadHistoryPeriodFast", second.clone()));
     frames.extend(attachment("loadHistoryPeriodFast", first.clone()));
     let (mut adapter, trace) = candle_adapter(vec![frames], &clock, None);
@@ -1172,16 +1180,16 @@ fn pocket_candle_prefetch_out_of_order_keeps_original_receipt_and_default_window
         first_page.raw,
         pocket_response(&first, &trace.sent).as_bytes()
     );
-    assert_candle_page(&adapter, &first_page, instrument, 2000, 1800);
+    assert_candle_page(&adapter, &first_page, instrument, 2000);
     clock.sleep(1000);
     let second_page = adapter
-        .history_page(instrument, scale(5), Some(1_800_000_000), granularity)
+        .history_page(instrument, scale(5), Some(1_805_000_000), granularity)
         .unwrap();
     assert_eq!(
         second_page.raw,
         pocket_response(&second, &trace.sent).as_bytes()
     );
-    assert_candle_page(&adapter, &second_page, instrument, 1800, 1600);
+    assert_candle_page(&adapter, &second_page, instrument, 1805);
     let requests = pocket_sent_events(&trace.sent, "loadHistoryPeriod");
     let index = requests[0]["index"].as_u64().unwrap();
     let arrivals = trace.arrivals.lock().unwrap();
@@ -1201,33 +1209,44 @@ fn pocket_candle_prefetch_gap_discards_skipped_anchors_and_stale_responses() {
     let clock = FakeClock::at(1_789_348_000_000_000);
     let index = 0;
     let mut frames = handshake();
-    for (n, page_anchor) in [2000, 1800, 1400, 1400, 1200, 1200].into_iter().enumerate() {
-        // Third request is anchored at 1600 but its first bar is 1200: a 400-second gap.
-        frames.extend(attachment(
-            "loadHistoryPeriodFast",
-            full_candle_page(index + n as u64, page_anchor),
-        ));
+    // The third page omits 1225..=1415, reaching back to 1220 to fill 40 bars.
+    // Its first row skips the predicted 1415 anchor, even though 1220 is buffered.
+    let gap_starts: Vec<_> = std::iter::once(1220)
+        .chain((1420..=1610).step_by(5))
+        .collect();
+    for (n, page_anchor) in [2000, 1805, 1610, 1415, 1220, 1220].into_iter().enumerate() {
+        let page = if n == 2 {
+            pocket_candle_page(index + n as u64, &gap_starts)
+        } else {
+            full_candle_page(index + n as u64, page_anchor)
+        };
+        frames.extend(attachment("loadHistoryPeriodFast", page));
     }
     let (mut adapter, trace) = candle_adapter(vec![frames], &clock, Some(3));
     let instrument = &pocket_ids()[0];
     let granularity = NativeGranularity::Bar { period_seconds: 5 };
     let mut anchor = 2_000_000_000;
-    for first in [1800, 1600, 1200, 1000] {
+    for first in [1805, 1610, 1220, 1025] {
         let page = adapter
             .history_page(instrument, scale(5), Some(anchor), granularity)
             .unwrap();
-        assert_candle_page(&adapter, &page, instrument, anchor / 1_000_000, first);
+        if first == 1220 {
+            assert_candle_rows(&adapter, &page, instrument, 1610, &gap_starts);
+        } else {
+            assert_candle_page(&adapter, &page, instrument, anchor / 1_000_000);
+        }
         anchor = adapter
             .decode_history(instrument, &page.raw, scale(5), granularity)
             .unwrap()
             .1
             .first_time_micros()
             .unwrap();
+        assert_eq!(anchor, first * 1_000_000);
     }
     let requests = pocket_sent_events(&trace.sent, "loadHistoryPeriod");
     assert_eq!(requests.len(), 8);
-    assert_eq!(requests[4]["time"], 8400);
-    assert_eq!(requests[5]["time"], 8400);
+    assert_eq!(requests[4]["time"], 8420);
+    assert_eq!(requests[5]["time"], 8420);
     let index = requests[0]["index"].as_u64().unwrap();
     assert_eq!(requests[5]["index"], index + 5);
     assert_eq!(trace.arrivals.lock().unwrap()[&(index + 5)].0, 8);
@@ -1239,12 +1258,12 @@ fn pocket_candle_prefetch_reconnect_resends_only_outstanding_pages() {
     let clock = FakeClock::at(1_789_348_000_000_000);
     let index = 0;
     let mut first = handshake();
-    let buffered = full_candle_page(index + 1, 1800);
+    let buffered = full_candle_page(index + 1, 1805);
     first.extend(attachment("loadHistoryPeriodFast", buffered.clone()));
     first.push(Frame::Text("41".into()));
     let reconnected_index = 3;
     let mut second = handshake();
-    for (index, anchor) in [(reconnected_index, 2000), (reconnected_index + 1, 1600)] {
+    for (index, anchor) in [(reconnected_index, 2000), (reconnected_index + 1, 1610)] {
         second.extend(attachment(
             "loadHistoryPeriodFast",
             full_candle_page(index, anchor),
@@ -1253,12 +1272,12 @@ fn pocket_candle_prefetch_reconnect_resends_only_outstanding_pages() {
     let (mut adapter, trace) = candle_adapter(vec![first, second], &clock, Some(3));
     let instrument = &pocket_ids()[0];
     let granularity = NativeGranularity::Bar { period_seconds: 5 };
-    for anchor in [2000, 1800, 1600] {
+    for anchor in [2000, 1805, 1610] {
         let page = adapter
             .history_page(instrument, scale(5), Some(anchor * 1_000_000), granularity)
             .unwrap();
-        assert_candle_page(&adapter, &page, instrument, anchor, anchor - 200);
-        if anchor == 1800 {
+        assert_candle_page(&adapter, &page, instrument, anchor);
+        if anchor == 1805 {
             assert_eq!(page.raw, pocket_response(&buffered, &trace.sent).as_bytes());
             let index = pocket_sent_events(&trace.sent, "loadHistoryPeriod")[0]["index"]
                 .as_u64()
@@ -1278,7 +1297,7 @@ fn pocket_candle_prefetch_reconnect_resends_only_outstanding_pages() {
             .windows(2)
             .all(|pair| pair[0]["index"].as_u64() < pair[1]["index"].as_u64())
     );
-    assert_eq!(requests[4]["time"], 8800);
+    assert_eq!(requests[4]["time"], 8810);
     assert_eq!(
         requests[4]["index"].as_u64().unwrap(),
         requests[3]["index"].as_u64().unwrap() + 1
@@ -1286,7 +1305,7 @@ fn pocket_candle_prefetch_reconnect_resends_only_outstanding_pages() {
     assert_eq!(
         requests
             .iter()
-            .filter(|request| request["time"] == 9000)
+            .filter(|request| request["time"] == 9005)
             .count(),
         1
     );
@@ -1299,13 +1318,13 @@ fn pocket_candle_prefetch_instrument_change_discards_buffered_and_outstanding_pa
     let clock = FakeClock::at(1_789_348_000_000_000);
     let index = 0;
     let mut frames = handshake();
-    for (n, anchor) in [(1, 1800), (0, 2000), (2, 1600)] {
+    for (n, anchor) in [(1, 1805), (0, 2000), (2, 1610)] {
         frames.extend(attachment(
             "loadHistoryPeriodFast",
             full_candle_page(index + n, anchor),
         ));
     }
-    let other = replace(&full_candle_page(index + 3, 1800), "asset", "\"#AAPL_otc\"");
+    let other = replace(&full_candle_page(index + 3, 1805), "asset", "\"#AAPL_otc\"");
     frames.extend(attachment("loadHistoryPeriodFast", other.clone()));
     let (mut adapter, trace) = candle_adapter(vec![frames], &clock, Some(3));
     let ids = pocket_ids();
@@ -1314,32 +1333,31 @@ fn pocket_candle_prefetch_instrument_change_discards_buffered_and_outstanding_pa
         .history_page(&ids[0], scale(5), Some(2_000_000_000), granularity)
         .unwrap();
     let page = adapter
-        .history_page(&ids[1], scale(5), Some(1_800_000_000), granularity)
+        .history_page(&ids[1], scale(5), Some(1_805_000_000), granularity)
         .unwrap();
     assert_eq!(page.raw, pocket_response(&other, &trace.sent).as_bytes());
-    assert_candle_page(&adapter, &page, &ids[1], 1800, 1600);
+    assert_candle_page(&adapter, &page, &ids[1], 1805);
     let requests = pocket_sent_events(&trace.sent, "loadHistoryPeriod");
     assert_eq!(requests.len(), 6);
     for (n, request) in requests[3..].iter().enumerate() {
         assert_eq!(request["asset"], "#AAPL_otc");
-        assert_eq!(request["time"], 9000 - n * 200);
+        assert_eq!(request["time"], 9005 - n * 195);
     }
     assert_eq!(adapter.foreign_history_responses(), 1);
 }
 
 #[test]
 fn pocket_candle_history_reconnects_after_second_page_and_preserves_rows() {
-    use binary_alpha_engine::market::Bar;
     let clock = FakeClock::at(1_789_348_000_000_000);
     let first_index = 0;
     let mut first = handshake();
     first.extend(attachment(
         "loadHistoryPeriodFast",
-        pocket_candle_page(first_index, &[20, 25]),
+        full_candle_page(first_index, 2000),
     ));
     first.extend(attachment(
         "loadHistoryPeriodFast",
-        pocket_candle_page(first_index + 1, &[10, 15]),
+        full_candle_page(first_index + 1, 1805),
     ));
     first.push(Frame::Text("41".into()));
     // The fourth request retries the outstanding page after reconnect.
@@ -1347,7 +1365,7 @@ fn pocket_candle_history_reconnects_after_second_page_and_preserves_rows() {
     let mut second = handshake();
     second.extend(attachment(
         "loadHistoryPeriodFast",
-        pocket_candle_page(second_index, &[0, 5]),
+        full_candle_page(second_index, 1610),
     ));
     let (connector, sent) = pocket_connector(vec![first, second], &clock);
     let mut adapter = PocketMarketData::connect(
@@ -1361,30 +1379,11 @@ fn pocket_candle_history_reconnects_after_second_page_and_preserves_rows() {
     let instrument = &pocket_ids()[0];
     adapter.subscribe(instrument, scale(5)).unwrap();
     let granularity = NativeGranularity::Bar { period_seconds: 5 };
-    for (anchor, starts) in [(30, [20, 25]), (20, [10, 15]), (10, [0, 5])] {
+    for anchor in [2000, 1805, 1610] {
         let page = adapter
             .history_page(instrument, scale(5), Some(anchor * 1_000_000), granularity)
             .unwrap();
-        let (symbol_id, rows) = adapter
-            .decode_history(instrument, &page.raw, scale(5), granularity)
-            .unwrap();
-        assert_eq!(symbol_id, Some(7));
-        let HistoryRows::Bars(rows) = rows else {
-            panic!("expected candles")
-        };
-        assert_eq!(
-            rows,
-            starts.map(|start_unix_s| Bar {
-                start_unix_s,
-                open: 1.25,
-                high: 1.5,
-                low: 1.0,
-                close: 1.375,
-                volume: 2.0,
-                period_s: 5,
-            })
-        );
-        assert_eq!(page.anchor_token, Some((anchor + 7200).to_string()));
+        assert_candle_page(&adapter, &page, instrument, anchor);
     }
     assert_eq!(adapter.history_reconnects(), 1);
     assert_eq!(adapter.foreign_history_responses(), 0);
@@ -1404,7 +1403,7 @@ fn pocket_candle_history_reconnects_after_second_page_and_preserves_rows() {
             .windows(2)
             .all(|pair| pair[0]["index"].as_u64() < pair[1]["index"].as_u64())
     );
-    for (request, anchor) in requests.iter().zip([7230, 7220, 7210, 7210]) {
+    for (request, anchor) in requests.iter().zip([9200, 9005, 8810, 8810]) {
         assert_eq!(
             *request,
             serde_json::json!({
@@ -1443,7 +1442,7 @@ fn pocket_history_skips_foreign_assets_and_indexes_without_extending_deadline() 
                     .to_string(),
                 )
             } else {
-                ("loadHistoryPeriodFast", pocket_candle_page(index, &[5]))
+                ("loadHistoryPeriodFast", full_candle_page(index, 10))
             };
             let mut frames = handshake();
             frames.extend(attachment(
@@ -1457,7 +1456,7 @@ fn pocket_history_skips_foreign_assets_and_indexes_without_extending_deadline() 
             if granularity != NativeGranularity::Tick {
                 frames.extend(attachment(
                     "loadHistoryPeriodFast",
-                    full_candle_page(index + 1, -190),
+                    full_candle_page(index + 1, -185),
                 ));
             }
             if matching {
@@ -1484,8 +1483,12 @@ fn pocket_history_skips_foreign_assets_and_indexes_without_extending_deadline() 
                 let (symbol_id, rows) = adapter
                     .decode_history(&pocket_ids()[0], &page.raw, scale(5), granularity)
                     .unwrap();
-                assert_eq!(rows.len(), 1);
-                assert_eq!(rows.first_time_micros(), Some(5_000_000));
+                if granularity == NativeGranularity::Tick {
+                    assert_eq!(rows.len(), 1);
+                    assert_eq!(rows.first_time_micros(), Some(5_000_000));
+                } else {
+                    assert_candle_page(&adapter, &page, &pocket_ids()[0], 10);
+                }
                 assert_eq!(
                     symbol_id,
                     if granularity == NativeGranularity::Tick {
@@ -1574,7 +1577,7 @@ fn pocket_history_namespace_reconnect_limit_persists_across_pages() {
         if session > 0 {
             frames.extend(attachment(
                 "loadHistoryPeriodFast",
-                pocket_candle_page(index, &[5]),
+                full_candle_page(index, 10),
             ));
         }
         frames.push(Frame::Text("41".into()));

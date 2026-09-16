@@ -135,7 +135,7 @@ struct CandleRow {
 }
 /// The only provider bar period this checkout admits, in seconds.
 const BAR_PERIOD_S: u16 = 5;
-const HISTORY_PAGE_MICROS: i64 = 200_000_000;
+const HISTORY_OFFSET_S: u16 = 200;
 
 #[derive(Default)]
 struct CandleHistoryBuffer {
@@ -465,7 +465,7 @@ impl PocketMarketData {
                 asset: symbol,
                 index,
                 time,
-                offset: 200,
+                offset: HISTORY_OFFSET_S,
                 period,
             },
         )?;
@@ -476,6 +476,12 @@ impl PocketMarketData {
         if limit == 0 {
             return Err("history_pages_in_flight must be positive".into());
         }
+        // A live producer's durable progress record (2026-09-16) shows offset=200,
+        // period=5 returning 40 bars from A-195s through A inclusive. Anchors
+        // 1788228000, 1788227805, 1788227610 each end at A and overlap the next
+        // page by one bar. The fetch owner uses the first row as its next anchor,
+        // so predict offset minus period; reset below if real gaps change that cursor.
+        let page_step_micros = (i64::from(HISTORY_OFFSET_S) - i64::from(period)) * 1_000_000;
         // Skipping an unconsumed anchor is a gap even if an older buffered anchor matches.
         if self.candle_history.asset != symbol
             || self
@@ -507,7 +513,7 @@ impl PocketMarketData {
         while self.candle_history.pages.len() < limit {
             let anchor = match self.candle_history.pages.first_key_value() {
                 Some((anchor, _)) => anchor
-                    .checked_sub(HISTORY_PAGE_MICROS)
+                    .checked_sub(page_step_micros)
                     .ok_or("pocket_option: history anchor overflow")?,
                 None => before,
             };

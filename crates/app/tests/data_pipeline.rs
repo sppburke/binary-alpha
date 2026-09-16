@@ -40,6 +40,7 @@ const DAY2: i64 = DAY1 + 86_400;
 const POCKET_START: i64 = 1_747_653_300;
 const POCKET_OFFSET_S: i64 = 7_200;
 const POCKET_SYMBOL_ID: i32 = 538;
+const POCKET_HISTORY_PAGES_IN_FLIGHT: usize = 8;
 
 /// The provider tick price at Unix second `t`, as exact five-decimal text.
 fn deriv_price(t: i64) -> String {
@@ -301,11 +302,15 @@ fn serve_broker(kind: Kind) -> FakeBroker {
                                         pages += 1;
                                         let anchor = request["time"].as_f64().unwrap() as i64 - POCKET_OFFSET_S;
                                         let index = request["index"].as_u64().unwrap();
-                                        // Every candle starting before the anchor, including one
-                                        // still in progress when the anchor lies inside it.
-                                        let first = (anchor.div_euclid(5) * 5 - 200).max(*from);
-                                        let rows: Vec<Value> = (first..anchor.min(*to))
+                                        assert_eq!(request["offset"], 200);
+                                        // The real window contains 40 starts, ending at the
+                                        // anchor inclusive. Off-grid cutoffs include the bar
+                                        // containing the cutoff; adjacent pages overlap by one bar.
+                                        let last = anchor.div_euclid(5) * 5;
+                                        let first = (last - 195).max(*from);
+                                        let rows: Vec<Value> = (first..=last)
                                             .step_by(5)
+                                            .filter(|start| *start < *to)
                                             .map(|start| {
                                                 let [open, high, low, close, volume] = synthetic_bar(start);
                                                 let shift = if faults.conflict_before.is_some_and(|before| start < before) { 0.0001 } else { 0.0 };
@@ -970,6 +975,7 @@ endpoint = "{endpoint}"
 credential = "PIPELINE_SYNTHETIC_AUTH"
 account_class = "{account_class}"
 server_offset_minutes = 120
+history_pages_in_flight = {POCKET_HISTORY_PAGES_IN_FLIGHT}
 
 [history]
 broker = "pocket_option"
@@ -1298,6 +1304,7 @@ fn expected_ticks(seed_end: i64, fetch_start: i64, cutoff: i64) -> Vec<Tick> {
     rows
 }
 
+// Page overlap contributes each start once; only bars closed by the cutoff are retained.
 fn expected_bars(seed_end: i64, fetch_start: i64, cutoff: i64) -> Vec<Bar> {
     let mut rows: Vec<Bar> = (POCKET_START..seed_end)
         .step_by(5)
@@ -1386,9 +1393,10 @@ fn pipeline_roundtrip() {
     );
     assert!(again.contains("(already published)"), "{again}");
 
-    // First update to a pinned cutoff two pages past the seed frontier, ending inside a bar.
+    // An aligned cutoff exercises matched prefetch anchors. The bar starting exactly at
+    // the cutoff is present on the first page but must be withheld until it closes.
     let deriv_cutoff = DERIV_SEED_END + 1_200;
-    let pocket_cutoff = POCKET_SEED_END + 362;
+    let pocket_cutoff = POCKET_SEED_END + 360;
     let first = pipeline(
         "update",
         &f.pipeline,
@@ -1412,9 +1420,10 @@ fn pipeline_roundtrip() {
         bars_after,
         expected_bars(POCKET_SEED_END, pocket_fetch_start, pocket_cutoff)
     );
+    assert_eq!(bars_after.len(), 272);
     assert_eq!(
         bars_after.last().unwrap().start_unix_s + 5,
-        pocket_cutoff - 2,
+        pocket_cutoff,
         "incomplete final bar withheld"
     );
     let pocket_coverage = coverage(&store, &dataset(&store, &pocket_first));
@@ -1426,7 +1435,26 @@ fn pipeline_roundtrip() {
         pocket_coverage.verified.as_ref().unwrap().start,
         time_text(pocket_fetch_start * 1_000_000)
     );
-    assert!(pocket_coverage.pages.len() >= 2, "{pocket_coverage:?}");
+    assert_eq!(pocket_coverage.pages.len(), 3, "{pocket_coverage:?}");
+    for (n, page) in pocket_coverage.pages.iter().enumerate() {
+        let anchor = pocket_cutoff - n as i64 * 195;
+        assert_eq!(page.anchor, Some((anchor + POCKET_OFFSET_S).to_string()));
+        assert_eq!(page.rows, 40);
+        assert_eq!(page.first, Some(time_text((anchor - 195) * 1_000_000)));
+        assert_eq!(page.last, Some(time_text(anchor * 1_000_000)));
+    }
+    let pocket_requests = f.pocket.requests();
+    assert!(
+        pocket_requests.len() <= pocket_coverage.pages.len() + POCKET_HISTORY_PAGES_IN_FLIGHT,
+        "matched anchors must reuse look-ahead requests: {pocket_requests:?}"
+    );
+    for (n, request) in pocket_requests.iter().enumerate() {
+        let request: Value = serde_json::from_str(request).unwrap();
+        assert_eq!(
+            request["time"].as_i64().unwrap() - POCKET_OFFSET_S,
+            pocket_cutoff - n as i64 * 195
+        );
+    }
     let pocket_manifest = dataset(&store, &pocket_first);
     assert!(pocket_manifest.objects.len() > 3);
     assert!(
@@ -1856,7 +1884,7 @@ fn pipeline_recovery() {
     let mut statuses = Vec::new();
     let mut generations = Vec::new();
     let mut resumed_anchor = cutoff;
-    for _ in 0..6 {
+    for n in 0..3 {
         let requests_before = f.pocket.requests().len();
         let result = pipeline("update", &pocket_only, &["--end", &end]);
         let request: Value = serde_json::from_str(&f.pocket.requests()[requests_before]).unwrap();
@@ -1879,27 +1907,22 @@ fn pipeline_recovery() {
                 assert_eq!(pending["progress"]["cutoff"], json!(end));
                 assert_eq!(pending["progress"]["baseline"], json!(baseline));
                 let pages = pending["progress"]["pages"].as_array().unwrap();
+                assert_eq!(pages.len(), n + 1);
+                assert_eq!(pages[n]["rows"], 40);
+                assert_eq!(
+                    pages[n]["last"],
+                    time_text((cutoff - 2 - n as i64 * 195) * 1_000_000)
+                );
                 resumed_anchor = binary_alpha_engine::market::parse_event_time_micros(
                     pages.last().unwrap()["first"].as_str().unwrap(),
                 )
                 .unwrap()
                     / 1_000_000;
+                assert_eq!(resumed_anchor, cutoff - 2 - (n as i64 + 1) * 195);
             }
         }
     }
-    assert_eq!(
-        statuses.last().map(String::as_str),
-        Some("archived"),
-        "{statuses:?}"
-    );
-    assert!(
-        statuses
-            .iter()
-            .filter(|status| *status == "pending")
-            .count()
-            >= 2,
-        "{statuses:?}"
-    );
+    assert_eq!(statuses, ["pending", "pending", "archived"]);
     assert!(!state.join("pocket/progress.json").exists());
     let final_generation = generations.last().unwrap();
     assert_eq!(
@@ -1930,12 +1953,7 @@ fn pipeline_recovery() {
         .iter()
         .map(|page| page["anchor"].as_str().unwrap().parse::<i64>().unwrap() - POCKET_OFFSET_S)
         .collect();
-    assert!(anchors.len() >= statuses.len(), "{receipt}");
-    assert_eq!(anchors[0], cutoff);
-    assert!(
-        anchors.windows(2).all(|pair| pair[1] < pair[0]),
-        "{anchors:?}"
-    );
+    assert_eq!(anchors, [cutoff, cutoff - 197, cutoff - 392]);
     // The same cutoff again: byte-identical pages, new request receipts, the dataset reused.
     let repeat = pipeline("update", &pocket_only, &["--end", &end]).unwrap();
     assert_eq!(
@@ -3070,6 +3088,14 @@ fn pipeline_schedule() {
         field(job_line(&first, "pocket"), "cutoff"),
         time_text(cutoff * 1_000_000)
     );
+    let pending_path = producer.join("pipeline_state/pocket/progress.json");
+    let pending = read_json(&pending_path);
+    assert_eq!(pending["progress"]["pages"].as_array().unwrap().len(), 1);
+    assert_eq!(pending["progress"]["pages"][0]["rows"], 40);
+    assert_eq!(
+        pending["progress"]["pages"][0]["first"],
+        time_text((cutoff - 197) * 1_000_000)
+    );
     binary_alpha_app::broker::Clock::sleep(&mut clock, 600 * 1_000_000);
     let mut out = Vec::new();
     data_pipeline::update_with(&pocket_only, None, &clock, &mut out).unwrap_err();
@@ -3079,6 +3105,13 @@ fn pipeline_schedule() {
         time_text(cutoff * 1_000_000),
         "{resumed}"
     );
+    assert_eq!(field(job_line(&resumed, "pocket"), "status"), "pending");
+    let pending = read_json(&pending_path);
+    let pages = pending["progress"]["pages"].as_array().unwrap();
+    assert_eq!(pages.len(), 2);
+    assert_eq!(pages[1]["rows"], 40);
+    assert_eq!(pages[0]["first"], pages[1]["last"]);
+    assert_eq!(pages[1]["first"], time_text((cutoff - 392) * 1_000_000));
     let mut out = Vec::new();
     data_pipeline::update_with(
         &pocket_only,
@@ -3089,20 +3122,19 @@ fn pipeline_schedule() {
     .unwrap_err();
     let conflict = String::from_utf8(out).unwrap();
     assert!(conflict.contains("conflicts"), "{conflict}");
-    let mut statuses = vec![];
-    for _ in 0..8 {
-        let mut out = Vec::new();
-        let result = data_pipeline::update_with(&pocket_only, None, &clock, &mut out);
-        let report = String::from_utf8(out).unwrap();
-        statuses.push(field(job_line(&report, "pocket"), "status").to_string());
-        if result.is_ok() {
-            break;
-        }
-    }
+    // The third page reaches cutoff-587, past the required seed overlap.
+    let mut out = Vec::new();
+    data_pipeline::update_with(&pocket_only, None, &clock, &mut out).unwrap();
+    let completed = String::from_utf8(out).unwrap();
+    assert_eq!(field(job_line(&completed, "pocket"), "status"), "archived");
+    assert!(!pending_path.exists());
+    let store = producer.join("store");
     assert_eq!(
-        statuses.last().map(String::as_str),
-        Some("archived"),
-        "{statuses:?}"
+        bars(
+            &store,
+            &dataset(&store, field(job_line(&completed, "pocket"), "dataset"))
+        ),
+        expected_bars(POCKET_SEED_END, POCKET_SEED_END - 60, cutoff)
     );
     // With the intent closed, the next invocation pins the advanced clock as its cutoff and,
     // under an unbounded page budget, closes in one run.
