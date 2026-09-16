@@ -39,6 +39,28 @@ struct Event {
     raw: Vec<u8>,
     receipt_micros: i64,
 }
+enum ReceiveError {
+    Disconnected,
+    Other(String),
+}
+impl From<String> for ReceiveError {
+    fn from(error: String) -> Self {
+        Self::Other(error)
+    }
+}
+impl From<&str> for ReceiveError {
+    fn from(error: &str) -> Self {
+        Self::Other(error.into())
+    }
+}
+impl From<ReceiveError> for String {
+    fn from(error: ReceiveError) -> Self {
+        match error {
+            ReceiveError::Disconnected => "socket.io: the server disconnected the namespace (an `origin` setting is usually required)".into(),
+            ReceiveError::Other(error) => error,
+        }
+    }
+}
 #[derive(Deserialize)]
 struct BalanceClass {
     #[serde(rename = "isDemo")]
@@ -122,6 +144,8 @@ pub struct PocketMarketData {
     continuity: Continuity,
     events: VecDeque<LiveEvent>,
     received_counts: BTreeMap<String, u64>,
+    foreign_history_responses: u64,
+    history_reconnects: u64,
     source: String,
 }
 impl PocketMarketData {
@@ -145,6 +169,8 @@ impl PocketMarketData {
             .map(|value| vec![("Origin".into(), value.clone())])
             .unwrap_or_default();
         let transport = connector.connect(&settings.endpoint, &headers)?;
+        let next_index = u64::try_from(clock.now_micros())
+            .map_err(|_| "pocket_option: negative history index clock")?;
         let mut broker = Self {
             settings: settings.clone(),
             instruments: instruments.to_vec(),
@@ -155,10 +181,12 @@ impl PocketMarketData {
             pending: None,
             discovered: Vec::new(),
             subscribed: BTreeMap::new(),
-            next_index: 1,
+            next_index,
             continuity: Continuity::default(),
             events: VecDeque::new(),
             received_counts: BTreeMap::new(),
+            foreign_history_responses: 0,
+            history_reconnects: 0,
             source: super::source_identity(&binary_alpha_engine::config::Broker::PocketOption(
                 settings.clone(),
             )),
@@ -172,7 +200,7 @@ impl PocketMarketData {
         self.transport
             .send(Frame::Text(socket_io::encode_event(name, &argument)))
     }
-    fn receive(&mut self, timeout_micros: i64) -> Result<Option<Event>, String> {
+    fn receive(&mut self, timeout_micros: i64) -> Result<Option<Event>, ReceiveError> {
         let deadline = self
             .clock
             .now_micros()
@@ -208,6 +236,7 @@ impl PocketMarketData {
                     }));
                 }
                 Frame::Text(text) => match socket_io::decode(&text)? {
+                    Packet::Disconnected => return Err(ReceiveError::Disconnected),
                     Packet::Ping => self.transport.send(Frame::Text(socket_io::PONG.into()))?,
                     Packet::BinaryHeader { name } => {
                         if self.pending.is_some() {
@@ -363,17 +392,17 @@ impl PocketMarketData {
         }
         Ok(())
     }
-    fn wait_event(&mut self, name: &str) -> Result<Event, String> {
-        let deadline = self.clock.now_micros().saturating_add(20_000_000);
+    fn wait_event(&mut self, names: &[&str], deadline: i64) -> Result<Event, ReceiveError> {
+        let name = names[0];
         loop {
             let remaining = deadline.saturating_sub(self.clock.now_micros());
             if remaining <= 0 {
-                return Err(format!("pocket_option {name}: response timeout"));
+                return Err(format!("pocket_option {name}: response timeout").into());
             }
             let event = self
                 .receive(remaining)?
                 .ok_or_else(|| format!("pocket_option {name}: response timeout"))?;
-            if event.name == name {
+            if names.contains(&event.name.as_str()) {
                 return Ok(event);
             }
             match event.name.as_str() {
@@ -382,15 +411,132 @@ impl PocketMarketData {
                     return Err("pocket_option: unexpected new handshake".into());
                 }
                 other if other.starts_with("error") || other.starts_with("fail") => {
-                    return Err(format!("pocket_option {name}: provider rejected request"));
+                    return Err(format!("pocket_option {name}: provider rejected request").into());
                 }
                 _ => (),
             }
         }
     }
+    fn request_history_page(
+        &mut self,
+        symbol: &str,
+        before_micros: Option<i64>,
+        period: u8,
+    ) -> Result<HistoryPage, ReceiveError> {
+        let Some(before) = before_micros else {
+            // The anchor-free page exists only for ticks; the evidenced candle family is the
+            // indexed older-history request answered as `loadHistoryPeriodFast`.
+            if period != 1 {
+                return Err("pocket_option: bar history requires an anchor".into());
+            }
+            self.send(
+                "changeSymbol",
+                &Change {
+                    asset: symbol,
+                    period: 1,
+                },
+            )?;
+            let deadline = self.clock.now_micros().saturating_add(20_000_000);
+            let event = self.wait_event(&["updateHistoryNewFast"], deadline)?;
+            let envelope: InitialEnvelope = serde_json::from_slice(&event.raw)
+                .map_err(|_| "pocket_option: malformed initial history")?;
+            if envelope.asset != symbol {
+                return Err("pocket_option: initial history asset mismatch".into());
+            }
+            let period = envelope.period.require_number()?;
+            if period.compare(Decimal::parse("1")?)? != std::cmp::Ordering::Equal {
+                return Err(format!(
+                    "pocket_option updateHistoryNewFast: unsupported period {period}"
+                )
+                .into());
+            }
+            return Ok(HistoryPage {
+                raw: event.raw,
+                anchor_token: None,
+                receipt_micros: event.receipt_micros,
+            });
+        };
+        let time = provider_token(before, self.settings.server_offset_minutes)?;
+        let anchor_token = Some(time.token()?.into_owned());
+        let index = self.next_index;
+        self.next_index = index
+            .checked_add(1)
+            .ok_or("pocket_option: history index overflow")?;
+        self.send(
+            "loadHistoryPeriod",
+            &OlderRequest {
+                asset: symbol,
+                index,
+                time,
+                offset: 200,
+                period,
+            },
+        )?;
+        let (event_name, expected_period) = if period == 1 {
+            // Request period 1 produced response period 0 in both retained older pages.
+            ("loadHistoryPeriod", 0)
+        } else {
+            ("loadHistoryPeriodFast", i64::from(period))
+        };
+        let deadline = self.clock.now_micros().saturating_add(20_000_000);
+        let skipped_before = self.foreign_history_responses;
+        loop {
+            let event = match self.wait_event(
+                &[
+                    event_name,
+                    if period == 1 {
+                        "loadHistoryPeriodFast"
+                    } else {
+                        "loadHistoryPeriod"
+                    },
+                ],
+                deadline,
+            ) {
+                Err(ReceiveError::Other(error))
+                    if self.foreign_history_responses > skipped_before =>
+                {
+                    return Err(format!(
+                        "pocket_option: no matching history response after asset or index mismatch; {error}"
+                    ).into());
+                }
+                result => result?,
+            };
+            let envelope: OlderEnvelope = serde_json::from_slice(&event.raw)
+                .map_err(|_| format!("pocket_option: malformed {} history", event.name))?;
+            if envelope.asset != symbol || envelope.index != index {
+                self.foreign_history_responses += 1;
+                continue;
+            }
+            if event.name != event_name {
+                continue;
+            }
+            let response_period = envelope.period.require_number()?;
+            if response_period.compare(Decimal::parse(&expected_period.to_string())?)?
+                != std::cmp::Ordering::Equal
+            {
+                return Err(format!(
+                    "pocket_option {event_name}: unsupported period {response_period}"
+                )
+                .into());
+            }
+            return Ok(HistoryPage {
+                raw: event.raw,
+                anchor_token,
+                receipt_micros: event.receipt_micros,
+            });
+        }
+    }
     /// All configured symbols observed on the wire, including a cancelled symbol, for inspection.
     pub fn received_counts(&self) -> &BTreeMap<String, u64> {
         &self.received_counts
+    }
+    /// History responses skipped because their asset or request index belonged elsewhere.
+    pub fn foreign_history_responses(&self) -> u64 {
+        self.foreign_history_responses
+    }
+    /// Reconnect attempts triggered by namespace disconnects while waiting for history.
+    pub fn history_reconnects(&self) -> u64 {
+        self.history_reconnects
     }
     fn tick_rows(&self, rows: &[PageRow], scale: PriceScale) -> Result<Vec<Tick>, String> {
         rows.iter()
@@ -509,78 +655,25 @@ impl MarketDataBroker for PocketMarketData {
                 ));
             }
         };
-        let Some(before) = before_micros else {
-            // The anchor-free page exists only for ticks; the evidenced candle family is the
-            // indexed older-history request answered as `loadHistoryPeriodFast`.
-            if period != 1 {
-                return Err("pocket_option: bar history requires an anchor".into());
+        let mut reconnects = 0;
+        loop {
+            match self.request_history_page(symbol, before_micros, period) {
+                Ok(page) => return Ok(page),
+                Err(ReceiveError::Disconnected) => {
+                    if reconnects >= 3 || self.history_reconnects >= 20 {
+                        return Err(
+                            "pocket_option: the server keeps disconnecting the namespace".into(),
+                        );
+                    }
+                    reconnects += 1;
+                    self.history_reconnects += 1;
+                    // Re-authentication failures, including connect-time namespace disconnects,
+                    // retain their original diagnostic and are not history retries.
+                    self.reconnect()?;
+                }
+                Err(error) => return Err(error.into()),
             }
-            self.send(
-                "changeSymbol",
-                &Change {
-                    asset: symbol,
-                    period: 1,
-                },
-            )?;
-            let event = self.wait_event("updateHistoryNewFast")?;
-            let envelope: InitialEnvelope = serde_json::from_slice(&event.raw)
-                .map_err(|_| "pocket_option: malformed initial history")?;
-            if envelope.asset != symbol {
-                return Err("pocket_option: initial history asset mismatch".into());
-            }
-            let period = envelope.period.require_number()?;
-            if period.compare(Decimal::parse("1")?)? != std::cmp::Ordering::Equal {
-                return Err(format!(
-                    "pocket_option updateHistoryNewFast: unsupported period {period}"
-                ));
-            }
-            return Ok(HistoryPage {
-                raw: event.raw,
-                anchor_token: None,
-                receipt_micros: event.receipt_micros,
-            });
-        };
-        let time = provider_token(before, self.settings.server_offset_minutes)?;
-        let anchor_token = Some(time.token()?.into_owned());
-        let index = self.next_index;
-        self.next_index = index
-            .checked_add(1)
-            .ok_or("pocket_option: history index overflow")?;
-        self.send(
-            "loadHistoryPeriod",
-            &OlderRequest {
-                asset: symbol,
-                index,
-                time,
-                offset: 200,
-                period,
-            },
-        )?;
-        let (event_name, expected_period) = if period == 1 {
-            // Request period 1 produced response period 0 in both retained older pages.
-            ("loadHistoryPeriod", 0)
-        } else {
-            ("loadHistoryPeriodFast", i64::from(period))
-        };
-        let event = self.wait_event(event_name)?;
-        let envelope: OlderEnvelope = serde_json::from_slice(&event.raw)
-            .map_err(|_| format!("pocket_option: malformed {event_name} history"))?;
-        if envelope.asset != symbol || envelope.index != index {
-            return Err("pocket_option: history asset or index mismatch".into());
         }
-        let response_period = envelope.period.require_number()?;
-        if response_period.compare(Decimal::parse(&expected_period.to_string())?)?
-            != std::cmp::Ordering::Equal
-        {
-            return Err(format!(
-                "pocket_option {event_name}: unsupported period {response_period}"
-            ));
-        }
-        Ok(HistoryPage {
-            raw: event.raw,
-            anchor_token,
-            receipt_micros: event.receipt_micros,
-        })
     }
     fn decode_history(
         &self,
@@ -681,7 +774,10 @@ impl MarketDataBroker for PocketMarketData {
         self.subscribed.clear();
         self.discovered.clear();
         self.events.clear();
-        self.next_index = 1;
+        self.next_index = self.next_index.max(
+            u64::try_from(self.clock.now_micros())
+                .map_err(|_| "pocket_option: negative history index clock")?,
+        );
         let generation = self.continuity.reconnect()?;
         self.handshake()?;
         self.events.push_back(LiveEvent::Break {

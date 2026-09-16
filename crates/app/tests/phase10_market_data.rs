@@ -181,6 +181,7 @@ fn exact_wire_numbers_and_socket_io_subset() {
         Packet::Open
     ));
     assert!(matches!(decode("40{}").unwrap(), Packet::Connected));
+    assert!(matches!(decode("41").unwrap(), Packet::Disconnected));
     assert!(matches!(decode("2").unwrap(), Packet::Ping));
     assert!(matches!(
         decode("42[\"successauth\"]").unwrap(),
@@ -549,11 +550,19 @@ fn pocket_retained_paging_live_cancellation_and_heartbeats() {
     ));
     frames.extend(attachment(
         "loadHistoryPeriod",
-        replace(&fixture("pocket-history-older-1.json"), "index", "1"),
+        replace(
+            &fixture("pocket-history-older-1.json"),
+            "index",
+            "1789348000000000",
+        ),
     ));
     frames.extend(attachment(
         "loadHistoryPeriod",
-        replace(&fixture("pocket-history-older-2.json"), "index", "2"),
+        replace(
+            &fixture("pocket-history-older-2.json"),
+            "index",
+            "1789348000000001",
+        ),
     ));
     for line in [6, 7, 10, 11, 13, 14, 15, 16].into_iter().chain(18..=36) {
         frames.extend(attachment(
@@ -712,6 +721,362 @@ fn pocket_rejects_class_membership_and_incomplete_attachments() {
         let (mut broker, _) = pocket(frames);
         broker.subscribe(&pocket_ids()[0], scale(5)).unwrap();
         assert!(broker.next_live(1000).unwrap_err().contains(expected));
+    }
+}
+
+fn pocket_candle_page(index: u64, starts: &[i64]) -> String {
+    serde_json::json!({
+        "asset": "EURUSD_otc",
+        "index": index,
+        "period": 5,
+        "data": starts.iter().map(|start| serde_json::json!({
+            "symbol_id": 7,
+            "time": start + 7200,
+            "open": 1.25,
+            "high": 1.5,
+            "low": 1.0,
+            "close": 1.375,
+            "volume": 2,
+        })).collect::<Vec<_>>(),
+    })
+    .to_string()
+}
+
+fn pocket_sent_events(sent: &Mutex<Vec<Frame>>, name: &str) -> Vec<serde_json::Value> {
+    sent.lock()
+        .unwrap()
+        .iter()
+        .filter_map(|frame| {
+            let Frame::Text(text) = frame else {
+                return None;
+            };
+            match broker::socket_io::decode(text).unwrap() {
+                broker::socket_io::Packet::Event {
+                    name: event,
+                    argument,
+                } if event == name => Some(serde_json::from_slice(&argument).unwrap()),
+                _ => None,
+            }
+        })
+        .collect()
+}
+
+#[test]
+fn pocket_candle_history_reconnects_after_second_page_and_preserves_rows() {
+    use binary_alpha_engine::market::Bar;
+    let clock = FakeClock::at(1_789_348_000_000_000);
+    let first_index = u64::try_from(clock.now_micros()).unwrap();
+    let mut first = handshake();
+    first.extend(attachment(
+        "loadHistoryPeriodFast",
+        pocket_candle_page(first_index, &[20, 25]),
+    ));
+    first.extend(attachment(
+        "loadHistoryPeriodFast",
+        pocket_candle_page(first_index + 1, &[10, 15]),
+    ));
+    first.push(Frame::Text("41".into()));
+    // The scripted transport advances this clock by ten microseconds per frame.
+    let second_index = first_index + first.len() as u64 * 10;
+    let mut second = handshake();
+    second.extend(attachment(
+        "loadHistoryPeriodFast",
+        pocket_candle_page(second_index, &[0, 5]),
+    ));
+    let (connector, sent) = connector(vec![first, second], &clock);
+    let mut adapter = PocketMarketData::connect(
+        &pocket_settings(),
+        &pocket_ids(),
+        connector,
+        Box::new(clock),
+        "{}".into(),
+    )
+    .unwrap();
+    let instrument = &pocket_ids()[0];
+    adapter.subscribe(instrument, scale(5)).unwrap();
+    let granularity = NativeGranularity::Bar { period_seconds: 5 };
+    for (anchor, starts) in [(30, [20, 25]), (20, [10, 15]), (10, [0, 5])] {
+        let page = adapter
+            .history_page(instrument, scale(5), Some(anchor * 1_000_000), granularity)
+            .unwrap();
+        let (symbol_id, rows) = adapter
+            .decode_history(instrument, &page.raw, scale(5), granularity)
+            .unwrap();
+        assert_eq!(symbol_id, Some(7));
+        let HistoryRows::Bars(rows) = rows else {
+            panic!("expected candles")
+        };
+        assert_eq!(
+            rows,
+            starts.map(|start_unix_s| Bar {
+                start_unix_s,
+                open: 1.25,
+                high: 1.5,
+                low: 1.0,
+                close: 1.375,
+                volume: 2.0,
+                period_s: 5,
+            })
+        );
+        assert_eq!(page.anchor_token, Some((anchor + 7200).to_string()));
+    }
+    assert_eq!(adapter.history_reconnects(), 1);
+    assert_eq!(adapter.foreign_history_responses(), 0);
+    assert_eq!(pocket_sent_events(&sent, "auth").len(), 2);
+    assert_eq!(
+        sent.lock()
+            .unwrap()
+            .iter()
+            .filter(|frame| **frame == Frame::Close)
+            .count(),
+        1
+    );
+    let requests = pocket_sent_events(&sent, "loadHistoryPeriod");
+    assert_eq!(requests.len(), 4);
+    for (request, (index, anchor)) in requests.iter().zip([
+        (first_index, 7230),
+        (first_index + 1, 7220),
+        (first_index + 2, 7210),
+        (second_index, 7210),
+    ]) {
+        assert_eq!(
+            *request,
+            serde_json::json!({
+                "asset": "EURUSD_otc", "index": index, "time": anchor, "offset": 200, "period": 5,
+            })
+        );
+    }
+    assert!(matches!(
+        adapter.next_live(0).unwrap(),
+        Some(LiveEvent::Break { generation: 1, .. })
+    ));
+    assert!(
+        adapter
+            .unsubscribe(instrument)
+            .unwrap_err()
+            .contains("not subscribed")
+    );
+}
+
+#[test]
+fn pocket_history_skips_foreign_assets_and_indexes_without_extending_deadline() {
+    for granularity in [
+        NativeGranularity::Tick,
+        NativeGranularity::Bar { period_seconds: 5 },
+    ] {
+        for matching in [true, false] {
+            let clock = FakeClock::at(1_789_348_000_000_000);
+            let index = u64::try_from(clock.now_micros()).unwrap();
+            let (name, raw) = if granularity == NativeGranularity::Tick {
+                (
+                    "loadHistoryPeriod",
+                    serde_json::json!({
+                        "asset": "EURUSD_otc", "index": index, "period": 0,
+                        "data": [{"time": 7205, "price": 1.25}],
+                    })
+                    .to_string(),
+                )
+            } else {
+                ("loadHistoryPeriodFast", pocket_candle_page(index, &[5]))
+            };
+            let mut frames = handshake();
+            frames.extend(attachment(
+                "loadHistoryPeriodFast",
+                replace(&raw, "asset", "\"#AAPL_otc\""),
+            ));
+            frames.extend(attachment(
+                "loadHistoryPeriod",
+                replace(&raw, "index", &(index + 99).to_string()),
+            ));
+            if matching {
+                frames.extend(attachment(name, raw.clone()));
+            }
+            let (connector, sent) = connector(vec![frames], &clock);
+            let mut adapter = PocketMarketData::connect(
+                &pocket_settings(),
+                &pocket_ids(),
+                connector,
+                Box::new(clock.clone()),
+                "{}".into(),
+            )
+            .unwrap();
+            let started = clock.now_micros();
+            let result =
+                adapter.history_page(&pocket_ids()[0], scale(5), Some(10_000_000), granularity);
+            if matching {
+                let page = result.unwrap();
+                assert_eq!(page.raw, raw.as_bytes());
+                let (symbol_id, rows) = adapter
+                    .decode_history(&pocket_ids()[0], &page.raw, scale(5), granularity)
+                    .unwrap();
+                assert_eq!(rows.len(), 1);
+                assert_eq!(rows.first_time_micros(), Some(5_000_000));
+                assert_eq!(
+                    symbol_id,
+                    if granularity == NativeGranularity::Tick {
+                        None
+                    } else {
+                        Some(7)
+                    }
+                );
+            } else {
+                let error = result.unwrap_err();
+                assert!(error.contains("response timeout"), "{error}");
+                assert_eq!(clock.now_micros() - started, 20_000_000);
+            }
+            assert_eq!(adapter.foreign_history_responses(), 2);
+            assert_eq!(adapter.history_reconnects(), 0);
+            assert_eq!(pocket_sent_events(&sent, "loadHistoryPeriod").len(), 1);
+        }
+    }
+}
+
+#[test]
+fn pocket_history_stops_after_three_namespace_reconnects_for_one_page() {
+    let clock = FakeClock::at(1_789_348_000_000_000);
+    let sessions = (0..4)
+        .map(|_| {
+            let mut frames = handshake();
+            frames.push(Frame::Text("41".into()));
+            frames
+        })
+        .collect();
+    let (connector, sent) = connector(sessions, &clock);
+    let mut adapter = PocketMarketData::connect(
+        &pocket_settings(),
+        &pocket_ids(),
+        connector,
+        Box::new(clock),
+        "{}".into(),
+    )
+    .unwrap();
+    let error = adapter
+        .history_page(
+            &pocket_ids()[0],
+            scale(5),
+            Some(10_000_000),
+            NativeGranularity::Bar { period_seconds: 5 },
+        )
+        .unwrap_err();
+    assert_eq!(
+        error,
+        "pocket_option: the server keeps disconnecting the namespace"
+    );
+    assert_eq!(adapter.history_reconnects(), 3);
+    assert_eq!(pocket_sent_events(&sent, "auth").len(), 4);
+    assert_eq!(
+        sent.lock()
+            .unwrap()
+            .iter()
+            .filter(|frame| **frame == Frame::Close)
+            .count(),
+        3
+    );
+    let requests = pocket_sent_events(&sent, "loadHistoryPeriod");
+    assert_eq!(requests.len(), 4);
+    assert!(
+        requests
+            .windows(2)
+            .all(|pair| pair[0]["index"].as_u64() < pair[1]["index"].as_u64())
+    );
+    assert!(requests.iter().all(|request| request["time"] == 7210));
+}
+
+#[test]
+fn pocket_history_namespace_reconnect_limit_persists_across_pages() {
+    let clock = FakeClock::at(1_789_348_000_000_000);
+    let mut index = u64::try_from(clock.now_micros()).unwrap();
+    let mut sessions = Vec::new();
+    for session in 0..=20 {
+        let mut frames = handshake();
+        if session > 0 {
+            frames.extend(attachment(
+                "loadHistoryPeriodFast",
+                pocket_candle_page(index, &[5]),
+            ));
+        }
+        frames.push(Frame::Text("41".into()));
+        index += frames.len() as u64 * 10;
+        sessions.push(frames);
+    }
+    let (connector, sent) = connector(sessions, &clock);
+    let mut adapter = PocketMarketData::connect(
+        &pocket_settings(),
+        &pocket_ids(),
+        connector,
+        Box::new(clock),
+        "{}".into(),
+    )
+    .unwrap();
+    for expected_reconnects in 1..=20 {
+        adapter
+            .history_page(
+                &pocket_ids()[0],
+                scale(5),
+                Some(10_000_000),
+                NativeGranularity::Bar { period_seconds: 5 },
+            )
+            .unwrap();
+        assert_eq!(adapter.history_reconnects(), expected_reconnects);
+    }
+    assert_eq!(
+        adapter
+            .history_page(
+                &pocket_ids()[0],
+                scale(5),
+                Some(10_000_000),
+                NativeGranularity::Bar { period_seconds: 5 },
+            )
+            .unwrap_err(),
+        "pocket_option: the server keeps disconnecting the namespace"
+    );
+    assert_eq!(adapter.history_reconnects(), 20);
+    assert_eq!(pocket_sent_events(&sent, "auth").len(), 21);
+    assert_eq!(pocket_sent_events(&sent, "loadHistoryPeriod").len(), 41);
+}
+
+#[test]
+fn pocket_connect_time_namespace_disconnect_keeps_origin_diagnostic() {
+    let expected = "socket.io: the server disconnected the namespace (an `origin` setting is usually required)";
+    for during_reconnect in [false, true] {
+        let clock = FakeClock::default();
+        let mut sessions = Vec::new();
+        if during_reconnect {
+            let mut first = handshake();
+            first.push(Frame::Text("41".into()));
+            sessions.push(first);
+        }
+        let mut rejected = handshake()[..2].to_vec();
+        rejected.push(Frame::Text("41".into()));
+        sessions.push(rejected);
+        let (connector, sent) = connector(sessions, &clock);
+        let result = PocketMarketData::connect(
+            &pocket_settings(),
+            &pocket_ids(),
+            connector,
+            Box::new(clock),
+            "{}".into(),
+        );
+        let error = if during_reconnect {
+            let mut adapter = result.ok().unwrap();
+            let error = adapter
+                .history_page(
+                    &pocket_ids()[0],
+                    scale(5),
+                    Some(10_000_000),
+                    NativeGranularity::Bar { period_seconds: 5 },
+                )
+                .unwrap_err();
+            assert_eq!(adapter.history_reconnects(), 1);
+            error
+        } else {
+            result.err().unwrap()
+        };
+        assert_eq!(error, expected);
+        assert_eq!(
+            pocket_sent_events(&sent, "auth").len(),
+            if during_reconnect { 2 } else { 1 }
+        );
     }
 }
 
@@ -2501,7 +2866,10 @@ fn pocket_period_pins_and_retained_anchor_text_are_exact() {
         ),
     ] {
         let mut frames = handshake();
-        frames.extend(attachment(event, fixture(file)));
+        frames.extend(attachment(
+            event,
+            replace(&fixture(file), "index", "1789348000000000"),
+        ));
         let (mut broker, _) = pocket(frames);
         let error = broker
             .history_page(&pocket_ids()[0], scale(5), anchor, NativeGranularity::Tick)
@@ -2610,8 +2978,16 @@ fn concrete_adapters_resume_interrupted_publication_and_page_backward() {
                 raw_pages,
             )
         } else {
-            let first = replace(&fixture("pocket-history-older-1.json"), "index", "1");
-            let second = replace(&fixture("pocket-history-older-2.json"), "index", "2");
+            let first = replace(
+                &fixture("pocket-history-older-1.json"),
+                "index",
+                "1789348010000000",
+            );
+            let second = replace(
+                &fixture("pocket-history-older-2.json"),
+                "index",
+                "1789348010000001",
+            );
             let mut frames = attachment("loadHistoryPeriod", first.clone());
             frames.extend(attachment("loadHistoryPeriod", second.clone()));
             (
@@ -2621,6 +2997,9 @@ fn concrete_adapters_resume_interrupted_publication_and_page_backward() {
             )
         };
         let create = || {
+            // Each simulated process starts at this scenario's epoch, keeping retained raw
+            // response identities stable across the interrupted-publication retry.
+            let clock = FakeClock::at(clock.now_micros());
             let mut frames = if kind == "pocket_option" {
                 handshake()
             } else {
