@@ -15,7 +15,7 @@ use std::process::Command;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use binary_alpha_app::broker::socket_io;
 use binary_alpha_app::data_pipeline::{self, Catalog};
@@ -398,6 +398,11 @@ fn attachment(name: &str, payload: String) -> Vec<tokio_tungstenite::tungstenite
 
 #[derive(Default, Clone)]
 struct DriveFaults {
+    /// Answer the next N object content uploads with 503; usize::MAX never clears.
+    unavailable_uploads: usize,
+    /// Drop the next N object media requests before replying; usize::MAX never clears.
+    /// When drop_download_at is also armed, first send that partial body.
+    drop_download_requests: usize,
     /// Close the connection without answering the chunk with this ordinal (per session).
     drop_upload_at_chunk: Option<usize>,
     /// Forget the session before answering this chunk: the client sees 404.
@@ -610,31 +615,14 @@ fn file_json(id: &str, entry: &RemoteEntry, omit_sha256: bool) -> Vec<u8> {
 
 fn handle_http(
     mut stream: TcpStream,
-    state: &Arc<Mutex<DriveState>>,
+    shared: &Arc<Mutex<DriveState>>,
     activity: &DriveActivity,
     base: &str,
 ) {
     let Some(request) = read_request(&mut stream) else {
         return;
     };
-    let in_flight = if request.method == "PUT"
-        && request.path.starts_with("/upload/session/")
-        && !request.body.is_empty()
-    {
-        Some(activity.uploads.enter())
-    } else if request.method == "GET"
-        && request.path.starts_with("/drive/v3/files/")
-        && request.query.get("alt").map(String::as_str) == Some("media")
-    {
-        Some(activity.downloads.enter())
-    } else {
-        None
-    };
-    if in_flight.is_some() {
-        // Model transfer latency outside the state lock so concurrent requests can overlap.
-        std::thread::sleep(Duration::from_millis(50));
-    }
-    let mut state = state.lock().unwrap();
+    let mut state = shared.lock().unwrap();
     state.log.push(format!(
         "{} {} {} {}",
         request.method,
@@ -663,6 +651,52 @@ fn handle_http(
     if request.headers.get("authorization").map(String::as_str) != Some("Bearer fixture-token") {
         respond(&mut stream, 401, &[], b"{}");
         return;
+    }
+    let content_upload = request.method == "PUT"
+        && request.path.starts_with("/upload/session/")
+        && !request.body.is_empty();
+    let media_download = request.method == "GET"
+        && request.path.starts_with("/drive/v3/files/")
+        && request.query.get("alt").map(String::as_str) == Some("media");
+    // Immediate transient faults leave the four-second test budget for the 3.75s backoff.
+    if content_upload
+        && state
+            .sessions
+            .get(request.path.trim_start_matches("/upload/session/"))
+            .is_some_and(|session| session.name.starts_with("object-"))
+        && state.faults.unavailable_uploads > 0
+    {
+        if state.faults.unavailable_uploads != usize::MAX {
+            state.faults.unavailable_uploads -= 1;
+        }
+        respond(&mut stream, 503, &[], b"{}");
+        return;
+    }
+    if media_download
+        && state
+            .files
+            .get(request.path.trim_start_matches("/drive/v3/files/"))
+            .is_some_and(|entry| entry.name.starts_with("object-"))
+        && state.faults.drop_download_at.is_none()
+        && state.faults.drop_download_requests > 0
+    {
+        if state.faults.drop_download_requests != usize::MAX {
+            state.faults.drop_download_requests -= 1;
+        }
+        return;
+    }
+    let in_flight = if content_upload {
+        Some(activity.uploads.enter())
+    } else if media_download {
+        Some(activity.downloads.enter())
+    } else {
+        None
+    };
+    if in_flight.is_some() {
+        // Model transfer latency outside the state lock so concurrent requests can overlap.
+        drop(state);
+        std::thread::sleep(Duration::from_millis(50));
+        state = shared.lock().unwrap();
     }
     let faults = state.faults.clone();
     match (request.method.as_str(), request.path.as_str()) {
@@ -1011,7 +1045,7 @@ fn pipeline_toml(
         text.push_str("parallel_jobs = 2\n");
     }
     text.push_str(&format!(
-        "\n[drive]\nroot_folder_id = \"fixture-root\"\nchunk_bytes = 262144\nrequest_timeout_seconds = 5\nmax_attempts = {max_attempts}\nloopback_endpoint = \"{drive_base}\"\n"
+        "\n[drive]\nroot_folder_id = \"fixture-root\"\nchunk_bytes = 262144\nrequest_timeout_seconds = 5\nmax_attempts = {max_attempts}\nretry_seconds = 4\nloopback_endpoint = \"{drive_base}\"\n"
     ));
     for (id, config) in jobs {
         text.push_str(&format!(
@@ -1812,21 +1846,30 @@ fn pipeline_recovery() {
             &[("pocket", "pocket.toml")],
             None,
             1,
-        ),
+        )
+        .replace("retry_seconds = 4", "retry_seconds = 1")
+        .replace("parallel_transfers = 3", "parallel_transfers = 1"),
     )
     .unwrap();
 
     let imported = import(&f.scratch.path("pocket-import.toml")).unwrap();
     let seed = imported_generation(&imported, "pocket_option:AEDCNY_otc").to_string();
-    // The first update publishes a descendant and catalog even with no added rows. Interrupted
-    // mid-upload, its next run resumes from the acknowledged offset under the same file identity.
+    // Persistent 503s exhaust the time budget, leaving the session and identity durable.
+    // A rerun clears that failure and survives four consecutive 503s on the same object,
+    // even with max_attempts = 1 (which governs authentication and session restarts only).
     let seed_end = time_text(POCKET_SEED_END * 1_000_000);
     f.drive.set(DriveFaults {
-        drop_upload_at_chunk: Some(1),
+        unavailable_uploads: usize::MAX,
         ..Default::default()
     });
+    let started = Instant::now();
     let failed = pipeline("update", &pocket_only, &["--end", &seed_end]).unwrap_err();
-    assert!(failed.contains("drive upload"), "{failed}");
+    assert!(started.elapsed() >= Duration::from_secs(1));
+    assert!(
+        failed.contains("pipeline job pocket failed: drive upload: HTTP 503 after ")
+            && failed.contains(" attempts over 1 s"),
+        "{failed}"
+    );
     let transfers = read_json(&state.join("pocket/transfers.json"));
     let open_session = transfers["files"]
         .as_object()
@@ -1835,8 +1878,35 @@ fn pipeline_recovery() {
         .find(|entry| entry["session"].is_string())
         .cloned();
     assert!(open_session.is_some(), "{transfers}");
+    let session = open_session.unwrap()["session"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    fs::write(
+        &pocket_only,
+        fs::read_to_string(&pocket_only)
+            .unwrap()
+            .replace("retry_seconds = 1", "retry_seconds = 4"),
+    )
+    .unwrap();
+    f.drive.set(DriveFaults {
+        unavailable_uploads: 4,
+        ..Default::default()
+    });
     let log_before = f.drive.log().len();
+    let started = Instant::now();
     let first = pipeline("update", &pocket_only, &["--end", &seed_end]).unwrap();
+    assert!(started.elapsed() >= Duration::from_millis(3_750));
+    assert_eq!(f.drive.state.lock().unwrap().faults.unavailable_uploads, 0);
+    let session_path = session.strip_prefix(&f.drive.base).unwrap();
+    assert_eq!(
+        f.drive.log()[log_before..]
+            .iter()
+            .filter(|line| line.starts_with(&format!("PUT {session_path} bytes 0-")))
+            .count(),
+        5,
+        "four 503s then success on the same content request"
+    );
     let baseline = field(job_line(&first, "pocket"), "dataset").to_string();
     assert_eq!(field(job_line(&first, "pocket"), "status"), "archived");
     assert_ne!(baseline, seed);
@@ -2010,10 +2080,13 @@ fn pipeline_recovery() {
     );
     f.drive.set(DriveFaults {
         expire_session_at_chunk: Some(1),
+        drop_upload_at_chunk: Some(1),
         omit_sha256: true,
         complete_without_reply: true,
+        drop_download_at: Some(1),
         ..Default::default()
     });
+    let log_before = f.drive.log().len();
     let recovered = pipeline("update", &pocket_only, &["--end", &end_2]).unwrap();
     let generation_2 = field(job_line(&recovered, "pocket"), "dataset").to_string();
     assert_ne!(generation_2, *final_generation);
@@ -2025,6 +2098,12 @@ fn pipeline_recovery() {
                 || line.starts_with("GET /drive/v3/files/fixture-id")),
         "readback after a missing checksum: {:?}",
         f.drive.log()
+    );
+    assert!(
+        f.drive.log()[log_before..]
+            .iter()
+            .any(|line| line.starts_with("GET /drive/v3/files/") && line.contains("bytes=1-")),
+        "checksum readback resumes after the streamed prefix without hashing it twice"
     );
     f.drive.set(DriveFaults::default());
 
@@ -2066,6 +2145,7 @@ fn pipeline_recovery() {
                 chunk_bytes: 262_144,
                 request_timeout_seconds: 5,
                 max_attempts: 3,
+                retry_seconds: None,
                 loopback_endpoint: Some(f.drive.base.clone()),
             })
             .unwrap();
@@ -2188,7 +2268,8 @@ fn pipeline_recovery() {
     fs::write(
         &consumer,
         pipeline_toml(&consumer_root, &f.drive.base, &[], None, 1)
-            .replace("parallel_transfers = 3", "parallel_transfers = 1"),
+            .replace("parallel_transfers = 3", "parallel_transfers = 1")
+            .replace("retry_seconds = 4", "retry_seconds = 1"),
     )
     .unwrap();
     let restore_args = [
@@ -2203,10 +2284,18 @@ fn pipeline_recovery() {
     ];
     f.drive.set(DriveFaults {
         drop_download_at: Some(1_000),
+        drop_download_requests: usize::MAX,
         ..Default::default()
     });
     let interrupted = pipeline("restore", &consumer, &restore_args).unwrap_err();
-    assert!(interrupted.contains("drive files.get"), "{interrupted}");
+    assert!(
+        interrupted.contains("drive files.get ")
+            && interrupted.contains(": transport failure after ")
+            && interrupted.contains(" attempts over 1 s: error sending request"),
+        "{interrupted}"
+    );
+    assert!(!interrupted.contains(&f.drive.base), "{interrupted}");
+    assert!(!interrupted.contains("fixture-token"), "{interrupted}");
     let downloads = consumer_root.join("pipeline_state/downloads");
     let partial = fs::read_dir(&downloads)
         .unwrap()
@@ -2221,15 +2310,32 @@ fn pipeline_recovery() {
     let mut corrupt = fs::read(&partial).unwrap();
     corrupt[0] ^= 0xff;
     fs::write(&partial, &corrupt).unwrap();
-    f.drive.set(DriveFaults::default());
+    fs::write(
+        &consumer,
+        fs::read_to_string(&consumer)
+            .unwrap()
+            .replace("retry_seconds = 1", "retry_seconds = 4"),
+    )
+    .unwrap();
+    f.drive.set(DriveFaults {
+        drop_download_requests: 4,
+        ..Default::default()
+    });
     let log_before = f.drive.log().len();
+    let started = Instant::now();
     let restored = pipeline("restore", &consumer, &restore_args).unwrap();
-    assert!(
+    assert!(started.elapsed() >= Duration::from_millis(3_750));
+    assert_eq!(
+        f.drive.state.lock().unwrap().faults.drop_download_requests,
+        0
+    );
+    assert_eq!(
         f.drive.log()[log_before..]
             .iter()
-            .any(|line| line.contains(&format!("bytes={partial_len}-"))),
-        "range resume: {:?}",
-        &f.drive.log()[log_before..]
+            .filter(|line| line.contains(&format!("bytes={partial_len}-")))
+            .count(),
+        5,
+        "four connection drops then a successful ranged download"
     );
     assert!(
         restored.starts_with("restored pocket_option:AEDCNY_otc development"),
@@ -2316,6 +2422,21 @@ fn pipeline_recovery() {
 fn pipeline_scope() {
     let f = fixture("pipeline_scope");
     let producer = f.scratch.path("producer");
+    let invalid_retry = f.scratch.path("invalid-retry.toml");
+    fs::write(
+        &invalid_retry,
+        fs::read_to_string(&f.pipeline)
+            .unwrap()
+            .replace("retry_seconds = 4", "retry_seconds = 0"),
+    )
+    .unwrap();
+    let refused = pipeline("update", &invalid_retry, &[]).unwrap_err();
+    assert!(
+        refused.contains("retry_seconds must be positive"),
+        "{refused}"
+    );
+    assert!(f.drive.log().is_empty());
+    assert!(f.pocket.requests().is_empty() && f.deriv.requests().is_empty());
     // Drive session failures belong to each job's report, even when all jobs fail to open.
     let unavailable_drive = f.scratch.path("unavailable-drive.toml");
     fs::write(

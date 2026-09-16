@@ -176,6 +176,10 @@ archive root and the same managed root for manual and timer producers. Update ho
 `pipeline_state/writer.lock`; a second producer fails immediately. Consumers do not acquire that
 lock.
 
+Set `drive.retry_seconds` to the per-request wall-clock budget for transient transport errors,
+HTTP 429, and 5xx (default 900 seconds); retries wait 250 ms initially, doubling to a 30-second
+cap. `drive.max_attempts` still limits 401 token refresh attempts and resumable-session restarts.
+
 ### Consent and credentials
 
 Initial user OAuth (Open Authorization) consent is an operator task using supported Google

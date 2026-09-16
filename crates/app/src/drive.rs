@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::Path;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// Resumable upload chunks are multiples of 256 KiB.
 /// The largest identifier batch `files.generateIds` accepts.
@@ -42,6 +42,9 @@ pub struct DriveSettings {
     pub chunk_bytes: u64,
     pub request_timeout_seconds: u32,
     pub max_attempts: u32,
+    /// Per-request transient retry budget in wall-clock seconds; defaults to 900.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry_seconds: Option<u32>,
     /// A literal loopback `http://` base that replaces every Google endpoint and uses a
     /// synthetic credential: the integration-test fixture, never an operator setting.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -65,6 +68,9 @@ impl DriveSettings {
         }
         if self.request_timeout_seconds == 0 || self.max_attempts == 0 {
             return Err("request_timeout_seconds and max_attempts must be positive".into());
+        }
+        if self.retry_seconds == Some(0) {
+            return Err("retry_seconds must be positive".into());
         }
         match (&self.loopback_endpoint, &self.credential) {
             (None, None) => return Err("credential is required without loopback_endpoint".into()),
@@ -147,6 +153,54 @@ struct Reply {
     body: Vec<u8>,
 }
 
+enum TransientFailure {
+    Transport(reqwest::Error),
+    Http(u16),
+}
+
+/// One logical request owns its elapsed-time budget and exponential backoff.
+struct RetryBudget {
+    started: Instant,
+    limit: Duration,
+    delay: Duration,
+    attempts: u64,
+}
+
+impl RetryBudget {
+    fn new(limit: Duration) -> Self {
+        Self {
+            started: Instant::now(),
+            limit,
+            delay: Duration::from_millis(250),
+            attempts: 0,
+        }
+    }
+
+    fn retry(&mut self, what: &str, failure: TransientFailure) -> Result<(), String> {
+        let remaining = self.limit.saturating_sub(self.started.elapsed());
+        if !remaining.is_zero() {
+            std::thread::sleep(self.delay.min(remaining));
+            self.delay = (self.delay * 2).min(Duration::from_secs(30));
+            if self.started.elapsed() < self.limit {
+                return Ok(());
+            }
+        }
+        let elapsed = self.started.elapsed().as_secs();
+        let attempts = self.attempts;
+        Err(match failure {
+            // A reqwest URL can contain a resumable-session capability. Keep Display's error
+            // text, but never expose that URL, request headers, tokens, or response bodies.
+            TransientFailure::Transport(error) => format!(
+                "drive {what}: transport failure after {attempts} attempts over {elapsed} s: {}",
+                error.without_url()
+            ),
+            TransientFailure::Http(status) => {
+                format!("drive {what}: HTTP {status} after {attempts} attempts over {elapsed} s")
+            }
+        })
+    }
+}
+
 /// The connected transport; every method is synchronous over one runtime.
 pub struct Drive {
     runtime: tokio::runtime::Runtime,
@@ -158,6 +212,7 @@ pub struct Drive {
     root: String,
     chunk_bytes: u64,
     max_attempts: u32,
+    retry_budget: Duration,
     access_token: Option<String>,
 }
 
@@ -203,6 +258,7 @@ impl Drive {
             root: settings.root_folder_id.clone(),
             chunk_bytes: settings.chunk_bytes,
             max_attempts: settings.max_attempts,
+            retry_budget: Duration::from_secs(u64::from(settings.retry_seconds.unwrap_or(900))),
             access_token: None,
         })
     }
@@ -240,20 +296,21 @@ impl Drive {
         Ok(token.access_token)
     }
 
-    /// Sends one authenticated request, refreshing the token once on 401 and retrying
-    /// transport failures, 429, and 5xx within `max_attempts`.
+    /// Sends one authenticated request, limiting 401 attempts with `max_attempts` and
+    /// transient transport, 429, and 5xx retries with a separate wall-clock budget.
     fn send(
         &mut self,
         what: &str,
         build: &dyn Fn(&reqwest::Client) -> reqwest::RequestBuilder,
     ) -> Result<Reply, String> {
-        let mut attempt = 0;
+        let mut retry = RetryBudget::new(self.retry_budget);
+        let mut unauthorized = 0;
         loop {
-            attempt += 1;
+            retry.attempts += 1;
             let token = self.token()?;
             let request = build(&self.client).bearer_auth(&token);
             let sent = self.runtime.block_on(async {
-                let response = request.send().await.map_err(|_| ())?;
+                let response = request.send().await?;
                 let status = response.status().as_u16();
                 let header = |name: &str| {
                     response
@@ -268,8 +325,8 @@ impl Drive {
                         .strip_prefix("bytes=0-")
                         .and_then(|end| end.parse::<u64>().ok())
                 });
-                let body = response.bytes().await.map_err(|_| ())?.to_vec();
-                Ok::<_, ()>(Reply {
+                let body = response.bytes().await?.to_vec();
+                Ok::<_, reqwest::Error>(Reply {
                     status,
                     location,
                     range_end,
@@ -277,24 +334,18 @@ impl Drive {
                 })
             });
             match sent {
-                Ok(reply) if reply.status == 401 && attempt < self.max_attempts => {
+                Ok(reply) if reply.status == 401 => {
+                    unauthorized += 1;
+                    if unauthorized >= self.max_attempts {
+                        return Ok(reply);
+                    }
                     self.access_token = None;
                 }
-                Ok(reply)
-                    if (reply.status == 429 || reply.status >= 500)
-                        && attempt < self.max_attempts =>
-                {
-                    std::thread::sleep(Duration::from_millis(200 * u64::from(attempt)));
+                Ok(reply) if reply.status == 429 || (500..=599).contains(&reply.status) => {
+                    retry.retry(what, TransientFailure::Http(reply.status))?;
                 }
                 Ok(reply) => return Ok(reply),
-                Err(()) if attempt < self.max_attempts => {
-                    std::thread::sleep(Duration::from_millis(200 * u64::from(attempt)));
-                }
-                Err(()) => {
-                    return Err(format!(
-                        "drive {what}: request failed after {attempt} attempts"
-                    ));
-                }
+                Err(error) => retry.retry(what, TransientFailure::Transport(error))?,
             }
         }
     }
@@ -341,7 +392,9 @@ impl Drive {
     pub fn metadata(&mut self, id: &str) -> Result<Option<RemoteFile>, String> {
         let url = format!("{}/files/{id}", self.api);
         let query = [("fields", "id,name,size,sha256Checksum,trashed")];
-        let reply = self.send("files.get", &|client| client.get(&url).query(&query))?;
+        let reply = self.send(&format!("files.get {id}"), &|client| {
+            client.get(&url).query(&query)
+        })?;
         match reply.status {
             200 => serde_json::from_slice(&reply.body)
                 .map(Some)
@@ -584,17 +637,21 @@ impl Drive {
     fn read(&mut self, id: &str, offset: u64, sink: &mut dyn Write) -> Result<u64, String> {
         let url = format!("{}/files/{id}", self.api);
         let query = [("alt", "media")];
-        let range = format!("bytes={offset}-");
-        let mut attempt = 0;
+        let mut retry = RetryBudget::new(self.retry_budget);
+        let mut unauthorized = 0;
+        let mut written = 0;
         loop {
-            attempt += 1;
+            retry.attempts += 1;
             let token = self.token()?;
             let mut request = self.client.get(&url).query(&query).bearer_auth(&token);
+            // A failed body read may already have written bytes, including into a hasher.
+            // Resume after them so a retry never appends the same prefix twice.
+            let offset = offset + written;
             if offset > 0 {
-                request = request.header("Range", &range);
+                request = request.header("Range", format!("bytes={offset}-"));
             }
             let outcome = self.runtime.block_on(async {
-                let mut response = request.send().await.map_err(|_| Failure::Transport)?;
+                let mut response = request.send().await?;
                 let status = response.status().as_u16();
                 match (status, offset) {
                     (206, _) | (200, 0) => {}
@@ -603,15 +660,16 @@ impl Drive {
                     (404, _) => {
                         return Err(Failure::Fatal(format!("drive files.get {id}: missing")));
                     }
-                    (429, _) | (500..=599, _) => return Err(Failure::Transport),
+                    (429, _) | (500..=599, _) => {
+                        return Err(Failure::Transient(TransientFailure::Http(status)));
+                    }
                     (status, _) => {
                         return Err(Failure::Fatal(format!(
                             "drive files.get {id}: status {status}"
                         )));
                     }
                 }
-                let mut written = 0;
-                while let Some(chunk) = response.chunk().await.map_err(|_| Failure::Transport)? {
+                while let Some(chunk) = response.chunk().await? {
                     sink.write_all(&chunk)
                         .map_err(|error| Failure::Fatal(format!("cannot write: {error}")))?;
                     written += chunk.len() as u64;
@@ -620,11 +678,18 @@ impl Drive {
             });
             match outcome {
                 Ok(written) => return Ok(written),
-                Err(Failure::Unauthorized) if attempt < self.max_attempts => {
-                    self.access_token = None
+                Err(Failure::Unauthorized) => {
+                    unauthorized += 1;
+                    if unauthorized >= self.max_attempts {
+                        return Err(format!(
+                            "drive files.get {id}: HTTP 401 after {} attempts",
+                            retry.attempts
+                        ));
+                    }
+                    self.access_token = None;
                 }
-                Err(Failure::Transport) if attempt < self.max_attempts => {
-                    std::thread::sleep(Duration::from_millis(200 * u64::from(attempt)));
+                Err(Failure::Transient(failure)) => {
+                    retry.retry(&format!("files.get {id}"), failure)?;
                 }
                 Err(Failure::RangeIgnored) => {
                     return Err(format!(
@@ -632,11 +697,6 @@ impl Drive {
                     ));
                 }
                 Err(Failure::Fatal(reason)) => return Err(reason),
-                Err(_) => {
-                    return Err(format!(
-                        "drive files.get {id}: request failed after {attempt} attempts"
-                    ));
-                }
             }
         }
     }
@@ -706,8 +766,14 @@ enum Resume {
 }
 
 enum Failure {
-    Transport,
+    Transient(TransientFailure),
     Unauthorized,
     RangeIgnored,
     Fatal(String),
+}
+
+impl From<reqwest::Error> for Failure {
+    fn from(error: reqwest::Error) -> Self {
+        Self::Transient(TransientFailure::Transport(error))
+    }
 }

@@ -23,6 +23,8 @@ credential = "BINARY_ALPHA_DRIVE_CREDENTIAL"
 chunk_bytes = 262144
 request_timeout_seconds = 30
 max_attempts = 3
+# Per-request transient retry budget in seconds (default 900), with capped exponential backoff.
+retry_seconds = 900
 
 [[jobs]]
 id = "deriv"

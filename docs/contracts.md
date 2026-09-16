@@ -578,8 +578,10 @@ generation fails before any credential is resolved.
 
 The `drive` table requires `root_folder_id` (nonempty, with no ASCII control characters, slash,
 or single quote), `chunk_bytes` (a positive unsigned 64-bit multiple of `262144`),
-`request_timeout_seconds`, and `max_attempts` (positive unsigned 32-bit integers). There are no
-default transfer limits. Operator mode also requires `credential`, an environment-variable name
+`request_timeout_seconds`, and `max_attempts` (positive unsigned 32-bit integers). Optional
+`retry_seconds` is a positive unsigned 32-bit per-request transient retry budget, defaulting to
+900 wall-clock seconds; the other transfer limits have no defaults. Operator mode also requires
+`credential`, an environment-variable name
 containing only letters, digits, and underscores, with no leading digit. The process variable
 holds user OAuth (Open Authorization) refresh credentials as a JSON (JavaScript Object Notation)
 object with string `client_id`, `client_secret`, and `refresh_token` fields. Operator transport
@@ -689,8 +691,10 @@ The producer derives the closure from validated dataset/stream manifests and che
 generation, instrument, and role linkage. It persists pre-generated Drive file identifiers before
 uploading. Resumable sessions are checkpointed before sending bytes; resumed sessions query status
 for their acknowledged offset. Expired sessions restart under the same file identifier; an
-ambiguous completion or status 409 reconciles that identifier. Transport/rate/server retries and
-session restarts are limited by `max_attempts`. Upload completion compares size and SHA-256,
+ambiguous completion or status 409 reconciles that identifier. Transport failures, HTTP 429, and
+5xx retry within `retry_seconds` from the first attempt, waiting 250 ms then doubling up to 30 s;
+`max_attempts` limits 401 token refresh attempts and resumable-session restarts. Upload completion
+compares size and SHA-256,
 reading back and hashing when Drive supplies no checksum. Different content is never replaced.
 Objects upload before manifests, and the catalog uploads last after those transfers confirm.
 The local catalog receipt is then published.
