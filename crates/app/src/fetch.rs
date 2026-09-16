@@ -502,14 +502,20 @@ fn prior(
         {
             return Err("fetch: prior coverage identity mismatch".into());
         }
-        let rank = |coverage: &HistoryCoverage| -> Result<(i64, std::cmp::Reverse<i64>), String> {
+        // The widest verified range wins; among equals, a closed acquisition outranks a partial
+        // snapshot left by an exhausted budget, and more retained pages outrank fewer.
+        let rank = |coverage: &HistoryCoverage| -> Result<(i64, std::cmp::Reverse<i64>, bool, usize), String> {
             let (start, end) = coverage
                 .verified
                 .as_ref()
                 .map(Range::bounds)
                 .transpose()?
                 .unwrap_or((i64::MAX, i64::MIN));
-            Ok((end, std::cmp::Reverse(start)))
+            let closed = coverage
+                .shortfall
+                .as_ref()
+                .is_none_or(|shortfall| shortfall.reason != BUDGET_SHORTFALL);
+            Ok((end, std::cmp::Reverse(start), closed, coverage.pages.len()))
         };
         if selected
             .as_ref()

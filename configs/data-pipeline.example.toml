@@ -1,11 +1,11 @@
 # Research market-data pipeline, schema version 1. Credential values never enter this file.
-# Job core configs follow configs/example.toml, with one [[import.sources]] entry and a [history]
-# table whose native_granularity, overlap_seconds, max_pages, and max_elapsed_seconds the pipeline
-# reads. Select one instrument per job, use run_mode = "research", omit [research] and foreground
+# Job core configs follow configs/example.toml with a [history] table naming one instrument, whose
+# native_granularity, overlap_seconds, max_pages, and max_elapsed_seconds the pipeline reads; the
+# instrument must already be imported into <local_root>/store by `data import`. Select one instrument per job, use run_mode = "research", omit [research] and foreground
 # refresh, and match history to the import's broker/ordinary role. Deriv uses ticks; Pocket uses
 # native five-second bars. Prepare the sibling core configs and non-secret evidence files first;
 # each evidence file is JSON whose source_identity names the broker source identity the archive
-# was collected under (bootstrap refuses a configured broker with a different identity).
+# was collected under (update refuses a configured broker with a different identity).
 schema_version = 1
 local_root = "../historical_data"
 # Supply an existing study declaration when applicable; use its actual authorized location.
@@ -23,11 +23,9 @@ max_attempts = 3
 [[jobs]]
 id = "deriv"
 config = "deriv.toml"
-intake_dir = "raw_sources/deriv"
 evidence = "evidence/deriv-source-binding.json"
 
 [[jobs]]
 id = "pocket"
 config = "pocket.toml"
-intake_dir = "raw_sources/pocket"
 evidence = "evidence/pocket-source-binding.json"

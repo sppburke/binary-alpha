@@ -11,14 +11,14 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use binary_alpha_engine::config::{
-    Config, ConfigPath, ManifestUri, PublicationUri, RunMode, Seed, Source, relative_path,
+    Config, ConfigPath, ManifestUri, PublicationUri, RunMode, Seed, relative_path,
 };
 use binary_alpha_engine::dataset::{
     Coverage, DatasetRole, GenerationManifest, NativeGranularity, ObjectRecord, SourceKind,
     manifest_key,
 };
 use binary_alpha_engine::market::{
-    format_event_time_micros as time_text, parse_event_time_micros as time,
+    BrokerId, format_event_time_micros as time_text, parse_event_time_micros as time,
 };
 use binary_alpha_engine::research::{Access, Declaration};
 use binary_alpha_engine::stream::StreamManifest;
@@ -29,7 +29,6 @@ use crate::audit;
 use crate::broker::{self, Clock, SystemClock};
 use crate::drive::{Drive, DriveSettings};
 use crate::fetch::{self, Bounds, PageReceipt, Progress, Requested};
-use crate::import;
 use crate::research;
 use crate::store::{self, ObjectIdentity, Store};
 use crate::verify;
@@ -37,7 +36,6 @@ use crate::verify;
 pub const PIPELINE_SCHEMA_VERSION: u32 = 1;
 pub const CATALOG_SCHEMA_VERSION: u32 = 1;
 const STORE_DIR: &str = "store";
-const RAW_SOURCES_DIR: &str = "raw_sources";
 const STATE_DIR: &str = "pipeline_state";
 const CATALOG_PREFIX: &str = "catalog-";
 
@@ -63,15 +61,14 @@ pub struct PipelineConfig {
     pub jobs: Vec<Job>,
 }
 
-/// One producer job: a core configuration declaring exactly one imported source and one
-/// matching history instrument, its intake beneath `raw_sources/`, and the non-secret
-/// evidence binding the imported archive to the configured broker context.
+/// One producer job: a core configuration declaring one history instrument whose imported
+/// generation in the managed store is the seed, and the non-secret evidence binding that
+/// archive to the configured broker context.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Job {
     pub id: String,
     pub config: PathBuf,
-    pub intake_dir: PathBuf,
     pub evidence: PathBuf,
 }
 
@@ -114,19 +111,9 @@ impl PipelineConfig {
             {
                 return Err(format!("{}: {} is listed twice", field("id"), job.id));
             }
-            for (name, path) in [
-                ("config", &job.config),
-                ("intake_dir", &job.intake_dir),
-                ("evidence", &job.evidence),
-            ] {
+            for (name, path) in [("config", &job.config), ("evidence", &job.evidence)] {
                 relative_path(&path.to_string_lossy())
                     .map_err(|reason| format!("{}: {reason}", field(name)))?;
-            }
-            if !job.intake_dir.starts_with(RAW_SOURCES_DIR) {
-                return Err(format!(
-                    "{}: must lie beneath {RAW_SOURCES_DIR}/",
-                    field("intake_dir")
-                ));
             }
         }
         Ok(())
@@ -136,7 +123,6 @@ impl PipelineConfig {
 /// The resolved managed root and its fixed children.
 struct Layout {
     base: PathBuf,
-    root: PathBuf,
     store: PathBuf,
     state: PathBuf,
 }
@@ -147,17 +133,12 @@ impl Layout {
         let root = absolute(&base.join(&config.local_root))?;
         let store = root.join(STORE_DIR);
         let state = root.join(STATE_DIR);
-        for dir in [&store, &state, &root.join(RAW_SOURCES_DIR)] {
+        for dir in [&store, &state] {
             fs::create_dir_all(dir)
                 .map_err(|error| format!("cannot create {}: {error}", dir.display()))?;
         }
         private(&state)?;
-        Ok(Self {
-            base,
-            root,
-            store,
-            state,
-        })
+        Ok(Self { base, store, state })
     }
 
     fn store(&self) -> Store {
@@ -270,9 +251,6 @@ struct Bound {
     core: Config,
     /// The one history instrument the job extends.
     symbol: String,
-    intake: PathBuf,
-    /// The intake is the declared source itself: nothing is copied and no manifest projected.
-    in_place: bool,
     evidence_sha256: String,
 }
 
@@ -289,28 +267,6 @@ fn bind(job: &Job, layout: &Layout) -> Result<Bound, String> {
                 .into(),
         ));
     }
-    let sources = core
-        .import
-        .as_ref()
-        .map(|import| import.sources.as_slice())
-        .unwrap_or_default();
-    let [source] = sources else {
-        return Err(field(
-            "import.sources must declare exactly one source".into(),
-        ));
-    };
-    let selected = match source {
-        Source::TickParquetDaily { instruments, .. } => instruments.len(),
-        Source::BarParquetCollection { instruments, .. } => {
-            instruments.as_ref().map_or(0, Vec::len)
-        }
-        Source::TickCsv { .. } => 1,
-    };
-    if selected != 1 {
-        return Err(field(
-            "the imported source must select exactly one instrument".into(),
-        ));
-    }
     let history = core
         .history
         .as_ref()
@@ -321,11 +277,6 @@ fn bind(job: &Job, layout: &Layout) -> Result<Bound, String> {
         ));
     };
     let symbol = symbol.to_string();
-    if history.role != source.role() || history.broker != *source.broker() {
-        return Err(field(
-            "history and the imported source must share one broker and role".into(),
-        ));
-    }
     if history.refresh_interval_seconds.is_some() {
         return Err(field(
             "history.refresh_interval_seconds must be absent".into(),
@@ -361,21 +312,6 @@ fn bind(job: &Job, layout: &Layout) -> Result<Bound, String> {
             evidence.display()
         ))
     })?;
-    let intake = absolute(&layout.root.join(&job.intake_dir))?;
-    let source_root = layout
-        .base
-        .join(&job.config)
-        .parent()
-        .unwrap_or(Path::new("."))
-        .join(source.path())
-        .canonicalize()
-        .map_err(|error| field(format!("source {}: {error}", source.path().display())))?;
-    if source_root.starts_with(&layout.store) || intake.starts_with(&layout.store) {
-        return Err(field(
-            "the source and the intake must lie outside the managed store".into(),
-        ));
-    }
-    let in_place = source_root == intake;
     // The operator's evidence binds the archive to one source context; the configured broker
     // must be that context, so a demo/real or endpoint switch is refused before admission.
     let declared: EvidenceBinding = serde_json::from_slice(&evidence_bytes)
@@ -392,8 +328,6 @@ fn bind(job: &Job, layout: &Layout) -> Result<Bound, String> {
     Ok(Bound {
         core,
         symbol,
-        in_place,
-        intake,
         evidence_sha256,
     })
 }
@@ -410,159 +344,26 @@ fn binding_hash(config: &Config) -> String {
 }
 
 /// The effective core configuration of a job: the managed store as both retained folder and
-/// publication root, the import source moved to its verified intake (with its projected manifest
-/// when one was staged), and, for an update, the seed binding and pinned cutoff.
+/// publication root, the seed binding, and the pinned cutoff.
 fn effective(
     bound: &Bound,
     layout: &Layout,
-    projection: Option<&str>,
-    cutoff: Option<i64>,
+    cutoff: i64,
     seeds: Vec<Seed>,
 ) -> Result<Config, String> {
     let mut config = bound.core.clone();
     config.storage.historical_data_dir =
         ConfigPath::try_from(layout.store.clone()).expect("an absolute store path");
     config.storage.publication_uri = PublicationUri::Filesystem(layout.store.clone());
-    let source = &mut config
-        .import
-        .as_mut()
-        .expect("bound configuration imports one source")
-        .sources[0];
-    let intake = ConfigPath::try_from(bound.intake.clone()).expect("an absolute intake path");
-    match source {
-        Source::TickCsv { path, .. } | Source::TickParquetDaily { path, .. } => *path = intake,
-        Source::BarParquetCollection {
-            path,
-            manifest,
-            provenance,
-            ..
-        } => {
-            *path = intake;
-            if let Some(projection) = projection {
-                let original = std::mem::replace(manifest, PathBuf::from(projection));
-                provenance.get_or_insert_with(Vec::new).insert(0, original);
-            }
-        }
-    }
     let history = config
         .history
         .as_mut()
         .expect("bound configuration has history");
-    if let Some(cutoff) = cutoff {
-        history.end = time_text(cutoff);
-    }
+    history.end = time_text(cutoff);
     history.seeds = seeds;
     // The effective document is parsed again so every cross-field rule applies to it.
     Config::parse(&config.canonical_toml())
         .map_err(|error| format!("effective configuration: {error}"))
-}
-
-// ----------------------------------------------------------------------------------------------
-// Intake
-// ----------------------------------------------------------------------------------------------
-
-/// The result of staging one job's selected source files.
-struct Staged {
-    projection: Option<String>,
-    copied: usize,
-    bytes: u64,
-}
-
-/// Copies exactly the selected source files into the intake through the create-once store
-/// owner (identical existing files are reused, different ones stop the intake), writes the
-/// projected collection manifest beside the retained original, and removes only this
-/// pipeline's own scratch leftovers.
-fn stage(bound: &Bound, layout: &Layout, job: &Job) -> Result<Staged, String> {
-    if bound.in_place {
-        return Ok(Staged {
-            projection: None,
-            copied: 0,
-            bytes: 0,
-        });
-    }
-    for path in walk(&bound.intake)? {
-        if path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .is_some_and(store_scratch)
-        {
-            fs::remove_file(&path)
-                .map_err(|error| format!("cannot remove {}: {error}", path.display()))?;
-        }
-    }
-    let source = &bound.core.import.as_ref().expect("bound").sources[0];
-    let base = layout
-        .base
-        .join(&job.config)
-        .parent()
-        .unwrap_or(Path::new("."))
-        .to_path_buf();
-    let plan = import::intake_plan(source, &base)?;
-    let intake = Store::filesystem(&bound.intake);
-    let mut copied = 0;
-    let mut bytes = 0;
-    for file in &plan.files {
-        let identity = store::identify(&file.source)?;
-        if let store::Put::Created(_) = intake.put_new(&file.relative, &file.source, &identity)? {
-            copied += 1;
-            bytes += identity.bytes;
-        }
-    }
-    let projection = match plan.projection {
-        Some((name, content)) => {
-            let scratch = layout.state.join(format!(".projection-{}", job.id));
-            fs::write(&scratch, &content)
-                .map_err(|error| format!("cannot write {}: {error}", scratch.display()))?;
-            let identity = store::identify(&scratch)?;
-            intake.put_new(&name, &scratch, &identity)?;
-            fs::remove_file(&scratch)
-                .map_err(|error| format!("cannot remove {}: {error}", scratch.display()))?;
-            Some(name)
-        }
-        None => None,
-    };
-    Ok(Staged {
-        projection,
-        copied,
-        bytes,
-    })
-}
-
-/// A create-once copy's scratch name, `.tmp-SHA256HEX-PID`, which no archive file carries.
-fn store_scratch(name: &str) -> bool {
-    name.strip_prefix(".tmp-")
-        .and_then(|rest| rest.split_once('-'))
-        .is_some_and(|(sha256, pid)| {
-            sha256.len() == 64
-                && sha256.bytes().all(|byte| byte.is_ascii_hexdigit())
-                && !pid.is_empty()
-                && pid.bytes().all(|byte| byte.is_ascii_digit())
-        })
-}
-
-/// Regular files beneath `root`; symbolic links are neither followed nor listed.
-fn walk(root: &Path) -> Result<Vec<PathBuf>, String> {
-    let mut files = Vec::new();
-    let mut pending = vec![root.to_path_buf()];
-    while let Some(dir) = pending.pop() {
-        let entries = match fs::read_dir(&dir) {
-            Ok(entries) => entries,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(error) => return Err(format!("cannot list {}: {error}", dir.display())),
-        };
-        for entry in entries {
-            let entry = entry.map_err(|error| format!("cannot list {}: {error}", dir.display()))?;
-            let kind = entry
-                .file_type()
-                .map_err(|error| format!("cannot list {}: {error}", dir.display()))?;
-            if kind.is_dir() {
-                pending.push(entry.path());
-            } else if kind.is_file() {
-                files.push(entry.path());
-            }
-        }
-    }
-    Ok(files)
 }
 
 // ----------------------------------------------------------------------------------------------
@@ -586,19 +387,6 @@ struct Intent {
     seeds: Vec<Seed>,
 }
 
-/// What a completed bootstrap binds for every later update of the job.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct BootstrapReceipt {
-    intent: String,
-    dataset_generation: String,
-    stream_generation: String,
-    provider_symbol: String,
-    /// The configured broker's source identity at bootstrap: every update must present it.
-    source_identity: String,
-    effective_config_hash: String,
-    catalog: CatalogReceipt,
-}
-
 /// The pending acquisition of one job.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct Pending {
@@ -620,8 +408,6 @@ struct Receipt {
     coverage: Option<fetch::HistoryCoverage>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     requests: Vec<PageReceipt>,
-    copied_files: usize,
-    copied_bytes: u64,
     catalog: Option<CatalogReceipt>,
     pending: bool,
 }
@@ -946,6 +732,38 @@ fn confirm_remote(
         .map(|_| ())
 }
 
+/// The newest imported dataset generation of one instrument in the store: the seed every
+/// update extends. Broker-history descendants are found from it by the fetch owner.
+fn imported_seed(
+    local: &Store,
+    broker: &BrokerId,
+    symbol: &str,
+    role: DatasetRole,
+) -> Result<Option<String>, String> {
+    let instrument = format!("{broker}:{symbol}");
+    let mut newest: Option<(String, String)> = None;
+    for generation in local.list_manifests()? {
+        let mut bytes = Vec::new();
+        local.read_to(&manifest_key(&generation), None, &mut bytes)?;
+        if verify::manifest_kind(&bytes)?.is_some() {
+            continue;
+        }
+        let manifest = GenerationManifest::from_json(&bytes)
+            .map_err(|error| format!("{generation}: {error}"))?;
+        if manifest.instrument != instrument
+            || manifest.role != role
+            || manifest.source_kind == SourceKind::BrokerHistory
+        {
+            continue;
+        }
+        let last = manifest.coverage.last_event_time.clone();
+        if newest.as_ref().is_none_or(|(_, known)| last > *known) {
+            newest = Some((manifest.generation.clone(), last));
+        }
+    }
+    Ok(newest.map(|(generation, _)| generation))
+}
+
 fn read_manifest(local: &Store, generation: &str) -> Result<(GenerationManifest, Vec<u8>), String> {
     let mut bytes = Vec::new();
     local.read_to(&manifest_key(generation), None, &mut bytes)?;
@@ -977,17 +795,8 @@ fn load(config_path: &Path) -> Result<(PipelineConfig, Layout, String), String> 
     Ok((config, layout, hash))
 }
 
-/// `data pipeline bootstrap`: stage, import, audit, verify, and archive every job without
-/// any broker contact.
-pub fn bootstrap(config_path: &Path, out: &mut dyn Write) -> Result<(), String> {
-    let (config, layout, hash) = load(config_path)?;
-    run_jobs(&config, &layout, out, |job, bound, drive, access, out| {
-        bootstrap_job(job, bound, &layout, &hash, drive, access, out)
-    })
-}
-
-/// `data pipeline update`: extend every bootstrapped job from its bound seed to one pinned
-/// cutoff within its budget, then audit, verify, and archive the result.
+/// `data pipeline update`: extend every job's imported generation from its frontier to one
+/// pinned cutoff within its budget, then audit, verify, and archive the result.
 pub fn update(config_path: &Path, end: Option<&str>, out: &mut dyn Write) -> Result<(), String> {
     update_with(config_path, end, &mut SystemClock, out)
 }
@@ -1049,110 +858,6 @@ fn run_jobs(
     }
 }
 
-fn bootstrap_job(
-    job: &Job,
-    bound: Bound,
-    layout: &Layout,
-    pipeline_hash: &str,
-    drive: &mut Drive,
-    access: Access<'_>,
-    out: &mut dyn Write,
-) -> Result<String, String> {
-    let staged = stage(&bound, layout, job)?;
-    let config = effective(
-        &bound,
-        layout,
-        staged.projection.as_deref(),
-        None,
-        Vec::new(),
-    )?;
-    let records = layout.records();
-    let intent = publish(
-        &records,
-        &format!("{}-intent", job.id),
-        &Intent {
-            schema_version: PIPELINE_SCHEMA_VERSION,
-            command: "bootstrap".into(),
-            job: job.id.clone(),
-            pipeline_config_hash: pipeline_hash.to_string(),
-            base_config_hash: bound.core.content_hash(),
-            effective_config_hash: config.content_hash(),
-            evidence_sha256: bound.evidence_sha256.clone(),
-            archive_root: drive.root().to_string(),
-            cutoff: None,
-            seeds: Vec::new(),
-        },
-    )?;
-    let state = layout.job_state(&job.id)?;
-    write_atomic(
-        &state.join("bootstrap.toml"),
-        config.canonical_toml().as_bytes(),
-    )?;
-    let local = layout.store();
-    let published = import::publish_all(&config, &layout.root, out)?;
-    let [publication] = published.as_slice() else {
-        return Err(format!(
-            "job {}: the source published {} generations, expected one",
-            job.id,
-            published.len()
-        ));
-    };
-    let dataset = &publication.manifest;
-    if dataset.provider_symbol.as_str() != bound.symbol {
-        return Err(format!(
-            "job {}: the imported generation is {}, but history names {}",
-            job.id, dataset.instrument, bound.symbol
-        ));
-    }
-    let stream = finish(&config, layout, &local, &dataset.generation, access, out)?;
-    let catalog = archive(drive, layout, &job.id, &dataset.generation, &stream)?;
-    let settings = config
-        .brokers
-        .iter()
-        .find(|broker| broker.id() == &config.history.as_ref().expect("bound").broker)
-        .expect("bound broker");
-    let receipt = BootstrapReceipt {
-        intent: intent.clone(),
-        dataset_generation: dataset.generation.clone(),
-        stream_generation: stream.clone(),
-        provider_symbol: bound.symbol.clone(),
-        source_identity: broker::source_identity(settings),
-        effective_config_hash: config.content_hash(),
-        catalog: catalog.clone(),
-    };
-    write_atomic(&state.join("bootstrap.json"), &json_bytes(&receipt)?)?;
-    publish(
-        &records,
-        &format!("{}-receipt", job.id),
-        &Receipt {
-            schema_version: PIPELINE_SCHEMA_VERSION,
-            command: "bootstrap".into(),
-            job: job.id.clone(),
-            intent,
-            status: "archived".into(),
-            dataset_generation: Some(dataset.generation.clone()),
-            stream_generation: Some(stream.clone()),
-            coverage: None,
-            requests: Vec::new(),
-            copied_files: staged.copied,
-            copied_bytes: staged.bytes,
-            catalog: Some(catalog.clone()),
-            pending: false,
-        },
-    )?;
-    Ok(format!(
-        "pipeline bootstrap {} {} dataset {} stream {stream} rows {} copied {} files {} bytes catalog {} sha256 {}",
-        job.id,
-        dataset.instrument,
-        dataset.generation,
-        dataset.row_count,
-        staged.copied,
-        staged.bytes,
-        catalog.file_id,
-        catalog.sha256
-    ))
-}
-
 /// Audits and verifies one dataset generation in the managed store, returning its stream
 /// generation.
 fn finish(
@@ -1185,11 +890,19 @@ fn update_job(
     out: &mut dyn Write,
 ) -> Result<String, String> {
     let state = layout.job_state(&job.id)?;
-    let bootstrap: BootstrapReceipt =
-        read_json(&state.join("bootstrap.json"))?.ok_or_else(|| {
+    let local = layout.store();
+    let history = bound.core.history.as_ref().expect("bound history");
+    let settings = bound
+        .core
+        .brokers
+        .iter()
+        .find(|broker| broker.id() == &history.broker)
+        .expect("bound broker");
+    let imported = imported_seed(&local, &history.broker, &bound.symbol, history.role)?
+        .ok_or_else(|| {
             format!(
-                "job {}: bootstrap first; no seed binding is recorded",
-                job.id
+                "job {}: the store holds no imported generation for {}:{}; run `data import` first",
+                job.id, history.broker, bound.symbol
             )
         })?;
     let pending_path = state.join("progress.json");
@@ -1208,30 +921,16 @@ fn update_job(
         (None, Some(end)) => end,
         (None, None) => clock.now_micros(),
     };
-    let staged = if bound.in_place {
-        None
-    } else {
-        Some(stage(&bound, layout, job)?)
-    };
-    let projection = staged.as_ref().and_then(|staged| staged.projection.clone());
     let seed = Seed {
         provider_symbol: bound
             .symbol
             .clone()
             .try_into()
             .expect("a bound symbol is a provider symbol"),
-        manifest: layout
-            .manifest_uri(&bootstrap.dataset_generation)
-            .parse::<ManifestUri>()?,
-        source_identity: bootstrap.source_identity.clone(),
+        manifest: layout.manifest_uri(&imported).parse::<ManifestUri>()?,
+        source_identity: broker::source_identity(settings),
     };
-    let config = effective(
-        &bound,
-        layout,
-        projection.as_deref(),
-        Some(cutoff),
-        vec![seed.clone()],
-    )?;
+    let config = effective(&bound, layout, cutoff, vec![seed.clone()])?;
     let binding = binding_hash(&config);
     let records = layout.records();
     if let Some(pending) = &pending {
@@ -1252,7 +951,6 @@ fn update_job(
             ));
         }
     }
-    let local = layout.store();
     // Seed binding and source context are checked before any credential is resolved.
     fetch::prepare(&config, &local, access.declaration)?;
     let intent = match &pending {
@@ -1358,8 +1056,6 @@ fn update_job(
             stream_generation: stream.clone(),
             coverage: Some(outcome.coverage.clone()),
             requests: outcome.receipts.clone(),
-            copied_files: staged.as_ref().map_or(0, |staged| staged.copied),
-            copied_bytes: staged.as_ref().map_or(0, |staged| staged.bytes),
             catalog: catalog.clone(),
             pending: outcome.pending,
         },

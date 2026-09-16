@@ -262,16 +262,10 @@ enum DataCommand {
 
 #[derive(Subcommand)]
 enum PipelineCommand {
-    /// Stage every job's selected originals, import, audit, verify, and archive them without
-    /// broker contact.
-    Bootstrap {
-        /// Path of the TOML pipeline document.
-        #[arg(long)]
-        config: PathBuf,
-    },
-    /// Extend every bootstrapped job from its bound seed to one pinned cutoff within its
-    /// budget, then audit, verify, and archive the result.
+    /// Extend every job's imported generation from its frontier to one pinned cutoff within
+    /// its budget, then audit, verify, and archive the result.
     Update {
+        /// Path of the TOML pipeline document.
         #[arg(long)]
         config: PathBuf,
         /// The pinned cutoff as `YYYY-MM-DDTHH:MM:SS[.ffffff]Z`; absent means now.
@@ -354,9 +348,6 @@ fn main() -> ExitCode {
         Command::Data {
             command: DataCommand::Pipeline { command },
         } => match command {
-            PipelineCommand::Bootstrap { config } => {
-                data_pipeline::bootstrap(&config, &mut std::io::stdout().lock())
-            }
             PipelineCommand::Update { config, end } => {
                 data_pipeline::update(&config, end.as_deref(), &mut std::io::stdout().lock())
             }

@@ -1,5 +1,5 @@
 //! Goal-bearing proof of `binary-alpha data pipeline` over synthetic sources, loopback Deriv
-//! and Pocket Option brokers, and a loopback Drive: selected intake, seeded backfill, private
+//! and Pocket Option brokers, and a loopback Drive: selected imports, seeded backfill, private
 //! archive, exact restore, crash and conflict recovery, scope denial, and schedule semantics.
 //! Every broker frame, archive byte, and Drive response here is synthetic.
 
@@ -932,7 +932,7 @@ fn pipeline_toml(
     ));
     for (id, config) in jobs {
         text.push_str(&format!(
-            "\n[[jobs]]\nid = \"{id}\"\nconfig = \"{config}\"\nintake_dir = \"raw_sources/{id}\"\nevidence = \"evidence/{id}.json\"\n"
+            "\n[[jobs]]\nid = \"{id}\"\nconfig = \"{config}\"\nevidence = \"evidence/{id}.json\"\n"
         ));
     }
     text
@@ -1015,6 +1015,24 @@ fn write_evidence(scratch: &Scratch, job: &str, core: &str) {
     .unwrap();
 }
 
+fn import_config(scratch: &Scratch, job: &str, core: &str) -> PathBuf {
+    let store = scratch.path("producer/store");
+    let path = scratch.path(&format!("{job}-import.toml"));
+    fs::write(
+        &path,
+        core.replace(
+            "historical_data_dir = \"unused\"",
+            &format!("historical_data_dir = \"{}\"", store.display()),
+        )
+        .replace(
+            "publication_uri = \"file:///unused\"",
+            &format!("publication_uri = \"file://{}\"", store.display()),
+        ),
+    )
+    .unwrap();
+    path
+}
+
 fn fixture(name: &str) -> Fixture {
     let scratch = Scratch::new(name);
     write_sources(&scratch);
@@ -1037,6 +1055,12 @@ fn fixture(name: &str) -> Fixture {
         pocket_core(&pocket.url, "demo", BAR_GRANULARITY, 60, 50, 60),
     )
     .unwrap();
+    import_config(&scratch, "deriv", &deriv_core(&deriv.url, 60, 50, 60));
+    import_config(
+        &scratch,
+        "pocket",
+        &pocket_core(&pocket.url, "demo", BAR_GRANULARITY, 60, 50, 60),
+    );
     write_evidence(&scratch, "deriv", &deriv_core(&deriv.url, 60, 50, 60));
     write_evidence(
         &scratch,
@@ -1095,6 +1119,18 @@ fn pipeline(command: &str, config: &Path, extra: &[&str]) -> Result<String, Stri
     ];
     args.extend_from_slice(extra);
     run(&args)
+}
+
+fn import(config: &Path) -> Result<String, String> {
+    run(&["data", "import", "--config", config.to_str().unwrap()])
+}
+
+fn imported_generation<'a>(report: &'a str, instrument: &str) -> &'a str {
+    let line = report
+        .lines()
+        .find(|line| line.starts_with(&format!("published {instrument} development generation ")))
+        .unwrap_or_else(|| panic!("no import line for {instrument} in {report}"));
+    field(line, "generation")
 }
 
 fn field<'a>(line: &'a str, key: &str) -> &'a str {
@@ -1244,35 +1280,13 @@ fn candle_clocks(store: &Path, stream: &StreamManifest) -> Vec<(i64, i64)> {
 fn pipeline_roundtrip() {
     let f = fixture("pipeline_roundtrip");
     let store = f.scratch.path("producer/store");
-    let bootstrap = pipeline("bootstrap", &f.pipeline, &[]).unwrap();
-    let deriv_seed = field(job_line(&bootstrap, "deriv"), "dataset").to_string();
-    let pocket_seed = field(job_line(&bootstrap, "pocket"), "dataset").to_string();
-    // Selected intake: only the selected trees exist beneath the intake, the projection names
-    // relative roots, and the excluded asset's broken tree was never opened.
-    assert!(f.scratch.path("producer/raw_sources/deriv/EURUSD").is_dir());
-    assert!(!f.scratch.path("producer/raw_sources/deriv/GBPUSD").exists());
-    assert!(
-        !f.scratch
-            .path("producer/raw_sources/pocket/EXCLUDED_otc")
-            .exists()
-    );
-    let projection = read_json(
-        &f.scratch
-            .path("producer/raw_sources/pocket/collection.intake.json"),
-    );
-    assert_eq!(
-        projection["assets"]["AEDCNY_otc"]["asset_root"],
-        json!("AEDCNY_otc")
-    );
-    assert_eq!(
-        projection["assets"]["AEDCNY_otc"]["dataset_root"],
-        json!("AEDCNY_otc/dataset")
-    );
-    assert!(projection["assets"].get("EXCLUDED_otc").is_none());
-    assert_eq!(
-        projection["binary_alpha_intake"]["selected"],
-        json!(["AEDCNY_otc"])
-    );
+    let deriv_import = import(&f.scratch.path("deriv-import.toml")).unwrap();
+    let pocket_import = import(&f.scratch.path("pocket-import.toml")).unwrap();
+    let deriv_seed = imported_generation(&deriv_import, "deriv:frxEURUSD").to_string();
+    let pocket_seed = imported_generation(&pocket_import, "pocket_option:AEDCNY_otc").to_string();
+    // Only the selected assets are imported; their broken neighbours are never opened.
+    assert_eq!(deriv_import.lines().count(), 1, "{deriv_import}");
+    assert_eq!(pocket_import.lines().count(), 1, "{pocket_import}");
     let seed_bars = bars(&store, &dataset(&store, &pocket_seed));
     assert_eq!(
         seed_bars,
@@ -1282,20 +1296,16 @@ fn pipeline_roundtrip() {
         ticks(&store, &dataset(&store, &deriv_seed)),
         expected_ticks(DERIV_SEED_END, DERIV_SEED_END, DERIV_SEED_END)
     );
-    // Repeated bootstrap reuses identical generations in the one managed store.
-    let again = pipeline("bootstrap", &f.pipeline, &[]).unwrap();
-    assert_eq!(field(job_line(&again, "deriv"), "dataset"), deriv_seed);
-    assert_eq!(field(job_line(&again, "pocket"), "dataset"), pocket_seed);
+    // Repeated imports reuse identical generations in the one managed store.
+    let again = import(&f.scratch.path("deriv-import.toml")).unwrap();
+    assert_eq!(imported_generation(&again, "deriv:frxEURUSD"), deriv_seed);
     assert!(again.contains("(already published)"), "{again}");
-    assert!(
-        fs::read_to_string(
-            f.scratch
-                .path("producer/pipeline_state/deriv/bootstrap.toml")
-        )
-        .unwrap()
-        .contains("file://"),
-        "publication stays on the local filesystem"
+    let again = import(&f.scratch.path("pocket-import.toml")).unwrap();
+    assert_eq!(
+        imported_generation(&again, "pocket_option:AEDCNY_otc"),
+        pocket_seed
     );
+    assert!(again.contains("(already published)"), "{again}");
 
     // First update to a pinned cutoff two pages past the seed frontier, ending inside a bar.
     let deriv_cutoff = DERIV_SEED_END + 1_200;
@@ -1306,8 +1316,8 @@ fn pipeline_roundtrip() {
         &["--end", &time_text(pocket_cutoff * 1_000_000)],
     )
     .unwrap_err();
-    // The Deriv cutoff and the Pocket cutoff are one pinned instant; Deriv's provider has no
-    // rows that late, so its job reports its tail honestly while Pocket archives cleanly.
+    // The pinned Pocket cutoff precedes Deriv's seed, so Deriv refuses the narrower range
+    // while Pocket publishes its first descendant and catalog.
     assert!(first.contains("pipeline update pocket "), "{first}");
     let pocket_line = job_line(&first, "pocket");
     assert_eq!(field(pocket_line, "status"), "archived");
@@ -1388,6 +1398,12 @@ fn pipeline_roundtrip() {
     .unwrap();
     let deriv_line = job_line(&second, "deriv");
     assert_eq!(field(deriv_line, "status"), "archived");
+    assert!(
+        fs::read_to_string(f.scratch.path("producer/pipeline_state/deriv/update.toml"))
+            .unwrap()
+            .contains("file://"),
+        "publication stays on the local filesystem"
+    );
     let deriv_first = field(deriv_line, "dataset").to_string();
     let deriv_stream = field(deriv_line, "stream").to_string();
     // The seed's last tick lies two seconds before its end; the acquisition starts one overlap
@@ -1474,18 +1490,13 @@ fn pipeline_roundtrip() {
         &["--broker", "deriv", "--symbol", "frxEURUSD"],
     )
     .unwrap();
-    assert_eq!(deriv_listing.lines().count(), 3, "{deriv_listing}");
+    assert_eq!(deriv_listing.lines().count(), 2, "{deriv_listing}");
     let expected_dataset_bytes =
         fs::read(store.join(format!("manifests/{pocket_first}/ready.json"))).unwrap();
     let expected_stream_bytes =
         fs::read(store.join(format!("manifests/{pocket_stream}/ready.json"))).unwrap();
     let pocket_objects = dataset(&store, &pocket_first).objects.clone();
     fs::rename(&store, f.scratch.path("producer/store.gone")).unwrap();
-    fs::rename(
-        f.scratch.path("producer/raw_sources"),
-        f.scratch.path("producer/raw_sources.gone"),
-    )
-    .unwrap();
     fs::rename(f.scratch.path("sources"), f.scratch.path("sources.gone")).unwrap();
     let consumer = f.scratch.path("consumer.toml");
     fs::write(
@@ -1625,13 +1636,16 @@ fn pipeline_recovery() {
     )
     .unwrap();
 
-    // Interrupted mid-upload during bootstrap: the next run resumes from the acknowledged
-    // offset under the same file identity.
+    let imported = import(&f.scratch.path("pocket-import.toml")).unwrap();
+    let seed = imported_generation(&imported, "pocket_option:AEDCNY_otc").to_string();
+    // The first update publishes a descendant and catalog even with no added rows. Interrupted
+    // mid-upload, its next run resumes from the acknowledged offset under the same file identity.
+    let seed_end = time_text(POCKET_SEED_END * 1_000_000);
     f.drive.set(DriveFaults {
         drop_upload_at_chunk: Some(1),
         ..Default::default()
     });
-    let failed = pipeline("bootstrap", &pocket_only, &[]).unwrap_err();
+    let failed = pipeline("update", &pocket_only, &["--end", &seed_end]).unwrap_err();
     assert!(failed.contains("drive upload"), "{failed}");
     let transfers = read_json(&state.join("pocket/transfers.json"));
     let open_session = transfers["files"]
@@ -1642,8 +1656,21 @@ fn pipeline_recovery() {
         .cloned();
     assert!(open_session.is_some(), "{transfers}");
     let log_before = f.drive.log().len();
-    let bootstrap = pipeline("bootstrap", &pocket_only, &[]).unwrap();
-    let seed = field(job_line(&bootstrap, "pocket"), "dataset").to_string();
+    let first = pipeline("update", &pocket_only, &["--end", &seed_end]).unwrap();
+    let baseline = field(job_line(&first, "pocket"), "dataset").to_string();
+    assert_eq!(field(job_line(&first, "pocket"), "status"), "archived");
+    assert_ne!(baseline, seed);
+    assert_eq!(
+        bars(&store, &dataset(&store, &baseline)),
+        bars(&store, &dataset(&store, &seed))
+    );
+    assert_eq!(
+        coverage(&store, &dataset(&store, &baseline))
+            .seed
+            .unwrap()
+            .generation,
+        seed
+    );
     let resumed = f.drive.log()[log_before..]
         .iter()
         .find(|line| line.starts_with("PUT /upload/session/") && line.contains("bytes */"))
@@ -1654,6 +1681,11 @@ fn pipeline_recovery() {
         f.drive.log()
     );
     let files = f.drive.files();
+    assert!(
+        files
+            .values()
+            .any(|entry| entry.name.starts_with("catalog-"))
+    );
     let ids: Vec<&String> = files.keys().collect();
     assert_eq!(
         ids.len(),
@@ -1669,6 +1701,7 @@ fn pipeline_recovery() {
     // until the seed overlap is reached, archiving partial snapshots without closing the intent.
     let cutoff = POCKET_SEED_END + 362;
     let end = time_text(cutoff * 1_000_000);
+    let requests_before = f.pocket.requests().len();
     let mut statuses = Vec::new();
     let mut generations = Vec::new();
     for _ in 0..6 {
@@ -1685,7 +1718,7 @@ fn pipeline_recovery() {
                 generations.push(field(line, "dataset").to_string());
                 let pending = read_json(&state.join("pocket/progress.json"));
                 assert_eq!(pending["progress"]["cutoff"], json!(end));
-                assert_eq!(pending["progress"]["baseline"], json!(seed));
+                assert_eq!(pending["progress"]["baseline"], json!(baseline));
             }
         }
     }
@@ -1708,9 +1741,7 @@ fn pipeline_recovery() {
         bars(&store, &dataset(&store, final_generation)),
         expected_bars(POCKET_SEED_END, POCKET_SEED_END - 60, cutoff)
     );
-    let requests: Vec<Value> = f
-        .pocket
-        .requests()
+    let requests: Vec<Value> = f.pocket.requests()[requests_before..]
         .iter()
         .map(|request| serde_json::from_str(request).unwrap())
         .collect();
@@ -2091,8 +2122,8 @@ fn pipeline_scope() {
     )
     .unwrap();
 
-    // Wrong native kind: a Pocket tick job and a Deriv bar job are refused before any
-    // credential or connection, as are invalid selections.
+    // Wrong native kind: a Pocket tick job and a Deriv bar job are refused at update before
+    // any credential or connection.
     write_pocket(pocket_core(
         &f.pocket.url,
         "demo",
@@ -2101,7 +2132,7 @@ fn pipeline_scope() {
         50,
         60,
     ));
-    let refused = pipeline("bootstrap", &pocket_only, &[]).unwrap_err();
+    let refused = pipeline("update", &pocket_only, &[]).unwrap_err();
     assert!(
         refused.contains("native_granularity must be 5-second bar"),
         "{refused}"
@@ -2114,7 +2145,7 @@ fn pipeline_scope() {
         ),
     )
     .unwrap();
-    let refused = pipeline("bootstrap", &deriv_only, &[]).unwrap_err();
+    let refused = pipeline("update", &deriv_only, &[]).unwrap_err();
     assert!(
         refused.contains("native_granularity must be tick")
             || refused.contains("must name a declared"),
@@ -2133,21 +2164,21 @@ fn pipeline_scope() {
         ),
         (r#"instruments = ["UNKNOWN_otc"]"#, "lists no asset"),
     ] {
-        write_pocket(
-            pocket_core(&f.pocket.url, "demo", BAR_GRANULARITY, 60, 50, 60).replacen(
+        let config = import_config(
+            &f.scratch,
+            "pocket",
+            &pocket_core(&f.pocket.url, "demo", BAR_GRANULARITY, 60, 50, 60).replacen(
                 r#"instruments = ["AEDCNY_otc"]"#,
                 selection,
                 1,
             ),
         );
-        let refused = pipeline("bootstrap", &pocket_only, &[]).unwrap_err();
+        let refused = import(&config).unwrap_err();
         assert!(refused.contains(expected), "{selection}: {refused}");
     }
     assert!(f.pocket.requests().is_empty() && f.deriv.requests().is_empty());
-    assert!(!producer.join("raw_sources/pocket/EXCLUDED_otc").exists());
 
-    // A real bootstrap binds the demo source context; a demo/real switch, an unknown seed
-    // binding, and range narrowing are all refused before a connection.
+    // An update requires an imported generation before it opens a broker connection.
     write_pocket(pocket_core(
         &f.pocket.url,
         "demo",
@@ -2156,8 +2187,21 @@ fn pipeline_scope() {
         50,
         60,
     ));
-    let bootstrap = pipeline("bootstrap", &pocket_only, &[]).unwrap();
-    let seed = field(job_line(&bootstrap, "pocket"), "dataset").to_string();
+    let refused = pipeline("update", &pocket_only, &[]).unwrap_err();
+    assert!(
+        refused.contains("job pocket: the store holds no imported generation for pocket_option:AEDCNY_otc; run `data import` first"),
+        "{refused}"
+    );
+    assert!(f.pocket.requests().is_empty() && f.deriv.requests().is_empty());
+    let config = import_config(
+        &f.scratch,
+        "pocket",
+        &pocket_core(&f.pocket.url, "demo", BAR_GRANULARITY, 60, 50, 60),
+    );
+    let imported = import(&config).unwrap();
+    let seed = imported_generation(&imported, "pocket_option:AEDCNY_otc").to_string();
+    // The evidence binds the demo source context; a demo/real switch, an inconsistent seed
+    // identity, and range narrowing are all refused before a connection.
     let requests = f.pocket.requests().len();
     write_pocket(pocket_core(
         &f.pocket.url,
@@ -2182,9 +2226,9 @@ fn pipeline_scope() {
         50,
         60,
     ));
-    let receipt_path = producer.join("pipeline_state/pocket/bootstrap.json");
-    let receipt = fs::read_to_string(&receipt_path).unwrap();
-    fs::write(&receipt_path, receipt.replace(&seed[..8], "00000000")).unwrap();
+    let seed_path = producer.join(format!("store/manifests/{seed}/ready.json"));
+    let manifest = fs::read_to_string(&seed_path).unwrap();
+    fs::write(&seed_path, manifest.replace(&seed, &"0".repeat(64))).unwrap();
     let refused = pipeline(
         "update",
         &pocket_only,
@@ -2192,10 +2236,10 @@ fn pipeline_scope() {
     )
     .unwrap_err();
     assert!(
-        refused.contains("seed") || refused.contains("manifest"),
+        refused.contains("does not match the recorded inputs"),
         "{refused}"
     );
-    fs::write(&receipt_path, &receipt).unwrap();
+    fs::write(&seed_path, &manifest).unwrap();
     let refused = pipeline(
         "update",
         &pocket_only,
@@ -2617,7 +2661,7 @@ fn seed_unchanged(store: &Path, generation: &str) -> bool {
     store
         .join(format!("manifests/{generation}/ready.json"))
         .is_file()
-        && manifests == 2
+        && manifests == 1
 }
 
 // ----------------------------------------------------------------------------------------------
@@ -2636,7 +2680,8 @@ fn pipeline_schedule() {
         pocket_core(&f.pocket.url, "demo", BAR_GRANULARITY, 60, 1, 60),
     )
     .unwrap();
-    pipeline("bootstrap", &f.pipeline, &[]).unwrap();
+    import(&f.scratch.path("deriv-import.toml")).unwrap();
+    import(&f.scratch.path("pocket-import.toml")).unwrap();
 
     // One updater invocation under an injected clock pins its cutoff at that clock; an
     // interrupted acquisition keeps the cutoff on resume; a later invocation advances the

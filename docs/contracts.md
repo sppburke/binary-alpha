@@ -544,23 +544,28 @@ empty). Unknown fields are rejected in the document, Drive settings, and jobs. R
 - `id`: unique, nonempty ASCII (American Standard Code for Information Interchange) letters,
   digits, underscores, or hyphens.
 - `config`: the core configuration path relative to the pipeline document.
-- `intake_dir`: a path under `raw_sources/`, relative to `local_root`.
 - `evidence`: a readable non-secret source-binding evidence file relative to the pipeline
   document. It is a JSON document whose `source_identity` names the broker source identity
   (see [broker access](#broker-access)) the archive was collected under; other keys are
   free-form notes. Binding refuses a job whose configured broker has a different identity, and
   the file's bytes are hashed into the intent.
 
-All three job paths must be relative, without empty, `.`, or `..` segments. Each core
-configuration must use `run_mode = "research"`, exactly one import source selecting one
-instrument, and one matching history instrument with the same broker and ordinary role.
-The core `research` table is rejected; supply an existing declaration through the pipeline's
-`governance_manifest` instead. The pipeline requires tick history for Deriv and five-second bar
-history for Pocket Option, positive `overlap_seconds`, `max_pages`, and `max_elapsed_seconds`,
-and no `refresh_interval_seconds`. It replaces storage paths with `local_root/store` in an
-effective configuration, and supplies the bootstrapped seed and update cutoff without editing the
-operator's core file. Consumer-only configurations may omit jobs; bootstrap/update require them.
-List/restore need no broker credentials.
+Both job paths must be relative, without empty, `.`, or `..` segments. Each core
+configuration must use `run_mode = "research"` and declare exactly one history instrument with
+an ordinary role; any `import` table it carries is ignored by the pipeline. The core `research`
+table is rejected; supply an existing declaration through the pipeline's `governance_manifest`
+instead. The pipeline requires tick history for Deriv and five-second bar history for Pocket
+Option, positive `overlap_seconds`, `max_pages`, and `max_elapsed_seconds`, and no
+`refresh_interval_seconds`. It replaces storage paths with `local_root/store` in an effective
+configuration, and supplies the seed and update cutoff without editing the operator's core file.
+Consumer-only configurations may omit jobs; update requires them. List/restore need no broker
+credentials.
+
+The seed of a job is the newest imported dataset generation of its instrument in the managed
+store (by coverage end): a generation published there by `data import` with a source kind other
+than `broker_history`. Importing is therefore the only entry of raw data, and the raw archive
+may be deleted after import; the store is the one system-owned copy. An update with no imported
+generation fails before any credential is resolved.
 
 The `drive` table requires `root_folder_id` (nonempty, with no ASCII control characters, slash,
 or single quote), `chunk_bytes` (a positive unsigned 64-bit multiple of `262144`),
@@ -576,9 +581,9 @@ operator credentials. See [the example](../configs/data-pipeline.example.toml).
 
 ### Local state and commands
 
-The managed root separates `store/` (retained and published objects), `raw_sources/` (selected
-intake), and `pipeline_state/`. State and per-job state directories have mode `0700`.
-Bootstrap/update hold the nonblocking `pipeline_state/writer.lock` for the producer run;
+The managed root separates `store/` (retained and published objects, also the importer's
+retained folder and publication root) and `pipeline_state/`. State and per-job state directories
+have mode `0700`. Update holds the nonblocking `pipeline_state/writer.lock` for the producer run;
 list/restore do not take that lock. Use one writer host per archive root.
 
 Under `pipeline_state/`:
@@ -587,11 +592,10 @@ Under `pipeline_state/`:
   content-named records; `HASH32` is the first 32 hexadecimal digits of the record's SHA-256
   (Secure Hash Algorithm, 256-bit). Intents retain command/job, configuration hashes, evidence
   digest, and update cutoff/seed binding. Receipts retain status, generations, coverage, request
-  receipts, copied-file/byte counts, catalog receipt, and pending state.
+  receipts, catalog receipt, and pending state.
 - `records/JOB-catalog-DATASET16-STREAM16.json` records the catalog's `file_id`, `sha256`,
   and `bytes`; the generation prefixes are 16 hexadecimal digits.
-- `JOB/bootstrap.toml` and `JOB/update.toml` hold effective core configurations.
-  `JOB/bootstrap.json` holds the bootstrap binding, generations, source identity, and catalog.
+- `JOB/update.toml` holds the effective core configuration of the last update.
 - `JOB/progress.json` holds a pending intent name, effective configuration binding, and
   `progress` with `baseline`, `start`, `cutoff`, and retained `pages`. Pages are retained
   before this checkpoint advances; resumption decodes them and continues backward. A page whose
@@ -612,19 +616,17 @@ Mutable checkpoints use flushed atomic replacement. Completed records and store 
 create-once publication; different content at an existing key is a conflict.
 
 ```text
-binary-alpha data pipeline bootstrap --config PIPELINE
+binary-alpha data import --config CORE
 binary-alpha data pipeline update --config PIPELINE [--end END]
 binary-alpha data pipeline list --config PIPELINE --broker BROKER --symbol SYMBOL
 binary-alpha data pipeline restore --config PIPELINE --catalog FILE_ID --sha256 SHA256 --broker BROKER --symbol SYMBOL
 ```
 
-Bootstrap stages only selected files, imports, audits, verifies dataset and stream, and archives
-without broker contact. Identical intake files are reused; conflicting files are not replaced.
-An already local intake can be used in place. For copied bar collections, a separate
-`NAME.intake.json` projection uses selected relative asset paths and retains the original
-collection manifest as provenance.
+Import is the existing command (see [Historical datasets](#historical-datasets)) run with
+`storage.historical_data_dir` and a `file://` `storage.publication_uri` both naming
+`local_root/store`; it may import every instrument of an archive in one run.
 
-Update requires the bootstrap binding; `END` is `YYYY-MM-DDTHH:MM:SS[.ffffff]Z`. Each job
+Update requires an imported generation; `END` is `YYYY-MM-DDTHH:MM:SS[.ffffff]Z`. Each job
 acquires a bounded extension, audits and verifies its result, and archives it independently.
 A pending acquisition keeps its original cutoff, baseline, start, and pages on rerun, even after
 a partial snapshot was archived. A conflicting `--end` or effective configuration fails with the
@@ -636,7 +638,6 @@ provider shortfall closes acquisition; it does not certify complete historical c
 Producer output includes the existing import/fetch/audit lines and these pipeline lines:
 
 ```text
-pipeline bootstrap JOB INSTRUMENT dataset G stream S rows N copied F files B bytes catalog FILE_ID sha256 HASH
 pipeline update JOB INSTRUMENT cutoff END status STATUS requested START END verified START END shortfall REASON dataset G stream S catalog FILE_ID sha256 HASH
 pipeline job JOB failed: REASON
 ```

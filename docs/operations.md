@@ -164,11 +164,12 @@ change; source files, the retained copy, and published generations stay intact.
 
 Use [the pipeline example](../configs/data-pipeline.example.toml) and
 [the implemented contracts](contracts.md#data-pipeline) to prepare the non-secret pipeline
-document, sibling core configurations, selected source inventory, and source-binding evidence.
-Keep `local_root/store/` separate from `local_root/raw_sources/`. Use one writer host per
-Google Drive archive root and the same managed root for manual and timer producers.
-Bootstrap/update hold `pipeline_state/writer.lock`; a second producer fails immediately.
-Consumers do not acquire that lock.
+document, sibling core configurations, and source-binding evidence. The managed store under
+`local_root/store/` is the one system-owned copy of every dataset; raw archives enter it only
+through `data import` and may be deleted afterwards. Use one writer host per Google Drive
+archive root and the same managed root for manual and timer producers. Update holds
+`pipeline_state/writer.lock`; a second producer fails immediately. Consumers do not acquire that
+lock.
 
 ### Consent and credentials
 
@@ -190,18 +191,20 @@ relative to the pipeline file; use an absolute managed `local_root` for an insta
 Supply any known study declaration as `governance_manifest`; a pinned catalog never overrides
 its denial. The core job configuration must omit its `research` table.
 
-### Bootstrap, update, list, and restore
+### Import, update, list, and restore
 
-After authorization for the exact Drive action, run:
+Import every raw archive once with the existing importer, pointing both storage fields at the
+managed store, for example:
 
 ```text
-binary-alpha data pipeline bootstrap --config PIPELINE
+binary-alpha data import --config CORE
 ```
 
-Bootstrap stages selected originals without altering them, imports into the managed store, audits
-and verifies the dataset and stream, and archives their closure without broker contact. A copied
-bar collection keeps the original manifest and a separate selected intake projection. Confirm the
-bootstrap report and retain the immutable receipt and catalog identifier/digest.
+where `CORE` declares `[storage] historical_data_dir = "<local_root>/store"` and
+`publication_uri = "file://<local_root>/store"` with the `[[import.sources]]` inventory
+(a `tick_parquet_daily` root with every Deriv symbol directory, a `bar_parquet_collection`
+with its manifest for Pocket Option). Verify the generations (`data verify`), then delete the raw
+archive if a second copy is unwanted; no later command reads it.
 
 For each source, establish the broker/account class, selected instrument, seed provenance, and
 clock mapping from authorized evidence, and record the resulting broker source identity in the
@@ -219,8 +222,7 @@ binary-alpha data pipeline update --config PIPELINE [--end END]
 current time for each job. Rerun the same command to resume interruption: pending intent preserves
 its cutoff, baseline, start, and retained pages even if a partial snapshot was archived.
 A conflicting `--end` or effective core configuration fails with the pending intent identity.
-Page/time budgets may change on resume. Preserve `pipeline_state/`, intake, and the managed
-store; transfer sessions and pre-generated file identifiers reconcile interrupted uploads.
+Page/time budgets may change on resume. Preserve `pipeline_state/` and the managed store; transfer sessions and pre-generated file identifiers reconcile interrupted uploads.
 After acquisition closes, a later update can select a new cutoff.
 
 Read every job's report and receipt. `pending` leaves acquisition open, possibly with an archived
@@ -256,7 +258,7 @@ Real Drive acceptance evidence is not yet retained: it is unavailable, not passi
 of a zero-byte object upload against real Drive is unverified. Before enabling real operation,
 retain a finite source update and small archive/restore acceptance with the actual authorized
 credentials, root, source context, and cutoff. Report source acceptance separately from transfer
-correctness. The four synthetic `data_pipeline` gates cover selected intake/roundtrip, recovery,
+correctness. The four synthetic `data_pipeline` gates cover import/roundtrip, recovery,
 scope denial, and schedule/checkpoint behavior; they do not establish external acceptance.
 
 Timer installation is a later, separately authorized operator action. Install the executable at
