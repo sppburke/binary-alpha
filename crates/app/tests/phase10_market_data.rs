@@ -336,6 +336,108 @@ fn deriv_market_correlation_precision_duplicates_cancellation_and_reconnect() {
 }
 
 #[test]
+fn deriv_history_retries_rate_limits_and_retains_only_the_successful_page() {
+    let clock = FakeClock::default();
+    let successful = correlated(&fixture("deriv-history-R_50.json"), 3);
+    // Keep the scripted transport's receipt latency separate from the adapter's backoff clock.
+    let (connector, sent) = connector(
+        vec![vec![
+            deriv_history_error(1, "RateLimit"),
+            deriv_history_error(2, "RateLimit"),
+            Frame::Text(successful.clone()),
+        ]],
+        &FakeClock::default(),
+    );
+    let mut broker =
+        DerivMarketData::connect(&deriv_settings(), connector, Box::new(clock.clone())).unwrap();
+    let page = broker
+        .history_page(
+            &id("deriv", "R_50"),
+            scale(4),
+            Some(1_789_348_000_000_000),
+            NativeGranularity::Tick,
+        )
+        .unwrap();
+    let (_, rows) = broker
+        .decode_history(
+            &id("deriv", "R_50"),
+            &page.raw,
+            scale(4),
+            NativeGranularity::Tick,
+        )
+        .unwrap();
+    assert_eq!(rows.ticks().unwrap(), expected_rows("history", "R_50"));
+    assert_eq!(page.raw, successful.as_bytes());
+    assert_eq!(page.anchor_token.as_deref(), Some("1789348000"));
+    assert_eq!(clock.now_micros(), 3_000_000);
+    assert_eq!(page.receipt_micros, 3_000_000);
+    let requests = sent.lock().unwrap();
+    assert_eq!(requests.len(), 3);
+    for (index, request) in requests.iter().enumerate() {
+        let Frame::Text(request) = request else {
+            panic!("expected a history request");
+        };
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(request).unwrap(),
+            serde_json::json!({
+                "ticks_history": "R_50",
+                "style": "ticks",
+                "start": "1788743200",
+                "end": "1789348000",
+                "count": 1000,
+                "req_id": index + 1,
+            })
+        );
+    }
+}
+
+#[test]
+fn deriv_history_rate_limits_exhaust_the_page_waiting_budget() {
+    let clock = FakeClock::default();
+    let (connector, sent) = connector(
+        vec![
+            (1..=20)
+                .map(|req_id| deriv_history_error(req_id, "RateLimit"))
+                .collect(),
+        ],
+        &FakeClock::default(),
+    );
+    let mut broker =
+        DerivMarketData::connect(&deriv_settings(), connector, Box::new(clock.clone())).unwrap();
+    let error = broker
+        .history_page(
+            &id("deriv", "R_50"),
+            scale(4),
+            Some(1_789_348_000_000_000),
+            NativeGranularity::Tick,
+        )
+        .unwrap_err();
+    assert_eq!(error, "deriv history: RateLimit (retried for 120 s)");
+    assert_eq!(clock.now_micros(), 120_000_000);
+    // 1 + 2 + 4 + fourteen 8-second waits + the final 1-second remainder.
+    assert_eq!(sent.lock().unwrap().len(), 19);
+}
+
+fn deriv_history_error(req_id: u64, code: &str) -> Frame {
+    Frame::Text(
+        serde_json::json!({
+            "error": {"code": code, "message": "Synthetic history rejection"},
+            "msg_type": "history",
+            "echo_req": {
+                "ticks_history": "R_50",
+                "style": "ticks",
+                "start": "1788743200",
+                "end": "1789348000",
+                "count": 1000,
+                "req_id": req_id,
+            },
+            "req_id": req_id,
+        })
+        .to_string(),
+    )
+}
+
+#[test]
 fn deriv_rejects_malformed_missing_fields_wrong_types_and_wrong_request_ids() {
     let base = fixture("deriv-history-R_50.json");
     let mut missing: BTreeMap<String, Box<RawValue>> = serde_json::from_str(&base).unwrap();

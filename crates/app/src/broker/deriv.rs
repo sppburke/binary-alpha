@@ -518,6 +518,12 @@ impl MarketDataBroker for DerivMarketData {
         before_micros: Option<i64>,
         granularity: NativeGranularity,
     ) -> Result<HistoryPage, String> {
+        // Public ticks_history measurement (2026-09-16): "sustained aggregate throughput
+        // settles at roughly 4 to 5 pages per second across all connections" after RateLimit.
+        const INITIAL_BACKOFF_MICROS: i64 = 1_000_000;
+        const MAX_BACKOFF_MICROS: i64 = 8_000_000;
+        const BACKOFF_BUDGET_MICROS: i64 = 120_000_000;
+
         self.check_instrument(instrument)?;
         if granularity != NativeGranularity::Tick {
             return Err(format!(
@@ -533,22 +539,39 @@ impl MarketDataBroker for DerivMarketData {
                 .saturating_sub(HISTORY_WINDOW_SECONDS)
                 .to_string()
         });
-        let response = self
-            .connection
-            .request(RateGroup::Other, "history", |req_id| HistoryRequest {
-                ticks_history: instrument.provider_symbol.as_str(),
-                style: "ticks",
-                start,
-                end,
-                // The provider returns at most 1000 ticks per page (observed against the public
-                // endpoint on 2026-09-16; a request for 5000 returned 1000).
-                count: HISTORY_PAGE_TICKS,
-                req_id,
-            })?;
-        if let Some(error) = &response.header.error {
-            // Schema-level code only: rate limit, retention, or an invalid range.
-            return Err(format!("deriv history: {}", error.code));
-        }
+        let mut backoff_micros = INITIAL_BACKOFF_MICROS;
+        let mut waited_micros = 0;
+        let response = loop {
+            let (req_id, text) =
+                self.connection
+                    .prepare(RateGroup::Other, |req_id| HistoryRequest {
+                        ticks_history: instrument.provider_symbol.as_str(),
+                        style: "ticks",
+                        start: start.clone(),
+                        end: end.clone(),
+                        // The provider returns at most 1000 ticks per page (observed against the
+                        // public endpoint on 2026-09-16; a request for 5000 returned 1000).
+                        count: HISTORY_PAGE_TICKS,
+                        req_id,
+                    })?;
+            self.connection.transport.send(Frame::Text(text))?;
+            let response = self.connection.response(req_id, "history")?;
+            let Some(error) = &response.header.error else {
+                break response;
+            };
+            let reason = format!("deriv history: {}", error.code);
+            self.connection.last_rejection = Some(reason.clone());
+            if error.code != "RateLimit" {
+                return Err(reason);
+            }
+            if waited_micros == BACKOFF_BUDGET_MICROS {
+                return Err("deriv history: RateLimit (retried for 120 s)".into());
+            }
+            let wait_micros = backoff_micros.min(BACKOFF_BUDGET_MICROS - waited_micros);
+            self.connection.clock.sleep(wait_micros);
+            waited_micros += wait_micros;
+            backoff_micros = (backoff_micros * 2).min(MAX_BACKOFF_MICROS);
+        };
         let _ = scale;
         Ok(HistoryPage {
             raw: response.raw,
