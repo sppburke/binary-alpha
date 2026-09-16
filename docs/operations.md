@@ -230,7 +230,10 @@ current time for each job. Rerun the same command to resume interruption: pendin
 its cutoff, baseline, start, and retained pages even if a partial snapshot was archived.
 A conflicting `--end` or effective core configuration fails with the pending intent identity.
 Page/time budgets may change on resume. Preserve `pipeline_state/` and the managed store; transfer sessions and pre-generated file identifiers reconcile interrupted uploads.
-After acquisition closes, a later update can select a new cutoff.
+After acquisition closes, a later update can select a new cutoff. Set `parallel_jobs` in the
+pipeline document to work several instruments at once (one connection each); raise it gradually,
+because provider rate limits per connection and per application identifier are not published,
+and the measured single-connection rate on Deriv is about 1.3 pages of 1000 ticks per second.
 
 Read every job's report and receipt. `pending` leaves acquisition open, possibly with an archived
 partial snapshot. `archived_with_gaps` records a catalog with a primary shortfall other than

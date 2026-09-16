@@ -17,6 +17,8 @@ use std::path::Path;
 use std::time::Duration;
 
 /// Resumable upload chunks are multiples of 256 KiB.
+/// The largest identifier batch `files.generateIds` accepts.
+const GENERATE_IDS_LIMIT: usize = 1000;
 pub const CHUNK_UNIT: u64 = 256 * 1024;
 const GOOGLE_API: &str = "https://www.googleapis.com/drive/v3";
 const GOOGLE_UPLOAD: &str = "https://www.googleapis.com/upload/drive/v3";
@@ -297,20 +299,27 @@ impl Drive {
         }
     }
 
-    /// Pre-generates `count` file identifiers so a creation can be reconciled by identity.
+    /// Pre-generates `count` file identifiers so a creation can be reconciled by identity,
+    /// in requests of at most `GENERATE_IDS_LIMIT` (the service rejects larger ones with 400;
+    /// observed 2026-09-16 with a 1249-object closure).
     pub fn generate_ids(&mut self, count: usize) -> Result<Vec<String>, String> {
         let url = format!("{}/files/generateIds", self.api);
-        let query = [("count", count.to_string()), ("space", "drive".into())];
-        let reply = self.send("generateIds", &|client| client.get(&url).query(&query))?;
-        if reply.status != 200 {
-            return Err(format!("drive generateIds: status {}", reply.status));
+        let mut ids = Vec::with_capacity(count);
+        while ids.len() < count {
+            let batch = (count - ids.len()).min(GENERATE_IDS_LIMIT);
+            let query = [("count", batch.to_string()), ("space", "drive".into())];
+            let reply = self.send("generateIds", &|client| client.get(&url).query(&query))?;
+            if reply.status != 200 {
+                return Err(format!("drive generateIds: status {}", reply.status));
+            }
+            let generated: GeneratedIds = serde_json::from_slice(&reply.body)
+                .map_err(|_| "drive generateIds: malformed response")?;
+            if generated.ids.len() != batch {
+                return Err("drive generateIds: wrong identifier count".into());
+            }
+            ids.extend(generated.ids);
         }
-        let generated: GeneratedIds = serde_json::from_slice(&reply.body)
-            .map_err(|_| "drive generateIds: malformed response")?;
-        if generated.ids.len() != count {
-            return Err("drive generateIds: wrong identifier count".into());
-        }
-        Ok(generated.ids)
+        Ok(ids)
     }
 
     /// The archive root this transport writes beneath.

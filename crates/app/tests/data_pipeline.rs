@@ -600,6 +600,10 @@ fn handle_http(mut stream: TcpStream, state: &Arc<Mutex<DriveState>>, base: &str
     match (request.method.as_str(), request.path.as_str()) {
         ("GET", "/drive/v3/files/generateIds") => {
             let count: usize = request.query["count"].parse().unwrap();
+            if count > 1000 {
+                respond(&mut stream, 400, &[], b"{}");
+                return;
+            }
             let ids: Vec<String> = (0..count)
                 .map(|_| {
                     state.next += 1;
@@ -933,6 +937,9 @@ fn pipeline_toml(
     );
     if let Some(uri) = governance {
         text.push_str(&format!("governance_manifest = \"{uri}\"\n"));
+    }
+    if jobs.len() > 1 {
+        text.push_str("parallel_jobs = 2\n");
     }
     text.push_str(&format!(
         "\n[drive]\nroot_folder_id = \"fixture-root\"\nchunk_bytes = 262144\nrequest_timeout_seconds = 5\nmax_attempts = {max_attempts}\nloopback_endpoint = \"{drive_base}\"\n"
@@ -1938,6 +1945,35 @@ fn pipeline_recovery() {
         entry.bytes = bytes;
     }
 
+    // Identifier allocation above the service limit is batched: 1500 identifiers arrive unique
+    // through more than one request, and the fake refuses any single request over 1000.
+    {
+        let mut drive =
+            binary_alpha_app::drive::Drive::open(&binary_alpha_app::drive::DriveSettings {
+                root_folder_id: "fixture-root".into(),
+                credential: None,
+                chunk_bytes: 262_144,
+                request_timeout_seconds: 5,
+                max_attempts: 3,
+                loopback_endpoint: Some(f.drive.base.clone()),
+            })
+            .unwrap();
+        let log_before = f.drive.log().len();
+        let ids = drive.generate_ids(1_500).unwrap();
+        assert_eq!(ids.len(), 1_500);
+        assert_eq!(
+            ids.iter().collect::<std::collections::BTreeSet<_>>().len(),
+            1_500
+        );
+        assert!(
+            f.drive.log()[log_before..]
+                .iter()
+                .filter(|line| line.contains("generateIds"))
+                .count()
+                >= 2
+        );
+    }
+
     // Transport drop after one retained page: the run fails, the page and its request receipt
     // stay durable, and the resumed run (through one token refresh) closes at the same cutoff
     // carrying that receipt.
@@ -2726,6 +2762,26 @@ fn pipeline_scope() {
     )
     .unwrap();
 
+    // A zero worker count is refused when the document loads.
+    let zero = f.scratch.path("zero-workers.toml");
+    fs::write(
+        &zero,
+        pipeline_toml(
+            &producer,
+            &f.drive.base,
+            &[("pocket", "pocket.toml")],
+            None,
+            3,
+        )
+        .replace("local_root = ", "parallel_jobs = 0\nlocal_root = "),
+    )
+    .unwrap();
+    let refused = pipeline("update", &zero, &["--end", &end]).unwrap_err();
+    assert!(
+        refused.contains("parallel_jobs must be positive"),
+        "{refused}"
+    );
+
     // Hands-off credential renewal: with the referenced variable unset, the operator's command
     // supplies the session; when the provider rejects a session, the command runs once more and
     // the connection is retried; a failing command names itself without echoing any value.
@@ -2821,7 +2877,7 @@ fn pipeline_schedule() {
     )
     .unwrap();
     let mut out = Vec::new();
-    data_pipeline::update_with(&pocket_only, None, &mut clock, &mut out).unwrap_err();
+    data_pipeline::update_with(&pocket_only, None, &clock, &mut out).unwrap_err();
     let first = String::from_utf8(out).unwrap();
     assert_eq!(
         field(job_line(&first, "pocket"), "status"),
@@ -2834,7 +2890,7 @@ fn pipeline_schedule() {
     );
     binary_alpha_app::broker::Clock::sleep(&mut clock, 600 * 1_000_000);
     let mut out = Vec::new();
-    data_pipeline::update_with(&pocket_only, None, &mut clock, &mut out).unwrap_err();
+    data_pipeline::update_with(&pocket_only, None, &clock, &mut out).unwrap_err();
     let resumed = String::from_utf8(out).unwrap();
     assert_eq!(
         field(job_line(&resumed, "pocket"), "cutoff"),
@@ -2845,7 +2901,7 @@ fn pipeline_schedule() {
     data_pipeline::update_with(
         &pocket_only,
         Some(&time_text((cutoff + 5) * 1_000_000)),
-        &mut clock,
+        &clock,
         &mut out,
     )
     .unwrap_err();
@@ -2854,7 +2910,7 @@ fn pipeline_schedule() {
     let mut statuses = vec![];
     for _ in 0..8 {
         let mut out = Vec::new();
-        let result = data_pipeline::update_with(&pocket_only, None, &mut clock, &mut out);
+        let result = data_pipeline::update_with(&pocket_only, None, &clock, &mut out);
         let report = String::from_utf8(out).unwrap();
         statuses.push(field(job_line(&report, "pocket"), "status").to_string());
         if result.is_ok() {
@@ -2874,7 +2930,7 @@ fn pipeline_schedule() {
     )
     .unwrap();
     let mut out = Vec::new();
-    let result = data_pipeline::update_with(&pocket_only, None, &mut clock, &mut out);
+    let result = data_pipeline::update_with(&pocket_only, None, &clock, &mut out);
     let advanced = String::from_utf8(out).unwrap();
     result.unwrap_or_else(|error| panic!("{error}\n{advanced}"));
     assert_eq!(
@@ -2893,7 +2949,7 @@ fn pipeline_schedule() {
     binary_alpha_app::broker::Clock::sleep(&mut clock, 600 * 1_000_000);
     drop(f.deriv);
     let mut out = Vec::new();
-    let partial = data_pipeline::update_with(&f.pipeline, None, &mut clock, &mut out).unwrap_err();
+    let partial = data_pipeline::update_with(&f.pipeline, None, &clock, &mut out).unwrap_err();
     assert!(partial.contains("1 job(s) failed: deriv"), "{partial}");
     let report = String::from_utf8(out).unwrap();
     assert!(report.contains("pipeline job deriv failed"), "{report}");
@@ -2902,8 +2958,7 @@ fn pipeline_schedule() {
     // Local writer-lock contention: a second producer is refused while the lock is held.
     let lock = File::create(producer.join("pipeline_state/writer.lock")).unwrap();
     lock.try_lock().unwrap();
-    let held =
-        data_pipeline::update_with(&pocket_only, None, &mut clock, &mut Vec::new()).unwrap_err();
+    let held = data_pipeline::update_with(&pocket_only, None, &clock, &mut Vec::new()).unwrap_err();
     assert!(held.contains("another producer holds"), "{held}");
     drop(lock);
 

@@ -366,6 +366,11 @@ pub fn connect(config: &Config) -> Result<Adapter, String> {
 /// Runs the operator's credential command and returns the authentication object it printed,
 /// without letting the value into any diagnostic.
 pub fn renew_credential(command: &[String]) -> Result<String, String> {
+    // Parallel jobs of one broker renew one at a time; a browser login must not race itself.
+    static RENEWAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _serial = RENEWAL
+        .lock()
+        .map_err(|_| "credential_command: renewal lock poisoned")?;
     let (program, arguments) = command
         .split_first()
         .ok_or("credential_command must name a program")?;

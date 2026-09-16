@@ -57,6 +57,10 @@ pub struct PipelineConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub governance_manifest: Option<String>,
     pub drive: DriveSettings,
+    /// How many jobs one producer run works on at a time (default 1). Each job keeps its own
+    /// broker connection and Drive session; the writer lock still admits one producer process.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parallel_jobs: Option<u32>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub jobs: Vec<Job>,
 }
@@ -80,6 +84,9 @@ impl PipelineConfig {
     }
 
     fn validate(&self) -> Result<(), String> {
+        if self.parallel_jobs == Some(0) {
+            return Err("parallel_jobs must be positive".into());
+        }
         if self.schema_version != PIPELINE_SCHEMA_VERSION {
             return Err(format!(
                 "unsupported schema_version {}, expected {PIPELINE_SCHEMA_VERSION}",
@@ -798,30 +805,36 @@ fn load(config_path: &Path) -> Result<(PipelineConfig, Layout, String), String> 
 /// `data pipeline update`: extend every job's imported generation from its frontier to one
 /// pinned cutoff within its budget, then audit, verify, and archive the result.
 pub fn update(config_path: &Path, end: Option<&str>, out: &mut dyn Write) -> Result<(), String> {
-    update_with(config_path, end, &mut SystemClock, out)
+    update_with(config_path, end, &SystemClock, out)
 }
 
 /// `update` under an explicit clock: the cutoff and the invocation deadline come from it.
 pub fn update_with(
     config_path: &Path,
     end: Option<&str>,
-    clock: &mut dyn Clock,
+    clock: &dyn Clock,
     out: &mut dyn Write,
 ) -> Result<(), String> {
     let (config, layout, hash) = load(config_path)?;
     let end = end.map(time).transpose()?;
-    run_jobs(&config, &layout, out, |job, bound, drive, access, out| {
+    run_jobs(&config, &layout, out, &|job, bound, drive, access, out| {
         update_job(job, bound, &layout, &hash, drive, access, end, clock, out)
     })
 }
 
-/// Runs every job independently under the writer lock; one failed job never masks another
-/// and the command fails when any job did.
+/// One job's work: the bound job, its own Drive session, the access rule, and its report sink.
+type JobRun<'a> = dyn Fn(&Job, Bound, &mut Drive, Access<'_>, &mut dyn Write) -> Result<String, String>
+    + Sync
+    + 'a;
+
+/// Runs every job independently under the writer lock, up to `parallel_jobs` at a time, each
+/// with its own Drive session; one failed job never masks another, each job's report lines stay
+/// contiguous, and the command fails when any job did.
 fn run_jobs(
     config: &PipelineConfig,
     layout: &Layout,
     out: &mut dyn Write,
-    mut run: impl FnMut(&Job, Bound, &mut Drive, Access<'_>, &mut dyn Write) -> Result<String, String>,
+    run: &JobRun<'_>,
 ) -> Result<(), String> {
     if config.jobs.is_empty() {
         return Err("pipeline: the configuration declares no jobs".into());
@@ -832,28 +845,71 @@ fn run_jobs(
         declaration: declaration.as_ref(),
         certification: None,
     };
-    let mut drive = Drive::open(&config.drive)?;
-    let mut failures = Vec::new();
-    for job in &config.jobs {
-        let result = bind(job, layout).and_then(|bound| run(job, bound, &mut drive, access, out));
-        match result {
-            Ok(line) => writeln!(out, "{line}")
-                .and_then(|()| out.flush())
-                .map_err(|error| format!("cannot write the report: {error}"))?,
+    // Credentials and the archive root are checked once before any worker starts.
+    drop(Drive::open(&config.drive)?);
+    let workers = usize::try_from(config.parallel_jobs.unwrap_or(1))
+        .unwrap_or(1)
+        .min(config.jobs.len())
+        .max(1);
+    let queue = std::sync::Mutex::new(
+        config
+            .jobs
+            .iter()
+            .collect::<std::collections::VecDeque<_>>(),
+    );
+    let report = std::sync::Mutex::new((Vec::<u8>::new(), Vec::<usize>::new()));
+    let one = |job: &Job| -> Result<String, String> {
+        let mut drive = Drive::open(&config.drive)?;
+        let mut lines = Vec::new();
+        let result =
+            bind(job, layout).and_then(|bound| run(job, bound, &mut drive, access, &mut lines));
+        let mut report = report
+            .lock()
+            .map_err(|_| "pipeline: report lock poisoned")?;
+        report.0.extend_from_slice(&lines);
+        match &result {
+            Ok(line) => writeln!(report.0, "{line}").map_err(|error| error.to_string())?,
             Err(reason) => {
-                writeln!(out, "pipeline job {} failed: {reason}", job.id)
-                    .map_err(|error| format!("cannot write the report: {error}"))?;
-                failures.push(job.id.clone());
+                writeln!(report.0, "pipeline job {} failed: {reason}", job.id)
+                    .map_err(|error| error.to_string())?;
+                let index = config.jobs.iter().position(|known| known.id == job.id);
+                report.1.extend(index);
             }
         }
-    }
-    if failures.is_empty() {
+        result
+    };
+    std::thread::scope(|scope| {
+        for _ in 0..workers {
+            scope.spawn(|| {
+                loop {
+                    let job = match queue.lock() {
+                        Ok(mut queue) => queue.pop_front(),
+                        Err(_) => None,
+                    };
+                    let Some(job) = job else { break };
+                    let _ = one(job);
+                }
+            });
+        }
+    });
+    let (bytes, mut failed) = report
+        .into_inner()
+        .map_err(|_| "pipeline: report lock poisoned")?;
+    out.write_all(&bytes)
+        .and_then(|()| out.flush())
+        .map_err(|error| format!("cannot write the report: {error}"))?;
+    failed.sort_unstable();
+    if failed.is_empty() {
         Ok(())
     } else {
         Err(format!(
             "pipeline: {} job(s) failed: {}",
-            failures.len(),
-            failures.join(", ")
+            failed.len(),
+            failed
+                .iter()
+                .map(|index| config.jobs[*index].id.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
         ))
     }
 }
@@ -886,7 +942,7 @@ fn update_job(
     drive: &mut Drive,
     access: Access<'_>,
     end: Option<i64>,
-    clock: &mut dyn Clock,
+    clock: &dyn Clock,
     out: &mut dyn Write,
 ) -> Result<String, String> {
     let state = layout.job_state(&job.id)?;
@@ -996,7 +1052,7 @@ fn update_job(
         let mut bounds = Bounds {
             max_pages: history.max_pages,
             deadline_micros: Some(deadline),
-            clock: &*clock,
+            clock,
             declaration: access.declaration,
             resume: pending.map(|pending| pending.progress),
             persist: Some(&mut persist),
