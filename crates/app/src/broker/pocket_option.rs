@@ -16,6 +16,13 @@ use serde_json::value::RawValue;
 use std::collections::{BTreeMap, VecDeque};
 use std::hash::{DefaultHasher, Hash, Hasher};
 
+/// The request index travels as a JSON number and comes back through the provider's
+/// JavaScript runtime, which represents integers exactly only below 2^53. Observed on the
+/// real endpoint (2026-09-16): a seed above that range was echoed inexactly, so every
+/// response looked foreign and the page timed out. The seed stays below 2^52, leaving 2^52
+/// increments of headroom.
+const HISTORY_INDEX_SEED_BITS: u32 = 52;
+
 fn history_index_seed(now_micros: i64) -> u64 {
     let mut hasher = DefaultHasher::new();
     (
@@ -24,7 +31,7 @@ fn history_index_seed(now_micros: i64) -> u64 {
         format!("{:?}", std::thread::current().id()),
     )
         .hash(&mut hasher);
-    hasher.finish() & i64::MAX as u64
+    hasher.finish() & ((1u64 << HISTORY_INDEX_SEED_BITS) - 1)
 }
 
 /// Converts the declared provider clock directly to universal integer microseconds.
@@ -908,5 +915,16 @@ impl MarketDataBroker for PocketMarketData {
     }
     fn continuity(&self) -> &Continuity {
         &self.continuity
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn history_index_seed_is_an_exact_javascript_integer() {
+        for now in [0, 1_789_593_000_000_000, i64::MAX] {
+            let seed = super::history_index_seed(now);
+            assert!(seed < (1u64 << 53) - (1u64 << 52), "{seed}");
+        }
     }
 }
