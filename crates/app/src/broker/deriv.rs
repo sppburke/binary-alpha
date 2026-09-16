@@ -5,6 +5,13 @@ pub use options::{
     to_observation,
 };
 
+/// The largest tick page the provider serves; the last that many ticks at or before the page
+/// anchor within its window.
+const HISTORY_PAGE_TICKS: u32 = 1000;
+/// The explicit window a backward page names before its anchor: without `start`, the provider
+/// ignores an `end` older than the current session and answers with the latest ticks.
+const HISTORY_WINDOW_SECONDS: i64 = 7 * 86_400;
+
 use super::transport::{Connector, Frame, Http, Transport};
 use super::wire::WireDecimal;
 use super::{
@@ -215,7 +222,9 @@ impl DerivConnection {
                 .receive(remaining)?
                 .ok_or_else(|| format!("deriv {expected}: response timeout"))?;
             if response.header.req_id == Some(id) {
-                if response.header.msg_type != expected {
+                // A provider error echoes the request under its own message type; the caller
+                // owns its meaning (a rejected purchase is an outcome, a history error a fault).
+                if response.header.msg_type != expected && response.header.error.is_none() {
                     return Err(format!("deriv {expected}: unexpected msg_type field"));
                 }
                 return Ok(response);
@@ -302,6 +311,10 @@ struct Contracts {
 struct HistoryRequest<'a> {
     ticks_history: &'a str,
     style: &'static str,
+    /// The provider serves an `end` older than the current session only inside an explicit
+    /// window; a page therefore names the week before its anchor as its start.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    start: Option<String>,
     end: String,
     count: u32,
     req_id: u64,
@@ -515,16 +528,27 @@ impl MarketDataBroker for DerivMarketData {
             || "latest".to_string(),
             |t| t.div_euclid(1_000_000).to_string(),
         );
+        let start = before_micros.map(|t| {
+            t.div_euclid(1_000_000)
+                .saturating_sub(HISTORY_WINDOW_SECONDS)
+                .to_string()
+        });
         let response = self
             .connection
             .request(RateGroup::Other, "history", |req_id| HistoryRequest {
                 ticks_history: instrument.provider_symbol.as_str(),
                 style: "ticks",
+                start,
                 end,
-                // ticks_history_request.schema.json:20-24 declares no maximum; the retained request used 100.
-                count: 100,
+                // The provider returns at most 1000 ticks per page (observed against the public
+                // endpoint on 2026-09-16; a request for 5000 returned 1000).
+                count: HISTORY_PAGE_TICKS,
                 req_id,
             })?;
+        if let Some(error) = &response.header.error {
+            // Schema-level code only: rate limit, retention, or an invalid range.
+            return Err(format!("deriv history: {}", error.code));
+        }
         let _ = scale;
         Ok(HistoryPage {
             raw: response.raw,

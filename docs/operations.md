@@ -21,7 +21,12 @@ Application Default Credentials and the configuration names only the bucket and 
 proprietary source data, locked holdout, completed evidence, and production cloud state are protected
 state. Broker `credential` fields name process environment variables. Deriv resolves a bearer token;
 Pocket Option resolves the complete opaque JSON authentication object. Keep values out of
-configuration, logs and evidence. Credential renewal is an operator action.
+configuration, logs and evidence. Credential renewal is an operator action, performed either by
+hand or by the operator's own renewal program named in the broker's `credential_command`; the
+application runs that program when the variable is unset and once more after a rejected session,
+and never contains a browser or login path itself. A Pocket Option renewal program that logs in
+with an account login and password from the environment and prints the session object is the
+operator's, kept outside this repository together with those values.
 
 For Google Drive, `drive.credential` names a process environment variable holding user OAuth
 (Open Authorization) refresh credentials as a JavaScript Object Notation (JSON) object with string
@@ -207,7 +212,9 @@ with its manifest for Pocket Option). Verify the generations (`data verify`), th
 archive if a second copy is unwanted; no later command reads it.
 
 For each source, establish the broker/account class, selected instrument, seed provenance, and
-clock mapping from authorized evidence, and record the resulting broker source identity in the
+clock mapping from authorized evidence (the production Pocket Option endpoint closes the
+namespace immediately unless the broker entry sets `origin = "https://pocketoption.com"`, observed
+2026-09-16), and record the resulting broker source identity in the
 job's evidence file (`{"source_identity": "…"}` plus notes); binding refuses a configured broker
 whose identity differs, and the refusal names both identities. A Pocket archive from a different
 account/source context must not be relabeled to match a demo endpoint. Configure Deriv tick history and Pocket

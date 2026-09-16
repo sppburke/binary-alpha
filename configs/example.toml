@@ -43,6 +43,7 @@ app_id = "APPLICATION-IDENTIFIER"
 id = "pocket_option"
 kind = "pocket_option"
 endpoint = "wss://demo-api-eu.po.market/socket.io/?EIO=4&transport=websocket"
+origin = "https://pocketoption.com"
 credential = "BINARY_ALPHA_POCKET_AUTH"
 account_class = "demo"
 server_offset_minutes = 120

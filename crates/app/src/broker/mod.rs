@@ -315,11 +315,11 @@ pub fn connect(config: &Config) -> Result<Adapter, String> {
         .iter()
         .find(|broker| broker.id() == &history.broker)
         .ok_or("history: broker is not declared")?;
-    let connector = Box::new(transport::WebSocketConnector::new()?);
-    let clock = Box::new(SystemClock);
     match settings {
         Broker::Deriv(settings) => Ok(Adapter::Deriv(deriv::DerivMarketData::connect(
-            settings, connector, clock,
+            settings,
+            Box::new(transport::WebSocketConnector::new()?),
+            Box::new(SystemClock),
         )?)),
         Broker::PocketOption(settings) => {
             let instruments = history
@@ -330,17 +330,63 @@ pub fn connect(config: &Config) -> Result<Adapter, String> {
                     provider_symbol: symbol.clone(),
                 })
                 .collect::<Vec<_>>();
-            Ok(Adapter::PocketOption(
+            let attempt = |credential: String| {
                 pocket_option::PocketMarketData::connect(
                     settings,
                     &instruments,
-                    connector,
-                    clock,
-                    resolve_secret(&settings.credential)?,
-                )?,
-            ))
+                    Box::new(transport::WebSocketConnector::new()?),
+                    Box::new(SystemClock),
+                    credential,
+                )
+            };
+            let credential = match resolve_secret(&settings.credential) {
+                Ok(credential) => credential,
+                Err(reason) => match &settings.credential_command {
+                    Some(command) => renew_credential(command)?,
+                    None => return Err(reason),
+                },
+            };
+            match attempt(credential) {
+                Ok(adapter) => Ok(Adapter::PocketOption(adapter)),
+                // A rejected or stale session is renewed once through the operator's command;
+                // any other failure of the fresh session is reported as is.
+                Err(reason) => match &settings.credential_command {
+                    Some(command) => attempt(renew_credential(command)?)
+                        .map(Adapter::PocketOption)
+                        .map_err(|renewed| {
+                            format!("{renewed} (after credential renewal; first attempt: {reason})")
+                        }),
+                    None => Err(reason),
+                },
+            }
         }
     }
+}
+
+/// Runs the operator's credential command and returns the authentication object it printed,
+/// without letting the value into any diagnostic.
+pub fn renew_credential(command: &[String]) -> Result<String, String> {
+    let (program, arguments) = command
+        .split_first()
+        .ok_or("credential_command must name a program")?;
+    let output = std::process::Command::new(program)
+        .args(arguments)
+        .stdin(std::process::Stdio::null())
+        .output()
+        .map_err(|error| format!("credential_command {program}: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "credential_command {program}: exited with {}",
+            output.status
+        ));
+    }
+    let credential = String::from_utf8(output.stdout)
+        .map_err(|_| format!("credential_command {program}: output is not UTF-8"))?;
+    let credential = credential.trim().to_string();
+    if credential.is_empty() {
+        return Err(format!("credential_command {program}: printed nothing"));
+    }
+    Ok(credential)
 }
 
 /// The configured account identity; provider login identifiers stay inside the adapter.

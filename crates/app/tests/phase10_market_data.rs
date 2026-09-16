@@ -102,6 +102,7 @@ fn pocket_settings() -> PocketSettings {
         endpoint: "ws://127.0.0.1/socket.io/?EIO=4&transport=websocket".into(),
         origin: Some("https://example.invalid".into()),
         credential: "PHASE10_SYNTHETIC_AUTH".into(),
+        credential_command: None,
         account_class: binary_alpha_engine::config::AccountClass::Demo,
         server_offset_minutes: 120,
     }
@@ -331,7 +332,7 @@ fn deriv_market_correlation_precision_duplicates_cancellation_and_reconnect() {
     consumer.reconnect().unwrap();
     consumer.accept(&row).unwrap();
     let requests = sent.lock().unwrap();
-    assert!(requests.iter().any(|f| matches!(f, Frame::Text(t) if t.contains("\"count\":100") && t.contains("\"end\":\"latest\""))));
+    assert!(requests.iter().any(|f| matches!(f, Frame::Text(t) if t.contains("\"count\":1000") && t.contains("\"end\":\"latest\""))));
 }
 
 #[test]
@@ -1500,7 +1501,7 @@ fn serve_broker(kind: &'static str) -> (String, std::thread::JoinHandle<()>) {
                             let count: u32 = field(&fields, "count");
                             let end: String = field(&fields, "end");
                             assert_eq!(style, "ticks");
-                            assert_eq!(count, 100);
+                            assert_eq!(count, 1000);
                             replies
                                 .push(Frame::Text(deriv_history_response(&symbol, &end, req_id)));
                         } else if fields.contains_key("ticks") {

@@ -25,6 +25,14 @@ pub fn decode(text: &str) -> Result<Packet, String> {
     if text.starts_with("40") {
         return Ok(Packet::Connected);
     }
+    if text.starts_with("41") {
+        // Observed against the real endpoint on 2026-09-16: sent immediately after the connect
+        // acknowledgement when the request carried no `Origin` header.
+        return Err(
+            "socket.io: the server disconnected the namespace (an `origin` setting is usually required)"
+                .into(),
+        );
+    }
     let (body, binary) = if let Some(body) = text.strip_prefix("451-") {
         (body, true)
     } else if let Some(body) = text.strip_prefix("42") {

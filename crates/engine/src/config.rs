@@ -443,6 +443,11 @@ pub struct PocketSettings {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub origin: Option<String>,
     pub credential: String,
+    /// A program and its arguments that print a fresh authentication object to standard
+    /// output; run when the referenced variable is unset and again, once, after the provider
+    /// rejects a session. The program is operator tooling outside this repository.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credential_command: Option<Vec<String>>,
     pub account_class: AccountClass,
     pub server_offset_minutes: i32,
 }
@@ -519,6 +524,11 @@ impl Broker {
                 }
             }
             Self::PocketOption(settings) => {
+                if let Some(command) = &settings.credential_command
+                    && command.first().is_none_or(String::is_empty)
+                {
+                    return Err("credential_command must name a program".into());
+                }
                 if settings.origin.as_ref().is_some_and(|origin| {
                     origin.is_empty() || origin.bytes().any(|b| b.is_ascii_control())
                 }) {

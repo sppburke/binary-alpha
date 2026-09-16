@@ -132,7 +132,12 @@ contains `public_endpoint`, `bootstrap_endpoint`, `app_id`, optional `credential
 `budgets` contains `trade`, `account`, `portfolio`, and `other`, each with positive `per_minute`
 and `per_hour` no greater than the limits in [Broker access](#broker-access); absence uses those
 limits. A Pocket Option entry instead contains `endpoint`, optional `origin`, required
-`credential`, `account_class` (`demo` or `real`), and `server_offset_minutes` (no default).
+`credential`, `account_class` (`demo` or `real`), `server_offset_minutes` (no default), and
+optional `credential_command` (a program and its arguments, first element nonempty). The
+program prints a fresh authentication object to standard output; the application runs it when
+the referenced variable is unset and once more after a first connection fails, then retries the
+connection with the printed object. The program is operator tooling outside this repository and
+its output never enters a diagnostic.
 Credentials are environment-variable names, never their values.
 
 `history` declares `broker`, a nonempty unique list of provider-symbol `instruments`, `role`

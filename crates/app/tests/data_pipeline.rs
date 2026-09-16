@@ -9,6 +9,7 @@ use std::collections::BTreeMap;
 use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -100,6 +101,8 @@ struct BrokerFaults {
     wrong_index: bool,
     wrong_period: bool,
     off_second: bool,
+    /// Reject the next authentication as a stale session, once.
+    reject_auth_once: bool,
 }
 
 struct FakeBroker {
@@ -262,6 +265,10 @@ fn serve_broker(kind: Kind) -> FakeBroker {
                                 panic!("unexpected client framing: {text}")
                             };
                             match name.as_str() {
+                                "auth" if faults.reject_auth_once => {
+                                    faults_.lock().unwrap().reject_auth_once = false;
+                                    replies.push(Message::Text(r#"42["error","synthetic session rejected"]"#.into()));
+                                }
                                 "auth" => {
                                     authenticated = true;
                                     replies.push(Message::Text(r#"42["successauth",{"synthetic":true}]"#.into()));
@@ -2654,6 +2661,55 @@ fn pipeline_scope() {
         ],
     )
     .unwrap();
+
+    // Hands-off credential renewal: with the referenced variable unset, the operator's command
+    // supplies the session; when the provider rejects a session, the command runs once more and
+    // the connection is retried; a failing command names itself without echoing any value.
+    let marker = f.scratch.path("renewals.log");
+    let renew = f.scratch.path("renew.sh");
+    fs::write(
+        &renew,
+        format!(
+            "#!/bin/sh\necho renewed >> {}\nprintf '%s' '{{\"synthetic\":true}}'\n",
+            marker.display()
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&renew, fs::Permissions::from_mode(0o700)).unwrap();
+    let renewing = pocket_core(&f.pocket.url, "demo", BAR_GRANULARITY, 60, 50, 60).replace(
+        "credential = \"PIPELINE_SYNTHETIC_AUTH\"",
+        &format!(
+            "credential = \"PIPELINE_UNSET_AUTH\"\ncredential_command = [\"{}\"]",
+            renew.display()
+        ),
+    );
+    assert!(renewing.contains("credential_command"));
+    write_pocket(renewing.clone());
+    f.pocket.set(BrokerFaults {
+        reject_auth_once: true,
+        ..Default::default()
+    });
+    let renewed_end = time_text((POCKET_SEED_END + 900) * 1_000_000);
+    let renewed = pipeline("update", &pocket_only, &["--end", &renewed_end]).unwrap();
+    assert_eq!(
+        field(job_line(&renewed, "pocket"), "status"),
+        "archived",
+        "{renewed}"
+    );
+    assert_eq!(fs::read_to_string(&marker).unwrap().lines().count(), 2);
+    assert!(!renewed.contains("synthetic\":true"), "{renewed}");
+    f.pocket.set(BrokerFaults::default());
+    fs::write(&renew, "#!/bin/sh\nexit 3\n").unwrap();
+    let refused = pipeline(
+        "update",
+        &pocket_only,
+        &["--end", &time_text((POCKET_SEED_END + 1_200) * 1_000_000)],
+    )
+    .unwrap_err();
+    assert!(
+        refused.contains("credential_command") && refused.contains("exited"),
+        "{refused}"
+    );
 }
 
 fn seed_unchanged(store: &Path, generation: &str) -> bool {
