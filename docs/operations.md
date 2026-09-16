@@ -241,8 +241,16 @@ without a catalog and exits successfully. Neither exit 0 nor an archive status e
 complete market coverage. Exit 1 means an operation failed or at least one job remained pending
 or had the reported gaps; another job's successful archive remains usable.
 
-List catalog metadata for an exact broker and provider symbol, then restore a chosen identifier
-and SHA-256 (Secure Hash Algorithm, 256-bit) digest into a consumer configuration:
+A consumer host (for example a cloud GPU machine that cloned the repository) pulls the newest
+archived generation of each instrument it needs; the command restores only when the generation is
+not already local, so it is safe to run before every research stage:
+
+```text
+binary-alpha data pipeline pull --config CONSUMER --broker BROKER --symbol SYMBOL
+```
+
+To inspect or pin an older snapshot, list catalog metadata for the broker and provider symbol,
+then restore a chosen identifier and SHA-256 (Secure Hash Algorithm, 256-bit) digest:
 
 ```text
 binary-alpha data pipeline list --config PIPELINE --broker BROKER --symbol SYMBOL

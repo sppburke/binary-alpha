@@ -272,6 +272,16 @@ enum PipelineCommand {
         #[arg(long)]
         end: Option<String>,
     },
+    /// Select the newest archived catalog of one instrument and restore it unless it is already
+    /// in this document's managed store; print the local ready-manifest locations.
+    Pull {
+        #[arg(long)]
+        config: PathBuf,
+        #[arg(long)]
+        broker: String,
+        #[arg(long)]
+        symbol: String,
+    },
     /// List every archived catalog of one instrument.
     List {
         #[arg(long)]
@@ -351,6 +361,11 @@ fn main() -> ExitCode {
             PipelineCommand::Update { config, end } => {
                 data_pipeline::update(&config, end.as_deref(), &mut std::io::stdout().lock())
             }
+            PipelineCommand::Pull {
+                config,
+                broker,
+                symbol,
+            } => data_pipeline::pull(&config, &broker, &symbol, &mut std::io::stdout().lock()),
             PipelineCommand::List {
                 config,
                 broker,

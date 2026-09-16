@@ -624,6 +624,7 @@ create-once publication; different content at an existing key is a conflict.
 binary-alpha data import --config CORE
 binary-alpha data pipeline update --config PIPELINE [--end END]
 binary-alpha data pipeline list --config PIPELINE --broker BROKER --symbol SYMBOL
+binary-alpha data pipeline pull --config PIPELINE --broker BROKER --symbol SYMBOL
 binary-alpha data pipeline restore --config PIPELINE --catalog FILE_ID --sha256 SHA256 --broker BROKER --symbol SYMBOL
 ```
 
@@ -709,6 +710,13 @@ catalog FILE_ID sha256 HASH INSTRUMENT ROLE NATIVE dataset G stream S coverage F
 
 `NATIVE` is `tick` or `5-second bar`; bytes sum unique catalog objects and both ready
 manifests, excluding the catalog itself.
+
+Pull is the consumer's one step: it enumerates the instrument's catalogs exactly as `list` does,
+selects the newest by coverage end (then by dataset generation), and, unless both of its ready
+manifests already exist in this configuration's managed store, restores it exactly as `restore`
+would with that catalog's identifier and digest. It prints the `restored …` line, or
+`pulled INSTRUMENT ROLE dataset URI stream URI catalog FILE_ID (already local)` when nothing was
+fetched. It fails when the archive holds no catalog for the instrument.
 
 Restore pins one catalog file identifier and expected SHA-256, checks broker/symbol assertions,
 and uses that catalog's finite set of manifests and objects as its allowset. A supplied

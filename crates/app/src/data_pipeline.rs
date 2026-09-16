@@ -1111,32 +1111,8 @@ pub fn list(
 ) -> Result<(), String> {
     let (config, layout, _) = load(config_path)?;
     let mut drive = Drive::open(&config.drive)?;
-    let scratch = layout.state.join("downloads");
     let mut lines = Vec::new();
-    for file in drive.list(CATALOG_PREFIX)? {
-        let (Some(size), Some(sha256)) = (file.size, file.sha256.as_deref()) else {
-            return Err(format!(
-                "drive: catalog {} reports no size or checksum",
-                file.id
-            ));
-        };
-        let partial = scratch.join(format!("{}.catalog", file.id));
-        drive.download(
-            &file.id,
-            &partial,
-            &ObjectIdentity {
-                bytes: size,
-                sha256: sha256.to_ascii_lowercase(),
-                crc32c: 0,
-            },
-        )?;
-        let bytes = fs::read(&partial).map_err(|error| error.to_string())?;
-        fs::remove_file(&partial).map_err(|error| error.to_string())?;
-        let catalog =
-            Catalog::from_json(&bytes).map_err(|error| format!("{}: {error}", file.id))?;
-        if catalog.broker != broker || catalog.provider_symbol != symbol {
-            continue;
-        }
+    for (file_id, sha256, catalog) in catalogs(&mut drive, &layout, broker, symbol)? {
         let transfer: u64 = catalog
             .objects
             .iter()
@@ -1145,9 +1121,7 @@ pub fn list(
             + catalog.dataset.bytes
             + catalog.stream.bytes;
         lines.push(format!(
-            "catalog {} sha256 {} {} {} {} dataset {} stream {} coverage {} {} rows {} bytes {transfer}",
-            file.id,
-            sha256.to_ascii_lowercase(),
+            "catalog {file_id} sha256 {sha256} {} {} {} dataset {} stream {} coverage {} {} rows {} bytes {transfer}",
             catalog.instrument,
             catalog.role,
             catalog.native_granularity,
@@ -1163,6 +1137,81 @@ pub fn list(
         writeln!(out, "{line}").map_err(|error| format!("cannot write the report: {error}"))?;
     }
     Ok(())
+}
+
+/// Every archived catalog of one instrument: the archive-root listing followed to completion,
+/// each catalog downloaded and validated against its reported size and checksum.
+fn catalogs(
+    drive: &mut Drive,
+    layout: &Layout,
+    broker: &str,
+    symbol: &str,
+) -> Result<Vec<(String, String, Catalog)>, String> {
+    let scratch = layout.state.join("downloads");
+    let mut found = Vec::new();
+    for file in drive.list(CATALOG_PREFIX)? {
+        let (Some(size), Some(sha256)) = (file.size, file.sha256.as_deref()) else {
+            return Err(format!(
+                "drive: catalog {} reports no size or checksum",
+                file.id
+            ));
+        };
+        let sha256 = sha256.to_ascii_lowercase();
+        let partial = scratch.join(format!("{}.catalog", file.id));
+        drive.download(
+            &file.id,
+            &partial,
+            &ObjectIdentity {
+                bytes: size,
+                sha256: sha256.clone(),
+                crc32c: 0,
+            },
+        )?;
+        let bytes = fs::read(&partial).map_err(|error| error.to_string())?;
+        fs::remove_file(&partial).map_err(|error| error.to_string())?;
+        let catalog =
+            Catalog::from_json(&bytes).map_err(|error| format!("{}: {error}", file.id))?;
+        if catalog.broker == broker && catalog.provider_symbol == symbol {
+            found.push((file.id, sha256, catalog));
+        }
+    }
+    Ok(found)
+}
+
+/// `data pipeline pull`: the consumer's one step. Select the newest archived catalog of one
+/// instrument (latest coverage end, then generation), restore it unless both of its manifests
+/// are already in this configuration's managed store, and print their local locations.
+pub fn pull(
+    config_path: &Path,
+    broker: &str,
+    symbol: &str,
+    out: &mut dyn Write,
+) -> Result<(), String> {
+    let (config, layout, _) = load(config_path)?;
+    let mut drive = Drive::open(&config.drive)?;
+    let mut found = catalogs(&mut drive, &layout, broker, symbol)?;
+    found.sort_by(|a, b| {
+        (&a.2.coverage.last_event_time, &a.2.dataset.generation)
+            .cmp(&(&b.2.coverage.last_event_time, &b.2.dataset.generation))
+    });
+    let Some((file_id, sha256, catalog)) = found.pop() else {
+        return Err(format!("drive: no archived catalog for {broker}:{symbol}"));
+    };
+    let local = layout.store();
+    if local.head(&catalog.dataset.key)?.is_some() && local.head(&catalog.stream.key)?.is_some() {
+        writeln!(
+            out,
+            "pulled {} {} dataset {} stream {} catalog {file_id} (already local)",
+            catalog.instrument,
+            catalog.role,
+            local.uri(&catalog.dataset.key),
+            local.uri(&catalog.stream.key)
+        )
+        .map_err(|error| format!("cannot write the report: {error}"))?;
+        return Ok(());
+    }
+    drop(drive);
+    restore(config_path, &file_id, &sha256, broker, symbol, out)
 }
 
 /// `data pipeline restore`: install exactly one catalog's dataset and stream closure into this

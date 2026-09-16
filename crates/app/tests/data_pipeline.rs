@@ -1613,6 +1613,70 @@ outputs = ["candle_direction", "range_bps"]
             .unwrap()
             .starts_with("verified")
     );
+
+    // The consumer's one step: `pull` selects the newest archived catalog of the instrument,
+    // restores it into a fresh store, and a second pull reuses it without any object download.
+    let listing = pipeline(
+        "list",
+        &f.pipeline,
+        &["--broker", "pocket_option", "--symbol", "AEDCNY_otc"],
+    )
+    .unwrap();
+    let newest = listing
+        .lines()
+        .max_by_key(|line| {
+            line.split(" coverage ")
+                .nth(1)
+                .unwrap()
+                .split(' ')
+                .nth(1)
+                .unwrap()
+                .to_string()
+        })
+        .unwrap();
+    let newest_dataset = field(newest, "dataset").to_string();
+    let puller_root = f.scratch.path("puller");
+    let puller = f.scratch.path("puller.toml");
+    fs::write(
+        &puller,
+        pipeline_toml(&puller_root, &f.drive.base, &[], None, 3),
+    )
+    .unwrap();
+    let pulled = pipeline(
+        "pull",
+        &puller,
+        &["--broker", "pocket_option", "--symbol", "AEDCNY_otc"],
+    )
+    .unwrap();
+    assert!(
+        pulled.starts_with("restored pocket_option:AEDCNY_otc"),
+        "{pulled}"
+    );
+    assert!(
+        field(&pulled, "dataset").contains(&newest_dataset),
+        "{pulled}\n{listing}"
+    );
+    let log_before = f.drive.log().len();
+    let again = pipeline(
+        "pull",
+        &puller,
+        &["--broker", "pocket_option", "--symbol", "AEDCNY_otc"],
+    )
+    .unwrap();
+    assert!(again.contains("(already local)"), "{again}");
+    assert!(
+        !f.drive.log()[log_before..]
+            .iter()
+            .any(|line| line.starts_with("GET /drive/v3/files/fixture-id")
+                && line.contains("alt=media")),
+        "objects fetched again: {:?}",
+        &f.drive.log()[log_before..]
+    );
+    assert!(
+        run(&["data", "verify", "--manifest", field(&pulled, "dataset")])
+            .unwrap()
+            .starts_with("verified")
+    );
 }
 
 // ----------------------------------------------------------------------------------------------
