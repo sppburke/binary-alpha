@@ -513,10 +513,13 @@ impl Drive {
                     format!("bytes {offset}-{}/{total}", offset + length - 1)
                 };
                 let body = chunk[..length as usize].to_vec();
+                // The client omits `Content-Length` for an empty body, and the real service
+                // answers `411 Length Required` (observed 2026-09-16), so it is set explicitly.
                 let reply = self.send("upload", &|client| {
                     client
                         .put(&uri)
                         .header("Content-Range", &range)
+                        .header("Content-Length", length.to_string())
                         .body(body.clone())
                 })?;
                 match reply.status {

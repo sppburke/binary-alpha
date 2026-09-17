@@ -652,6 +652,15 @@ fn handle_http(
         respond(&mut stream, 401, &[], b"{}");
         return;
     }
+    // The real service refuses a PUT without `Content-Length` with `411 Length Required`
+    // (observed 2026-09-16 on an empty object), even when `Content-Range` says `bytes */0`.
+    if request.method == "PUT"
+        && request.path.starts_with("/upload/session/")
+        && !request.headers.contains_key("content-length")
+    {
+        respond(&mut stream, 411, &[], b"Length Required");
+        return;
+    }
     let content_upload = request.method == "PUT"
         && request.path.starts_with("/upload/session/")
         && !request.body.is_empty();
