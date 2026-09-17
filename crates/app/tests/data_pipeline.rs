@@ -408,6 +408,9 @@ struct DriveFaults {
     /// Answer the next N object upload/download requests with the given 403 reason.
     forbidden_uploads: Option<(&'static str, usize)>,
     forbidden_downloads: Option<(&'static str, usize)>,
+    forbidden_begins: Option<(&'static str, usize)>,
+    /// Permanently reject status queries of this recorded session path with a 403 reason.
+    forbidden_session_status: Option<(String, &'static str)>,
     /// Hold the first upload until another job's report has been flushed.
     upload_gate: Option<Arc<Mutex<std::sync::mpsc::Receiver<()>>>>,
     /// Drop the next N object media requests before replying; usize::MAX never clears.
@@ -695,6 +698,8 @@ fn handle_http(
         &mut state.faults.forbidden_uploads
     } else if media_download {
         &mut state.faults.forbidden_downloads
+    } else if request.method == "POST" && request.path == "/upload/drive/v3/files" {
+        &mut state.faults.forbidden_begins
     } else {
         &mut None
     };
@@ -801,6 +806,19 @@ fn handle_http(
                 .get("content-range")
                 .cloned()
                 .unwrap_or_default();
+            if range.starts_with("bytes */")
+                && let Some((session_path, reason)) = &faults.forbidden_session_status
+                && session_path == path
+            {
+                let body = json!({ "error": {
+                    "code": 403,
+                    "message": "User rate limit exceeded.",
+                    "errors": [{ "message": "User rate limit exceeded.",
+                        "domain": "usageLimits", "reason": reason }],
+                } });
+                respond(&mut stream, 403, &[], body.to_string().as_bytes());
+                return;
+            }
             let Some(session) = state.sessions.get_mut(&token) else {
                 respond(&mut stream, 404, &[], b"{}");
                 return;
@@ -2449,8 +2467,186 @@ fn pipeline_drive_forbidden_recovery() {
     }
 }
 
+fn abandoned_session_recovery(reason: &'static str, completed: bool) {
+    let f = fixture(&format!("pipeline_abandoned_{reason}_{completed}"));
+    import(&f.scratch.path("pocket-import.toml")).unwrap();
+    let config = f.scratch.path("pocket-only.toml");
+    let settings = pipeline_toml(
+        &f.scratch.path("producer"),
+        &f.drive.base,
+        &[("pocket", "pocket.toml")],
+        None,
+        2,
+    )
+    .replace("parallel_transfers = 3", "parallel_transfers = 1");
+    fs::write(
+        &config,
+        settings.replace("retry_seconds = 4", "retry_seconds = 1"),
+    )
+    .unwrap();
+    f.drive.set(DriveFaults {
+        unavailable_uploads: if completed { 0 } else { usize::MAX },
+        complete_without_reply: completed,
+        ..Default::default()
+    });
+    let end = time_text(POCKET_SEED_END * 1_000_000);
+    let failed = pipeline("update", &config, &["--end", &end]).unwrap_err();
+    assert!(
+        failed.contains(if completed {
+            "status 409 (fileIdInUse)"
+        } else {
+            "drive upload: HTTP 503"
+        }),
+        "{failed}"
+    );
+    let transfers_path = f
+        .scratch
+        .path("producer/pipeline_state/pocket/transfers.json");
+    let transfers = read_json(&transfers_path);
+    let (key, entry) = transfers["files"]
+        .as_object()
+        .unwrap()
+        .iter()
+        .find(|(_, entry)| entry["session"].is_string())
+        .expect("failed upload must leave its pre-generated id and session recorded");
+    let id = entry["file_id"].as_str().unwrap();
+    let session_path = entry["session"]
+        .as_str()
+        .unwrap()
+        .strip_prefix(&f.drive.base)
+        .unwrap();
+    assert_eq!(f.drive.files().contains_key(id), completed);
+    assert_eq!(entry["done"], false);
+    fs::write(
+        &config,
+        settings.replace("retry_seconds = 4", "retry_seconds = 30"),
+    )
+    .unwrap();
+    f.drive.set(DriveFaults {
+        forbidden_session_status: Some((session_path.to_string(), reason)),
+        // Session creation still retries a genuinely rate-limited account.
+        forbidden_begins: (!completed).then_some((reason, 1)),
+        omit_sha256: completed,
+        ..Default::default()
+    });
+    if completed {
+        // Reconciliation must read and check content when metadata lacks a checksum.
+        f.drive
+            .state
+            .lock()
+            .unwrap()
+            .files
+            .get_mut(id)
+            .unwrap()
+            .bytes[0] ^= 1;
+        let conflict = pipeline("update", &config, &["--end", &end]).unwrap_err();
+        assert!(conflict.contains("nothing was replaced"), "{conflict}");
+        assert_eq!(read_json(&transfers_path)["files"][key], *entry);
+        f.drive
+            .state
+            .lock()
+            .unwrap()
+            .files
+            .get_mut(id)
+            .unwrap()
+            .bytes[0] ^= 1;
+    }
+    let log_before = f.drive.log().len();
+    let started = Instant::now();
+    let recovered = pipeline("update", &config, &["--end", &end]).unwrap_or_else(|error| {
+        panic!("recorded session {reason} (completed={completed}) must recover: {error}")
+    });
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "session recovery must finish far below its 30-second retry budget"
+    );
+    assert_eq!(field(job_line(&recovered, "pocket"), "status"), "archived");
+    let transfers = read_json(&transfers_path);
+    assert_eq!(transfers["files"][key]["file_id"], id);
+    assert_eq!(transfers["files"][key]["done"], true);
+    assert!(transfers["files"][key]["session"].is_null());
+    let log = f.drive.log();
+    let resumed = &log[log_before..];
+    assert_eq!(
+        resumed
+            .iter()
+            .filter(|line| line.starts_with(&format!("PUT {session_path} bytes */")))
+            .count(),
+        1,
+        "the abandoned session is queried exactly once: {resumed:?}"
+    );
+    assert!(!resumed.iter().any(
+        |line| line.starts_with(&format!("PUT {session_path} bytes "))
+            && !line.contains("bytes */")
+    ));
+    assert!(
+        resumed
+            .iter()
+            .any(|line| line.starts_with(&format!("GET /drive/v3/files/{id} ")))
+    );
+    let state = f.drive.state.lock().unwrap();
+    let sessions: Vec<_> = state
+        .sessions
+        .iter()
+        .filter(|(_, session)| session.id == id)
+        .collect();
+    assert_eq!(
+        sessions.len(),
+        if completed { 1 } else { 2 },
+        "new session only when the file is absent"
+    );
+    assert_eq!(
+        sessions
+            .iter()
+            .filter(|(_, session)| session.completed)
+            .count(),
+        1,
+        "the pre-generated id is uploaded exactly once"
+    );
+    let (token, session) = sessions
+        .iter()
+        .find(|(_, session)| session.completed)
+        .unwrap();
+    let entry = &state.files[id];
+    assert_eq!(entry.bytes, session.received);
+    assert_eq!(
+        entry.name,
+        format!(
+            "object-{}",
+            binary_alpha_engine::hex(&Sha256::digest(&entry.bytes))
+        )
+    );
+    assert_eq!(
+        state
+            .files
+            .values()
+            .filter(|file| file.name == entry.name)
+            .count(),
+        1
+    );
+    if !completed {
+        assert_ne!(format!("/upload/session/{token}"), session_path);
+        assert!(
+            resumed
+                .iter()
+                .any(|line| line.starts_with("POST /upload/drive/v3/files "))
+        );
+        assert!(
+            resumed
+                .iter()
+                .any(|line| line.starts_with(&format!("PUT /upload/session/{token} bytes 0-")))
+        );
+        assert_eq!(state.faults.forbidden_begins, Some((reason, 0)));
+    }
+}
+
 #[test]
 fn pipeline_recovery() {
+    for reason in ["userRateLimitExceeded", "rateLimitExceeded"] {
+        for completed in [false, true] {
+            abandoned_session_recovery(reason, completed);
+        }
+    }
     append_log_recovery();
     let f = fixture("pipeline_recovery");
     let store = f.scratch.path("producer/store");

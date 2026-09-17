@@ -335,6 +335,15 @@ impl Drive {
         what: &str,
         build: &dyn Fn(&reqwest::Client) -> reqwest::RequestBuilder,
     ) -> Result<Reply, String> {
+        self.send_with_rate_limit_retry(what, true, build)
+    }
+
+    fn send_with_rate_limit_retry(
+        &mut self,
+        what: &str,
+        retry_rate_limits: bool,
+        build: &dyn Fn(&reqwest::Client) -> reqwest::RequestBuilder,
+    ) -> Result<Reply, String> {
         let mut retry = RetryBudget::new(self.retry_budget);
         let mut unauthorized = 0;
         loop {
@@ -374,7 +383,8 @@ impl Drive {
                     self.access_token = None;
                 }
                 Ok(reply)
-                    if transient_status(reply.status, error_reason(&reply.body).as_deref()) =>
+                    if (retry_rate_limits || reply.status != 403)
+                        && transient_status(reply.status, error_reason(&reply.body).as_deref()) =>
                 {
                     retry.retry(
                         what,
@@ -514,7 +524,10 @@ impl Drive {
                     }
                     Resume::Completed(remote) => return self.confirm(id, remote, identity),
                     Resume::Exists => return self.confirm_existing(id, name, identity),
-                    Resume::Expired => {
+                    Resume::Abandoned if self.metadata(id)?.is_some() => {
+                        return self.confirm_existing(id, name, identity);
+                    }
+                    Resume::Expired | Resume::Abandoned => {
                         checkpoint(None)?;
                         continue;
                     }
@@ -611,10 +624,10 @@ impl Drive {
         }
     }
 
-    /// Queries a resumable session: the next byte, completion, an existing identity, or expiry.
+    /// Queries a recorded session; a rate-limit 403 abandons it after identity reconciliation.
     fn status(&mut self, uri: &str, total: u64) -> Result<Resume, String> {
         let range = format!("bytes */{total}");
-        let reply = self.send("upload status", &|client| {
+        let reply = self.send_with_rate_limit_retry("upload status", false, &|client| {
             client
                 .put(uri)
                 .header("Content-Range", &range)
@@ -626,6 +639,9 @@ impl Drive {
                 .map(Resume::Completed)
                 .map_err(|_| "drive upload status: malformed completion".into()),
             404 | 410 => Ok(Resume::Expired),
+            403 if transient_status(reply.status, error_reason(&reply.body).as_deref()) => {
+                Ok(Resume::Abandoned)
+            }
             409 if error_reason(&reply.body).as_deref() == Some("fileIdInUse") => {
                 Ok(Resume::Exists)
             }
@@ -825,6 +841,7 @@ enum Resume {
     Completed(RemoteFile),
     Exists,
     Expired,
+    Abandoned,
 }
 
 enum Failure {
