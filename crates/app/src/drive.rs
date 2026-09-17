@@ -511,11 +511,21 @@ impl Drive {
             File::open(path).map_err(|error| format!("cannot open {}: {error}", path.display()))?;
         let mut offset;
         let mut started = 0;
+        let mut last_rate_limit = None;
         loop {
-            started += 1;
-            if started > self.max_attempts {
-                return Err(format!("drive upload {name}: session restarted too often"));
+            if started == self.max_attempts {
+                let last = last_rate_limit
+                    .as_deref()
+                    .map_or_else(String::new, |reason| format!(" (last: 403 {reason})"));
+                return Err(format!(
+                    "drive upload {name}: session restarted too often{last}"
+                ));
             }
+            if last_rate_limit.take().is_some() {
+                // Pace replacement sessions too when the account itself may be throttled.
+                std::thread::sleep(Duration::from_secs((1 << (started - 1).min(5)).min(30)));
+            }
+            started += 1;
             let uri = match session.take() {
                 Some(uri) => match self.status(&uri, total)? {
                     Resume::At(next) => {
@@ -563,7 +573,7 @@ impl Drive {
                 let body = chunk[..length as usize].to_vec();
                 // The client omits `Content-Length` for an empty body, and the real service
                 // answers `411 Length Required` (observed 2026-09-16), so it is set explicitly.
-                let reply = self.send("upload", &|client| {
+                let reply = self.send_with_rate_limit_retry("upload", false, &|client| {
                     client
                         .put(&uri)
                         .header("Content-Range", &range)
@@ -583,13 +593,17 @@ impl Drive {
                         break Ok(Some(remote));
                     }
                     404 | 410 => break Ok(None),
+                    403 if transient_status(reply.status, error_reason(&reply.body).as_deref()) => {
+                        last_rate_limit = error_reason(&reply.body);
+                        break Ok(None);
+                    }
                     _ => break Err(reply.error(&format!("upload {name}"))),
                 }
             };
             match outcome? {
                 Some(remote) => return self.confirm(id, remote, identity),
                 None => {
-                    // The session expired: the same identity continues under a new session.
+                    // The session expired or was rate limited: restart under the same identity.
                     checkpoint(None)?;
                 }
             }

@@ -181,7 +181,7 @@ HTTP 429, and 5xx (default 900 seconds); retries wait 250 ms initially, doubling
 cap. `drive.max_attempts` still limits 401 token refresh attempts and resumable-session restarts.
 HTTP 403 reasons `userRateLimitExceeded` and `rateLimitExceeded` use that same backoff and
 budget; other 403s fail immediately, with the Drive reason included in the report.
-On a recorded session's status query, either rate-limit 403 instead triggers a content check of the pre-generated file id if it exists, or clears the session checkpoint and starts a new session for that same id within `drive.max_attempts`, with creation still using the retry budget.
+On a recorded session's status query or a chunk PUT, either rate-limit 403 instead abandons the session within `drive.max_attempts`, reconciling any existing file under the pre-generated id or clearing the checkpoint and starting a replacement for that same id, with chunk-triggered replacements waiting 1, 2, 4 seconds and so on by restart count up to 30 seconds and session creation still using the retry budget.
 
 ### Consent and credentials
 

@@ -411,6 +411,8 @@ struct DriveFaults {
     forbidden_begins: Option<(&'static str, usize)>,
     /// Permanently reject status queries of this recorded session path with a 403 reason.
     forbidden_session_status: Option<(String, &'static str)>,
+    /// Reject every chunk of the named object's first N sessions; usize::MAX poisons all.
+    forbidden_chunk_sessions: Option<(String, &'static str, usize)>,
     /// Hold the first upload until another job's report has been flushed.
     upload_gate: Option<Arc<Mutex<std::sync::mpsc::Receiver<()>>>>,
     /// Drop the next N object media requests before replying; usize::MAX never clears.
@@ -442,6 +444,7 @@ struct Session {
     received: Vec<u8>,
     chunks: usize,
     completed: bool,
+    forbidden_chunks: Option<&'static str>,
 }
 
 #[derive(Default)]
@@ -779,8 +782,19 @@ fn handle_http(
                 return;
             }
             let total: usize = request.headers["x-upload-content-length"].parse().unwrap();
+            let forbidden_chunks = faults
+                .forbidden_chunk_sessions
+                .as_ref()
+                .filter(|(name, _, count)| {
+                    metadata["name"] == *name
+                        && state.sessions.values().filter(|s| s.id == id).count() < *count
+                })
+                .map(|(_, reason, _)| *reason);
             state.next += 1;
             let token = format!("session-{}", state.next);
+            state
+                .log
+                .push(format!("BEGIN {id} /upload/session/{token}"));
             state.sessions.insert(
                 token.clone(),
                 Session {
@@ -790,6 +804,7 @@ fn handle_http(
                     received: Vec::new(),
                     chunks: 0,
                     completed: false,
+                    forbidden_chunks,
                 },
             );
             respond(
@@ -842,6 +857,10 @@ fn handle_http(
                 return;
             }
             session.chunks += 1;
+            if let Some(reason) = session.forbidden_chunks {
+                respond(&mut stream, 403, &[], &drive_error(reason));
+                return;
+            }
             if faults.expire_session_at_chunk == Some(session.chunks) {
                 state.faults.expire_session_at_chunk = None;
                 state.sessions.remove(&token);
@@ -2369,6 +2388,7 @@ fn pipeline_drive_forbidden_recovery() {
         let f = fixture(&format!("pipeline_drive_{reason}"));
         import(&f.scratch.path("pocket-import.toml")).unwrap();
         let config = f.scratch.path("pocket-only.toml");
+        let transient = reason != "storageQuotaExceeded";
         fs::write(
             &config,
             pipeline_toml(
@@ -2376,12 +2396,11 @@ fn pipeline_drive_forbidden_recovery() {
                 &f.drive.base,
                 &[("pocket", "pocket.toml")],
                 None,
-                1,
+                if transient { 5 } else { 1 },
             )
             .replace("parallel_transfers = 3", "parallel_transfers = 1"),
         )
         .unwrap();
-        let transient = reason != "storageQuotaExceeded";
         let count = if transient { 4 } else { 1 };
         f.drive.set(DriveFaults {
             forbidden_uploads: Some((reason, count)),
@@ -2464,6 +2483,184 @@ fn pipeline_drive_forbidden_recovery() {
             drive.download(&id, &partial, &expected).unwrap();
         }
         assert_eq!(fs::read(partial).unwrap(), entry.bytes);
+    }
+}
+
+fn chunk_rate_limited_session_recovery(reason: &'static str, poison_all: bool) {
+    let f = fixture(&format!("pipeline_chunk_rate_limit_{reason}_{poison_all}"));
+    let imported = import(&f.scratch.path("pocket-import.toml")).unwrap();
+    let store = f.scratch.path("producer/store");
+    let manifest = dataset(
+        &store,
+        imported_generation(&imported, "pocket_option:AEDCNY_otc"),
+    );
+    let object = manifest.objects.iter().max_by_key(|o| o.bytes).unwrap();
+    let name = format!("object-{}", object.sha256);
+    let max_attempts = 3;
+    let config = f.scratch.path("pocket-only.toml");
+    fs::write(
+        &config,
+        pipeline_toml(
+            &f.scratch.path("producer"),
+            &f.drive.base,
+            &[("pocket", "pocket.toml")],
+            None,
+            max_attempts,
+        )
+        .replace("parallel_transfers = 3", "parallel_transfers = 1")
+        .replace("retry_seconds = 4", "retry_seconds = 30"),
+    )
+    .unwrap();
+    f.drive.set(DriveFaults {
+        forbidden_chunk_sessions: Some((
+            name.clone(),
+            reason,
+            if poison_all { usize::MAX } else { 1 },
+        )),
+        ..Default::default()
+    });
+    let end = time_text(POCKET_SEED_END * 1_000_000);
+    let started = Instant::now();
+    let result = pipeline("update", &config, &["--end", &end]);
+    let elapsed = started.elapsed();
+    if poison_all {
+        let error = result.unwrap_err();
+        assert!(
+            error.contains(&format!(
+                "drive upload {name}: session restarted too often (last: 403 {reason})"
+            )),
+            "{error}"
+        );
+        assert!(
+            error.contains("pipeline: 1 job(s) failed: pocket"),
+            "{error}"
+        );
+    } else {
+        let report = result.unwrap_or_else(|error| {
+            panic!("a chunk-rate-limited first session must recover: {error}")
+        });
+        assert_eq!(field(job_line(&report, "pocket"), "status"), "archived");
+    }
+    assert!(
+        elapsed < Duration::from_secs(10),
+        "session restarts must finish far below the 30-second retry budget: {elapsed:?}"
+    );
+    assert!(
+        elapsed >= Duration::from_secs(if poison_all { 3 } else { 1 }),
+        "replacement sessions must wait for exponential backoff: {elapsed:?}"
+    );
+    let transfers_path = f
+        .scratch
+        .path("producer/pipeline_state/pocket/transfers.json");
+    let transfers = read_json(&transfers_path);
+    let entry = &transfers["files"][&object.key];
+    let id = entry["file_id"].as_str().unwrap();
+    assert_eq!(entry["done"], !poison_all);
+    assert!(entry["session"].is_null(), "abandonment must be durable");
+    {
+        let state = f.drive.state.lock().unwrap();
+        let sessions: Vec<_> = state.sessions.iter().filter(|(_, s)| s.id == id).collect();
+        assert_eq!(
+            sessions.len(),
+            if poison_all { max_attempts as usize } else { 2 }
+        );
+        let poisoned: Vec<_> = sessions
+            .iter()
+            .filter(|(_, session)| session.forbidden_chunks.is_some())
+            .collect();
+        assert_eq!(
+            poisoned.len(),
+            if poison_all { max_attempts as usize } else { 1 }
+        );
+        for (token, session) in poisoned {
+            assert_eq!(session.forbidden_chunks, Some(reason));
+            assert!(!session.completed);
+            assert!(session.received.is_empty());
+            assert_eq!(session.chunks, 1);
+            assert_eq!(
+                state
+                    .log
+                    .iter()
+                    .filter(|line| {
+                        line.starts_with(&format!("PUT /upload/session/{token} bytes "))
+                            && !line.contains("bytes */")
+                    })
+                    .count(),
+                1,
+                "a poisoned session must get exactly one chunk PUT: {:?}",
+                state.log
+            );
+        }
+        for (token, _) in sessions {
+            assert!(
+                state
+                    .log
+                    .contains(&format!("BEGIN {id} /upload/session/{token}")),
+                "every replacement must begin under the same file id"
+            );
+        }
+        if poison_all {
+            assert!(!state.files.contains_key(id));
+        }
+    }
+    if poison_all {
+        f.drive.set(DriveFaults::default());
+        let recovered = pipeline("update", &config, &["--end", &end]).unwrap();
+        assert_eq!(field(job_line(&recovered, "pocket"), "status"), "archived");
+    }
+    let transfers = read_json(&transfers_path);
+    assert_eq!(transfers["files"][&object.key]["file_id"], id);
+    assert_eq!(transfers["files"][&object.key]["done"], true);
+    assert!(transfers["files"][&object.key]["session"].is_null());
+    let state = f.drive.state.lock().unwrap();
+    let sessions: Vec<_> = state.sessions.iter().filter(|(_, s)| s.id == id).collect();
+    assert_eq!(
+        sessions.len(),
+        if poison_all {
+            max_attempts as usize + 1
+        } else {
+            2
+        }
+    );
+    let completed: Vec<_> = sessions.iter().filter(|(_, s)| s.completed).collect();
+    assert_eq!(completed.len(), 1, "the object must be stored exactly once");
+    let (token, session) = completed[0];
+    assert!(session.forbidden_chunks.is_none());
+    assert!(
+        state
+            .log
+            .contains(&format!("BEGIN {id} /upload/session/{token}"))
+    );
+    let remote = &state.files[id];
+    assert_eq!(remote.name, name);
+    assert_eq!(remote.bytes.len() as u64, object.bytes);
+    assert_eq!(
+        binary_alpha_engine::hex(&Sha256::digest(&remote.bytes)),
+        object.sha256
+    );
+    assert_eq!(remote.bytes, fs::read(store.join(&object.key)).unwrap());
+    assert_eq!(remote.bytes, session.received);
+    assert_eq!(
+        state
+            .files
+            .values()
+            .filter(|file| file.name == name)
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn pipeline_drive_chunk_rate_limit_recovery() {
+    for reason in ["userRateLimitExceeded", "rateLimitExceeded"] {
+        chunk_rate_limited_session_recovery(reason, false);
+    }
+}
+
+#[test]
+fn pipeline_drive_chunk_rate_limit_exhaustion() {
+    for reason in ["userRateLimitExceeded", "rateLimitExceeded"] {
+        chunk_rate_limited_session_recovery(reason, true);
     }
 }
 
