@@ -231,7 +231,9 @@ so backward paging steps by 195 seconds with a one-bar overlap; the
 2026-09-16 real-account measurement was about 4.0, 16.6, and 32.9 pages/s with 1, 4, and 8
 requests in flight, respectively (about 0.24 seconds per batch).
 Set the Pocket broker's `history_pages_in_flight` to a positive count (default 8) to control
-candle-page prefetch on each connection. With exact broker and Drive authorization, run a bounded update:
+candle-page prefetch on each connection.
+Pocket history reconnects and resends outstanding requests with fresh indexes after a response timeout (at most three retries per page), or before sending after more than 25 seconds without a server frame, sharing the adapter's 20-reconnect limit.
+With exact broker and Drive authorization, run a bounded update:
 
 ```text
 binary-alpha data pipeline update --config PIPELINE [--end END]

@@ -1255,62 +1255,66 @@ fn pocket_candle_prefetch_gap_discards_skipped_anchors_and_stale_responses() {
 
 #[test]
 fn pocket_candle_prefetch_reconnect_resends_only_outstanding_pages() {
-    let clock = FakeClock::at(1_789_348_000_000_000);
-    let index = 0;
-    let mut first = handshake();
-    let buffered = full_candle_page(index + 1, 1805);
-    first.extend(attachment("loadHistoryPeriodFast", buffered.clone()));
-    first.push(Frame::Text("41".into()));
-    let reconnected_index = 3;
-    let mut second = handshake();
-    for (index, anchor) in [(reconnected_index, 2000), (reconnected_index + 1, 1610)] {
-        second.extend(attachment(
-            "loadHistoryPeriodFast",
-            full_candle_page(index, anchor),
-        ));
-    }
-    let (mut adapter, trace) = candle_adapter(vec![first, second], &clock, Some(3));
-    let instrument = &pocket_ids()[0];
-    let granularity = NativeGranularity::Bar { period_seconds: 5 };
-    for anchor in [2000, 1805, 1610] {
-        let page = adapter
-            .history_page(instrument, scale(5), Some(anchor * 1_000_000), granularity)
-            .unwrap();
-        assert_candle_page(&adapter, &page, instrument, anchor);
-        if anchor == 1805 {
-            assert_eq!(page.raw, pocket_response(&buffered, &trace.sent).as_bytes());
-            let index = pocket_sent_events(&trace.sent, "loadHistoryPeriod")[0]["index"]
-                .as_u64()
-                .unwrap();
-            assert_eq!(
-                page.receipt_micros,
-                trace.arrivals.lock().unwrap()[&(index + 1)].1
-            );
-            assert!(page.receipt_micros < clock.now_micros());
+    for disconnect in [true, false] {
+        let clock = FakeClock::at(1_789_348_000_000_000);
+        let index = 0;
+        let mut first = handshake();
+        let buffered = full_candle_page(index + 1, 1805);
+        first.extend(attachment("loadHistoryPeriodFast", buffered.clone()));
+        if disconnect {
+            first.push(Frame::Text("41".into()));
         }
+        let reconnected_index = 3;
+        let mut second = handshake();
+        for (index, anchor) in [(reconnected_index, 2000), (reconnected_index + 1, 1610)] {
+            second.extend(attachment(
+                "loadHistoryPeriodFast",
+                full_candle_page(index, anchor),
+            ));
+        }
+        let (mut adapter, trace) = candle_adapter(vec![first, second], &clock, Some(3));
+        let instrument = &pocket_ids()[0];
+        let granularity = NativeGranularity::Bar { period_seconds: 5 };
+        for anchor in [2000, 1805, 1610] {
+            let page = adapter
+                .history_page(instrument, scale(5), Some(anchor * 1_000_000), granularity)
+                .unwrap();
+            assert_candle_page(&adapter, &page, instrument, anchor);
+            if anchor == 1805 {
+                assert_eq!(page.raw, pocket_response(&buffered, &trace.sent).as_bytes());
+                let index = pocket_sent_events(&trace.sent, "loadHistoryPeriod")[0]["index"]
+                    .as_u64()
+                    .unwrap();
+                assert_eq!(
+                    page.receipt_micros,
+                    trace.arrivals.lock().unwrap()[&(index + 1)].1
+                );
+                assert!(page.receipt_micros < clock.now_micros());
+            }
+        }
+        let requests = pocket_sent_events(&trace.sent, "loadHistoryPeriod");
+        assert_eq!(requests.len(), 7);
+        assert_eq!(requests[3]["time"], 9200);
+        assert!(
+            requests
+                .windows(2)
+                .all(|pair| pair[0]["index"].as_u64() < pair[1]["index"].as_u64())
+        );
+        assert_eq!(requests[4]["time"], 8810);
+        assert_eq!(
+            requests[4]["index"].as_u64().unwrap(),
+            requests[3]["index"].as_u64().unwrap() + 1
+        );
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|request| request["time"] == 9005)
+                .count(),
+            1
+        );
+        assert_eq!(adapter.history_reconnects(), 1);
+        assert_eq!(adapter.foreign_history_responses(), 0);
     }
-    let requests = pocket_sent_events(&trace.sent, "loadHistoryPeriod");
-    assert_eq!(requests.len(), 7);
-    assert_eq!(requests[3]["time"], 9200);
-    assert!(
-        requests
-            .windows(2)
-            .all(|pair| pair[0]["index"].as_u64() < pair[1]["index"].as_u64())
-    );
-    assert_eq!(requests[4]["time"], 8810);
-    assert_eq!(
-        requests[4]["index"].as_u64().unwrap(),
-        requests[3]["index"].as_u64().unwrap() + 1
-    );
-    assert_eq!(
-        requests
-            .iter()
-            .filter(|request| request["time"] == 9005)
-            .count(),
-        1
-    );
-    assert_eq!(adapter.history_reconnects(), 1);
-    assert_eq!(adapter.foreign_history_responses(), 0);
 }
 
 #[test]
@@ -1462,7 +1466,16 @@ fn pocket_history_skips_foreign_assets_and_indexes_without_extending_deadline() 
             if matching {
                 frames.extend(attachment(name, raw.clone()));
             }
-            let (connector, sent) = pocket_connector(vec![frames], &clock);
+            let mut sessions = vec![frames];
+            if !matching {
+                for _ in 0..3 {
+                    let mut retry = handshake();
+                    retry.extend(attachment(name, replace(&raw, "asset", "\"#AAPL_otc\"")));
+                    retry.extend(attachment(name, replace(&raw, "index", "99")));
+                    sessions.push(retry);
+                }
+            }
+            let (connector, sent) = pocket_connector(sessions, &clock);
             let mut adapter = PocketMarketData::connect(
                 &PocketSettings {
                     history_pages_in_flight: Some(3),
@@ -1499,20 +1512,255 @@ fn pocket_history_skips_foreign_assets_and_indexes_without_extending_deadline() 
                 );
             } else {
                 let error = result.unwrap_err();
-                assert!(error.contains("response timeout"), "{error}");
-                assert_eq!(clock.now_micros() - started, 20_000_000);
+                assert_eq!(
+                    error,
+                    format!(
+                        "pocket_option: no matching history response after asset or index mismatch; pocket_option: history response timeout reconnect limit reached; pocket_option {name}: response timeout"
+                    )
+                );
+                // Four fixed 20s deadlines plus three six-frame handshakes at 10us/frame.
+                assert_eq!(clock.now_micros() - started, 80_000_180);
             }
-            assert_eq!(adapter.foreign_history_responses(), 2);
-            assert_eq!(adapter.history_reconnects(), 0);
+            assert_eq!(
+                adapter.foreign_history_responses(),
+                if matching { 2 } else { 8 }
+            );
+            assert_eq!(adapter.history_reconnects(), if matching { 0 } else { 3 });
+            assert_eq!(
+                pocket_sent_events(&sent, "auth").len(),
+                if matching { 1 } else { 4 }
+            );
             assert_eq!(
                 pocket_sent_events(&sent, "loadHistoryPeriod").len(),
                 if granularity == NativeGranularity::Tick {
-                    1
+                    if matching { 1 } else { 4 }
                 } else {
-                    3
+                    // The received prefetched page survives all three reconnects.
+                    if matching { 3 } else { 9 }
                 }
             );
         }
+    }
+}
+
+#[test]
+fn pocket_history_reconnects_after_silent_response_timeout() {
+    for limit in [1, 3] {
+        let clock = FakeClock::at(1_789_348_000_000_000);
+        let mut first = handshake();
+        first.extend(attachment(
+            "loadHistoryPeriodFast",
+            full_candle_page(0, 2000),
+        ));
+        // Exhausted scripted frames leave the transport open and advance the fake clock
+        // by the receive timeout: no namespace disconnect or transport Close is returned.
+        let mut second = handshake();
+        second.extend(attachment(
+            "loadHistoryPeriodFast",
+            full_candle_page(u64::from(limit) + 1, 1805),
+        ));
+        let (mut adapter, trace) = candle_adapter(vec![first, second], &clock, Some(limit));
+        let instrument = &pocket_ids()[0];
+        let granularity = NativeGranularity::Bar { period_seconds: 5 };
+        let page = adapter
+            .history_page(instrument, scale(5), Some(2_000_000_000), granularity)
+            .unwrap();
+        assert_candle_page(&adapter, &page, instrument, 2000);
+        assert_eq!(adapter.history_reconnects(), 0);
+        let started = clock.now_micros();
+        let page = adapter
+            .history_page(instrument, scale(5), Some(1_805_000_000), granularity)
+            .unwrap();
+        assert_candle_page(&adapter, &page, instrument, 1805);
+        assert_eq!(clock.now_micros() - started, 20_000_080);
+        assert_eq!(adapter.history_reconnects(), 1);
+        assert_eq!(pocket_sent_events(&trace.sent, "auth").len(), 2);
+        let requests = pocket_sent_events(&trace.sent, "loadHistoryPeriod");
+        let limit = usize::from(limit);
+        assert_eq!(requests.len(), 2 * limit + 1);
+        for (original, resent) in requests[1..=limit].iter().zip(&requests[limit + 1..]) {
+            assert_eq!(original["time"], resent["time"]);
+            assert!(resent["index"].as_u64() > original["index"].as_u64());
+        }
+    }
+}
+
+#[test]
+fn pocket_history_reconnects_before_sending_on_stale_session() {
+    for silent_retries in [0, 3] {
+        let mut clock = FakeClock::at(1_789_348_000_000_000);
+        let mut first = handshake();
+        first.extend(attachment(
+            "loadHistoryPeriodFast",
+            full_candle_page(0, 2000),
+        ));
+        let mut sessions = vec![first];
+        sessions.extend((0..silent_retries).map(|_| handshake()));
+        let mut last = handshake();
+        last.extend(attachment(
+            "loadHistoryPeriodFast",
+            full_candle_page(1 + silent_retries, 1805),
+        ));
+        sessions.push(last);
+        let (mut adapter, trace) = candle_adapter(sessions, &clock, Some(1));
+        let instrument = &pocket_ids()[0];
+        let granularity = NativeGranularity::Bar { period_seconds: 5 };
+        let page = adapter
+            .history_page(instrument, scale(5), Some(2_000_000_000), granularity)
+            .unwrap();
+        assert_candle_page(&adapter, &page, instrument, 2000);
+        let sent_before_advance = trace.sent.lock().unwrap().len();
+        clock.sleep(30_000_000);
+        let page = adapter
+            .history_page(instrument, scale(5), Some(1_805_000_000), granularity)
+            .unwrap();
+        assert_candle_page(&adapter, &page, instrument, 1805);
+        // A preflight reconnect leaves all three per-page retries available.
+        assert_eq!(adapter.history_reconnects(), 1 + silent_retries);
+        assert_eq!(
+            pocket_sent_events(&trace.sent, "auth").len() as u64,
+            2 + silent_retries
+        );
+        let requests = pocket_sent_events(&trace.sent, "loadHistoryPeriod");
+        assert_eq!(requests.len() as u64, 2 + silent_retries);
+        assert!(requests[1..].iter().all(|request| request["time"] == 9005));
+        let sent = trace.sent.lock().unwrap();
+        // Close is the very first action after the clock advance: the stale connection
+        // receives no further history request, and the new connection authenticates first.
+        assert_eq!(sent[sent_before_advance], Frame::Close);
+        assert_eq!(sent[sent_before_advance + 1], Frame::Text("40".into()));
+        assert!(
+            matches!(&sent[sent_before_advance + 2], Frame::Text(text) if text.starts_with("42[\"auth\","))
+        );
+        assert!(
+            matches!(&sent[sent_before_advance + 3], Frame::Text(text) if text.starts_with("42[\"loadHistoryPeriod\","))
+        );
+    }
+}
+
+#[test]
+fn pocket_history_stale_check_uses_heartbeat_receipt_and_strict_threshold() {
+    for heartbeat in [
+        Frame::Text("2".into()),
+        Frame::Ping(vec![1]),
+        Frame::Pong(vec![2]),
+    ] {
+        let mut clock = FakeClock::at(1_789_348_000_000_000);
+        let mut frames = handshake();
+        frames.extend(attachment(
+            "loadHistoryPeriodFast",
+            full_candle_page(0, 2000),
+        ));
+        frames.push(heartbeat);
+        frames.extend(attachment(
+            "loadHistoryPeriodFast",
+            full_candle_page(1, 1805),
+        ));
+        let (mut adapter, trace) = candle_adapter(vec![frames], &clock, Some(1));
+        let instrument = &pocket_ids()[0];
+        let granularity = NativeGranularity::Bar { period_seconds: 5 };
+        adapter
+            .history_page(instrument, scale(5), Some(2_000_000_000), granularity)
+            .unwrap();
+        clock.sleep(20_000_000);
+        assert!(adapter.next_live(0).unwrap().is_none());
+        clock.sleep(25_000_000);
+        let page = adapter
+            .history_page(instrument, scale(5), Some(1_805_000_000), granularity)
+            .unwrap();
+        assert_candle_page(&adapter, &page, instrument, 1805);
+        assert_eq!(adapter.history_reconnects(), 0);
+        assert_eq!(pocket_sent_events(&trace.sent, "auth").len(), 1);
+    }
+}
+
+#[test]
+fn pocket_history_stale_reconnects_stop_at_adapter_limit() {
+    let mut clock = FakeClock::at(1_789_348_000_000_000);
+    let sessions = (0..=20)
+        .map(|index| {
+            let mut frames = handshake();
+            frames.extend(attachment(
+                "loadHistoryPeriodFast",
+                full_candle_page(index, 2000),
+            ));
+            frames
+        })
+        .collect();
+    let (mut adapter, trace) = candle_adapter(sessions, &clock, Some(1));
+    for reconnects in 0..=20 {
+        let page = adapter
+            .history_page(
+                &pocket_ids()[0],
+                scale(5),
+                Some(2_000_000_000),
+                NativeGranularity::Bar { period_seconds: 5 },
+            )
+            .unwrap();
+        assert_candle_page(&adapter, &page, &pocket_ids()[0], 2000);
+        assert_eq!(adapter.history_reconnects(), reconnects);
+        clock.sleep(30_000_000);
+    }
+    let sent_before = trace.sent.lock().unwrap().len();
+    assert_eq!(
+        adapter
+            .history_page(
+                &pocket_ids()[0],
+                scale(5),
+                Some(2_000_000_000),
+                NativeGranularity::Bar { period_seconds: 5 }
+            )
+            .unwrap_err(),
+        "pocket_option: stale history session reconnect limit reached"
+    );
+    assert_eq!(adapter.history_reconnects(), 20);
+    assert_eq!(pocket_sent_events(&trace.sent, "auth").len(), 21);
+    assert_eq!(trace.sent.lock().unwrap().len(), sent_before);
+}
+
+#[test]
+fn pocket_history_stops_after_three_response_timeout_reconnects_for_one_page() {
+    for (before, granularity, event) in [
+        (None, NativeGranularity::Tick, "updateHistoryNewFast"),
+        (
+            Some(10_000_000),
+            NativeGranularity::Tick,
+            "loadHistoryPeriod",
+        ),
+        (
+            Some(10_000_000),
+            NativeGranularity::Bar { period_seconds: 5 },
+            "loadHistoryPeriodFast",
+        ),
+    ] {
+        let clock = FakeClock::at(1_789_348_000_000_000);
+        let (mut adapter, trace) =
+            candle_adapter((0..4).map(|_| handshake()).collect(), &clock, Some(1));
+        let started = clock.now_micros();
+        let error = adapter
+            .history_page(&pocket_ids()[0], scale(5), before, granularity)
+            .unwrap_err();
+        assert_eq!(
+            error,
+            format!(
+                "pocket_option: history response timeout reconnect limit reached; pocket_option {event}: response timeout"
+            )
+        );
+        assert_eq!(adapter.history_reconnects(), 3);
+        assert_eq!(pocket_sent_events(&trace.sent, "auth").len(), 4);
+        assert_eq!(
+            pocket_sent_events(
+                &trace.sent,
+                if before.is_none() {
+                    "changeSymbol"
+                } else {
+                    "loadHistoryPeriod"
+                }
+            )
+            .len(),
+            4
+        );
+        assert_eq!(clock.now_micros() - started, 80_000_180);
     }
 }
 
@@ -1734,56 +1982,64 @@ fn pocket_history_stops_after_three_namespace_reconnects_for_one_page() {
 }
 
 #[test]
-fn pocket_history_namespace_reconnect_limit_persists_across_pages() {
-    let clock = FakeClock::at(1_789_348_000_000_000);
-    let mut index = 0;
-    let mut sessions = Vec::new();
-    for session in 0..=20 {
-        let mut frames = handshake();
-        if session > 0 {
-            frames.extend(attachment(
-                "loadHistoryPeriodFast",
-                full_candle_page(index, 10),
-            ));
+fn pocket_history_reconnect_limit_persists_across_pages() {
+    for disconnect in [true, false] {
+        let clock = FakeClock::at(1_789_348_000_000_000);
+        let mut index = 0;
+        let mut sessions = Vec::new();
+        for session in 0..=20 {
+            let mut frames = handshake();
+            if session > 0 {
+                frames.extend(attachment(
+                    "loadHistoryPeriodFast",
+                    full_candle_page(index, 10),
+                ));
+            }
+            if disconnect {
+                frames.push(Frame::Text("41".into()));
+            }
+            index += if session == 0 { 1 } else { 2 };
+            sessions.push(frames);
         }
-        frames.push(Frame::Text("41".into()));
-        index += if session == 0 { 1 } else { 2 };
-        sessions.push(frames);
+        let (connector, sent) = pocket_connector(sessions, &clock);
+        let mut adapter = PocketMarketData::connect(
+            &pocket_settings(),
+            &pocket_ids(),
+            connector,
+            Box::new(clock),
+            "{}".into(),
+        )
+        .unwrap();
+        for expected_reconnects in 1..=20 {
+            adapter
+                .history_page(
+                    &pocket_ids()[0],
+                    scale(5),
+                    Some(10_000_000),
+                    NativeGranularity::Bar { period_seconds: 5 },
+                )
+                .unwrap();
+            assert_eq!(adapter.history_reconnects(), expected_reconnects);
+        }
+        assert_eq!(
+            adapter
+                .history_page(
+                    &pocket_ids()[0],
+                    scale(5),
+                    Some(10_000_000),
+                    NativeGranularity::Bar { period_seconds: 5 },
+                )
+                .unwrap_err(),
+            if disconnect {
+                "pocket_option: the server keeps disconnecting the namespace"
+            } else {
+                "pocket_option: history response timeout reconnect limit reached; pocket_option loadHistoryPeriodFast: response timeout"
+            }
+        );
+        assert_eq!(adapter.history_reconnects(), 20);
+        assert_eq!(pocket_sent_events(&sent, "auth").len(), 21);
+        assert_eq!(pocket_sent_events(&sent, "loadHistoryPeriod").len(), 41);
     }
-    let (connector, sent) = pocket_connector(sessions, &clock);
-    let mut adapter = PocketMarketData::connect(
-        &pocket_settings(),
-        &pocket_ids(),
-        connector,
-        Box::new(clock),
-        "{}".into(),
-    )
-    .unwrap();
-    for expected_reconnects in 1..=20 {
-        adapter
-            .history_page(
-                &pocket_ids()[0],
-                scale(5),
-                Some(10_000_000),
-                NativeGranularity::Bar { period_seconds: 5 },
-            )
-            .unwrap();
-        assert_eq!(adapter.history_reconnects(), expected_reconnects);
-    }
-    assert_eq!(
-        adapter
-            .history_page(
-                &pocket_ids()[0],
-                scale(5),
-                Some(10_000_000),
-                NativeGranularity::Bar { period_seconds: 5 },
-            )
-            .unwrap_err(),
-        "pocket_option: the server keeps disconnecting the namespace"
-    );
-    assert_eq!(adapter.history_reconnects(), 20);
-    assert_eq!(pocket_sent_events(&sent, "auth").len(), 21);
-    assert_eq!(pocket_sent_events(&sent, "loadHistoryPeriod").len(), 41);
 }
 
 #[test]

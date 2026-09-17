@@ -61,6 +61,7 @@ struct Event {
 enum ReceiveError {
     Disconnected,
     Transport(String),
+    ResponseTimeout(String),
     Other(String),
 }
 impl From<String> for ReceiveError {
@@ -77,7 +78,7 @@ impl From<ReceiveError> for String {
     fn from(error: ReceiveError) -> Self {
         match error {
             ReceiveError::Disconnected => "socket.io: the server disconnected the namespace (an `origin` setting is usually required)".into(),
-            ReceiveError::Transport(error) | ReceiveError::Other(error) => error,
+            ReceiveError::Transport(error) | ReceiveError::ResponseTimeout(error) | ReceiveError::Other(error) => error,
         }
     }
 }
@@ -167,6 +168,7 @@ pub struct PocketMarketData {
     connector: Box<dyn Connector>,
     transport: Box<dyn Transport>,
     clock: Box<dyn Clock>,
+    last_received_frame_micros: i64,
     credential_json: String,
     pending: Option<String>,
     discovered: Vec<DiscoveredInstrument>,
@@ -202,12 +204,14 @@ impl PocketMarketData {
             .unwrap_or_default();
         let transport = connector.connect(&settings.endpoint, &headers)?;
         let next_index = history_index_seed(clock.now_micros());
+        let last_received_frame_micros = clock.now_micros();
         let mut broker = Self {
             settings: settings.clone(),
             instruments: instruments.to_vec(),
             connector,
             transport,
             clock,
+            last_received_frame_micros,
             credential_json,
             pending: None,
             discovered: Vec::new(),
@@ -247,6 +251,7 @@ impl PocketMarketData {
                 return Ok(None);
             };
             let receipt_micros = self.clock.now_micros();
+            self.last_received_frame_micros = receipt_micros;
             match frame {
                 Frame::Ping(bytes) => self
                     .transport
@@ -438,11 +443,13 @@ impl PocketMarketData {
         loop {
             let remaining = deadline.saturating_sub(self.clock.now_micros());
             if remaining <= 0 {
-                return Err(format!("pocket_option {name}: response timeout").into());
+                return Err(ReceiveError::ResponseTimeout(format!(
+                    "pocket_option {name}: response timeout"
+                )));
             }
-            let event = self
-                .receive(remaining)?
-                .ok_or_else(|| format!("pocket_option {name}: response timeout"))?;
+            let event = self.receive(remaining)?.ok_or_else(|| {
+                ReceiveError::ResponseTimeout(format!("pocket_option {name}: response timeout"))
+            })?;
             if names.contains(&event.name.as_str()) {
                 return Ok(event);
             }
@@ -555,9 +562,6 @@ impl PocketMarketData {
         let Some(before) = before_micros else {
             // The anchor-free page exists only for ticks; the evidenced candle family is the
             // indexed older-history request answered as `loadHistoryPeriodFast`.
-            if period != 1 {
-                return Err("pocket_option: bar history requires an anchor".into());
-            }
             self.send(
                 "changeSymbol",
                 &Change {
@@ -678,7 +682,7 @@ impl PocketMarketData {
     pub fn foreign_history_responses(&self) -> u64 {
         self.foreign_history_responses
     }
-    /// Reconnect attempts triggered by namespace disconnects or transport failures in history.
+    /// History reconnect attempts after disconnects, transport failures, timeouts or stale sessions.
     pub fn history_reconnects(&self) -> u64 {
         self.history_reconnects
     }
@@ -799,16 +803,41 @@ impl MarketDataBroker for PocketMarketData {
                 ));
             }
         };
+        if before_micros.is_none() && period != 1 {
+            return Err("pocket_option: bar history requires an anchor".into());
+        }
+        // Real-endpoint probe (2026-09-16): unanswered Engine.IO pings closed an idle
+        // session after about 45s; answering them kept history working after 100s.
+        // Reconnect before sending after 25s without any received frame, including pings.
+        if self
+            .clock
+            .now_micros()
+            .saturating_sub(self.last_received_frame_micros)
+            > 25_000_000
+        {
+            if self.history_reconnects >= 20 {
+                return Err("pocket_option: stale history session reconnect limit reached".into());
+            }
+            self.history_reconnects += 1;
+            self.reconnect_transport(true)?;
+        }
         let mut reconnects = 0;
         let skipped_before = self.foreign_history_responses;
         loop {
             match self.request_history_page(symbol, before_micros, period) {
                 Ok(page) => return Ok(page),
-                Err(error @ (ReceiveError::Disconnected | ReceiveError::Transport(_))) => {
+                Err(
+                    error @ (ReceiveError::Disconnected
+                    | ReceiveError::Transport(_)
+                    | ReceiveError::ResponseTimeout(_)),
+                ) => {
                     if reconnects >= 3 || self.history_reconnects >= 20 {
                         let reason = match error {
                             ReceiveError::Transport(error) => format!(
                                 "pocket_option: history transport reconnect limit reached; {error}"
+                            ),
+                            ReceiveError::ResponseTimeout(error) => format!(
+                                "pocket_option: history response timeout reconnect limit reached; {error}"
                             ),
                             _ => {
                                 "pocket_option: the server keeps disconnecting the namespace".into()
@@ -826,7 +855,10 @@ impl MarketDataBroker for PocketMarketData {
                     self.history_reconnects += 1;
                     // Re-authentication failures, including connect-time namespace disconnects,
                     // retain their original diagnostic and are not history retries.
-                    self.reconnect_transport(matches!(error, ReceiveError::Transport(_)))?;
+                    self.reconnect_transport(matches!(
+                        error,
+                        ReceiveError::Transport(_) | ReceiveError::ResponseTimeout(_)
+                    ))?;
                 }
                 Err(error) => return Err(error.into()),
             }
