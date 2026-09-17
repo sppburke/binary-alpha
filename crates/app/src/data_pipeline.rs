@@ -5,11 +5,11 @@
 //! immutable catalog published last, and restores one exact catalog into a fresh store. Every
 //! mutable step is resumable from `pipeline_state/`; every completed record is immutable.
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::VecDeque;
 use std::fs::{self, File};
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 
 use binary_alpha_engine::config::{
     Config, ConfigPath, ManifestUri, PublicationUri, RunMode, Seed, relative_path,
@@ -140,6 +140,7 @@ struct Layout {
     base: PathBuf,
     store: PathBuf,
     state: PathBuf,
+    registry: OnceLock<Result<crate::registry::Registry, String>>,
 }
 
 impl Layout {
@@ -153,7 +154,12 @@ impl Layout {
                 .map_err(|error| format!("cannot create {}: {error}", dir.display()))?;
         }
         private(&state)?;
-        Ok(Self { base, store, state })
+        Ok(Self {
+            base,
+            store,
+            state,
+            registry: OnceLock::new(),
+        })
     }
 
     fn store(&self) -> Store {
@@ -502,6 +508,8 @@ pub struct ObjectEntry {
 #[serde(deny_unknown_fields)]
 pub struct Catalog {
     pub schema_version: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub layout: Option<binary_alpha_engine::dataset::Layout>,
     pub job: String,
     pub broker: String,
     pub provider_symbol: String,
@@ -546,25 +554,10 @@ impl Catalog {
     }
 }
 
-/// The durable transfer index of one job: every file identity pre-generated for a local
-/// object, its open session, and whether Drive confirmed it.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-struct Transfers {
-    files: BTreeMap<String, Transfer>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct Transfer {
-    file_id: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    session: Option<String>,
-    done: bool,
-}
-
 /// Archives one dataset generation and its stream generation from the managed store: every
 /// object once, then both manifests, then the catalog. A catalog receipt already recorded for
 /// the pair is reused after its remote file is confirmed.
-fn archive(
+fn archive_generation(
     config: &PipelineConfig,
     drive: &mut Drive,
     layout: &Layout,
@@ -583,6 +576,7 @@ fn archive(
     if stream_manifest.source_generation != dataset_manifest.generation
         || stream_manifest.instrument != dataset_manifest.instrument
         || stream_manifest.role != dataset_manifest.role
+        || stream_manifest.layout != dataset_manifest.layout
         || dataset_manifest.role == DatasetRole::Holdout
     {
         return Err(format!(
@@ -590,8 +584,54 @@ fn archive(
         ));
     }
     let state = layout.job_state(job)?;
-    let transfers_path = state.join("transfers.json");
-    let mut transfers: Transfers = read_json(&transfers_path)?.unwrap_or_default();
+    let registry = layout
+        .registry
+        .get_or_init(|| crate::registry::Registry::open(&layout.state, &config.drive, drive))
+        .as_ref()
+        .map_err(Clone::clone)?;
+    // Immutable receipts pin exact file ids even if a later rebuild finds duplicate bytes.
+    if let Some(receipt) =
+        read_json::<CatalogReceipt>(&records.local_path(&receipt_name).expect("local records"))?
+    {
+        confirm_remote(drive, &receipt.file_id, receipt.bytes, &receipt.sha256)?;
+        let scratch = state.join(".existing-catalog");
+        drive.download(
+            &receipt.file_id,
+            &scratch,
+            &ObjectIdentity {
+                bytes: receipt.bytes,
+                sha256: receipt.sha256.clone(),
+                crc32c: 0,
+            },
+        )?;
+        let catalog = Catalog::from_json(&fs::read(&scratch).map_err(|e| e.to_string())?)?;
+        fs::remove_file(scratch).map_err(|e| e.to_string())?;
+        if catalog.job != job
+            || catalog.dataset.generation != dataset
+            || catalog.stream.generation != stream
+        {
+            return Err("catalog receipt does not bind the requested job and generations".into());
+        }
+        for entry in &catalog.objects {
+            confirm_remote(drive, &entry.file_id, entry.bytes, &entry.sha256)?;
+        }
+        for entry in [&catalog.dataset, &catalog.stream] {
+            confirm_remote(drive, &entry.file_id, entry.bytes, &entry.sha256)?;
+        }
+        return Ok(receipt);
+    }
+    let legacy = registry.legacy_catalog_bindings(drive, job, dataset, stream)?;
+    let transfer =
+        |drive: &mut Drive, key: &str, name: &str, path: &Path, identity: &ObjectIdentity| {
+            if let Some(bindings) = &legacy {
+                let file_id = bindings
+                    .get(key)
+                    .ok_or_else(|| format!("legacy catalog: missing binding for {key}"))?;
+                confirm_remote(drive, file_id, identity.bytes, &identity.sha256)?;
+                return Ok(file_id.clone());
+            }
+            registry.transfer(drive, &format!("{job}/{key}"), name, path, identity)
+        };
     let mut closure: Vec<&ObjectRecord> = Vec::new();
     for object in dataset_manifest
         .objects
@@ -602,32 +642,6 @@ fn archive(
             closure.push(object);
         }
     }
-    // Every file identity is fixed before any upload so ambiguity reconciles by identity.
-    let mut wanted: Vec<String> = closure
-        .iter()
-        .map(|object| object.key.clone())
-        .chain([
-            dataset_manifest.key(),
-            stream_manifest.key(),
-            format!("catalog/{dataset}/{stream}"),
-        ])
-        .filter(|key| !transfers.files.contains_key(key))
-        .collect();
-    if !wanted.is_empty() {
-        let ids = drive.generate_ids(wanted.len())?;
-        for (key, file_id) in wanted.drain(..).zip(ids) {
-            transfers.files.insert(
-                key,
-                Transfer {
-                    file_id,
-                    session: None,
-                    done: false,
-                },
-            );
-        }
-        write_atomic(&transfers_path, &json_bytes(&transfers)?)?;
-    }
-    let transfers = Mutex::new(transfers);
     let objects = run_pool(config, &closure, |object, drive| {
         let path = local
             .local_path(&object.key)
@@ -641,8 +655,6 @@ fn archive(
         }
         let file_id = transfer(
             drive,
-            &transfers,
-            &transfers_path,
             &object.key,
             &format!("object-{}", object.sha256),
             &path,
@@ -666,8 +678,6 @@ fn archive(
         let identity = store::identify(&scratch)?;
         let file_id = transfer(
             drive,
-            &transfers,
-            &transfers_path,
             &key,
             &format!("manifest-{generation}.json"),
             &scratch,
@@ -687,6 +697,7 @@ fn archive(
     let dataset_entry = manifests.pop().expect("dataset entry");
     let catalog = Catalog {
         schema_version: CATALOG_SCHEMA_VERSION,
+        layout: dataset_manifest.layout,
         job: job.to_string(),
         broker: dataset_manifest.broker.to_string(),
         provider_symbol: dataset_manifest.provider_symbol.to_string(),
@@ -705,11 +716,9 @@ fn archive(
     fs::write(&scratch, &bytes)
         .map_err(|error| format!("cannot write {}: {error}", scratch.display()))?;
     let identity = store::identify(&scratch)?;
-    let file_id = transfer(
+    let file_id = registry.transfer(
         drive,
-        &transfers,
-        &transfers_path,
-        &format!("catalog/{dataset}/{stream}"),
+        &format!("{job}/catalog/{dataset}/{stream}"),
         &format!("{CATALOG_PREFIX}{}-{}.json", &dataset[..16], &stream[..16]),
         &scratch,
         &identity,
@@ -723,55 +732,6 @@ fn archive(
     };
     research::publish_record(&records, &records, &receipt_name, &json_bytes(&receipt)?)?;
     Ok(receipt)
-}
-
-/// Uploads one local file under its pre-generated identity unless the index already confirms
-/// it, persisting every session change before bytes flow.
-fn transfer(
-    drive: &mut Drive,
-    transfers: &Mutex<Transfers>,
-    transfers_path: &Path,
-    key: &str,
-    name: &str,
-    path: &Path,
-    identity: &ObjectIdentity,
-) -> Result<String, String> {
-    let entry = transfers
-        .lock()
-        .map_err(|_| "pipeline: transfers lock poisoned")?
-        .files
-        .get(key)
-        .cloned()
-        .expect("every key has a pre-generated identity");
-    if entry.done {
-        confirm_remote(drive, &entry.file_id, identity.bytes, &identity.sha256)?;
-        return Ok(entry.file_id);
-    }
-    let file_id = entry.file_id.clone();
-    let mut checkpoint = |session: Option<&str>| -> Result<(), String> {
-        let mut transfers = transfers
-            .lock()
-            .map_err(|_| "pipeline: transfers lock poisoned")?;
-        let entry = transfers.files.get_mut(key).expect("indexed");
-        entry.session = session.map(str::to_string);
-        write_atomic(transfers_path, &json_bytes(&*transfers)?)
-    };
-    drive.upload(
-        &file_id,
-        name,
-        path,
-        identity,
-        entry.session,
-        &mut checkpoint,
-    )?;
-    let mut transfers = transfers
-        .lock()
-        .map_err(|_| "pipeline: transfers lock poisoned")?;
-    let entry = transfers.files.get_mut(key).expect("indexed");
-    entry.session = None;
-    entry.done = true;
-    write_atomic(transfers_path, &json_bytes(&*transfers)?)?;
-    Ok(file_id)
 }
 
 /// Transfers objects with one Drive session per worker. A failure stops new work; in-flight
@@ -910,6 +870,34 @@ fn load(config_path: &Path) -> Result<(PipelineConfig, Layout, String), String> 
     let layout = Layout::open(config_path, &config)?;
     let hash = sha256_hex(text.as_bytes());
     Ok((config, layout, hash))
+}
+
+/// Archive existing v2 history without acquisition. Verification uses the same
+/// owner as update; all jobs share the archive-root registry and writer lock.
+pub fn archive(config_path: &Path, job: Option<&str>, out: &mut dyn Write) -> Result<(), String> {
+    let (mut config, layout, _) = load(config_path)?;
+    if let Some(id) = job {
+        config.jobs.retain(|job| job.id == id);
+        if config.jobs.is_empty() {
+            return Err(format!("pipeline: unknown job {id}"));
+        }
+    }
+    run_jobs(&config, &layout, out, &|job, bound, drive, access, _out| {
+        let local = layout.store();
+        let history = bound.core.history.as_ref().expect("bound history");
+        let dataset = crate::registry::newest_daily(
+            &local,
+            &format!("{}:{}", history.broker, bound.symbol),
+            history.role,
+            access,
+        )?;
+        let stream = crate::registry::verified_daily_stream(&local, &dataset, &bound.core, access)?;
+        let receipt = archive_generation(&config, drive, &layout, &job.id, &dataset, &stream)?;
+        Ok(format!(
+            "pipeline archive {} dataset {dataset} stream {stream} catalog {} sha256 {}",
+            job.id, receipt.file_id, receipt.sha256
+        ))
+    })
 }
 
 /// `data pipeline update`: extend every job's imported generation from its frontier to one
@@ -1237,7 +1225,7 @@ fn update_job(
     let (stream, catalog) = match &outcome.generation {
         Some(dataset) => {
             let stream = finish(&config, layout, &local, dataset, access, out)?;
-            let catalog = archive(pipeline, drive, layout, &job.id, dataset, &stream)?;
+            let catalog = archive_generation(pipeline, drive, layout, &job.id, dataset, &stream)?;
             (Some(stream), Some(catalog))
         }
         None => (None, None),
@@ -1333,10 +1321,11 @@ pub fn list(
             + catalog.dataset.bytes
             + catalog.stream.bytes;
         lines.push(format!(
-            "catalog {file_id} sha256 {sha256} {} {} {} dataset {} stream {} coverage {} {} rows {} bytes {transfer}",
+            "catalog {file_id} sha256 {sha256} {} {} {} layout {} dataset {} stream {} coverage {} {} rows {} bytes {transfer}",
             catalog.instrument,
             catalog.role,
             catalog.native_granularity,
+            catalog.layout.map_or("v1".to_string(), |layout| layout.to_string()),
             catalog.dataset.generation,
             catalog.stream.generation,
             catalog.coverage.first_event_time,
@@ -1362,13 +1351,9 @@ fn catalogs(
     let scratch = layout.state.join("downloads");
     let mut found = Vec::new();
     for file in drive.list(CATALOG_PREFIX)? {
-        let (Some(size), Some(sha256)) = (file.size, file.sha256.as_deref()) else {
-            return Err(format!(
-                "drive: catalog {} reports no size or checksum",
-                file.id
-            ));
-        };
-        let sha256 = sha256.to_ascii_lowercase();
+        let identity = drive.listed_identity(&file)?;
+        let size = identity.bytes;
+        let sha256 = identity.sha256;
         let partial = scratch.join(format!("{}.catalog", file.id));
         drive.download(
             &file.id,
@@ -1402,20 +1387,23 @@ pub fn pull(
     let (config, layout, _) = load(config_path)?;
     let mut drive = Drive::open(&config.drive)?;
     let mut found = catalogs(&mut drive, &layout, broker, symbol)?;
-    found.sort_by(|a, b| {
-        (&a.2.coverage.last_event_time, &a.2.dataset.generation)
-            .cmp(&(&b.2.coverage.last_event_time, &b.2.dataset.generation))
-    });
-    let Some((file_id, sha256, catalog)) = found.pop() else {
+    if found.is_empty() {
         return Err(format!("drive: no archived catalog for {broker}:{symbol}"));
+    }
+    let declaration = declaration(&config)?;
+    let access = Access {
+        declaration: declaration.as_ref(),
+        certification: None,
     };
+    let selected = crate::registry::newest_catalog(
+        &found,
+        &mut drive,
+        &layout.state.join("downloads"),
+        access,
+    )?;
+    let (file_id, sha256, catalog) = found.swap_remove(selected);
     let local = layout.store();
     if local.head(&catalog.dataset.key)?.is_some() && local.head(&catalog.stream.key)?.is_some() {
-        let declaration = declaration(&config)?;
-        let access = Access {
-            declaration: declaration.as_ref(),
-            certification: None,
-        };
         verify::run_with(&local.uri(&catalog.dataset.key), access)?;
         verify::run_with(&local.uri(&catalog.stream.key), access)?;
         writeln!(
@@ -1505,6 +1493,13 @@ pub fn restore(
     if dataset.key() != catalog.dataset.key
         || dataset.instrument != catalog.instrument
         || dataset.role != catalog.role
+        || dataset.layout != catalog.layout
+        || dataset.coverage != catalog.coverage
+        || dataset.row_count != catalog.row_count
+        || dataset.broker.to_string() != catalog.broker
+        || dataset.provider_symbol.to_string() != catalog.provider_symbol
+        || dataset.source_kind != catalog.source_kind
+        || dataset.native_granularity != catalog.native_granularity
         || dataset.role == DatasetRole::Holdout
     {
         return Err(format!(
@@ -1519,6 +1514,8 @@ pub fn restore(
     if stream.key() != catalog.stream.key
         || stream.source_generation != dataset.generation
         || stream.role != dataset.role
+        || stream.layout != dataset.layout
+        || stream.instrument != dataset.instrument
     {
         return Err(format!(
             "catalog {catalog_id}: the stream manifest does not derive from dataset {}",

@@ -9,6 +9,7 @@ pub mod live;
 pub mod outcomes;
 pub mod parallel;
 pub mod portfolio;
+pub mod registry;
 pub mod replay;
 pub mod research;
 pub mod search;

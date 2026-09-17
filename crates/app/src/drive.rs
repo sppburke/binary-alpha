@@ -138,6 +138,8 @@ struct Listing {
     next_page_token: Option<String>,
     #[serde(default)]
     files: Vec<RemoteFile>,
+    #[serde(default, rename = "incompleteSearch")]
+    incomplete_search: bool,
 }
 
 #[derive(Deserialize)]
@@ -455,19 +457,24 @@ impl Drive {
     /// pagination to the end.
     pub fn list(&mut self, prefix: &str) -> Result<Vec<RemoteFile>, String> {
         let url = format!("{}/files", self.api);
-        let filter = format!(
-            "'{}' in parents and trashed = false and name contains '{}'",
-            self.root,
-            prefix.replace('\\', "\\\\").replace('\'', "\\'")
-        );
+        let mut filter = format!("'{}' in parents and trashed = false", self.root);
+        if !prefix.is_empty() {
+            filter.push_str(&format!(
+                " and name contains '{}'",
+                prefix.replace('\\', "\\\\").replace('\'', "\\'")
+            ));
+        }
         let mut files = Vec::new();
         let mut page_token: Option<String> = None;
+        let mut restarts = 0;
+        let mut seen_tokens = std::collections::BTreeSet::new();
         loop {
             let mut query = vec![
                 ("q".to_string(), filter.clone()),
                 (
                     "fields".to_string(),
-                    "nextPageToken,files(id,name,size,sha256Checksum,trashed)".to_string(),
+                    "nextPageToken,incompleteSearch,files(id,name,size,sha256Checksum,trashed)"
+                        .to_string(),
                 ),
                 ("pageSize".to_string(), "1000".to_string()),
             ];
@@ -475,11 +482,24 @@ impl Drive {
                 query.push(("pageToken".to_string(), token.clone()));
             }
             let reply = self.send("files.list", &|client| client.get(&url).query(&query))?;
+            if reply.status == 400 && page_token.is_some() && restarts < self.max_attempts {
+                // Drive page tokens can expire. Discard the partial view and restart.
+                restarts += 1;
+                files.clear();
+                seen_tokens.clear();
+                page_token = None;
+                continue;
+            }
             if reply.status != 200 {
                 return Err(reply.error("files.list"));
             }
             let listing: Listing = serde_json::from_slice(&reply.body)
                 .map_err(|_| "drive files.list: malformed response")?;
+            if listing.incomplete_search {
+                return Err(
+                    "drive files.list: incompleteSearch; no complete archive inventory".into(),
+                );
+            }
             files.extend(
                 listing
                     .files
@@ -487,7 +507,12 @@ impl Drive {
                     .filter(|file| file.name.starts_with(prefix)),
             );
             match listing.next_page_token {
-                Some(token) => page_token = Some(token),
+                Some(token) => {
+                    if !seen_tokens.insert(token.clone()) {
+                        return Err("drive files.list: repeated page token".into());
+                    }
+                    page_token = Some(token);
+                }
                 None => return Ok(files),
             }
         }
@@ -707,6 +732,34 @@ impl Drive {
             sha256: Some(sha256),
             ..remote
         })
+    }
+
+    /// Confirms a listed file's size and checksum, reading bytes when Drive omits SHA-256.
+    pub fn listed_identity(&mut self, remote: &RemoteFile) -> Result<ObjectIdentity, String> {
+        if remote.trashed {
+            return Err(format!("drive: {} is trashed", remote.id));
+        }
+        let bytes = remote
+            .size
+            .ok_or_else(|| format!("drive: {} reports no size", remote.id))?;
+        let identity = if let Some(sha256) = &remote.sha256 {
+            ObjectIdentity {
+                bytes,
+                sha256: sha256.to_ascii_lowercase(),
+                crc32c: 0,
+            }
+        } else {
+            let identity = self.hash(&remote.id)?;
+            if identity.bytes != bytes {
+                return Err(format!(
+                    "drive: {} readback size disagrees with listing",
+                    remote.id
+                ));
+            }
+            identity
+        };
+        self.verify(&remote.id, &identity)?;
+        Ok(identity)
     }
 
     /// Reads file `id` back completely and returns its identity without keeping the bytes.
