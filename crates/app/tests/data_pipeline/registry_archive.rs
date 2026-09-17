@@ -34,6 +34,9 @@ pub(super) fn registry_state(directory: &Path) -> Value {
                 .unwrap()
                 .remove(change["key"].as_str().unwrap());
         }
+        if change["kind"] == "legacy" {
+            state["legacy"][change["alias"].as_str().unwrap()] = change["entry"].clone();
+        }
         state["sequence"] = record["sequence"].clone();
     }
     state
@@ -582,6 +585,271 @@ fn archive_daily_fresh_restore_verifies_every_partition_for_both_brokers() {
 }
 
 #[test]
+fn restored_daily_seed_updates_and_archives_without_legacy_data() {
+    let (scratch, fake, pair, config) = archive_fixture("restore_update", true, false);
+    pipeline("archive", &config, &[]).unwrap();
+    let (id, original) = remote_catalogs(&fake).remove(0);
+    let producer = scratch.path("producer/store");
+    fs::remove_file(producer.join(pair.v1.key())).unwrap();
+    for object in &pair.v1.objects {
+        if !pair
+            .v2
+            .objects
+            .iter()
+            .any(|retained| retained.key == object.key)
+        {
+            fs::remove_file(producer.join(&object.key)).unwrap();
+        }
+    }
+    let from = pair.bars.last().unwrap().start_unix_s + 5;
+    let to = from + 30;
+    let broker = serve_broker(Kind::Pocket { from: from - 5, to });
+    let core = fs::read_to_string(scratch.path("core.toml"))
+        .unwrap()
+        .replace("ws://127.0.0.1:9/socket.io/", &broker.url)
+        .replace("overlap_seconds = 60", "overlap_seconds = 1");
+    fs::write(scratch.path("core.toml"), &core).unwrap();
+    write_evidence(&scratch, "first", &core);
+    let consumer = scratch.path("consumer.toml");
+    fs::write(
+        &consumer,
+        pipeline_toml(
+            &scratch.path("consumer"),
+            &fake.base,
+            &[("first", "core.toml")],
+            None,
+            3,
+        ),
+    )
+    .unwrap();
+    let hash = binary_alpha_engine::hex(&Sha256::digest(&fake.files()[&id].bytes));
+    pipeline(
+        "restore",
+        &consumer,
+        &[
+            "--catalog",
+            &id,
+            "--sha256",
+            &hash,
+            "--broker",
+            "pocket_option",
+            "--symbol",
+            "AEDCNY_otc",
+        ],
+    )
+    .unwrap();
+    let root = scratch.path("consumer/store");
+    assert!(!root.join(pair.v1.key()).exists());
+    let result = pipeline("update", &consumer, &["--end", &time_text(to * 1_000_000)]).unwrap();
+    let line = job_line(&result, "first");
+    assert_eq!(field(line, "status"), "archived");
+    let generation = field(line, "dataset");
+    let updated = dataset(&root, generation);
+    let mut expected: Vec<Bar> = pair
+        .bars
+        .iter()
+        .map(|bar| Bar {
+            start_unix_s: bar.start_unix_s,
+            open: bar.open,
+            high: bar.high,
+            low: bar.low,
+            close: bar.close,
+            volume: bar.volume,
+            period_s: bar.period_s,
+            provider: (),
+        })
+        .collect();
+    expected.extend((from..to).step_by(5).map(|start_unix_s| {
+        let [open, high, low, close, volume] = synthetic_bar(start_unix_s);
+        Bar {
+            start_unix_s,
+            open,
+            high,
+            low,
+            close,
+            volume,
+            period_s: 5,
+            provider: (),
+        }
+    }));
+    assert_eq!(
+        bars(&root, &updated),
+        expected,
+        "every restored partition and appended provider row must survive update"
+    );
+    let lineage = updated
+        .objects
+        .iter()
+        .find(|object| object.path == binary_alpha_app::lineage::LINEAGE_PATH)
+        .unwrap();
+    assert_eq!(
+        read_json(&root.join(&lineage.key))["continuation"]["seed"]["generation"],
+        pair.v2.generation
+    );
+    common::verify(&root.join(updated.key())).unwrap();
+    assert!(!root.join(pair.v1.key()).exists());
+    assert!(!broker.requests().is_empty());
+    assert!(broker.forbidden().is_empty());
+    let catalogs = remote_catalogs(&fake);
+    let (catalog_id, archived) = catalogs
+        .iter()
+        .find(|(_, c)| c.dataset.generation == generation)
+        .unwrap();
+    assert_eq!(catalog_id, field(line, "catalog"));
+    assert_eq!(archived.stream.generation, field(line, "stream"));
+    let remote = fake.files();
+    for object in &archived.objects {
+        let bytes = fs::read(root.join(&object.key)).unwrap();
+        assert_eq!(remote[&object.file_id].bytes, bytes);
+        assert_eq!(
+            binary_alpha_engine::hex(&Sha256::digest(&bytes)),
+            object.sha256
+        );
+        assert_eq!(bytes.len() as u64, object.bytes);
+        if let Some(prior) = original
+            .objects
+            .iter()
+            .find(|prior| prior.key == object.key)
+        {
+            assert_eq!(
+                object.file_id, prior.file_id,
+                "retained objects reuse their original archive binding"
+            );
+        }
+    }
+    // Assert a specific retained page, so the reuse oracle cannot pass on an empty intersection.
+    let page_key = pair
+        .v2
+        .day_inventory
+        .iter()
+        .find(|day| day.family == dataset::DayFamily::Pages)
+        .unwrap()
+        .object
+        .as_ref()
+        .unwrap();
+    assert_eq!(
+        archived
+            .objects
+            .iter()
+            .find(|o| &o.key == page_key)
+            .unwrap(),
+        original
+            .objects
+            .iter()
+            .find(|o| &o.key == page_key)
+            .unwrap(),
+    );
+}
+
+#[test]
+fn restore_rejects_hash_consistent_later_dataset_and_stream_inventory() {
+    for pocket in [false, true] {
+        let (scratch, fake, pair, config) = archive_fixture(
+            if pocket {
+                "restore_invalid_pocket"
+            } else {
+                "restore_invalid_deriv"
+            },
+            pocket,
+            false,
+        );
+        pipeline("archive", &config, &[]).unwrap();
+        let original = remote_catalogs(&fake)[0].1.clone();
+        for is_stream in [false, true] {
+            let kind = if is_stream { "stream" } else { "dataset" };
+            let mut catalog = original.clone();
+            let entry = if is_stream {
+                &mut catalog.stream
+            } else {
+                &mut catalog.dataset
+            };
+            let mut remote = fake.state.lock().unwrap();
+            let mut manifest: Value =
+                serde_json::from_slice(&remote.files[&entry.file_id].bytes).unwrap();
+            let day = manifest["day_inventory"]
+                .as_array_mut()
+                .unwrap()
+                .iter_mut()
+                .rev()
+                .find(|day| day["date"] == fixture::LAST && day["rows"].as_u64().unwrap() > 1)
+                .unwrap();
+            let expected_day: dataset::DayInventoryEntry =
+                serde_json::from_value(day.clone()).unwrap();
+            let first = binary_alpha_engine::market::parse_event_time_micros(
+                day["first_time"].as_str().unwrap(),
+            )
+            .unwrap();
+            // Keep every object and aggregate row count intact. Only the later partition's
+            // declared first time lies: byte hashes and manifest validation still succeed.
+            day["first_time"] = json!(time_text(first + 1));
+            let bytes = serde_json::to_vec(&manifest).unwrap();
+            if is_stream {
+                StreamManifest::from_json(&bytes).unwrap();
+            } else {
+                GenerationManifest::from_json(&bytes).unwrap();
+            }
+            entry.file_id = format!("invalid-{kind}-manifest");
+            entry.bytes = bytes.len() as u64;
+            entry.sha256 = binary_alpha_engine::hex(&Sha256::digest(&bytes));
+            remote.files.insert(
+                entry.file_id.clone(),
+                RemoteEntry {
+                    name: format!("manifest-{}.json", entry.generation),
+                    bytes,
+                    trashed: false,
+                },
+            );
+            let bytes = serde_json::to_vec(&catalog).unwrap();
+            Catalog::from_json(&bytes).unwrap();
+            let hash = binary_alpha_engine::hex(&Sha256::digest(&bytes));
+            let id = format!("invalid-{kind}-catalog");
+            remote.files.insert(
+                id.clone(),
+                RemoteEntry {
+                    name: format!("catalog-{id}.json"),
+                    bytes,
+                    trashed: false,
+                },
+            );
+            drop(remote);
+            let consumer = scratch.path(&format!("consumer-{kind}.toml"));
+            let root = scratch.path(&format!("consumer-{kind}"));
+            fs::write(&consumer, pipeline_toml(&root, &fake.base, &[], None, 3)).unwrap();
+            let error = pipeline(
+                "restore",
+                &consumer,
+                &[
+                    "--catalog",
+                    &id,
+                    "--sha256",
+                    &hash,
+                    "--broker",
+                    pair.v2.broker.as_str(),
+                    "--symbol",
+                    pair.v2.provider_symbol.as_str(),
+                ],
+            )
+            .unwrap_err();
+            assert!(
+                error.contains(&format!(
+                    "{}: day inventory mismatch",
+                    expected_day.logical_path().unwrap()
+                )),
+                "{kind}: {error}"
+            );
+            // All bytes arrived with the exact pinned identities: rejection is semantic.
+            for object in &catalog.objects {
+                let identity = store::identify(&root.join("store").join(&object.key)).unwrap();
+                assert_eq!(
+                    (identity.bytes, identity.sha256),
+                    (object.bytes, object.sha256.clone())
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn pull_prefers_daily_layout_over_legacy_at_equal_coverage() {
     let (scratch, fake, pair, config) = archive_fixture("registry_pull_tie", false, false);
     pipeline("archive", &config, &[]).unwrap();
@@ -944,4 +1212,112 @@ fn legacy_catalog_sessions_keep_original_ids_despite_shared_registry_duplicates(
         );
         assert_eq!(remote.sessions.values().filter(|s| s.id == id).count(), 1);
     }
+}
+
+// Permanent adversarial regressions; every fixture is local or loopback.
+#[test]
+fn archive_rejects_trashed_completed_legacy_object() {
+    let (scratch, fake, pair, config) = archive_fixture("review_legacy_trashed", false, false);
+    let object = &pair.v2.objects[0];
+    let id = "trashed-legacy-object";
+    fake.state.lock().unwrap().files.insert(
+        id.into(),
+        RemoteEntry {
+            name: format!("object-{}", object.sha256),
+            bytes: fs::read(scratch.path("producer/store").join(&object.key)).unwrap(),
+            trashed: true,
+        },
+    );
+    let state = scratch.path("producer/pipeline_state/first");
+    fs::create_dir_all(&state).unwrap();
+    fs::write(
+        state.join("transfers.json"),
+        json!({"files": {&object.key: {"file_id":id, "done":true}}}).to_string(),
+    )
+    .unwrap();
+    let before = fs::read(state.join("transfers.json")).unwrap();
+    let result = pipeline("archive", &config, &[]);
+    let catalogs = remote_catalogs(&fake);
+    assert_eq!(fs::read(state.join("transfers.json")).unwrap(), before);
+    let error = result
+        .expect_err("must reject a trashed completed legacy entry before publishing a catalog");
+    assert!(error.contains("trashed"), "{error}");
+    assert!(catalogs.is_empty());
+    let registry = registry_state(&scratch.path("producer/pipeline_state/registry"));
+    assert!(registry["files"][&object.key].is_null());
+    assert_eq!(
+        registry["legacy"][format!("first/{}", object.key)]["file_id"],
+        id
+    );
+    // Reopening must keep rejecting the receipt, including after the trashed file is gone.
+    fake.state.lock().unwrap().files.remove(id);
+    let error = pipeline("archive", &config, &[]).unwrap_err();
+    assert!(error.contains("missing or trashed"), "{error}");
+    assert!(remote_catalogs(&fake).is_empty());
+    assert_eq!(fs::read(state.join("transfers.json")).unwrap(), before);
+}
+
+#[test]
+fn newest_daily_skips_unrelated_declared_holdout() {
+    let (scratch, _fake, pair, _config) = archive_fixture("review_unrelated_holdout", false, false);
+    let root = scratch.path("producer/store");
+    let protected = "f".repeat(64);
+    let protected_path = root.join(dataset::manifest_key(&protected));
+    fs::create_dir_all(protected_path.parent().unwrap()).unwrap();
+    fs::write(&protected_path, b"fixture must not be opened").unwrap();
+    let declaration = binary_alpha_engine::research::Declaration::from_json(&serde_json::to_vec(&json!({
+        "schema_version": 1, "operator": "fixture", "root": fixture::uri(&root), "namespace": "fixture",
+        "populations": [
+            {"id":"allowed", "role":"development", "instrument":pair.v2.instrument, "source":"synthetic", "coverage":pair.v2.coverage, "generations":[pair.v2.generation], "tokens":["allowed"]},
+            {"id":"unrelated", "role":"holdout", "instrument":"deriv:R_100", "source":"synthetic", "coverage":pair.v2.coverage, "generations":[protected], "tokens":["protected"]}
+        ]
+    })).unwrap()).unwrap();
+    let result = binary_alpha_app::lineage::newest_daily(
+        &store::Store::filesystem(&root),
+        &pair.v2.instrument,
+        pair.v2.role,
+        Access {
+            declaration: Some(&declaration),
+            certification: None,
+        },
+    );
+    assert_eq!(result.unwrap(), pair.v2.generation);
+    let denied = binary_alpha_app::lineage::newest_daily(
+        &store::Store::filesystem(&root),
+        "deriv:R_100",
+        dataset::DatasetRole::Holdout,
+        Access {
+            declaration: Some(&declaration),
+            certification: None,
+        },
+    )
+    .unwrap_err();
+    assert!(denied.contains("holdout data is protected"), "{denied}");
+}
+
+#[test]
+fn rebuild_checksumless_uses_one_full_readback() {
+    let scratch = Scratch::new("review_checksumless_rebuild");
+    let fake = serve_drive();
+    let settings = settings(&fake);
+    let mut drive = Drive::open(&settings).unwrap();
+    let state = scratch.path("pipeline_state");
+    let registry = Registry::open(&state, &settings, &mut drive).unwrap();
+    let (path, identity) = bytes_fixture(&scratch, "content");
+    let id = transfer(&registry, &mut drive, &path, &identity).unwrap();
+    fake.set(DriveFaults {
+        omit_sha256: true,
+        ..Default::default()
+    });
+    fake.state.lock().unwrap().media_requests.clear();
+    registry.rebuild(&mut drive).unwrap();
+    assert_eq!(
+        fake.state.lock().unwrap().media_requests,
+        vec![(id.clone(), None)],
+        "one complete readback suffices to confirm size and SHA-256"
+    );
+    assert_eq!(
+        registry_state(&state.join("registry"))["files"][dataset::object_key(&identity.sha256)],
+        json!({"file_id":id,"session":null,"done":true,"bytes":identity.bytes,"sha256":identity.sha256,"aliases":[]})
+    );
 }

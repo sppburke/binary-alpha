@@ -416,15 +416,32 @@ impl Registry {
                 (other.split_once('/').map(|(_, suffix)| suffix) == Some(key)).then_some(entry)
             })
         });
-        let (file_id, session) = if let Some(entry) = legacy.filter(|e| !e.done) {
-            (entry.file_id.clone(), entry.session.clone())
+        let legacy = match legacy {
+            Some(entry)
+                if entry.done
+                    && crate::retire::retired_closures(
+                        self.directory.parent().expect("state directory"),
+                    )?
+                    .contains(&entry.file_id) =>
+            {
+                None
+            }
+            entry => entry,
+        };
+        let (file_id, session, done) = if let Some(entry) = legacy {
+            // A completed legacy receipt is still binding even when its remote file is
+            // missing or trashed. Verify it before recording or allocating anything.
+            if entry.done {
+                drive.verify(&entry.file_id, identity)?;
+            }
+            (entry.file_id.clone(), entry.session.clone(), entry.done)
         } else {
-            (drive.generate_ids(1)?.remove(0), None)
+            (drive.generate_ids(1)?.remove(0), None, false)
         };
         let entry = Entry {
             file_id,
             session,
-            done: false,
+            done,
             bytes: identity.bytes,
             sha256: identity.sha256.clone(),
             aliases: BTreeSet::from([alias.into()]),

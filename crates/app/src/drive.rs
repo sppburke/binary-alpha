@@ -733,6 +733,9 @@ impl Drive {
                 .metadata(id)?
                 .ok_or_else(|| format!("drive: {id} vanished after completion"))?,
         };
+        if remote.trashed {
+            return Err(format!("drive: archived file {id} is trashed"));
+        }
         let sha256 = match &remote.sha256 {
             Some(sha256) => sha256.to_ascii_lowercase(),
             None => self.hash(id)?.sha256,
@@ -761,12 +764,14 @@ impl Drive {
         let bytes = remote
             .size
             .ok_or_else(|| format!("drive: {} reports no size", remote.id))?;
-        let identity = if let Some(sha256) = &remote.sha256 {
-            ObjectIdentity {
+        if let Some(sha256) = &remote.sha256 {
+            let identity = ObjectIdentity {
                 bytes,
                 sha256: sha256.to_ascii_lowercase(),
                 crc32c: 0,
-            }
+            };
+            self.verify(&remote.id, &identity)?;
+            Ok(identity)
         } else {
             let identity = self.hash(&remote.id)?;
             if identity.bytes != bytes {
@@ -775,10 +780,21 @@ impl Drive {
                     remote.id
                 ));
             }
-            identity
-        };
-        self.verify(&remote.id, &identity)?;
-        Ok(identity)
+            // Recheck current metadata against the measured bytes without downloading them
+            // a second time when Drive still reports no checksum.
+            let current = self
+                .metadata(&remote.id)?
+                .ok_or_else(|| format!("drive: {} vanished after readback", remote.id))?;
+            self.confirm(
+                &remote.id,
+                RemoteFile {
+                    sha256: current.sha256.or_else(|| Some(identity.sha256.clone())),
+                    ..current
+                },
+                &identity,
+            )?;
+            Ok(identity)
+        }
     }
 
     /// Reads file `id` back completely and returns its identity without keeping the bytes.
