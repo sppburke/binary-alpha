@@ -575,6 +575,45 @@ Each entry: `date`, `family` (and candle `duration`/`offset`), `object` key or n
 - `unknown`: source evidence exists without a completeness claim (reason recorded, for example a Deriv historical gap with `complete: false`);
 - `empty_known`: evidence covers the whole day with zero rows (for example Deriv `market_closed: true` without clipping); `object` is null.
 
+#### Typed v2 acquisition coverage
+
+For `daily-v2`, `provenance/coverage.json` is the engine-owned
+`dataset::coverage::DailyCoverage` contract with `schema_version = 2`. Its required fields are
+`broker`, `provider_symbol`, `role`, `native_granularity`, `acquisitions`, and `days`.
+It rejects unknown fields and contains no page index. Each acquisition preserves
+`acquisition_id`, `source_identity`, `requested`, `verified`, `shortfalls` (each a `reason`
+and `unresolved` range), and `unresolved`. Ranges are ordered, nonoverlapping half-open
+`{start, end}` UTC intervals, measured in observation event time (bar starts). Empty request
+lists preserve imports that made no request claim. Cumulative verified ranges may extend
+outside the current request. Verified and unresolved acquisition spans cannot overlap;
+every requested span is accounted for, and every shortfall names unresolved coverage.
+
+Each `(family, date)` has exactly one `DayCoverage` record: `acquisition_ids`, a nonempty
+`basis` identifying the retained evidence, `verified` spans, `unresolved` spans, and nullable
+`reason`. Only observations and pages belong here. Verified day spans lie within that UTC
+day; unresolved spans must be their exact complement. No verified span derives `unknown`,
+a proper verified subset derives `partial`, and a fully verified day derives `complete`
+for nonzero rows or `empty_known` for zero rows. Incomplete days require a reason; complete
+days have none. Observation verification must be supported by the referenced acquisitions'
+verified ranges. Page evidence independently establishes retention of response occurrences;
+market coverage alone never proves page completeness. Producers must leave page days unknown
+when that evidence is unavailable. Rows can exist within unresolved spans: unresolved means
+incomplete acquisition, not proven absence. Unknown days record the whole day as unresolved.
+
+Verification authenticates and decodes this object, binds its instrument, role and native
+granularity to the dataset, and checks the exact day set, every state, reason and unresolved
+interval against the inventory, including zero-row days. The evidence is a retained source
+claim, not a new inference from sparse observations or authority to read external data.
+
+V2 stream manifests also record `source_manifest_uri`. Verification first resolves their
+`source_generation` in the stream store (supporting fresh-store restores), then uses that
+explicit original reference if the local source is absent. Existing access checks precede
+source reads. The source dataset must verify and match the stream's identity and summary;
+unavailable evidence fails verification. Audit and verification share candle-day derivation
+for every source day, finalized candle-open day and pending day. Coverage through a finalizing
+bar concerns its event time (`known_at` minus native period), while retaining the candle-close
+bound. Old manifests without a source URI remain verifiable with their source in the same store.
+
 #### Deterministic encoding profile `daily-parquet-v1`
 
 Rows sorted canonically (observations and candles by time then original order; pages by `acquisition_id` then `ordinal`); fixed schema and semantic metadata per family; no generation, cutoff, or run metadata inside daily files; `parquet` crate 59.3.0 as pinned in `Cargo.lock`; Zstandard level 3; dictionary encoding off; statistics setting fixed; one row group per file; fixed numeric data page row and byte limits; every column written in canonical segments of exactly 8,192 values (the last shorter) regardless of how rows arrive upstream; writer `created_by` fixed to the profile name. Equal rows, schema, semantic metadata, and profile produce equal bytes; hash-equality tests vary upstream batch boundaries (777, 1,024, and 65,536 rows) and repeat writes. An unchanged day is referenced by key and never regenerated. A later profile version is a new layout input.

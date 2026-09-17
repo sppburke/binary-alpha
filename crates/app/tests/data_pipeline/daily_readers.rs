@@ -410,9 +410,15 @@ fn daily_recorded_warmup_preserves_full_history_and_pending_state() {
     }
     // A recorded market session exists but its first row is beyond the warm-up boundary.
     records[4] = support::scenario_tick(start, "1.8000");
+    for seconds in [5, 10, 15, 20, 25, 30] {
+        records.push(support::scenario_tick(
+            start + seconds * 1_000_000,
+            "1.8010",
+        ));
+    }
     let log = support::scenario_log(&records);
     let mut profiles = Vec::new();
-    let mut states = Vec::new();
+    let mut outputs = Vec::new();
     for v2 in [false, true] {
         let mut fixture = support::isolated_fixture(&base, if v2 { "v2" } else { "v1" });
         let live = fixture.config.live.as_mut().unwrap();
@@ -420,12 +426,12 @@ fn daily_recorded_warmup_preserves_full_history_and_pending_state() {
         live.compatibility.observation_start = format_event_time_micros(start);
         live.compatibility.observation_end = format_event_time_micros(start + 40_000_000);
         let recorded = RecordedConnector::from_jsonl(&log).unwrap();
-        let owner = support::runtime_with(
+        let mut owner = support::runtime_with(
             &fixture,
             live::Mode::Replay,
             &recorded,
             Box::new(live::control::FakeControl::new(start)),
-            |_| {},
+            |definition| definition.policy.replay.bindings.clear(),
             |m| m,
         )
         .unwrap();
@@ -434,10 +440,33 @@ fn daily_recorded_warmup_preserves_full_history_and_pending_state() {
         assert_eq!(profile.coverage, Some(pair.v1.coverage.clone()));
         assert!(profile.streams.iter().any(|s| s.withheld_observations > 0));
         profiles.push(normalize_profile(profile, "source"));
-        states.push(owner.engine().state_identity());
+        let observed = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let sink = observed.clone();
+        owner.feature_observer = Some(Box::new(move |instrument, produced| {
+            sink.borrow_mut().push((instrument, produced.clone()));
+        }));
+        owner.run_until(|_| recorded.exhausted()).unwrap().unwrap();
+        assert_eq!(
+            owner.features()[0].profile().observations,
+            pair.ticks.len() as u64 + 7
+        );
+        let observed = observed.borrow().clone();
+        assert_eq!(
+            observed.len(),
+            7,
+            "every recorded observation advanced features"
+        );
+        assert!(observed.iter().any(|(_, output)| !output.rows.is_empty()));
+        assert!(
+            observed
+                .iter()
+                .flat_map(|(_, output)| &output.rows)
+                .any(|(_, row)| row.values.iter().any(Option::is_some))
+        );
+        outputs.push(observed);
     }
     assert_eq!(profiles[0], profiles[1]);
-    assert_eq!(states[0], states[1]);
+    assert_eq!(outputs[0], outputs[1]);
     // The same real warm-up binder still rejects bar datasets before workers ingest them.
     let pocket_scratch = Scratch::new("daily_pocket_warmup_inputs");
     let pocket = common::daily::pair(&pocket_scratch, true);
@@ -479,6 +508,14 @@ fn daily_verify_refuses_wrong_date_missing_object_payload_and_inventory_tamperin
                             parse_event_time_micros(time.as_ref().unwrap()).unwrap()
                                 - 86_400_000_000,
                         ));
+                    }
+                    for interval in &mut day.unresolved {
+                        interval.start = format_event_time_micros(
+                            parse_event_time_micros(&interval.start).unwrap() - 86_400_000_000,
+                        );
+                        interval.end = format_event_time_micros(
+                            parse_event_time_micros(&interval.end).unwrap() - 86_400_000_000,
+                        );
                     }
                     pair.v2
                         .objects
@@ -571,23 +608,7 @@ fn daily_stream_keeps_an_earlier_pending_day_partial_and_rejects_tampering() {
     day.last_time = day.first_time.clone();
     day.unresolved[0].start = format_event_time_micros(tick.event_time_micros + 1);
     pair.v2.coverage.last_event_time = format_event_time_micros(tick.event_time_micros);
-    let provenance = scratch.path("cutoff.json");
-    fs::write(
-        &provenance,
-        b"{\"synthetic_cutoff\":\"2026-09-21T00:00:00Z\"}",
-    )
-    .unwrap();
-    *pair
-        .v2
-        .objects
-        .iter_mut()
-        .find(|o| o.path == "provenance/coverage.json")
-        .unwrap() = common::daily::object(
-        &root,
-        "provenance/coverage.json",
-        ObjectRole::Provenance,
-        &provenance,
-    );
+    write_coverage(&scratch, &mut pair.v2);
     publish(&root, &mut pair.v2);
     common::verify(&pair.path(&scratch, true)).unwrap();
     let path = audit(&scratch, &pair, true);
@@ -717,19 +738,7 @@ fn daily_offset_candle_completeness_requires_the_next_day_prefix() {
             _ => vec![],
         };
         pair.v2.coverage.last_event_time = day.last_time.clone().unwrap();
-        let file = scratch.path("dependency.json");
-        fs::write(&file, format!("{{\"synthetic\":\"{case}\"}}")).unwrap();
-        *pair
-            .v2
-            .objects
-            .iter_mut()
-            .find(|o| o.path == "provenance/coverage.json")
-            .unwrap() = common::daily::object(
-            &root,
-            "provenance/coverage.json",
-            ObjectRole::Provenance,
-            &file,
-        );
+        write_coverage(&scratch, &mut pair.v2);
         publish(&root, &mut pair.v2);
         common::verify(&pair.path(&scratch, true)).unwrap();
         let path = audit(&scratch, &pair, true);
