@@ -535,9 +535,21 @@ pub fn newest_daily(
     access: binary_alpha_engine::research::Access<'_>,
 ) -> Result<String, String> {
     use binary_alpha_engine::dataset::{GenerationManifest, Layout, manifest_key};
+    let generations: Vec<_> = match access.declaration {
+        Some(declaration) => declaration
+            .populations
+            .iter()
+            .filter(|population| population.instrument == instrument && population.role == role)
+            .flat_map(|population| population.generations.iter().cloned())
+            .collect(),
+        None => local.list_manifests()?,
+    };
     let mut candidates = Vec::new();
-    for generation in local.list_manifests()? {
+    for generation in generations {
         access.lookup(&generation)?;
+        if local.head(&manifest_key(&generation))?.is_none() {
+            continue;
+        }
         let mut bytes = Vec::new();
         local.read_to(&manifest_key(&generation), None, &mut bytes)?;
         if crate::verify::manifest_kind(&bytes)?.is_some() {

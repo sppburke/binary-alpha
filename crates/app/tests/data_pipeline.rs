@@ -455,6 +455,7 @@ struct DriveState {
     sessions: BTreeMap<String, Session>,
     next: usize,
     log: Vec<String>,
+    media_requests: Vec<(String, Option<String>)>,
     faults: DriveFaults,
 }
 
@@ -691,6 +692,12 @@ fn handle_http(
     let media_download = request.method == "GET"
         && request.path.starts_with("/drive/v3/files/")
         && request.query.get("alt").map(String::as_str) == Some("media");
+    if media_download {
+        state.media_requests.push((
+            request.path.trim_start_matches("/drive/v3/files/").into(),
+            request.headers.get("range").cloned(),
+        ));
+    }
     if content_upload && let Some(gate) = state.faults.upload_gate.take() {
         drop(state);
         gate.lock()
