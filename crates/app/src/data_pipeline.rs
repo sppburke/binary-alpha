@@ -406,6 +406,8 @@ struct Intent {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct Pending {
     intent: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    acquisition_id: Option<String>,
     effective_config_hash: String,
     progress: Progress,
 }
@@ -455,6 +457,8 @@ struct Receipt {
     job: String,
     intent: String,
     status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    acquisition_id: Option<String>,
     dataset_generation: Option<String>,
     stream_generation: Option<String>,
     coverage: Option<fetch::HistoryCoverage>,
@@ -856,8 +860,12 @@ fn imported_seed(
     broker: &BrokerId,
     symbol: &str,
     role: DatasetRole,
+    access: Access<'_>,
 ) -> Result<Option<String>, String> {
     let instrument = format!("{broker}:{symbol}");
+    if let Some(root) = crate::lineage::root(local, &instrument, role, access)? {
+        return Ok(Some(root));
+    }
     let mut newest: Option<(String, String)> = None;
     for generation in local.list_manifests()? {
         let mut bytes = Vec::new();
@@ -957,6 +965,20 @@ fn run_jobs(
         declaration: declaration.as_ref(),
         certification: None,
     };
+    // No acquisition or publication may race reachability checks and single-page deletion.
+    let reclaim = || -> Result<(), String> {
+        for job in &config.jobs {
+            crate::lineage::reclaim(
+                &layout.store(),
+                &layout.job_state(&job.id)?,
+                &layout.state,
+                &layout.records(),
+                access,
+            )?;
+        }
+        Ok(())
+    };
+    reclaim()?;
     let workers = usize::try_from(config.parallel_jobs.unwrap_or(1))
         .unwrap_or(1)
         .min(config.jobs.len())
@@ -1014,6 +1036,7 @@ fn run_jobs(
         }
         Ok::<_, String>(failed)
     })?;
+    reclaim()?;
     failed.sort_unstable();
     if failed.is_empty() {
         Ok(())
@@ -1071,7 +1094,7 @@ fn update_job(
         .iter()
         .find(|broker| broker.id() == &history.broker)
         .expect("bound broker");
-    let imported = imported_seed(&local, &history.broker, &bound.symbol, history.role)?
+    let imported = imported_seed(&local, &history.broker, &bound.symbol, history.role, access)?
         .ok_or_else(|| {
             format!(
                 "job {}: the store holds no imported generation for {}:{}; run `data import` first",
@@ -1081,6 +1104,13 @@ fn update_job(
     let pending_path = state.join("progress.json");
     let pages_path = state.join("progress.pages.jsonl");
     let (pending, partial) = read_pending(&pending_path, &pages_path)?;
+    let (diagnostics, received_partial) = crate::lineage::diagnostics(
+        &state,
+        pending.as_ref().map(|p| p.progress.pages.as_slice()),
+    )?;
+    if received_partial {
+        writeln!(out, "pipeline job {} received log: incomplete response metadata retained as unresolved; single-page reclamation deferred", job.id).map_err(|e| e.to_string())?;
+    }
     if partial {
         writeln!(
             out,
@@ -1162,10 +1192,21 @@ fn update_job(
     let deadline = clock
         .now_micros()
         .saturating_add(i64::from(history.max_elapsed_seconds.expect("bound")) * 1_000_000);
+    let token = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|e| e.to_string())?
+        .as_nanos()
+        .to_string();
+    let acquisition_id = publish(
+        &records,
+        &format!("{}-acquisition", job.id),
+        &serde_json::json!({"schema_version": 1, "intent": intent, "invocation": token, "process": std::process::id()}),
+    )?;
     let intent_name = intent.clone();
     let mut persist = |event: ProgressEvent<'_>| -> Result<(), String> {
         match event {
             ProgressEvent::Started(progress) => {
+                crate::lineage::clear_received(&state)?;
                 // A crash after removing a completed header can leave its old log behind.
                 File::create(&pages_path)
                     .map_err(|error| format!("cannot create {}: {error}", pages_path.display()))?;
@@ -1173,10 +1214,21 @@ fn update_job(
                     &pending_path,
                     &json_bytes(&Pending {
                         intent: intent_name.clone(),
+                        acquisition_id: Some(acquisition_id.clone()),
                         effective_config_hash: binding.clone(),
                         progress: progress.clone(),
                     })?,
                 )
+            }
+            ProgressEvent::Received(page) => crate::lineage::received(&state, page),
+            ProgressEvent::Invalidate => {
+                if let Some(mut pending) = read_json::<Pending>(&pending_path)? {
+                    pending.progress.pages.clear();
+                    write_atomic(&pending_path, &json_bytes(&pending)?)?;
+                }
+                File::create(&pages_path)
+                    .and_then(|f| f.sync_all())
+                    .map_err(|e| format!("cannot invalidate {}: {e}", pages_path.display()))
             }
             ProgressEvent::Page(page) => {
                 let mut line = serde_json::to_vec(page).map_err(|error| error.to_string())?;
@@ -1196,14 +1248,20 @@ fn update_job(
                         line.len()
                     ));
                 }
-                file.flush()
-                    .map_err(|error| format!("cannot flush {}: {error}", pages_path.display()))
+                file.sync_all()
+                    .map_err(|error| format!("cannot sync {}: {error}", pages_path.display()))
             }
         }
     };
     let mut adapter = broker::connect(&config)?;
     let outcomes = {
         let mut bounds = Bounds {
+            diagnostics,
+            acquisition: Some(fetch::OccurrenceIdentity {
+                acquisition_id: acquisition_id.clone(),
+                intent: Some(intent.clone()),
+                ordinal: 0,
+            }),
             max_pages: history.max_pages,
             deadline_micros: Some(deadline),
             clock,
@@ -1224,15 +1282,17 @@ fn update_job(
     let [outcome] = outcomes.as_slice() else {
         return Err(format!("job {}: expected one acquisition outcome", job.id));
     };
-    if !outcome.pending {
-        // The intent closed: reaching its start or a terminal provider shortfall.
-        for path in [&pending_path, &pages_path] {
-            match fs::remove_file(path) {
-                Ok(()) => {}
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => return Err(format!("cannot remove {}: {error}", path.display())),
-            }
-        }
+    let daily = outcome
+        .generation
+        .as_deref()
+        .map(|g| {
+            read_manifest(&local, g)
+                .map(|(m, _)| m.layout == Some(binary_alpha_engine::dataset::Layout::DailyV2))
+        })
+        .transpose()?
+        .unwrap_or(false);
+    if !outcome.pending && !daily {
+        crate::lineage::clear_pending(&state)?;
     }
     let (stream, catalog) = match &outcome.generation {
         Some(dataset) => {
@@ -1255,7 +1315,7 @@ fn update_job(
         (false, true, Some(_)) => "archived_with_gaps",
         (false, false, Some(_)) => "archived",
     };
-    publish(
+    let receipt = publish(
         &records,
         &format!("{}-receipt", job.id),
         &Receipt {
@@ -1264,6 +1324,7 @@ fn update_job(
             job: job.id.clone(),
             intent: intent.clone(),
             status: status.into(),
+            acquisition_id: Some(acquisition_id),
             dataset_generation: outcome.generation.clone(),
             stream_generation: stream.clone(),
             coverage: Some(outcome.coverage.clone()),
@@ -1272,6 +1333,23 @@ fn update_job(
             pending: outcome.pending,
         },
     )?;
+    if !outcome.pending
+        && let Some(generation) = &outcome.generation
+    {
+        let (manifest, _) = read_manifest(&local, generation)?;
+        if manifest.layout == Some(binary_alpha_engine::dataset::Layout::DailyV2) {
+            crate::lineage::schedule_reclamation(
+                &state,
+                &intent,
+                &receipt,
+                generation,
+                &outcome.receipts,
+            )?;
+        }
+    }
+    if !outcome.pending {
+        crate::lineage::clear_pending(&state)?;
+    }
     let line = format!(
         "pipeline update {} {} cutoff {} status {status} requested {} {} verified {} shortfall {} dataset {} stream {} catalog {} sha256 {}",
         job.id,

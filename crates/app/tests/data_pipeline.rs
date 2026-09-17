@@ -4,6 +4,8 @@
 //! Every broker frame, archive byte, and Drive response here is synthetic.
 
 mod common;
+#[path = "data_pipeline/lineage.rs"]
+mod lineage;
 
 use std::collections::BTreeMap;
 use std::fs::{self, File};
@@ -1331,7 +1333,7 @@ fn pipeline(command: &str, config: &Path, extra: &[&str]) -> Result<String, Stri
 }
 
 fn import(config: &Path) -> Result<String, String> {
-    run(&["data", "import", "--config", config.to_str().unwrap()])
+    lineage::legacy_import(config)
 }
 
 fn imported_generation<'a>(report: &'a str, instrument: &str) -> &'a str {
