@@ -20,7 +20,8 @@ use crate::drive::Drive;
 use crate::store::{self, ObjectIdentity, Store};
 use crate::verify;
 
-const SCHEMA: u32 = 1;
+// Schema 1 seals predate verified migration and reliable pending-acquisition authorization.
+const SCHEMA: u32 = 2;
 const BATCH: usize = 32;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -89,7 +90,7 @@ pub struct Totals {
     pub drive_bytes: u64,
 }
 
-/// Version 1 plan: the exact pre-state, reachability decisions, retained verification roots,
+/// Version 2 plan: the exact pre-state, reachability decisions, retained verification roots,
 /// and ordered deletion inventory. Its SHA-256 is the plan filename and progress binding.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -125,6 +126,89 @@ struct Archive {
     stream: String,
     job: String,
     end: String,
+}
+
+/// Completed migration evidence in pipeline_state/records. All equalities refer to this
+/// exact mapping; layout/coverage and a converted phase alone never authorize retirement.
+#[derive(Deserialize)]
+struct MigrationEvidence {
+    schema_version: u32,
+    job: String,
+    phase: String,
+    v1_generations: BTreeSet<String>,
+    v1_stream: String,
+    v2_root: String,
+    v2_stream: String,
+    equality: MigrationEquality,
+}
+
+#[derive(Deserialize)]
+struct MigrationEquality {
+    observations: bool,
+    pages: bool,
+    source_files: bool,
+    candles: bool,
+}
+
+#[derive(Deserialize)]
+struct MigrationLineage {
+    v1_generations: BTreeSet<String>,
+    v1_stream: String,
+}
+
+fn verified_replacements(
+    records: &[MigrationEvidence],
+    job: &str,
+    root: &str,
+    lineage: &Value,
+    manifests: &BTreeMap<String, Manifest>,
+    retired: &BTreeSet<String>,
+) -> Result<BTreeSet<String>, String> {
+    let mapping: MigrationLineage = serde_json::from_value(lineage.clone())
+        .map_err(|_| format!("retire: unresolved migration mapping for {root}"))?;
+    let instrument = &manifests[root].instrument;
+    let valid_old = |id: &String, dataset: bool| {
+        hex_id(id)
+            && manifests.get(id).map_or_else(
+                || retired.contains(id),
+                |m| m.ordinary && !m.daily && m.dataset == dataset && &m.instrument == instrument,
+            )
+    };
+    if mapping.v1_generations.is_empty()
+        || !mapping.v1_generations.iter().all(|id| valid_old(id, true))
+        || !valid_old(&mapping.v1_stream, false)
+        || manifests.get(&mapping.v1_stream).is_some_and(|m| {
+            !m.value["source_generation"]
+                .as_str()
+                .is_some_and(|id| mapping.v1_generations.contains(id))
+        })
+        || !records.iter().any(|record| {
+            record.schema_version == 1
+                && record.phase == "verified"
+                && record.job == job
+                && record.v1_generations == mapping.v1_generations
+                && record.v1_stream == mapping.v1_stream
+                && record.v2_root == root
+                && record.equality.observations
+                && record.equality.pages
+                && record.equality.source_files
+                && record.equality.candles
+                && manifests.get(&record.v2_stream).is_some_and(|m| {
+                    m.ordinary
+                        && m.daily
+                        && !m.dataset
+                        && &m.instrument == instrument
+                        && m.value["source_generation"] == root
+                })
+        })
+    {
+        return Err(format!(
+            "retire: missing verified migration evidence for {root}"
+        ));
+    }
+    let mut replaced = mapping.v1_generations;
+    replaced.insert(mapping.v1_stream);
+    Ok(replaced)
 }
 
 fn hash(bytes: &[u8]) -> String {
@@ -662,6 +746,25 @@ fn check_parents(value: &Value, known: &BTreeSet<String>) -> Result<(), String> 
     Ok(())
 }
 
+fn registry_document(path: &Path, state: &Path) -> bool {
+    let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+        return false;
+    };
+    if path.parent() == Some(state) {
+        return matches!(
+            name,
+            "registry.json"
+                | "registry.jsonl"
+                | "registry.ndjson"
+                | "registry.snapshot.json"
+                | "registry.log.jsonl"
+                | "registry.log"
+                | "transfers.json"
+        );
+    }
+    path.parent().and_then(Path::parent) == Some(state) && name == "transfers.json"
+}
+
 fn documents(path: &Path) -> Result<Vec<Value>, String> {
     let bytes = fs::read(path).map_err(|e| e.to_string())?;
     if bytes.is_empty() {
@@ -835,6 +938,16 @@ fn plan(
     let remote = remote_state(drive)?;
     let manifests = manifests(layout, access)?;
     let archives = archives(drive, layout, &remote, access)?;
+    let mut record_paths = Vec::new();
+    files(&layout.state.join("records"), &mut record_paths)?;
+    let mut migrations = Vec::new();
+    for path in &record_paths {
+        for value in documents(path)? {
+            if let Ok(record) = serde_json::from_value::<MigrationEvidence>(value) {
+                migrations.push(record);
+            }
+        }
+    }
     let mut selected = BTreeMap::new();
     for job in &config.jobs {
         if job_filter.is_some_and(|id| id != job.id) {
@@ -881,7 +994,7 @@ fn plan(
         .cloned()
         .collect();
     let mut replaced = BTreeSet::new();
-    for (instrument, catalog_id) in selected.values() {
+    for (job, (instrument, catalog_id)) in &selected {
         let archive = archives
             .iter()
             .find(|a| &a.file.file_id == catalog_id)
@@ -936,38 +1049,37 @@ fn plan(
                 "retire: unresolved continuation lineage for {instrument}"
             ));
         }
-        // Only the selected catalog's ancestry authorizes replacement. The immutable mapping
-        // is migration's lossless proof; daily verification above independently checks storage.
-        for id in ancestors {
-            if let Some(value) = lineage.get(&id) {
-                let mut refs = BTreeSet::new();
-                references(value, &generation_names, &mut refs);
-                for id in refs {
-                    if let Some(old) = manifests.get(&id)
-                        && old.ordinary
-                        && !old.daily
-                        && old.dataset
-                        && &old.instrument == instrument
-                        && newest.value["coverage"]["first_event_time"].as_str()
-                            <= old.value["coverage"]["first_event_time"].as_str()
-                        && newest.value["coverage"]["last_event_time"].as_str()
-                            >= old.value["coverage"]["last_event_time"].as_str()
-                    {
-                        replaced.insert(id);
-                    }
-                }
+        // Require completed lossless verification for the selected ancestry's root. A later
+        // lineage document cannot grant additional replacement authority just by naming v1.
+        let root = continuation_roots[0];
+        let verified = verified_replacements(
+            &migrations,
+            job,
+            root,
+            &lineage[root],
+            &manifests,
+            &already_retired,
+        )?;
+        for id in &verified {
+            if let Some(old) = manifests.get(id)
+                && old.dataset
+                && newest.value["coverage"]["first_event_time"].as_str()
+                    <= old.value["coverage"]["first_event_time"].as_str()
+                && newest.value["coverage"]["last_event_time"].as_str()
+                    >= old.value["coverage"]["last_event_time"].as_str()
+            {
+                replaced.insert(id.clone());
             }
         }
-    }
-    for (id, m) in &manifests {
-        if !m.daily
-            && !m.dataset
-            && m.ordinary
-            && m.value["source_generation"]
-                .as_str()
-                .is_some_and(|source| replaced.contains(source))
-        {
-            replaced.insert(id.clone());
+        for id in verified {
+            if let Some(old) = manifests.get(&id)
+                && !old.dataset
+                && old.value["source_generation"]
+                    .as_str()
+                    .is_some_and(|source| replaced.contains(source))
+            {
+                replaced.insert(id);
+            }
         }
     }
     let mut known: BTreeSet<String> = manifests.keys().cloned().collect();
@@ -1025,8 +1137,6 @@ fn plan(
         }
     }
     // Inventory all immutable records, including migration records regardless of their prefix.
-    let mut record_paths = Vec::new();
-    files(&layout.state.join("records"), &mut record_paths)?;
     let mut records = Vec::new();
     for path in record_paths {
         let id = path
@@ -1110,9 +1220,16 @@ fn plan(
         if path.extension().is_some_and(|e| e == "lock") {
             continue;
         }
+        // Acquisition references are inventoried independently below, regardless of any
+        // ancestor directory names or registry formats.
+        if path
+            .file_name()
+            .is_some_and(|n| n.to_string_lossy().starts_with("progress"))
+        {
+            continue;
+        }
         let values = documents(&path)?;
-        let registry = path.to_string_lossy().contains("transfer")
-            || path.to_string_lossy().contains("registry");
+        let registry = registry_document(&path, &layout.state);
         for value in values {
             let mut refs = BTreeSet::new();
             if registry {
@@ -1170,6 +1287,12 @@ fn plan(
             }
         }
         for value in documents(&path)? {
+            let mut refs = BTreeSet::new();
+            references(&value, &known, &mut refs);
+            for r in refs {
+                roots.insert(r.clone());
+                inventory.push((path.display().to_string(), r, "pending acquisition"));
+            }
             page_keys(&value, &mut roots);
         }
     }
@@ -1540,8 +1663,23 @@ fn seal(path: &Path, bytes: &[u8]) -> Result<(), String> {
     fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     // Publish via hard link: a crash during the scratch write can never leave a partial sealed
     // plan/record, and publication never replaces an existing immutable identity.
-    let scratch = parent.join(format!(".seal-{}", std::process::id()));
-    let mut file = File::create(&scratch).map_err(|e| e.to_string())?;
+    let mut collision = 0_u64;
+    let (scratch, mut file) = loop {
+        let scratch = parent.join(format!(".seal-{}-{collision}", std::process::id()));
+        match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&scratch)
+        {
+            Ok(file) => break (scratch, file),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                collision = collision
+                    .checked_add(1)
+                    .ok_or("retire: seal names exhausted")?;
+            }
+            Err(e) => return Err(e.to_string()),
+        }
+    };
     file.write_all(bytes)
         .and_then(|()| file.sync_all())
         .map_err(|e| e.to_string())?;
@@ -1641,8 +1779,10 @@ fn apply_plan(
         return Err("retire: altered plan".into());
     }
     let plan: Plan = serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
-    if plan.schema_version != SCHEMA
-        || plan.store != layout.store
+    if plan.schema_version != SCHEMA {
+        return Err("retire: unsupported plan schema; a new retirement plan is required".into());
+    }
+    if plan.store != layout.store
         || plan.archive_root != config.drive.root_folder_id
         || job.is_some_and(|j| plan.jobs != [j])
     {
@@ -1716,12 +1856,7 @@ fn apply_plan(
             }
             if index < plan.delete_drive.len() {
                 let item = &plan.delete_drive[index];
-                // Verify identity immediately before name-checked deletion. A missing file is
-                // an already-completed delete, including an ambiguous network response.
-                if drive.metadata(&item.file_id)?.is_some() {
-                    drive.verify(&item.file_id, &item.identity.remote())?;
-                }
-                drive.delete_named(&item.file_id, &item.name)?;
+                drive.delete_named(&item.file_id, &item.name, &item.identity.remote())?;
             } else {
                 let item = &plan.delete_local[index - plan.delete_drive.len()];
                 for (key, identity) in &item.files {

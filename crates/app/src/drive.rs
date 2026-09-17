@@ -352,30 +352,7 @@ impl Drive {
             retry.attempts += 1;
             let token = self.token()?;
             let request = build(&self.client).bearer_auth(&token);
-            let sent = self.runtime.block_on(async {
-                let response = request.send().await?;
-                let status = response.status().as_u16();
-                let header = |name: &str| {
-                    response
-                        .headers()
-                        .get(name)
-                        .and_then(|value| value.to_str().ok())
-                        .map(str::to_string)
-                };
-                let location = header("location");
-                let range_end = header("range").and_then(|range| {
-                    range
-                        .strip_prefix("bytes=0-")
-                        .and_then(|end| end.parse::<u64>().ok())
-                });
-                let body = response.bytes().await?.to_vec();
-                Ok::<_, reqwest::Error>(Reply {
-                    status,
-                    location,
-                    range_end,
-                    body,
-                })
-            });
+            let sent = self.send_once(request);
             match sent {
                 Ok(reply) if reply.status == 401 => {
                     unauthorized += 1;
@@ -397,6 +374,34 @@ impl Drive {
                 Err(error) => retry.retry(what, TransientFailure::Transport(error))?,
             }
         }
+    }
+
+    /// One transport attempt; callers own retries and any required preconditions.
+    fn send_once(&self, request: reqwest::RequestBuilder) -> Result<Reply, reqwest::Error> {
+        self.runtime.block_on(async {
+            let response = request.send().await?;
+            let status = response.status().as_u16();
+            let header = |name: &str| {
+                response
+                    .headers()
+                    .get(name)
+                    .and_then(|value| value.to_str().ok())
+                    .map(str::to_string)
+            };
+            let location = header("location");
+            let range_end = header("range").and_then(|range| {
+                range
+                    .strip_prefix("bytes=0-")
+                    .and_then(|end| end.parse::<u64>().ok())
+            });
+            let body = response.bytes().await?.to_vec();
+            Ok(Reply {
+                status,
+                location,
+                range_end,
+                body,
+            })
+        })
     }
 
     /// Pre-generates `count` file identifiers so a creation can be reconciled by identity,
@@ -453,22 +458,61 @@ impl Drive {
         }
     }
 
-    /// Delete one explicitly planned file only while its name still matches its recorded
-    /// content key. Missing files are successful resumptions of a previous deletion.
-    pub fn delete_named(&mut self, id: &str, name: &str) -> Result<(), String> {
-        let Some(file) = self.metadata(id)? else {
-            return Ok(());
-        };
-        if file.name != name {
-            return Err(format!(
-                "drive: refusing to delete {id}: recorded name mismatch"
-            ));
-        }
+    /// Delete one planned file, rechecking identity and name before every transport attempt.
+    /// Missing files are successful resumptions of a previous deletion.
+    pub fn delete_named(
+        &mut self,
+        id: &str,
+        name: &str,
+        identity: &ObjectIdentity,
+    ) -> Result<(), String> {
         let url = format!("{}/files/{id}", self.api);
-        let reply = self.send(&format!("files.delete {id}"), &|client| client.delete(&url))?;
-        match reply.status {
-            200 | 204 | 404 => Ok(()),
-            _ => Err(reply.error(&format!("files.delete {id}"))),
+        let what = format!("files.delete {id}");
+        let mut retry = RetryBudget::new(self.retry_budget);
+        let mut unauthorized = 0;
+        loop {
+            let Some(file) = self.metadata(id)? else {
+                return Ok(());
+            };
+            if file.id != id || file.name != name {
+                return Err(format!(
+                    "drive: refusing to delete {id}: recorded name mismatch"
+                ));
+            }
+            let file = self.confirm(id, file, identity)?;
+            // Confirmation can refresh missing metadata. Check the latest observed name
+            // and preserve verify's refusal to permanently remove a trashed target.
+            if file.id != id || file.name != name {
+                return Err(format!(
+                    "drive: refusing to delete {id}: recorded name mismatch"
+                ));
+            }
+            if file.trashed {
+                return Err(format!("drive: refusing to delete {id}: file is trashed"));
+            }
+            retry.attempts += 1;
+            let token = self.token()?;
+            let request = self.client.delete(&url).bearer_auth(&token);
+            match self.send_once(request) {
+                Ok(reply) if matches!(reply.status, 200 | 204 | 404) => return Ok(()),
+                Ok(reply) if reply.status == 401 => {
+                    unauthorized += 1;
+                    if unauthorized >= self.max_attempts {
+                        return Err(reply.error(&what));
+                    }
+                    self.access_token = None;
+                }
+                Ok(reply)
+                    if transient_status(reply.status, error_reason(&reply.body).as_deref()) =>
+                {
+                    retry.retry(
+                        &what,
+                        TransientFailure::Http(reply.status, error_reason(&reply.body)),
+                    )?;
+                }
+                Ok(reply) => return Err(reply.error(&what)),
+                Err(error) => retry.retry(&what, TransientFailure::Transport(error))?,
+            }
         }
     }
 
