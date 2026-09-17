@@ -119,7 +119,18 @@ fn daily_stream_checks_earlier_unknown_and_empty_days() {
                         .iter()
                         .find(|d| d.date == "2026-09-19" && d.duration == Some(5))
                         .unwrap();
-                    assert_eq!(day.state, DayState::EmptyKnown);
+                    // R_50 and OTC are always open: the empty observation day now
+                    // yields 17,280 engine candles and remains fully covered.
+                    assert_eq!(day.state, DayState::Complete);
+                    assert_eq!(day.rows, 17280);
+                    let removed = day.object.clone().unwrap();
+                    manifest
+                        .streams
+                        .iter_mut()
+                        .find(|s| s.duration_seconds == 5 && s.offset_seconds == 0)
+                        .unwrap()
+                        .rows -= 17280;
+                    manifest.objects.retain(|o| o.key != removed);
                     manifest
                         .day_inventory
                         .retain(|d| !(d.date == "2026-09-19" && d.duration == Some(5)));
@@ -136,10 +147,12 @@ fn daily_stream_checks_earlier_unknown_and_empty_days() {
             }
             fs::write(&path, manifest.to_json()).unwrap();
             let error = common::verify(&path).unwrap_err();
-            assert!(
-                error.contains("must be unknown") || error.contains("every expected source day"),
-                "{change}: {error}"
-            );
+            let expected = if change == "remove-empty-day" {
+                "session continuity mismatch"
+            } else {
+                "must be unknown"
+            };
+            assert!(error.contains(expected), "{change}: {error}");
         }
     }
 }
@@ -191,14 +204,22 @@ fn regression_completed_bar_candle_must_not_depend_on_next_bar_start() {
         5,
     )
     .unwrap();
-    assert_eq!(rows.len(), 1);
-    assert_eq!(rows[0].close_time_micros, micros(LAST) + 5_000_000);
-    assert_eq!(rows[0].known_at_micros, rows[0].close_time_micros);
+    // The always session fills the preceding 5,759 buckets. The last row is the
+    // same real cross-midnight candle, finalized by the bar ending at 00:00:05.
+    assert_eq!(rows.len(), 5760);
+    assert!(
+        rows[..5759]
+            .iter()
+            .all(|c| c.observations == 0 && !c.flags.clean())
+    );
+    let final_row = rows.last().unwrap();
+    assert_eq!(final_row.close_time_micros, micros(LAST) + 5_000_000);
+    assert_eq!(final_row.known_at_micros, final_row.close_time_micros);
     println!(
         "BAR DAY actual {:?}, reason {:?}; candle close/known_at {}, source unresolved starts {}",
         sunday.state,
         sunday.reason,
-        format_event_time_micros(rows[0].known_at_micros),
+        format_event_time_micros(final_row.known_at_micros),
         format_event_time_micros(micros(LAST) + 5_000_000)
     );
     assert_eq!(

@@ -1477,7 +1477,9 @@ fn convert(
             && bound
                 .core
                 .instrument(&m.definition.id(), newest.native_granularity)
-                == Some(&m.definition)
+                .is_some_and(|definition| {
+                    crate::session_migration::compatible(&m.definition, definition)
+                })
     });
     if streamed_source.is_some() && old_stream.is_none() {
         return Err("newest v1 stream definition differs from migration configuration".into());
@@ -1991,11 +1993,27 @@ fn verify_migration(
     let stream = read_stream(layout, &state.stream)?;
     let candles = if let Some(old_stream) = &state.old_stream {
         let before = read_stream(layout, old_stream)?;
-        if before.streams != stream.streams {
+        // SESSION MIGRATION HOOK: retain exact legacy equality under its original
+        // definition; data verify below independently proves the changed session product.
+        let reconstruction = stream
+            .definition
+            .session
+            .as_ref()
+            .map(|_| {
+                crate::session_migration::reconstruct(&local, &new, &before.definition, &proof)
+            })
+            .transpose()?;
+        let compared = reconstruction
+            .as_ref()
+            .map_or(&stream.streams, |r| &r.streams);
+        if &before.streams != compared {
             return Err("candle summaries differ".into());
         }
         let a = candle_digest(layout, &before)?;
-        let b = candle_digest(layout, &stream)?;
+        let b = match &reconstruction {
+            Some(r) => r.digest.clone(),
+            None => candle_digest(layout, &stream)?,
+        };
         if a != b {
             return Err("candle row equality proof failed".into());
         }
@@ -2008,7 +2026,10 @@ fn verify_migration(
             serde_json::from_reader(File::open(object_path(layout, o)?).map_err(err)?).map_err(err)
         };
         let mut a_profile = profile(&before)?;
-        let b_profile = profile(&stream)?;
+        let b_profile = match &reconstruction {
+            Some(r) => serde_json::to_value(&r.profile).map_err(err)?,
+            None => profile(&stream)?,
+        };
         a_profile["source"]["generation"] = json!(state.dataset);
         for calculation in a_profile["calculations"]
             .as_array_mut()
@@ -2043,7 +2064,7 @@ fn verify_migration(
                     .into(),
             );
         }
-        json!({"equal":true,"sha256":a,"profile_equal":true,"profile_substitution":{"from":before.source_generation,"to":state.dataset,"fields":["source.generation","calculations[*].reason.generation"]}})
+        json!({"equal":true,"sha256":a,"profile_equal":true,"basis":if reconstruction.is_some() {"legacy_definition_reconstruction"} else {"direct_product_equality"},"legacy_definition":before.definition,"legacy_streams":before.streams,"product_definition":stream.definition,"product_streams":stream.streams,"session_product_verified":reconstruction.is_some(),"profile_substitution":{"from":before.source_generation,"to":state.dataset,"fields":["source.generation","calculations[*].reason.generation"]}})
     } else {
         json!({"equal":null,"reason":"no v1 stream exists"})
     };

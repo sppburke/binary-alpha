@@ -15,6 +15,9 @@ pub mod replay;
 pub mod research;
 pub mod retire;
 pub mod search;
+mod session_audit;
+mod session_candles;
+mod session_migration;
 pub mod store;
 pub mod verify;
 

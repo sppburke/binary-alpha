@@ -564,7 +564,8 @@ fn verify_stream(
                     .all(|(facts, summary)| {
                         facts.duration_seconds == summary.duration_seconds
                             && facts.offset_seconds == summary.offset_seconds
-                            && facts.finalized == summary.rows
+                            && (manifest.layout.is_some() && definition.session.is_some()
+                                || facts.finalized == summary.rows)
                     });
             if !consistent {
                 return Err(format!(
@@ -602,7 +603,11 @@ fn verify_stream(
                 last_event_micros: rows.last().map(|c| c.open_time_micros),
             };
             crate::daily::check_inventory(day, &data)?;
-            if let Some(at) = rows.iter().map(|c| c.known_at_micros).max() {
+            if let Some(at) = rows
+                .iter()
+                .map(crate::session_candles::inventory_finalizer)
+                .max()
+            {
                 finalized_days
                     .entry(spec)
                     .or_default()
@@ -649,6 +654,7 @@ fn verify_stream(
     if manifest.layout.is_some() {
         let profile = observed_profile.ok_or("daily stream lacks profile")?;
         let source = stream_source(store, &manifest, access)?;
+        crate::session_audit::verify_continuity(store, &manifest, &source, &profile)?;
         for (index, summary) in manifest.streams.iter().enumerate() {
             let total = daily_totals
                 .get(&(summary.duration_seconds, summary.offset_seconds))
@@ -666,11 +672,12 @@ fn verify_stream(
             let expected = crate::audit::candle_inventory(
                 &manifest.definition.candles[index],
                 &source.day_inventory,
-                crate::audit::pending_open(&profile, index)?,
+                crate::audit::pending_open(&profile, index, manifest.definition.session.as_ref())?,
                 finalized_days
                     .get(&(summary.duration_seconds, summary.offset_seconds))
                     .unwrap_or(&std::collections::BTreeMap::new()),
                 source.native_granularity,
+                manifest.definition.session.as_ref(),
             )?;
             let actual: Vec<_> = manifest
                 .day_inventory

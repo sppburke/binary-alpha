@@ -440,7 +440,7 @@ fn fixture() -> Fixture {
     )
     .unwrap();
     let core = deriv_core("ws://127.0.0.1:9/", 60, 50, 60);
-    fs::write(scratch.path("job.toml"), core.replace("frxEURUSD", "R_50")).unwrap();
+    fs::write(scratch.path("job.toml"), synthetic_deriv(core)).unwrap();
     let shared = pair
         .v1
         .objects

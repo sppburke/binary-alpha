@@ -45,7 +45,7 @@ impl Pair {
             "{ kind = \"bar\", period_seconds = 5 }"
         };
         format!(
-            "\n[[instruments]]\nbroker = \"{}\"\nprovider_symbol = \"{}\"\nquote_currency = \"USD\"\nprice_scale = 4\nnative_granularity = {native}\ngap = {{ max_seconds = 2, reopen_seconds = 60 }}\ncandles = [{{ duration_seconds = 5, offset_seconds = 0 }}, {{ duration_seconds = 15, offset_seconds = 5 }}]\n",
+            "\n[[instruments]]\nbroker = \"{}\"\nprovider_symbol = \"{}\"\nquote_currency = \"USD\"\nprice_scale = 4\nsession = {{ kind = \"always\" }}\nnative_granularity = {native}\ngap = {{ max_seconds = 2, reopen_seconds = 60 }}\ncandles = [{{ duration_seconds = 5, offset_seconds = 0 }}, {{ duration_seconds = 15, offset_seconds = 5 }}]\n",
             self.v1.broker, self.v1.provider_symbol
         )
     }

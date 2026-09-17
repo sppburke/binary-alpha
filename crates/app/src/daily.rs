@@ -528,13 +528,19 @@ pub fn write_candles<B: IntoIterator<Item = Candle>>(
     candle_spec(duration, offset)?;
     let rows: Vec<_> = batches.into_iter().flatten().collect();
     check_candle_intervals(&rows)?;
+    for row in &rows {
+        crate::session_candles::check(row, binary_alpha_engine::continuous::fill(row).as_str())?;
+    }
     let summary = summary(date, &rows, candle_time, true)?;
     write_file(
         path,
-        archive::CANDLE_SCHEMA,
+        &crate::session_candles::schema(),
         archive::candle_metadata(instrument, scale, duration, offset),
         &rows,
         |c, i| match i {
+            33 => Value::Bytes(ByteArray::from(
+                binary_alpha_engine::continuous::fill(c).as_str(),
+            )),
             12 => c.volume.map_or(Value::Null, Value::Double),
             13 => c.gap_before_micros.map_or(Value::Null, Value::Int64),
             21..=32 => Value::Bool(archive::flag_field(c, i)),
@@ -568,9 +574,21 @@ pub fn read_candles(
     offset: u32,
 ) -> Result<Vec<Candle>, String> {
     candle_spec(duration, offset)?;
+    let reader = SerializedFileReader::new(File::open(path).map_err(err)?).map_err(err)?;
+    let has_fill = reader
+        .metadata()
+        .file_metadata()
+        .schema_descr()
+        .num_columns()
+        == 34;
+    let schema = if has_fill {
+        crate::session_candles::schema()
+    } else {
+        archive::CANDLE_SCHEMA.into()
+    };
     let rows = read_file(
         path,
-        archive::CANDLE_SCHEMA,
+        &schema,
         archive::candle_metadata(instrument, scale, duration, offset),
         |r| {
             let time = |c| r.get_timestamp_micros(c).map_err(err);
@@ -592,7 +610,7 @@ pub fn read_candles(
             if flags.complete() != flag(31)? || flags.clean() != flag(32)? {
                 return Err("candle complete/clean flags disagree".into());
             }
-            Ok(Candle {
+            let candle = Candle {
                 open_time_micros: time(0)?,
                 close_time_micros: time(1)?,
                 known_at_micros: time(2)?,
@@ -615,7 +633,11 @@ pub fn read_candles(
                 max_delayed_jump_basis_points: count(19)?,
                 max_reopen_jump_basis_points: count(20)?,
                 flags,
-            })
+            };
+            if has_fill {
+                crate::session_candles::check(&candle, r.get_string(33).map_err(err)?)?;
+            }
+            Ok(candle)
         },
     )?;
     check_candle_intervals(&rows)?;

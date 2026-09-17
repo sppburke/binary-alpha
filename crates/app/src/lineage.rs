@@ -52,6 +52,8 @@ pub struct MigrationEquality {
     pub observations: bool,
     pub pages: bool,
     pub source_files: bool,
+    /// Legacy candle evidence remains exactly reproducible. Session migrations record
+    /// reconstruction under the legacy definition separately from the new product proof.
     /// None means there was no legacy stream to compare, not a measured equality.
     pub candles: Option<bool>,
 }
@@ -71,12 +73,51 @@ pub struct MigrationRecord {
     pub evidence: BTreeMap<String, Value>,
 }
 impl MigrationRecord {
+    fn session_proof_consistent(&self) -> bool {
+        let Some(candles) = self.evidence.get("proofs").and_then(|p| p.get("candles")) else {
+            return true; // Legacy records predate the session-product proof.
+        };
+        match candles.get("basis").and_then(Value::as_str) {
+            Some("legacy_definition_reconstruction") => {}
+            Some("direct_product_equality") => {
+                return candles["equal"] == true
+                    && candles["profile_equal"] == true
+                    && candles["session_product_verified"] == false
+                    && candles["product_definition"].is_object()
+                    && candles["product_definition"]["session"].is_null()
+                    && candles["legacy_definition"] == candles["product_definition"]
+                    && candles["legacy_streams"].is_array()
+                    && candles["legacy_streams"] == candles["product_streams"];
+            }
+            Some(_) => return false,
+            None => {
+                return [
+                    "basis",
+                    "session_product_verified",
+                    "legacy_definition",
+                    "product_definition",
+                    "legacy_streams",
+                    "product_streams",
+                ]
+                .iter()
+                .all(|field| candles.get(field).is_none());
+            }
+        }
+        candles["equal"] == true
+            && candles["profile_equal"] == true
+            && candles["session_product_verified"] == true
+            && candles["legacy_definition"].is_object()
+            && candles["product_definition"]["session"].is_object()
+            && candles["legacy_streams"].is_array()
+            && candles["product_streams"].is_array()
+    }
     pub fn verified(&self) -> bool {
         self.schema_version == 1
             && self.phase == "verified"
             && self.equality.observations
             && self.equality.pages
             && self.equality.source_files
+            && self.session_proof_consistent()
             && if self.mapping.streams().is_empty() {
                 self.equality.candles.is_none()
             } else {

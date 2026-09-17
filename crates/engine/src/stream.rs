@@ -148,6 +148,7 @@ impl Record {
 crate::string_enum! {
     /// Why a record was refused; the stream state is unchanged by a refusal.
     RejectionReason "rejection" {
+        SessionCalendar => "session_calendar",
         BackwardsTime => "backwards_time",
         ConflictingDuplicate => "conflicting_duplicate",
         WrongGranularity => "wrong_granularity",
@@ -533,6 +534,9 @@ struct CandleStream {
     hard_min_observations: Option<u32>,
     working: Option<Working>,
     previous_open_time: Option<i64>,
+    // Actual missing-feed evidence on source fills is also carried to the next real candle.
+    source_fill_missing: u64,
+    source_fill_gap: Option<i64>,
     facts: StreamFacts,
 }
 
@@ -551,6 +555,7 @@ pub fn interval_open(event: i64, duration: i64, offset: i64) -> i64 {
 /// The thresholds of the enabled checks, in the stream's units.
 #[derive(Debug, Clone, Copy)]
 struct Checks {
+    source_fill_quality: bool,
     /// The gap and reopen thresholds.
     gap_micros: Option<(i64, i64)>,
     frozen: Option<(u32, i64)>,
@@ -634,6 +639,7 @@ impl InstrumentStream {
             .collect();
         let seconds = |value: u32| i64::from(value) * MICROS_PER_SECOND;
         let checks = Checks {
+            source_fill_quality: instrument.session.is_some(),
             gap_micros: instrument
                 .gap
                 .as_ref()
@@ -667,6 +673,8 @@ impl InstrumentStream {
                 hard_min_observations: spec.hard_min_observations,
                 working: None,
                 previous_open_time: None,
+                source_fill_missing: 0,
+                source_fill_gap: None,
                 facts: StreamFacts {
                     duration_seconds: spec.duration_seconds,
                     offset_seconds: spec.offset_seconds,
@@ -1031,7 +1039,25 @@ impl InstrumentStream {
 
     /// Closes the stream's working candle, evaluates its checks, and records its facts.
     fn finalize(stream: &mut CandleStream, checks: &Checks, known_at: i64) -> Candle {
-        let working = stream.working.take().expect("a working candle");
+        let mut working = stream.working.take().expect("a working candle");
+        let source_fill = checks.source_fill_quality
+            && working.volume == Some(0.0)
+            && working.open == working.high
+            && working.open == working.low
+            && working.open == working.close;
+        if checks.source_fill_quality {
+            if source_fill {
+                stream.source_fill_missing += working.missing_before;
+                stream.source_fill_gap = stream.source_fill_gap.max(working.gap_before);
+                if working.max_gap_inside > 0 {
+                    stream.source_fill_gap =
+                        stream.source_fill_gap.max(Some(working.max_gap_inside));
+                }
+            } else {
+                working.missing_before += std::mem::take(&mut stream.source_fill_missing);
+                working.gap_before = working.gap_before.max(stream.source_fill_gap.take());
+            }
+        }
         stream.previous_open_time = Some(working.open_time);
         let active_span = working.last_known_at - working.first_event;
         let flags = Flags {
@@ -1048,10 +1074,11 @@ impl InstrumentStream {
                 .gap_micros
                 .is_some_and(|(max, _)| working.max_gap_inside > max),
             missing_before: working.missing_before > 0,
-            frozen: checks.frozen.is_some_and(|(observations, micros)| {
-                working.frozen_observations >= u64::from(observations)
-                    || working.frozen_micros >= micros
-            }),
+            frozen: source_fill
+                || checks.frozen.is_some_and(|(observations, micros)| {
+                    working.frozen_observations >= u64::from(observations)
+                        || working.frozen_micros >= micros
+                }),
             jump: checks
                 .jump_basis_points
                 .is_some_and(|min| working.max_jump[0] >= u64::from(min)),
@@ -1438,6 +1465,7 @@ mod tests {
                 min_basis_points: 5,
             }),
             span: Some(SpanCheck { min_percent: 75 }),
+            session: None,
             sessions: Some(vec![Session {
                 name: "week".to_string(),
                 open_seconds: 0,
@@ -1736,6 +1764,63 @@ mod tests {
             std::hint::black_box(1.0005_f64),
         );
         assert!((to - from) / from * 10_000.0 < 5.0);
+    }
+
+    #[test]
+    fn missing_feed_evidence_survives_source_fills_to_next_real_candle() {
+        let granularity = NativeGranularity::Bar { period_seconds: 5 };
+        let mut definition = instrument(granularity, &[(5, 0)]);
+        definition.session = Some(crate::session::Session::Always);
+        definition.candles[0].min_observations = None;
+        definition.candles[0].hard_min_observations = None;
+        let mut stream = InstrumentStream::new(&definition, source(granularity, None)).unwrap();
+        let raw = feed(
+            &mut stream,
+            &[
+                bar(0, [100_000, 100_002, 99_999, 100_001], 1.0),
+                bar(15, [100_001; 4], 0.0),
+                bar(20, [100_001; 4], 0.0),
+                bar(25, [100_001, 100_002, 99_999, 100_001], 1.0),
+                bar(30, [100_001, 100_002, 99_999, 100_001], 1.0),
+                bar(35, [100_001; 4], 0.0),
+                bar(40, [100_001, 100_002, 99_999, 100_001], 1.0),
+            ],
+        );
+        let mut transform = crate::continuous::Continuous::new(
+            definition.session.as_ref().unwrap().calendar().unwrap(),
+            &definition.candles[0],
+            vec![(0, 45 * SECOND)],
+            true,
+        )
+        .unwrap();
+        let mut rows = Vec::new();
+        for (_, candle) in raw {
+            transform
+                .push(candle, &mut |c| {
+                    rows.push(c);
+                    Ok(())
+                })
+                .unwrap();
+        }
+        assert_eq!(
+            rows.iter()
+                .map(|c| c.open_time_micros / SECOND)
+                .collect::<Vec<_>>(),
+            (0..45).step_by(5).collect::<Vec<_>>()
+        );
+        assert_eq!(rows[3].missing_buckets_before, 2);
+        assert_eq!(rows[5].missing_buckets_before, 2);
+        assert_eq!(rows[5].gap_before_micros, Some(10 * SECOND));
+        assert!(rows[5].flags.gap_before && rows[5].flags.missing_before);
+        assert!(rows[1..=5].iter().all(|c| !c.flags.clean()));
+        for i in [6, 8] {
+            assert_eq!(rows[i].missing_buckets_before, 0);
+            assert_eq!(rows[i].gap_before_micros, Some(0));
+            assert!(
+                rows[i].flags.clean(),
+                "contiguous source rows never count as missing feed"
+            );
+        }
     }
 
     #[test]

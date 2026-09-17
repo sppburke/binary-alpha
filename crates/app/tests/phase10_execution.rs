@@ -1084,6 +1084,7 @@ account_class="demo"
 [[instruments]]
 broker="deriv"
 provider_symbol="R_50"
+session={kind="always"}
 quote_currency="USD"
 price_scale=4
 native_granularity={kind="tick"}

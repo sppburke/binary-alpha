@@ -289,7 +289,7 @@ fn archive_fixture(
             60,
         )
     } else {
-        deriv_core("ws://127.0.0.1:9", 60, 50, 60).replace("frxEURUSD", "R_50")
+        synthetic_deriv(deriv_core("ws://127.0.0.1:9", 60, 50, 60))
     };
     let start = core.find("[[instruments]]").unwrap();
     let end = core.find("[[brokers]]").unwrap();

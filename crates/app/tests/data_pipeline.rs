@@ -1041,6 +1041,12 @@ const DERIV_SEED_END: i64 = DAY2 + 300;
 const POCKET_SEED_END: i64 = POCKET_START + 1_000;
 const POCKET_SERIES_END: i64 = POCKET_START + 7_200;
 
+const DERIV_FX_SESSION: &str = r#"{ kind = "weekly", timezone = "UTC", open = { day = "monday", time = "00:00:00" }, close = { day = "friday", time = "20:55:00" } }"#;
+fn synthetic_deriv(core: String) -> String {
+    core.replace("frxEURUSD", "R_50")
+        .replace(DERIV_FX_SESSION, r#"{ kind = "always" }"#)
+}
+
 fn deriv_core(endpoint: &str, overlap: u32, max_pages: u32, max_elapsed: u32) -> String {
     format!(
         r#"schema_version = 1
@@ -1061,6 +1067,7 @@ instruments = ["EURUSD"]
 [[instruments]]
 broker = "deriv"
 provider_symbol = "frxEURUSD"
+session = {DERIV_FX_SESSION}
 quote_currency = "USD"
 price_scale = 5
 native_granularity = {{ kind = "tick" }}
@@ -1114,6 +1121,7 @@ instruments = ["AEDCNY_otc"]
 [[instruments]]
 broker = "pocket_option"
 provider_symbol = "AEDCNY_otc"
+session = {{ kind = "always" }}
 quote_currency = "CNY"
 price_scale = 6
 native_granularity = {granularity}
@@ -1955,6 +1963,7 @@ publication_uri = "file://{store}"
 [[instruments]]
 broker = "pocket_option"
 provider_symbol = "AEDCNY_otc"
+session = {{ kind = "always" }}
 quote_currency = "CNY"
 price_scale = 6
 native_granularity = {{ kind = "bar", period_seconds = 5 }}
@@ -3249,6 +3258,17 @@ fn pipeline_recovery() {
     // carrying that receipt.
     let cutoff_3 = cutoff_2 + 150;
     let end_3 = time_text(cutoff_3 * 1_000_000);
+    // This fault requires the first response to become durable before reconnect.
+    // A multi-request prefetch can hit the close while still sending its initial
+    // burst, before consuming that response. Use one in-flight page for this
+    // serial retention proof; the regular pipeline fixtures still exercise eight.
+    let pocket_core_path = f.scratch.path("pocket.toml");
+    let original_pocket_core = fs::read_to_string(&pocket_core_path).unwrap();
+    let serial_pocket_core = original_pocket_core.replace(
+        &format!("history_pages_in_flight = {POCKET_HISTORY_PAGES_IN_FLIGHT}"),
+        "history_pages_in_flight = 1",
+    );
+    fs::write(&pocket_core_path, serial_pocket_core).unwrap();
     f.pocket.set(BrokerFaults {
         drop_after_pages: Some(1),
         reject_auth_after_drop: true,
@@ -3308,6 +3328,7 @@ fn pipeline_recovery() {
         requests[0]["receipt_time"], retained[0]["receipt_time"],
         "{receipt}"
     );
+    fs::write(&pocket_core_path, original_pocket_core).unwrap();
     // Conflicting overlap from the provider stops publication and keeps the prior generation.
     f.pocket.set(BrokerFaults {
         conflict_before: Some(cutoff_2),
@@ -4867,7 +4888,22 @@ fn pipeline_migration_lossless_resume_and_tamper() {
         );
         let before_stream = stream(&store, source_stream);
         let after_stream = stream(&store, state["stream"].as_str().unwrap());
-        assert_eq!(before_stream.streams, after_stream.streams);
+        // The fixture spans Monday/Tuesday: every bucket is inside both the Deriv
+        // FX week and the OTC always session. Daily candles fill the overnight
+        // feed gap while preserving every original feed-candle field.
+        let mut expected_streams = before_stream.streams.clone();
+        for spec in &mut expected_streams {
+            let start = binary_alpha_engine::market::parse_event_time_micros(
+                spec.first_open_time.as_ref().unwrap(),
+            )
+            .unwrap();
+            let end = binary_alpha_engine::market::parse_event_time_micros(
+                spec.last_close_time.as_ref().unwrap(),
+            )
+            .unwrap();
+            spec.rows = ((end - start) / (i64::from(spec.duration_seconds) * 1_000_000)) as u64;
+        }
+        assert_eq!(expected_streams, after_stream.streams);
         for spec in &before_stream.streams {
             let prefix = format!(
                 "candles/{}s_{}s",
@@ -4885,14 +4921,28 @@ fn pipeline_migration_lossless_resume_and_tamper() {
                 objects.sort_by_key(|o| &o.path);
                 objects
                     .into_iter()
-                    .flat_map(|o| migration_table_rows(&store.join(&o.key)))
+                    .flat_map(|o| common::read_table(&store.join(&o.key)).1)
                     .collect::<Vec<_>>()
             };
-            assert_eq!(
-                rows(&after_stream),
-                rows(&before_stream),
-                "{job}: candle sequence"
-            );
+            let after_rows = rows(&after_stream);
+            let feed: Vec<_> = after_rows
+                .iter()
+                .filter(|row| row[10] != Some(binary_alpha_engine::features::Value::Int(0)))
+                .map(|row| row[..33].to_vec())
+                .collect();
+            assert_eq!(feed, rows(&before_stream), "{job}: feed candle sequence");
+            for adjacent in after_rows.windows(2) {
+                let Some(binary_alpha_engine::features::Value::Time(open)) = adjacent[0][0] else {
+                    panic!("candle timestamp");
+                };
+                assert_eq!(
+                    adjacent[1][0],
+                    Some(binary_alpha_engine::features::Value::Time(
+                        open + i64::from(spec.duration_seconds) * 1_000_000
+                    )),
+                    "{job}: continuous candle sequence"
+                );
+            }
         }
         let pages: Vec<_> = manifest
             .day_inventory

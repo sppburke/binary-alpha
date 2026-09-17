@@ -337,14 +337,56 @@ fn migration_archive_restores_the_proved_stream_after_configuration_changes() {
     )
     .unwrap();
     import(&f.scratch.path("deriv-import.toml")).unwrap();
+    let session_config = fs::read_to_string(f.scratch.path("deriv.toml")).unwrap();
+    let legacy_config = session_config
+        .lines()
+        .filter(|line| !line.starts_with("session ="))
+        .collect::<Vec<_>>()
+        .join("\n");
+    fs::write(f.scratch.path("deriv.toml"), legacy_config).unwrap();
     pipeline(
         "update",
         &config,
         &["--end", &time_text((DERIV_SEED_END + 120) * 1_000_000)],
     )
     .unwrap();
+    // A calendar may be added to a legacy definition; every other field stays exact.
+    fs::write(f.scratch.path("deriv.toml"), &session_config).unwrap();
     pipeline("migrate", &config, &[]).unwrap();
     let state = read_json(&producer.join("pipeline_state/deriv/migration.json"));
+    let record_path = producer
+        .join("pipeline_state/records")
+        .join(state["record"].as_str().unwrap());
+    let mut record: binary_alpha_app::lineage::MigrationRecord =
+        serde_json::from_value(read_json(&record_path)).unwrap();
+    assert!(record.verified());
+    let candle_proof = &record.evidence["proofs"]["candles"];
+    assert_eq!(candle_proof["basis"], "legacy_definition_reconstruction");
+    assert_eq!(candle_proof["equal"], true);
+    assert_eq!(candle_proof["profile_equal"], true);
+    assert!(candle_proof["legacy_definition"].get("session").is_none());
+    assert_ne!(
+        candle_proof["legacy_streams"], candle_proof["product_streams"],
+        "session grid fills the fixture's missing feed buckets; equality proves legacy reconstruction"
+    );
+    record.evidence.get_mut("proofs").unwrap()["candles"]["session_product_verified"] =
+        serde_json::json!(false);
+    assert!(
+        !record.verified(),
+        "a failed session proof cannot authorize retirement"
+    );
+    for basis in [Some("unknown"), Some("direct_product_equality"), None] {
+        let proof = &mut record.evidence.get_mut("proofs").unwrap()["candles"];
+        if let Some(basis) = basis {
+            proof["basis"] = serde_json::json!(basis);
+        } else {
+            proof.as_object_mut().unwrap().remove("basis");
+        }
+        assert!(
+            !record.verified(),
+            "a malformed basis cannot bypass session proof"
+        );
+    }
     let root = state["dataset"].as_str().unwrap();
     let proved_stream = state["stream"].as_str().unwrap();
     let core = fs::read_to_string(f.scratch.path("deriv.toml"))

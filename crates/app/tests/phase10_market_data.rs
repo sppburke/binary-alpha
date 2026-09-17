@@ -2090,7 +2090,7 @@ fn pocket_connect_time_namespace_disconnect_keeps_origin_diagnostic() {
 
 fn instrument_text(broker: &str, symbol: &str, digits: u8, currency: &str) -> String {
     format!(
-        "\n[[instruments]]\nbroker = \"{broker}\"\nprovider_symbol = \"{symbol}\"\nquote_currency = \"{currency}\"\nprice_scale = {digits}\nnative_granularity = {{ kind = \"tick\" }}\ngap = {{ max_seconds = 1, reopen_seconds = 10 }}\ncandles = [{{ duration_seconds = 1, offset_seconds = 0, min_observations = 3 }}]\n"
+        "\n[[instruments]]\nbroker = \"{broker}\"\nprovider_symbol = \"{symbol}\"\nquote_currency = \"{currency}\"\nprice_scale = {digits}\nsession = {{ kind = \"always\" }}\nnative_granularity = {{ kind = \"tick\" }}\ngap = {{ max_seconds = 1, reopen_seconds = 10 }}\ncandles = [{{ duration_seconds = 1, offset_seconds = 0, min_observations = 3 }}]\n"
     )
 }
 fn test_config(scratch: &Scratch, kind: &str, endpoint: &str, two: bool) -> Config {

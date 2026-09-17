@@ -113,13 +113,50 @@ fn parity(pocket: bool) {
         normalize_profile(profiles[0].clone(), "source"),
         normalize_profile(profiles[1].clone(), "source")
     );
-    assert_eq!(manifests[0].streams, manifests[1].streams);
+    // The always session fills missing buckets (including weekends) for R_50/OTC.
+    // The raw feed rows and every downstream evidence consumer remain identical.
+    let mut expected = manifests[0].streams.clone();
+    for spec in &mut expected {
+        let start = binary_alpha_engine::market::parse_event_time_micros(
+            spec.first_open_time.as_ref().unwrap(),
+        )
+        .unwrap();
+        let end = binary_alpha_engine::market::parse_event_time_micros(
+            spec.last_close_time.as_ref().unwrap(),
+        )
+        .unwrap();
+        spec.rows = ((end - start) / (i64::from(spec.duration_seconds) * 1_000_000)) as u64;
+    }
+    assert_eq!(expected, manifests[1].streams);
     let mut later = false;
     let mut weekend_finalized = false;
     for spec in &manifests[0].streams {
         let a = candles(&root, &manifests[0], spec);
         let b = candles(&root, &manifests[1], spec);
-        assert_eq!(a, b);
+        // Daily rows append fill; compare all original columns for every feed candle.
+        let feed: Vec<_> = b
+            .iter()
+            .filter(|row| row[10] != Some(Value::Int(0)))
+            .map(|row| row[..33].to_vec())
+            .collect();
+        assert_eq!(a, feed);
+        let expected_rows = expected
+            .iter()
+            .find(|s| s.duration_seconds == spec.duration_seconds)
+            .unwrap()
+            .rows;
+        assert_eq!(b.len() as u64, expected_rows);
+        for pair in b.windows(2) {
+            assert_eq!(
+                pair[1][0],
+                match pair[0][0] {
+                    Some(Value::Time(t)) => Some(Value::Time(
+                        t + i64::from(spec.duration_seconds) * 1_000_000
+                    )),
+                    _ => panic!("candle timestamp"),
+                }
+            );
+        }
         assert!(!a.is_empty());
         for day in manifests[1].day_inventory.iter().filter(|d| {
             d.duration == Some(spec.duration_seconds) && d.offset == Some(spec.offset_seconds)
@@ -620,7 +657,9 @@ fn daily_stream_keeps_an_earlier_pending_day_partial_and_rejects_tampering() {
         .find(|d| d.date == "2026-09-20" && d.duration == Some(15) && d.offset == Some(5))
         .unwrap();
     assert_eq!(pending.state, DayState::Partial);
-    assert_eq!(pending.rows, 0);
+    // Always-open grid contains 5,759 completed 15s buckets before the pending
+    // 23:59:50 bucket; that unfinished bucket still keeps this day partial.
+    assert_eq!(pending.rows, 5759);
     assert!(pending.object.is_some());
     for tamper in ["state", "missing", "count", "summary"] {
         let mut changed = manifest.clone();
@@ -749,7 +788,12 @@ fn daily_offset_candle_completeness_requires_the_next_day_prefix() {
             .iter()
             .find(|d| d.date == "2026-09-20" && d.duration == Some(15) && d.offset == Some(5))
             .unwrap();
-        assert_eq!(sunday.rows, 1, "the offset candle actually exists");
+        // Always-open fills add the preceding 5,759 buckets; the final real offset
+        // candle still depends on Monday's prefix exactly as before.
+        assert_eq!(
+            sunday.rows, 5760,
+            "full always-open 15s grid including the offset candle"
+        );
         assert_eq!(
             sunday.state,
             if matches!(case, "complete" | "partial-tail") {
