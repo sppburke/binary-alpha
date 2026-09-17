@@ -551,8 +551,9 @@ their instrument streams. Derived research artifacts retain their own formats. T
 dataset and instrument-stream layout documented elsewhere here is **legacy layout v1**, readable
 until verified retirement. An absent manifest `layout` means v1; `layout = "daily-v2"` selects
 this contract. Types, codecs, shared v1/v2 observation readers, v2 audit candle publication,
-and v2 verification are implemented. Migration, v2 acquisition/continuation, archive registry,
-and retirement belong to later steps; this reader/writer step is verified with fixtures only.
+v2 verification, the archive-root registry, and daily archive/list/pull/restore are implemented.
+Migration, v2 acquisition/continuation, and retirement belong to separate steps; verification
+here uses fixtures only.
 
 ### 1. Families
 
@@ -739,8 +740,22 @@ Under `pipeline_state/`:
   intent never replays a conflicting page; completion removes both progress files. Removing both
   files abandons a pending intent (its retained pages stay as unreferenced diagnostics) so a later update may pin a new
   cutoff.
-- `JOB/transfers.json` maps object/manifest/catalog keys to `file_id`, optional secret
-  `session`, and `done`. Session status supplies the acknowledged upload offset on resume.
+- `registry/snapshot.json` (version `1`) binds `archive_root` and the fixture `endpoint`, and
+  stores a `sequence` watermark, `files`, pending `legacy` aliases, imported job names, and
+  the completed-rebuild flag. Every `files` key is `objects/SHA256HEX`, including the byte
+  identities of ready manifests and catalogs; values are `{file_id, session, done, bytes, sha256}`.
+- `registry/events.ndjson` appends synced `{sequence, change}` records. Changes are `put`
+  (key and entry), `remove` (a stale completed key on rebuild), `legacy` (job/key alias and
+  old entry), `imported` (job), or `rebuilt`.
+  A flushed, atomically renamed snapshot compacts every 256 events before truncating the log;
+  replay skips its watermark and discards only an unfinished trailing line. Reservations and
+  sessions are synced before upload bytes, and a shared per-content lease covers completion.
+  A journal or snapshot write failure stops further transfers until the registry is reopened;
+  rebuild excludes concurrent transfers. Old `JOB/transfers.json` files are imported once
+  without rewriting them: completed entries require remote identity confirmation, and unfinished
+  ids/sessions resume on their first use. Started legacy catalogs retain the original per-job
+  object and manifest bindings so their resumed bytes do not change during deduplication.
+  Session capabilities stay inside the private pipeline-state directory.
 - `downloads/` holds temporary `FILE_ID.catalog`, `GENERATION.manifest`, and
   `SHA256HEX.partial` downloads.
 
@@ -754,6 +769,7 @@ create-once publication; different content at an existing key is a conflict.
 ```text
 binary-alpha data import --config CORE
 binary-alpha data pipeline update --config PIPELINE [--end END]
+binary-alpha data pipeline archive --config PIPELINE [--job ID]
 binary-alpha data pipeline list --config PIPELINE --broker BROKER --symbol SYMBOL
 binary-alpha data pipeline pull --config PIPELINE --broker BROKER --symbol SYMBOL
 binary-alpha data pipeline restore --config PIPELINE --catalog FILE_ID --sha256 SHA256 --broker BROKER --symbol SYMBOL
@@ -762,6 +778,19 @@ binary-alpha data pipeline restore --config PIPELINE --catalog FILE_ID --sha256 
 Import is the existing command (see [Historical datasets](#historical-datasets)) run with
 `storage.historical_data_dir` and a `file://` `storage.publication_uri` both naming
 `local_root/store`; it may import every instrument of an archive in one run.
+
+Archive selects the newest local `daily-v2` dataset for each selected job by coverage end,
+then lineage (ambiguous daily ancestry is refused), verifies its existing
+matching stream, and publishes the closure without
+broker acquisition. It shares update's archive owner and archive-root registry. Registry loss
+rebuilds completed entries from a full root listing; `incompleteSearch` is refused, rejected
+page tokens restart pagination, and every candidate requires size/SHA-256 confirmation (byte
+readback without a reported checksum). Unfinished reservations survive explicit rebuilds.
+Existing immutable catalog receipts retain their exact file-id bindings.
+At equal coverage, a generation named in another candidate's hash-confirmed
+`provenance/lineage.json` is a predecessor. Generation references are bare identifiers in JSON
+values; selection does not impose migration/acquisition field names or read ancestor closures.
+The lineage object is archived and restored with the other manifest-owned objects.
 
 Update requires an imported generation; `END` is `YYYY-MM-DDTHH:MM:SS[.ffffff]Z`. Each job
 acquires a bounded extension, audits and verifies its result, and archives it independently.
@@ -796,6 +825,7 @@ A catalog is pretty-printed JSON with a trailing newline and every field below:
 | Field | Meaning |
 | --- | --- |
 | `schema_version` | `1` |
+| `layout` | `"daily-v2"` for daily dataset/stream pairs; absent for v1 catalogs |
 | `job` | producer job identifier |
 | `broker`, `provider_symbol`, `instrument` | dataset source identifiers |
 | `role` | dataset role, development or evaluation for this workflow |
@@ -833,19 +863,20 @@ are not printed.
 
 ### List and restore
 
-List follows archive-root catalog listing pages to completion, requires each catalog's remote size
-and checksum, downloads and validates the catalog documents, filters by broker/symbol, and sorts
+List follows archive-root catalog listing pages to completion, confirms each catalog's remote size
+and checksum (with readback when absent), downloads and validates the catalog documents, filters by broker/symbol, and sorts
 the resulting lines. It reads no market-data objects. The line is:
 
 ```text
-catalog FILE_ID sha256 HASH INSTRUMENT ROLE NATIVE dataset G stream S coverage FIRST LAST rows N bytes B
+catalog FILE_ID sha256 HASH INSTRUMENT ROLE NATIVE layout LAYOUT dataset G stream S coverage FIRST LAST rows N bytes B
 ```
 
 `NATIVE` is `tick` or `5-second bar`; bytes sum unique catalog objects and both ready
 manifests, excluding the catalog itself.
 
 Pull is the consumer's one step: it enumerates the instrument's catalogs exactly as `list` does,
-selects the newest by coverage end (then by dataset generation), and, unless both of its ready
+selects the newest by coverage end (preferring `daily-v2` at equal coverage, then its unique
+lineage descendant; v1 ties use dataset generation), and, unless both of its ready
 manifests already exist in this configuration's managed store, restores it exactly as `restore`
 would with that catalog's identifier and digest. It prints the `restored …` line, or
 `pulled INSTRUMENT ROLE dataset URI stream URI catalog FILE_ID (already local)` when nothing was

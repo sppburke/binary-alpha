@@ -262,6 +262,13 @@ enum DataCommand {
 
 #[derive(Subcommand)]
 enum PipelineCommand {
+    /// Archive the newest local daily dataset without acquiring broker history.
+    Archive {
+        #[arg(long)]
+        config: PathBuf,
+        #[arg(long)]
+        job: Option<String>,
+    },
     /// Extend every job's imported generation from its frontier to one pinned cutoff within
     /// its budget, then audit, verify, and archive the result.
     Update {
@@ -358,6 +365,9 @@ fn main() -> ExitCode {
         Command::Data {
             command: DataCommand::Pipeline { command },
         } => match command {
+            PipelineCommand::Archive { config, job } => {
+                data_pipeline::archive(&config, job.as_deref(), &mut std::io::stdout().lock())
+            }
             PipelineCommand::Update { config, end } => {
                 data_pipeline::update(&config, end.as_deref(), &mut std::io::stdout().lock())
             }

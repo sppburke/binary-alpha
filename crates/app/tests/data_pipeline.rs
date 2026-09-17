@@ -425,6 +425,8 @@ struct DriveFaults {
     /// Store the final chunk, then close without a reply.
     complete_without_reply: bool,
     omit_sha256: bool,
+    incomplete_listing: bool,
+    reject_page_token_once: bool,
     /// Close the media download after this many bytes, once.
     drop_download_at: Option<usize>,
     unauthorized_once: bool,
@@ -908,6 +910,12 @@ fn handle_http(
             }
         }
         ("GET", "/drive/v3/files") => {
+            assert!(request.query["fields"].contains("incompleteSearch"));
+            if faults.reject_page_token_once && request.query.contains_key("pageToken") {
+                state.faults.reject_page_token_once = false;
+                respond(&mut stream, 400, &[], &drive_error("invalidPageToken"));
+                return;
+            }
             let page: usize = request
                 .query
                 .get("pageToken")
@@ -916,7 +924,11 @@ fn handle_http(
             let matching: Vec<(String, RemoteEntry)> = state
                 .files
                 .iter()
-                .filter(|(_, entry)| !entry.trashed && entry.name.contains("catalog-"))
+                .filter(|(_, entry)| {
+                    !entry.trashed
+                        && (!request.query["q"].contains("catalog-")
+                            || entry.name.contains("catalog-"))
+                })
                 .map(|(id, entry)| (id.clone(), entry.clone()))
                 .collect();
             let files: Vec<Value> = matching
@@ -927,7 +939,7 @@ fn handle_http(
                     serde_json::from_slice(&file_json(id, entry, faults.omit_sha256)).unwrap()
                 })
                 .collect();
-            let mut body = json!({ "files": files });
+            let mut body = json!({ "files": files, "incompleteSearch": faults.incomplete_listing });
             if (page + 1) * 2 < matching.len() {
                 body["nextPageToken"] = json!((page + 1).to_string());
             }
@@ -2427,9 +2439,8 @@ fn pipeline_drive_forbidden_recovery() {
                     .count(),
                 1
             );
-            let transfers = read_json(
-                &f.scratch
-                    .path("producer/pipeline_state/pocket/transfers.json"),
+            let transfers = registry_archive::registry_state(
+                &f.scratch.path("producer/pipeline_state/registry"),
             );
             assert!(
                 transfers["files"]
@@ -2547,10 +2558,8 @@ fn chunk_rate_limited_session_recovery(reason: &'static str, poison_all: bool) {
         elapsed >= Duration::from_secs(if poison_all { 3 } else { 1 }),
         "replacement sessions must wait for exponential backoff: {elapsed:?}"
     );
-    let transfers_path = f
-        .scratch
-        .path("producer/pipeline_state/pocket/transfers.json");
-    let transfers = read_json(&transfers_path);
+    let transfers_path = f.scratch.path("producer/pipeline_state/registry");
+    let transfers = registry_archive::registry_state(&transfers_path);
     let entry = &transfers["files"][&object.key];
     let id = entry["file_id"].as_str().unwrap();
     assert_eq!(entry["done"], !poison_all);
@@ -2606,7 +2615,7 @@ fn chunk_rate_limited_session_recovery(reason: &'static str, poison_all: bool) {
         let recovered = pipeline("update", &config, &["--end", &end]).unwrap();
         assert_eq!(field(job_line(&recovered, "pocket"), "status"), "archived");
     }
-    let transfers = read_json(&transfers_path);
+    let transfers = registry_archive::registry_state(&transfers_path);
     assert_eq!(transfers["files"][&object.key]["file_id"], id);
     assert_eq!(transfers["files"][&object.key]["done"], true);
     assert!(transfers["files"][&object.key]["session"].is_null());
@@ -2694,10 +2703,8 @@ fn abandoned_session_recovery(reason: &'static str, completed: bool) {
         }),
         "{failed}"
     );
-    let transfers_path = f
-        .scratch
-        .path("producer/pipeline_state/pocket/transfers.json");
-    let transfers = read_json(&transfers_path);
+    let transfers_path = f.scratch.path("producer/pipeline_state/registry");
+    let transfers = registry_archive::registry_state(&transfers_path);
     let (key, entry) = transfers["files"]
         .as_object()
         .unwrap()
@@ -2736,7 +2743,10 @@ fn abandoned_session_recovery(reason: &'static str, completed: bool) {
             .bytes[0] ^= 1;
         let conflict = pipeline("update", &config, &["--end", &end]).unwrap_err();
         assert!(conflict.contains("nothing was replaced"), "{conflict}");
-        assert_eq!(read_json(&transfers_path)["files"][key], *entry);
+        assert_eq!(
+            registry_archive::registry_state(&transfers_path)["files"][key],
+            *entry
+        );
         f.drive
             .state
             .lock()
@@ -2756,7 +2766,7 @@ fn abandoned_session_recovery(reason: &'static str, completed: bool) {
         "session recovery must finish far below its 30-second retry budget"
     );
     assert_eq!(field(job_line(&recovered, "pocket"), "status"), "archived");
-    let transfers = read_json(&transfers_path);
+    let transfers = registry_archive::registry_state(&transfers_path);
     assert_eq!(transfers["files"][key]["file_id"], id);
     assert_eq!(transfers["files"][key]["done"], true);
     assert!(transfers["files"][key]["session"].is_null());
@@ -2885,7 +2895,7 @@ fn pipeline_recovery() {
             && failed.contains(" attempts over 1 s"),
         "{failed}"
     );
-    let transfers = read_json(&state.join("pocket/transfers.json"));
+    let transfers = registry_archive::registry_state(&state.join("registry"));
     let open_session = transfers["files"]
         .as_object()
         .unwrap()
@@ -4544,3 +4554,6 @@ mod daily_readers;
 mod fixture_config;
 #[path = "phase12_live_runtime/support.rs"]
 mod live_support;
+
+#[path = "data_pipeline/registry_archive.rs"]
+mod registry_archive;
