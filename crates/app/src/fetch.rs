@@ -57,7 +57,15 @@ pub struct Actual {
     pub last: String,
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OccurrenceIdentity {
+    pub acquisition_id: String,
+    pub intent: Option<String>,
+    pub ordinal: u64,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PageCoverage {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub occurrence: Option<OccurrenceIdentity>,
     pub path: String,
     pub sha256: String,
     pub bytes: u64,
@@ -103,6 +111,7 @@ pub struct HistoryCoverage {
     pub verified: Option<Range>,
     pub actual: Option<Actual>,
     pub rows: u64,
+    #[serde(default)]
     pub pages: Vec<PageCoverage>,
     /// This acquisition's bundle; carried bundles are bound by their source object records.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -124,6 +133,8 @@ pub enum PassLimit {
 /// One request made in this invocation, recorded whether or not its bytes were new.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PageReceipt {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub occurrence: Option<OccurrenceIdentity>,
     pub anchor: Option<String>,
     pub sha256: String,
     pub bytes: u64,
@@ -153,12 +164,32 @@ pub enum Requested {
 /// The header is emitted once; replayed pages never emit another page event.
 pub enum ProgressEvent<'a> {
     Started(&'a Progress),
+    Received(&'a PageCoverage),
     Page(&'a PageCoverage),
+    Invalidate,
 }
 pub type Persist<'a> = &'a mut dyn FnMut(ProgressEvent<'_>) -> Result<(), String>;
 
+/// A semantic rejection can implicate an earlier page's deferred overlap boundary. Keep
+/// received evidence, but refetch the indexed acquisition instead of replaying it forever.
+fn validated<T>(
+    result: Result<T, String>,
+    daily: bool,
+    bounds: &mut Bounds<'_>,
+) -> Result<T, String> {
+    if result.is_err()
+        && daily
+        && let Some(persist) = bounds.persist.as_mut()
+    {
+        persist(ProgressEvent::Invalidate)?;
+    }
+    result
+}
+
 /// Per-invocation limits and durable progress of a pipeline acquisition.
 pub struct Bounds<'a> {
+    pub acquisition: Option<OccurrenceIdentity>,
+    pub diagnostics: Vec<PageCoverage>,
     pub max_pages: Option<u32>,
     pub deadline_micros: Option<i64>,
     pub clock: &'a dyn Clock,
@@ -173,6 +204,8 @@ impl<'a> Bounds<'a> {
     /// A standalone pass: no page or time limit and no durable progress.
     pub fn none(clock: &'a dyn Clock) -> Self {
         Self {
+            acquisition: None,
+            diagnostics: Vec::new(),
             max_pages: None,
             deadline_micros: None,
             clock,
@@ -264,7 +297,7 @@ pub fn passes(
 
 /// The row type one acquisition handles; ticks and bars share every paging, overlap, and
 /// coverage rule through this boundary.
-pub trait Row: Copy + PartialEq + std::fmt::Debug + Send {
+pub(crate) trait Row: Copy + PartialEq + std::fmt::Debug + Send {
     type Sequence: Default;
     /// The provider event time: the tick time or the bar start.
     fn time(&self) -> i64;
@@ -276,6 +309,11 @@ pub trait Row: Copy + PartialEq + std::fmt::Debug + Send {
     fn accept(sequence: &mut Self::Sequence, row: Self) -> Result<(), String>;
     fn unpack(rows: HistoryRows) -> Result<Vec<Self>, String>;
     fn from_market(row: crate::daily::MarketRow) -> Result<Self, String>;
+    fn daily(
+        self,
+        instrument: &InstrumentId,
+        native: &Native,
+    ) -> Result<crate::lineage::Observation, String>;
     fn write(
         path: &Path,
         instrument: &InstrumentId,
@@ -311,6 +349,13 @@ impl Row for Tick {
             crate::daily::MarketRow::Tick(row) => Ok(row),
             _ => Err("baseline row granularity mismatch".into()),
         }
+    }
+    fn daily(
+        self,
+        _instrument: &InstrumentId,
+        _native: &Native,
+    ) -> Result<crate::lineage::Observation, String> {
+        Ok(crate::lineage::Observation::Tick(self))
     }
     fn write(
         path: &Path,
@@ -350,6 +395,33 @@ impl Row for Bar {
             crate::daily::MarketRow::Bar(row) => Ok(row),
             _ => Err("baseline row granularity mismatch".into()),
         }
+    }
+    fn daily(
+        self,
+        instrument: &InstrumentId,
+        native: &Native,
+    ) -> Result<crate::lineage::Observation, String> {
+        Ok(crate::lineage::Observation::Bar(crate::daily::DailyBar {
+            symbol: Some(instrument.provider_symbol.to_string()),
+            symbol_id: native.symbol_id,
+            timestamp_utc: Some(
+                self.start_unix_s
+                    .checked_mul(1_000_000)
+                    .ok_or("bar timestamp overflow")?,
+            ),
+            unix_utc_s: Some(self.start_unix_s),
+            server_time_s: Some(
+                self.start_unix_s
+                    .checked_add(native.server_offset_s)
+                    .ok_or("bar server time overflow")?,
+            ),
+            open: Some(self.open),
+            high: Some(self.high),
+            low: Some(self.low),
+            close: Some(self.close),
+            volume: Some(self.volume),
+            period_s: Some(self.period_s),
+        }))
     }
     fn write(
         path: &Path,
@@ -451,6 +523,7 @@ fn prior(
         NativeGranularity::Bar { .. } => PriceRepresentation::BinaryFloat64,
     };
     let mut selected: Option<Baseline> = None;
+    let mut daily = Vec::new();
     for key in candidates {
         if local.head(&key)?.is_none() {
             continue;
@@ -468,6 +541,9 @@ fn prior(
                 manifest.generation
             ));
         }
+        if seed_generation == Some(manifest.generation.as_str()) {
+            continue;
+        }
         if manifest.source_kind != SourceKind::BrokerHistory
             || manifest.instrument != instrument.to_string()
             || manifest.role != history.role
@@ -478,16 +554,14 @@ fn prior(
         if manifest.price_representation != expected_representation {
             return Err("fetch: prior history price scale differs from configuration".into());
         }
-        let object = manifest
-            .objects
-            .iter()
-            .find(|object| object.path == COVERAGE_PATH)
-            .ok_or("fetch: prior coverage object missing")?;
-        let (_, fetched) = verify::fetch(local, object, true)?;
-        let coverage: HistoryCoverage = serde_json::from_slice(
-            &fs::read(&fetched.expect("decoded").path).map_err(|error| error.to_string())?,
-        )
-        .map_err(|error| format!("fetch: malformed prior coverage: {error}"))?;
+        Access {
+            declaration,
+            certification: None,
+        }
+        .permit(Some(manifest.role), &manifest.generation)?;
+        let Some(coverage) = crate::lineage::history_coverage(local, &manifest)? else {
+            continue;
+        };
         if coverage.source_identity != source_identity
             || coverage.seed.as_ref().map(|seed| seed.generation.as_str()) != seed_generation
         {
@@ -500,6 +574,14 @@ fn prior(
             || coverage.rows != manifest.row_count
         {
             return Err("fetch: prior coverage identity mismatch".into());
+        }
+        if manifest.layout == Some(binary_alpha_engine::dataset::Layout::DailyV2) {
+            daily.push(Baseline {
+                seed: coverage.seed.clone(),
+                manifest,
+                coverage: Some(coverage),
+            });
+            continue;
         }
         // The widest verified range wins; among equals, a closed acquisition outranks a partial
         // snapshot left by an exhausted budget, and more retained pages outrank fewer.
@@ -518,7 +600,7 @@ fn prior(
         };
         if selected
             .as_ref()
-            .map(|prior| rank(prior.coverage.as_ref().expect("descendant coverage")))
+            .map(|prior| rank(prior.coverage.as_ref().expect("history coverage")))
             .transpose()?
             .is_none_or(|old| rank(&coverage).is_ok_and(|new| new > old))
         {
@@ -528,6 +610,11 @@ fn prior(
                 coverage: Some(coverage),
             });
         }
+    }
+    if !daily.is_empty() {
+        let newest =
+            crate::lineage::newest_from(local, daily.iter().map(|b| &b.manifest).collect())?;
+        selected = daily.into_iter().find(|b| b.manifest.generation == newest);
     }
     if let Some(prior) = &selected {
         verify::run_with(
@@ -592,13 +679,39 @@ fn seed_baseline(
             history.native_granularity
         ));
     }
+    let coverage = if manifest.layout == Some(binary_alpha_engine::dataset::Layout::DailyV2)
+        && manifest.source_kind == SourceKind::BrokerHistory
+    {
+        let coverage = crate::lineage::history_coverage(&store, &manifest)?;
+        if let Some(mut coverage) = coverage {
+            if coverage.schema_version != 1
+                || coverage.source_identity != source_identity
+                || coverage.broker != instrument.broker.as_str()
+                || coverage.provider_symbol != instrument.provider_symbol.as_str()
+                || coverage.role != history.role
+                || coverage.native_granularity != history.native_granularity
+                || coverage.rows != manifest.row_count
+            {
+                return Err("fetch: continuation root coverage identity mismatch".into());
+            }
+            coverage.seed = Some(SeedLineage {
+                generation: manifest.generation.clone(),
+                source_identity: seed.source_identity.clone(),
+            });
+            Some(coverage)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
     Ok(Baseline {
         seed: Some(SeedLineage {
             generation: manifest.generation.clone(),
             source_identity: seed.source_identity.clone(),
         }),
         manifest,
-        coverage: None,
+        coverage,
     })
 }
 
@@ -1010,6 +1123,8 @@ fn acquire_one<R: Row>(
     let requested = plan.requested;
     let overlap = i64::from(history.overlap_seconds.unwrap_or(0)) * 1_000_000;
     let baseline = plan.baseline.as_ref();
+    let daily_layout = baseline
+        .is_some_and(|b| b.manifest.layout == Some(binary_alpha_engine::dataset::Layout::DailyV2));
     let seed_lineage = baseline.and_then(|baseline| baseline.seed.clone());
     let previous_verified = baseline.map(Baseline::verified).transpose()?.flatten();
     // A verified suffix after shortfall must not skip the still-unfetched leading interval; a
@@ -1054,6 +1169,7 @@ fn acquire_one<R: Row>(
     let started = Instant::now();
     let mut rows: Vec<R> = Vec::new();
     let mut objects = baseline
+        .filter(|_| !daily_layout)
         .map(|baseline| carried_objects(baseline, local))
         .transpose()?
         .unwrap_or_default();
@@ -1096,7 +1212,39 @@ fn acquire_one<R: Row>(
     {
         persist(ProgressEvent::Started(&progress))?;
     }
-    let mut receipts = Vec::new();
+    let acquisition = if daily_layout && bounds.acquisition.is_none() {
+        let invocation = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|e| e.to_string())?
+            .as_nanos()
+            .to_string();
+        let record = import::retain_bytes(
+            local,
+            &json_bytes(
+                &serde_json::json!({"kind":"acquisition","instrument":instrument.to_string(),"invocation":invocation,"process":std::process::id()}),
+            )?,
+            "acquisition",
+        )?;
+        Some(OccurrenceIdentity {
+            acquisition_id: object_key(&record.sha256),
+            intent: None,
+            ordinal: 0,
+        })
+    } else {
+        bounds.acquisition.clone()
+    };
+    let mut receipts: Vec<_> = bounds
+        .diagnostics
+        .iter()
+        .map(|page| PageReceipt {
+            occurrence: page.occurrence.clone(),
+            anchor: page.anchor.clone(),
+            sha256: page.sha256.clone(),
+            bytes: page.bytes,
+            rows: page.rows,
+            receipt_time: page.receipt_time.clone().expect("received page timestamp"),
+        })
+        .collect();
     let mut earliest = None;
     let floor = previous_verified.map_or(fetch_start, |(start, _)| start);
     let mut anchor = Some(requested.1);
@@ -1117,6 +1265,7 @@ fn acquire_one<R: Row>(
                 broker.decode_history(instrument, &raw, native.scale, native.granularity)?;
             if let Some(receipt_time) = &retained.receipt_time {
                 receipts.push(PageReceipt {
+                    occurrence: retained.occurrence.clone(),
                     anchor: retained.anchor.clone(),
                     sha256: retained.sha256.clone(),
                     bytes: retained.bytes,
@@ -1144,6 +1293,24 @@ fn acquire_one<R: Row>(
             // The matched response is retained before its rows can be rejected, so a malformed
             // page stays inspectable as a diagnostic object that no manifest names.
             let identity = import::retain_bytes(local, &page.raw, "history-page")?;
+            let occurrence = acquisition.as_ref().map(|id| OccurrenceIdentity {
+                ordinal: u64::from(requests - 1),
+                ..id.clone()
+            });
+            if daily_layout && let Some(persist) = bounds.persist.as_mut() {
+                persist(ProgressEvent::Received(&PageCoverage {
+                    occurrence: occurrence.clone(),
+                    path: format!("raw/{}.json", identity.sha256),
+                    sha256: identity.sha256.clone(),
+                    bytes: identity.bytes,
+                    anchor: page.anchor_token.clone(),
+                    offset: None,
+                    rows: 0,
+                    first: None,
+                    last: None,
+                    receipt_time: Some(time_text(page.receipt_micros)),
+                }))?;
+            }
             let (symbol_id, decoded) = broker
                 .decode_history(instrument, &page.raw, native.scale, native.granularity)
                 .map_err(|reason| {
@@ -1154,6 +1321,7 @@ fn acquire_one<R: Row>(
                 })?;
             let page_rows = R::unpack(decoded)?;
             receipts.push(PageReceipt {
+                occurrence: occurrence.clone(),
                 anchor: page.anchor_token.clone(),
                 sha256: identity.sha256.clone(),
                 bytes: identity.bytes,
@@ -1161,6 +1329,7 @@ fn acquire_one<R: Row>(
                 receipt_time: time_text(page.receipt_micros),
             });
             let coverage_page = PageCoverage {
+                occurrence,
                 path: format!("raw/{}.json", identity.sha256),
                 sha256: identity.sha256,
                 bytes: identity.bytes,
@@ -1175,15 +1344,30 @@ fn acquire_one<R: Row>(
         };
         let mut sequence = R::Sequence::default();
         for row in &page_rows {
-            R::accept(&mut sequence, *row)
-                .map_err(|error| format!("fetch {instrument}: {error}"))?;
+            validated(
+                R::accept(&mut sequence, *row)
+                    .map_err(|error| format!("fetch {instrument}: {error}")),
+                daily_layout,
+                bounds,
+            )?;
+        }
+        if !replayed
+            && daily_layout
+            && let Some(persist) = bounds.persist.as_mut()
+        {
+            // Preserve decoded bounds even when identity or overlap validation rejects the page.
+            persist(ProgressEvent::Received(&coverage_page))?;
         }
         if let Some(symbol_id) = symbol_id {
             if native.symbol_id.is_some_and(|known| known != symbol_id) {
-                return Err(format!(
-                    "fetch {instrument}: the provider identifies this instrument as {symbol_id}, but the retained lineage carries {}",
-                    native.symbol_id.unwrap_or_default()
-                ));
+                return validated(
+                    Err(format!(
+                        "fetch {instrument}: the provider identifies this instrument as {symbol_id}, but the retained lineage carries {}",
+                        native.symbol_id.unwrap_or_default()
+                    )),
+                    daily_layout,
+                    bounds,
+                );
             }
             native.symbol_id = Some(symbol_id);
         }
@@ -1193,7 +1377,11 @@ fn acquire_one<R: Row>(
         let boundary = received_all
             .first()
             .map_or(floor, |row| row.time().saturating_add(1).max(floor));
-        check_verified_overlap(instrument, &previous_rows, &received_all, boundary)?;
+        validated(
+            check_verified_overlap(instrument, &previous_rows, &received_all, boundary),
+            daily_layout,
+            bounds,
+        )?;
         let first = page_rows.first().map(Row::time);
         if let Some(last_row) = page_rows.last().filter(|row| row.time() >= fetch_start) {
             // Coverage ends at the last complete row, or where a row straddles the cutoff: a
@@ -1221,9 +1409,13 @@ fn acquire_one<R: Row>(
             // Contradicting prices are still errors, even in a non-progressing response.
             for new in &page_rows {
                 if rows.iter().any(|old: &R| old.conflicts(new)) {
-                    return Err(format!(
-                        "fetch {instrument}: conflicting prices at one time"
-                    ));
+                    return validated(
+                        Err(format!(
+                            "fetch {instrument}: conflicting prices at one time"
+                        )),
+                        daily_layout,
+                        bounds,
+                    );
                 }
             }
             break Some(Shortfall {
@@ -1247,7 +1439,11 @@ fn acquire_one<R: Row>(
         }
         anchor = Some(first);
     };
-    check_verified_overlap(instrument, &previous_rows, &received_all, floor)?;
+    validated(
+        check_verified_overlap(instrument, &previous_rows, &received_all, floor),
+        daily_layout,
+        bounds,
+    )?;
     let new_count = rows.len();
     let pending = shortfall
         .as_ref()
@@ -1331,8 +1527,31 @@ fn acquire_one<R: Row>(
             reason: TAIL_SHORTFALL.into(),
             unresolved: Range::new(end.max(fetch_start), requested.1),
         });
-    let tail_shortfall = shortfall.as_ref().and(tail.clone());
-    let shortfall = shortfall.or(tail);
+    let mut tail_shortfall = shortfall.as_ref().and(tail.clone());
+    let mut shortfall = shortfall.or(tail);
+    if daily_layout && let Some((from, to)) = verified_bounds {
+        // A cumulative baseline can already prove the overlap of an interrupted request.
+        // Shortfalls describe only the still-unverified part of the requested range.
+        for slot in [&mut shortfall, &mut tail_shortfall] {
+            if let Some(gap) = slot {
+                let (mut a, mut b) = gap.unresolved.bounds()?;
+                if a >= from && a < to {
+                    a = a.max(to);
+                }
+                if b > from && b <= to {
+                    b = b.min(from);
+                }
+                if a >= b {
+                    *slot = None;
+                } else {
+                    gap.unresolved = Range::new(a, b);
+                }
+            }
+        }
+        if shortfall.is_none() {
+            shortfall = tail_shortfall.take();
+        }
+    }
     let mut coverage = HistoryCoverage {
         schema_version: 1,
         source_identity: source_identity.to_string(),
@@ -1361,7 +1580,7 @@ fn acquire_one<R: Row>(
                 && previous.tail_shortfall == coverage.tail_shortfall
                 && previous.verified == coverage.verified
         });
-    if no_change {
+    if no_change && !daily_layout {
         let prior = prior.expect("no change has a prior generation");
         coverage = coverage_of(prior);
         coverage.requested = Range::new(requested.0, requested.1);
@@ -1379,6 +1598,69 @@ fn acquire_one<R: Row>(
         return Ok(Outcome {
             instrument: instrument.clone(),
             generation: Some(prior.manifest.generation.clone()),
+            coverage,
+            pending,
+            receipts,
+        });
+    }
+    if daily_layout && !rows.is_empty() {
+        let baseline = &baseline.expect("daily baseline").manifest;
+        let mut manifest = baseline.clone();
+        manifest.source_kind = SourceKind::BrokerHistory;
+        manifest.config_hash = config.content_hash();
+        manifest.code_revision = CODE_REVISION.into();
+        manifest.row_count = rows.len() as u64;
+        manifest.coverage = Coverage {
+            first_event_time: time_text(rows.first().expect("rows").time()),
+            last_event_time: time_text(rows.last().expect("rows").time()),
+        };
+        let daily_rows = rows
+            .into_iter()
+            .map(|r| r.daily(instrument, &native))
+            .collect::<Result<Vec<_>, _>>()?;
+        let own = if bounds.declaration.is_none() {
+            crate::research::declaration(config)?
+        } else {
+            None
+        };
+        let published = crate::lineage::descendant(
+            local,
+            destination,
+            baseline,
+            manifest,
+            daily_rows,
+            &coverage,
+            acquisition
+                .as_ref()
+                .ok_or("daily acquisition identity absent")?,
+            &progress.pages,
+            &bounds.diagnostics,
+            native.server_offset_s,
+            Access {
+                declaration: bounds.declaration.or(own.as_ref()),
+                certification: None,
+            },
+        )?;
+        let generation = published.manifest.generation.clone();
+        // Receipts retain their exact single-page references; daily coverage has no page index.
+        coverage.pages = progress.pages;
+        writeln!(
+            out,
+            "{}",
+            report(
+                instrument,
+                history.role,
+                &generation,
+                &coverage,
+                published.manifest.objects.len(),
+                published.reused,
+                (started.elapsed().as_secs_f64(), 0.0)
+            )
+        )
+        .map_err(|e| e.to_string())?;
+        return Ok(Outcome {
+            instrument: instrument.clone(),
+            generation: Some(generation),
             coverage,
             pending,
             receipts,
@@ -1581,6 +1863,7 @@ mod bundle_tests {
             .map(|raw| {
                 let identity = import::retain_bytes(&local, raw, "history-page").unwrap();
                 PageCoverage {
+                    occurrence: None,
                     path: format!("raw/{}.json", identity.sha256),
                     sha256: identity.sha256,
                     bytes: identity.bytes,

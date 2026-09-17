@@ -70,7 +70,7 @@ pub fn run_with(uri: &str, access: Access<'_>) -> Result<String, String> {
                 .map_err(|reason| format!("{uri}: {reason}"))?;
             verify_dataset(uri, &store, &manifest_key, &bytes)
         }
-        Some(STREAM_MANIFEST_KIND) => verify_stream(uri, &store, &manifest_key, &bytes),
+        Some(STREAM_MANIFEST_KIND) => verify_stream(uri, &store, &manifest_key, &bytes, access),
         Some(FEATURE_MANIFEST_KIND) => {
             crate::features::verify_feature(uri, &store, &manifest_key, &bytes)
         }
@@ -297,9 +297,15 @@ fn verify_dataset(uri: &str, store: &Store, key: &str, bytes: &[u8]) -> Result<S
                 && d.object.as_ref() == Some(&object.key)
                 && d.logical_path().is_ok_and(|p| p == object.path)
         });
-        let (verified, local) = fetch(store, object, page_day.is_some())?;
+        let coverage = manifest.layout.is_some() && object.path == "provenance/coverage.json";
+        let (verified, local) = fetch(store, object, page_day.is_some() || coverage)?;
         bytes_verified += verified;
-        if let Some(day) = page_day {
+        if coverage {
+            binary_alpha_engine::dataset::coverage::DailyCoverage::from_json(
+                &fs::read(&local.expect("coverage object").path).map_err(|e| e.to_string())?,
+            )?
+            .check_manifest(&manifest)?;
+        } else if let Some(day) = page_day {
             let pages = crate::daily::read_pages(&local.expect("page partition").path, &day.date)
                 .map_err(|e| format!("{}: {e}", object.path))?;
             let mut data = DataSummary::default();
@@ -482,7 +488,13 @@ pub fn bar_expectation(manifest: &GenerationManifest) -> Result<BarExpectation, 
 
 /// Verifies a stream generation: every object's bytes and hashes, the profile's consistency
 /// with the manifest, and every candle object's rows and bounds.
-fn verify_stream(uri: &str, store: &Store, key: &str, bytes: &[u8]) -> Result<String, String> {
+fn verify_stream(
+    uri: &str,
+    store: &Store,
+    key: &str,
+    bytes: &[u8],
+    access: Access<'_>,
+) -> Result<String, String> {
     let manifest = StreamManifest::from_json(bytes).map_err(|error| format!("{uri}: {error}"))?;
     if manifest.key() != key {
         return Err(format!(
@@ -495,6 +507,10 @@ fn verify_stream(uri: &str, store: &Store, key: &str, bytes: &[u8]) -> Result<St
     let mut daily_totals =
         std::collections::BTreeMap::<(u32, u32), (u64, Option<i64>, Option<i64>)>::new();
     let mut observed_profile = None;
+    let mut finalized_days = std::collections::BTreeMap::<
+        (u32, u32),
+        std::collections::BTreeMap<String, (u64, i64)>,
+    >::new();
     let ordered_objects = if manifest.layout.is_some() {
         let mut objects: Vec<_> = manifest
             .objects
@@ -586,6 +602,12 @@ fn verify_stream(uri: &str, store: &Store, key: &str, bytes: &[u8]) -> Result<St
                 last_event_micros: rows.last().map(|c| c.open_time_micros),
             };
             crate::daily::check_inventory(day, &data)?;
+            if let Some(at) = rows.iter().map(|c| c.known_at_micros).max() {
+                finalized_days
+                    .entry(spec)
+                    .or_default()
+                    .insert(day.date.clone(), (data.rows, at));
+            }
             let total = daily_totals.entry(spec).or_default();
             for candle in rows {
                 archive::check_candle_order(total.2, &candle)
@@ -626,6 +648,7 @@ fn verify_stream(uri: &str, store: &Store, key: &str, bytes: &[u8]) -> Result<St
     }
     if manifest.layout.is_some() {
         let profile = observed_profile.ok_or("daily stream lacks profile")?;
+        let source = stream_source(store, &manifest, access)?;
         for (index, summary) in manifest.streams.iter().enumerate() {
             let total = daily_totals
                 .get(&(summary.duration_seconds, summary.offset_seconds))
@@ -640,27 +663,35 @@ fn verify_stream(uri: &str, store: &Store, key: &str, bytes: &[u8]) -> Result<St
                     summary.duration_seconds, summary.offset_seconds
                 ));
             }
-            if let Some(open) = crate::audit::pending_open(&profile, index)? {
-                let date = format_event_time_micros(open)[..10].to_string();
-                let day = manifest
-                    .day_inventory
-                    .iter()
-                    .find(|d| {
-                        d.date == date
-                            && d.duration == Some(summary.duration_seconds)
-                            && d.offset == Some(summary.offset_seconds)
-                    })
-                    .ok_or_else(|| format!("missing partial candle day {date}"))?;
-                if day.state != binary_alpha_engine::dataset::daily::DayState::Partial
-                    || !day.unresolved.iter().any(|i| {
-                        binary_alpha_engine::market::parse_event_time_micros(&i.start)
-                            .is_ok_and(|t| t <= open)
-                            && binary_alpha_engine::market::parse_event_time_micros(&i.end)
-                                .is_ok_and(|t| t > open)
-                    })
+            let expected = crate::audit::candle_inventory(
+                &manifest.definition.candles[index],
+                &source.day_inventory,
+                crate::audit::pending_open(&profile, index)?,
+                finalized_days
+                    .get(&(summary.duration_seconds, summary.offset_seconds))
+                    .unwrap_or(&std::collections::BTreeMap::new()),
+                source.native_granularity,
+            )?;
+            let actual: Vec<_> = manifest
+                .day_inventory
+                .iter()
+                .filter(|d| {
+                    d.duration == Some(summary.duration_seconds)
+                        && d.offset == Some(summary.offset_seconds)
+                })
+                .collect();
+            if actual.len() != expected.len() {
+                return Err("candle inventory does not contain every expected source day".into());
+            }
+            for (actual, expected) in actual.iter().zip(expected) {
+                if actual.date != expected.date
+                    || actual.state != expected.state
+                    || actual.reason != expected.reason
+                    || actual.unresolved != expected.unresolved
                 {
                     return Err(format!(
-                        "candle day {date} must be partial: last candle may be finalized by later input"
+                        "candle day {} must be {} with the derived source coverage and unresolved intervals",
+                        expected.date, expected.state
                     ));
                 }
             }
@@ -673,4 +704,45 @@ fn verify_stream(uri: &str, store: &Store, key: &str, bytes: &[u8]) -> Result<St
         manifest.generation,
         manifest.objects.len()
     ))
+}
+
+/// Prefer a restored closure, otherwise resolve the writer's explicit source location.
+/// Permission and source identity checks precede any source object reads.
+fn stream_source(
+    store: &Store,
+    stream: &StreamManifest,
+    access: Access<'_>,
+) -> Result<GenerationManifest, String> {
+    access.permit(Some(stream.role), &stream.source_generation)?;
+    let key = binary_alpha_engine::dataset::manifest_key(&stream.source_generation);
+    let fallback;
+    let source_store = if store.head(&key)?.is_some() {
+        store
+    } else {
+        let uri = stream
+            .source_manifest_uri
+            .as_ref()
+            .ok_or("stream source evidence unavailable: no local dataset or source reference")?;
+        fallback = open(uri)?.0;
+        &fallback
+    };
+    let mut bytes = Vec::new();
+    source_store
+        .read_to(&key, None, &mut bytes)
+        .map_err(|e| format!("stream source evidence unavailable: {e}"))?;
+    let source = GenerationManifest::from_json(&bytes)?;
+    access.permit(Some(source.role), &source.generation)?;
+    if source.key() != key
+        || source.layout != stream.layout
+        || source.role != stream.role
+        || source.instrument != stream.instrument
+        || source.source_kind != stream.source_kind
+        || source.native_granularity != stream.definition.native_granularity
+        || source.row_count != stream.observations
+        || Some(&source.coverage) != stream.coverage.as_ref()
+    {
+        return Err("stream source dataset identity or summary mismatch".into());
+    }
+    verify_dataset(&source_store.uri(&key), source_store, &key, &bytes)?;
+    Ok(source)
 }

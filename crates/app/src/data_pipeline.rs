@@ -5,11 +5,11 @@
 //! immutable catalog published last, and restores one exact catalog into a fresh store. Every
 //! mutable step is resumable from `pipeline_state/`; every completed record is immutable.
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::VecDeque;
 use std::fs::{self, File};
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 
 use binary_alpha_engine::config::{
     Config, ConfigPath, ManifestUri, PublicationUri, RunMode, Seed, relative_path,
@@ -140,10 +140,11 @@ impl PipelineConfig {
 }
 
 /// The resolved managed root and its fixed children.
-struct Layout {
-    base: PathBuf,
-    store: PathBuf,
-    state: PathBuf,
+pub(crate) struct Layout {
+    pub(crate) base: PathBuf,
+    pub(crate) store: PathBuf,
+    pub(crate) state: PathBuf,
+    registry: OnceLock<Result<crate::registry::Registry, String>>,
 }
 
 impl Layout {
@@ -157,7 +158,12 @@ impl Layout {
                 .map_err(|error| format!("cannot create {}: {error}", dir.display()))?;
         }
         private(&state)?;
-        Ok(Self { base, store, state })
+        Ok(Self {
+            base,
+            store,
+            state,
+            registry: OnceLock::new(),
+        })
     }
 
     fn store(&self) -> Store {
@@ -228,8 +234,8 @@ fn sha256_hex(bytes: &[u8]) -> String {
 }
 
 /// The one local writer of an archive root: producer commands hold this nonblocking lock for
-/// their whole run; consumer commands never take it.
-fn writer_lock(layout: &Layout) -> Result<File, String> {
+/// their whole run; installing consumers also hold it to exclude retirement.
+pub(crate) fn writer_lock(layout: &Layout) -> Result<File, String> {
     let path = layout.state.join("writer.lock");
     let file = File::create(&path)
         .map_err(|error| format!("cannot create {}: {error}", path.display()))?;
@@ -410,6 +416,8 @@ struct Intent {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct Pending {
     intent: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    acquisition_id: Option<String>,
     effective_config_hash: String,
     progress: Progress,
 }
@@ -459,6 +467,8 @@ struct Receipt {
     job: String,
     intent: String,
     status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    acquisition_id: Option<String>,
     dataset_generation: Option<String>,
     stream_generation: Option<String>,
     coverage: Option<fetch::HistoryCoverage>,
@@ -506,6 +516,8 @@ pub struct ObjectEntry {
 #[serde(deny_unknown_fields)]
 pub struct Catalog {
     pub schema_version: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub layout: Option<binary_alpha_engine::dataset::Layout>,
     pub job: String,
     pub broker: String,
     pub provider_symbol: String,
@@ -517,10 +529,49 @@ pub struct Catalog {
     pub row_count: u64,
     pub dataset: ManifestEntry,
     pub stream: ManifestEntry,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub lineage_manifests: Vec<ManifestEntry>,
     pub objects: Vec<ObjectEntry>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub records: Vec<ObjectEntry>,
 }
 
 impl Catalog {
+    pub(crate) fn check_migration_records(
+        &self,
+        layout: &Layout,
+        dataset: &GenerationManifest,
+        access: Access<'_>,
+    ) -> Result<crate::lineage::MigrationRecords, String> {
+        if dataset.layout == Some(binary_alpha_engine::dataset::Layout::DailyV2) {
+            let bindings = crate::lineage::migration_records(
+                &layout.store(),
+                &layout.state.join("records"),
+                dataset,
+                &self.job,
+                access,
+            )?;
+            if bindings.streams.keys().any(|generation| {
+                !std::iter::once(&self.stream)
+                    .chain(&self.lineage_manifests)
+                    .any(|entry| &entry.generation == generation)
+            }) {
+                return Err("catalog omits the verified migration stream".into());
+            }
+            if bindings.files.len() != self.records.len()
+                || bindings.files.iter().any(|(key, id)| {
+                    !self
+                        .records
+                        .iter()
+                        .any(|r| &r.key == key && r.bytes == id.bytes && r.sha256 == id.sha256)
+                })
+            {
+                return Err("catalog migration records do not match the pinned lineage".into());
+            }
+            return Ok(bindings);
+        }
+        Ok(Default::default())
+    }
     pub fn from_json(bytes: &[u8]) -> Result<Self, String> {
         let catalog: Self = serde_json::from_slice(bytes).map_err(|error| error.to_string())?;
         if catalog.schema_version != CATALOG_SCHEMA_VERSION {
@@ -529,10 +580,18 @@ impl Catalog {
                 catalog.schema_version
             ));
         }
-        if catalog.dataset.key != manifest_key(&catalog.dataset.generation)
-            || catalog.stream.key != manifest_key(&catalog.stream.generation)
+        let mut generations = std::collections::BTreeSet::new();
+        for entry in [&catalog.dataset, &catalog.stream]
+            .into_iter()
+            .chain(&catalog.lineage_manifests)
         {
-            return Err("catalog manifest keys do not name their generations".into());
+            if entry.generation.len() != 64
+                || !entry.generation.bytes().all(|b| b.is_ascii_hexdigit())
+                || entry.key != manifest_key(&entry.generation)
+                || !generations.insert(&entry.generation)
+            {
+                return Err("catalog manifest keys must name unique generation identities".into());
+            }
         }
         for (index, object) in catalog.objects.iter().enumerate() {
             if object.key != binary_alpha_engine::dataset::object_key(&object.sha256)
@@ -546,35 +605,31 @@ impl Catalog {
                 ));
             }
         }
+        let mut names = std::collections::BTreeSet::new();
+        for record in &catalog.records {
+            crate::lineage::record_name(&record.key)?;
+            if !names.insert(&record.key)
+                || record.sha256.len() != 64
+                || !record.sha256.bytes().all(|b| b.is_ascii_hexdigit())
+            {
+                return Err("catalog requires unique, hash-bound migration records".into());
+            }
+        }
         Ok(catalog)
     }
-}
-
-/// The durable transfer index of one job: every file identity pre-generated for a local
-/// object, its open session, and whether Drive confirmed it.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-struct Transfers {
-    files: BTreeMap<String, Transfer>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct Transfer {
-    file_id: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    session: Option<String>,
-    done: bool,
 }
 
 /// Archives one dataset generation and its stream generation from the managed store: every
 /// object once, then both manifests, then the catalog. A catalog receipt already recorded for
 /// the pair is reused after its remote file is confirmed.
-fn archive(
+fn archive_generation(
     config: &PipelineConfig,
     drive: &mut Drive,
     layout: &Layout,
     job: &str,
     dataset: &str,
     stream: &str,
+    access: Access<'_>,
 ) -> Result<CatalogReceipt, String> {
     let local = layout.store();
     let records = layout.records();
@@ -587,6 +642,7 @@ fn archive(
     if stream_manifest.source_generation != dataset_manifest.generation
         || stream_manifest.instrument != dataset_manifest.instrument
         || stream_manifest.role != dataset_manifest.role
+        || stream_manifest.layout != dataset_manifest.layout
         || dataset_manifest.role == DatasetRole::Holdout
     {
         return Err(format!(
@@ -594,44 +650,140 @@ fn archive(
         ));
     }
     let state = layout.job_state(job)?;
-    let transfers_path = state.join("transfers.json");
-    let mut transfers: Transfers = read_json(&transfers_path)?.unwrap_or_default();
+    let registry = layout
+        .registry
+        .get_or_init(|| crate::registry::Registry::open(&layout.state, &config.drive, drive))
+        .as_ref()
+        .map_err(Clone::clone)?;
+    // Immutable receipts pin exact file ids even if a later rebuild finds duplicate bytes.
+    if let Some(receipt) =
+        read_json::<CatalogReceipt>(&records.local_path(&receipt_name).expect("local records"))?
+    {
+        confirm_remote(drive, &receipt.file_id, receipt.bytes, &receipt.sha256)?;
+        let scratch = state.join(".existing-catalog");
+        drive.download(
+            &receipt.file_id,
+            &scratch,
+            &ObjectIdentity {
+                bytes: receipt.bytes,
+                sha256: receipt.sha256.clone(),
+                crc32c: 0,
+            },
+        )?;
+        let catalog = Catalog::from_json(&fs::read(&scratch).map_err(|e| e.to_string())?)?;
+        fs::remove_file(scratch).map_err(|e| e.to_string())?;
+        if catalog.job != job
+            || catalog.dataset.generation != dataset
+            || catalog.stream.generation != stream
+        {
+            return Err("catalog receipt does not bind the requested job and generations".into());
+        }
+        catalog.check_migration_records(layout, &dataset_manifest, access)?;
+        for entry in catalog.objects.iter().chain(&catalog.records) {
+            confirm_remote(drive, &entry.file_id, entry.bytes, &entry.sha256)?;
+        }
+        for entry in [&catalog.dataset, &catalog.stream]
+            .into_iter()
+            .chain(&catalog.lineage_manifests)
+        {
+            confirm_remote(drive, &entry.file_id, entry.bytes, &entry.sha256)?;
+        }
+        return Ok(receipt);
+    }
+    let legacy = registry.legacy_catalog_bindings(drive, job, dataset, stream)?;
+    let transfer =
+        |drive: &mut Drive, key: &str, name: &str, path: &Path, identity: &ObjectIdentity| {
+            if let Some(bindings) = &legacy {
+                let file_id = bindings
+                    .get(key)
+                    .ok_or_else(|| format!("legacy catalog: missing binding for {key}"))?;
+                confirm_remote(drive, file_id, identity.bytes, &identity.sha256)?;
+                return Ok(file_id.clone());
+            }
+            registry.transfer(drive, &format!("{job}/{key}"), name, path, identity)
+        };
+    // Every descendant catalog also owns the continuation root and its configured stream.
+    // This makes fresh-store restore preserve seed identity and retirement's retained root.
+    let mut lineage_manifests = Vec::new();
+    let mut lineage_objects = Vec::new();
+    if dataset_manifest.layout == Some(binary_alpha_engine::dataset::Layout::DailyV2)
+        && let Some(root) = crate::lineage::root(
+            &local,
+            &dataset_manifest.instrument,
+            dataset_manifest.role,
+            access,
+        )?
+        && root != dataset
+    {
+        let (root_manifest, bytes) = read_manifest(&local, &root)?;
+        verify::run_with(&local.uri(&root_manifest.key()), access)?;
+        lineage_objects.extend(root_manifest.objects);
+        lineage_manifests.push((root.clone(), manifest_key(&root), bytes));
+        let root_stream = binary_alpha_engine::stream::stream_generation_id_with_layout(
+            &root,
+            &stream_manifest.definition.canonical_toml(),
+            dataset_manifest.layout,
+        );
+        let root_key = manifest_key(&root_stream);
+        if local.head(&root_key)?.is_none() {
+            // The root may have been imported without an audit. Use the same semantic audit
+            // owner and definition as this descendant, before publishing either catalog.
+            let core = crate::load_config(
+                &layout.base.join(
+                    &config
+                        .jobs
+                        .iter()
+                        .find(|j| j.id == job)
+                        .ok_or("archive job absent")?
+                        .config,
+                ),
+            )?;
+            let mut core = core;
+            core.storage.historical_data_dir = ConfigPath::try_from(layout.store.clone())?;
+            core.storage.publication_uri = PublicationUri::Filesystem(layout.store.clone());
+            finish(&core, layout, &local, &root, access, &mut std::io::sink())?;
+        }
+        verify::run_with(&local.uri(&root_key), access)?;
+        let mut bytes = Vec::new();
+        local.read_to(&root_key, None, &mut bytes)?;
+        let root_manifest = StreamManifest::from_json(&bytes)?;
+        lineage_objects.extend(root_manifest.objects);
+        lineage_manifests.push((root_stream, root_key, bytes));
+    }
+    let record_bindings =
+        if dataset_manifest.layout == Some(binary_alpha_engine::dataset::Layout::DailyV2) {
+            crate::lineage::migration_records(
+                &local,
+                &layout.state.join("records"),
+                &dataset_manifest,
+                job,
+                access,
+            )?
+        } else {
+            Default::default()
+        };
+    // A changed configured stream cannot replace the stream whose candle equality was
+    // proved by migration. Retain that exact manifest and closure for restore and retire.
+    for (generation, migrated) in &record_bindings.streams {
+        if generation != stream && !lineage_manifests.iter().any(|(id, _, _)| id == generation) {
+            let key = migrated.key();
+            let mut bytes = Vec::new();
+            local.read_to(&key, None, &mut bytes)?;
+            lineage_objects.extend(migrated.objects.clone());
+            lineage_manifests.push((generation.clone(), key, bytes));
+        }
+    }
     let mut closure: Vec<&ObjectRecord> = Vec::new();
     for object in dataset_manifest
         .objects
         .iter()
         .chain(stream_manifest.objects.iter())
+        .chain(lineage_objects.iter())
     {
         if !closure.iter().any(|known| known.key == object.key) {
             closure.push(object);
         }
     }
-    // Every file identity is fixed before any upload so ambiguity reconciles by identity.
-    let mut wanted: Vec<String> = closure
-        .iter()
-        .map(|object| object.key.clone())
-        .chain([
-            dataset_manifest.key(),
-            stream_manifest.key(),
-            format!("catalog/{dataset}/{stream}"),
-        ])
-        .filter(|key| !transfers.files.contains_key(key))
-        .collect();
-    if !wanted.is_empty() {
-        let ids = drive.generate_ids(wanted.len())?;
-        for (key, file_id) in wanted.drain(..).zip(ids) {
-            transfers.files.insert(
-                key,
-                Transfer {
-                    file_id,
-                    session: None,
-                    done: false,
-                },
-            );
-        }
-        write_atomic(&transfers_path, &json_bytes(&transfers)?)?;
-    }
-    let transfers = Mutex::new(transfers);
     let objects = run_pool(config, &closure, |object, drive| {
         let path = local
             .local_path(&object.key)
@@ -645,8 +797,6 @@ fn archive(
         }
         let file_id = transfer(
             drive,
-            &transfers,
-            &transfers_path,
             &object.key,
             &format!("object-{}", object.sha256),
             &path,
@@ -659,19 +809,43 @@ fn archive(
             file_id,
         })
     })?;
-    let mut manifests = Vec::with_capacity(2);
+    let mut archived_records = Vec::new();
+    for (key, identity) in record_bindings.files {
+        let path = layout
+            .state
+            .join("records")
+            .join(crate::lineage::record_name(&key)?);
+        let file_id = transfer(
+            drive,
+            &key,
+            &format!("record-{}", identity.sha256),
+            &path,
+            &identity,
+        )?;
+        archived_records.push(ObjectEntry {
+            key,
+            sha256: identity.sha256,
+            bytes: identity.bytes,
+            file_id,
+        });
+    }
+    let mut manifests = Vec::with_capacity(2 + lineage_manifests.len());
     for (generation, key, bytes) in [
         (dataset, dataset_manifest.key(), &dataset_bytes),
         (stream, stream_manifest.key(), &stream_bytes),
-    ] {
+    ]
+    .into_iter()
+    .chain(
+        lineage_manifests
+            .iter()
+            .map(|(g, k, b)| (g.as_str(), k.clone(), b)),
+    ) {
         let scratch = state.join(format!(".manifest-{generation}"));
         fs::write(&scratch, bytes)
             .map_err(|error| format!("cannot write {}: {error}", scratch.display()))?;
         let identity = store::identify(&scratch)?;
         let file_id = transfer(
             drive,
-            &transfers,
-            &transfers_path,
             &key,
             &format!("manifest-{generation}.json"),
             &scratch,
@@ -687,10 +861,12 @@ fn archive(
             file_id,
         });
     }
+    let lineage_manifests = manifests.split_off(2);
     let stream_entry = manifests.pop().expect("stream entry");
     let dataset_entry = manifests.pop().expect("dataset entry");
     let catalog = Catalog {
         schema_version: CATALOG_SCHEMA_VERSION,
+        layout: dataset_manifest.layout,
         job: job.to_string(),
         broker: dataset_manifest.broker.to_string(),
         provider_symbol: dataset_manifest.provider_symbol.to_string(),
@@ -702,18 +878,18 @@ fn archive(
         row_count: dataset_manifest.row_count,
         dataset: dataset_entry,
         stream: stream_entry,
+        lineage_manifests,
         objects,
+        records: archived_records,
     };
     let bytes = json_bytes(&catalog)?;
     let scratch = state.join(format!(".catalog-{}", &dataset[..16]));
     fs::write(&scratch, &bytes)
         .map_err(|error| format!("cannot write {}: {error}", scratch.display()))?;
     let identity = store::identify(&scratch)?;
-    let file_id = transfer(
+    let file_id = registry.transfer(
         drive,
-        &transfers,
-        &transfers_path,
-        &format!("catalog/{dataset}/{stream}"),
+        &format!("{job}/catalog/{dataset}/{stream}"),
         &format!("{CATALOG_PREFIX}{}-{}.json", &dataset[..16], &stream[..16]),
         &scratch,
         &identity,
@@ -727,55 +903,6 @@ fn archive(
     };
     research::publish_record(&records, &records, &receipt_name, &json_bytes(&receipt)?)?;
     Ok(receipt)
-}
-
-/// Uploads one local file under its pre-generated identity unless the index already confirms
-/// it, persisting every session change before bytes flow.
-fn transfer(
-    drive: &mut Drive,
-    transfers: &Mutex<Transfers>,
-    transfers_path: &Path,
-    key: &str,
-    name: &str,
-    path: &Path,
-    identity: &ObjectIdentity,
-) -> Result<String, String> {
-    let entry = transfers
-        .lock()
-        .map_err(|_| "pipeline: transfers lock poisoned")?
-        .files
-        .get(key)
-        .cloned()
-        .expect("every key has a pre-generated identity");
-    if entry.done {
-        confirm_remote(drive, &entry.file_id, identity.bytes, &identity.sha256)?;
-        return Ok(entry.file_id);
-    }
-    let file_id = entry.file_id.clone();
-    let mut checkpoint = |session: Option<&str>| -> Result<(), String> {
-        let mut transfers = transfers
-            .lock()
-            .map_err(|_| "pipeline: transfers lock poisoned")?;
-        let entry = transfers.files.get_mut(key).expect("indexed");
-        entry.session = session.map(str::to_string);
-        write_atomic(transfers_path, &json_bytes(&*transfers)?)
-    };
-    drive.upload(
-        &file_id,
-        name,
-        path,
-        identity,
-        entry.session,
-        &mut checkpoint,
-    )?;
-    let mut transfers = transfers
-        .lock()
-        .map_err(|_| "pipeline: transfers lock poisoned")?;
-    let entry = transfers.files.get_mut(key).expect("indexed");
-    entry.session = None;
-    entry.done = true;
-    write_atomic(transfers_path, &json_bytes(&*transfers)?)?;
-    Ok(file_id)
 }
 
 /// Transfers objects with one Drive session per worker. A failure stops new work; in-flight
@@ -860,8 +987,12 @@ fn imported_seed(
     broker: &BrokerId,
     symbol: &str,
     role: DatasetRole,
+    access: Access<'_>,
 ) -> Result<Option<String>, String> {
     let instrument = format!("{broker}:{symbol}");
+    if let Some(root) = crate::lineage::root(local, &instrument, role, access)? {
+        return Ok(Some(root));
+    }
     let mut newest: Option<(String, String)> = None;
     for generation in local.list_manifests()? {
         let mut bytes = Vec::new();
@@ -898,7 +1029,7 @@ fn read_manifest(local: &Store, generation: &str) -> Result<(GenerationManifest,
 // ----------------------------------------------------------------------------------------------
 
 /// The declaration a pipeline applies to every read, when it names one.
-fn declaration(config: &PipelineConfig) -> Result<Option<Declaration>, String> {
+pub(crate) fn declaration(config: &PipelineConfig) -> Result<Option<Declaration>, String> {
     config
         .governance_manifest
         .as_deref()
@@ -907,13 +1038,42 @@ fn declaration(config: &PipelineConfig) -> Result<Option<Declaration>, String> {
         .map_err(|reason| format!("governance_manifest: {reason}"))
 }
 
-fn load(config_path: &Path) -> Result<(PipelineConfig, Layout, String), String> {
+pub(crate) fn load(config_path: &Path) -> Result<(PipelineConfig, Layout, String), String> {
     let text = fs::read_to_string(config_path)
         .map_err(|error| format!("cannot read {}: {error}", config_path.display()))?;
     let config = PipelineConfig::parse(&text)?;
     let layout = Layout::open(config_path, &config)?;
     let hash = sha256_hex(text.as_bytes());
     Ok((config, layout, hash))
+}
+
+/// Archive existing v2 history without acquisition. Verification uses the same
+/// owner as update; all jobs share the archive-root registry and writer lock.
+pub fn archive(config_path: &Path, job: Option<&str>, out: &mut dyn Write) -> Result<(), String> {
+    let (mut config, layout, _) = load(config_path)?;
+    if let Some(id) = job {
+        config.jobs.retain(|job| job.id == id);
+        if config.jobs.is_empty() {
+            return Err(format!("pipeline: unknown job {id}"));
+        }
+    }
+    run_jobs(&config, &layout, out, &|job, bound, drive, access, _out| {
+        let local = layout.store();
+        let history = bound.core.history.as_ref().expect("bound history");
+        let dataset = crate::lineage::newest_daily(
+            &local,
+            &format!("{}:{}", history.broker, bound.symbol),
+            history.role,
+            access,
+        )?;
+        let stream = crate::lineage::verified_daily_stream(&local, &dataset, &bound.core, access)?;
+        let receipt =
+            archive_generation(&config, drive, &layout, &job.id, &dataset, &stream, access)?;
+        Ok(format!(
+            "pipeline archive {} dataset {dataset} stream {stream} catalog {} sha256 {}",
+            job.id, receipt.file_id, receipt.sha256
+        ))
+    })
 }
 
 /// `data pipeline update`: extend every job's imported generation from its frontier to one
@@ -956,11 +1116,26 @@ fn run_jobs(
         return Err("pipeline: the configuration declares no jobs".into());
     }
     let _lock = writer_lock(layout)?;
+    let _archive_lock = archive_lock(config)?;
     let declaration = declaration(config)?;
     let access = Access {
         declaration: declaration.as_ref(),
         certification: None,
     };
+    // No acquisition or publication may race reachability checks and single-page deletion.
+    let reclaim = || -> Result<(), String> {
+        for job in &config.jobs {
+            crate::lineage::reclaim(
+                &layout.store(),
+                &layout.job_state(&job.id)?,
+                &layout.state,
+                &layout.records(),
+                access,
+            )?;
+        }
+        Ok(())
+    };
+    reclaim()?;
     let workers = usize::try_from(config.parallel_jobs.unwrap_or(1))
         .unwrap_or(1)
         .min(config.jobs.len())
@@ -1018,6 +1193,7 @@ fn run_jobs(
         }
         Ok::<_, String>(failed)
     })?;
+    reclaim()?;
     failed.sort_unstable();
     if failed.is_empty() {
         Ok(())
@@ -1075,7 +1251,7 @@ fn update_job(
         .iter()
         .find(|broker| broker.id() == &history.broker)
         .expect("bound broker");
-    let imported = imported_seed(&local, &history.broker, &bound.symbol, history.role)?
+    let imported = imported_seed(&local, &history.broker, &bound.symbol, history.role, access)?
         .ok_or_else(|| {
             format!(
                 "job {}: the store holds no imported generation for {}:{}; run `data import` first",
@@ -1085,6 +1261,13 @@ fn update_job(
     let pending_path = state.join("progress.json");
     let pages_path = state.join("progress.pages.jsonl");
     let (pending, partial) = read_pending(&pending_path, &pages_path)?;
+    let (diagnostics, received_partial) = crate::lineage::diagnostics(
+        &state,
+        pending.as_ref().map(|p| p.progress.pages.as_slice()),
+    )?;
+    if received_partial {
+        writeln!(out, "pipeline job {} received log: incomplete response metadata retained as unresolved; single-page reclamation deferred", job.id).map_err(|e| e.to_string())?;
+    }
     if partial {
         writeln!(
             out,
@@ -1166,10 +1349,21 @@ fn update_job(
     let deadline = clock
         .now_micros()
         .saturating_add(i64::from(history.max_elapsed_seconds.expect("bound")) * 1_000_000);
+    let token = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|e| e.to_string())?
+        .as_nanos()
+        .to_string();
+    let acquisition_id = publish(
+        &records,
+        &format!("{}-acquisition", job.id),
+        &serde_json::json!({"schema_version": 1, "intent": intent, "invocation": token, "process": std::process::id()}),
+    )?;
     let intent_name = intent.clone();
     let mut persist = |event: ProgressEvent<'_>| -> Result<(), String> {
         match event {
             ProgressEvent::Started(progress) => {
+                crate::lineage::clear_received(&state)?;
                 // A crash after removing a completed header can leave its old log behind.
                 File::create(&pages_path)
                     .map_err(|error| format!("cannot create {}: {error}", pages_path.display()))?;
@@ -1177,10 +1371,21 @@ fn update_job(
                     &pending_path,
                     &json_bytes(&Pending {
                         intent: intent_name.clone(),
+                        acquisition_id: Some(acquisition_id.clone()),
                         effective_config_hash: binding.clone(),
                         progress: progress.clone(),
                     })?,
                 )
+            }
+            ProgressEvent::Received(page) => crate::lineage::received(&state, page),
+            ProgressEvent::Invalidate => {
+                if let Some(mut pending) = read_json::<Pending>(&pending_path)? {
+                    pending.progress.pages.clear();
+                    write_atomic(&pending_path, &json_bytes(&pending)?)?;
+                }
+                File::create(&pages_path)
+                    .and_then(|f| f.sync_all())
+                    .map_err(|e| format!("cannot invalidate {}: {e}", pages_path.display()))
             }
             ProgressEvent::Page(page) => {
                 let mut line = serde_json::to_vec(page).map_err(|error| error.to_string())?;
@@ -1200,14 +1405,20 @@ fn update_job(
                         line.len()
                     ));
                 }
-                file.flush()
-                    .map_err(|error| format!("cannot flush {}: {error}", pages_path.display()))
+                file.sync_all()
+                    .map_err(|error| format!("cannot sync {}: {error}", pages_path.display()))
             }
         }
     };
     let mut adapter = broker::connect(&config)?;
     let outcomes = {
         let mut bounds = Bounds {
+            diagnostics,
+            acquisition: Some(fetch::OccurrenceIdentity {
+                acquisition_id: acquisition_id.clone(),
+                intent: Some(intent.clone()),
+                ordinal: 0,
+            }),
             max_pages: history.max_pages,
             deadline_micros: Some(deadline),
             clock,
@@ -1228,20 +1439,23 @@ fn update_job(
     let [outcome] = outcomes.as_slice() else {
         return Err(format!("job {}: expected one acquisition outcome", job.id));
     };
-    if !outcome.pending {
-        // The intent closed: reaching its start or a terminal provider shortfall.
-        for path in [&pending_path, &pages_path] {
-            match fs::remove_file(path) {
-                Ok(()) => {}
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => return Err(format!("cannot remove {}: {error}", path.display())),
-            }
-        }
+    let daily = outcome
+        .generation
+        .as_deref()
+        .map(|g| {
+            read_manifest(&local, g)
+                .map(|(m, _)| m.layout == Some(binary_alpha_engine::dataset::Layout::DailyV2))
+        })
+        .transpose()?
+        .unwrap_or(false);
+    if !outcome.pending && !daily {
+        crate::lineage::clear_pending(&state)?;
     }
     let (stream, catalog) = match &outcome.generation {
         Some(dataset) => {
             let stream = finish(&config, layout, &local, dataset, access, out)?;
-            let catalog = archive(pipeline, drive, layout, &job.id, dataset, &stream)?;
+            let catalog =
+                archive_generation(pipeline, drive, layout, &job.id, dataset, &stream, access)?;
             (Some(stream), Some(catalog))
         }
         None => (None, None),
@@ -1259,7 +1473,7 @@ fn update_job(
         (false, true, Some(_)) => "archived_with_gaps",
         (false, false, Some(_)) => "archived",
     };
-    publish(
+    let receipt = publish(
         &records,
         &format!("{}-receipt", job.id),
         &Receipt {
@@ -1268,6 +1482,7 @@ fn update_job(
             job: job.id.clone(),
             intent: intent.clone(),
             status: status.into(),
+            acquisition_id: Some(acquisition_id),
             dataset_generation: outcome.generation.clone(),
             stream_generation: stream.clone(),
             coverage: Some(outcome.coverage.clone()),
@@ -1276,6 +1491,23 @@ fn update_job(
             pending: outcome.pending,
         },
     )?;
+    if !outcome.pending
+        && let Some(generation) = &outcome.generation
+    {
+        let (manifest, _) = read_manifest(&local, generation)?;
+        if manifest.layout == Some(binary_alpha_engine::dataset::Layout::DailyV2) {
+            crate::lineage::schedule_reclamation(
+                &state,
+                &intent,
+                &receipt,
+                generation,
+                &outcome.receipts,
+            )?;
+        }
+    }
+    if !outcome.pending {
+        crate::lineage::clear_pending(&state)?;
+    }
     let line = format!(
         "pipeline update {} {} cutoff {} status {status} requested {} {} verified {} shortfall {} dataset {} stream {} catalog {} sha256 {}",
         job.id,
@@ -1332,15 +1564,22 @@ pub fn list(
         let transfer: u64 = catalog
             .objects
             .iter()
+            .chain(&catalog.records)
             .map(|object| object.bytes)
             .sum::<u64>()
             + catalog.dataset.bytes
-            + catalog.stream.bytes;
+            + catalog.stream.bytes
+            + catalog
+                .lineage_manifests
+                .iter()
+                .map(|entry| entry.bytes)
+                .sum::<u64>();
         lines.push(format!(
-            "catalog {file_id} sha256 {sha256} {} {} {} dataset {} stream {} coverage {} {} rows {} bytes {transfer}",
+            "catalog {file_id} sha256 {sha256} {} {} {} layout {} dataset {} stream {} coverage {} {} rows {} bytes {transfer}",
             catalog.instrument,
             catalog.role,
             catalog.native_granularity,
+            catalog.layout.map_or("v1".to_string(), |layout| layout.to_string()),
             catalog.dataset.generation,
             catalog.stream.generation,
             catalog.coverage.first_event_time,
@@ -1366,13 +1605,9 @@ fn catalogs(
     let scratch = layout.state.join("downloads");
     let mut found = Vec::new();
     for file in drive.list(CATALOG_PREFIX)? {
-        let (Some(size), Some(sha256)) = (file.size, file.sha256.as_deref()) else {
-            return Err(format!(
-                "drive: catalog {} reports no size or checksum",
-                file.id
-            ));
-        };
-        let sha256 = sha256.to_ascii_lowercase();
+        let identity = drive.listed_identity(&file)?;
+        let size = identity.bytes;
+        let sha256 = identity.sha256;
         let partial = scratch.join(format!("{}.catalog", file.id));
         drive.download(
             &file.id,
@@ -1395,8 +1630,8 @@ fn catalogs(
 }
 
 /// `data pipeline pull`: the consumer's one step. Select the newest archived catalog of one
-/// instrument (latest coverage end, then generation), restore it unless both of its manifests
-/// are already in this configuration's managed store, verify both, and print their locations.
+/// instrument, preferring daily lineage and resolving equal coverage by ancestry. Restore any
+/// missing pinned manifest, verify the full closure, and print the ready-manifest locations.
 pub fn pull(
     config_path: &Path,
     broker: &str,
@@ -1404,24 +1639,66 @@ pub fn pull(
     out: &mut dyn Write,
 ) -> Result<(), String> {
     let (config, layout, _) = load(config_path)?;
+    let _lock = writer_lock(&layout)?;
+    let _archive_lock = archive_lock(&config)?;
     let mut drive = Drive::open(&config.drive)?;
     let mut found = catalogs(&mut drive, &layout, broker, symbol)?;
-    found.sort_by(|a, b| {
-        (&a.2.coverage.last_event_time, &a.2.dataset.generation)
-            .cmp(&(&b.2.coverage.last_event_time, &b.2.dataset.generation))
-    });
-    let Some((file_id, sha256, catalog)) = found.pop() else {
+    if found.is_empty() {
         return Err(format!("drive: no archived catalog for {broker}:{symbol}"));
+    }
+    let declaration = declaration(&config)?;
+    let access = Access {
+        declaration: declaration.as_ref(),
+        certification: None,
     };
+    let selected = crate::lineage::newest_catalog(
+        &found,
+        &mut drive,
+        &layout.state.join("downloads"),
+        access,
+    )?;
+    let (file_id, sha256, catalog) = found.swap_remove(selected);
     let local = layout.store();
-    if local.head(&catalog.dataset.key)?.is_some() && local.head(&catalog.stream.key)?.is_some() {
-        let declaration = declaration(&config)?;
-        let access = Access {
-            declaration: declaration.as_ref(),
-            certification: None,
-        };
-        verify::run_with(&local.uri(&catalog.dataset.key), access)?;
-        verify::run_with(&local.uri(&catalog.stream.key), access)?;
+    let entries: Vec<_> = [&catalog.dataset, &catalog.stream]
+        .into_iter()
+        .chain(&catalog.lineage_manifests)
+        .collect();
+    let records_present = catalog
+        .records
+        .iter()
+        .map(|entry| {
+            let path = layout
+                .state
+                .join("records")
+                .join(crate::lineage::record_name(&entry.key)?);
+            if !path.is_file() {
+                return Ok(false);
+            }
+            let identity = store::identify(&path)?;
+            if identity.sha256 != entry.sha256 || identity.bytes != entry.bytes {
+                return Err("local migration record differs from pinned catalog".to_string());
+            }
+            Ok(true)
+        })
+        .collect::<Result<Vec<_>, String>>()?
+        .into_iter()
+        .all(|present| present);
+    if records_present
+        && entries
+            .iter()
+            .map(|entry| local.head(&entry.key).map(|m| m.is_some()))
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .all(|present| present)
+    {
+        for entry in entries {
+            verify::run_with(&local.uri(&entry.key), access)?;
+        }
+        catalog.check_migration_records(
+            &layout,
+            &read_manifest(&local, &catalog.dataset.generation)?.0,
+            access,
+        )?;
         writeln!(
             out,
             "pulled {} {} dataset {} stream {} catalog {file_id} (already local)",
@@ -1433,8 +1710,7 @@ pub fn pull(
         .map_err(|error| format!("cannot write the report: {error}"))?;
         return Ok(());
     }
-    drop(drive);
-    restore(config_path, &file_id, &sha256, broker, symbol, out)
+    restore_locked(&config, &layout, &file_id, &sha256, broker, symbol, out)
 }
 
 /// `data pipeline restore`: install exactly one catalog's dataset and stream closure into this
@@ -1448,7 +1724,22 @@ pub fn restore(
     out: &mut dyn Write,
 ) -> Result<(), String> {
     let (config, layout, _) = load(config_path)?;
-    let declaration = declaration(&config)?;
+    let _lock = writer_lock(&layout)?;
+    let _archive_lock = archive_lock(&config)?;
+    restore_locked(&config, &layout, catalog_id, sha256, broker, symbol, out)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn restore_locked(
+    config: &PipelineConfig,
+    layout: &Layout,
+    catalog_id: &str,
+    sha256: &str,
+    broker: &str,
+    symbol: &str,
+    out: &mut dyn Write,
+) -> Result<(), String> {
+    let declaration = declaration(config)?;
     let access = Access {
         declaration: declaration.as_ref(),
         certification: None,
@@ -1509,6 +1800,13 @@ pub fn restore(
     if dataset.key() != catalog.dataset.key
         || dataset.instrument != catalog.instrument
         || dataset.role != catalog.role
+        || dataset.layout != catalog.layout
+        || dataset.coverage != catalog.coverage
+        || dataset.row_count != catalog.row_count
+        || dataset.broker.to_string() != catalog.broker
+        || dataset.provider_symbol.to_string() != catalog.provider_symbol
+        || dataset.source_kind != catalog.source_kind
+        || dataset.native_granularity != catalog.native_granularity
         || dataset.role == DatasetRole::Holdout
     {
         return Err(format!(
@@ -1523,18 +1821,45 @@ pub fn restore(
     if stream.key() != catalog.stream.key
         || stream.source_generation != dataset.generation
         || stream.role != dataset.role
+        || stream.layout != dataset.layout
+        || stream.instrument != dataset.instrument
     {
         return Err(format!(
             "catalog {catalog_id}: the stream manifest does not derive from dataset {}",
             dataset.generation
         ));
     }
+    let mut lineage = Vec::new();
+    let mut lineage_objects = Vec::new();
+    for entry in &catalog.lineage_manifests {
+        access.lookup(&entry.generation)?;
+        let bytes = fetch_entry(&mut drive, entry)?;
+        let (key, instrument, role, objects) = if verify::manifest_kind(&bytes)?.is_none() {
+            let m = GenerationManifest::from_json(&bytes)?;
+            access.permit(Some(m.role), &m.generation)?;
+            (m.key(), m.instrument, m.role, m.objects)
+        } else {
+            let m = StreamManifest::from_json(&bytes)?;
+            access.permit(Some(m.role), &m.source_generation)?;
+            (m.key(), m.instrument, m.role, m.objects)
+        };
+        if key != entry.key || role != catalog.role || instrument != catalog.instrument {
+            return Err("catalog lineage manifest identity mismatch".into());
+        }
+        lineage_objects.extend(objects);
+        lineage.push((key, bytes));
+    }
     let allowed = |object: &ObjectRecord| {
         catalog.objects.iter().any(|entry| {
             entry.key == object.key && entry.sha256 == object.sha256 && entry.bytes == object.bytes
         })
     };
-    for object in dataset.objects.iter().chain(stream.objects.iter()) {
+    for object in dataset
+        .objects
+        .iter()
+        .chain(stream.objects.iter())
+        .chain(&lineage_objects)
+    {
         if !allowed(object) {
             return Err(format!(
                 "catalog {catalog_id}: object {} lies outside the pinned catalog closure",
@@ -1547,6 +1872,7 @@ pub fn restore(
             .objects
             .iter()
             .chain(stream.objects.iter())
+            .chain(&lineage_objects)
             .any(|object| object.key == entry.key)
     }) {
         return Err(format!(
@@ -1554,7 +1880,7 @@ pub fn restore(
             extra.key
         ));
     }
-    let installed = run_pool(&config, &catalog.objects, |entry, drive| {
+    let installed = run_pool(config, &catalog.objects, |entry, drive| {
         let identity = ObjectIdentity {
             bytes: entry.bytes,
             sha256: entry.sha256.clone(),
@@ -1582,17 +1908,37 @@ pub fn restore(
     .filter(|installed| *installed)
     .count();
     let reused = catalog.objects.len() - installed;
+    let record_store = layout.records();
+    for entry in &catalog.records {
+        let name = crate::lineage::record_name(&entry.key)?;
+        let partial = downloads.join(format!("{}.record", entry.sha256));
+        let identity = ObjectIdentity {
+            bytes: entry.bytes,
+            sha256: entry.sha256.clone(),
+            crc32c: 0,
+        };
+        drive.download(&entry.file_id, &partial, &identity)?;
+        record_store.put_new(name, &partial, &store::identify(&partial)?)?;
+        fs::remove_file(partial).map_err(|e| e.to_string())?;
+    }
     // Manifests last, through the same create-once owner.
     for (key, bytes) in [
         (dataset.key(), &dataset_bytes),
         (stream.key(), &stream_bytes),
-    ] {
+    ]
+    .into_iter()
+    .chain(lineage.iter().map(|(k, b)| (k.clone(), b)))
+    {
         research::publish_record(&local, &local, &key, bytes)?;
     }
     let dataset_uri = layout.manifest_uri(&dataset.generation);
     let stream_uri = layout.manifest_uri(&stream.generation);
     verify::run_with(&dataset_uri, access)?;
     verify::run_with(&stream_uri, access)?;
+    for (key, _) in &lineage {
+        verify::run_with(&local.uri(key), access)?;
+    }
+    catalog.check_migration_records(layout, &dataset, access)?;
     writeln!(
         out,
         "restored {} {} dataset {dataset_uri} stream {stream_uri} objects {} installed {installed} reused {reused}",
@@ -1601,4 +1947,47 @@ pub fn restore(
         catalog.objects.len()
     )
     .map_err(|error| format!("cannot write the report: {error}"))
+}
+
+/// The archive fence also excludes restores into another managed store on this host.
+pub(crate) fn archive_lock(config: &PipelineConfig) -> Result<File, String> {
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    let binding = format!(
+        "{}\n{}",
+        config
+            .drive
+            .loopback_endpoint
+            .as_deref()
+            .unwrap_or("https://www.googleapis.com"),
+        config.drive.root_folder_id
+    );
+    let path = std::env::temp_dir().join(format!(
+        "binary-alpha-archive-{}.lock",
+        binary_alpha_engine::hex(&Sha256::digest(binding.as_bytes()))
+    ));
+    let file = match fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&path)
+    {
+        Ok(file) => file,
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            let metadata = fs::symlink_metadata(&path).map_err(|e| e.to_string())?;
+            if !metadata.is_file() || metadata.permissions().mode() & 0o077 != 0 {
+                return Err("retire: archive lock is not private regular storage".into());
+            }
+            fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&path)
+                .map_err(|e| e.to_string())?
+        }
+        Err(e) => return Err(e.to_string()),
+    };
+    file.try_lock().map_err(|_| {
+        "pipeline: another operation holds this archive root (including a restore)".to_string()
+    })?;
+    Ok(file)
 }

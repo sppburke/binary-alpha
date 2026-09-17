@@ -1257,6 +1257,9 @@ pub struct StreamManifest {
     pub instrument: String,
     pub role: DatasetRole,
     pub source_generation: String,
+    /// Original source location; restored closures may resolve the same generation locally.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_manifest_uri: Option<String>,
     pub source_kind: SourceKind,
     pub definition: Instrument,
     pub config_hash: String,
@@ -1299,6 +1302,12 @@ impl StreamManifest {
     }
 
     fn validate(&self) -> Result<(), String> {
+        if let Some(uri) = &self.source_manifest_uri {
+            let target: crate::config::ManifestUri = uri.parse()?;
+            if target.generation() != self.source_generation {
+                return Err("stream source reference does not name its source generation".into());
+            }
+        }
         let definition = &self.definition;
         if self.broker != definition.broker
             || self.provider_symbol != definition.provider_symbol
@@ -2424,6 +2433,7 @@ mod tests {
             instrument: definition.id().to_string(),
             role: DatasetRole::Development,
             source_generation: "source".into(),
+            source_manifest_uri: None,
             source_kind: SourceKind::TickParquetDaily,
             definition: definition.clone(),
             config_hash: "config".into(),
@@ -2502,6 +2512,7 @@ mod tests {
             instrument: "b:S".to_string(),
             role: DatasetRole::Development,
             source_generation: "source-generation".to_string(),
+            source_manifest_uri: None,
             source_kind: SourceKind::TickCsv,
             definition: definition.clone(),
             config_hash: "v3:sha256:0".to_string(),

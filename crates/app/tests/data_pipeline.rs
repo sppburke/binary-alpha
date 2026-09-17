@@ -4,6 +4,8 @@
 //! Every broker frame, archive byte, and Drive response here is synthetic.
 
 mod common;
+#[path = "data_pipeline/lineage.rs"]
+mod lineage;
 
 use std::collections::BTreeMap;
 use std::fs::{self, File};
@@ -425,6 +427,8 @@ struct DriveFaults {
     /// Store the final chunk, then close without a reply.
     complete_without_reply: bool,
     omit_sha256: bool,
+    incomplete_listing: bool,
+    reject_page_token_once: bool,
     /// Close the media download after this many bytes, once.
     drop_download_at: Option<usize>,
     unauthorized_once: bool,
@@ -453,6 +457,7 @@ struct DriveState {
     sessions: BTreeMap<String, Session>,
     next: usize,
     log: Vec<String>,
+    media_requests: Vec<(String, Option<String>)>,
     faults: DriveFaults,
 }
 
@@ -674,6 +679,12 @@ fn handle_http(
         respond(&mut stream, 401, &[], b"{}");
         return;
     }
+    if request.method == "DELETE" && request.path.starts_with("/drive/v3/files/") {
+        let id = request.path.trim_start_matches("/drive/v3/files/");
+        let existed = state.files.remove(id).is_some();
+        respond(&mut stream, if existed { 204 } else { 404 }, &[], b"");
+        return;
+    }
     // The real service refuses a PUT without `Content-Length` with `411 Length Required`
     // (observed 2026-09-16 on an empty object), even when `Content-Range` says `bytes */0`.
     if request.method == "PUT"
@@ -689,6 +700,12 @@ fn handle_http(
     let media_download = request.method == "GET"
         && request.path.starts_with("/drive/v3/files/")
         && request.query.get("alt").map(String::as_str) == Some("media");
+    if media_download {
+        state.media_requests.push((
+            request.path.trim_start_matches("/drive/v3/files/").into(),
+            request.headers.get("range").cloned(),
+        ));
+    }
     if content_upload && let Some(gate) = state.faults.upload_gate.take() {
         drop(state);
         gate.lock()
@@ -908,6 +925,12 @@ fn handle_http(
             }
         }
         ("GET", "/drive/v3/files") => {
+            assert!(request.query["fields"].contains("incompleteSearch"));
+            if faults.reject_page_token_once && request.query.contains_key("pageToken") {
+                state.faults.reject_page_token_once = false;
+                respond(&mut stream, 400, &[], &drive_error("invalidPageToken"));
+                return;
+            }
             let page: usize = request
                 .query
                 .get("pageToken")
@@ -916,7 +939,11 @@ fn handle_http(
             let matching: Vec<(String, RemoteEntry)> = state
                 .files
                 .iter()
-                .filter(|(_, entry)| !entry.trashed && entry.name.contains("catalog-"))
+                .filter(|(_, entry)| {
+                    !entry.trashed
+                        && (!request.query["q"].contains("catalog-")
+                            || entry.name.contains("catalog-"))
+                })
                 .map(|(id, entry)| (id.clone(), entry.clone()))
                 .collect();
             let files: Vec<Value> = matching
@@ -927,7 +954,7 @@ fn handle_http(
                     serde_json::from_slice(&file_json(id, entry, faults.omit_sha256)).unwrap()
                 })
                 .collect();
-            let mut body = json!({ "files": files });
+            let mut body = json!({ "files": files, "incompleteSearch": faults.incomplete_listing });
             if (page + 1) * 2 < matching.len() {
                 body["nextPageToken"] = json!((page + 1).to_string());
             }
@@ -1331,7 +1358,7 @@ fn pipeline(command: &str, config: &Path, extra: &[&str]) -> Result<String, Stri
 }
 
 fn import(config: &Path) -> Result<String, String> {
-    run(&["data", "import", "--config", config.to_str().unwrap()])
+    lineage::legacy_import(config)
 }
 
 fn imported_generation<'a>(report: &'a str, instrument: &str) -> &'a str {
@@ -2427,9 +2454,8 @@ fn pipeline_drive_forbidden_recovery() {
                     .count(),
                 1
             );
-            let transfers = read_json(
-                &f.scratch
-                    .path("producer/pipeline_state/pocket/transfers.json"),
+            let transfers = registry_archive::registry_state(
+                &f.scratch.path("producer/pipeline_state/registry"),
             );
             assert!(
                 transfers["files"]
@@ -2547,10 +2573,8 @@ fn chunk_rate_limited_session_recovery(reason: &'static str, poison_all: bool) {
         elapsed >= Duration::from_secs(if poison_all { 3 } else { 1 }),
         "replacement sessions must wait for exponential backoff: {elapsed:?}"
     );
-    let transfers_path = f
-        .scratch
-        .path("producer/pipeline_state/pocket/transfers.json");
-    let transfers = read_json(&transfers_path);
+    let transfers_path = f.scratch.path("producer/pipeline_state/registry");
+    let transfers = registry_archive::registry_state(&transfers_path);
     let entry = &transfers["files"][&object.key];
     let id = entry["file_id"].as_str().unwrap();
     assert_eq!(entry["done"], !poison_all);
@@ -2606,7 +2630,7 @@ fn chunk_rate_limited_session_recovery(reason: &'static str, poison_all: bool) {
         let recovered = pipeline("update", &config, &["--end", &end]).unwrap();
         assert_eq!(field(job_line(&recovered, "pocket"), "status"), "archived");
     }
-    let transfers = read_json(&transfers_path);
+    let transfers = registry_archive::registry_state(&transfers_path);
     assert_eq!(transfers["files"][&object.key]["file_id"], id);
     assert_eq!(transfers["files"][&object.key]["done"], true);
     assert!(transfers["files"][&object.key]["session"].is_null());
@@ -2694,10 +2718,8 @@ fn abandoned_session_recovery(reason: &'static str, completed: bool) {
         }),
         "{failed}"
     );
-    let transfers_path = f
-        .scratch
-        .path("producer/pipeline_state/pocket/transfers.json");
-    let transfers = read_json(&transfers_path);
+    let transfers_path = f.scratch.path("producer/pipeline_state/registry");
+    let transfers = registry_archive::registry_state(&transfers_path);
     let (key, entry) = transfers["files"]
         .as_object()
         .unwrap()
@@ -2736,7 +2758,10 @@ fn abandoned_session_recovery(reason: &'static str, completed: bool) {
             .bytes[0] ^= 1;
         let conflict = pipeline("update", &config, &["--end", &end]).unwrap_err();
         assert!(conflict.contains("nothing was replaced"), "{conflict}");
-        assert_eq!(read_json(&transfers_path)["files"][key], *entry);
+        assert_eq!(
+            registry_archive::registry_state(&transfers_path)["files"][key],
+            *entry
+        );
         f.drive
             .state
             .lock()
@@ -2756,7 +2781,7 @@ fn abandoned_session_recovery(reason: &'static str, completed: bool) {
         "session recovery must finish far below its 30-second retry budget"
     );
     assert_eq!(field(job_line(&recovered, "pocket"), "status"), "archived");
-    let transfers = read_json(&transfers_path);
+    let transfers = registry_archive::registry_state(&transfers_path);
     assert_eq!(transfers["files"][key]["file_id"], id);
     assert_eq!(transfers["files"][key]["done"], true);
     assert!(transfers["files"][key]["session"].is_null());
@@ -2885,7 +2910,7 @@ fn pipeline_recovery() {
             && failed.contains(" attempts over 1 s"),
         "{failed}"
     );
-    let transfers = read_json(&state.join("pocket/transfers.json"));
+    let transfers = registry_archive::registry_state(&state.join("registry"));
     let open_session = transfers["files"]
         .as_object()
         .unwrap()
@@ -4811,6 +4836,7 @@ fn pipeline_migration_lossless_resume_and_tamper() {
                 .as_array()
                 .unwrap()
                 .iter()
+                .chain(record["v1_streams"].as_array().unwrap())
                 .map(|v| v.as_str().unwrap().to_string()),
         );
         let manifest = dataset(&store, state["dataset"].as_str().unwrap());
@@ -5222,6 +5248,15 @@ fn pipeline_migration_import_only_and_writer_lock() {
         &f.scratch
             .path("producer/pipeline_state/deriv/migration.json"),
     );
+    let record: binary_alpha_app::lineage::MigrationRecord = serde_json::from_value(read_json(
+        &f.scratch
+            .path("producer/pipeline_state/records")
+            .join(state["record"].as_str().unwrap()),
+    ))
+    .unwrap();
+    assert!(record.verified());
+    assert!(record.mapping.streams().is_empty());
+    assert_eq!(record.equality.candles, None);
     let m = dataset(&store, state["dataset"].as_str().unwrap());
     assert!(
         m.day_inventory
@@ -5235,7 +5270,7 @@ fn pipeline_migration_import_only_and_writer_lock() {
         .iter()
         .find(|d| d.family == DayFamily::Observations && d.date == "2025-08-12")
         .unwrap();
-    assert_eq!(cutoff_day.state, DayState::Partial);
+    assert_eq!(cutoff_day.state, DayState::Unknown);
     assert!(
         cutoff_day
             .reason
@@ -5512,9 +5547,24 @@ fn pipeline_migration_pending_receipt_is_diagnostic() {
 fn pipeline_migration_checkpoint_only_import_is_unresolved() {
     let f = fixture("review_checkpoint_only");
     let root = f.scratch.path("sources/pocket/AEDCNY_otc");
-    fs::remove_file(root.join("raw_pages.ndjson")).unwrap();
+    let report = import(&f.scratch.path("pocket-import.toml")).unwrap();
+    let store = f.scratch.path("producer/store");
+    let mut manifest = dataset(
+        &store,
+        imported_generation(&report, "pocket_option:AEDCNY_otc"),
+    );
+    fs::remove_dir_all(store.join(manifest.key()).parent().unwrap()).unwrap();
+    manifest
+        .objects
+        .retain(|o| o.path != "raw_pages.ndjson" && o.path != "checkpoint.ndjson");
     fs::write(root.join("checkpoint.ndjson"), json!({"payload_sha256":"0".repeat(64),"target_server_s":POCKET_START+7200,"rows":1,"recovered_from_raw":true}).to_string()+"\n").unwrap();
-    import(&f.scratch.path("pocket-import.toml")).unwrap();
+    manifest.objects.push(common::daily::object(
+        &store,
+        "checkpoint.ndjson",
+        binary_alpha_engine::dataset::ObjectRole::Provenance,
+        &root.join("checkpoint.ndjson"),
+    ));
+    migration_publish_v1(&store, &mut manifest);
     let result = pipeline("migrate", &f.pipeline, &["--job", "pocket"]);
     let error = result.expect_err("checkpoint entry must not disappear");
     assert!(
@@ -5877,3 +5927,12 @@ fn pipeline_migration_pending_bounds_must_match_payload() {
         );
     }
 }
+#[path = "data_pipeline/daily_review_fixes.rs"]
+mod daily_review_fixes;
+#[path = "data_pipeline/registry_archive.rs"]
+mod registry_archive;
+#[path = "data_pipeline/retire.rs"]
+mod retire;
+
+#[path = "data_pipeline/daily_end_to_end.rs"]
+mod daily_end_to_end;

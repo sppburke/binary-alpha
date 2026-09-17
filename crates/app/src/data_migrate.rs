@@ -4,7 +4,8 @@ use super::*;
 use crate::daily::{
     self, LosslessRow, PageDisposition, PageOccurrence, PageOrderKind, ReceiptState,
 };
-use crate::{archive, import};
+use crate::lineage::receipt_time;
+use crate::{archive, import, lineage};
 use binary_alpha_engine::dataset::daily::{
     DAY_MICROS, DayFamily, DayInventoryEntry, DayState, Layout as DailyLayout, UnresolvedInterval,
     day_bounds,
@@ -14,6 +15,7 @@ use binary_alpha_engine::dataset::{
 };
 use binary_alpha_engine::market::InstrumentId;
 use serde_json::{Value, json};
+use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 
 fn err(e: impl std::fmt::Display) -> String {
@@ -839,6 +841,18 @@ fn add_receipts(
         if !records.iter().any(|r| r["name"] == intent) {
             records.push(json!({"kind":"intent","name":intent,"sha256":intent_id.sha256,"bytes":intent_id.bytes}));
         }
+        if let Some(acquisition) = header["acquisition_id"].as_str() {
+            lineage::record_name(&format!("records/{acquisition}"))?;
+            let path = spool.layout.state.join("records").join(acquisition);
+            let record: Value = get(&path)?;
+            if record["intent"] != intent {
+                return Err("receipt acquisition does not bind its intent".into());
+            }
+            let id = store::identify(&path)?;
+            if !records.iter().any(|r| r["name"] == acquisition) {
+                records.push(json!({"kind":"acquisition","name":acquisition,"sha256":id.sha256,"bytes":id.bytes}));
+            }
+        }
         let mut ordinal = 0;
         document(&path, &mut |kind, value| {
             if kind != "requests" {
@@ -868,6 +882,7 @@ fn add_receipts(
                 return Err(format!("{name} request {ordinal}: rows mismatch"));
             }
             let page = fetch::PageCoverage {
+                occurrence: None,
                 path: String::new(),
                 offset: None,
                 sha256: request.sha256,
@@ -970,36 +985,19 @@ fn add_import(
             })?;
         let checkpoint_bytes = slice(spool.layout, &cp.source)?;
         let v: Value = serde_json::from_slice(&checkpoint_bytes).map_err(err)?;
-        let token = token(&v["target_server_s"]);
-        let receipt = v["received_at"].as_str().map(receipt_time).transpose()?;
-        let (rows, first, last) = payload_bounds(&bytes, recorded_offset)?;
-        if v["rows"].as_u64().is_some_and(|expected| expected != rows) {
+        let page = lineage::import_page(
+            bytes.clone(),
+            &raw.sha256,
+            ordinal,
+            Some((cp.ordinal, checkpoint_bytes)),
+            recorded_offset,
+        )?;
+        if v["rows"]
+            .as_u64()
+            .is_some_and(|expected| expected != page.rows)
+        {
             return Err(format!("checkpoint line {}: rows mismatch", cp.ordinal));
         }
-        let page = PageOccurrence {
-            acquisition_id: raw.sha256.clone(),
-            intent: None,
-            ordinal,
-            checkpoint_ordinal: Some(cp.ordinal),
-            order_kind: PageOrderKind::SourceFileOrder,
-            payload_sha256: hash.clone(),
-            payload: vec![],
-            request_token: token.clone(),
-            request_anchor_utc: anchor(token.as_deref(), recorded_offset)?,
-            receipt_time_utc: receipt,
-            receipt_state: if receipt.is_some() {
-                ReceiptState::Recorded
-            } else if v["recovered_from_raw"] == true {
-                ReceiptState::NotRecordedBySource
-            } else {
-                ReceiptState::AbsentInLegacyRecord
-            },
-            first_event_time: first.as_deref().map(time).transpose()?,
-            last_event_time: last.as_deref().map(time).transpose()?,
-            rows,
-            checkpoint: Some(checkpoint_bytes),
-            disposition: PageDisposition::Indexed,
-        };
         spool.add(
             page,
             Alias {
@@ -1520,6 +1518,21 @@ fn convert(
     let mut records = Vec::new();
     add_receipts(&mut spool, &sources, &identity, &mut records)?;
     add_pending(&mut spool, &sources, &mut records, &identity)?;
+    // Archive pending diagnostics as immutable evidence without turning a restore into
+    // resumption of a broker acquisition. The original active progress remains protected.
+    for record in &mut records {
+        if let Some(relative) = record["path"].as_str() {
+            let path = layout.state.join(relative);
+            let id = store::identify(&path)?;
+            let extension = path
+                .extension()
+                .and_then(|e| e.to_str())
+                .ok_or("pending evidence extension")?;
+            let name = format!("{}-migration-pending-{}.{}", job.id, id.sha256, extension);
+            layout.records().put_new(&name, &path, &id)?;
+            record["name"] = json!(name);
+        }
+    }
     json_lines::<IndexedPage>(&work.join("coverage-pages.jsonl"), |p| {
         spool.history(&p, None, p.ordinal, false)?;
         Ok(())
@@ -1652,19 +1665,47 @@ fn convert(
             Ok(json!({"generation":g,"sha256":id.sha256,"bytes":id.bytes}))
         })
         .collect::<Result<Vec<_>, String>>()?;
-    let lineage = json!({"schema_version":1,"layout":"daily-v2","source_identity":identity,"role":newest.role,"newest_v1_dataset":newest.generation,"newest_v1_stream":old_stream.map(|m|&m.generation),"v1_generations":generations,"objects":replaced,"manifests":manifest_bindings,"imports":imports,"identity_basis":{"recorded":"intent plus request fingerprint and per-receipt occurrence count; shortest receipt then lexical name owns acquisition/ordinal","legacy":"bundle origin and slice, or inherited canonical single-page coverage prefix; legacy-coverage-<coverage SHA-256> and original coverage ordinal"},"ndjson_framing":"per-line terminators, offsets and independent ordinals in immutable alias table","alias_table":{"record":aliases,"sha256":aliases_id.sha256,"bytes":aliases_id.bytes},"records":records});
+    let mapping = lineage::MigrationMapping {
+        v1_generations: sources
+            .datasets
+            .iter()
+            .map(|m| m.generation.clone())
+            .collect(),
+        v1_stream: old_stream.map(|m| m.generation.clone()),
+        v1_streams: sources
+            .streams
+            .iter()
+            .map(|m| m.generation.clone())
+            .collect(),
+    };
+    let mut lineage = json!({"schema_version":1,"kind":"migration","layout":"daily-v2","source_identity":identity,"role":newest.role,"newest_v1_dataset":newest.generation,"objects":replaced,"manifests":manifest_bindings,"imports":imports,"identity_basis":{"recorded":"intent plus request fingerprint and per-receipt occurrence count; shortest receipt then lexical name owns acquisition/ordinal","legacy":"bundle origin and slice, or inherited canonical single-page coverage prefix; legacy-coverage-<coverage SHA-256> and original coverage ordinal"},"ndjson_framing":"per-line terminators, offsets and independent ordinals in immutable alias table","alias_table":{"record":aliases,"sha256":aliases_id.sha256,"bytes":aliases_id.bytes},"records":records});
+    lineage.as_object_mut().unwrap().extend(
+        serde_json::to_value(&mapping)
+            .map_err(err)?
+            .as_object()
+            .unwrap()
+            .clone(),
+    );
+    if newest.source_kind == SourceKind::BrokerHistory {
+        lineage["continuation"] = json!({
+            "acquisition_id": format!("v1-history:{}", newest.generation),
+            "seed": null,
+        });
+    }
     objects.push(retain_json(
         &local,
         work,
         "provenance/lineage.json",
         &lineage,
     )?);
-    let cov = json!({"schema_version":2,"source_identity":identity,"broker":newest.broker,"provider_symbol":newest.provider_symbol,"role":newest.role,"rows":newest.row_count,"actual":newest.coverage,"continuation":{"imported_generations":sources.datasets.iter().filter(|m|m.source_kind!=SourceKind::BrokerHistory).map(|m|m.generation.clone()).collect::<Vec<_>>(),"newest_v1_dataset":newest.generation,"newest_v1_stream":old_stream.map(|m|&m.generation)},"acquisitions":coverage.iter().map(|(g,c)|json!({"generation":g,"coverage":c})).collect::<Vec<_>>(),"unresolved_ranges":days.iter().filter(|d|matches!(d.state,DayState::Partial|DayState::Unknown)).collect::<Vec<_>>()});
-    objects.push(retain_json(&local, work, "provenance/coverage.json", &cov)?);
     let mut manifest = newest.clone();
     manifest.layout = Some(DailyLayout::DailyV2);
     manifest.day_inventory = days;
     manifest.objects = objects;
+    let cov = lineage::migration_coverage(&mut manifest, &coverage, &identity)?;
+    manifest
+        .objects
+        .push(retain_json(&local, work, fetch::COVERAGE_PATH, &cov)?);
     manifest.code_revision = import::CODE_REVISION.into();
     let scale = match manifest.price_representation {
         PriceRepresentation::IntegerUnits { scale } => Some(scale),
@@ -1827,19 +1868,24 @@ fn verify_migration(
         .as_array()
         .ok_or("missing source records")?
     {
-        let path = if let Some(name) = record["name"].as_str() {
-            layout.state.join("records").join(name)
-        } else {
-            layout
-                .state
-                .join(record["path"].as_str().ok_or("record path")?)
-        };
-        let id = store::identify(&path)?;
-        if record["sha256"] != id.sha256 || record["bytes"] != id.bytes {
-            return Err(format!(
-                "migration source record changed: {}",
-                path.display()
-            ));
+        let mut paths = Vec::new();
+        if let Some(name) = record["name"].as_str() {
+            paths.push(layout.state.join("records").join(name));
+        }
+        if let Some(path) = record["path"].as_str() {
+            paths.push(layout.state.join(path));
+        }
+        if paths.is_empty() {
+            return Err("migration source record lacks a name or path".into());
+        }
+        for path in paths {
+            let id = store::identify(&path)?;
+            if record["sha256"] != id.sha256 || record["bytes"] != id.bytes {
+                return Err(format!(
+                    "migration source record changed: {}",
+                    path.display()
+                ));
+            }
         }
     }
     let mut count = 0;
@@ -2075,10 +2121,34 @@ fn migrate_job_with(
     };
     after_converted(&job.id)?;
     let proofs = verify_migration(layout, &state, access, &work, offset_seconds(bound))?;
+    let root = read_manifest(&layout.store(), &state.dataset)?.0;
+    let lineage = lineage::read_lineage(&layout.store(), &root)?;
+    let mapping: lineage::MigrationMapping = serde_json::from_value(lineage).map_err(err)?;
+    let mut evidence = BTreeMap::new();
+    evidence.insert("command".into(), json!("migrate"));
+    evidence.insert("binding".into(), json!(binding));
+    evidence.insert("newest_v1_dataset".into(), json!(state.newest));
+    evidence.insert("alias_table".into(), json!(state.aliases));
+    evidence.insert("proofs".into(), proofs);
+    evidence.insert("memory".into(), json!({"bound":"one UTC observation/page day plus one provider response and Parquet column buffers; audit holds one candle day per configured stream; manifests/lineage and verification occurrence IDs are additional metadata; conversion page/checkpoint indexes are on disk","peak_day_rows":state.peak_day_rows,"peak_day_payload_bytes":state.peak_day_payload_bytes}));
     let record = publish(
         &layout.records(),
         &format!("{}-migration", job.id),
-        &json!({"schema_version":1,"command":"migrate","job":job.id,"layout":"daily-v2","binding":binding,"v1_generations":state.generations,"newest_v1_dataset":state.newest,"newest_v1_stream":state.old_stream,"dataset_generation":state.dataset,"stream_generation":state.stream,"alias_table":state.aliases,"proofs":proofs,"memory":{"bound":"one UTC observation/page day plus one provider response and Parquet column buffers; audit holds one candle day per configured stream; manifests/lineage and verification occurrence IDs are additional metadata; conversion page/checkpoint indexes are on disk","peak_day_rows":state.peak_day_rows,"peak_day_payload_bytes":state.peak_day_payload_bytes}}),
+        &lineage::MigrationRecord {
+            schema_version: 1,
+            job: job.id.clone(),
+            phase: "verified".into(),
+            mapping,
+            v2_root: state.dataset.clone(),
+            v2_stream: state.stream.clone(),
+            equality: lineage::MigrationEquality {
+                observations: true,
+                pages: true,
+                source_files: true,
+                candles: state.old_stream.as_ref().map(|_| true),
+            },
+            evidence,
+        },
     )?;
     state.record = Some(record);
     state.phase = "verified".into();
@@ -2122,28 +2192,6 @@ pub fn migrate_with(
     Ok(())
 }
 
-fn receipt_time(value: &str) -> Result<i64, String> {
-    if value.ends_with('Z') {
-        return time(value);
-    }
-    if value.len() >= 6 {
-        let i = value.len() - 6;
-        let zone = &value[i..];
-        if (zone.starts_with('+') || zone.starts_with('-')) && zone.as_bytes()[3] == b':' {
-            let h: i64 = zone[1..3].parse().map_err(err)?;
-            let m: i64 = zone[4..].parse().map_err(err)?;
-            if h > 23 || m > 59 {
-                return Err("receipt timezone offset is invalid".into());
-            }
-            let offset =
-                (h * 3600 + m * 60) * 1_000_000 * if zone.starts_with('-') { -1 } else { 1 };
-            return time(&format!("{}Z", &value[..i]))?
-                .checked_sub(offset)
-                .ok_or("receipt time overflow".into());
-        }
-    }
-    time(value)
-}
 fn import_offset(layout: &Layout, m: &GenerationManifest) -> Result<i64, String> {
     let mut found = None;
     for o in &m.objects {
@@ -2442,6 +2490,7 @@ mod tests {
         let payload = br#"{"history":{"times":[1754956800,1754956802]}}"#.to_vec();
         let (rows, first, last) = payload_bounds(&payload, 0).unwrap();
         let coverage = fetch::PageCoverage {
+            occurrence: None,
             path: "raw/fixture.json".into(),
             offset: None,
             sha256: sha256_hex(&payload),

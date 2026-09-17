@@ -134,6 +134,8 @@ fn decimal_text<'de, D: serde::Deserializer<'de>>(
 
 #[derive(Deserialize)]
 struct Listing {
+    #[serde(default, rename = "incompleteSearch")]
+    incomplete_search: bool,
     #[serde(default, rename = "nextPageToken")]
     next_page_token: Option<String>,
     #[serde(default)]
@@ -350,30 +352,7 @@ impl Drive {
             retry.attempts += 1;
             let token = self.token()?;
             let request = build(&self.client).bearer_auth(&token);
-            let sent = self.runtime.block_on(async {
-                let response = request.send().await?;
-                let status = response.status().as_u16();
-                let header = |name: &str| {
-                    response
-                        .headers()
-                        .get(name)
-                        .and_then(|value| value.to_str().ok())
-                        .map(str::to_string)
-                };
-                let location = header("location");
-                let range_end = header("range").and_then(|range| {
-                    range
-                        .strip_prefix("bytes=0-")
-                        .and_then(|end| end.parse::<u64>().ok())
-                });
-                let body = response.bytes().await?.to_vec();
-                Ok::<_, reqwest::Error>(Reply {
-                    status,
-                    location,
-                    range_end,
-                    body,
-                })
-            });
+            let sent = self.send_once(request);
             match sent {
                 Ok(reply) if reply.status == 401 => {
                     unauthorized += 1;
@@ -395,6 +374,34 @@ impl Drive {
                 Err(error) => retry.retry(what, TransientFailure::Transport(error))?,
             }
         }
+    }
+
+    /// One transport attempt; callers own retries and any required preconditions.
+    fn send_once(&self, request: reqwest::RequestBuilder) -> Result<Reply, reqwest::Error> {
+        self.runtime.block_on(async {
+            let response = request.send().await?;
+            let status = response.status().as_u16();
+            let header = |name: &str| {
+                response
+                    .headers()
+                    .get(name)
+                    .and_then(|value| value.to_str().ok())
+                    .map(str::to_string)
+            };
+            let location = header("location");
+            let range_end = header("range").and_then(|range| {
+                range
+                    .strip_prefix("bytes=0-")
+                    .and_then(|end| end.parse::<u64>().ok())
+            });
+            let body = response.bytes().await?.to_vec();
+            Ok(Reply {
+                status,
+                location,
+                range_end,
+                body,
+            })
+        })
     }
 
     /// Pre-generates `count` file identifiers so a creation can be reconciled by identity,
@@ -451,23 +458,86 @@ impl Drive {
         }
     }
 
+    /// Delete one planned file, rechecking identity and name before every transport attempt.
+    /// Missing files are successful resumptions of a previous deletion.
+    pub fn delete_named(
+        &mut self,
+        id: &str,
+        name: &str,
+        identity: &ObjectIdentity,
+    ) -> Result<(), String> {
+        let url = format!("{}/files/{id}", self.api);
+        let what = format!("files.delete {id}");
+        let mut retry = RetryBudget::new(self.retry_budget);
+        let mut unauthorized = 0;
+        loop {
+            let Some(file) = self.metadata(id)? else {
+                return Ok(());
+            };
+            if file.id != id || file.name != name {
+                return Err(format!(
+                    "drive: refusing to delete {id}: recorded name mismatch"
+                ));
+            }
+            let file = self.confirm(id, file, identity)?;
+            // Confirmation can refresh missing metadata. Check the latest observed name
+            // and preserve verify's refusal to permanently remove a trashed target.
+            if file.id != id || file.name != name {
+                return Err(format!(
+                    "drive: refusing to delete {id}: recorded name mismatch"
+                ));
+            }
+            if file.trashed {
+                return Err(format!("drive: refusing to delete {id}: file is trashed"));
+            }
+            retry.attempts += 1;
+            let token = self.token()?;
+            let request = self.client.delete(&url).bearer_auth(&token);
+            match self.send_once(request) {
+                Ok(reply) if matches!(reply.status, 200 | 204 | 404) => return Ok(()),
+                Ok(reply) if reply.status == 401 => {
+                    unauthorized += 1;
+                    if unauthorized >= self.max_attempts {
+                        return Err(reply.error(&what));
+                    }
+                    self.access_token = None;
+                }
+                Ok(reply)
+                    if transient_status(reply.status, error_reason(&reply.body).as_deref()) =>
+                {
+                    retry.retry(
+                        &what,
+                        TransientFailure::Http(reply.status, error_reason(&reply.body)),
+                    )?;
+                }
+                Ok(reply) => return Err(reply.error(&what)),
+                Err(error) => retry.retry(&what, TransientFailure::Transport(error))?,
+            }
+        }
+    }
+
     /// Every non-trashed file beneath the root whose name starts with `prefix`, following
     /// pagination to the end.
     pub fn list(&mut self, prefix: &str) -> Result<Vec<RemoteFile>, String> {
         let url = format!("{}/files", self.api);
-        let filter = format!(
-            "'{}' in parents and trashed = false and name contains '{}'",
-            self.root,
-            prefix.replace('\\', "\\\\").replace('\'', "\\'")
-        );
+        let mut filter = format!("'{}' in parents and trashed = false", self.root);
+        if !prefix.is_empty() {
+            filter.push_str(&format!(
+                " and name contains '{}'",
+                prefix.replace('\\', "\\\\").replace('\'', "\\'")
+            ));
+        }
         let mut files = Vec::new();
         let mut page_token: Option<String> = None;
+        let mut restarts = 0;
+        let mut seen_tokens = std::collections::BTreeSet::new();
         loop {
             let mut query = vec![
                 ("q".to_string(), filter.clone()),
                 (
                     "fields".to_string(),
-                    "nextPageToken,files(id,name,size,sha256Checksum,trashed)".to_string(),
+                    "nextPageToken,incompleteSearch,files(id,name,size,sha256Checksum,trashed)"
+                        .to_string(),
                 ),
                 ("pageSize".to_string(), "1000".to_string()),
             ];
@@ -475,11 +545,24 @@ impl Drive {
                 query.push(("pageToken".to_string(), token.clone()));
             }
             let reply = self.send("files.list", &|client| client.get(&url).query(&query))?;
+            if reply.status == 400 && page_token.is_some() && restarts < self.max_attempts {
+                // Drive page tokens can expire. Discard the partial view and restart.
+                restarts += 1;
+                files.clear();
+                seen_tokens.clear();
+                page_token = None;
+                continue;
+            }
             if reply.status != 200 {
                 return Err(reply.error("files.list"));
             }
             let listing: Listing = serde_json::from_slice(&reply.body)
                 .map_err(|_| "drive files.list: malformed response")?;
+            if listing.incomplete_search {
+                return Err(
+                    "drive files.list: incompleteSearch: incomplete search; no complete archive inventory".into(),
+                );
+            }
             files.extend(
                 listing
                     .files
@@ -487,7 +570,12 @@ impl Drive {
                     .filter(|file| file.name.starts_with(prefix)),
             );
             match listing.next_page_token {
-                Some(token) => page_token = Some(token),
+                Some(token) => {
+                    if !seen_tokens.insert(token.clone()) {
+                        return Err("drive files.list: repeated page token".into());
+                    }
+                    page_token = Some(token);
+                }
                 None => return Ok(files),
             }
         }
@@ -689,6 +777,9 @@ impl Drive {
                 .metadata(id)?
                 .ok_or_else(|| format!("drive: {id} vanished after completion"))?,
         };
+        if remote.trashed {
+            return Err(format!("drive: archived file {id} is trashed"));
+        }
         let sha256 = match &remote.sha256 {
             Some(sha256) => sha256.to_ascii_lowercase(),
             None => self.hash(id)?.sha256,
@@ -709,8 +800,49 @@ impl Drive {
         })
     }
 
+    /// Confirms a listed file's size and checksum, reading bytes when Drive omits SHA-256.
+    pub fn listed_identity(&mut self, remote: &RemoteFile) -> Result<ObjectIdentity, String> {
+        if remote.trashed {
+            return Err(format!("drive: {} is trashed", remote.id));
+        }
+        let bytes = remote
+            .size
+            .ok_or_else(|| format!("drive: {} reports no size", remote.id))?;
+        if let Some(sha256) = &remote.sha256 {
+            let identity = ObjectIdentity {
+                bytes,
+                sha256: sha256.to_ascii_lowercase(),
+                crc32c: 0,
+            };
+            self.verify(&remote.id, &identity)?;
+            Ok(identity)
+        } else {
+            let identity = self.hash(&remote.id)?;
+            if identity.bytes != bytes {
+                return Err(format!(
+                    "drive: {} readback size disagrees with listing",
+                    remote.id
+                ));
+            }
+            // Recheck current metadata against the measured bytes without downloading them
+            // a second time when Drive still reports no checksum.
+            let current = self
+                .metadata(&remote.id)?
+                .ok_or_else(|| format!("drive: {} vanished after readback", remote.id))?;
+            self.confirm(
+                &remote.id,
+                RemoteFile {
+                    sha256: current.sha256.or_else(|| Some(identity.sha256.clone())),
+                    ..current
+                },
+                &identity,
+            )?;
+            Ok(identity)
+        }
+    }
+
     /// Reads file `id` back completely and returns its identity without keeping the bytes.
-    fn hash(&mut self, id: &str) -> Result<ObjectIdentity, String> {
+    pub(crate) fn hash(&mut self, id: &str) -> Result<ObjectIdentity, String> {
         let mut hasher = Hasher::default();
         self.read(id, 0, &mut hasher)?;
         Ok(hasher.finish())

@@ -180,21 +180,20 @@ pub(crate) fn audit(
             let spec = &instrument.candles[index];
             writer.flush(local, &generation, &id, instrument.price_scale, spec)?;
             let pending = pending_open(&profile, index)?;
-            let mut dates: std::collections::BTreeSet<_> = manifest
-                .day_inventory
+            let finalized = writer
+                .days
                 .iter()
-                .filter(|d| d.family == DayFamily::Observations)
-                .map(|d| d.date.clone())
+                .map(|(date, (_, data, at))| (date.clone(), (data.rows, *at)))
                 .collect();
-            dates.extend(writer.days.keys().cloned());
-            if let Some(open) = pending {
-                dates.insert(date(open));
-            }
             streams.push(writer.summary(spec));
-            for date in dates {
-                let finalized_at = writer.days.get(&date).map(|(_, _, at)| *at);
-                let mut day =
-                    candle_day(&date, spec, &manifest.day_inventory, pending, finalized_at)?;
+            for mut day in candle_inventory(
+                spec,
+                &manifest.day_inventory,
+                pending,
+                &finalized,
+                manifest.native_granularity,
+            )? {
+                let date = day.date.clone();
                 let (temporary, data) = match writer.days.remove(&date) {
                     Some((path, data, _)) => (path, data),
                     None if day.state == DayState::EmptyKnown => {
@@ -277,6 +276,7 @@ pub(crate) fn audit(
         instrument: id.to_string(),
         role: manifest.role,
         source_generation: manifest.generation.clone(),
+        source_manifest_uri: manifest.layout.map(|_| uri.to_string()),
         source_kind: manifest.source_kind,
         definition: instrument.clone(),
         config_hash: config.content_hash(),
@@ -398,6 +398,48 @@ pub(crate) fn pending_open(
     )))
 }
 
+/// Shared writer/verifier derivation, including empty days and cross-day finalizers.
+pub(crate) fn candle_inventory(
+    spec: &CandleSpec,
+    source: &[DayInventoryEntry],
+    pending: Option<i64>,
+    finalized: &std::collections::BTreeMap<String, (u64, i64)>,
+    native: binary_alpha_engine::dataset::NativeGranularity,
+) -> Result<Vec<DayInventoryEntry>, String> {
+    let mut dates: std::collections::BTreeSet<_> = source
+        .iter()
+        .filter(|d| d.family == DayFamily::Observations)
+        .map(|d| d.date.clone())
+        .collect();
+    dates.extend(finalized.keys().cloned());
+    if let Some(open) = pending {
+        dates.insert(date(open));
+    }
+    dates
+        .into_iter()
+        .map(|date| {
+            let observed = finalized.get(&date);
+            let finalizer = observed
+                .map(|(_, at)| {
+                    let period = match native {
+                        binary_alpha_engine::dataset::NativeGranularity::Tick => 0,
+                        binary_alpha_engine::dataset::NativeGranularity::Bar { period_seconds } => {
+                            i64::from(period_seconds) * 1_000_000
+                        }
+                    };
+                    at.checked_sub(period)
+                        .ok_or("finalizer event time overflow")
+                })
+                .transpose()?;
+            let mut day = candle_day(&date, spec, source, pending, finalizer)?;
+            if day.state == DayState::EmptyKnown && observed.is_some_and(|(rows, _)| *rows > 0) {
+                day.state = DayState::Complete;
+            }
+            Ok(day)
+        })
+        .collect()
+}
+
 fn candle_day(
     date: &str,
     spec: &CandleSpec,
@@ -439,13 +481,22 @@ fn candle_day(
             i64::from(spec.offset_seconds) * 1_000_000,
         );
         if last_open >= start {
-            // Finalization time is part of the candle too: a missing observation between
-            // close and known_at could have finalized it earlier.
-            let close = (last_open + duration).max(finalized_at.map_or(end, |at| at + 1));
+            // Missing observation starts before the finalizer could have finalized earlier.
+            // For bars, availability includes the period; coverage concerns starts.
+            let finalizer_end = finalized_at
+                .map(|at| at.checked_add(1).ok_or("finalizer time overflow"))
+                .transpose()?
+                .unwrap_or(end);
+            let close = last_open
+                .checked_add(duration)
+                .ok_or("candle close overflow")?
+                .max(finalizer_end);
             let mut cursor = end;
             while cursor < close {
-                let next_end =
-                    (cursor + binary_alpha_engine::dataset::daily::DAY_MICROS).min(close);
+                let next_end = cursor
+                    .checked_add(binary_alpha_engine::dataset::daily::DAY_MICROS)
+                    .ok_or("coverage day overflow")?
+                    .min(close);
                 let next_date = self::date(cursor);
                 let next = inventory
                     .iter()

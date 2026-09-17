@@ -2,7 +2,7 @@
 //! and normalize each dataset from its retained bytes, publish it, and commit one ready manifest
 //! last.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
@@ -757,6 +757,14 @@ fn publish(
     );
 
     let retaining = Instant::now();
+    let daily = dataset.role == DatasetRole::Development
+        && matches!(
+            source_kind,
+            SourceKind::TickParquetDaily | SourceKind::BarParquet
+        );
+    let staging = daily
+        .then(|| import_staging(local, &generation, &objects))
+        .transpose()?;
     for (file, identity) in dataset.files.iter().zip(&identities) {
         local.put_new(&object_key(&identity.sha256), &file.absolute, identity)?;
     }
@@ -782,20 +790,41 @@ fn publish(
                     TickRows::Daily { days } => {
                         let paths: Vec<PathBuf> =
                             objects[..days.len()].iter().map(retained_path).collect();
-                        archive::write_ticks(
-                            &temporary,
-                            &dataset.instrument,
-                            *scale,
-                            daily_tick_rows(days, &paths, *scale),
-                        )?
+                        if dataset.role != DatasetRole::Development {
+                            archive::write_ticks(
+                                &temporary,
+                                &dataset.instrument,
+                                *scale,
+                                daily_tick_rows(days, &paths, *scale),
+                            )?
+                        } else {
+                            let mut summary = DataSummary::default();
+                            let mut sequence = binary_alpha_engine::market::TickSequence::default();
+                            for row in daily_tick_rows(days, &paths, *scale) {
+                                let tick = row?;
+                                sequence
+                                    .accept(tick)
+                                    .map_err(|e| format!("{}: {e}", dataset.instrument))?;
+                                summary.rows += 1;
+                                summary
+                                    .first_event_micros
+                                    .get_or_insert(tick.event_time_micros);
+                                summary.last_event_micros = Some(tick.event_time_micros);
+                            }
+                            summary
+                        }
                     }
                 };
-                let identity = store::identify(&temporary)?;
-                local.put_new(&object_key(&identity.sha256), &temporary, &identity)?;
-                fs::remove_file(&temporary)
-                    .map_err(|error| format!("cannot remove {}: {error}", temporary.display()))?;
-                objects.push(record(ObjectRole::Normalized, TICK_OBJECT_PATH, &identity));
-                identities.push(identity);
+                if matches!(rows, TickRows::Csv { .. }) || dataset.role != DatasetRole::Development
+                {
+                    let identity = store::identify(&temporary)?;
+                    local.put_new(&object_key(&identity.sha256), &temporary, &identity)?;
+                    fs::remove_file(&temporary).map_err(|error| {
+                        format!("cannot remove {}: {error}", temporary.display())
+                    })?;
+                    objects.push(record(ObjectRole::Normalized, TICK_OBJECT_PATH, &identity));
+                    identities.push(identity);
+                }
                 (
                     summary,
                     NativeGranularity::Tick,
@@ -843,7 +872,7 @@ fn publish(
     let validated = validating.elapsed();
 
     let (first_event_time, last_event_time) = archive::coverage(&summary)?;
-    let manifest = GenerationManifest {
+    let mut manifest = GenerationManifest {
         layout: None,
         day_inventory: Vec::new(),
         schema_version: MANIFEST_SCHEMA_VERSION,
@@ -877,8 +906,56 @@ fn publish(
         interval,
         objects,
     };
+    if daily {
+        manifest = crate::lineage::import_root(local, manifest)?;
+        identities = manifest
+            .objects
+            .iter()
+            .map(|o| store::identify(&retained_path(o)))
+            .collect::<Result<_, _>>()?;
+    }
+    let generation = manifest.generation.clone();
     let publishing = Instant::now();
     let published = publish_generation(manifest, &identities, local, destination)?;
+    if let Some((journal, staging)) = staging {
+        // The durable journal owns staging across retries. Ready manifests still pin keys.
+        let mut referenced = BTreeSet::new();
+        for generation in local.list_manifests()? {
+            let mut bytes = Vec::new();
+            local.read_to(
+                &binary_alpha_engine::dataset::manifest_key(&generation),
+                None,
+                &mut bytes,
+            )?;
+            let value: serde_json::Value =
+                serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
+            if let Some(objects) = value["objects"].as_array() {
+                for o in objects {
+                    if let Some(key) = o["key"].as_str() {
+                        referenced.insert(key.to_string());
+                    }
+                }
+            }
+        }
+        for key in staging {
+            if !referenced.contains(&key) {
+                match fs::remove_file(local.local_path(&key).expect("local staging")) {
+                    Ok(()) => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(e) => return Err(e.to_string()),
+                }
+            }
+        }
+        // Persist deletions before forgetting ownership; a crash can safely replay the journal.
+        File::open(local.local_path("objects").expect("local staging"))
+            .and_then(|dir| dir.sync_all())
+            .map_err(|e| e.to_string())?;
+        fs::remove_file(&journal).map_err(|e| e.to_string())?;
+        File::open(journal.parent().ok_or("import staging parent absent")?)
+            .and_then(|dir| dir.sync_all())
+            .map_err(|e| e.to_string())?;
+    }
+
     let elapsed = publishing.elapsed();
     let report = format!(
         "published {} {} generation {generation} rows {} objects {} reused {}",
@@ -900,6 +977,53 @@ fn publish(
         )
     };
     Ok((line, published))
+}
+
+/// Record ownership before the first input copy, so a retry can reclaim `Put::Reused`
+/// inputs from its earlier attempt without adopting unrelated pre-existing objects.
+fn import_staging(
+    local: &Store,
+    generation: &str,
+    objects: &[ObjectRecord],
+) -> Result<(PathBuf, BTreeSet<String>), String> {
+    let key = format!("import_staging/{generation}.json");
+    let journal = local
+        .local_path(&key)
+        .ok_or("import staging requires local store")?;
+    let staging: BTreeSet<String> = if local.head(&key)?.is_some() {
+        serde_json::from_slice(&fs::read(&journal).map_err(|e| e.to_string())?)
+            .map_err(|e| e.to_string())?
+    } else {
+        let mut staging = BTreeSet::new();
+        for object in objects {
+            if local.head(&object.key)?.is_none() {
+                staging.insert(object.key.clone());
+            }
+        }
+        let temporary = temporary_path(local, "import-staging")?;
+        fs::write(
+            &temporary,
+            serde_json::to_vec(&staging).map_err(|e| e.to_string())?,
+        )
+        .map_err(|e| e.to_string())?;
+        local.put_new(&key, &temporary, &store::identify(&temporary)?)?;
+        fs::remove_file(temporary).map_err(|e| e.to_string())?;
+        staging
+    };
+    if staging
+        .iter()
+        .any(|key| !objects.iter().any(|o| &o.key == key))
+    {
+        return Err("import staging journal names an input outside this generation".into());
+    }
+    // The create-once store syncs file bytes; sync its directory entry before retaining inputs.
+    File::open(journal.parent().ok_or("import staging parent absent")?)
+        .and_then(|dir| dir.sync_all())
+        .map_err(|e| e.to_string())?;
+    File::open(local.local_path("").expect("local staging"))
+        .and_then(|dir| dir.sync_all())
+        .map_err(|e| e.to_string())?;
+    Ok((journal, staging))
 }
 
 /// The shared immutable publication tail, after source normalization and local retention.

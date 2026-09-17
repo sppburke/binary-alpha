@@ -3,6 +3,7 @@
 //! A generation is identified by its inputs; its ready manifest is the sole publication record.
 //! `docs/contracts.md`, section "Historical datasets", is the normative description.
 
+pub mod coverage;
 pub mod daily;
 pub use daily::{DayFamily, DayInventoryEntry, DayState, Layout, UnresolvedInterval};
 
