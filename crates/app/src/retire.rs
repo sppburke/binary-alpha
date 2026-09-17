@@ -1049,16 +1049,65 @@ fn plan(
                 .get("root_generation")
                 .and_then(Value::as_str)
                 .unwrap_or(&seed);
-            replaced.extend(
-                value
-                    .get("ancestors")
-                    .and_then(Value::as_array)
-                    .into_iter()
-                    .flatten()
-                    .filter_map(Value::as_str)
-                    .filter(|id| *id != logical_root && *id != seed && *id != archive.dataset)
-                    .map(str::to_string),
-            );
+            for id in value
+                .get("ancestors")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+                .filter(|id| *id != logical_root && *id != seed && *id != archive.dataset)
+            {
+                // An ancestry claim never grants v1 deletion authority. Local daily
+                // ancestors were verified above; remote-only ones need a pinned manifest.
+                if let Some(manifest) = manifests.get(id) {
+                    if manifest.daily
+                        && manifest.dataset
+                        && manifest.ordinary
+                        && &manifest.instrument == instrument
+                    {
+                        replaced.insert(id.to_string());
+                    }
+                    continue;
+                }
+                if let Some(prior) = archives.iter().find(|a| {
+                    a.dataset == id
+                        && a.value["layout"] == "daily-v2"
+                        && a.value["role"] == "development"
+                        && a.value["instrument"] == *instrument
+                }) {
+                    let catalog = data_pipeline::Catalog::from_json(
+                        &serde_json::to_vec(&prior.value).map_err(|e| e.to_string())?,
+                    )?;
+                    access.permit(Some(catalog.role), id)?;
+                    let entry = &catalog.dataset;
+                    let scratch = layout
+                        .state
+                        .join("retirement/downloads")
+                        .join(format!("{}.manifest", entry.sha256));
+                    drive.download(
+                        &entry.file_id,
+                        &scratch,
+                        &ObjectIdentity {
+                            bytes: entry.bytes,
+                            sha256: entry.sha256.clone(),
+                            crc32c: 0,
+                        },
+                    )?;
+                    let bytes = fs::read(&scratch).map_err(|e| e.to_string())?;
+                    fs::remove_file(scratch).map_err(|e| e.to_string())?;
+                    let manifest = GenerationManifest::from_json(&bytes)?;
+                    if manifest.generation != id
+                        || manifest.layout != Some(DataLayout::DailyV2)
+                        || manifest.role != DatasetRole::Development
+                        || &manifest.instrument != instrument
+                    {
+                        return Err(
+                            "retire: archive ancestor is not the claimed daily dataset".into()
+                        );
+                    }
+                    replaced.insert(id.to_string());
+                }
+            }
         }
         // Native daily roots need no migration authorization. If legacy manifests are
         // present, only the root's verified migration mapping can authorize their removal.

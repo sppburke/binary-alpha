@@ -1414,3 +1414,121 @@ fn retirement_retries_unchanged_delete_after_fresh_metadata() {
             .any(|line| line == &format!("GET /drive/v3/files/{first}"))
     );
 }
+
+#[test]
+fn retirement_descendant_ancestry_cannot_authorize_unmapped_legacy_deletion() {
+    for local_legacy in [true, false] {
+        let f = fixture();
+        let root = f.root.join("store");
+        let audit_config = f.scratch.path("ancestry-audit.toml");
+        fs::write(
+            &audit_config,
+            toml::to_string(&json!({
+                "schema_version":1,"run_mode":"research",
+                "storage":{"historical_data_dir":root,"publication_uri":daily::uri(&root)},
+                "instruments":[f.new_stream.definition]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let audit = |manifest: &GenerationManifest| {
+            let mut report = Vec::new();
+            binary_alpha_app::audit::run(
+                &audit_config,
+                &daily::uri(&root.join(manifest.key())),
+                &mut report,
+            )
+            .unwrap();
+            stream(
+                &root,
+                &common::generation(&String::from_utf8(report).unwrap()),
+            )
+        };
+        let extra = f.scratch.path("outside-migration.json");
+        fs::write(&extra, b"{\"not_verified_by_migration\":true}").unwrap();
+        let mut legacy = dataset(&root, &f.old[0]);
+        let unique = daily::object(
+            &root,
+            "provenance/outside-migration.json",
+            ObjectRole::Provenance,
+            &extra,
+        );
+        legacy.objects.push(unique.clone());
+        daily::publish(&root, &mut legacy);
+        let legacy_stream = audit(&legacy);
+        let legacy_catalog = archive_fixture(&f.drive, &root, &legacy, &legacy_stream).0;
+
+        // A later valid v2 manifest names an ordinary v1 generation outside the verified
+        // root mapping. Its ancestry claim grants no authority to delete that legacy closure.
+        let mut descendant = f.new_dataset.clone();
+        let lineage_path = f.scratch.path("claimed-ancestry.json");
+        fs::write(
+            &lineage_path,
+            json!({"root_generation":f.new_dataset.generation,
+                "parent_generation":f.new_dataset.generation,
+                "ancestors":[f.new_dataset.generation,legacy.generation],
+                "continuation":{}})
+            .to_string(),
+        )
+        .unwrap();
+        descendant
+            .objects
+            .retain(|o| o.path != "provenance/lineage.json");
+        descendant.objects.push(daily::object(
+            &root,
+            "provenance/lineage.json",
+            ObjectRole::Provenance,
+            &lineage_path,
+        ));
+        daily::publish(&root, &mut descendant);
+        let descendant_stream = audit(&descendant);
+        archive_fixture(&f.drive, &root, &descendant, &descendant_stream);
+        if !local_legacy {
+            for generation in [&legacy.generation, &legacy_stream.generation] {
+                fs::remove_dir_all(root.join("manifests").join(generation)).unwrap();
+            }
+        }
+        let original_remote = f.drive.drive.files()[&legacy_catalog].bytes.clone();
+        if !local_legacy {
+            let error = pipeline("retire", &f.config, &["--plan"]).unwrap_err();
+            assert!(error.contains("unresolved retained generation"), "{error}");
+            assert_eq!(
+                f.drive.drive.files()[&legacy_catalog].bytes,
+                original_remote
+            );
+            assert!(
+                !f.drive
+                    .drive
+                    .log()
+                    .iter()
+                    .any(|line| line.starts_with("DELETE"))
+            );
+            continue;
+        }
+        let (path, plan) = plan(&f);
+        assert!(
+            !plan
+                .delete_drive
+                .iter()
+                .any(|d| d.file_id == legacy_catalog),
+            "unverified v1 catalog is protected even when named by a v2 descendant"
+        );
+        assert!(plan.retained_objects.contains_key(&unique.key));
+        if local_legacy {
+            assert!(plan.retained_manifests.contains(&legacy.key()));
+            assert!(
+                plan.retained_manifests
+                    .contains(&binary_alpha_engine::dataset::manifest_key(
+                        &legacy_stream.generation
+                    ))
+            );
+        }
+        apply(&f, &path).unwrap();
+        assert_eq!(
+            f.drive.drive.files()[&legacy_catalog].bytes,
+            original_remote
+        );
+        assert!(root.join(unique.key).exists());
+        common::verify(&root.join(descendant.key())).unwrap();
+    }
+}

@@ -4,6 +4,7 @@ use binary_alpha_app::{daily, store::Store};
 use binary_alpha_engine::dataset::{
     self as ds, DayFamily, Layout, ObjectRole, PriceRepresentation,
 };
+use std::collections::BTreeSet;
 
 /// Keep the original bundle/legacy-seed regression cases on explicit v1 fixtures. The command
 /// under test now imports daily roots; new tests below exercise that real output directly.
@@ -34,7 +35,7 @@ pub(super) fn legacy_import(config: &Path) -> Result<String, String> {
             original.push(object);
         }
         if let PriceRepresentation::IntegerUnits { scale } = m.price_representation {
-            let rows = ticks(&root, &m);
+            let rows = legacy_tick_rows(&m);
             let tmp = root.join("legacy-ticks.parquet");
             binary_alpha_app::archive::write_ticks(
                 &tmp,
@@ -78,6 +79,121 @@ pub(super) fn legacy_import(config: &Path) -> Result<String, String> {
         }
     }
     Ok(result)
+}
+
+fn legacy_tick_rows(manifest: &GenerationManifest) -> Vec<Tick> {
+    let PriceRepresentation::IntegerUnits { scale } = manifest.price_representation else {
+        panic!("expected tick fixture");
+    };
+    let mut sources: Vec<_> = manifest
+        .inputs
+        .iter()
+        .filter(|i| i.path.ends_with("_ticks.parquet"))
+        .collect();
+    sources.sort_by_key(|i| &i.path);
+    assert!(
+        !sources.is_empty(),
+        "legacy oracle requires original daily source files"
+    );
+    sources
+        .into_iter()
+        .flat_map(|input| {
+            let name = Path::new(&input.path)
+                .file_name()
+                .unwrap()
+                .to_str()
+                .unwrap();
+            let date = &name[name.len() - "YYYY-MM-DD_ticks.parquet".len()..][..10];
+            binary_alpha_app::archive::read_daily_ticks(
+                Path::new(&input.path),
+                scale,
+                ds::daily::day_bounds(date).unwrap().0,
+            )
+            .unwrap()
+        })
+        .collect()
+}
+
+fn assert_exact_reclamation(
+    store: &Path,
+    inventory: &BTreeSet<String>,
+    expected: &BTreeSet<String>,
+) {
+    let deleted: BTreeSet<_> = inventory
+        .iter()
+        .filter(|key| !store.join(key).exists())
+        .cloned()
+        .collect();
+    assert_eq!(
+        &deleted, expected,
+        "every eligible single and no protected object must be reclaimed"
+    );
+}
+
+#[test]
+fn reclamation_oracle_rejects_any_retained_eligible_single() {
+    let scratch = Scratch::new("reclamation_oracle");
+    let keys = BTreeSet::from(["deleted".to_string(), "accidentally-retained".to_string()]);
+    fs::write(scratch.path("accidentally-retained"), b"single page").unwrap();
+    assert!(
+        std::panic::catch_unwind(|| assert_exact_reclamation(&scratch.path(""), &keys, &keys))
+            .is_err(),
+        "the deletion oracle must reject retention of any eligible key"
+    );
+}
+
+#[test]
+fn legacy_tick_oracle_ignores_corrupted_daily_output() {
+    let f = fixture("legacy_tick_oracle");
+    let report = run(&[
+        "data",
+        "import",
+        "--config",
+        f.scratch.path("deriv-import.toml").to_str().unwrap(),
+    ])
+    .unwrap();
+    let store = f.scratch.path("producer/store");
+    let mut manifest = dataset(&store, imported_generation(&report, "deriv:frxEURUSD"));
+    let instrument = binary_alpha_engine::market::InstrumentId {
+        broker: manifest.broker.clone(),
+        provider_symbol: manifest.provider_symbol.clone(),
+    };
+    for day in manifest
+        .day_inventory
+        .iter_mut()
+        .filter(|d| d.family == DayFamily::Observations)
+    {
+        let Some(key) = &day.object else {
+            continue;
+        };
+        let scale = 5.try_into().unwrap();
+        let mut rows = daily::read_ticks(&store.join(key), &day.date, &instrument, scale).unwrap();
+        for row in &mut rows {
+            row.price_units += 1;
+        }
+        let path = f.scratch.path("corrupted-daily.parquet");
+        daily::write_ticks(&path, &day.date, &instrument, scale, [rows]).unwrap();
+        let object = common::daily::object(
+            &store,
+            &day.logical_path().unwrap(),
+            ObjectRole::Normalized,
+            &path,
+        );
+        manifest.objects.retain(|o| &o.key != key);
+        day.object = Some(object.key.clone());
+        manifest.objects.push(object);
+    }
+    let expected = expected_ticks(DERIV_SEED_END, DERIV_SEED_END, DERIV_SEED_END);
+    assert_ne!(
+        ticks(&store, &manifest),
+        expected,
+        "fault injection must change the v2 prices"
+    );
+    assert_eq!(
+        legacy_tick_rows(&manifest),
+        expected,
+        "legacy rows must come independently from the source fixture"
+    );
 }
 
 fn sparse_pocket(times: Vec<i64>) -> FakeBroker {
@@ -669,15 +785,36 @@ fn daily_updates_preserve_days_occurrences_resume_and_reclaim_for_both_brokers()
                 .unwrap()
                 .contains(&json!(ds::object_key(&first_hash)))
         );
-        for path in before_close {
-            if !path.exists() {
-                let key = format!("objects/{}", path.file_name().unwrap().to_str().unwrap());
-                assert!(
-                    plan["reclaimed"].as_array().unwrap().contains(&json!(key)),
-                    "only journaled singles may be reclaimed"
-                );
-            }
-        }
+        let receipt = read_json(
+            &scratch
+                .path("producer/pipeline_state/records")
+                .join(plan["receipt"].as_str().unwrap()),
+        );
+        let candidates: BTreeSet<_> = receipt["requests"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| ds::object_key(r["sha256"].as_str().unwrap()))
+            .collect();
+        let expected: BTreeSet<_> = candidates
+            .iter()
+            .filter(|k| **k != ds::object_key(&first_hash))
+            .cloned()
+            .collect();
+        assert!(
+            !expected.is_empty(),
+            "fixture must have unpinned singles eligible for reclamation"
+        );
+        let inventory = before_close
+            .iter()
+            .map(|p| format!("objects/{}", p.file_name().unwrap().to_str().unwrap()))
+            .chain(candidates.iter().cloned())
+            .collect();
+        assert_exact_reclamation(&store, &inventory, &expected);
+        assert_eq!(
+            serde_json::from_value::<BTreeSet<String>>(plan["reclaimed"].clone()).unwrap(),
+            expected
+        );
         fs::remove_file(foreign_state.join("progress.json")).unwrap();
         assert_eq!(
             all_pages(&store, &first_m)
@@ -1033,7 +1170,9 @@ fn fresh_imports_are_daily_roots_with_lossless_provider_rows_and_source_framing(
         let legacy_report = legacy_import(&config).unwrap();
         let legacy = dataset(&store, imported_generation(&legacy_report, instrument));
         if job == "deriv" {
-            assert_eq!(ticks(&store, &m), ticks(&store, &legacy));
+            let expected = expected_ticks(DERIV_SEED_END, DERIV_SEED_END, DERIV_SEED_END);
+            assert_eq!(ticks(&store, &m), expected);
+            assert_eq!(ticks(&store, &legacy), expected);
         } else {
             assert_eq!(bars(&store, &m), bars(&store, &legacy));
         }
@@ -1119,4 +1258,264 @@ fn daily_received_journal_interruption_resumes_without_deleting_unresolved_evide
         serde_json::from_value::<Vec<u8>>(read_json(&fragment)["fragment"].clone()).unwrap(),
         b"{\"interrupted\":"
     );
+}
+
+#[test]
+fn deferred_reclamation_survives_retirement_of_superseded_descendant() {
+    let f = fixture("review_reclaim_retirement");
+    let config = f.scratch.path("only-pocket.toml");
+    fs::write(
+        &config,
+        pipeline_toml(
+            &f.scratch.path("producer"),
+            &f.drive.base,
+            &[("pocket", "pocket.toml")],
+            None,
+            1,
+        ),
+    )
+    .unwrap();
+    run(&[
+        "data",
+        "import",
+        "--config",
+        f.scratch.path("pocket-import.toml").to_str().unwrap(),
+    ])
+    .unwrap();
+    fs::write(
+        f.scratch.path("pocket.toml"),
+        pocket_core(&f.pocket.url, "demo", BAR_GRANULARITY, 60, 1, 60),
+    )
+    .unwrap();
+    let end = time_text((POCKET_SEED_END + 300) * 1_000_000);
+    assert!(
+        pipeline("update", &config, &["--end", &end])
+            .unwrap_err()
+            .contains("status pending")
+    );
+    let state = f.scratch.path("producer/pipeline_state/pocket");
+    let progress = read_progress(&state.join("progress.json"));
+    let hash = progress["progress"]["pages"][0]["sha256"].as_str().unwrap();
+    let other = f.scratch.path("producer/pipeline_state/another-job");
+    fs::create_dir_all(&other).unwrap();
+    fs::write(
+        other.join("progress.json"),
+        json!({"page":{"sha256":hash}}).to_string(),
+    )
+    .unwrap();
+    fs::write(
+        f.scratch.path("pocket.toml"),
+        pocket_core(&f.pocket.url, "demo", BAR_GRANULARITY, 60, 50, 60),
+    )
+    .unwrap();
+    let first = pipeline("update", &config, &["--end", &end]).unwrap();
+    let first_generation = field(job_line(&first, "pocket"), "dataset");
+    let second = pipeline(
+        "update",
+        &config,
+        &["--end", &time_text((POCKET_SEED_END + 600) * 1_000_000)],
+    )
+    .unwrap();
+    let second_generation = field(job_line(&second, "pocket"), "dataset");
+    assert_ne!(first_generation, second_generation);
+    let store = f.scratch.path("producer/store");
+    let newest = dataset(&store, second_generation);
+    verify::run(&format!("file://{}", store.join(newest.key()).display())).unwrap();
+    // Retirement keeps the root/newest closure and pending shared single, dropping the old snapshot.
+    fs::remove_file(store.join(ds::manifest_key(first_generation))).unwrap();
+    assert!(store.join(ds::object_key(hash)).exists());
+    let after_retirement = pipeline(
+        "update",
+        &config,
+        &["--end", &time_text((POCKET_SEED_END + 900) * 1_000_000)],
+    );
+    assert!(
+        after_retirement.is_ok(),
+        "a deferred old cleanup must not block valid continuation: {after_retirement:?}"
+    );
+    let report = after_retirement.unwrap();
+    let latest = dataset(&store, field(job_line(&report, "pocket"), "dataset"));
+    let single = store.join(ds::object_key(hash));
+    assert!(
+        single.exists(),
+        "pending ownership still pins the single after retirement"
+    );
+    fs::remove_file(other.join("progress.json")).unwrap();
+    fs::remove_file(store.join(newest.key())).unwrap();
+    fs::remove_file(store.join(latest.key())).unwrap();
+
+    // A valid daily closure with the same payload but a different occurrence is not proof.
+    let mut wrong = latest.clone();
+    let mut changed = false;
+    let mut page_key = None;
+    for day in wrong
+        .day_inventory
+        .iter_mut()
+        .filter(|d| d.family == DayFamily::Pages)
+    {
+        let Some(key) = day.object.clone() else {
+            continue;
+        };
+        let mut pages = daily::read_pages(&store.join(&key), &day.date).unwrap();
+        for page in &mut pages {
+            if page.payload_sha256 == hash {
+                page.ordinal += 1_000_000;
+                changed = true;
+                page_key = Some(key.clone());
+            }
+        }
+        pages.sort_by(|a, b| (&a.acquisition_id, a.ordinal).cmp(&(&b.acquisition_id, b.ordinal)));
+        let file = f.scratch.path("wrong-occurrence.parquet");
+        daily::write_pages(&file, &day.date, [pages]).unwrap();
+        let object = common::daily::object(
+            &store,
+            &day.logical_path().unwrap(),
+            ObjectRole::Source,
+            &file,
+        );
+        wrong.objects.retain(|o| o.key != key);
+        day.object = Some(object.key.clone());
+        wrong.objects.push(object);
+    }
+    assert!(
+        changed,
+        "fixture must alter the protected response occurrence"
+    );
+    common::daily::publish(&store, &mut wrong);
+    verify::run(&format!("file://{}", store.join(wrong.key()).display())).unwrap();
+    let core = fs::read_to_string(f.scratch.path("pocket.toml")).unwrap();
+    // Admission fails after the cleanup pass, preventing any new acquisition from changing proof.
+    fs::write(f.scratch.path("pocket.toml"), "invalid fixture config").unwrap();
+    let error = pipeline("update", &config, &["--end", &end]).unwrap_err();
+    assert!(
+        error.contains("pipeline job pocket failed: job pocket:"),
+        "cleanup must defer and reach the deliberately invalid job configuration: {error}"
+    );
+    assert!(
+        single.exists(),
+        "an equal payload with the wrong occurrence cannot authorize reclamation"
+    );
+    fs::remove_file(store.join(wrong.key())).unwrap();
+    fs::write(store.join(latest.key()), latest.to_json()).unwrap();
+    let page_path = store.join(page_key.unwrap());
+    let hidden = f.scratch.path("temporarily-unavailable-page");
+    fs::rename(&page_path, &hidden).unwrap();
+    let error = pipeline("update", &config, &["--end", &end]).unwrap_err();
+    assert!(
+        error.contains("pipeline job pocket failed: job pocket:"),
+        "cleanup must defer and reach the deliberately invalid job configuration: {error}"
+    );
+    assert!(
+        single.exists(),
+        "unavailable replacement proof must defer deletion"
+    );
+    fs::rename(hidden, page_path).unwrap();
+    fs::write(f.scratch.path("pocket.toml"), core).unwrap();
+    let resumed = pipeline(
+        "update",
+        &config,
+        &["--end", &time_text((POCKET_SEED_END + 1200) * 1_000_000)],
+    )
+    .unwrap();
+    assert!(
+        !single.exists(),
+        "released singles must be reclaimed using the retained descendant"
+    );
+    let final_manifest = dataset(&store, field(job_line(&resumed, "pocket"), "dataset"));
+    verify::run(&format!(
+        "file://{}",
+        store.join(final_manifest.key()).display()
+    ))
+    .unwrap();
+}
+
+#[test]
+fn interrupted_import_reclaims_owned_staging_on_retry() {
+    let f = fixture("import_staging_retry");
+    let config = f.scratch.path("pocket-import.toml");
+    let store = f.scratch.path("producer/store");
+    let destination = f.scratch.path("published");
+    fs::create_dir_all(&destination).unwrap();
+    // Fail publication after source retention, without changing source bytes on retry.
+    fs::write(destination.join("objects"), b"publication interrupted").unwrap();
+    fs::write(
+        &config,
+        fs::read_to_string(&config).unwrap().replace(
+            &format!("publication_uri = \"file://{}\"", store.display()),
+            &format!("publication_uri = \"file://{}\"", destination.display()),
+        ),
+    )
+    .unwrap();
+    let preexisting = f
+        .scratch
+        .path("sources/pocket/AEDCNY_otc/preexisting.ndjson");
+    fs::write(&preexisting, b"{\"independent_owner\":true}\n").unwrap();
+    let preexisting_key = ds::object_key(
+        &binary_alpha_app::store::identify(&preexisting)
+            .unwrap()
+            .sha256,
+    );
+    fs::create_dir_all(store.join("objects")).unwrap();
+    fs::copy(&preexisting, store.join(&preexisting_key)).unwrap();
+    let source = f.scratch.path("sources/pocket/AEDCNY_otc/raw_pages.ndjson");
+    let checkpoint = f
+        .scratch
+        .path("sources/pocket/AEDCNY_otc/checkpoint.ndjson");
+    let checkpoint_key = ds::object_key(
+        &binary_alpha_app::store::identify(&checkpoint)
+            .unwrap()
+            .sha256,
+    );
+    let identity = binary_alpha_app::store::identify(&source).unwrap();
+    let key = ds::object_key(&identity.sha256);
+    assert!(run(&["data", "import", "--config", config.to_str().unwrap()]).is_err());
+    assert_eq!(
+        fs::read(store.join(&key)).unwrap(),
+        fs::read(&source).unwrap(),
+        "failed invocation retained the raw input"
+    );
+    assert!(store.join(&checkpoint_key).exists());
+    // Another ready generation acquires a reference while this import is interrupted.
+    let legacy = legacy_import(&f.scratch.path("deriv-import.toml")).unwrap();
+    let mut pinned = dataset(&store, imported_generation(&legacy, "deriv:frxEURUSD"));
+    let pinned_object = common::daily::object(
+        &store,
+        "source/shared-metadata.json",
+        ObjectRole::Source,
+        &f.scratch
+            .path("sources/pocket/AEDCNY_otc/download_manifest.json"),
+    );
+    pinned.objects.push(pinned_object.clone());
+    common::daily::publish(&store, &mut pinned);
+    verify::run(&format!("file://{}", store.join(pinned.key()).display())).unwrap();
+    fs::remove_file(destination.join("objects")).unwrap();
+    let report = run(&["data", "import", "--config", config.to_str().unwrap()]).unwrap();
+    let manifest = dataset(
+        &store,
+        imported_generation(&report, "pocket_option:AEDCNY_otc"),
+    );
+    assert_eq!(manifest.layout, Some(Layout::DailyV2));
+    assert!(!manifest.objects.iter().any(|o| o.key == key));
+    assert!(
+        !store.join(&key).exists(),
+        "successful retry must reclaim its earlier raw staging object"
+    );
+    assert!(
+        !store.join(&checkpoint_key).exists(),
+        "checkpoint staging must also be reclaimed"
+    );
+    assert_eq!(
+        fs::read(store.join(&preexisting_key)).unwrap(),
+        fs::read(preexisting).unwrap(),
+        "unowned reused inputs remain untouched"
+    );
+    assert_eq!(
+        binary_alpha_app::store::identify(&store.join(&pinned_object.key))
+            .unwrap()
+            .sha256,
+        pinned_object.sha256,
+        "ready-manifest references still protect owned staging"
+    );
+    verify::run(&format!("file://{}", store.join(pinned.key()).display())).unwrap();
+    verify::run(&format!("file://{}", store.join(manifest.key()).display())).unwrap();
 }

@@ -859,6 +859,10 @@ Retirement uses the registry owner's read-only replay, including snapshot waterm
 logical aliases, and legacy transfer files. Completed reclamation records do not pin removed
 single-page representations. A missing completed remote binding is reusable only after an exact
 completed retirement record authorizes its removal; unrelated remote loss remains an error.
+Deferred single-page cleanup can use a verified descendant after its original publication is
+retired, but only when it retains every exact receipt occurrence. Missing replacement proof
+defers cleanup. Daily import staging has a durable ownership journal so interrupted imports can
+reclaim their own unreferenced source copies on retry without adopting pre-existing objects.
 Retiring v1 manifests requires a matching immutable, verified migration record as specified in
 [retirement](retirement.md); native v2 ancestry retirement does not require migration evidence.
 Retirement plans use schema 2, refuse older apply plans, and preserve completed evidence when

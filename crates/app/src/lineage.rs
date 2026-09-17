@@ -1191,6 +1191,112 @@ fn references(value: &Value, keys: &mut BTreeSet<String>) {
         _ => {}
     }
 }
+/// A retired publication can be replaced as deletion proof only by a permitted, verified
+/// closure in the same lineage that still carries every exact recorded response occurrence.
+fn reclamation_proven(
+    local: &Store,
+    plan: &Reclamation,
+    receipt: &Value,
+    access: Access<'_>,
+) -> Result<bool, String> {
+    if verify::run_with(&local.uri(&manifest_key(&plan.generation)), access).is_ok() {
+        return Ok(true);
+    }
+    let coverage: HistoryCoverage =
+        serde_json::from_value(receipt["coverage"].clone()).map_err(err)?;
+    let Some(seed) = &coverage.seed else {
+        return Ok(false);
+    };
+    let requests: Vec<crate::fetch::PageReceipt> =
+        serde_json::from_value(receipt["requests"].clone()).map_err(err)?;
+    if requests.iter().any(|r| r.occurrence.is_none()) {
+        return Ok(false);
+    }
+    for generation in local.list_manifests()? {
+        let proves = || -> Result<bool, String> {
+            access.lookup(&generation)?;
+            access.permit(Some(coverage.role), &generation)?;
+            let mut bytes = Vec::new();
+            local.read_to(&manifest_key(&generation), None, &mut bytes)?;
+            if verify::manifest_kind(&bytes)?.is_some() {
+                return Ok(false);
+            }
+            let manifest = GenerationManifest::from_json(&bytes)?;
+            if manifest.layout != Some(Layout::DailyV2)
+                || manifest.broker.as_str() != coverage.broker
+                || manifest.provider_symbol.as_str() != coverage.provider_symbol
+                || manifest.role != coverage.role
+            {
+                return Ok(false);
+            }
+            access.permit(Some(manifest.role), &generation)?;
+            let lineage = manifest
+                .objects
+                .iter()
+                .find(|o| o.path == LINEAGE_PATH)
+                .ok_or("replacement lineage absent")?;
+            let (_, file) = verify::fetch(local, lineage, true)?;
+            let lineage: Value =
+                serde_json::from_slice(&fs::read(&file.expect("lineage").path).map_err(err)?)
+                    .map_err(err)?;
+            let descendant = lineage["ancestors"].as_array().is_some_and(|ancestors| {
+                ancestors.iter().any(|ancestor| {
+                    ancestor.as_str() == Some(plan.generation.as_str())
+                        || ancestor.as_str() == Some(seed.generation.as_str())
+                })
+            });
+            // A self-contained restored descendant may be the operational seed while
+            // root_generation still names the original, unavailable logical root.
+            if lineage["root_generation"].as_str() != Some(seed.generation.as_str())
+                && lineage["continuation"]["seed"]["generation"].as_str()
+                    != Some(seed.generation.as_str())
+                && !descendant
+            {
+                return Ok(false);
+            }
+            let mut remaining: BTreeMap<_, _> = requests
+                .iter()
+                .map(|request| {
+                    let occurrence = request.occurrence.as_ref().expect("checked occurrence");
+                    (
+                        (occurrence.acquisition_id.clone(), occurrence.ordinal),
+                        request,
+                    )
+                })
+                .collect();
+            for day in manifest
+                .day_inventory
+                .iter()
+                .filter(|d| d.family == DayFamily::Pages && d.object.is_some())
+            {
+                let (_, file) = verify::fetch(local, old_object(&manifest, day)?, true)?;
+                for page in daily::read_pages(&file.expect("pages").path, &day.date)? {
+                    let key = (page.acquisition_id.clone(), page.ordinal);
+                    if let Some(request) = remaining.get(&key)
+                        && page.intent == request.occurrence.as_ref().expect("checked").intent
+                        && page.payload_sha256 == request.sha256
+                        && page.payload.len() as u64 == request.bytes
+                        && page.rows == request.rows
+                        && page.request_token == request.anchor
+                        && page.receipt_time_utc == Some(time(&request.receipt_time)?)
+                        && page.receipt_state == daily::ReceiptState::Recorded
+                    {
+                        remaining.remove(&key);
+                    }
+                }
+            }
+            Ok(remaining.is_empty()
+                && verify::run_with(&local.uri(&manifest_key(&generation)), access).is_ok())
+        };
+        // Missing, incomplete, inaccessible, or mismatched replacement evidence defers
+        // this cleanup; it must neither authorize deletion nor block other update jobs.
+        if proves().unwrap_or(false) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 /// Caller holds the pipeline writer lock. The closed receipt and verified daily generation
 /// authorize precisely this acquisition's singles; manifests and other pending logs pin keys.
 pub(crate) fn reclaim(
@@ -1223,7 +1329,9 @@ pub(crate) fn reclaim(
         {
             return Err("reclamation receipt does not close this acquisition".into());
         }
-        verify::run_with(&local.uri(&manifest_key(&plan.generation)), access)?;
+        if !reclamation_proven(local, &plan, &receipt, access)? {
+            continue;
+        }
         let pending = state.join("progress.json");
         if pending.exists() {
             let bytes = fs::read(&pending).map_err(err)?;

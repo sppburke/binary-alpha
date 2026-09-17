@@ -15,6 +15,8 @@ and matching stream have an archived catalog. The shared lineage selector choose
 v2 catalog by coverage end, then proved ancestry at equal coverage; ambiguous branches are
 refused. Its dataset ancestry must reach the instrument's one readable daily continuation
 root with `provenance/lineage.json`. Proven superseded v2 ancestry is independently eligible.
+An ancestry name is considered v2 only after checking its local manifest or its archived,
+hash-pinned manifest; a descendant cannot expand the root's verified v1 replacement mapping.
 
 Retiring local legacy manifests additionally requires a completed immutable migration record
 under `pipeline_state/records` matching the root's mapping. Lineage names and coverage
