@@ -2444,10 +2444,32 @@ impl MarketDataBroker for Pages {
         &self,
         _: &InstrumentId,
         raw: &[u8],
-        _: PriceScale,
-        _: NativeGranularity,
+        scale: PriceScale,
+        native: NativeGranularity,
     ) -> Result<(Option<i32>, HistoryRows), String> {
         let rows: Vec<(i64, i64)> = serde_json::from_slice(raw).map_err(|e| e.to_string())?;
+        if let NativeGranularity::Bar { period_seconds } = native {
+            return Ok((
+                Some(538),
+                HistoryRows::Bars(
+                    rows.iter()
+                        .map(|&(t, p)| {
+                            let price = p as f64 / scale.unit() as f64;
+                            binary_alpha_engine::market::Bar {
+                                provider: (),
+                                start_unix_s: t / 1_000_000,
+                                open: price,
+                                high: price,
+                                low: price,
+                                close: price,
+                                volume: 1.,
+                                period_s: period_seconds,
+                            }
+                        })
+                        .collect(),
+                ),
+            ));
+        }
         Ok((
             None,
             HistoryRows::Ticks(
@@ -2519,7 +2541,63 @@ fn read_coverage(scratch: &Scratch, manifest: &GenerationManifest) -> fetch::His
         .iter()
         .find(|object| object.path == fetch::COVERAGE_PATH)
         .unwrap();
-    serde_json::from_slice(&fs::read(scratch.path("published").join(&object.key)).unwrap()).unwrap()
+    use binary_alpha_engine::dataset::coverage::DailyCoverage;
+    assert_eq!(
+        manifest.layout,
+        Some(binary_alpha_engine::dataset::Layout::DailyV2)
+    );
+    let coverage =
+        DailyCoverage::from_json(&fs::read(scratch.path("published").join(&object.key)).unwrap())
+            .unwrap();
+    coverage.check_manifest(manifest).unwrap();
+    let lineage: serde_json::Value = serde_json::from_slice(
+        &fs::read(
+            scratch.path("published").join(
+                &manifest
+                    .objects
+                    .iter()
+                    .find(|o| o.path == "provenance/lineage.json")
+                    .unwrap()
+                    .key,
+            ),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let acquisition = coverage
+        .acquisitions
+        .iter()
+        .find(|a| a.acquisition_id == lineage["continuation"]["acquisition_id"])
+        .unwrap();
+    let range = |r: &binary_alpha_engine::dataset::coverage::CoverageRange| fetch::Range {
+        start: r.start.clone(),
+        end: r.end.clone(),
+    };
+    let shortfall =
+        |s: &binary_alpha_engine::dataset::coverage::CoverageShortfall| fetch::Shortfall {
+            reason: s.reason.clone(),
+            unresolved: range(&s.unresolved),
+        };
+    fetch::HistoryCoverage {
+        schema_version: 1,
+        source_identity: acquisition.source_identity.clone(),
+        broker: manifest.broker.to_string(),
+        provider_symbol: manifest.provider_symbol.to_string(),
+        role: manifest.role,
+        requested: range(&acquisition.requested[0]),
+        verified: acquisition.verified.first().map(range),
+        actual: Some(fetch::Actual {
+            first: manifest.coverage.first_event_time.clone(),
+            last: manifest.coverage.last_event_time.clone(),
+        }),
+        rows: manifest.row_count,
+        pages: vec![],
+        bundle: None,
+        shortfall: acquisition.shortfalls.first().map(shortfall),
+        tail_shortfall: acquisition.shortfalls.get(1).map(shortfall),
+        native_granularity: manifest.native_granularity,
+        seed: serde_json::from_value(lineage["continuation"]["seed"].clone()).unwrap(),
+    }
 }
 fn read_manifests(scratch: &Scratch) -> Vec<GenerationManifest> {
     if !scratch.path("published/manifests").exists() {
@@ -2575,6 +2653,10 @@ fn fetch_refresh_overlap_no_new_data_verification_and_phase03_audit() {
         [10, 20, 30]
     );
     for (index, manifest) in manifests.iter().enumerate() {
+        assert_eq!(
+            manifest.layout,
+            Some(binary_alpha_engine::dataset::Layout::DailyV2)
+        );
         let coverage = read_coverage(&scratch, manifest);
         assert_eq!(
             coverage.verified,
@@ -2608,9 +2690,25 @@ fn fetch_refresh_overlap_no_new_data_verification_and_phase03_audit() {
         &mut out,
     )
     .unwrap();
-    assert_eq!(read_manifests(&scratch).len(), 3);
-    assert_eq!(before, scratch.objects("published"));
-    assert!(String::from_utf8(out).unwrap().contains("(no new data)"));
+    let after = read_manifests(&scratch);
+    assert_eq!(after.len(), 4);
+    assert!(scratch.objects("published").len() > before.len());
+    assert_eq!(after.last().unwrap().row_count, 30);
+    let old_observations: Vec<_> = manifests[2]
+        .objects
+        .iter()
+        .filter(|o| o.path.starts_with("observations/"))
+        .collect();
+    for old in old_observations {
+        assert!(
+            after
+                .last()
+                .unwrap()
+                .objects
+                .iter()
+                .any(|o| o.path == old.path && o.key == old.key)
+        );
+    }
     let config_path = scratch.path("audit.toml");
     fs::write(&config_path, config.canonical_toml()).unwrap();
     let mut report = Vec::new();
@@ -2763,8 +2861,28 @@ fn fetch_conflicts_provider_errors_and_interrupted_publication_do_not_advance() 
     assert!(read_manifests(&scratch).is_empty());
     let first = range_page(5, 10);
     let second = range_page(0, 6);
-    let bundle = [first.raw.as_slice(), second.raw.as_slice()].concat();
-    let failure_path = scratch.path("published/objects").join(hash(&bundle));
+    let file = scratch.path("expected-daily-ticks.parquet");
+    let instrument = &config.instruments[0];
+    binary_alpha_app::daily::write_ticks(
+        &file,
+        "1970-01-01",
+        &InstrumentId {
+            broker: instrument.broker.clone(),
+            provider_symbol: instrument.provider_symbol.clone(),
+        },
+        instrument.price_scale,
+        [range_rows(0, 10)
+            .into_iter()
+            .map(|(t, p)| Tick {
+                event_time_micros: t * 1_000_000,
+                price_units: p,
+            })
+            .collect::<Vec<_>>()],
+    )
+    .unwrap();
+    let failure_path = scratch
+        .path("published/objects")
+        .join(hash(&fs::read(file).unwrap()));
     fs::create_dir_all(&failure_path).unwrap();
     assert!(
         fetch::pass(
@@ -3193,7 +3311,10 @@ fn binary_fetch_verify_and_inspect_both_providers_over_real_local_transports() {
                 ),
             ]);
             assert!(report.starts_with("verified"));
-            assert!(report.contains("history bundles 1"), "{report}");
+            assert_eq!(
+                manifest.layout,
+                Some(binary_alpha_engine::dataset::Layout::DailyV2)
+            );
             let rows = common::read_normalized_ticks(&scratch.path("published"), manifest);
             assert_eq!(rows.len() as u64, manifest.row_count);
             assert_eq!(
@@ -3206,35 +3327,37 @@ fn binary_fetch_verify_and_inspect_both_providers_over_real_local_transports() {
                     .all(|row| time(&history.start).unwrap() <= row.event_time_micros
                         && row.event_time_micros < time(&history.end).unwrap())
             );
-            let coverage = read_coverage(&scratch, manifest);
-            if kind == "deriv" {
-                assert_eq!(coverage.pages.len(), 3);
-            }
-            for page in &coverage.pages {
-                let bundle = manifest
-                    .objects
-                    .iter()
-                    .find(|object| object.path == page.path)
-                    .unwrap();
-                let bytes = fs::read(scratch.path("published").join(&bundle.key)).unwrap();
-                let offset = page.offset.unwrap() as usize;
-                let raw = &bytes[offset..offset + page.bytes as usize];
-                assert_eq!(
-                    raw,
-                    fs::read(
-                        scratch
-                            .path("retained")
-                            .join(binary_alpha_engine::dataset::object_key(&page.sha256))
+            let pages: Vec<_> = manifest
+                .day_inventory
+                .iter()
+                .filter(|d| d.family == binary_alpha_engine::dataset::DayFamily::Pages)
+                .flat_map(|d| {
+                    binary_alpha_app::daily::read_pages(
+                        &scratch.path("published").join(d.object.as_ref().unwrap()),
+                        &d.date,
                     )
                     .unwrap()
+                })
+                .collect();
+            if kind == "deriv" {
+                assert_eq!(pages.len(), 3);
+            }
+            for page in &pages {
+                let raw = page.payload.as_slice();
+                assert_eq!(
+                    raw,
+                    fs::read(scratch.path("retained").join(
+                        binary_alpha_engine::dataset::object_key(&page.payload_sha256)
+                    ))
+                    .unwrap()
                 );
-                assert_eq!(hash(raw), page.sha256);
+                assert_eq!(hash(raw), page.payload_sha256);
                 let expected = if kind == "deriv" {
                     let envelope: binary_alpha_app::broker::deriv::Envelope =
                         serde_json::from_slice(raw).unwrap();
                     deriv_history_response(
                         manifest.provider_symbol.as_str(),
-                        page.anchor.as_deref().unwrap(),
+                        page.request_token.as_deref().unwrap(),
                         envelope.req_id.unwrap(),
                     )
                 } else {
@@ -3244,7 +3367,7 @@ fn binary_fetch_verify_and_inspect_both_providers_over_real_local_transports() {
                     }
                     let response: Page = serde_json::from_slice(raw).unwrap();
                     let anchor: WireDecimal =
-                        serde_json::from_str(page.anchor.as_deref().unwrap()).unwrap();
+                        serde_json::from_str(page.request_token.as_deref().unwrap()).unwrap();
                     pocket_history_response(
                         manifest.provider_symbol.as_str(),
                         &anchor,
@@ -3272,9 +3395,15 @@ fn binary_fetch_verify_and_inspect_both_providers_over_real_local_transports() {
             if kind == "deriv" { 2 } else { 0 }
         );
         if kind == "pocket_option" {
-            assert_eq!(second.matches("(no new data)").count(), 2);
+            assert_eq!(
+                read_manifests(&scratch).len(),
+                4,
+                "new response occurrences are retained"
+            );
+            assert!(scratch.objects("published").len() > objects.len());
+        } else {
+            assert_eq!(objects, scratch.objects("published"));
         }
-        assert_eq!(objects, scratch.objects("published"));
         for (path, bytes) in before {
             assert_eq!(fs::read(path).unwrap(), bytes);
         }
@@ -3526,9 +3655,21 @@ fn repeated_shortfall_reuses_verified_content_and_preserves_within_page_repeats(
         &mut out,
     )
     .unwrap();
-    assert_eq!(read_manifests(&scratch).len(), 1);
-    assert_eq!(scratch.objects("published").len(), count);
-    assert!(String::from_utf8(out).unwrap().contains("(no new data)"));
+    let manifests = read_manifests(&scratch);
+    assert_eq!(manifests.len(), 2);
+    assert!(scratch.objects("published").len() > count);
+    let observations = |m: &GenerationManifest| {
+        m.objects
+            .iter()
+            .filter(|o| o.path.starts_with("observations/"))
+            .map(|o| o.key.clone())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(observations(&manifests[0]), observations(&manifests[1]));
+    assert!(manifests.iter().all(|m| m.row_count == 3));
+    for manifest in manifests {
+        verify::run(&destination.uri(&manifest.key())).unwrap();
+    }
 }
 
 #[test]
@@ -3953,7 +4094,7 @@ fn concrete_deriv_tail_shortfall_is_requested_again() {
         &mut out,
     )
     .unwrap();
-    assert_eq!(read_manifests(&scratch).len(), 1);
+    assert_eq!(read_manifests(&scratch).len(), 2);
     assert_eq!(
         sent.lock().unwrap().len(),
         2,
@@ -4408,4 +4549,301 @@ fn prefix_repair_preserves_verified_end_and_restart_rejects_changed_prefix() {
         common::read_normalized_ticks(&scratch.path("published"), &manifests[2]),
         rows_of(&range_rows(0, 10))
     );
+}
+
+#[test]
+fn fetch_refuses_v1_seed_and_prior_before_requesting_any_page() {
+    use binary_alpha_engine::dataset::{ObjectRole, SourceKind};
+    for seed in [false, true] {
+        let scratch = Scratch::new(&format!("no_v1_fetch_{seed}"));
+        let pair = common::daily::pair(&scratch, false);
+        let mut config = test_config(&scratch, "deriv", "ws://127.0.0.1/", false);
+        let root = scratch.path("published");
+        let local = Store::filesystem(&root);
+        let destination = Store::filesystem(scratch.path("refused"));
+        let source_identity = broker::source_identity(&config.brokers[0]);
+        if seed {
+            config
+                .history
+                .as_mut()
+                .unwrap()
+                .seeds
+                .push(binary_alpha_engine::config::Seed {
+                    provider_symbol: pair.v1.provider_symbol.clone(),
+                    manifest: common::daily::uri(&pair.path(&scratch, false))
+                        .parse()
+                        .unwrap(),
+                    source_identity,
+                });
+        } else {
+            let mut prior = pair.v1.clone();
+            prior.source_kind = SourceKind::BrokerHistory;
+            let coverage = fetch::HistoryCoverage {
+                schema_version: 1,
+                source_identity,
+                broker: prior.broker.to_string(),
+                provider_symbol: prior.provider_symbol.to_string(),
+                role: prior.role,
+                requested: fetch::Range {
+                    start: prior.coverage.first_event_time.clone(),
+                    end: prior.coverage.last_event_time.clone(),
+                },
+                verified: None,
+                actual: Some(fetch::Actual {
+                    first: prior.coverage.first_event_time.clone(),
+                    last: prior.coverage.last_event_time.clone(),
+                }),
+                rows: prior.row_count,
+                pages: vec![],
+                bundle: None,
+                shortfall: None,
+                tail_shortfall: None,
+                native_granularity: prior.native_granularity,
+                seed: None,
+            };
+            let file = scratch.path("legacy-coverage.json");
+            fs::write(&file, serde_json::to_vec(&coverage).unwrap()).unwrap();
+            prior.objects.retain(|o| o.path != fetch::COVERAGE_PATH);
+            prior.objects.push(common::daily::object(
+                &root,
+                fetch::COVERAGE_PATH,
+                ObjectRole::Provenance,
+                &file,
+            ));
+            let raw = scratch.path("legacy-raw.json");
+            fs::write(&raw, b"{}").unwrap();
+            prior.objects.push(common::daily::object(
+                &root,
+                "raw/fixture.json",
+                ObjectRole::Source,
+                &raw,
+            ));
+            common::daily::publish(&root, &mut prior);
+        }
+        let mut pages = Pages::new(vec![]);
+        let error = fetch::pass(
+            &config,
+            &mut pages,
+            &local,
+            &destination,
+            (0, 10_000_000),
+            &mut Vec::new(),
+        )
+        .unwrap_err();
+        assert!(error.contains("data pipeline migrate"), "{error}");
+        assert!(pages.anchors.is_empty());
+        assert!(!scratch.path("refused/manifests").exists());
+    }
+}
+
+#[test]
+fn unseeded_multiday_fetch_publishes_daily_rows_and_exact_page_payloads() {
+    let scratch = Scratch::new("unseeded_multiday_daily");
+    let config = test_config(&scratch, "deriv", "ws://127.0.0.1/", false);
+    let (local, destination) = stores(&scratch);
+    let rows = [
+        (86_399_000_000, 100),
+        (172_800_000_000, 101),
+        (172_800_000_000, 101),
+        (172_801_000_000, 102),
+    ];
+    let page = page_micros(&rows);
+    let raw = page.raw.clone();
+    fetch::pass(
+        &config,
+        &mut Pages::new(vec![page]),
+        &local,
+        &destination,
+        (86_399_000_000, 172_801_000_001),
+        &mut Vec::new(),
+    )
+    .unwrap();
+    let manifest = read_manifests(&scratch).remove(0);
+    assert_eq!(
+        manifest.layout,
+        Some(binary_alpha_engine::dataset::Layout::DailyV2)
+    );
+    assert_eq!(
+        common::read_normalized_ticks(&scratch.path("published"), &manifest),
+        rows.iter()
+            .map(|(t, p)| Tick {
+                event_time_micros: *t,
+                price_units: *p
+            })
+            .collect::<Vec<_>>()
+    );
+    let observations: Vec<_> = manifest
+        .day_inventory
+        .iter()
+        .filter(|d| d.family == binary_alpha_engine::dataset::DayFamily::Observations)
+        .collect();
+    assert_eq!(
+        observations
+            .iter()
+            .map(|d| (&*d.date, d.rows))
+            .collect::<Vec<_>>(),
+        [("1970-01-01", 1), ("1970-01-02", 0), ("1970-01-03", 3)]
+    );
+    let pages: Vec<_> = manifest
+        .day_inventory
+        .iter()
+        .filter(|d| d.family == binary_alpha_engine::dataset::DayFamily::Pages)
+        .collect();
+    assert_eq!(pages.len(), 1);
+    assert_eq!(pages[0].date, "1970-01-03");
+    assert_eq!(
+        observations[1].state,
+        binary_alpha_engine::dataset::DayState::EmptyKnown
+    );
+    assert!(observations[1].object.is_none());
+    let occurrences = binary_alpha_app::daily::read_pages(
+        &scratch
+            .path("published")
+            .join(pages[0].object.as_ref().unwrap()),
+        &pages[0].date,
+    )
+    .unwrap();
+    assert_eq!(occurrences.len(), 1);
+    assert_eq!(occurrences[0].payload, raw);
+    assert_eq!(occurrences[0].rows, 4);
+    assert!(!occurrences[0].acquisition_id.is_empty());
+    assert!(
+        manifest
+            .objects
+            .iter()
+            .all(|o| !o.path.starts_with("raw/") && !o.path.starts_with("normalized/"))
+    );
+    verify::run(&destination.uri(&manifest.key())).unwrap();
+}
+
+#[test]
+fn unseeded_multiday_bar_fetch_preserves_provider_columns_and_audits_daily() {
+    let scratch = Scratch::new("unseeded_multiday_daily_bars");
+    let mut config = test_config(&scratch, "pocket_option", "ws://127.0.0.1/", false);
+    let native = NativeGranularity::Bar { period_seconds: 5 };
+    config.history.as_mut().unwrap().native_granularity = native;
+    config.instruments[0].native_granularity = native;
+    for candle in &mut config.instruments[0].candles {
+        candle.duration_seconds = 5;
+        candle.offset_seconds = 0;
+    }
+    let (local, destination) = stores(&scratch);
+    let rows = [
+        (86_395_000_000, 100_000),
+        (86_400_000_000, 100_100),
+        (86_405_000_000, 100_200),
+    ];
+    fetch::pass(
+        &config,
+        &mut Pages::new(vec![page_micros(&rows)]),
+        &local,
+        &destination,
+        (86_395_000_000, 86_410_000_000),
+        &mut Vec::new(),
+    )
+    .unwrap();
+    let manifest = read_manifests(&scratch).remove(0);
+    assert_eq!(
+        manifest.layout,
+        Some(binary_alpha_engine::dataset::Layout::DailyV2)
+    );
+    let mut actual = Vec::new();
+    binary_alpha_app::daily::read_generation_lossless(&destination, &manifest, |row| {
+        actual.push(row);
+        Ok(())
+    })
+    .unwrap();
+    assert_eq!(actual.len(), rows.len());
+    let Broker::PocketOption(settings) = &config.brokers[0] else {
+        unreachable!()
+    };
+    for (row, (at, units)) in actual.iter().zip(rows) {
+        let binary_alpha_app::daily::LosslessRow::Bar(bar) = row else {
+            panic!("bar row expected")
+        };
+        assert_eq!(bar.symbol.as_deref(), Some("EURUSD_otc"));
+        assert_eq!(bar.symbol_id, Some(538));
+        assert_eq!(bar.timestamp_utc, Some(at));
+        assert_eq!(bar.unix_utc_s, Some(at / 1_000_000));
+        assert_eq!(
+            bar.server_time_s,
+            Some(at / 1_000_000 + i64::from(settings.server_offset_minutes) * 60)
+        );
+        assert_eq!(
+            [bar.open, bar.high, bar.low, bar.close],
+            [Some(units as f64 / 100_000.); 4]
+        );
+        assert_eq!(bar.volume, Some(1.));
+        assert_eq!(bar.period_s, Some(5));
+    }
+    verify::run(&destination.uri(&manifest.key())).unwrap();
+    let config_path = scratch.path("audit-bars.toml");
+    fs::write(&config_path, config.canonical_toml()).unwrap();
+    let mut report = Vec::new();
+    binary_alpha_app::audit::run(&config_path, &destination.uri(&manifest.key()), &mut report)
+        .unwrap();
+    let generation = common::generation(&String::from_utf8(report).unwrap());
+    let key = binary_alpha_engine::dataset::manifest_key(&generation);
+    let stream = binary_alpha_engine::stream::StreamManifest::from_json(
+        &fs::read(scratch.path("published").join(&key)).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        stream.layout,
+        Some(binary_alpha_engine::dataset::Layout::DailyV2)
+    );
+    verify::run(&destination.uri(&key)).unwrap();
+}
+
+#[test]
+fn daily_prior_continues_when_its_original_seed_manifest_is_absent() {
+    let scratch = Scratch::new("daily_prior_without_seed");
+    let pair = common::daily::pair(&scratch, false);
+    let root = scratch.path("published");
+    let local = Store::filesystem(&root);
+    let mut config = test_config(&scratch, "deriv", "ws://127.0.0.1/", false);
+    let start = pair.ticks.last().unwrap().event_time_micros + 1;
+    let source_identity = broker::source_identity(&config.brokers[0]);
+    let history = config.history.as_mut().unwrap();
+    history.start = pair.v2.coverage.first_event_time.clone();
+    history.end = time_text(start + 2);
+    history.seeds.push(binary_alpha_engine::config::Seed {
+        provider_symbol: pair.v2.provider_symbol.clone(),
+        manifest: common::daily::uri(&pair.path(&scratch, true))
+            .parse()
+            .unwrap(),
+        source_identity,
+    });
+    fetch::pass(
+        &config,
+        &mut Pages::new(vec![page_micros(&[(start, 12345)])]),
+        &local,
+        &local,
+        (start, start + 1),
+        &mut Vec::new(),
+    )
+    .unwrap();
+    fs::remove_file(root.join(pair.v2.key())).unwrap();
+    let mut report = Vec::new();
+    fetch::pass(
+        &config,
+        &mut Pages::new(vec![page_micros(&[(start + 1, 12346)])]),
+        &local,
+        &local,
+        (start, start + 2),
+        &mut report,
+    )
+    .unwrap();
+    let generation = common::generation(&String::from_utf8(report).unwrap());
+    let path = root.join(binary_alpha_engine::dataset::manifest_key(&generation));
+    common::verify(&path).unwrap();
+    let manifest = GenerationManifest::from_json(&fs::read(path).unwrap()).unwrap();
+    assert_eq!(
+        manifest.layout,
+        Some(binary_alpha_engine::dataset::Layout::DailyV2)
+    );
+    assert_eq!(manifest.row_count, pair.v2.row_count + 2);
+    let actual = common::read_normalized_ticks(&root, &manifest);
+    assert_eq!(&actual[..pair.ticks.len()], pair.ticks);
+    assert_eq!(actual.last().unwrap().price_units, 12346);
 }

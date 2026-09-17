@@ -906,6 +906,9 @@ fn publish(
         interval,
         objects,
     };
+    if !daily {
+        return Err("data import: this source kind/role cannot publish daily-v2; only development tick_parquet_daily and bar_parquet_collection imports are supported; existing v1 data remains readable and must use data pipeline migrate".into());
+    }
     if daily {
         manifest = crate::lineage::import_root(local, manifest)?;
         identities = manifest
