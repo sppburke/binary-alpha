@@ -3,6 +3,9 @@
 //! A generation is identified by its inputs; its ready manifest is the sole publication record.
 //! `docs/contracts.md`, section "Historical datasets", is the normative description.
 
+pub mod daily;
+pub use daily::{DayFamily, DayInventoryEntry, DayState, Layout, UnresolvedInterval};
+
 use std::fmt;
 
 use serde::{Deserialize, Serialize};
@@ -271,8 +274,23 @@ pub fn generation_id(
     price_scale: Option<PriceScale>,
     inputs: &[ObjectRecord],
 ) -> String {
+    generation_id_with_layout(instrument, source_kind, role, price_scale, inputs, None)
+}
+
+/// Layout-aware identity; the absent marker follows the exact legacy hash recipe.
+pub fn generation_id_with_layout(
+    instrument: &InstrumentId,
+    source_kind: SourceKind,
+    role: DatasetRole,
+    price_scale: Option<PriceScale>,
+    inputs: &[ObjectRecord],
+    layout: Option<Layout>,
+) -> String {
     let mut hasher = Sha256::new();
     hasher.update(GENERATION_DOMAIN_V1);
+    if let Some(layout) = layout {
+        hasher.update(format!("layout {layout}\n").as_bytes());
+    }
     for line in [
         instrument.broker.as_str(),
         instrument.provider_symbol.as_str(),
@@ -307,6 +325,10 @@ pub fn generation_id(
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct GenerationManifest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub layout: Option<Layout>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub day_inventory: Vec<DayInventoryEntry>,
     pub schema_version: u32,
     pub generation: String,
     pub broker: BrokerId,
@@ -413,38 +435,61 @@ impl GenerationManifest {
             interval.validate()?;
         }
         validate_objects(&self.objects)?;
-        let normalized = self
-            .objects
-            .iter()
-            .filter(|object| object.role == ObjectRole::Normalized)
-            .count();
-        if normalized != expected || self.objects.len() == normalized {
-            return Err(format!(
-                "expected {expected} normalized object among {} objects, found {normalized}",
-                self.objects.len()
-            ));
-        }
-        let normalized_path = self.native_granularity.normalized_object_path();
-        if self.source_kind == SourceKind::BrokerHistory
-            && (!self.objects.iter().any(|o| o.role == ObjectRole::Source)
-                || !self.objects.iter().any(|o| {
-                    o.role == ObjectRole::Provenance && o.path == "provenance/coverage.json"
-                })
-                || !self
-                    .objects
+        if self.layout == Some(Layout::DailyV2) {
+            if self.role != DatasetRole::Development || self.source_kind == SourceKind::TickCsv {
+                return Err("daily-v2 requires development tick_parquet_daily, bar_parquet, or broker_history".into());
+            }
+            daily::validate_inventory(
+                &self.day_inventory,
+                &self.objects,
+                daily::DailyOwner::Dataset,
+            )?;
+            if daily::inventory_rows(
+                self.day_inventory
                     .iter()
-                    .any(|o| o.role == ObjectRole::Normalized && o.path == normalized_path))
-        {
-            return Err(format!(
-                "broker_history requires raw source pages, provenance/coverage.json, and {normalized_path}"
-            ));
+                    .filter(|day| day.family == DayFamily::Observations),
+            )? != self.row_count
+            {
+                return Err("observation inventory rows disagree with row_count".into());
+            }
+        } else {
+            if !self.day_inventory.is_empty() {
+                return Err("day_inventory requires layout daily-v2".into());
+            }
+            let normalized = self
+                .objects
+                .iter()
+                .filter(|object| object.role == ObjectRole::Normalized)
+                .count();
+            if normalized != expected || self.objects.len() == normalized {
+                return Err(format!(
+                    "expected {expected} normalized object among {} objects, found {normalized}",
+                    self.objects.len()
+                ));
+            }
+            let normalized_path = self.native_granularity.normalized_object_path();
+            if self.source_kind == SourceKind::BrokerHistory
+                && (!self.objects.iter().any(|o| o.role == ObjectRole::Source)
+                    || !self.objects.iter().any(|o| {
+                        o.role == ObjectRole::Provenance && o.path == "provenance/coverage.json"
+                    })
+                    || !self
+                        .objects
+                        .iter()
+                        .any(|o| o.role == ObjectRole::Normalized && o.path == normalized_path))
+            {
+                return Err(format!(
+                    "broker_history requires raw source pages, provenance/coverage.json, and {normalized_path}"
+                ));
+            }
         }
-        if generation_id(
+        if generation_id_with_layout(
             &instrument,
             self.source_kind,
             self.role,
             scale,
             &self.objects,
+            self.layout,
         ) != self.generation
         {
             return Err(format!(
@@ -554,6 +599,8 @@ mod tests {
             ),
         ];
         GenerationManifest {
+            layout: None,
+            day_inventory: Vec::new(),
             schema_version: MANIFEST_SCHEMA_VERSION,
             generation: generation_id(
                 &instrument,
@@ -591,6 +638,88 @@ mod tests {
             }),
             objects,
         }
+    }
+
+    #[test]
+    fn daily_manifest_round_trips_without_changing_legacy_bytes_or_identity() {
+        let legacy = manifest();
+        let legacy_bytes = legacy.to_json();
+        assert!(!String::from_utf8_lossy(&legacy_bytes).contains("layout"));
+        assert!(!String::from_utf8_lossy(&legacy_bytes).contains("day_inventory"));
+        assert_eq!(
+            GenerationManifest::from_json(&legacy_bytes)
+                .unwrap()
+                .to_json(),
+            legacy_bytes
+        );
+        assert_eq!(
+            legacy.generation,
+            "c81fe40d17a4bd2914e0b941bdc895147ef9f21cc713e7e1d910e652dbab867e"
+        );
+        let mut daily = legacy.clone();
+        daily.layout = Some(Layout::DailyV2);
+        let day = daily::tests::entry(DayFamily::Observations);
+        daily.row_count = day.rows;
+        daily.coverage = Coverage {
+            first_event_time: day.first_time.clone().unwrap(),
+            last_event_time: day.last_time.clone().unwrap(),
+        };
+        daily.objects = vec![
+            daily::tests::object(&day.logical_path().unwrap(), ObjectRole::Normalized),
+            daily::tests::object("provenance/coverage.json", ObjectRole::Provenance),
+            daily::tests::object("provenance/lineage.json", ObjectRole::Provenance),
+        ];
+        daily.day_inventory = vec![day];
+        let instrument = InstrumentId {
+            broker: daily.broker.clone(),
+            provider_symbol: daily.provider_symbol.clone(),
+        };
+        daily.generation = generation_id_with_layout(
+            &instrument,
+            daily.source_kind,
+            daily.role,
+            None,
+            &daily.objects,
+            daily.layout,
+        );
+        assert_ne!(
+            daily.generation,
+            generation_id(
+                &instrument,
+                daily.source_kind,
+                daily.role,
+                None,
+                &daily.objects
+            )
+        );
+        assert_eq!(
+            GenerationManifest::from_json(&daily.to_json()).unwrap(),
+            daily
+        );
+        let mut bad = daily.clone();
+        bad.row_count += 1;
+        assert!(
+            GenerationManifest::from_json(&bad.to_json())
+                .unwrap_err()
+                .contains("row_count")
+        );
+        let mut bad = daily.clone();
+        bad.layout = None;
+        assert!(
+            GenerationManifest::from_json(&bad.to_json())
+                .unwrap_err()
+                .contains("requires layout")
+        );
+        let mut bad = daily.clone();
+        bad.role = DatasetRole::Evaluation;
+        assert!(
+            GenerationManifest::from_json(&bad.to_json())
+                .unwrap_err()
+                .contains("requires development")
+        );
+        let mut bad = serde_json::to_value(daily).unwrap();
+        bad["layout"] = "future".into();
+        assert!(GenerationManifest::from_json(&serde_json::to_vec(&bad).unwrap()).is_err());
     }
 
     #[test]

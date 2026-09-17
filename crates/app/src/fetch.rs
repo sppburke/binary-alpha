@@ -1520,6 +1520,8 @@ fn acquire_one<R: Row>(
         .collect::<Result<_, _>>()?;
     let (first_event_time, last_event_time) = archive::coverage(&summary)?;
     let manifest = GenerationManifest {
+        layout: None,
+        day_inventory: Vec::new(),
         schema_version: MANIFEST_SCHEMA_VERSION,
         generation: generation.clone(),
         broker: instrument.broker.clone(),

@@ -756,6 +756,7 @@ impl PocketMarketData {
                 return Err("pocket_option: candle start is not a whole second".into());
             }
             let bar = Bar {
+                provider: (),
                 start_unix_s: start_micros / 1_000_000,
                 open: exact(&row.open)?,
                 high: exact(&row.high)?,

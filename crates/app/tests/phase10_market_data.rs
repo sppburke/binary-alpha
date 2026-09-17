@@ -1100,6 +1100,7 @@ fn assert_candle_rows(
         starts
             .iter()
             .map(|&start_unix_s| Bar {
+                provider: (),
                 start_unix_s,
                 open: 1.25,
                 high: 1.5,

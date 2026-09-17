@@ -543,6 +543,99 @@ permits the target before it is opened and refuses an undeclared dataset (see
 write nothing further to standard output, write one diagnostic to standard error, and exit with
 status 1. None removes source files, retained objects, or published objects.
 
+## Market data layout v2 (daily)
+
+The following is the normative owner-adopted layout standard, revision 3. It applies to
+ordinary `development` datasets (`tick_parquet_daily`, `bar_parquet`, `broker_history`) and
+their instrument streams. Derived research artifacts retain their own formats. The historical
+dataset and instrument-stream layout documented elsewhere here is **legacy layout v1**, readable
+until verified retirement. An absent manifest `layout` means v1; `layout = "daily-v2"` selects
+this contract. This foundation adds types and codecs; command routing, migration, continuation,
+archive registry, and retirement are implemented in later steps and are not authorized here.
+
+### 1. Families
+
+Every data-bearing object is one Parquet file per UTC day `D` (`YYYY-MM-DD`) and per family. Dataset manifests own observations and pages; stream manifests own candles and the aggregate profile. Existing object roles are kept (`normalized` for observations and candles, `source` for pages).
+
+| Family | Logical path | Rows | Day rule |
+| --- | --- | --- | --- |
+| Observations | `observations/D.parquet` | Deriv: normalized ticks (existing tick schema). Pocket: normalized 5 s bars keeping all eleven provider columns (symbol, symbol_id, timestamp_utc, unix_utc_s, server_time_s, open, high, low, close, volume, period_s) | Tick event time, or bar start time, in `[D, D+1)`; repeated ticks keep multiplicity and order |
+| Pages | `pages/D.parquet` | One row per provider response occurrence (section 2) | Nonempty page: UTC day of its last event. Empty page: UTC day of `request_anchor_utc`. Otherwise: UTC day of its receipt time. A page with none of the three is never deleted and is reported as unresolved |
+| Candles | `candles/<N>s_<O>s/D.parquet` | Finalized candles (existing candle schema) | Candle open time; one continuous stream state across all days |
+
+Single per-generation metadata (not market rows): the ready manifest with its ordered day inventory, `provenance/coverage.json` (acquisition coverage and unresolved ranges; no page index), `provenance/lineage.json` (section 5), and the stream `profile.json`.
+
+#### Day inventory
+
+Each entry: `date`, `family` (and candle `duration`/`offset`), `object` key or null, `rows`, first/last time or null, and `state`:
+
+- `complete`: evidence covers the whole day and no later input can change this family's output for the day;
+- `partial`: some of the day is covered (reason and unresolved intervals recorded; includes the cutoff day and any candle day whose last candle may still be finalized by a later observation);
+- `unknown`: source evidence exists without a completeness claim (reason recorded, for example a Deriv historical gap with `complete: false`);
+- `empty_known`: evidence covers the whole day with zero rows (for example Deriv `market_closed: true` without clipping); `object` is null.
+
+#### Deterministic encoding profile `daily-parquet-v1`
+
+Rows sorted canonically (observations and candles by time then original order; pages by `acquisition_id` then `ordinal`); fixed schema and semantic metadata per family; no generation, cutoff, or run metadata inside daily files; `parquet` crate 59.3.0 as pinned in `Cargo.lock`; Zstandard level 3; dictionary encoding off; statistics setting fixed; one row group per file; fixed numeric data page row and byte limits; every column written in canonical segments of exactly 8,192 values (the last shorter) regardless of how rows arrive upstream; writer `created_by` fixed to the profile name. Equal rows, schema, semantic metadata, and profile produce equal bytes; hash-equality tests vary upstream batch boundaries (777, 1,024, and 65,536 rows) and repeat writes. An unchanged day is referenced by key and never regenerated. A later profile version is a new layout input.
+
+### 2. Page occurrences
+
+Columns: `acquisition_id` (import: SHA-256 of the replaced `raw_pages.ndjson`; broker history: the name of the immutable operation receipt record of the invocation that made the request, or for requests only held in a pending progress log, the intent name plus the SHA-256 of that log's header); `intent` (nullable, the intent record name, kept separately); `ordinal` (0-based position in that acquisition's raw source order: NDJSON line number, or request order within the receipt or log); `checkpoint_ordinal` (nullable, the checkpoint line's own 0-based position, which can differ from `ordinal`); `order_kind` (`request_order` or `source_file_order`); `payload_sha256`; `payload` (exact response bytes; for NDJSON lines the bytes without the trailing newline, which is what the checkpoint `payload_sha256` covers); `request_token` (opaque provider anchor as sent, nullable); `request_anchor_utc` (nullable; the historical request boundary, not dispatch time: Pocket `UTC = provider_seconds − recorded_offset_minutes × 60`, Deriv `UTC = epoch_seconds`, both converted with checked arithmetic to microseconds); `receipt_time_utc` (nullable); `receipt_state` (`recorded`, `not_recorded_by_source` for recovered checkpoint lines, `absent_in_legacy_record`); `first_event_time`, `last_event_time` (nullable for empty pages); `rows`; `checkpoint` (exact original checkpoint line bytes, nullable); `disposition` (`indexed`, `diagnostic` for retained responses that failed validation or belong to abandoned acquisitions).
+
+Rules: one row per response occurrence, never deduplicated by payload hash; the inventory of occurrences covers every completed operation receipt, every published coverage index, every pending progress log, and every import NDJSON/checkpoint pair. Storage aliases of one occurrence (a single-page object, its bundle slice, a replayed checkpoint of the same request) map to that one occurrence through an explicit alias table in the migration record; requests with different recorded receipt times are different occurrences even when anchor and payload are equal. Checkpoint lines are matched to raw lines by payload hash with occurrence counting in source order, never by provider `index` or position alone, and the raw and checkpoint files are each reconstructed from their own ordinal and framing. Import lineage records the NDJSON framing (line terminator, final newline) and both source-file hashes so the original `raw_pages.ndjson` and `checkpoint.ndjson` can be reconstructed byte for byte from the pages of that acquisition.
+
+### 3. Identity and continuation
+
+- Dataset and stream identities gain the input `layout daily-v2`; v1 identities and every completed record are never rewritten.
+- Each instrument gets exactly one v2 continuation root: a v2 dataset carrying all history (import plus every acquisition to date) and its stream. `data pipeline update` seeds and selects priors from the v2 continuation root instead of the v1 import. A migration record per instrument binds v1 generations (import, newest history, stream) to the v2 root with the equality results.
+- A descendant references unchanged daily objects by key; it writes new objects only for days whose output changes, per family (new observation days, the previous partial day, and any earlier candle day completed by a newly finalized candle).
+- The five pending v1 acquisitions (8,285 retained pages, 36,198,285 bytes) are migrated first: their retained payloads and progress records become v2 page rows with disposition `diagnostic`, the migration record keeps their intents and the abandonment provenance, and only then are they abandoned by the documented rule. Refetched responses are additional occurrences. The IRRUSD_otc intent record is kept as is (it has no progress pair).
+- The continuation mapping (v1 import, newest history and stream → v2 root and stream) is persisted as an immutable record and archived with the v2 catalog; it preserves source identity, role, requested and verified coverage, shortfalls, and unresolved ranges. `imported_seed`, `prior`, and `pull` select within the v2 lineage (v2 roots and their descendants), prefer it over v1 while both exist, and restore→update works after v1 is removed. The two existing operator fetch configurations that pin v1 seeds (`~/.config/binary-alpha/pipeline/deriv-fetch.toml`, `pocket-fetch.toml`) are rebound to v2 roots or retired before their targets are deleted. The mapping grants no new read authority; existing permit checks still run before object reads.
+
+### 4. Archive, transfers, and retirement
+
+- Transfers move to one archive-root registry: content key → `{file_id, session, done, bytes, sha256}`, with atomic reservation across concurrent jobs, persisted incrementally (append-only log plus periodic compact snapshot, never a full rewrite per transfer). Completed entries can be rebuilt from a complete paginated Drive listing (no incomplete results; restart on rejected tokens) and are reused only after size and SHA-256 confirmation (readback when Drive reports no checksum).
+- Before retirement, every completed record (intents, operation receipts, catalog receipts) and every configuration reference to a generation, stream, or catalog is inventoried, and each referenced closure is recorded as `protected` or `retired` with the reason; immutable records are never rewritten, retained catalogs keep their exact file-id bindings, and an unresolved dependency is never a deletion candidate.
+- Retirement is by reachability, never by age or file name. Retained roots: the newest v2 catalog per job (the catalog file itself, its manifests, and its objects), v2 continuation roots and their streams, pending acquisitions and their retained pages, and in-flight transfers. Under the writer lock an exact deletion inventory (local keys and Drive file ids) is computed, recorded, applied in resumable batches, and each retained closure is re-verified afterwards. Superseded v2 catalogs and replaced partial-day objects are retired by the same rule on later updates.
+
+### 5. Lineage
+
+`provenance/lineage.json` per v2 root: for each replaced v1 object its logical path, key, SHA-256, bytes, and row count; Deriv per-day `.meta.json` contents; Pocket per-instrument `download_manifest.json`, `dataset/manifest.json`, `dataset/hashes.sha256`, `dataset/reports/quality.json` embedded verbatim and the instrument's entry of the shared collection manifest; NDJSON framing; the v1 generation identities it replaces. Markers (`_SUCCESS`, `.conversion.lock`) and the empty shared `gaps.parquet` are recorded by hash only.
+
+### 6. Verification and acceptance
+
+`data verify` on a v2 dataset decodes every daily file, checks day membership, cross-day order and multiplicity, the day inventory against the files, each page's `payload_sha256`, and aggregate rows and coverage; on a v2 stream it verifies each candle day and the aggregate summary. Migration additionally proves, per instrument, before any deletion: identical observation rows in order to the v1 newest history (or import); every NDJSON line, checkpoint line, bundle slice, and single page accounted for exactly once and both import source files reconstructed byte for byte; identical candles to the v1 stream.
+
+Named non-live gates (`cargo test -p binary-alpha-app --test data_pipeline` and the affected suites): one multi-day Deriv and one multi-day Pocket fixture through import, migration, history update, audit, feature/outcome/replay readers, archive, fresh-store restore, retirement, and a later update that uploads zero unchanged objects; covering midnight repeats, a cross-midnight page, an empty page, missing receipt metadata, a historical gap, a partial cutoff day, a weekend-delayed candle finalization, pending-acquisition diagnostics, repeated requests under one intent with unchanged observations (which changes only a page day), v1/v2 coexistence with equal coverage, encoding determinism across batch boundaries, interruption at each phase, and archive-registry rebuild. Assertions are on goal-bearing outputs, traversing every daily partition: identical feature rows and engine state, identical global outcome indices and reasons, identical replay ledger and results, identical recorded warm-up state, identical candles and profile, exact page reconstruction, and Pocket's existing rejection of tick-only outcome and replay paths.
+
+### Foundation representation and encoding choices
+
+`day_inventory` entries use `first_time` and `last_time` as inclusive bounds of the row's
+partition timestamp: event time, bar start, candle open, or the page's day-assignment time.
+They are not the page's first event (which may lie on an earlier day), nor candle close.
+Times are UTC strings in the existing manifest timestamp format. `unresolved` intervals have
+`start` (inclusive) and `end` (exclusive), within the entry's day, sorted and nonoverlapping.
+`partial` requires a nonempty reason and intervals; `unknown` requires a nonempty reason.
+Zero rows require null time bounds. Only `empty_known` has a null object. Date ordering is
+strict within `(family, duration, offset)`; candle duration and offset are seconds. Dataset
+row counts equal observation inventory totals; stream summary counts equal candle inventory
+totals. Dataset coverage metadata is required; lineage is allowed on descendants and required
+by the migration/root workflow, which owns the root distinction. Streams own only candle
+objects and the normalized aggregate profile.
+
+For `daily-parquet-v1`, data page row and byte limits are respectively **8,192** and
+**1,048,576**, write batch size is **8,192**, writer version is `PARQUET_1_0`, value encoding
+is `PLAIN`, and statistics are **disabled**. Canonical segments count logical column positions,
+including nulls; each optional segment supplies its matching definition levels and present
+values. Page limits are Parquet's thresholds checked at a write batch boundary, not a hard
+maximum on a single binary value. These fixed settings bound page construction without
+payload min/max statistics or dependence on caller batch sizes. Readers validate schema,
+semantic metadata, profile, ordering and day membership. Equal-time rows retain input order;
+no codec sorts or deduplicates them. Checkpoint bytes and their independent ordinal must
+be present together. Codecs buffer at most the single daily input passed to a call; bounded
+whole-history conversion belongs to the later migration workflow. Unassignable pages return an unresolved error to the
+caller, which must retain the source; codecs perform no source deletion.
+
 ## Data pipeline
 
 The application-owned research pipeline imports selected originals, extends Deriv ticks or Pocket

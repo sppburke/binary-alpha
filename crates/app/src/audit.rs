@@ -179,6 +179,8 @@ pub(crate) fn audit(
     }
     let candles: u64 = streams.iter().map(|summary| summary.rows).sum();
     let stream_manifest = StreamManifest {
+        layout: None,
+        day_inventory: Vec::new(),
         kind: STREAM_MANIFEST_KIND.to_string(),
         schema_version: STREAM_SCHEMA_VERSION,
         generation: generation.clone(),

@@ -37,7 +37,7 @@ const ROW_GROUP_ROWS: usize = 1 << 20;
 const BATCH: usize = 1 << 16;
 
 /// The exact schema every archive file must carry, as the direct reader prints it.
-const BAR_SCHEMA: &str = "message duckdb_schema {
+pub(crate) const BAR_SCHEMA: &str = "message duckdb_schema {
   OPTIONAL BYTE_ARRAY symbol (UTF8);
   OPTIONAL INT32 symbol_id (INT_32);
   OPTIONAL INT64 timestamp_utc (TIMESTAMP(MICROS,true));
@@ -52,7 +52,7 @@ const BAR_SCHEMA: &str = "message duckdb_schema {
 }
 ";
 
-const TICK_SCHEMA: &str = "message binary_alpha_ticks {
+pub(crate) const TICK_SCHEMA: &str = "message binary_alpha_ticks {
   REQUIRED INT64 event_time_micros (TIMESTAMP(MICROS,true));
   REQUIRED INT64 price_units;
 }
@@ -66,7 +66,7 @@ const DAILY_TICK_SCHEMA: &str = "message schema {
 ";
 
 /// The exact schema of one candle object.
-const CANDLE_SCHEMA: &str = "message binary_alpha_candles {
+pub(crate) const CANDLE_SCHEMA: &str = "message binary_alpha_candles {
   REQUIRED INT64 open_time_micros (TIMESTAMP(MICROS,true));
   REQUIRED INT64 close_time_micros (TIMESTAMP(MICROS,true));
   REQUIRED INT64 known_at_micros (TIMESTAMP(MICROS,true));
@@ -590,6 +590,7 @@ pub fn validate_bar_file_with(
                 )
             })?;
             let bar = Bar {
+                provider: (),
                 start_unix_s: unix[row],
                 open: prices[0][row],
                 high: prices[1][row],
@@ -808,7 +809,7 @@ impl CandleWriter {
 
 /// The integer columns of the candle schema in order; optional `gap_before_micros` is written
 /// through its own definition levels.
-fn int_field(candle: &Candle, column: usize) -> i64 {
+pub(crate) fn int_field(candle: &Candle, column: usize) -> i64 {
     match column {
         0 => candle.open_time_micros,
         1 => candle.close_time_micros,
@@ -839,7 +840,7 @@ fn count(value: u64) -> i64 {
     i64::try_from(value).expect("candle counts stay below the column's limit")
 }
 
-fn flag_field(candle: &Candle, column: usize) -> bool {
+pub(crate) fn flag_field(candle: &Candle, column: usize) -> bool {
     let flags = candle.flags;
     match column {
         21 => flags.low_activity,
@@ -860,7 +861,7 @@ fn flag_field(candle: &Candle, column: usize) -> bool {
 
 /// The footer metadata every candle object carries: the instrument, scale, and stream it
 /// belongs to, so a read-back is bound to exactly one stream of one instrument.
-fn candle_metadata(
+pub(crate) fn candle_metadata(
     instrument: &InstrumentId,
     scale: PriceScale,
     duration_seconds: u32,
@@ -1446,6 +1447,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("bars.parquet");
         let bars = [0, 5, 15].map(|start_unix_s| Bar {
+            provider: (),
             start_unix_s,
             open: 1.25,
             high: 1.5,

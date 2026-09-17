@@ -844,6 +844,8 @@ fn publish(
 
     let (first_event_time, last_event_time) = archive::coverage(&summary)?;
     let manifest = GenerationManifest {
+        layout: None,
+        day_inventory: Vec::new(),
         schema_version: MANIFEST_SCHEMA_VERSION,
         generation: generation.clone(),
         broker: dataset.instrument.broker.clone(),
@@ -1195,6 +1197,8 @@ mod tests {
     fn manifest(crc32c: Option<u32>, generation: Option<i64>) -> GenerationManifest {
         let sha256 = "a".repeat(64);
         GenerationManifest {
+            layout: None,
+            day_inventory: Vec::new(),
             schema_version: MANIFEST_SCHEMA_VERSION,
             generation: "g".repeat(64),
             broker: BrokerId::try_from("b".to_string()).unwrap(),
@@ -1291,6 +1295,7 @@ mod tests {
         let local = Store::filesystem(dir.join("retained"));
         let destination = Store::filesystem(dir.join("published"));
         let bars = [0, 5, 15].map(|start_unix_s| Bar {
+            provider: (),
             start_unix_s,
             open: 1.25,
             high: 1.5,

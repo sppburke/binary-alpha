@@ -1440,6 +1440,7 @@ fn expected_bars(seed_end: i64, fetch_start: i64, cutoff: i64) -> Vec<Bar> {
         .map(|start| {
             let [open, high, low, close, volume] = synthetic_bar(start);
             Bar {
+                provider: (),
                 start_unix_s: start,
                 open,
                 high,
