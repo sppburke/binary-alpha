@@ -1953,7 +1953,10 @@ fn pipeline_roundtrip() {
     .unwrap();
     let dataset_uri = field(&restored, "dataset").to_string();
     let verified = run(&["data", "verify", "--manifest", &dataset_uri]).unwrap();
-    assert!(verified.contains(&format!("generation {pocket_first} rows ")), "{verified}");
+    assert!(
+        verified.contains(&format!("generation {pocket_first} rows ")),
+        "{verified}"
+    );
     assert_eq!(
         dataset(&f.scratch.path("elsewhere/consumer/store"), &pocket_first).layout,
         Some(binary_alpha_engine::dataset::Layout::DailyV2)
@@ -2217,9 +2220,19 @@ fn append_log_recovery() {
         .map(|page| page.anchor.as_ref().unwrap().parse::<i64>().unwrap() - POCKET_OFFSET_S)
         .collect();
     assert_eq!(anchors, [cutoff, cutoff - 197, cutoff - 392]);
-    let verified = verify::run(&format!("file://{}", store.join(manifest.key()).display())).unwrap();
-    assert!(verified.contains(&format!("generation {} rows {}", manifest.generation, manifest.row_count)), "{verified}");
-    assert_eq!(manifest.layout, Some(binary_alpha_engine::dataset::Layout::DailyV2));
+    let verified =
+        verify::run(&format!("file://{}", store.join(manifest.key()).display())).unwrap();
+    assert!(
+        verified.contains(&format!(
+            "generation {} rows {}",
+            manifest.generation, manifest.row_count
+        )),
+        "{verified}"
+    );
+    assert_eq!(
+        manifest.layout,
+        Some(binary_alpha_engine::dataset::Layout::DailyV2)
+    );
     assert_eq!(
         bars(&store, &manifest),
         expected_bars(POCKET_SEED_END, POCKET_SEED_END - 60, cutoff)
@@ -2384,14 +2397,28 @@ fn failed_restore_pull(f: &Fixture, catalog_id: &str) {
         fs::read(store.join(&bundled.key)).unwrap(),
         files[&bundle_entry.file_id].bytes
     );
+    // A legacy catalog never wins selection while a daily catalog exists: pull restores the
+    // newest verified daily catalog and never reports the refused, already installed legacy
+    // manifests as local. The refused legacy dataset stays refused.
     let pulled = pipeline(
         "pull",
         &consumer,
         &["--broker", "pocket_option", "--symbol", "AEDCNY_otc"],
     )
-    .unwrap_err();
-    assert_eq!(pulled, refused);
+    .unwrap();
     assert!(!pulled.contains("already local"), "{pulled}");
+    let pulled_dataset = field(&pulled, "dataset");
+    assert!(
+        !pulled_dataset.contains(&catalog.dataset.generation),
+        "{pulled}"
+    );
+    verify::run(pulled_dataset).unwrap();
+    let legacy = verify::run(&format!(
+        "file://{}",
+        store.join(&catalog.dataset.key).display()
+    ))
+    .unwrap_err();
+    assert!(legacy.contains(&expected), "{legacy}");
 }
 
 #[test]
@@ -3152,12 +3179,23 @@ fn pipeline_recovery() {
     assert_ne!(repeated_generation, final_generation);
     let previous = dataset(&store, final_generation);
     let repeated = dataset(&store, repeated_generation);
-    let market_keys = |m: &GenerationManifest| m.objects.iter().filter(|o|o.path.starts_with("observations/"))
-        .map(|o| (&o.path, &o.key)).map(|(p,k)|(p.clone(),k.clone())).collect::<BTreeMap<_,_>>();
+    let market_keys = |m: &GenerationManifest| {
+        m.objects
+            .iter()
+            .filter(|o| o.path.starts_with("observations/"))
+            .map(|o| (&o.path, &o.key))
+            .map(|(p, k)| (p.clone(), k.clone()))
+            .collect::<BTreeMap<_, _>>()
+    };
     assert_eq!(market_keys(&previous), market_keys(&repeated));
     assert_eq!(bars(&store, &previous), bars(&store, &repeated));
-    let count_pages = |m: &GenerationManifest| m.day_inventory.iter()
-        .filter(|d|d.family == binary_alpha_engine::dataset::DayFamily::Pages).map(|d|d.rows).sum::<u64>();
+    let count_pages = |m: &GenerationManifest| {
+        m.day_inventory
+            .iter()
+            .filter(|d| d.family == binary_alpha_engine::dataset::DayFamily::Pages)
+            .map(|d| d.rows)
+            .sum::<u64>()
+    };
     assert!(count_pages(&repeated) > count_pages(&previous));
     assert_eq!(field(job_line(&repeat, "pocket"), "status"), "archived");
     let newest = fs::read_dir(state.join("records"))

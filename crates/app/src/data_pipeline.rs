@@ -746,13 +746,18 @@ pub(crate) fn evidence_records(
                 selected.insert(key.clone());
             }
             if selected.contains(&key) {
-                for name in [&value.intent, &value.acquisition_id, &value.supersedes].into_iter().flatten() {
+                for name in [&value.intent, &value.acquisition_id, &value.supersedes]
+                    .into_iter()
+                    .flatten()
+                {
                     let key = format!("records/{name}");
                     crate::lineage::record_name(&key)?;
                     selected.insert(key);
                 }
                 if let Some(alias) = &value.alias_table {
-                    let name = alias.as_str().or_else(|| alias["record"].as_str())
+                    let name = alias
+                        .as_str()
+                        .or_else(|| alias["record"].as_str())
                         .ok_or("migration alias table record name absent")?;
                     let key = format!("records/{name}");
                     crate::lineage::record_name(&key)?;
