@@ -376,6 +376,7 @@ pub fn pair(scratch: &Scratch, pocket: bool) -> Pair {
         ));
         v2.objects.push(o);
     }
+    write_coverage(scratch, &mut v2);
     // Object listing order is not chronological authority; the inventory is.
     v2.objects.reverse();
     publish(&root, &mut v2);
@@ -476,4 +477,86 @@ pub fn flip_page_payload(source: &Path, target: &Path) {
     }
     group.close().unwrap();
     writer.close().unwrap();
+}
+
+/// Synthetic acquisition claims for fixtures; production never infers proof from inventory.
+pub fn write_coverage(scratch: &Scratch, manifest: &mut GenerationManifest) {
+    use binary_alpha_engine::dataset::coverage::*;
+    let mut acquisitions = Vec::new();
+    let mut days = Vec::new();
+    for day in &mut manifest.day_inventory {
+        let (start, end) = day_bounds(&day.date).unwrap();
+        if day.state == DayState::Unknown {
+            day.unresolved = vec![UnresolvedInterval {
+                start: format_event_time_micros(start),
+                end: format_event_time_micros(end),
+            }];
+        }
+        let unresolved: Vec<_> = day
+            .unresolved
+            .iter()
+            .map(|i| CoverageRange {
+                start: i.start.clone(),
+                end: i.end.clone(),
+            })
+            .collect();
+        let mut verified = Vec::new();
+        let mut cursor = start;
+        for interval in &unresolved {
+            let (from, to) = interval.bounds().unwrap();
+            if cursor < from {
+                verified.push(CoverageRange::new(cursor, from));
+            }
+            cursor = to;
+        }
+        if cursor < end {
+            verified.push(CoverageRange::new(cursor, end));
+        }
+        let id = format!("fixture-{}-{}", day.family, day.date);
+        acquisitions.push(AcquisitionCoverage {
+            acquisition_id: id.clone(),
+            source_identity: "synthetic-day-evidence".into(),
+            requested: vec![CoverageRange::new(start, end)],
+            verified: verified.clone(),
+            shortfalls: unresolved
+                .iter()
+                .map(|range| CoverageShortfall {
+                    reason: day.reason.clone().unwrap(),
+                    unresolved: range.clone(),
+                })
+                .collect(),
+            unresolved: unresolved.clone(),
+        });
+        days.push(DayCoverage {
+            date: day.date.clone(),
+            family: day.family,
+            acquisition_ids: vec![id],
+            basis: "synthetic fixture acquisition claim; no external source".into(),
+            verified,
+            unresolved,
+            reason: day.reason.clone(),
+        });
+    }
+    let coverage = DailyCoverage {
+        schema_version: 2,
+        broker: manifest.broker.clone(),
+        provider_symbol: manifest.provider_symbol.clone(),
+        role: manifest.role,
+        native_granularity: manifest.native_granularity,
+        acquisitions,
+        days,
+    };
+    coverage.check_manifest(manifest).unwrap();
+    let file = scratch.path("typed-coverage.json");
+    fs::write(&file, coverage.to_json()).unwrap();
+    *manifest
+        .objects
+        .iter_mut()
+        .find(|o| o.path == "provenance/coverage.json")
+        .unwrap() = object(
+        &scratch.path("published"),
+        "provenance/coverage.json",
+        ObjectRole::Provenance,
+        &file,
+    );
 }

@@ -402,10 +402,15 @@ struct Dispatch {
     claim_at: Option<i64>,
 }
 
+/// Optional observation of the feature owner's output; never grants mutable engine access.
+pub type FeatureObserver = Box<dyn FnMut(usize, &FeatureOutput)>;
+
 /// All financial mutation stays on the caller's thread. A hook returning true simulates loss.
 pub struct Runtime {
     pub definition: LiveDefinition,
     pub hook: Option<Box<dyn FnMut(Checkpoint) -> bool>>,
+    /// Read-only inspection of causal feature output before execution consumes its rows.
+    pub feature_observer: Option<FeatureObserver>,
     engine: Engine,
     features: Vec<FeatureEngine>,
     journal: Journal,
@@ -690,6 +695,7 @@ impl Runtime {
             hook: None,
             engine,
             features,
+            feature_observer: None,
             journal,
             records,
             control,
@@ -1428,6 +1434,9 @@ impl Runtime {
                         self.failure.get_or_insert(error.to_string());
                     }
                     return Ok(());
+                }
+                if let Some(observer) = &mut self.feature_observer {
+                    observer(instrument, &produced);
                 }
                 let plan = &self.definition.plans[instrument];
                 let bound = &self.definition.definition.instruments[instrument];
