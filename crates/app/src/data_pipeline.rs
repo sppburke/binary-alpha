@@ -136,10 +136,10 @@ impl PipelineConfig {
 }
 
 /// The resolved managed root and its fixed children.
-struct Layout {
-    base: PathBuf,
-    store: PathBuf,
-    state: PathBuf,
+pub(crate) struct Layout {
+    pub(crate) base: PathBuf,
+    pub(crate) store: PathBuf,
+    pub(crate) state: PathBuf,
     registry: OnceLock<Result<crate::registry::Registry, String>>,
 }
 
@@ -230,8 +230,8 @@ fn sha256_hex(bytes: &[u8]) -> String {
 }
 
 /// The one local writer of an archive root: producer commands hold this nonblocking lock for
-/// their whole run; consumer commands never take it.
-fn writer_lock(layout: &Layout) -> Result<File, String> {
+/// their whole run; installing consumers also hold it to exclude retirement.
+pub(crate) fn writer_lock(layout: &Layout) -> Result<File, String> {
     let path = layout.state.join("writer.lock");
     let file = File::create(&path)
         .map_err(|error| format!("cannot create {}: {error}", path.display()))?;
@@ -854,7 +854,7 @@ fn read_manifest(local: &Store, generation: &str) -> Result<(GenerationManifest,
 // ----------------------------------------------------------------------------------------------
 
 /// The declaration a pipeline applies to every read, when it names one.
-fn declaration(config: &PipelineConfig) -> Result<Option<Declaration>, String> {
+pub(crate) fn declaration(config: &PipelineConfig) -> Result<Option<Declaration>, String> {
     config
         .governance_manifest
         .as_deref()
@@ -863,7 +863,7 @@ fn declaration(config: &PipelineConfig) -> Result<Option<Declaration>, String> {
         .map_err(|reason| format!("governance_manifest: {reason}"))
 }
 
-fn load(config_path: &Path) -> Result<(PipelineConfig, Layout, String), String> {
+pub(crate) fn load(config_path: &Path) -> Result<(PipelineConfig, Layout, String), String> {
     let text = fs::read_to_string(config_path)
         .map_err(|error| format!("cannot read {}: {error}", config_path.display()))?;
     let config = PipelineConfig::parse(&text)?;
@@ -940,6 +940,7 @@ fn run_jobs(
         return Err("pipeline: the configuration declares no jobs".into());
     }
     let _lock = writer_lock(layout)?;
+    let _archive_lock = crate::retire::archive_lock(config)?;
     let declaration = declaration(config)?;
     let access = Access {
         declaration: declaration.as_ref(),
@@ -1385,6 +1386,8 @@ pub fn pull(
     out: &mut dyn Write,
 ) -> Result<(), String> {
     let (config, layout, _) = load(config_path)?;
+    let lock = writer_lock(&layout)?;
+    let archive_lock = crate::retire::archive_lock(&config)?;
     let mut drive = Drive::open(&config.drive)?;
     let mut found = catalogs(&mut drive, &layout, broker, symbol)?;
     if found.is_empty() {
@@ -1418,6 +1421,8 @@ pub fn pull(
         return Ok(());
     }
     drop(drive);
+    drop(archive_lock);
+    drop(lock);
     restore(config_path, &file_id, &sha256, broker, symbol, out)
 }
 
@@ -1432,6 +1437,8 @@ pub fn restore(
     out: &mut dyn Write,
 ) -> Result<(), String> {
     let (config, layout, _) = load(config_path)?;
+    let _lock = writer_lock(&layout)?;
+    let _archive_lock = crate::retire::archive_lock(&config)?;
     let declaration = declaration(&config)?;
     let access = Access {
         declaration: declaration.as_ref(),

@@ -134,6 +134,8 @@ fn decimal_text<'de, D: serde::Deserializer<'de>>(
 
 #[derive(Deserialize)]
 struct Listing {
+    #[serde(default, rename = "incompleteSearch")]
+    incomplete_search: bool,
     #[serde(default, rename = "nextPageToken")]
     next_page_token: Option<String>,
     #[serde(default)]
@@ -453,6 +455,25 @@ impl Drive {
         }
     }
 
+    /// Delete one explicitly planned file only while its name still matches its recorded
+    /// content key. Missing files are successful resumptions of a previous deletion.
+    pub fn delete_named(&mut self, id: &str, name: &str) -> Result<(), String> {
+        let Some(file) = self.metadata(id)? else {
+            return Ok(());
+        };
+        if file.name != name {
+            return Err(format!(
+                "drive: refusing to delete {id}: recorded name mismatch"
+            ));
+        }
+        let url = format!("{}/files/{id}", self.api);
+        let reply = self.send(&format!("files.delete {id}"), &|client| client.delete(&url))?;
+        match reply.status {
+            200 | 204 | 404 => Ok(()),
+            _ => Err(reply.error(&format!("files.delete {id}"))),
+        }
+    }
+
     /// Every non-trashed file beneath the root whose name starts with `prefix`, following
     /// pagination to the end.
     pub fn list(&mut self, prefix: &str) -> Result<Vec<RemoteFile>, String> {
@@ -763,7 +784,7 @@ impl Drive {
     }
 
     /// Reads file `id` back completely and returns its identity without keeping the bytes.
-    fn hash(&mut self, id: &str) -> Result<ObjectIdentity, String> {
+    pub(crate) fn hash(&mut self, id: &str) -> Result<ObjectIdentity, String> {
         let mut hasher = Hasher::default();
         self.read(id, 0, &mut hasher)?;
         Ok(hasher.finish())

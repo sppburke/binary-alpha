@@ -552,8 +552,8 @@ dataset and instrument-stream layout documented elsewhere here is **legacy layou
 until verified retirement. An absent manifest `layout` means v1; `layout = "daily-v2"` selects
 this contract. Types, codecs, shared v1/v2 observation readers, v2 audit candle publication,
 v2 verification, the archive-root registry, and daily archive/list/pull/restore are implemented.
-Migration, v2 acquisition/continuation, and retirement belong to separate steps; verification
-here uses fixtures only.
+[Retirement](retirement.md) supports explicit local/Drive plans and resumable application.
+Migration and v2 acquisition/continuation belong to separate steps; verification uses fixtures only.
 
 ### 1. Families
 

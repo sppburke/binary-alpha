@@ -4559,3 +4559,5 @@ mod live_support;
 mod daily_review_fixes;
 #[path = "data_pipeline/registry_archive.rs"]
 mod registry_archive;
+#[path = "data_pipeline/retire.rs"]
+mod retire;
