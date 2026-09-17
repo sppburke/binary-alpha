@@ -1517,6 +1517,172 @@ fn pocket_history_skips_foreign_assets_and_indexes_without_extending_deadline() 
 }
 
 #[test]
+fn pocket_history_reconnects_after_send_and_close_fail() {
+    struct FailingConnector {
+        inner: Box<dyn Connector>,
+        fail: bool,
+    }
+    struct FailingTransport(Box<dyn Transport>);
+    impl Connector for FailingConnector {
+        fn connect(
+            &mut self,
+            url: &str,
+            headers: &[(String, String)],
+        ) -> Result<Box<dyn Transport>, String> {
+            let inner = self.inner.connect(url, headers)?;
+            if std::mem::take(&mut self.fail) {
+                Ok(Box::new(FailingTransport(inner)))
+            } else {
+                Ok(inner)
+            }
+        }
+    }
+    impl Transport for FailingTransport {
+        fn send(&mut self, frame: Frame) -> Result<(), String> {
+            if matches!(&frame, Frame::Text(text) if text.starts_with("42[\"loadHistoryPeriod\"")) {
+                return Err("websocket 127.0.0.1: send failed".into());
+            }
+            self.0.send(frame)
+        }
+        fn receive(&mut self, timeout: i64) -> Result<Option<Frame>, String> {
+            self.0.receive(timeout)
+        }
+        fn close(&mut self) -> Result<(), String> {
+            Err("websocket 127.0.0.1: send failed".into())
+        }
+    }
+    let clock = FakeClock::at(1_789_348_000_000_000);
+    let mut second = handshake();
+    second.extend(attachment("loadHistoryPeriodFast", full_candle_page(0, 10)));
+    let (inner, sent) = pocket_connector(vec![handshake(), second], &clock);
+    let mut adapter = PocketMarketData::connect(
+        &pocket_settings(),
+        &pocket_ids(),
+        Box::new(FailingConnector { inner, fail: true }),
+        Box::new(clock),
+        "{}".into(),
+    )
+    .unwrap();
+    let page = adapter
+        .history_page(
+            &pocket_ids()[0],
+            scale(5),
+            Some(10_000_000),
+            NativeGranularity::Bar { period_seconds: 5 },
+        )
+        .unwrap();
+    assert_candle_page(&adapter, &page, &pocket_ids()[0], 10);
+    assert_eq!(adapter.history_reconnects(), 1);
+    assert_eq!(pocket_sent_events(&sent, "auth").len(), 2);
+    assert_eq!(pocket_sent_events(&sent, "loadHistoryPeriod").len(), 1);
+}
+
+#[test]
+fn pocket_history_reconnects_after_tcp_close_between_pages() {
+    use futures_util::{SinkExt, StreamExt};
+    use tokio_tungstenite::tungstenite::Message;
+
+    let (listener, endpoint) = loopback_listener();
+    let (closed, dropped) = std::sync::mpsc::channel();
+    let server = std::thread::spawn(move || {
+        runtime().block_on(async move {
+            let listener = tokio::net::TcpListener::from_std(listener).unwrap();
+            let mut requests = Vec::new();
+            for anchor in [2000, 1805] {
+                let (socket, _) =
+                    tokio::time::timeout(std::time::Duration::from_secs(5), listener.accept())
+                        .await
+                        .unwrap()
+                        .unwrap();
+                let mut socket = tokio_tungstenite::accept_async(socket).await.unwrap();
+                for frame in handshake() {
+                    socket
+                        .send(match frame {
+                            Frame::Text(text) => Message::Text(text.into()),
+                            Frame::Binary(bytes) => Message::Binary(bytes.into()),
+                            _ => unreachable!(),
+                        })
+                        .await
+                        .unwrap();
+                }
+                loop {
+                    let message = socket.next().await.unwrap().unwrap();
+                    let Message::Text(text) = message else {
+                        continue;
+                    };
+                    let Ok(broker::socket_io::Packet::Event { name, argument }) =
+                        broker::socket_io::decode(&text)
+                    else {
+                        continue;
+                    };
+                    if name != "loadHistoryPeriod" {
+                        continue;
+                    }
+                    let request: serde_json::Value = serde_json::from_slice(&argument).unwrap();
+                    assert_eq!(request["time"], anchor + 7200);
+                    assert_eq!(request["asset"], "EURUSD_otc");
+                    let index = request["index"].as_u64().unwrap();
+                    requests.push(index);
+                    for frame in
+                        attachment("loadHistoryPeriodFast", full_candle_page(index, anchor))
+                    {
+                        socket
+                            .send(match frame {
+                                Frame::Text(text) => Message::Text(text.into()),
+                                Frame::Binary(bytes) => Message::Binary(bytes.into()),
+                                _ => unreachable!(),
+                            })
+                            .await
+                            .unwrap();
+                    }
+                    break;
+                }
+                // Drop TCP directly: neither a Socket.IO 41 nor a WebSocket Close is sent.
+                drop(socket);
+                if anchor == 2000 {
+                    closed.send(()).unwrap();
+                }
+            }
+            requests
+        })
+    });
+    let mut adapter = PocketMarketData::connect(
+        &PocketSettings {
+            endpoint,
+            ..pocket_settings()
+        },
+        &pocket_ids(),
+        Box::new(WebSocketConnector::new().unwrap()),
+        Box::new(FakeClock::at(1_789_348_000_000_000)),
+        "{}".into(),
+    )
+    .unwrap();
+    for anchor in [2000, 1805] {
+        let page = adapter
+            .history_page(
+                &pocket_ids()[0],
+                scale(5),
+                Some(anchor * 1_000_000),
+                NativeGranularity::Bar { period_seconds: 5 },
+            )
+            .unwrap();
+        assert_candle_page(&adapter, &page, &pocket_ids()[0], anchor);
+        if anchor == 2000 {
+            assert_eq!(adapter.history_reconnects(), 0);
+            dropped
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap();
+        }
+    }
+    assert_eq!(adapter.history_reconnects(), 1);
+    let requests = server.join().unwrap();
+    assert!(
+        requests[1] > requests[0] + 1,
+        "the failed request must be resent with a new index: {requests:?}"
+    );
+}
+
+#[test]
 fn pocket_history_stops_after_three_namespace_reconnects_for_one_page() {
     let clock = FakeClock::at(1_789_348_000_000_000);
     let sessions = (0..4)

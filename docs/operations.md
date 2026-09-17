@@ -179,6 +179,8 @@ lock.
 Set `drive.retry_seconds` to the per-request wall-clock budget for transient transport errors,
 HTTP 429, and 5xx (default 900 seconds); retries wait 250 ms initially, doubling to a 30-second
 cap. `drive.max_attempts` still limits 401 token refresh attempts and resumable-session restarts.
+HTTP 403 reasons `userRateLimitExceeded` and `rateLimitExceeded` use that same backoff and
+budget; other 403s fail immediately, with the Drive reason included in the report.
 
 ### Consent and credentials
 
@@ -259,6 +261,8 @@ can have this status, and inherited gaps may remain outside the overlap. `no_dat
 without a catalog and exits successfully. Neither exit 0 nor an archive status establishes
 complete market coverage. Exit 1 means an operation failed or at least one job remained pending
 or had the reported gaps; another job's successful archive remains usable.
+Each job's report, including any failure cause, is written and flushed as soon as it finishes,
+with its lines kept together; the final failure summary still lists all failed jobs.
 
 A consumer host (for example a cloud GPU machine that cloned the repository) pulls the newest
 archived generation of each instrument it needs; the command restores only when the generation is

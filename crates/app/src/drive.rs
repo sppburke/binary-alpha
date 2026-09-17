@@ -153,9 +153,38 @@ struct Reply {
     body: Vec<u8>,
 }
 
+/// Retain the service's diagnostic, without including the full response body.
+fn error_reason(body: &[u8]) -> Option<String> {
+    let body: serde_json::Value = serde_json::from_slice(body).ok()?;
+    body.pointer("/error/errors/0/reason")
+        .and_then(serde_json::Value::as_str)
+        .or_else(|| body.pointer("/error/message")?.as_str())
+        .map(str::to_owned)
+}
+
+fn reason_suffix(reason: Option<&str>) -> String {
+    reason.map_or_else(String::new, |reason| format!(" ({reason})"))
+}
+
+fn transient_status(status: u16, reason: Option<&str>) -> bool {
+    status == 429
+        || (500..=599).contains(&status)
+        || (status == 403 && matches!(reason, Some("userRateLimitExceeded" | "rateLimitExceeded")))
+}
+
+impl Reply {
+    fn error(&self, what: &str) -> String {
+        format!(
+            "drive {what}: status {}{}",
+            self.status,
+            reason_suffix(error_reason(&self.body).as_deref())
+        )
+    }
+}
+
 enum TransientFailure {
     Transport(reqwest::Error),
-    Http(u16),
+    Http(u16, Option<String>),
 }
 
 /// One logical request owns its elapsed-time budget and exponential backoff.
@@ -194,8 +223,11 @@ impl RetryBudget {
                 "drive {what}: transport failure after {attempts} attempts over {elapsed} s: {}",
                 error.without_url()
             ),
-            TransientFailure::Http(status) => {
-                format!("drive {what}: HTTP {status} after {attempts} attempts over {elapsed} s")
+            TransientFailure::Http(status, reason) => {
+                format!(
+                    "drive {what}: HTTP {status} after {attempts} attempts over {elapsed} s{}",
+                    reason_suffix(reason.as_deref())
+                )
             }
         })
     }
@@ -297,7 +329,7 @@ impl Drive {
     }
 
     /// Sends one authenticated request, limiting 401 attempts with `max_attempts` and
-    /// transient transport, 429, and 5xx retries with a separate wall-clock budget.
+    /// transient transport, rate-limit 403, 429, and 5xx retries with a wall-clock budget.
     fn send(
         &mut self,
         what: &str,
@@ -341,8 +373,13 @@ impl Drive {
                     }
                     self.access_token = None;
                 }
-                Ok(reply) if reply.status == 429 || (500..=599).contains(&reply.status) => {
-                    retry.retry(what, TransientFailure::Http(reply.status))?;
+                Ok(reply)
+                    if transient_status(reply.status, error_reason(&reply.body).as_deref()) =>
+                {
+                    retry.retry(
+                        what,
+                        TransientFailure::Http(reply.status, error_reason(&reply.body)),
+                    )?;
                 }
                 Ok(reply) => return Ok(reply),
                 Err(error) => retry.retry(what, TransientFailure::Transport(error))?,
@@ -361,7 +398,7 @@ impl Drive {
             let query = [("count", batch.to_string()), ("space", "drive".into())];
             let reply = self.send("generateIds", &|client| client.get(&url).query(&query))?;
             if reply.status != 200 {
-                return Err(format!("drive generateIds: status {}", reply.status));
+                return Err(reply.error("generateIds"));
             }
             let generated: GeneratedIds = serde_json::from_slice(&reply.body)
                 .map_err(|_| "drive generateIds: malformed response")?;
@@ -400,7 +437,7 @@ impl Drive {
                 .map(Some)
                 .map_err(|_| "drive files.get: malformed response".into()),
             404 => Ok(None),
-            status => Err(format!("drive files.get {id}: status {status}")),
+            _ => Err(reply.error(&format!("files.get {id}"))),
         }
     }
 
@@ -429,7 +466,7 @@ impl Drive {
             }
             let reply = self.send("files.list", &|client| client.get(&url).query(&query))?;
             if reply.status != 200 {
-                return Err(format!("drive files.list: status {}", reply.status));
+                return Err(reply.error("files.list"));
             }
             let listing: Listing = serde_json::from_slice(&reply.body)
                 .map_err(|_| "drive files.list: malformed response")?;
@@ -476,6 +513,7 @@ impl Drive {
                         uri
                     }
                     Resume::Completed(remote) => return self.confirm(id, remote, identity),
+                    Resume::Exists => return self.confirm_existing(id, name, identity),
                     Resume::Expired => {
                         checkpoint(None)?;
                         continue;
@@ -489,10 +527,7 @@ impl Drive {
                     }
                     None => {
                         // The identity was already created: reconcile the existing file.
-                        let remote = self.metadata(id)?.ok_or_else(|| {
-                            format!("drive upload {name}: {id} was created but is unreadable")
-                        })?;
-                        return self.confirm(id, remote, identity);
+                        return self.confirm_existing(id, name, identity);
                     }
                 },
             };
@@ -535,7 +570,7 @@ impl Drive {
                         break Ok(Some(remote));
                     }
                     404 | 410 => break Ok(None),
-                    status => break Err(format!("drive upload {name}: status {status}")),
+                    _ => break Err(reply.error(&format!("upload {name}"))),
                 }
             };
             match outcome? {
@@ -572,11 +607,11 @@ impl Drive {
                 .map(Some)
                 .ok_or("drive upload begin: no session location".into()),
             409 => Ok(None),
-            status => Err(format!("drive upload begin {name}: status {status}")),
+            _ => Err(reply.error(&format!("upload begin {name}"))),
         }
     }
 
-    /// Queries a resumable session: the next byte to send, the completed file, or expiry.
+    /// Queries a resumable session: the next byte, completion, an existing identity, or expiry.
     fn status(&mut self, uri: &str, total: u64) -> Result<Resume, String> {
         let range = format!("bytes */{total}");
         let reply = self.send("upload status", &|client| {
@@ -591,8 +626,23 @@ impl Drive {
                 .map(Resume::Completed)
                 .map_err(|_| "drive upload status: malformed completion".into()),
             404 | 410 => Ok(Resume::Expired),
-            status => Err(format!("drive upload status: status {status}")),
+            409 if error_reason(&reply.body).as_deref() == Some("fileIdInUse") => {
+                Ok(Resume::Exists)
+            }
+            _ => Err(reply.error("upload status")),
         }
+    }
+
+    fn confirm_existing(
+        &mut self,
+        id: &str,
+        name: &str,
+        identity: &ObjectIdentity,
+    ) -> Result<RemoteFile, String> {
+        let remote = self
+            .metadata(id)?
+            .ok_or_else(|| format!("drive upload {name}: {id} was created but is unreadable"))?;
+        self.confirm(id, remote, identity)
     }
 
     /// The remote file is the uploaded bytes: equal size and SHA-256, read back and hashed when
@@ -659,16 +709,23 @@ impl Drive {
                 match (status, offset) {
                     (206, _) | (200, 0) => {}
                     (200, _) => return Err(Failure::RangeIgnored),
-                    (401, _) => return Err(Failure::Unauthorized),
-                    (404, _) => {
-                        return Err(Failure::Fatal(format!("drive files.get {id}: missing")));
-                    }
-                    (429, _) | (500..=599, _) => {
-                        return Err(Failure::Transient(TransientFailure::Http(status)));
-                    }
                     (status, _) => {
+                        let reason = error_reason(&response.bytes().await?);
+                        if status == 401 {
+                            return Err(Failure::Unauthorized(reason));
+                        }
+                        if transient_status(status, reason.as_deref()) {
+                            return Err(Failure::Transient(TransientFailure::Http(status, reason)));
+                        }
+                        if status == 404 {
+                            return Err(Failure::Fatal(format!(
+                                "drive files.get {id}: missing{}",
+                                reason_suffix(reason.as_deref())
+                            )));
+                        }
                         return Err(Failure::Fatal(format!(
-                            "drive files.get {id}: status {status}"
+                            "drive files.get {id}: status {status}{}",
+                            reason_suffix(reason.as_deref())
                         )));
                     }
                 }
@@ -681,12 +738,13 @@ impl Drive {
             });
             match outcome {
                 Ok(written) => return Ok(written),
-                Err(Failure::Unauthorized) => {
+                Err(Failure::Unauthorized(reason)) => {
                     unauthorized += 1;
                     if unauthorized >= self.max_attempts {
                         return Err(format!(
-                            "drive files.get {id}: HTTP 401 after {} attempts",
-                            retry.attempts
+                            "drive files.get {id}: HTTP 401 after {} attempts{}",
+                            retry.attempts,
+                            reason_suffix(reason.as_deref())
                         ));
                     }
                     self.access_token = None;
@@ -765,12 +823,13 @@ impl Drive {
 enum Resume {
     At(u64),
     Completed(RemoteFile),
+    Exists,
     Expired,
 }
 
 enum Failure {
     Transient(TransientFailure),
-    Unauthorized,
+    Unauthorized(Option<String>),
     RangeIgnored,
     Fatal(String),
 }

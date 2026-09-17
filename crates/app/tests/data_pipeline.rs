@@ -97,6 +97,8 @@ struct BrokerFaults {
     conflict_before: Option<i64>,
     /// Close the connection after this many history responses.
     drop_after_pages: Option<usize>,
+    /// Keep an interrupted acquisition pending by rejecting its attempted reconnect.
+    reject_auth_after_drop: bool,
     unrelated_frames: usize,
     wrong_asset: bool,
     wrong_index: bool,
@@ -354,6 +356,9 @@ fn serve_broker(kind: Kind) -> FakeBroker {
                     }
                     continue_send(&mut socket, replies).await;
                     if drop_after {
+                        if faults.reject_auth_after_drop {
+                            faults_.lock().unwrap().reject_auth_once = true;
+                        }
                         let _ = socket.close(None).await;
                         break;
                     }
@@ -400,6 +405,11 @@ fn attachment(name: &str, payload: String) -> Vec<tokio_tungstenite::tungstenite
 struct DriveFaults {
     /// Answer the next N object content uploads with 503; usize::MAX never clears.
     unavailable_uploads: usize,
+    /// Answer the next N object upload/download requests with the given 403 reason.
+    forbidden_uploads: Option<(&'static str, usize)>,
+    forbidden_downloads: Option<(&'static str, usize)>,
+    /// Hold the first upload until another job's report has been flushed.
+    upload_gate: Option<Arc<Mutex<std::sync::mpsc::Receiver<()>>>>,
     /// Drop the next N object media requests before replying; usize::MAX never clears.
     /// When drop_download_at is also armed, first send that partial body.
     drop_download_requests: usize,
@@ -438,6 +448,12 @@ struct DriveState {
     next: usize,
     log: Vec<String>,
     faults: DriveFaults,
+}
+
+fn drive_error(reason: &str) -> Vec<u8> {
+    json!({ "error": { "message": "Synthetic Drive error", "errors": [{ "reason": reason }] } })
+        .to_string()
+        .into_bytes()
 }
 
 #[derive(Default)]
@@ -667,6 +683,28 @@ fn handle_http(
     let media_download = request.method == "GET"
         && request.path.starts_with("/drive/v3/files/")
         && request.query.get("alt").map(String::as_str) == Some("media");
+    if content_upload && let Some(gate) = state.faults.upload_gate.take() {
+        drop(state);
+        gate.lock()
+            .unwrap()
+            .recv_timeout(Duration::from_secs(5))
+            .expect("another job's report must flush before this upload completes");
+        state = shared.lock().unwrap();
+    }
+    let forbidden = if content_upload {
+        &mut state.faults.forbidden_uploads
+    } else if media_download {
+        &mut state.faults.forbidden_downloads
+    } else {
+        &mut None
+    };
+    if let Some((reason, remaining)) = forbidden
+        && *remaining > 0
+    {
+        *remaining -= 1;
+        respond(&mut stream, 403, &[], &drive_error(reason));
+        return;
+    }
     // Immediate transient faults leave the four-second test budget for the 3.75s backoff.
     if content_upload
         && state
@@ -768,14 +806,7 @@ fn handle_http(
                 return;
             };
             if session.completed {
-                let id = session.id.clone();
-                let entry = state.files[&id].clone();
-                respond(
-                    &mut stream,
-                    200,
-                    &[],
-                    &file_json(&id, &entry, faults.omit_sha256),
-                );
+                respond(&mut stream, 409, &[], &drive_error("fileIdInUse"));
                 return;
             }
             if range.starts_with("bytes */") && session.received.len() < session.total {
@@ -2250,6 +2281,175 @@ fn failed_restore_pull(f: &Fixture, catalog_id: &str) {
 }
 
 #[test]
+fn pipeline_flushes_each_job_to_a_non_send_writer() {
+    struct Reports(
+        std::rc::Rc<std::cell::RefCell<Vec<Vec<u8>>>>,
+        Option<std::sync::mpsc::Sender<()>>,
+    );
+    impl Write for Reports {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .borrow_mut()
+                .last_mut()
+                .unwrap()
+                .extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            self.0.borrow_mut().push(Vec::new());
+            if let Some(report_flushed) = self.1.take() {
+                report_flushed.send(()).unwrap();
+            }
+            Ok(())
+        }
+    }
+    let f = fixture("pipeline_streamed_reports");
+    import(&f.scratch.path("deriv-import.toml")).unwrap();
+    let (report_flushed, wait_for_report) = std::sync::mpsc::channel();
+    f.drive.set(DriveFaults {
+        upload_gate: Some(Arc::new(Mutex::new(wait_for_report))),
+        ..Default::default()
+    });
+    fs::write(
+        &f.pipeline,
+        pipeline_toml(
+            &f.scratch.path("producer"),
+            &f.drive.base,
+            &[("first", "missing-first.toml"), ("deriv", "deriv.toml")],
+            None,
+            1,
+        ),
+    )
+    .unwrap();
+    let reports = std::rc::Rc::new(std::cell::RefCell::new(vec![Vec::new()]));
+    let error = data_pipeline::update_with(
+        &f.pipeline,
+        None,
+        &FakeClock::at(DERIV_SEED_END * 1_000_000),
+        &mut Reports(std::rc::Rc::clone(&reports), Some(report_flushed)),
+    )
+    .unwrap_err();
+    assert_eq!(error, "pipeline: 1 job(s) failed: first");
+    let reports = reports.borrow();
+    assert_eq!(reports.len(), 3, "each job must flush independently");
+    assert!(reports[2].is_empty());
+    let first = std::str::from_utf8(&reports[0]).unwrap();
+    let second = std::str::from_utf8(&reports[1]).unwrap();
+    assert!(first.contains("pipeline job first failed: "), "{first}");
+    assert!(!first.contains("pipeline update deriv"), "{first}");
+    assert_eq!(field(job_line(second, "deriv"), "status"), "archived");
+    assert!(!second.contains("pipeline job first"), "{second}");
+}
+
+#[test]
+fn pipeline_drive_forbidden_recovery() {
+    for reason in [
+        "userRateLimitExceeded",
+        "rateLimitExceeded",
+        "storageQuotaExceeded",
+    ] {
+        let f = fixture(&format!("pipeline_drive_{reason}"));
+        import(&f.scratch.path("pocket-import.toml")).unwrap();
+        let config = f.scratch.path("pocket-only.toml");
+        fs::write(
+            &config,
+            pipeline_toml(
+                &f.scratch.path("producer"),
+                &f.drive.base,
+                &[("pocket", "pocket.toml")],
+                None,
+                1,
+            )
+            .replace("parallel_transfers = 3", "parallel_transfers = 1"),
+        )
+        .unwrap();
+        let transient = reason != "storageQuotaExceeded";
+        let count = if transient { 4 } else { 1 };
+        f.drive.set(DriveFaults {
+            forbidden_uploads: Some((reason, count)),
+            ..Default::default()
+        });
+        let end = time_text(POCKET_SEED_END * 1_000_000);
+        let result = pipeline("update", &config, &["--end", &end]);
+        let report = if transient {
+            result.unwrap()
+        } else {
+            let error = result.unwrap_err();
+            assert!(
+                error.contains("status 403 (storageQuotaExceeded)"),
+                "{error}"
+            );
+            assert!(
+                error.contains("pipeline: 1 job(s) failed: pocket"),
+                "{error}"
+            );
+            // One fault would have cleared on retry: failure proves this 403 was final.
+            assert_eq!(
+                f.drive
+                    .log()
+                    .iter()
+                    .filter(|line| line.starts_with("PUT ") && !line.contains("bytes */"))
+                    .count(),
+                1
+            );
+            let transfers = read_json(
+                &f.scratch
+                    .path("producer/pipeline_state/pocket/transfers.json"),
+            );
+            assert!(
+                transfers["files"]
+                    .as_object()
+                    .unwrap()
+                    .values()
+                    .any(|entry| entry["session"].is_string())
+            );
+            f.drive.set(DriveFaults::default());
+            pipeline("update", &config, &["--end", &end]).unwrap()
+        };
+        assert_eq!(field(job_line(&report, "pocket"), "status"), "archived");
+        if transient {
+            assert_eq!(
+                f.drive.state.lock().unwrap().faults.forbidden_uploads,
+                Some((reason, 0))
+            );
+        }
+
+        // Downloads share the classification and never write an error body into the file.
+        let (id, entry) = f
+            .drive
+            .files()
+            .into_iter()
+            .max_by_key(|(_, entry)| entry.bytes.len())
+            .unwrap();
+        let mut hasher = binary_alpha_app::store::Hasher::default();
+        hasher.write_all(&entry.bytes).unwrap();
+        let expected = hasher.finish();
+        let settings: data_pipeline::PipelineConfig =
+            toml::from_str(&fs::read_to_string(&config).unwrap()).unwrap();
+        let mut drive = binary_alpha_app::drive::Drive::open(&settings.drive).unwrap();
+        let partial = f.scratch.path("download.partial");
+        f.drive.set(DriveFaults {
+            forbidden_downloads: Some((reason, if transient { 2 } else { 1 })),
+            ..Default::default()
+        });
+        let result = drive.download(&id, &partial, &expected);
+        if transient {
+            result.unwrap();
+        } else {
+            let error = result.unwrap_err();
+            assert!(
+                error.contains("status 403 (storageQuotaExceeded)"),
+                "{error}"
+            );
+            assert!(fs::read(&partial).unwrap().is_empty());
+            f.drive.set(DriveFaults::default());
+            drive.download(&id, &partial, &expected).unwrap();
+        }
+        assert_eq!(fs::read(partial).unwrap(), entry.bytes);
+    }
+}
+
+#[test]
 fn pipeline_recovery() {
     append_log_recovery();
     let f = fixture("pipeline_recovery");
@@ -2508,7 +2708,7 @@ fn pipeline_recovery() {
 
     // Expired session, missing remote checksum, unrelated same-name file, and completion whose
     // reply was lost: with retries allowed again, a fresh archive of a new generation survives
-    // each once within one run.
+    // each once; the lost completion is reconciled by session status on the next run.
     let cutoff_2 = cutoff + 300;
     let end_2 = time_text(cutoff_2 * 1_000_000);
     fs::write(
@@ -2544,6 +2744,11 @@ fn pipeline_recovery() {
         ..Default::default()
     });
     let log_before = f.drive.log().len();
+    let lost_reply = pipeline("update", &pocket_only, &["--end", &end_2]).unwrap_err();
+    assert!(
+        lost_reply.contains("status 409 (fileIdInUse)"),
+        "{lost_reply}"
+    );
     let recovered = pipeline("update", &pocket_only, &["--end", &end_2]).unwrap();
     let generation_2 = field(job_line(&recovered, "pocket"), "dataset").to_string();
     assert_ne!(generation_2, *final_generation);
@@ -2623,13 +2828,14 @@ fn pipeline_recovery() {
         );
     }
 
-    // Transport drop after one retained page: the run fails, the page and its request receipt
+    // Transport drop after one retained page and rejected reconnect: the run fails, the page and its request receipt
     // stay durable, and the resumed run (through one token refresh) closes at the same cutoff
     // carrying that receipt.
     let cutoff_3 = cutoff_2 + 150;
     let end_3 = time_text(cutoff_3 * 1_000_000);
     f.pocket.set(BrokerFaults {
         drop_after_pages: Some(1),
+        reject_auth_after_drop: true,
         ..Default::default()
     });
     let dropped = pipeline("update", &pocket_only, &["--end", &end_3]).unwrap_err();

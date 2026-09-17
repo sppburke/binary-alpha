@@ -60,6 +60,7 @@ struct Event {
 }
 enum ReceiveError {
     Disconnected,
+    Transport(String),
     Other(String),
 }
 impl From<String> for ReceiveError {
@@ -76,7 +77,7 @@ impl From<ReceiveError> for String {
     fn from(error: ReceiveError) -> Self {
         match error {
             ReceiveError::Disconnected => "socket.io: the server disconnected the namespace (an `origin` setting is usually required)".into(),
-            ReceiveError::Other(error) => error,
+            ReceiveError::Transport(error) | ReceiveError::Other(error) => error,
         }
     }
 }
@@ -225,11 +226,12 @@ impl PocketMarketData {
         broker.handshake()?;
         Ok(broker)
     }
-    fn send<T: Serialize>(&mut self, name: &str, argument: &T) -> Result<(), String> {
+    fn send<T: Serialize>(&mut self, name: &str, argument: &T) -> Result<(), ReceiveError> {
         let argument = serde_json::to_string(argument)
             .map_err(|_| "pocket_option: request serialization failed")?;
         self.transport
             .send(Frame::Text(socket_io::encode_event(name, &argument)))
+            .map_err(ReceiveError::Transport)
     }
     fn receive(&mut self, timeout_micros: i64) -> Result<Option<Event>, ReceiveError> {
         let deadline = self
@@ -239,21 +241,26 @@ impl PocketMarketData {
         loop {
             let Some(frame) = self
                 .transport
-                .receive(deadline.saturating_sub(self.clock.now_micros()).max(0))?
+                .receive(deadline.saturating_sub(self.clock.now_micros()).max(0))
+                .map_err(ReceiveError::Transport)?
             else {
                 return Ok(None);
             };
             let receipt_micros = self.clock.now_micros();
             match frame {
-                Frame::Ping(bytes) => self.transport.send(Frame::Pong(bytes))?,
+                Frame::Ping(bytes) => self
+                    .transport
+                    .send(Frame::Pong(bytes))
+                    .map_err(ReceiveError::Transport)?,
                 Frame::Pong(_) => (),
                 Frame::Close => {
                     return Err(if self.pending.is_some() {
-                        "pocket_option: close with incomplete binary attachment"
+                        ReceiveError::Other(
+                            "pocket_option: close with incomplete binary attachment".into(),
+                        )
                     } else {
-                        "pocket_option: connection closed"
-                    }
-                    .into());
+                        ReceiveError::Transport("pocket_option: connection closed".into())
+                    });
                 }
                 Frame::Binary(raw) => {
                     let name = self
@@ -268,7 +275,10 @@ impl PocketMarketData {
                 }
                 Frame::Text(text) => match socket_io::decode(&text)? {
                     Packet::Disconnected => return Err(ReceiveError::Disconnected),
-                    Packet::Ping => self.transport.send(Frame::Text(socket_io::PONG.into()))?,
+                    Packet::Ping => self
+                        .transport
+                        .send(Frame::Text(socket_io::PONG.into()))
+                        .map_err(ReceiveError::Transport)?,
                     Packet::BinaryHeader { name } => {
                         if self.pending.is_some() {
                             return Err("pocket_option: overlapping binary event headers".into());
@@ -453,7 +463,7 @@ impl PocketMarketData {
         symbol: &str,
         before: i64,
         period: u8,
-    ) -> Result<u64, String> {
+    ) -> Result<u64, ReceiveError> {
         let time = provider_token(before, self.settings.server_offset_minutes)?;
         let index = self.next_index;
         self.next_index = index
@@ -471,7 +481,12 @@ impl PocketMarketData {
         )?;
         Ok(index)
     }
-    fn prefetch_candles(&mut self, symbol: &str, before: i64, period: u8) -> Result<(), String> {
+    fn prefetch_candles(
+        &mut self,
+        symbol: &str,
+        before: i64,
+        period: u8,
+    ) -> Result<(), ReceiveError> {
         let limit = usize::from(self.settings.history_pages_in_flight.unwrap_or(8));
         if limit == 0 {
             return Err("history_pages_in_flight must be positive".into());
@@ -663,7 +678,7 @@ impl PocketMarketData {
     pub fn foreign_history_responses(&self) -> u64 {
         self.foreign_history_responses
     }
-    /// Reconnect attempts triggered by namespace disconnects while waiting for history.
+    /// Reconnect attempts triggered by namespace disconnects or transport failures in history.
     pub fn history_reconnects(&self) -> u64 {
         self.history_reconnects
     }
@@ -785,20 +800,33 @@ impl MarketDataBroker for PocketMarketData {
             }
         };
         let mut reconnects = 0;
+        let skipped_before = self.foreign_history_responses;
         loop {
             match self.request_history_page(symbol, before_micros, period) {
                 Ok(page) => return Ok(page),
-                Err(ReceiveError::Disconnected) => {
+                Err(error @ (ReceiveError::Disconnected | ReceiveError::Transport(_))) => {
                     if reconnects >= 3 || self.history_reconnects >= 20 {
-                        return Err(
-                            "pocket_option: the server keeps disconnecting the namespace".into(),
-                        );
+                        let reason = match error {
+                            ReceiveError::Transport(error) => format!(
+                                "pocket_option: history transport reconnect limit reached; {error}"
+                            ),
+                            _ => {
+                                "pocket_option: the server keeps disconnecting the namespace".into()
+                            }
+                        };
+                        return Err(if self.foreign_history_responses > skipped_before {
+                            format!(
+                                "pocket_option: no matching history response after asset or index mismatch; {reason}"
+                            )
+                        } else {
+                            reason
+                        });
                     }
                     reconnects += 1;
                     self.history_reconnects += 1;
                     // Re-authentication failures, including connect-time namespace disconnects,
                     // retain their original diagnostic and are not history retries.
-                    self.reconnect()?;
+                    self.reconnect_transport(matches!(error, ReceiveError::Transport(_)))?;
                 }
                 Err(error) => return Err(error.into()),
             }
@@ -891,7 +919,20 @@ impl MarketDataBroker for PocketMarketData {
         Ok(Cancellation::SentWithoutAcknowledgement)
     }
     fn reconnect(&mut self) -> Result<(), String> {
-        self.transport.close()?;
+        self.reconnect_transport(false)
+    }
+    fn continuity(&self) -> &Continuity {
+        &self.continuity
+    }
+}
+
+impl PocketMarketData {
+    fn reconnect_transport(&mut self, failed_transport: bool) -> Result<(), String> {
+        let closed = self.transport.close();
+        // A failed history transport may already be closed; discard it even if Close fails.
+        if !failed_transport {
+            closed?;
+        }
         let headers = self
             .settings
             .origin
@@ -918,9 +959,6 @@ impl MarketDataBroker for PocketMarketData {
             reason: "explicit reconnect; subscriptions and causal warm-up must be rebuilt".into(),
         });
         Ok(())
-    }
-    fn continuity(&self) -> &Continuity {
-        &self.continuity
     }
 }
 

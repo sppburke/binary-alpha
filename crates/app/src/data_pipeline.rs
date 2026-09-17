@@ -965,49 +965,55 @@ fn run_jobs(
         config
             .jobs
             .iter()
+            .enumerate()
             .collect::<std::collections::VecDeque<_>>(),
     );
-    let report = std::sync::Mutex::new((Vec::<u8>::new(), Vec::<usize>::new()));
-    let one = |job: &Job| -> Result<String, String> {
+    let (reports, finished) = std::sync::mpsc::channel();
+    let one = |job: &Job| {
         let mut lines = Vec::new();
         let result = Drive::open(&config.drive).and_then(|mut drive| {
             bind(job, layout).and_then(|bound| run(job, bound, &mut drive, access, &mut lines))
         });
-        let mut report = report
-            .lock()
-            .map_err(|_| "pipeline: report lock poisoned")?;
-        report.0.extend_from_slice(&lines);
         match &result {
-            Ok(line) => writeln!(report.0, "{line}").map_err(|error| error.to_string())?,
+            Ok(line) => writeln!(lines, "{line}").expect("writing to a Vec cannot fail"),
             Err(reason) => {
-                writeln!(report.0, "pipeline job {} failed: {reason}", job.id)
-                    .map_err(|error| error.to_string())?;
-                let index = config.jobs.iter().position(|known| known.id == job.id);
-                report.1.extend(index);
+                writeln!(lines, "pipeline job {} failed: {reason}", job.id)
+                    .expect("writing to a Vec cannot fail");
             }
         }
-        result
+        (lines, result.is_err())
     };
-    std::thread::scope(|scope| {
+    let mut failed = std::thread::scope(|scope| {
         for _ in 0..workers {
-            scope.spawn(|| {
+            let reports = reports.clone();
+            let queue = &queue;
+            let one = &one;
+            scope.spawn(move || {
                 loop {
                     let job = match queue.lock() {
                         Ok(mut queue) => queue.pop_front(),
                         Err(_) => None,
                     };
-                    let Some(job) = job else { break };
-                    let _ = one(job);
+                    let Some((index, job)) = job else { break };
+                    let (lines, failed) = one(job);
+                    if reports.send((index, lines, failed)).is_err() {
+                        break;
+                    }
                 }
             });
         }
-    });
-    let (bytes, mut failed) = report
-        .into_inner()
-        .map_err(|_| "pipeline: report lock poisoned")?;
-    out.write_all(&bytes)
-        .and_then(|()| out.flush())
-        .map_err(|error| format!("cannot write the report: {error}"))?;
+        drop(reports);
+        let mut failed = Vec::new();
+        for (index, lines, job_failed) in finished {
+            out.write_all(&lines)
+                .and_then(|()| out.flush())
+                .map_err(|error| format!("cannot write the report: {error}"))?;
+            if job_failed {
+                failed.push(index);
+            }
+        }
+        Ok::<_, String>(failed)
+    })?;
     failed.sort_unstable();
     if failed.is_empty() {
         Ok(())
