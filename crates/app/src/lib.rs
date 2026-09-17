@@ -11,6 +11,7 @@ pub mod parallel;
 pub mod portfolio;
 pub mod replay;
 pub mod research;
+pub mod retire;
 pub mod search;
 pub mod store;
 pub mod verify;

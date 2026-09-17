@@ -551,8 +551,9 @@ their instrument streams. Derived research artifacts retain their own formats. T
 dataset and instrument-stream layout documented elsewhere here is **legacy layout v1**, readable
 until verified retirement. An absent manifest `layout` means v1; `layout = "daily-v2"` selects
 this contract. Types, codecs, shared v1/v2 observation readers, v2 audit candle publication,
-and v2 verification are implemented. Migration, v2 acquisition/continuation, archive registry,
-and retirement belong to later steps; this reader/writer step is verified with fixtures only.
+and v2 verification are implemented. [Retirement](retirement.md) supports explicit local/Drive
+plans and resumable application, verified with fixtures only. Migration, v2
+acquisition/continuation, and the archive registry belong to separate steps.
 
 ### 1. Families
 

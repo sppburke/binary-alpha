@@ -262,6 +262,17 @@ enum DataCommand {
 
 #[derive(Subcommand)]
 enum PipelineCommand {
+    /// Plan unreachable local and Drive data retirement, or resume one immutable plan.
+    Retire {
+        #[arg(long)]
+        config: PathBuf,
+        #[arg(long)]
+        job: Option<String>,
+        #[arg(long, conflicts_with = "apply")]
+        plan: bool,
+        #[arg(long)]
+        apply: Option<PathBuf>,
+    },
     /// Extend every job's imported generation from its frontier to one pinned cutoff within
     /// its budget, then audit, verify, and archive the result.
     Update {
@@ -358,6 +369,17 @@ fn main() -> ExitCode {
         Command::Data {
             command: DataCommand::Pipeline { command },
         } => match command {
+            PipelineCommand::Retire {
+                config,
+                job,
+                plan: _,
+                apply,
+            } => binary_alpha_app::retire::run(
+                &config,
+                job.as_deref(),
+                apply.as_deref(),
+                &mut std::io::stdout().lock(),
+            ),
             PipelineCommand::Update { config, end } => {
                 data_pipeline::update(&config, end.as_deref(), &mut std::io::stdout().lock())
             }

@@ -134,6 +134,8 @@ fn decimal_text<'de, D: serde::Deserializer<'de>>(
 
 #[derive(Deserialize)]
 struct Listing {
+    #[serde(default, rename = "incompleteSearch")]
+    incomplete_search: bool,
     #[serde(default, rename = "nextPageToken")]
     next_page_token: Option<String>,
     #[serde(default)]
@@ -451,6 +453,25 @@ impl Drive {
         }
     }
 
+    /// Delete one explicitly planned file only while its name still matches its recorded
+    /// content key. Missing files are successful resumptions of a previous deletion.
+    pub fn delete_named(&mut self, id: &str, name: &str) -> Result<(), String> {
+        let Some(file) = self.metadata(id)? else {
+            return Ok(());
+        };
+        if file.name != name {
+            return Err(format!(
+                "drive: refusing to delete {id}: recorded name mismatch"
+            ));
+        }
+        let url = format!("{}/files/{id}", self.api);
+        let reply = self.send(&format!("files.delete {id}"), &|client| client.delete(&url))?;
+        match reply.status {
+            200 | 204 | 404 => Ok(()),
+            _ => Err(reply.error(&format!("files.delete {id}"))),
+        }
+    }
+
     /// Every non-trashed file beneath the root whose name starts with `prefix`, following
     /// pagination to the end.
     pub fn list(&mut self, prefix: &str) -> Result<Vec<RemoteFile>, String> {
@@ -462,12 +483,14 @@ impl Drive {
         );
         let mut files = Vec::new();
         let mut page_token: Option<String> = None;
+        let mut seen_tokens = std::collections::BTreeSet::new();
         loop {
             let mut query = vec![
                 ("q".to_string(), filter.clone()),
                 (
                     "fields".to_string(),
-                    "nextPageToken,files(id,name,size,sha256Checksum,trashed)".to_string(),
+                    "incompleteSearch,nextPageToken,files(id,name,size,sha256Checksum,trashed)"
+                        .to_string(),
                 ),
                 ("pageSize".to_string(), "1000".to_string()),
             ];
@@ -480,6 +503,11 @@ impl Drive {
             }
             let listing: Listing = serde_json::from_slice(&reply.body)
                 .map_err(|_| "drive files.list: malformed response")?;
+            if listing.incomplete_search {
+                return Err(
+                    "drive files.list: incomplete search cannot establish reachability".into(),
+                );
+            }
             files.extend(
                 listing
                     .files
@@ -487,7 +515,12 @@ impl Drive {
                     .filter(|file| file.name.starts_with(prefix)),
             );
             match listing.next_page_token {
-                Some(token) => page_token = Some(token),
+                Some(token) => {
+                    if !seen_tokens.insert(token.clone()) {
+                        return Err("drive files.list: repeated page token".into());
+                    }
+                    page_token = Some(token);
+                }
                 None => return Ok(files),
             }
         }
@@ -710,7 +743,7 @@ impl Drive {
     }
 
     /// Reads file `id` back completely and returns its identity without keeping the bytes.
-    fn hash(&mut self, id: &str) -> Result<ObjectIdentity, String> {
+    pub(crate) fn hash(&mut self, id: &str) -> Result<ObjectIdentity, String> {
         let mut hasher = Hasher::default();
         self.read(id, 0, &mut hasher)?;
         Ok(hasher.finish())
