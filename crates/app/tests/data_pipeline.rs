@@ -4545,6 +4545,16 @@ mod fixture_config;
 #[path = "phase12_live_runtime/support.rs"]
 mod live_support;
 
+fn migration_table_rows(path: &Path) -> Vec<parquet::record::Row> {
+    use parquet::file::reader::{FileReader, SerializedFileReader};
+    SerializedFileReader::new(File::open(path).unwrap())
+        .unwrap()
+        .get_row_iter(None)
+        .unwrap()
+        .map(Result::unwrap)
+        .collect()
+}
+
 /// Lossless offline continuation from real import/update entry points and synthetic transports.
 #[test]
 fn pipeline_migration_lossless_resume_and_tamper() {
@@ -4623,6 +4633,8 @@ fn pipeline_migration_lossless_resume_and_tamper() {
     fs::write(import_root.join("checkpoint.ndjson"), &cp_bytes).unwrap();
     import(&f.scratch.path("deriv-import.toml")).unwrap();
     import(&f.scratch.path("pocket-import.toml")).unwrap();
+    // Capture the actual v1 outputs before migration for independent sequence oracles.
+    let mut source_outputs = BTreeMap::new();
     // Run each existing pipeline job under its own cutoff.
     for (job, end) in [
         ("pocket", midnight + 40),
@@ -4641,7 +4653,15 @@ fn pipeline_migration_lossless_resume_and_tamper() {
             ),
         )
         .unwrap();
-        pipeline("update", &path, &["--end", &time_text(end * 1_000_000)]).unwrap();
+        let report = pipeline("update", &path, &["--end", &time_text(end * 1_000_000)]).unwrap();
+        let line = job_line(&report, job);
+        source_outputs.insert(
+            job,
+            (
+                field(line, "dataset").to_string(),
+                field(line, "stream").to_string(),
+            ),
+        );
     }
     let before_generations = binary_alpha_app::store::Store::filesystem(&store)
         .list_manifests()
@@ -4786,9 +4806,6 @@ fn pipeline_migration_lossless_resume_and_tamper() {
         );
         assert_eq!(state["phase"], "verified");
         let record = read_json(&records.join(state["record"].as_str().unwrap()));
-        assert_eq!(record["proofs"]["observations"]["equal"], true);
-        assert_eq!(record["proofs"]["pages"]["equal"], true);
-        assert_eq!(record["proofs"]["candles"]["equal"], true);
         all_recorded.extend(
             record["v1_generations"]
                 .as_array()
@@ -4797,6 +4814,119 @@ fn pipeline_migration_lossless_resume_and_tamper() {
                 .map(|v| v.as_str().unwrap().to_string()),
         );
         let manifest = dataset(&store, state["dataset"].as_str().unwrap());
+        let (source_dataset, source_stream) = &source_outputs[job];
+        let before = dataset(&store, source_dataset);
+        // Decode full rows directly: this includes every Pocket provider column and repeated ticks.
+        let observations = |m: &GenerationManifest| {
+            let mut objects: Vec<_> = m
+                .objects
+                .iter()
+                .filter(|o| {
+                    o.path.starts_with("normalized/") || o.path.starts_with("observations/")
+                })
+                .collect();
+            objects.sort_by_key(|o| &o.path);
+            objects
+                .into_iter()
+                .flat_map(|o| migration_table_rows(&store.join(&o.key)))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            observations(&manifest),
+            observations(&before),
+            "{job}: observation sequence"
+        );
+        let before_stream = stream(&store, source_stream);
+        let after_stream = stream(&store, state["stream"].as_str().unwrap());
+        assert_eq!(before_stream.streams, after_stream.streams);
+        for spec in &before_stream.streams {
+            let prefix = format!(
+                "candles/{}s_{}s",
+                spec.duration_seconds, spec.offset_seconds
+            );
+            let rows = |m: &StreamManifest| {
+                let mut objects: Vec<_> = m
+                    .objects
+                    .iter()
+                    .filter(|o| {
+                        o.path == format!("{prefix}.parquet")
+                            || o.path.starts_with(&format!("{prefix}/"))
+                    })
+                    .collect();
+                objects.sort_by_key(|o| &o.path);
+                objects
+                    .into_iter()
+                    .flat_map(|o| migration_table_rows(&store.join(&o.key)))
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(
+                rows(&after_stream),
+                rows(&before_stream),
+                "{job}: candle sequence"
+            );
+        }
+        let pages: Vec<_> = manifest
+            .day_inventory
+            .iter()
+            .filter(|d| d.family == DayFamily::Pages)
+            .flat_map(|d| {
+                daily::read_pages(&store.join(d.object.as_ref().unwrap()), &d.date).unwrap()
+            })
+            .collect();
+        // Source receipts establish occurrence multiplicity; aliases and reported proof flags
+        // cannot certify their own completeness. Replay copies contribute the maximum per intent.
+        let mut expected = BTreeMap::new();
+        for entry in fs::read_dir(&records).unwrap() {
+            let path = entry.unwrap().path();
+            if !path
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .contains("-receipt-")
+            {
+                continue;
+            }
+            let receipt = read_json(&path);
+            if receipt["coverage"]["provider_symbol"] != before.provider_symbol.as_str() {
+                continue;
+            }
+            let mut invocation = BTreeMap::<String, usize>::new();
+            for request in receipt["requests"].as_array().unwrap() {
+                let raw = fs::read(store.join(binary_alpha_engine::dataset::object_key(
+                    request["sha256"].as_str().unwrap(),
+                )))
+                .unwrap();
+                let key = json!([
+                    receipt["intent"],
+                    request["anchor"],
+                    request["receipt_time"],
+                    request["rows"],
+                    raw
+                ])
+                .to_string();
+                *invocation.entry(key).or_default() += 1;
+            }
+            for (key, count) in invocation {
+                let total = expected.entry(key).or_insert(0);
+                *total = (*total).max(count);
+            }
+        }
+        let mut actual = BTreeMap::new();
+        for page in pages
+            .iter()
+            .filter(|p| p.order_kind == PageOrderKind::RequestOrder)
+        {
+            let key = json!([
+                page.intent,
+                page.request_token,
+                page.receipt_time_utc.map(time_text),
+                page.rows,
+                page.payload
+            ])
+            .to_string();
+            *actual.entry(key).or_insert(0) += 1;
+        }
+        assert_eq!(actual, expected, "{job}: request bytes and multiplicity");
         verify::run(&format!("file://{}", store.join(manifest.key()).display())).unwrap();
         verify::run(&format!(
             "file://{}",
@@ -4856,11 +4986,25 @@ fn pipeline_migration_lossless_resume_and_tamper() {
                         && d.date == "2025-08-11"
                         && d.state == DayState::Unknown)
             );
+            let cutoff = manifest
+                .day_inventory
+                .iter()
+                .find(|d| d.family == DayFamily::Observations && d.date == "2025-08-12")
+                .unwrap();
+            assert_eq!(cutoff.state, DayState::Partial);
             assert!(
-                manifest
-                    .day_inventory
-                    .iter()
-                    .any(|d| d.family == DayFamily::Observations && d.state == DayState::Partial)
+                cutoff
+                    .reason
+                    .as_deref()
+                    .unwrap()
+                    .contains("cutoff day may receive later input")
+            );
+            assert_eq!(
+                cutoff.unresolved,
+                vec![binary_alpha_engine::dataset::daily::UnresolvedInterval {
+                    start: time_text((DERIV_SEED_END + 300) * 1_000_000),
+                    end: time_text((DAY2 + 86_400) * 1_000_000),
+                }]
             );
         } else {
             let head = manifest
@@ -4912,6 +5056,71 @@ fn pipeline_migration_lossless_resume_and_tamper() {
                 .filter(|p| p.order_kind == PageOrderKind::SourceFileOrder)
                 .collect();
             imported.sort_by_key(|p| p.ordinal);
+            let aliases: Vec<Value> =
+                fs::read_to_string(records.join(state["aliases"].as_str().unwrap()))
+                    .unwrap()
+                    .lines()
+                    .map(|line| serde_json::from_str(line).unwrap())
+                    .collect();
+            let reconstruct = |checkpoint: bool| {
+                let mut ordered = imported.clone();
+                ordered.sort_by_key(|p| {
+                    if checkpoint {
+                        p.checkpoint_ordinal.unwrap()
+                    } else {
+                        p.ordinal
+                    }
+                });
+                let mut bytes = Vec::new();
+                for (ordinal, page) in ordered.into_iter().enumerate() {
+                    assert_eq!(
+                        if checkpoint {
+                            page.checkpoint_ordinal.unwrap()
+                        } else {
+                            page.ordinal
+                        },
+                        ordinal as u64
+                    );
+                    let alias = aliases
+                        .iter()
+                        .find(|a| {
+                            a["acquisition_id"] == page.acquisition_id
+                                && a["ordinal"] == page.ordinal
+                        })
+                        .unwrap();
+                    let (source, suffix, chunk) = if checkpoint {
+                        (
+                            &alias["checkpoint"],
+                            &alias["checkpoint_suffix"],
+                            page.checkpoint.as_deref().unwrap(),
+                        )
+                    } else {
+                        (
+                            &alias["source"],
+                            &alias["raw_suffix"],
+                            page.payload.as_slice(),
+                        )
+                    };
+                    assert_eq!(
+                        source["offset"].as_u64().unwrap(),
+                        bytes.len() as u64,
+                        "source offsets must reconstruct contiguous bytes"
+                    );
+                    bytes.extend_from_slice(chunk);
+                    bytes.extend(serde_json::from_value::<Vec<u8>>(suffix.clone()).unwrap());
+                }
+                bytes
+            };
+            assert_eq!(
+                reconstruct(false),
+                raw_bytes.as_bytes(),
+                "raw source bytes including recorded framing"
+            );
+            assert_eq!(
+                reconstruct(true),
+                cp_bytes.as_bytes(),
+                "checkpoint source bytes including recorded framing"
+            );
             assert_eq!(imported.len(), 3);
             assert_eq!(imported[0].checkpoint_ordinal, Some(1));
             assert_eq!(imported[1].checkpoint_ordinal, Some(0));
@@ -5046,11 +5255,24 @@ fn pipeline_migration_import_only_and_writer_lock() {
 
 #[test]
 fn pipeline_migration_carried_legacy_occurrences() {
+    migration_carried_legacy_occurrences(false);
+}
+
+#[test]
+fn pipeline_migration_legacy_requests_with_retained_anchor() {
+    migration_carried_legacy_occurrences(true);
+}
+
+fn migration_carried_legacy_occurrences(retain_anchor: bool) {
     use binary_alpha_app::daily::{self, ReceiptState};
     use binary_alpha_engine::dataset::daily::DayFamily;
     use binary_alpha_engine::dataset::{PriceRepresentation, generation_id, object_key};
     use binary_alpha_engine::market::InstrumentId;
-    let f = fixture("migration_carried_legacy");
+    let f = fixture(if retain_anchor {
+        "migration_legacy_with_anchor"
+    } else {
+        "migration_carried_legacy"
+    });
     import(&f.scratch.path("deriv-import.toml")).unwrap();
     let config = f.scratch.path("legacy-only.toml");
     fs::write(
@@ -5090,7 +5312,9 @@ fn pipeline_migration_carried_legacy_occurrences() {
     legacy.path = single.path.clone();
     legacy.offset = None;
     legacy.receipt_time = None;
-    legacy.anchor = None;
+    if !retain_anchor {
+        legacy.anchor = None;
+    }
     original.objects.push(single);
     // Two original requests can have identical bytes and absent receipt metadata. Both
     // occurrences are carried in order into a later generation and must remain exactly two.
@@ -5142,13 +5366,26 @@ fn pipeline_migration_carried_legacy_occurrences() {
         .filter(|d| d.family == DayFamily::Pages)
         .flat_map(|d| daily::read_pages(&store.join(d.object.as_ref().unwrap()), &d.date).unwrap())
         .collect();
+    let raw = fs::read(store.join(object_key(&hash))).unwrap();
+    let expected = (
+        raw,
+        ReceiptState::AbsentInLegacyRecord,
+        None,
+        cov.pages[0].anchor.clone(),
+    );
     assert_eq!(
         pages
             .iter()
             .filter(|p| p.payload_sha256 == hash
                 && p.receipt_state == ReceiptState::AbsentInLegacyRecord)
-            .count(),
-        2
+            .map(|p| (
+                p.payload.clone(),
+                p.receipt_state,
+                p.receipt_time_utc,
+                p.request_token.clone()
+            ))
+            .collect::<Vec<_>>(),
+        vec![expected.clone(), expected]
     );
     let aliases: Vec<Value> = fs::read_to_string(
         f.scratch
@@ -5159,6 +5396,7 @@ fn pipeline_migration_carried_legacy_occurrences() {
     .lines()
     .map(|line| serde_json::from_str(line).unwrap())
     .collect();
+    let mut legacy_targets = Vec::new();
     for ordinal in [0, 1] {
         let targets: Vec<_> = generations
             .iter()
@@ -5174,6 +5412,35 @@ fn pipeline_migration_carried_legacy_occurrences() {
             targets[0], targets[1],
             "carried prefix keeps occurrence identity"
         );
+        let row = pages
+            .iter()
+            .find(|p| json!(p.acquisition_id) == targets[0].0 && json!(p.ordinal) == targets[0].1)
+            .unwrap();
+        assert_eq!(
+            row.payload,
+            fs::read(store.join(object_key(&hash))).unwrap()
+        );
+        assert_eq!(row.receipt_state, ReceiptState::AbsentInLegacyRecord);
+        assert_eq!(row.receipt_time_utc, None);
+        assert_eq!(
+            row.request_token,
+            if retain_anchor {
+                cov.pages[0].anchor.clone()
+            } else {
+                None
+            }
+        );
+        legacy_targets.push(targets[0].clone());
+    }
+    assert_ne!(
+        legacy_targets[0], legacy_targets[1],
+        "distinct legacy requests retain multiplicity"
+    );
+    for row in pages
+        .iter()
+        .filter(|p| p.payload_sha256 == hash && p.receipt_state == ReceiptState::Recorded)
+    {
+        assert!(!legacy_targets.contains(&(json!(row.acquisition_id), json!(row.ordinal))));
     }
     assert!(
         pages
@@ -5239,4 +5506,374 @@ fn pipeline_migration_pending_receipt_is_diagnostic() {
     assert_eq!(pages[0].disposition, PageDisposition::Diagnostic);
     assert!(pages[0].acquisition_id.contains("-receipt-"));
     assert!(pages[0].intent.is_some());
+}
+
+#[test]
+fn pipeline_migration_checkpoint_only_import_is_unresolved() {
+    let f = fixture("review_checkpoint_only");
+    let root = f.scratch.path("sources/pocket/AEDCNY_otc");
+    fs::remove_file(root.join("raw_pages.ndjson")).unwrap();
+    fs::write(root.join("checkpoint.ndjson"), json!({"payload_sha256":"0".repeat(64),"target_server_s":POCKET_START+7200,"rows":1,"recovered_from_raw":true}).to_string()+"\n").unwrap();
+    import(&f.scratch.path("pocket-import.toml")).unwrap();
+    let result = pipeline("migrate", &f.pipeline, &["--job", "pocket"]);
+    let error = result.expect_err("checkpoint entry must not disappear");
+    assert!(
+        error.contains("checkpoint.ndjson has no raw_pages.ndjson"),
+        "{error}"
+    );
+    assert!(
+        !f.scratch
+            .path("producer/pipeline_state/pocket/migration.json")
+            .exists()
+    );
+}
+
+fn migration_publish_v1(store: &Path, manifest: &mut GenerationManifest) {
+    use binary_alpha_engine::dataset::{PriceRepresentation, generation_id};
+    use binary_alpha_engine::market::InstrumentId;
+    manifest.generation = generation_id(
+        &InstrumentId {
+            broker: manifest.broker.clone(),
+            provider_symbol: manifest.provider_symbol.clone(),
+        },
+        manifest.source_kind,
+        manifest.role,
+        match manifest.price_representation {
+            PriceRepresentation::IntegerUnits { scale } => Some(scale),
+            _ => None,
+        },
+        &manifest.objects,
+    );
+    GenerationManifest::from_json(&manifest.to_json()).unwrap();
+    let path = store.join(manifest.key());
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    fs::write(path, manifest.to_json()).unwrap();
+}
+
+#[test]
+fn pipeline_migration_coverage_bounds_must_match_payload() {
+    for rows_mismatch in [false, true] {
+        migration_coverage_payload_mismatch(rows_mismatch);
+    }
+}
+
+fn migration_coverage_payload_mismatch(rows_mismatch: bool) {
+    use binary_alpha_engine::dataset::object_key;
+    let f = fixture("review_coverage_day");
+    import(&f.scratch.path("deriv-import.toml")).unwrap();
+    let config = f.scratch.path("only.toml");
+    fs::write(
+        &config,
+        pipeline_toml(
+            &f.scratch.path("producer"),
+            &f.drive.base,
+            &[("deriv", "deriv.toml")],
+            None,
+            2,
+        ),
+    )
+    .unwrap();
+    let report = pipeline(
+        "update",
+        &config,
+        &["--end", &time_text((DERIV_SEED_END + 200) * 1_000_000)],
+    )
+    .unwrap();
+    let store = f.scratch.path("producer/store");
+    let mut m = dataset(&store, field(job_line(&report, "deriv"), "dataset"));
+    let mut c = coverage(&store, &m);
+    let old_generation = m.generation.clone();
+    // Old legacy coverage can be internally self-consistent while disagreeing with provider bytes.
+    for p in &mut c.pages {
+        p.receipt_time = None;
+        if rows_mismatch {
+            p.rows += 1;
+        } else {
+            for t in [&mut p.first, &mut p.last].into_iter().flatten() {
+                *t = time_text(
+                    binary_alpha_engine::market::parse_event_time_micros(t).unwrap()
+                        + 86_400_000_000,
+                );
+            }
+        }
+    }
+    let bytes = serde_json::to_vec(&c).unwrap();
+    let o = m
+        .objects
+        .iter_mut()
+        .find(|o| o.path == "provenance/coverage.json")
+        .unwrap();
+    o.sha256 = binary_alpha_engine::hex(&Sha256::digest(&bytes));
+    o.bytes = bytes.len() as u64;
+    o.key = object_key(&o.sha256);
+    o.crc32c = None;
+    o.generation = None;
+    fs::write(store.join(&o.key), bytes).unwrap();
+    // Remove modern receipt/stream evidence to model a legacy-only generation.
+    let local = binary_alpha_app::store::Store::filesystem(&store);
+    for g in local.list_manifests().unwrap() {
+        let path = store.join(binary_alpha_engine::dataset::manifest_key(&g));
+        let v = read_json(&path);
+        if v["kind"] == "instrument_stream" || g == old_generation {
+            fs::remove_file(path).unwrap();
+        }
+    }
+    for entry in fs::read_dir(f.scratch.path("producer/pipeline_state/records")).unwrap() {
+        let p = entry.unwrap().path();
+        if p.file_name()
+            .unwrap()
+            .to_string_lossy()
+            .contains("-receipt-")
+        {
+            fs::remove_file(p).unwrap();
+        }
+    }
+    migration_publish_v1(&store, &mut m);
+    let error = pipeline("migrate", &config, &[])
+        .expect_err("provider bounds must be validated before partitioning");
+    assert!(
+        error.contains("coverage:") && error.contains("payload rows/event bounds mismatch"),
+        "{error}"
+    );
+    assert!(
+        !f.scratch
+            .path("producer/pipeline_state/deriv/migration.json")
+            .exists()
+    );
+}
+
+#[test]
+fn pipeline_migration_receipt_without_coverage_preserves_request() {
+    for case in [
+        "bound",
+        "unbound",
+        "ambiguous",
+        "conflicting",
+        "unrelated",
+        "late",
+    ] {
+        migration_receipt_without_coverage(case);
+    }
+}
+
+fn migration_receipt_without_coverage(case: &str) {
+    let f = fixture("review_receipt_no_coverage");
+    import(&f.scratch.path("deriv-import.toml")).unwrap();
+    let config = f.scratch.path("only.toml");
+    fs::write(
+        &config,
+        pipeline_toml(
+            &f.scratch.path("producer"),
+            &f.drive.base,
+            &[("deriv", "deriv.toml")],
+            None,
+            2,
+        ),
+    )
+    .unwrap();
+    pipeline(
+        "update",
+        &config,
+        &["--end", &time_text((DERIV_SEED_END + 200) * 1_000_000)],
+    )
+    .unwrap();
+    let records = f.scratch.path("producer/pipeline_state/records");
+    let receipt_path = fs::read_dir(&records)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .find(|p| {
+            p.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("deriv-receipt-")
+        })
+        .unwrap();
+    let mut v = read_json(&receipt_path);
+    let mut req = v["requests"][0].clone();
+    let received =
+        binary_alpha_engine::market::parse_event_time_micros(req["receipt_time"].as_str().unwrap())
+            .unwrap();
+    req["receipt_time"] = json!(time_text(received + 1_000_000));
+    v["requests"] = json!([req.clone()]);
+    v["coverage"] = Value::Null;
+    v["dataset_generation"] = Value::Null;
+    v["stream_generation"] = Value::Null;
+    v["catalog"] = Value::Null;
+    v["status"] = json!("no_data");
+    let name = "deriv-receipt-without-coverage.json";
+    if matches!(case, "unbound" | "ambiguous" | "conflicting" | "unrelated") {
+        let mut intent = read_json(&records.join(v["intent"].as_str().unwrap()));
+        match case {
+            "unbound" => intent["seeds"] = json!([]),
+            "conflicting" => intent["seeds"][0]["source_identity"] = json!("another-context"),
+            "ambiguous" => {
+                let mut other = intent["seeds"][0].clone();
+                other["provider_symbol"] = json!("OTHER");
+                intent["seeds"].as_array_mut().unwrap().push(other);
+            }
+            "unrelated" => intent["seeds"][0]["provider_symbol"] = json!("OTHER"),
+            _ => unreachable!(),
+        }
+        let name = "fixture-null-coverage-intent.json";
+        fs::write(records.join(name), intent.to_string()).unwrap();
+        v["intent"] = json!(name);
+    }
+    if case == "late" {
+        let stopped = data_pipeline::migrate_with(
+            &config,
+            Some("deriv"),
+            &mut |_| Err("stop after converted".into()),
+            &mut Vec::new(),
+        )
+        .unwrap_err();
+        assert_eq!(stopped, "stop after converted");
+    }
+    fs::write(records.join(name), v.to_string()).unwrap();
+    let result = pipeline("migrate", &config, &[]);
+    if matches!(case, "unbound" | "ambiguous" | "conflicting" | "late") {
+        let error = result.expect_err("unaccounted receipt must prevent verified");
+        let expected = if case == "late" {
+            "missing source alias receipt:deriv-receipt-without-coverage.json/0"
+        } else if case == "unbound" {
+            "intent has no source binding"
+        } else if case == "conflicting" {
+            "receipt source identity mismatch"
+        } else {
+            "intent binds multiple sources"
+        };
+        assert!(error.contains(expected), "{case}: {error}");
+        return;
+    }
+    result.unwrap();
+    let state = read_json(
+        &f.scratch
+            .path("producer/pipeline_state/deriv/migration.json"),
+    );
+    let aliases = fs::read_to_string(records.join(state["aliases"].as_str().unwrap())).unwrap();
+    let alias = aliases
+        .lines()
+        .map(|s| serde_json::from_str::<Value>(s).unwrap())
+        .find(|v| v["label"] == format!("receipt:{name}/0"));
+    if case == "unrelated" {
+        assert!(
+            alias.is_none(),
+            "another instrument's request must not enter this migration"
+        );
+        return;
+    }
+    let alias = alias.expect("receipt with null coverage must retain its request");
+    let store = f.scratch.path("producer/store");
+    let m = dataset(&store, state["dataset"].as_str().unwrap());
+    let pages: Vec<_> = m
+        .day_inventory
+        .iter()
+        .filter(|d| d.family == binary_alpha_engine::dataset::daily::DayFamily::Pages)
+        .flat_map(|d| {
+            binary_alpha_app::daily::read_pages(&store.join(d.object.as_ref().unwrap()), &d.date)
+                .unwrap()
+        })
+        .collect();
+    let row = pages
+        .iter()
+        .find(|p| {
+            json!(p.acquisition_id) == alias["acquisition_id"]
+                && json!(p.ordinal) == alias["ordinal"]
+        })
+        .unwrap();
+    assert_eq!(
+        row.payload,
+        fs::read(store.join(binary_alpha_engine::dataset::object_key(
+            req["sha256"].as_str().unwrap()
+        )))
+        .unwrap()
+    );
+    assert_eq!(row.receipt_time_utc, Some(received + 1_000_000));
+    assert_eq!(row.intent.as_deref(), v["intent"].as_str());
+    assert_eq!(json!(row.request_token), req["anchor"]);
+    assert_eq!(json!(row.rows), req["rows"]);
+}
+
+#[test]
+fn pipeline_migration_pending_bounds_must_match_payload() {
+    for rows_mismatch in [false, true] {
+        let f = fixture("migration_pending_bounds");
+        import(&f.scratch.path("deriv-import.toml")).unwrap();
+        let core = deriv_core(&f.deriv.url, 60, 1, 60);
+        fs::write(f.scratch.path("deriv.toml"), &core).unwrap();
+        write_evidence(&f.scratch, "deriv", &core);
+        let config = f.scratch.path("pending-only.toml");
+        fs::write(
+            &config,
+            pipeline_toml(
+                &f.scratch.path("producer"),
+                &f.drive.base,
+                &[("deriv", "deriv.toml")],
+                None,
+                2,
+            ),
+        )
+        .unwrap();
+        let error = pipeline(
+            "update",
+            &config,
+            &["--end", &time_text((DERIV_SEED_END + 1000) * 1_000_000)],
+        )
+        .unwrap_err();
+        assert!(error.contains("status pending"), "{error}");
+        // Retain only the pending evidence, so a modern receipt cannot supply the bounds.
+        let records = f.scratch.path("producer/pipeline_state/records");
+        for entry in fs::read_dir(&records).unwrap() {
+            let path = entry.unwrap().path();
+            if path
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .contains("-receipt-")
+            {
+                fs::remove_file(path).unwrap();
+            }
+        }
+        let log = f
+            .scratch
+            .path("producer/pipeline_state/deriv/progress.pages.jsonl");
+        let original = fs::read_to_string(&log).unwrap();
+        let mut pages: Vec<Value> = original
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        for page in &mut pages {
+            page["receipt_time"] = Value::Null;
+            if rows_mismatch {
+                page["rows"] = json!(page["rows"].as_u64().unwrap() + 1);
+            } else {
+                for key in ["first", "last"] {
+                    page[key] = json!(time_text(
+                        binary_alpha_engine::market::parse_event_time_micros(
+                            page[key].as_str().unwrap()
+                        )
+                        .unwrap()
+                            + 86_400_000_000
+                    ));
+                }
+            }
+        }
+        let bytes = pages.iter().map(|p| format!("{p}\n")).collect::<String>();
+        fs::write(&log, &bytes).unwrap();
+        let error = pipeline("migrate", &config, &[])
+            .expect_err("pending payload metadata must be validated before partitioning");
+        assert!(
+            error.contains("pending:") && error.contains("payload rows/event bounds mismatch"),
+            "{error}"
+        );
+        assert_eq!(
+            fs::read_to_string(log).unwrap(),
+            bytes,
+            "unresolved pending evidence is retained"
+        );
+        assert!(
+            !f.scratch
+                .path("producer/pipeline_state/deriv/migration.json")
+                .exists()
+        );
+    }
 }

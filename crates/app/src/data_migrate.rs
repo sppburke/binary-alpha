@@ -441,12 +441,27 @@ impl Spool<'_> {
         diagnostic: bool,
     ) -> Result<(), String> {
         let p = &indexed.page;
+        let (rows, first, last) =
+            payload_bounds(&slice(self.layout, &indexed.source)?, self.offset_s)?;
+        let first = first.as_deref().map(time).transpose()?;
+        let last = last.as_deref().map(time).transpose()?;
+        if (rows, first, last)
+            != (
+                p.rows,
+                p.first.as_deref().map(time).transpose()?,
+                p.last.as_deref().map(time).transpose()?,
+            )
+        {
+            return Err(format!(
+                "{}: payload rows/event bounds mismatch",
+                indexed.label
+            ));
+        }
         let fingerprint = sha256_hex(&json_bytes(&(
             p.anchor.as_ref(),
             &p.sha256,
             p.receipt_time.as_ref(),
         ))?);
-        let weak = sha256_hex(&json_bytes(&(p.anchor.as_ref(), &p.sha256))?);
         let mut pending_match = None;
         if indexed.label.starts_with("pending:") && p.receipt_time.is_some() {
             let matches = entries(&self.work.join("requests-exact").join(&fingerprint))?;
@@ -485,19 +500,12 @@ impl Spool<'_> {
                 indexed.request_occurrence.unwrap_or(ordinal),
                 &fingerprint,
             ))?)
+        } else if p.receipt_time.is_none() {
+            // Equal anchor/payload alone is not evidence of the same request. Preserve the
+            // ordered legacy prefix or bundle slice identity, including carried occurrences.
+            sha256_hex(indexed.legacy_identity.as_bytes())
         } else {
-            let folder = self
-                .work
-                .join(if p.receipt_time.is_some() {
-                    "requests-exact"
-                } else {
-                    "requests-legacy"
-                })
-                .join(if p.receipt_time.is_some() {
-                    &fingerprint
-                } else {
-                    &weak
-                });
+            let folder = self.work.join("requests-exact").join(&fingerprint);
             let candidates = entries(&folder)?;
             if candidates.len() > 1 {
                 return Err(format!(
@@ -529,8 +537,8 @@ impl Spool<'_> {
             } else {
                 ReceiptState::AbsentInLegacyRecord
             },
-            first_event_time: p.first.as_deref().map(time).transpose()?,
-            last_event_time: p.last.as_deref().map(time).transpose()?,
+            first_event_time: first,
+            last_event_time: last,
             rows: p.rows,
             checkpoint: None,
             disposition: if diagnostic {
@@ -554,11 +562,9 @@ impl Spool<'_> {
             Some(identity.clone()),
         )?;
         if has_intent {
-            for (kind, key) in [("requests-exact", fingerprint), ("requests-legacy", weak)] {
-                let dir = self.work.join(kind).join(key);
-                mkdir(&dir)?;
-                save(&dir.join(&identity), &identity)?;
-            }
+            let dir = self.work.join("requests-exact").join(fingerprint);
+            mkdir(&dir)?;
+            save(&dir.join(&identity), &identity)?;
         }
         Ok(())
     }
@@ -739,6 +745,55 @@ fn index_coverage(
     }
     Ok(coverage)
 }
+// Null coverage is normal for requests that produced no dataset. The immutable intent
+// still binds those requests to a source; a filename or job name is not ownership evidence.
+fn receipt_matches(
+    layout: &Layout,
+    header: &Value,
+    source: &GenerationManifest,
+    identity: &str,
+    has_requests: bool,
+) -> Result<bool, String> {
+    if let Some(cov) = header.get("coverage").filter(|v| !v.is_null()) {
+        if cov["broker"] != source.broker.as_str()
+            || cov["provider_symbol"] != source.provider_symbol.as_str()
+        {
+            return Ok(false);
+        }
+        if cov["source_identity"] != identity {
+            return Err("receipt source identity mismatch".into());
+        }
+        return Ok(true);
+    }
+    let Some(intent) = header["intent"].as_str() else {
+        return if has_requests {
+            Err("unresolved receipt ownership: missing intent".into())
+        } else {
+            Ok(false)
+        };
+    };
+    let intent: Intent = get(&layout.state.join("records").join(intent))
+        .map_err(|e| format!("unresolved receipt ownership: {e}"))?;
+    if intent.seeds.is_empty() {
+        return if has_requests {
+            Err("unresolved receipt ownership: intent has no source binding".into())
+        } else {
+            Ok(false)
+        };
+    }
+    if intent.seeds.iter().any(|seed| {
+        seed.provider_symbol == source.provider_symbol && seed.source_identity != identity
+    }) {
+        return Err("unresolved receipt source identity mismatch".into());
+    }
+    let matches = intent.seeds.iter().any(|seed| {
+        seed.provider_symbol == source.provider_symbol && seed.source_identity == identity
+    });
+    if matches && intent.seeds.len() != 1 && has_requests {
+        return Err("unresolved receipt ownership: intent binds multiple sources".into());
+    }
+    Ok(matches)
+}
 fn add_receipts(
     spool: &mut Spool<'_>,
     sources: &Sources,
@@ -762,20 +817,16 @@ fn add_receipts(
         receipts.push((count, path));
     }
     receipts.sort();
-    for (_, path) in receipts {
+    for (count, path) in receipts {
         let name = path.file_name().unwrap().to_string_lossy().to_string();
         if !name.contains("-receipt-") || !name.ends_with(".json") {
             continue;
         }
         let header = document(&path, &mut |_, _| Ok(()))?;
-        let cov = &header["coverage"];
-        if cov["broker"] != first.broker.as_str()
-            || cov["provider_symbol"] != first.provider_symbol.as_str()
+        if !receipt_matches(spool.layout, &header, first, identity, count != 0)
+            .map_err(|e| format!("{name}: {e}"))?
         {
             continue;
-        }
-        if cov["source_identity"] != identity {
-            return Err(format!("{name}: receipt source identity mismatch"));
         }
         let record_id = store::identify(&path)?;
         records.push(json!({"name":name,"sha256":record_id.sha256,"bytes":record_id.bytes,"kind":"operation_receipt"}));
@@ -860,18 +911,28 @@ fn next_count(dir: &Path, hash: &str) -> Result<u64, String> {
     save(&path, &(count + 1))?;
     Ok(count)
 }
+fn import_pair(m: &GenerationManifest) -> Result<Option<(&ObjectRecord, &ObjectRecord)>, String> {
+    match (
+        m.objects.iter().find(|o| o.path == "raw_pages.ndjson"),
+        m.objects.iter().find(|o| o.path == "checkpoint.ndjson"),
+    ) {
+        (None, None) => Ok(None),
+        (Some(raw), Some(checkpoint)) => Ok(Some((raw, checkpoint))),
+        (Some(_), None) => {
+            Err("raw_pages.ndjson has no checkpoint.ndjson; unresolved import".into())
+        }
+        (None, Some(_)) => {
+            Err("checkpoint.ndjson has no raw_pages.ndjson; unresolved import".into())
+        }
+    }
+}
 fn add_import(
     spool: &mut Spool<'_>,
     m: &GenerationManifest,
 ) -> Result<Option<ImportFiles>, String> {
-    let Some(raw) = m.objects.iter().find(|o| o.path == "raw_pages.ndjson") else {
+    let Some((raw, checkpoint)) = import_pair(m)? else {
         return Ok(None);
     };
-    let checkpoint = m
-        .objects
-        .iter()
-        .find(|o| o.path == "checkpoint.ndjson")
-        .ok_or("raw_pages.ndjson has no checkpoint.ndjson")?;
     let raw_path = object_path(spool.layout, raw)?;
     let checkpoint_path = object_path(spool.layout, checkpoint)?;
     let recorded_offset = import_offset(spool.layout, m)?;
@@ -1720,6 +1781,7 @@ fn verify_migration(
     state: &State,
     access: Access<'_>,
     work: &Path,
+    offset_s: i64,
 ) -> Result<Value, String> {
     let local = layout.store();
     for generation in &state.generations {
@@ -1845,7 +1907,7 @@ fn verify_migration(
             if marker.exists() {
                 return Err("checkpoint ordinal mapped more than once".into());
             }
-            File::create(marker).map_err(err)?;
+            save(&marker, &key)?;
             for (name, at, data, suffix) in [
                 (
                     "raw",
@@ -1903,7 +1965,7 @@ fn verify_migration(
                 .push(json!({"path":object.path,"sha256":id.sha256,"bytes":id.bytes,"equal":true}));
         }
     }
-    let source_census = census(layout, state, &proof, &lineage)?;
+    let source_census = census(layout, state, &proof, &lineage, offset_s)?;
     let stream = read_stream(layout, &state.stream)?;
     let candles = if let Some(old_stream) = &state.old_stream {
         let before = read_stream(layout, old_stream)?;
@@ -2012,7 +2074,7 @@ fn migrate_job_with(
         state
     };
     after_converted(&job.id)?;
-    let proofs = verify_migration(layout, &state, access, &work)?;
+    let proofs = verify_migration(layout, &state, access, &work, offset_seconds(bound))?;
     let record = publish(
         &layout.records(),
         &format!("{}-migration", job.id),
@@ -2104,9 +2166,46 @@ fn import_offset(layout: &Layout, m: &GenerationManifest) -> Result<i64, String>
     found.ok_or("import lacks recorded server offset; current broker configuration is not historical evidence".into())
 }
 
+fn check_history_occurrence(
+    label: &str,
+    p: &fetch::PageCoverage,
+    row: &PageOccurrence,
+    offset_s: i64,
+) -> Result<(), String> {
+    // Resume must validate retained payloads even if an earlier converter recorded bad bounds.
+    let (rows, first, last) = payload_bounds(&row.payload, offset_s)?;
+    if (
+        rows,
+        first.as_deref().map(time).transpose()?,
+        last.as_deref().map(time).transpose()?,
+    ) != (row.rows, row.first_event_time, row.last_event_time)
+    {
+        return Err(format!("{label}: payload rows/event bounds mismatch"));
+    }
+    if row.payload_sha256 != p.sha256
+        || row.payload.len() as u64 != p.bytes
+        || row.rows != p.rows
+        || row.request_token != p.anchor
+        || row.first_event_time != p.first.as_deref().map(time).transpose()?
+        || row.last_event_time != p.last.as_deref().map(time).transpose()?
+        || row.receipt_time_utc != p.receipt_time.as_deref().map(receipt_time).transpose()?
+    {
+        return Err(format!(
+            "{label}: occurrence metadata equality proof failed"
+        ));
+    }
+    Ok(())
+}
+
 // Independent source-side census. The generated alias table cannot certify its own
 // completeness: every original index and receipt is traversed again and must have a target.
-fn census(layout: &Layout, state: &State, proof: &Path, lineage: &Value) -> Result<Value, String> {
+fn census(
+    layout: &Layout,
+    state: &State,
+    proof: &Path,
+    lineage: &Value,
+    offset_s: i64,
+) -> Result<Value, String> {
     let local = layout.store();
     let newest = read_manifest(&local, &state.newest)?.0;
     let require = |label: &str| -> Result<PageOccurrence, String> {
@@ -2118,24 +2217,7 @@ fn census(layout: &Layout, state: &State, proof: &Path, lineage: &Value) -> Resu
         ))?)))
     };
     let check = |label: &str, p: &fetch::PageCoverage| -> Result<(), String> {
-        let row = require(label)?;
-        if row.payload_sha256 != p.sha256
-            || row.payload.len() as u64 != p.bytes
-            || row.rows != p.rows
-            || row.request_token != p.anchor
-            || row.first_event_time != p.first.as_deref().map(time).transpose()?
-            || row.last_event_time != p.last.as_deref().map(time).transpose()?
-            || p.receipt_time
-                .as_deref()
-                .map(receipt_time)
-                .transpose()?
-                .is_some_and(|t| row.receipt_time_utc != Some(t))
-        {
-            return Err(format!(
-                "{label}: occurrence metadata equality proof failed"
-            ));
-        }
-        Ok(())
+        check_history_occurrence(label, p, &require(label)?, offset_s)
     };
     for binding in lineage["manifests"]
         .as_array()
@@ -2150,6 +2232,7 @@ fn census(layout: &Layout, state: &State, proof: &Path, lineage: &Value) -> Resu
         }
     }
     let (mut pages, mut requests, mut singles, mut pending) = (0u64, 0u64, 0u64, 0u64);
+    let (mut raw_lines, mut checkpoint_lines) = (0u64, 0u64);
     for generation in local.list_manifests()? {
         let bytes = fs::read(layout.store.join(manifest_key(&generation))).map_err(err)?;
         if let Some(kind) = verify::manifest_kind(&bytes)? {
@@ -2178,14 +2261,62 @@ fn census(layout: &Layout, state: &State, proof: &Path, lineage: &Value) -> Resu
                 "new v1 generation {generation} appeared after converted; migration snapshot is unresolved"
             ));
         }
+        if let Some((raw, checkpoint)) = import_pair(&m)? {
+            if !state.imports.iter().any(|i| {
+                i.acquisition_id == raw.sha256
+                    && i.raw.bytes == raw.bytes
+                    && i.checkpoint.sha256 == checkpoint.sha256
+                    && i.checkpoint.bytes == checkpoint.bytes
+            }) {
+                return Err(format!(
+                    "{generation}: import files missing from migration census"
+                ));
+            }
+            raw_lines += lines(&object_path(layout, raw)?, |ordinal, _, bytes, _| {
+                let key = sha256_hex(&json_bytes(&(&raw.sha256, ordinal))?);
+                let row: PageOccurrence = get(&proof.join(key))?;
+                if row.payload != bytes {
+                    return Err(format!(
+                        "{generation}: raw line {ordinal} equality proof failed"
+                    ));
+                }
+                Ok(())
+            })?;
+            checkpoint_lines +=
+                lines(&object_path(layout, checkpoint)?, |ordinal, _, bytes, _| {
+                    let key: String =
+                        get(&proof.join(format!("checkpoint-{}-{ordinal}", raw.sha256)))?;
+                    let row: PageOccurrence = get(&proof.join(key))?;
+                    let cp: Value = serde_json::from_slice(&bytes).map_err(err)?;
+                    if row.checkpoint_ordinal != Some(ordinal)
+                        || row.checkpoint.as_ref() != Some(&bytes)
+                        || cp["payload_sha256"] != row.payload_sha256
+                    {
+                        return Err(format!(
+                            "{generation}: checkpoint line {ordinal} equality proof failed"
+                        ));
+                    }
+                    Ok(())
+                })?;
+        }
         for o in &m.objects {
             if o.path == fetch::COVERAGE_PATH {
                 let path = object_path(layout, o)?;
                 let mut ordinal = 0;
+                let mut legacy_targets = std::collections::BTreeSet::new();
                 document(&path, &mut |kind, value| {
                     if kind == "pages" {
                         let p: fetch::PageCoverage = serde_json::from_value(value).map_err(err)?;
-                        check(&format!("coverage:{generation}/{ordinal}"), &p)?;
+                        let label = format!("coverage:{generation}/{ordinal}");
+                        check(&label, &p)?;
+                        if p.receipt_time.is_none() {
+                            let row = require(&label)?;
+                            if !legacy_targets.insert((row.acquisition_id, row.ordinal)) {
+                                return Err(format!(
+                                    "{label}: distinct legacy requests share an occurrence"
+                                ));
+                            }
+                        }
                         ordinal += 1;
                         pages += 1;
                     }
@@ -2206,9 +2337,23 @@ fn census(layout: &Layout, state: &State, proof: &Path, lineage: &Value) -> Resu
         if !name.contains("-receipt-") || !name.ends_with(".json") {
             continue;
         }
-        let header = document(&path, &mut |_, _| Ok(()))?;
-        if header["coverage"]["broker"] != newest.broker.as_str()
-            || header["coverage"]["provider_symbol"] != newest.provider_symbol.as_str()
+        let mut count = 0;
+        let header = document(&path, &mut |kind, _| {
+            if kind == "requests" {
+                count += 1;
+            }
+            Ok(())
+        })?;
+        if !receipt_matches(
+            layout,
+            &header,
+            &newest,
+            lineage["source_identity"]
+                .as_str()
+                .ok_or("lineage source identity")?,
+            count != 0,
+        )
+        .map_err(|e| format!("{name}: {e}"))?
         {
             continue;
         }
@@ -2285,6 +2430,88 @@ fn census(layout: &Layout, state: &State, proof: &Path, lineage: &Value) -> Resu
         json_lines::<Value>(&dir.join("progress.pages.jsonl"), accept)?;
     }
     Ok(
-        json!({"coverage_entries":pages,"receipt_requests":requests,"single_objects":singles,"pending_pages":pending,"all_mapped_once":true}),
+        json!({"coverage_entries":pages,"receipt_requests":requests,"single_objects":singles,"pending_pages":pending,"raw_lines":raw_lines,"checkpoint_lines":checkpoint_lines,"all_mapped_once":true}),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn converted_page() -> (fetch::PageCoverage, PageOccurrence) {
+        let payload = br#"{"history":{"times":[1754956800,1754956802]}}"#.to_vec();
+        let (rows, first, last) = payload_bounds(&payload, 0).unwrap();
+        let coverage = fetch::PageCoverage {
+            path: "raw/fixture.json".into(),
+            offset: None,
+            sha256: sha256_hex(&payload),
+            bytes: payload.len() as u64,
+            anchor: Some("1754956810".into()),
+            rows,
+            first,
+            last,
+            receipt_time: None,
+        };
+        let row = PageOccurrence {
+            acquisition_id: "legacy-coverage-fixture".into(),
+            intent: None,
+            ordinal: 0,
+            checkpoint_ordinal: None,
+            order_kind: PageOrderKind::RequestOrder,
+            payload_sha256: coverage.sha256.clone(),
+            payload,
+            request_token: coverage.anchor.clone(),
+            request_anchor_utc: Some(1_754_956_810_000_000),
+            receipt_time_utc: None,
+            receipt_state: ReceiptState::AbsentInLegacyRecord,
+            first_event_time: Some(1_754_956_800_000_000),
+            last_event_time: Some(1_754_956_802_000_000),
+            rows,
+            checkpoint: None,
+            disposition: PageDisposition::Indexed,
+        };
+        (coverage, row)
+    }
+
+    #[test]
+    fn census_rejects_converted_bounds_that_disagree_with_payload() {
+        for corrupt_rows in [false, true] {
+            let (mut coverage, mut row) = converted_page();
+            assert_eq!(
+                check_history_occurrence("coverage:fixture/0", &coverage, &row, 0),
+                Ok(())
+            );
+            // Old converted artifacts and their source metadata can agree with each other
+            // while disagreeing with the retained provider bytes.
+            if corrupt_rows {
+                coverage.rows += 1;
+                row.rows += 1;
+            } else {
+                row.first_event_time = row.first_event_time.map(|t| t + DAY_MICROS);
+                row.last_event_time = row.last_event_time.map(|t| t + DAY_MICROS);
+                coverage.first = row.first_event_time.map(time_text);
+                coverage.last = row.last_event_time.map(time_text);
+            }
+            assert_eq!(
+                check_history_occurrence("coverage:fixture/0", &coverage, &row, 0),
+                Err("coverage:fixture/0: payload rows/event bounds mismatch".into())
+            );
+        }
+    }
+
+    #[test]
+    fn census_rejects_converted_legacy_occurrence_with_recorded_receipt() {
+        let (coverage, mut row) = converted_page();
+        assert_eq!(
+            check_history_occurrence("coverage:fixture/0", &coverage, &row, 0),
+            Ok(())
+        );
+        row.acquisition_id = "modern-receipt.json".into();
+        row.receipt_state = ReceiptState::Recorded;
+        row.receipt_time_utc = Some(1_754_956_900_000_000);
+        assert_eq!(
+            check_history_occurrence("coverage:fixture/0", &coverage, &row, 0),
+            Err("coverage:fixture/0: occurrence metadata equality proof failed".into())
+        );
+    }
 }
