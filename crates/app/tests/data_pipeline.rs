@@ -4580,6 +4580,9 @@ fn migration_table_rows(path: &Path) -> Vec<parquet::record::Row> {
         .collect()
 }
 
+#[path = "data_pipeline/migrate_census.rs"]
+mod migrate_census;
+
 /// Lossless offline continuation from real import/update entry points and synthetic transports.
 #[test]
 fn pipeline_migration_lossless_resume_and_tamper() {
