@@ -4770,16 +4770,19 @@ fn pipeline_migration_lossless_resume_and_tamper() {
     fs::write(path, legacy.to_json()).unwrap();
     let broker_requests = (f.deriv.requests().len(), f.pocket.requests().len());
     let drive_requests = f.drive.log().len();
+    let mut interrupted_report = Vec::new();
     let interrupted = data_pipeline::migrate_with(
         &f.pipeline,
         Some("pocket"),
-        &mut |_| Err("fixture interruption after converted".into()),
-        &mut Vec::new(),
+        &|_| Err("fixture interruption after converted".into()),
+        &mut interrupted_report,
     )
     .unwrap_err();
+    assert_eq!(interrupted, "pipeline: 1 job(s) failed: pocket");
+    let interrupted_report = String::from_utf8(interrupted_report).unwrap();
     assert!(
-        interrupted.contains("fixture interruption"),
-        "{interrupted}"
+        interrupted_report.contains("fixture interruption"),
+        "{interrupted_report}"
     );
     let state_path = f
         .scratch
@@ -5213,6 +5216,116 @@ fn pipeline_migration_lossless_resume_and_tamper() {
 }
 
 #[test]
+fn pipeline_migration_parallel_jobs_are_deterministic_and_isolate_failures() {
+    use std::sync::Condvar;
+
+    fn copy_tree(source: &Path, destination: &Path) {
+        fs::create_dir_all(destination).unwrap();
+        for entry in fs::read_dir(source).unwrap() {
+            let entry = entry.unwrap();
+            let target = destination.join(entry.file_name());
+            if entry.file_type().unwrap().is_dir() {
+                copy_tree(&entry.path(), &target);
+            } else {
+                fs::copy(entry.path(), target).unwrap();
+            }
+        }
+    }
+
+    let f = fixture("migration_parallel_jobs");
+    for job in ["deriv", "pocket"] {
+        import(&f.scratch.path(&format!("{job}-import.toml"))).unwrap();
+    }
+    let mut identities = BTreeMap::new();
+    for (mode, workers) in [("serial", 1), ("parallel", 2), ("failure", 2)] {
+        let root = f.scratch.path(mode);
+        copy_tree(&f.scratch.path("producer/store"), &root.join("store"));
+        let config = f.scratch.path(&format!("{mode}.toml"));
+        let mut document: data_pipeline::PipelineConfig =
+            toml::from_str(&fs::read_to_string(&f.pipeline).unwrap()).unwrap();
+        document.local_root = root.clone();
+        document.parallel_jobs = Some(workers);
+        fs::write(&config, toml::to_string(&document).unwrap()).unwrap();
+        let report = if mode == "serial" {
+            pipeline("migrate", &config, &[]).unwrap()
+        } else {
+            let arrived = Mutex::new(0);
+            let ready = Condvar::new();
+            let mut report = Vec::new();
+            let result = data_pipeline::migrate_with(
+                &config,
+                None,
+                &|job| {
+                    // Both conversions must finish before either hook returns. A timeout
+                    // makes a serial scheduler regression fail without hanging the suite.
+                    let mut count = arrived.lock().unwrap();
+                    *count += 1;
+                    ready.notify_all();
+                    let (count, _) = ready
+                        .wait_timeout_while(count, Duration::from_secs(30), |n| *n < 2)
+                        .unwrap();
+                    if *count != 2 {
+                        return Err("fixture jobs did not overlap".into());
+                    }
+                    if mode == "failure" && job == "deriv" {
+                        return Err("fixture conversion interruption".into());
+                    }
+                    Ok(())
+                },
+                &mut report,
+            );
+            if mode == "failure" {
+                assert_eq!(result.unwrap_err(), "pipeline: 1 job(s) failed: deriv");
+            } else {
+                result.unwrap();
+            }
+            String::from_utf8(report).unwrap()
+        };
+        assert_eq!(report.lines().count(), 2, "{report}");
+        for job in ["deriv", "pocket"] {
+            let state = read_json(&root.join(format!("pipeline_state/{job}/migration.json")));
+            let line = job_line(&report, job);
+            if mode == "failure" && job == "deriv" {
+                assert_eq!(state["phase"], "converted");
+                assert!(state["record"].is_null());
+                assert!(
+                    line.contains("failed: fixture conversion interruption"),
+                    "{line}"
+                );
+            } else {
+                assert_eq!(state["phase"], "verified");
+                assert_eq!(field(line, "status"), "verified");
+                let record: binary_alpha_app::lineage::MigrationRecord =
+                    serde_json::from_value(read_json(
+                        &root
+                            .join("pipeline_state/records")
+                            .join(state["record"].as_str().unwrap()),
+                    ))
+                    .unwrap();
+                assert!(record.verified());
+            }
+            let generations = (state["dataset"].clone(), state["stream"].clone());
+            if mode == "serial" {
+                identities.insert(job, generations);
+            } else {
+                assert_eq!(generations, identities[job], "{mode} {job}");
+            }
+        }
+        if mode == "failure" {
+            let resumed = pipeline("migrate", &config, &[]).unwrap();
+            assert_eq!(field(job_line(&resumed, "deriv"), "status"), "verified");
+            assert_eq!(
+                field(job_line(&resumed, "pocket"), "status"),
+                "already_verified"
+            );
+        }
+    }
+    assert!(f.deriv.requests().is_empty());
+    assert!(f.pocket.requests().is_empty());
+    assert!(f.drive.log().is_empty());
+}
+
+#[test]
 fn pipeline_migration_import_only_and_writer_lock() {
     use binary_alpha_engine::dataset::daily::{DayFamily, DayState};
     let f = fixture("migration_import_only");
@@ -5518,6 +5631,21 @@ fn pipeline_migration_pending_receipt_is_diagnostic() {
         .path("producer/pipeline_state/deriv/progress.json");
     let before = fs::read(&header).unwrap();
     let requests = f.deriv.requests().len();
+    // A sibling finishes first and publishes a Pending copy whose valid job id contains
+    // the receipt marker. That copy must not enter the next job's immutable source census:
+    // otherwise serial and parallel schedules could produce different lineage identities.
+    let mut document: data_pipeline::PipelineConfig =
+        toml::from_str(&fs::read_to_string(&config).unwrap()).unwrap();
+    document.parallel_jobs = Some(1);
+    document.jobs.insert(
+        0,
+        data_pipeline::Job {
+            id: "first-receipt-job".into(),
+            config: "deriv.toml".into(),
+            evidence: "evidence/deriv.json".into(),
+        },
+    );
+    fs::write(&config, toml::to_string(&document).unwrap()).unwrap();
     pipeline("migrate", &config, &[]).unwrap();
     assert_eq!(f.deriv.requests().len(), requests);
     assert_eq!(fs::read(header).unwrap(), before);
@@ -5527,6 +5655,21 @@ fn pipeline_migration_pending_receipt_is_diagnostic() {
     );
     let store = f.scratch.path("producer/store");
     let m = dataset(&store, state["dataset"].as_str().unwrap());
+    let lineage_object = m
+        .objects
+        .iter()
+        .find(|o| o.path == "provenance/lineage.json")
+        .unwrap();
+    let lineage = read_json(&store.join(&lineage_object.key));
+    let records = lineage["records"].as_array().unwrap();
+    assert!(records.iter().any(|r| r["kind"] == "pending"));
+    assert!(
+        !records.iter().any(|r| {
+            r["kind"] == "operation_receipt"
+                && r["name"].as_str().unwrap().contains("-migration-pending-")
+        }),
+        "{records:?}"
+    );
     let mut pages = Vec::new();
     for day in m
         .day_inventory
@@ -5769,14 +5912,20 @@ fn migration_receipt_without_coverage(case: &str) {
         v["intent"] = json!(name);
     }
     if case == "late" {
+        let mut report = Vec::new();
         let stopped = data_pipeline::migrate_with(
             &config,
             Some("deriv"),
-            &mut |_| Err("stop after converted".into()),
-            &mut Vec::new(),
+            &|_| Err("stop after converted".into()),
+            &mut report,
         )
         .unwrap_err();
-        assert_eq!(stopped, "stop after converted");
+        assert_eq!(stopped, "pipeline: 1 job(s) failed: deriv");
+        assert!(
+            String::from_utf8(report)
+                .unwrap()
+                .contains("stop after converted")
+        );
     }
     fs::write(records.join(name), v.to_string()).unwrap();
     let result = pipeline("migrate", &config, &[]);

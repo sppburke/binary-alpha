@@ -1136,6 +1136,22 @@ fn run_jobs(
         Ok(())
     };
     reclaim()?;
+    let failed = run_job_pool(config, out, &|job, lines| {
+        Drive::open(&config.drive).and_then(|mut drive| {
+            bind(job, layout).and_then(|bound| run(job, bound, &mut drive, access, lines))
+        })
+    })?;
+    reclaim()?;
+    job_result(config, failed)
+}
+
+/// The shared scheduler and report owner, also used by offline migration. Callers hold the
+/// writer lock and supply each job's capabilities; the pool opens no external sessions.
+fn run_job_pool(
+    config: &PipelineConfig,
+    out: &mut dyn Write,
+    run: &(dyn Fn(&Job, &mut dyn Write) -> Result<String, String> + Sync),
+) -> Result<Vec<usize>, String> {
     let workers = usize::try_from(config.parallel_jobs.unwrap_or(1))
         .unwrap_or(1)
         .min(config.jobs.len())
@@ -1150,9 +1166,7 @@ fn run_jobs(
     let (reports, finished) = std::sync::mpsc::channel();
     let one = |job: &Job| {
         let mut lines = Vec::new();
-        let result = Drive::open(&config.drive).and_then(|mut drive| {
-            bind(job, layout).and_then(|bound| run(job, bound, &mut drive, access, &mut lines))
-        });
+        let result = run(job, &mut lines);
         match &result {
             Ok(line) => writeln!(lines, "{line}").expect("writing to a Vec cannot fail"),
             Err(reason) => {
@@ -1162,7 +1176,7 @@ fn run_jobs(
         }
         (lines, result.is_err())
     };
-    let mut failed = std::thread::scope(|scope| {
+    std::thread::scope(|scope| {
         for _ in 0..workers {
             let reports = reports.clone();
             let queue = &queue;
@@ -1192,8 +1206,11 @@ fn run_jobs(
             }
         }
         Ok::<_, String>(failed)
-    })?;
-    reclaim()?;
+    })
+}
+
+/// Report failed jobs in configuration order, independent of their completion order.
+fn job_result(config: &PipelineConfig, mut failed: Vec<usize>) -> Result<(), String> {
     failed.sort_unstable();
     if failed.is_empty() {
         Ok(())

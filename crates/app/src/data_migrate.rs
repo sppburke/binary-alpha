@@ -102,37 +102,7 @@ pub fn migrate(
     selected: Option<&str>,
     out: &mut dyn Write,
 ) -> Result<(), String> {
-    let (config, layout, _) = load(config_path)?;
-    let _lock = writer_lock(&layout)?;
-    if config.jobs.is_empty() {
-        return Err("migration: no jobs".into());
-    }
-    if selected.is_some_and(|id| !config.jobs.iter().any(|j| j.id == id)) {
-        return Err("migration: unknown --job".into());
-    }
-    let declaration = declaration(&config)?;
-    let access = Access {
-        declaration: declaration.as_ref(),
-        certification: None,
-    };
-    let mut failed = Vec::new();
-    for job in config
-        .jobs
-        .iter()
-        .filter(|j| selected.is_none_or(|id| id == j.id))
-    {
-        let result = bind(job, &layout).and_then(|bound| migrate_job(job, &bound, &layout, access));
-        match result {
-            Ok((state, reused)) => writeln!(out, "pipeline migrate {} status {} dataset {} stream {} record {} observations_equal true pages {} import_files_equal true candles_equal {} peak_day_rows {} peak_day_payload_bytes {}", job.id, if reused {"already_verified"} else {"verified"}, state.dataset, state.stream, state.record.as_deref().unwrap_or("none"), state.occurrences, if state.old_stream.is_some() {"true"} else {"not_applicable"}, state.peak_day_rows, state.peak_day_payload_bytes).map_err(err)?,
-            Err(reason) => { writeln!(out, "pipeline migrate {} failed: {reason}", job.id).map_err(err)?; failed.push(job.id.clone()); }
-        }
-        out.flush().map_err(err)?;
-    }
-    if failed.is_empty() {
-        Ok(())
-    } else {
-        Err(format!("migration failed: {}", failed.join(", ")))
-    }
+    migrate_with(config_path, selected, &|_| Ok(()), out)
 }
 
 fn inventory(local: &Store, bound: &Bound, access: Access<'_>) -> Result<Sources, String> {
@@ -756,6 +726,12 @@ fn receipt_matches(
     identity: &str,
     has_requests: bool,
 ) -> Result<bool, String> {
+    // Migration retains Pending snapshots beside receipts. A valid job id can contain
+    // `-receipt-`, so the filename alone cannot distinguish them. Never let a sibling's
+    // newly published diagnostic snapshot become a schedule-dependent source receipt.
+    if header.get("progress").is_some() {
+        return Ok(false);
+    }
     if let Some(cov) = header.get("coverage").filter(|v| !v.is_null()) {
         if cov["broker"] != source.broker.as_str()
             || cov["provider_symbol"] != source.provider_symbol.as_str()
@@ -2077,20 +2053,12 @@ fn verify_migration(
         json!({"observations":{"equal":true,"v1":old_rows,"v2":new_rows},"pages":{"equal":true,"occurrences":count,"aliases":aliases,"checkpoint_lines":checkpoint_count,"source_census":source_census},"import_files":reconstructed,"candles":candles,"data_verify":{"dataset":dataset_verified,"stream":stream_verified}}),
     )
 }
-fn migrate_job(
-    job: &Job,
-    bound: &Bound,
-    layout: &Layout,
-    access: Access<'_>,
-) -> Result<(State, bool), String> {
-    migrate_job_with(job, bound, layout, access, &mut |_| Ok(()))
-}
 fn migrate_job_with(
     job: &Job,
     bound: &Bound,
     layout: &Layout,
     access: Access<'_>,
-    after_converted: &mut dyn FnMut(&str) -> Result<(), String>,
+    after_converted: &(dyn Fn(&str) -> Result<(), String> + Sync),
 ) -> Result<(State, bool), String> {
     let dir = layout.job_state(&job.id)?;
     let path = dir.join("migration.json");
@@ -2158,38 +2126,53 @@ fn migrate_job_with(
 }
 
 /// A deterministic interruption boundary for non-live orchestration and fixture recovery.
+/// The hook can run concurrently for different jobs; a hook failure is reported with that
+/// job while the remaining jobs continue, just like a conversion or verification failure.
 pub fn migrate_with(
     config_path: &Path,
     selected: Option<&str>,
-    after_converted: &mut dyn FnMut(&str) -> Result<(), String>,
+    after_converted: &(dyn Fn(&str) -> Result<(), String> + Sync),
     out: &mut dyn Write,
 ) -> Result<(), String> {
-    let (config, layout, _) = load(config_path)?;
+    let (mut config, layout, _) = load(config_path)?;
     let _lock = writer_lock(&layout)?;
+    if config.jobs.is_empty() {
+        return Err("migration: no jobs".into());
+    }
+    if selected.is_some_and(|id| !config.jobs.iter().any(|j| j.id == id)) {
+        return Err("migration: unknown --job".into());
+    }
+    config.jobs.retain(|j| selected.is_none_or(|id| id == j.id));
     let declaration = declaration(&config)?;
     let access = Access {
         declaration: declaration.as_ref(),
         certification: None,
     };
-    let jobs = config
-        .jobs
-        .iter()
-        .filter(|j| selected.is_none_or(|id| id == j.id))
-        .collect::<Vec<_>>();
-    if jobs.is_empty() {
-        return Err("migration: no matching jobs".into());
-    }
-    for job in jobs {
+    let failed = run_job_pool(&config, out, &|job, _out| {
         let bound = bind(job, &layout)?;
-        let (state, _) = migrate_job_with(job, &bound, &layout, access, after_converted)?;
-        writeln!(
-            out,
-            "pipeline migrate {} status {} dataset {} stream {}",
-            job.id, state.phase, state.dataset, state.stream
-        )
-        .map_err(err)?;
-    }
-    Ok(())
+        let (state, reused) = migrate_job_with(job, &bound, &layout, access, after_converted)?;
+        Ok(format!(
+            "pipeline migrate {} status {} dataset {} stream {} record {} observations_equal true pages {} import_files_equal true candles_equal {} peak_day_rows {} peak_day_payload_bytes {}",
+            job.id,
+            if reused {
+                "already_verified"
+            } else {
+                "verified"
+            },
+            state.dataset,
+            state.stream,
+            state.record.as_deref().unwrap_or("none"),
+            state.occurrences,
+            if state.old_stream.is_some() {
+                "true"
+            } else {
+                "not_applicable"
+            },
+            state.peak_day_rows,
+            state.peak_day_payload_bytes
+        ))
+    })?;
+    job_result(&config, failed)
 }
 
 fn import_offset(layout: &Layout, m: &GenerationManifest) -> Result<i64, String> {

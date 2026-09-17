@@ -7,6 +7,7 @@
 use std::fs::{self, File};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use binary_alpha_engine::config::PublicationUri;
 use google_cloud_storage::client::{Storage, StorageControl};
@@ -216,8 +217,15 @@ impl Store {
                     .ok_or_else(|| format!("{key} has no parent"))?;
                 fs::create_dir_all(parent)
                     .map_err(|error| format!("cannot create {}: {error}", parent.display()))?;
-                let temporary =
-                    parent.join(format!(".tmp-{}-{}", identity.sha256, std::process::id()));
+                // Identical content can be published by multiple jobs in this process.
+                // Each copy needs its own inode until the create-once hard link below.
+                static SEQUENCE: AtomicU64 = AtomicU64::new(0);
+                let sequence = SEQUENCE.fetch_add(1, Ordering::Relaxed);
+                let temporary = parent.join(format!(
+                    ".tmp-{}-{}-{sequence}",
+                    identity.sha256,
+                    std::process::id()
+                ));
                 let copied = File::open(local)
                     .and_then(|mut source| {
                         let mut file = File::create(&temporary)?;
@@ -481,6 +489,59 @@ mod tests {
             0xE306_9283
         );
         assert_eq!(crc32c_update(0, b""), 0);
+    }
+
+    #[test]
+    fn concurrent_identical_publications_create_once_without_sharing_scratch_files() {
+        let dir = std::env::temp_dir().join(format!(
+            "binary-alpha-store-concurrent-{}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let source = dir.join("source");
+        let bytes = vec![42; 1 << 20];
+        fs::write(&source, &bytes).unwrap();
+        let identity = identify(&source).unwrap();
+        let store = Store::filesystem(dir.join("root"));
+        // Exercise shared object and record directories, including different keys with
+        // identical bytes: all of these previously used the same per-process scratch name.
+        for prefix in ["objects", "records"] {
+            let barrier = std::sync::Barrier::new(8);
+            let results = std::thread::scope(|scope| {
+                let handles: Vec<_> = (0..8)
+                    .map(|index| {
+                        let (store, source, identity, barrier) =
+                            (&store, &source, &identity, &barrier);
+                        scope.spawn(move || {
+                            barrier.wait();
+                            store.put_new(&format!("{prefix}/{}", index % 2), source, identity)
+                        })
+                    })
+                    .collect();
+                handles
+                    .into_iter()
+                    .map(|handle| handle.join().unwrap().unwrap())
+                    .collect::<Vec<_>>()
+            });
+            assert_eq!(
+                results
+                    .iter()
+                    .filter(|put| matches!(put, Put::Created(_)))
+                    .count(),
+                2
+            );
+            for key in ["0", "1"] {
+                assert_eq!(
+                    fs::read(dir.join("root").join(prefix).join(key)).unwrap(),
+                    bytes
+                );
+            }
+            assert_eq!(
+                fs::read_dir(dir.join("root").join(prefix)).unwrap().count(),
+                2
+            );
+        }
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
