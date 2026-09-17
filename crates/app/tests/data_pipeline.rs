@@ -4544,3 +4544,699 @@ mod daily_readers;
 mod fixture_config;
 #[path = "phase12_live_runtime/support.rs"]
 mod live_support;
+
+/// Lossless offline continuation from real import/update entry points and synthetic transports.
+#[test]
+fn pipeline_migration_lossless_resume_and_tamper() {
+    use binary_alpha_app::daily::{self, PageOrderKind, ReceiptState};
+    use binary_alpha_engine::dataset::daily::{DayFamily, DayState};
+    let mut f = fixture("pipeline_migration_lossless");
+    let store = f.scratch.path("producer/store");
+    // Repeated midnight ticks survive the shared v1/v2 reader in their original order.
+    let first = vec![(DAY1 * 1_000_000_000, deriv_price(DAY1).parse().unwrap())];
+    let mut second: Vec<_> = deriv_ticks(DAY2, DERIV_SEED_END)
+        .into_iter()
+        .map(|(t, p)| (t * 1_000_000_000, p.parse::<f64>().unwrap()))
+        .collect();
+    second.insert(0, second[0]);
+    write_daily_directory(
+        &f.scratch.path("sources/deriv/EURUSD"),
+        "EURUSD",
+        "frxEURUSD",
+        &[("2025-08-11", &first), ("2025-08-12", &second)],
+    );
+    let meta = f
+        .scratch
+        .path("sources/deriv/EURUSD/EURUSD_2025-08-11_ticks.meta.json");
+    let mut value = read_json(&meta);
+    value["complete"] = json!(false);
+    fs::write(meta, value.to_string()).unwrap();
+    fs::write(f.scratch.path("sources/deriv/EURUSD/EURUSD_2025-08-10_ticks.meta.json"), json!({"calendar":"UTC","date":"2025-08-10","symbol":"frxEURUSD","ticks":0,"market_closed":true}).to_string()).unwrap();
+    let midnight = (POCKET_START / 86_400 + 1) * 86_400;
+    f.pocket = serve_broker(Kind::Pocket {
+        from: midnight - 1_000,
+        to: midnight + 35,
+    });
+    let core = pocket_core(&f.pocket.url, "demo", BAR_GRANULARITY, 30, 50, 60);
+    fs::write(f.scratch.path("pocket.toml"), &core).unwrap();
+    import_config(&f.scratch, "pocket", &core);
+    write_evidence(&f.scratch, "pocket", &core);
+    write_collection(
+        &f.scratch.path("sources/pocket"),
+        &[AssetSpec {
+            asset: "AEDCNY_otc",
+            expected_symbol_id: None,
+            symbol_id: Some(POCKET_SYMBOL_ID),
+            files: vec![
+                bar_rows(midnight - 10, midnight),
+                bar_rows(midnight, midnight + 20),
+            ],
+            metadata: true,
+        }],
+    );
+    let import_root = f.scratch.path("sources/pocket/AEDCNY_otc");
+    fs::write(
+        import_root.join("download_manifest.json"),
+        json!({"asset":"AEDCNY_otc","server_timestamp_offset_seconds":7200}).to_string(),
+    )
+    .unwrap();
+    let page = json!({"asset":"AEDCNY_otc","period":5,"data":[{"time":midnight-5+7200},{"time":midnight+7200}]}).to_string();
+    let empty = json!({"asset":"AEDCNY_otc","period":5,"data":[]}).to_string();
+    let hash = |s: &str| binary_alpha_engine::hex(&Sha256::digest(s.as_bytes()));
+    let cp = |payload: &str, rows: u64, recovered: bool| {
+        let mut v = json!({"target_server_s":midnight+30+7200,"index":42,"attempt":1,"rows":rows,"payload_sha256":hash(payload)});
+        if recovered {
+            v["recovered_from_raw"] = json!(true);
+        } else {
+            v["received_at"] = json!(time_text((midnight + 100) * 1_000_000));
+        }
+        v.to_string()
+    };
+    let raw_bytes = format!("{page}\r\n{empty}\n{page}");
+    let cp_bytes = format!(
+        "{}\n{}\r\n{}",
+        cp(&empty, 0, false),
+        cp(&page, 2, true),
+        cp(&page, 2, false)
+    );
+    fs::write(import_root.join("raw_pages.ndjson"), &raw_bytes).unwrap();
+    fs::write(import_root.join("checkpoint.ndjson"), &cp_bytes).unwrap();
+    import(&f.scratch.path("deriv-import.toml")).unwrap();
+    import(&f.scratch.path("pocket-import.toml")).unwrap();
+    // Run each existing pipeline job under its own cutoff.
+    for (job, end) in [
+        ("pocket", midnight + 40),
+        ("deriv", DERIV_SEED_END + 200),
+        ("deriv", DERIV_SEED_END + 300),
+    ] {
+        let path = f.scratch.path(&format!("migration-{job}.toml"));
+        fs::write(
+            &path,
+            pipeline_toml(
+                &f.scratch.path("producer"),
+                &f.drive.base,
+                &[(job, &format!("{job}.toml"))],
+                None,
+                2,
+            ),
+        )
+        .unwrap();
+        pipeline("update", &path, &["--end", &time_text(end * 1_000_000)]).unwrap();
+    }
+    let before_generations = binary_alpha_app::store::Store::filesystem(&store)
+        .list_manifests()
+        .unwrap();
+    let records = f.scratch.path("producer/pipeline_state/records");
+    // Replay a request receipt under another immutable record name; occurrence identity stays
+    // tied to its original request/receipt timestamp. Also retain one legacy single-page alias.
+    let receipt = fs::read_dir(&records)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .filter(|p| {
+            p.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("deriv-receipt-")
+        })
+        .max_by_key(|p| read_json(p)["requests"].as_array().unwrap().len())
+        .unwrap();
+    let receipt_value = read_json(&receipt);
+    fs::write(
+        records.join("legacy-deriv-receipt-replay.json"),
+        serde_json::to_vec_pretty(&receipt_value).unwrap(),
+    )
+    .unwrap();
+    let mut subset = receipt_value.clone();
+    let requests = receipt_value["requests"].as_array().unwrap();
+    assert!(requests.len() > 1);
+    subset["requests"] = json!([requests.last().unwrap()]);
+    fs::write(
+        records.join("legacy-deriv-receipt-subset.json"),
+        serde_json::to_vec_pretty(&subset).unwrap(),
+    )
+    .unwrap();
+    let mut additional = receipt_value.clone();
+    let mut request = additional["requests"][0].clone();
+    let original_receipt = binary_alpha_engine::market::parse_event_time_micros(
+        request["receipt_time"].as_str().unwrap(),
+    )
+    .unwrap();
+    request["receipt_time"] = json!(time_text(original_receipt + 1_000_000));
+    additional["requests"] = json!([request]);
+    fs::write(
+        records.join("legacy-deriv-receipt-distinct-time.json"),
+        serde_json::to_vec_pretty(&additional).unwrap(),
+    )
+    .unwrap();
+    let generation = receipt_value["dataset_generation"].as_str().unwrap();
+    let mut legacy = dataset(&store, generation);
+    let cov = coverage(&store, &legacy);
+    let p = &cov.pages[0];
+    let mut object = legacy
+        .objects
+        .iter()
+        .find(|o| o.path == p.path)
+        .unwrap()
+        .clone();
+    object.path = format!("raw/{}.json", p.sha256);
+    object.key = format!("objects/{}", p.sha256);
+    object.bytes = p.bytes;
+    object.sha256 = p.sha256.clone();
+    object.crc32c = None;
+    object.generation = None;
+    legacy.objects.push(object);
+    let scale = match legacy.price_representation {
+        binary_alpha_engine::dataset::PriceRepresentation::IntegerUnits { scale } => Some(scale),
+        _ => None,
+    };
+    legacy.generation = binary_alpha_engine::dataset::generation_id(
+        &binary_alpha_engine::market::InstrumentId {
+            broker: legacy.broker.clone(),
+            provider_symbol: legacy.provider_symbol.clone(),
+        },
+        legacy.source_kind,
+        legacy.role,
+        scale,
+        &legacy.objects,
+    );
+    binary_alpha_engine::dataset::GenerationManifest::from_json(&legacy.to_json()).unwrap();
+    let path = store.join(legacy.key());
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    fs::write(path, legacy.to_json()).unwrap();
+    let broker_requests = (f.deriv.requests().len(), f.pocket.requests().len());
+    let drive_requests = f.drive.log().len();
+    let interrupted = data_pipeline::migrate_with(
+        &f.pipeline,
+        Some("pocket"),
+        &mut |_| Err("fixture interruption after converted".into()),
+        &mut Vec::new(),
+    )
+    .unwrap_err();
+    assert!(
+        interrupted.contains("fixture interruption"),
+        "{interrupted}"
+    );
+    let state_path = f
+        .scratch
+        .path("producer/pipeline_state/pocket/migration.json");
+    let converted = read_json(&state_path);
+    assert_eq!(converted["phase"], "converted");
+    let v2 = dataset(&store, converted["dataset"].as_str().unwrap());
+    let page_object = v2
+        .objects
+        .iter()
+        .find(|o| o.path.starts_with("pages/"))
+        .unwrap();
+    let page_path = store.join(&page_object.key);
+    let original = fs::read(&page_path).unwrap();
+    let mut changed = original.clone();
+    changed[10] ^= 1;
+    fs::write(&page_path, &changed).unwrap();
+    let error = pipeline("migrate", &f.pipeline, &["--job", "pocket"]).unwrap_err();
+    assert!(
+        error.contains("pages/") && error.contains("SHA-256"),
+        "{error}"
+    );
+    assert_eq!(read_json(&state_path)["phase"], "converted");
+    fs::write(&page_path, original).unwrap();
+    let imported = converted["imports"][0]["checkpoint"]["key"]
+        .as_str()
+        .unwrap();
+    let cp_path = store.join(imported);
+    let original = fs::read(&cp_path).unwrap();
+    let mut changed = original.clone();
+    changed[1] ^= 1;
+    fs::write(&cp_path, changed).unwrap();
+    let error = pipeline("migrate", &f.pipeline, &["--job", "pocket"]).unwrap_err();
+    assert!(error.contains("checkpoint"), "{error}");
+    assert_eq!(read_json(&state_path)["phase"], "converted");
+    fs::write(cp_path, original).unwrap();
+    let report = pipeline("migrate", &f.pipeline, &[]).unwrap();
+    assert!(report.contains("status verified"), "{report}");
+    assert_eq!(
+        (f.deriv.requests().len(), f.pocket.requests().len()),
+        broker_requests
+    );
+    assert_eq!(f.drive.log().len(), drive_requests, "migrate is offline");
+    let mut all_recorded = Vec::new();
+    for job in ["deriv", "pocket"] {
+        let state = read_json(
+            &f.scratch
+                .path(&format!("producer/pipeline_state/{job}/migration.json")),
+        );
+        assert_eq!(state["phase"], "verified");
+        let record = read_json(&records.join(state["record"].as_str().unwrap()));
+        assert_eq!(record["proofs"]["observations"]["equal"], true);
+        assert_eq!(record["proofs"]["pages"]["equal"], true);
+        assert_eq!(record["proofs"]["candles"]["equal"], true);
+        all_recorded.extend(
+            record["v1_generations"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|v| v.as_str().unwrap().to_string()),
+        );
+        let manifest = dataset(&store, state["dataset"].as_str().unwrap());
+        verify::run(&format!("file://{}", store.join(manifest.key()).display())).unwrap();
+        verify::run(&format!(
+            "file://{}",
+            store
+                .join(binary_alpha_engine::dataset::manifest_key(
+                    state["stream"].as_str().unwrap()
+                ))
+                .display()
+        ))
+        .unwrap();
+        if job == "deriv" {
+            let aliases: Vec<Value> =
+                fs::read_to_string(records.join(state["aliases"].as_str().unwrap()))
+                    .unwrap()
+                    .lines()
+                    .map(|line| serde_json::from_str(line).unwrap())
+                    .collect();
+            let receipt_name = receipt.file_name().unwrap().to_str().unwrap();
+            let alias = |label: &str| aliases.iter().find(|a| a["label"] == label).unwrap();
+            let occurrence = |a: &Value| (a["acquisition_id"].clone(), a["ordinal"].clone());
+            assert_eq!(
+                occurrence(alias(&format!("receipt:{receipt_name}/0"))),
+                occurrence(alias("receipt:legacy-deriv-receipt-replay.json/0")),
+            );
+            assert_ne!(
+                occurrence(alias(&format!("receipt:{receipt_name}/0"))),
+                occurrence(alias("receipt:legacy-deriv-receipt-distinct-time.json/0")),
+            );
+            assert_eq!(
+                occurrence(alias(&format!(
+                    "receipt:{receipt_name}/{}",
+                    requests.len() - 1
+                ))),
+                occurrence(alias("receipt:legacy-deriv-receipt-subset.json/0")),
+            );
+            assert_eq!(
+                occurrence(alias(&format!("coverage:{}/0", legacy.generation))),
+                occurrence(alias(&format!(
+                    "single:{}/raw/{}.json",
+                    legacy.generation, p.sha256
+                ))),
+            );
+            assert!(
+                manifest
+                    .day_inventory
+                    .iter()
+                    .any(|d| d.family == DayFamily::Observations
+                        && d.date == "2025-08-10"
+                        && d.state == DayState::EmptyKnown
+                        && d.object.is_none())
+            );
+            assert!(
+                manifest
+                    .day_inventory
+                    .iter()
+                    .any(|d| d.family == DayFamily::Observations
+                        && d.date == "2025-08-11"
+                        && d.state == DayState::Unknown)
+            );
+            assert!(
+                manifest
+                    .day_inventory
+                    .iter()
+                    .any(|d| d.family == DayFamily::Observations && d.state == DayState::Partial)
+            );
+        } else {
+            let head = manifest
+                .day_inventory
+                .iter()
+                .find(|d| {
+                    d.family == DayFamily::Observations
+                        && d.date == time_text((midnight - 1) * 1_000_000)[..10]
+                })
+                .unwrap();
+            assert_eq!(head.state, DayState::Partial);
+            assert_eq!(head.unresolved.len(), 1);
+            assert_eq!(
+                head.unresolved[0].start,
+                time_text((midnight - 86_400) * 1_000_000)
+            );
+            assert_eq!(
+                head.unresolved[0].end,
+                time_text((midnight - 10) * 1_000_000)
+            );
+            let tail = manifest
+                .day_inventory
+                .iter()
+                .find(|d| {
+                    d.family == DayFamily::Observations
+                        && d.date == time_text(midnight * 1_000_000)[..10]
+                })
+                .unwrap();
+            assert_eq!(tail.state, DayState::Partial);
+            assert_eq!(tail.unresolved.len(), 1);
+            assert_eq!(
+                tail.unresolved[0].start,
+                time_text((midnight + 35) * 1_000_000),
+                "provider shortfall before cutoff remains unresolved"
+            );
+            let mut pages = Vec::new();
+            for day in manifest
+                .day_inventory
+                .iter()
+                .filter(|d| d.family == DayFamily::Pages)
+            {
+                pages.extend(
+                    daily::read_pages(&store.join(day.object.as_ref().unwrap()), &day.date)
+                        .unwrap(),
+                );
+            }
+            let mut imported: Vec<_> = pages
+                .iter()
+                .filter(|p| p.order_kind == PageOrderKind::SourceFileOrder)
+                .collect();
+            imported.sort_by_key(|p| p.ordinal);
+            assert_eq!(imported.len(), 3);
+            assert_eq!(imported[0].checkpoint_ordinal, Some(1));
+            assert_eq!(imported[1].checkpoint_ordinal, Some(0));
+            assert_eq!(imported[0].receipt_state, ReceiptState::NotRecordedBySource);
+            assert_eq!(
+                imported[0].first_event_time,
+                Some((midnight - 5) * 1_000_000)
+            );
+            assert_eq!(imported[0].last_event_time, Some(midnight * 1_000_000));
+            assert_eq!(imported[1].rows, 0);
+            assert_eq!(
+                imported[1].request_anchor_utc,
+                Some((midnight + 30) * 1_000_000)
+            );
+            assert_eq!(
+                record["proofs"]["import_files"].as_array().unwrap().len(),
+                2
+            );
+        }
+        println!(
+            "migration fixture {job}: peak_day_rows={} peak_day_payload_bytes={}",
+            state["peak_day_rows"], state["peak_day_payload_bytes"]
+        );
+    }
+    for generation in before_generations {
+        assert!(
+            all_recorded.contains(&generation),
+            "missing v1 generation {generation}"
+        );
+    }
+    assert!(all_recorded.contains(&legacy.generation));
+    let record_count = fs::read_dir(&records).unwrap().count();
+    let before_manifests = binary_alpha_app::store::Store::filesystem(&store)
+        .list_manifests()
+        .unwrap();
+    let before_states: Vec<_> = ["deriv", "pocket"]
+        .map(|job| {
+            fs::read(
+                f.scratch
+                    .path(&format!("producer/pipeline_state/{job}/migration.json")),
+            )
+            .unwrap()
+        })
+        .into();
+    let rerun = pipeline("migrate", &f.pipeline, &[]).unwrap();
+    assert_eq!(rerun.matches("status already_verified").count(), 2);
+    assert_eq!(record_count, fs::read_dir(records).unwrap().count());
+    assert_eq!(
+        before_manifests,
+        binary_alpha_app::store::Store::filesystem(&store)
+            .list_manifests()
+            .unwrap()
+    );
+    for (job, before) in ["deriv", "pocket"].into_iter().zip(before_states) {
+        assert_eq!(
+            before,
+            fs::read(
+                f.scratch
+                    .path(&format!("producer/pipeline_state/{job}/migration.json"))
+            )
+            .unwrap()
+        );
+    }
+}
+
+#[test]
+fn pipeline_migration_import_only_and_writer_lock() {
+    use binary_alpha_engine::dataset::daily::{DayFamily, DayState};
+    let f = fixture("migration_import_only");
+    let store = f.scratch.path("producer/store");
+    let meta = f
+        .scratch
+        .path("sources/deriv/EURUSD/EURUSD_2025-08-11_ticks.meta.json");
+    let mut clipped = read_json(&meta);
+    clipped["market_closed"] = json!(false);
+    clipped["clipped_by_retention"] = json!(true);
+    fs::write(meta, clipped.to_string()).unwrap();
+    let cutoff_meta = f
+        .scratch
+        .path("sources/deriv/EURUSD/EURUSD_2025-08-12_ticks.meta.json");
+    let mut gap = read_json(&cutoff_meta);
+    gap["complete"] = json!(false);
+    fs::write(cutoff_meta, gap.to_string()).unwrap();
+    import(&f.scratch.path("deriv-import.toml")).unwrap();
+    let lock = File::create(f.scratch.path("producer/pipeline_state/writer.lock"));
+    // The pipeline state directory is normally first created by the command.
+    if lock.is_err() {
+        fs::create_dir_all(f.scratch.path("producer/pipeline_state")).unwrap();
+    }
+    let lock = File::create(f.scratch.path("producer/pipeline_state/writer.lock")).unwrap();
+    lock.lock().unwrap();
+    let denied = pipeline("migrate", &f.pipeline, &["--job", "deriv"]).unwrap_err();
+    assert!(denied.contains("another producer"), "{denied}");
+    drop(lock);
+    let report = pipeline("migrate", &f.pipeline, &["--job", "deriv"]).unwrap();
+    assert!(report.contains("pages 0"), "{report}");
+    assert!(report.contains("candles_equal not_applicable"), "{report}");
+    let state = read_json(
+        &f.scratch
+            .path("producer/pipeline_state/deriv/migration.json"),
+    );
+    let m = dataset(&store, state["dataset"].as_str().unwrap());
+    assert!(
+        m.day_inventory
+            .iter()
+            .any(|d| d.family == DayFamily::Observations
+                && d.date == "2025-08-11"
+                && d.state == DayState::Unknown)
+    );
+    let cutoff_day = m
+        .day_inventory
+        .iter()
+        .find(|d| d.family == DayFamily::Observations && d.date == "2025-08-12")
+        .unwrap();
+    assert_eq!(cutoff_day.state, DayState::Partial);
+    assert!(
+        cutoff_day
+            .reason
+            .as_ref()
+            .unwrap()
+            .contains("complete=false")
+    );
+    assert_eq!(cutoff_day.unresolved[0].start, time_text(DAY2 * 1_000_000));
+    assert_eq!(
+        cutoff_day.unresolved[0].end,
+        time_text((DAY2 + 86_400) * 1_000_000)
+    );
+    assert!(f.deriv.requests().is_empty());
+    assert!(f.pocket.requests().is_empty());
+    assert!(f.drive.log().is_empty());
+}
+
+#[test]
+fn pipeline_migration_carried_legacy_occurrences() {
+    use binary_alpha_app::daily::{self, ReceiptState};
+    use binary_alpha_engine::dataset::daily::DayFamily;
+    use binary_alpha_engine::dataset::{PriceRepresentation, generation_id, object_key};
+    use binary_alpha_engine::market::InstrumentId;
+    let f = fixture("migration_carried_legacy");
+    import(&f.scratch.path("deriv-import.toml")).unwrap();
+    let config = f.scratch.path("legacy-only.toml");
+    fs::write(
+        &config,
+        pipeline_toml(
+            &f.scratch.path("producer"),
+            &f.drive.base,
+            &[("deriv", "deriv.toml")],
+            None,
+            2,
+        ),
+    )
+    .unwrap();
+    let report = pipeline(
+        "update",
+        &config,
+        &["--end", &time_text((DERIV_SEED_END + 200) * 1_000_000)],
+    )
+    .unwrap();
+    let store = f.scratch.path("producer/store");
+    let mut original = dataset(&store, field(job_line(&report, "deriv"), "dataset"));
+    let mut cov = coverage(&store, &original);
+    let mut legacy = cov.pages[0].clone();
+    let hash = legacy.sha256.clone();
+    let mut single = original
+        .objects
+        .iter()
+        .find(|o| o.path == legacy.path)
+        .unwrap()
+        .clone();
+    single.path = format!("raw/{hash}.json");
+    single.key = object_key(&hash);
+    single.sha256 = hash.clone();
+    single.bytes = legacy.bytes;
+    single.crc32c = None;
+    single.generation = None;
+    legacy.path = single.path.clone();
+    legacy.offset = None;
+    legacy.receipt_time = None;
+    legacy.anchor = None;
+    original.objects.push(single);
+    // Two original requests can have identical bytes and absent receipt metadata. Both
+    // occurrences are carried in order into a later generation and must remain exactly two.
+    cov.pages.splice(0..0, [legacy.clone(), legacy]);
+    let mut generations = Vec::new();
+    for extra in [0, 1] {
+        let mut manifest = original.clone();
+        cov.requested.end = time_text((DERIV_SEED_END + 200 + extra) * 1_000_000);
+        let bytes = serde_json::to_vec(&cov).unwrap();
+        let object = manifest
+            .objects
+            .iter_mut()
+            .find(|o| o.path == "provenance/coverage.json")
+            .unwrap();
+        object.sha256 = binary_alpha_engine::hex(&Sha256::digest(&bytes));
+        object.bytes = bytes.len() as u64;
+        object.key = object_key(&object.sha256);
+        object.crc32c = None;
+        object.generation = None;
+        fs::write(store.join(&object.key), bytes).unwrap();
+        manifest.generation = generation_id(
+            &InstrumentId {
+                broker: manifest.broker.clone(),
+                provider_symbol: manifest.provider_symbol.clone(),
+            },
+            manifest.source_kind,
+            manifest.role,
+            match manifest.price_representation {
+                PriceRepresentation::IntegerUnits { scale } => Some(scale),
+                _ => None,
+            },
+            &manifest.objects,
+        );
+        GenerationManifest::from_json(&manifest.to_json()).unwrap();
+        let path = store.join(manifest.key());
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, manifest.to_json()).unwrap();
+        generations.push(manifest.generation);
+    }
+    pipeline("migrate", &config, &[]).unwrap();
+    let state = read_json(
+        &f.scratch
+            .path("producer/pipeline_state/deriv/migration.json"),
+    );
+    let manifest = dataset(&store, state["dataset"].as_str().unwrap());
+    let pages: Vec<_> = manifest
+        .day_inventory
+        .iter()
+        .filter(|d| d.family == DayFamily::Pages)
+        .flat_map(|d| daily::read_pages(&store.join(d.object.as_ref().unwrap()), &d.date).unwrap())
+        .collect();
+    assert_eq!(
+        pages
+            .iter()
+            .filter(|p| p.payload_sha256 == hash
+                && p.receipt_state == ReceiptState::AbsentInLegacyRecord)
+            .count(),
+        2
+    );
+    let aliases: Vec<Value> = fs::read_to_string(
+        f.scratch
+            .path("producer/pipeline_state/records")
+            .join(state["aliases"].as_str().unwrap()),
+    )
+    .unwrap()
+    .lines()
+    .map(|line| serde_json::from_str(line).unwrap())
+    .collect();
+    for ordinal in [0, 1] {
+        let targets: Vec<_> = generations
+            .iter()
+            .map(|g| {
+                let a = aliases
+                    .iter()
+                    .find(|a| a["label"] == format!("coverage:{g}/{ordinal}"))
+                    .unwrap();
+                (a["acquisition_id"].clone(), a["ordinal"].clone())
+            })
+            .collect();
+        assert_eq!(
+            targets[0], targets[1],
+            "carried prefix keeps occurrence identity"
+        );
+    }
+    assert!(
+        pages
+            .iter()
+            .any(|p| p.payload_sha256 == hash && p.receipt_state == ReceiptState::Recorded),
+        "independent modern request using the same payload stays separate"
+    );
+}
+
+#[test]
+fn pipeline_migration_pending_receipt_is_diagnostic() {
+    use binary_alpha_app::daily::{self, PageDisposition};
+    use binary_alpha_engine::dataset::daily::DayFamily;
+    let f = fixture("migration_pending");
+    import(&f.scratch.path("deriv-import.toml")).unwrap();
+    let core = deriv_core(&f.deriv.url, 60, 1, 60);
+    fs::write(f.scratch.path("deriv.toml"), &core).unwrap();
+    write_evidence(&f.scratch, "deriv", &core);
+    let config = f.scratch.path("pending-only.toml");
+    fs::write(
+        &config,
+        pipeline_toml(
+            &f.scratch.path("producer"),
+            &f.drive.base,
+            &[("deriv", "deriv.toml")],
+            None,
+            2,
+        ),
+    )
+    .unwrap();
+    let pending = pipeline(
+        "update",
+        &config,
+        &["--end", &time_text((DERIV_SEED_END + 1000) * 1_000_000)],
+    )
+    .unwrap_err();
+    assert!(pending.contains("status pending"), "{pending}");
+    let header = f
+        .scratch
+        .path("producer/pipeline_state/deriv/progress.json");
+    let before = fs::read(&header).unwrap();
+    let requests = f.deriv.requests().len();
+    pipeline("migrate", &config, &[]).unwrap();
+    assert_eq!(f.deriv.requests().len(), requests);
+    assert_eq!(fs::read(header).unwrap(), before);
+    let state = read_json(
+        &f.scratch
+            .path("producer/pipeline_state/deriv/migration.json"),
+    );
+    let store = f.scratch.path("producer/store");
+    let m = dataset(&store, state["dataset"].as_str().unwrap());
+    let mut pages = Vec::new();
+    for day in m
+        .day_inventory
+        .iter()
+        .filter(|d| d.family == DayFamily::Pages)
+    {
+        pages.extend(
+            daily::read_pages(&store.join(day.object.as_ref().unwrap()), &day.date).unwrap(),
+        );
+    }
+    assert_eq!(pages.len(), 1);
+    assert_eq!(pages[0].disposition, PageDisposition::Diagnostic);
+    assert!(pages[0].acquisition_id.contains("-receipt-"));
+    assert!(pages[0].intent.is_some());
+}

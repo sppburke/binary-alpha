@@ -262,6 +262,13 @@ enum DataCommand {
 
 #[derive(Subcommand)]
 enum PipelineCommand {
+    /// Convert retained v1 generations to a verified daily-v2 continuation root, offline.
+    Migrate {
+        #[arg(long)]
+        config: PathBuf,
+        #[arg(long)]
+        job: Option<String>,
+    },
     /// Extend every job's imported generation from its frontier to one pinned cutoff within
     /// its budget, then audit, verify, and archive the result.
     Update {
@@ -358,6 +365,9 @@ fn main() -> ExitCode {
         Command::Data {
             command: DataCommand::Pipeline { command },
         } => match command {
+            PipelineCommand::Migrate { config, job } => {
+                data_pipeline::migrate(&config, job.as_deref(), &mut std::io::stdout().lock())
+            }
             PipelineCommand::Update { config, end } => {
                 data_pipeline::update(&config, end.as_deref(), &mut std::io::stdout().lock())
             }

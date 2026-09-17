@@ -25,6 +25,7 @@ use parquet::{
     record::{Field, Row, RowAccessor},
     schema::parser::parse_message_type,
 };
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::archive::{self, DataSummary};
@@ -54,25 +55,25 @@ const PAGE_SCHEMA: &str = "message binary_alpha_pages {
 }
 ";
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PageOrderKind {
     RequestOrder,
     SourceFileOrder,
 }
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ReceiptState {
     Recorded,
     NotRecordedBySource,
     AbsentInLegacyRecord,
 }
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PageDisposition {
     Indexed,
     Diagnostic,
 }
 
 /// One response occurrence, including its own request and independent checkpoint position.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PageOccurrence {
     pub acquisition_id: String,
     pub intent: Option<String>,
@@ -350,7 +351,7 @@ pub fn read_ticks(
 }
 
 /// Lossless provider row. Optional Parquet values stay optional; execution still uses `Bar<()>`.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DailyBar {
     pub symbol: Option<String>,
     pub symbol_id: Option<i32>,
@@ -399,7 +400,7 @@ impl DailyBar {
         Ok(bar)
     }
 
-    fn time(&self) -> Result<i64, String> {
+    pub(crate) fn time(&self) -> Result<i64, String> {
         let unix = self
             .unix_utc_s
             .map(|t| t.checked_mul(1_000_000).ok_or("bar timestamp overflow"))
@@ -460,23 +461,25 @@ pub fn write_bars<B: IntoIterator<Item = R>, R: Into<DailyBar>>(
 }
 
 pub fn read_bars(path: &Path, date: &str) -> Result<Vec<DailyBar>, String> {
-    let rows = read_file(path, archive::BAR_SCHEMA, bar_metadata(), |r| {
-        Ok(DailyBar {
-            symbol: optional(&r, 0, |r, c| r.get_string(c).cloned())?,
-            symbol_id: optional(&r, 1, RowAccessor::get_int)?,
-            timestamp_utc: optional(&r, 2, RowAccessor::get_timestamp_micros)?,
-            unix_utc_s: optional(&r, 3, RowAccessor::get_long)?,
-            server_time_s: optional(&r, 4, RowAccessor::get_long)?,
-            open: optional(&r, 5, RowAccessor::get_double)?,
-            high: optional(&r, 6, RowAccessor::get_double)?,
-            low: optional(&r, 7, RowAccessor::get_double)?,
-            close: optional(&r, 8, RowAccessor::get_double)?,
-            volume: optional(&r, 9, RowAccessor::get_double)?,
-            period_s: optional(&r, 10, RowAccessor::get_ushort)?,
-        })
-    })?;
+    let rows = read_file(path, archive::BAR_SCHEMA, bar_metadata(), decode_bar)?;
     summary(date, &rows, DailyBar::time, true)?;
     Ok(rows)
+}
+
+pub(crate) fn decode_bar(r: Row) -> Result<DailyBar, String> {
+    Ok(DailyBar {
+        symbol: optional(&r, 0, |r, c| r.get_string(c).cloned())?,
+        symbol_id: optional(&r, 1, RowAccessor::get_int)?,
+        timestamp_utc: optional(&r, 2, RowAccessor::get_timestamp_micros)?,
+        unix_utc_s: optional(&r, 3, RowAccessor::get_long)?,
+        server_time_s: optional(&r, 4, RowAccessor::get_long)?,
+        open: optional(&r, 5, RowAccessor::get_double)?,
+        high: optional(&r, 6, RowAccessor::get_double)?,
+        low: optional(&r, 7, RowAccessor::get_double)?,
+        close: optional(&r, 8, RowAccessor::get_double)?,
+        volume: optional(&r, 9, RowAccessor::get_double)?,
+        period_s: optional(&r, 10, RowAccessor::get_ushort)?,
+    })
 }
 
 fn candle_time(candle: &Candle) -> Result<i64, String> {
@@ -733,12 +736,6 @@ pub enum MarketRow {
     Bar(Bar),
 }
 impl MarketRow {
-    fn time(self) -> i64 {
-        match self {
-            Self::Tick(t) => t.event_time_micros,
-            Self::Bar(b) => b.start_unix_s * 1_000_000,
-        }
-    }
     pub fn observation(
         self,
         scale: PriceScale,
@@ -841,6 +838,34 @@ pub fn read_generation(
     manifest: &binary_alpha_engine::dataset::GenerationManifest,
     mut sink: impl FnMut(MarketRow) -> Result<(), String>,
 ) -> Result<GenerationRead, String> {
+    read_generation_lossless(store, manifest, |row| {
+        sink(match row {
+            LosslessRow::Tick(t) => MarketRow::Tick(t),
+            LosslessRow::Bar(b) => MarketRow::Bar(b.bar()?),
+        })
+    })
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum LosslessRow {
+    Tick(Tick),
+    Bar(DailyBar),
+}
+impl LosslessRow {
+    pub fn time(&self) -> Result<i64, String> {
+        match self {
+            Self::Tick(t) => Ok(t.event_time_micros),
+            Self::Bar(b) => b.time(),
+        }
+    }
+}
+
+/// The same partition and sequence owner, retaining all provider columns for migration.
+pub fn read_generation_lossless(
+    store: &crate::store::Store,
+    manifest: &binary_alpha_engine::dataset::GenerationManifest,
+    mut sink: impl FnMut(LosslessRow) -> Result<(), String>,
+) -> Result<GenerationRead, String> {
     use binary_alpha_engine::{
         dataset::PriceRepresentation,
         market::{BarSequence, TickSequence},
@@ -861,12 +886,12 @@ pub fn read_generation(
         result.bytes += bytes;
         let local = local.expect("decoded partition");
         let mut data = DataSummary::default();
-        let mut accept = |row: MarketRow| -> Result<(), String> {
-            match row {
-                MarketRow::Tick(t) => ticks.accept(t)?,
-                MarketRow::Bar(b) => bars.accept(b.start_unix_s)?,
+        let mut accept = |row: LosslessRow| -> Result<(), String> {
+            match &row {
+                LosslessRow::Tick(t) => ticks.accept(*t)?,
+                LosslessRow::Bar(b) => bars.accept(b.bar()?.start_unix_s)?,
             }
-            let time = row.time();
+            let time = row.time()?;
             // Legacy verification forbids overlapping objects (ties within a file are retained).
             if day.is_none()
                 && data.rows == 0
@@ -886,11 +911,11 @@ pub fn read_generation(
             match (manifest.price_representation, day) {
                 (PriceRepresentation::IntegerUnits { scale }, Some(day)) => {
                     for tick in read_ticks(&local.path, &day.date, &instrument, scale)? {
-                        accept(MarketRow::Tick(tick))?;
+                        accept(LosslessRow::Tick(tick))?;
                     }
                 }
                 (PriceRepresentation::IntegerUnits { scale }, None) => {
-                    archive::read_ticks_with(&local.path, scale, |t| accept(MarketRow::Tick(t)))?;
+                    archive::read_ticks_with(&local.path, scale, |t| accept(LosslessRow::Tick(t)))?;
                 }
                 (PriceRepresentation::BinaryFloat64, Some(day)) => {
                     for row in read_bars(&local.path, &day.date)? {
@@ -901,14 +926,14 @@ pub fn read_generation(
                         check_symbol_id(&mut result.symbol_id, Some(id))?;
                         row.timestamp_utc.ok_or("null bar timestamp_utc")?;
                         row.server_time_s.ok_or("null bar server_time_s")?;
-                        accept(MarketRow::Bar(row.bar()?))?;
+                        accept(LosslessRow::Bar(row))?;
                     }
                 }
                 (PriceRepresentation::BinaryFloat64, None) => {
-                    let summary = archive::validate_bar_file_with(
+                    let summary = archive::validate_bar_file_lossless_with(
                         &local.path,
                         &crate::verify::bar_expectation(manifest)?,
-                        |b| accept(MarketRow::Bar(b)),
+                        |b| accept(LosslessRow::Bar(b)),
                     )?;
                     check_symbol_id(&mut result.symbol_id, summary.symbol_id)?;
                 }

@@ -716,6 +716,14 @@ fn malformed_inputs_and_unsafe_layouts_are_rejected() {
             "period 60 seconds",
         ),
         (
+            "period overflows its logical unsigned width",
+            vec![BarRow {
+                period: 65_541,
+                ..rows[0].clone()
+            }],
+            "not an unsigned 16-bit value",
+        ),
+        (
             "timestamp drift",
             vec![BarRow {
                 timestamp: Some(1),

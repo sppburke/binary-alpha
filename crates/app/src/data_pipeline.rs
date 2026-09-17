@@ -34,6 +34,10 @@ use crate::research;
 use crate::store::{self, ObjectIdentity, Store};
 use crate::verify;
 
+#[path = "data_migrate.rs"]
+mod migration;
+pub use migration::{migrate, migrate_with};
+
 pub const PIPELINE_SCHEMA_VERSION: u32 = 1;
 pub const CATALOG_SCHEMA_VERSION: u32 = 1;
 const STORE_DIR: &str = "store";
