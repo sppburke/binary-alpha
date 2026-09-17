@@ -124,7 +124,6 @@ struct Archive {
     dataset: String,
     stream: String,
     job: String,
-    end: String,
 }
 
 fn hash(bytes: &[u8]) -> String {
@@ -425,14 +424,16 @@ fn archives(
         if !string(metadata, "name")?.starts_with("catalog-") {
             continue;
         }
+        let confirmed = drive.listed_identity(&crate::drive::RemoteFile {
+            id: id.clone(),
+            name: string(metadata, "name")?.into(),
+            size: metadata["bytes"].as_u64(),
+            sha256: metadata["sha256"].as_str().map(str::to_string),
+            trashed: metadata["trashed"].as_bool().unwrap_or(false),
+        })?;
         let identity = Identity {
-            bytes: metadata["bytes"]
-                .as_u64()
-                .ok_or("retire: catalog size unresolved")?,
-            sha256: match metadata["sha256"].as_str() {
-                Some(sha) => sha.to_ascii_lowercase(),
-                None => drive.hash(id)?.sha256,
-            },
+            bytes: confirmed.bytes,
+            sha256: confirmed.sha256,
         };
         // Do not use a remote identifier as a filesystem component.
         let scratch = layout
@@ -458,7 +459,6 @@ fn archives(
         archive_entries(&value, remote, &mut entries)?;
         result.push(Archive {
             job: string(&value, "job")?.into(),
-            end: string(&value["coverage"], "last_event_time")?.into(),
             file: Remote {
                 key: key.clone(),
                 name: name(&key)?,
@@ -683,9 +683,9 @@ fn documents(path: &Path) -> Result<Vec<Value>, String> {
 /// Historical references may already have been removed by a completed, sealed plan. This
 /// affects record classification only; a live configuration or pending acquisition still pins
 /// its dependencies and fails if one is absent.
-fn retired_closures(layout: &Layout) -> Result<BTreeSet<String>, String> {
+pub(crate) fn retired_closures(state: &Path) -> Result<BTreeSet<String>, String> {
     let mut paths = Vec::new();
-    files(&layout.state.join("retirement"), &mut paths)?;
+    files(&state.join("retirement"), &mut paths)?;
     let mut retired = BTreeSet::new();
     for path in paths.into_iter().filter(|p| {
         p.file_name()
@@ -696,13 +696,8 @@ fn retired_closures(layout: &Layout) -> Result<BTreeSet<String>, String> {
         if !hex_id(digest) {
             return Err("retire: invalid completed retirement identity".into());
         }
-        let bytes = fs::read(
-            layout
-                .state
-                .join("retirement")
-                .join(format!("plan-{digest}.json")),
-        )
-        .map_err(|e| e.to_string())?;
+        let bytes = fs::read(state.join("retirement").join(format!("plan-{digest}.json")))
+            .map_err(|e| e.to_string())?;
         let plan: Plan = serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
         if hash(&bytes) != digest
             || record["removed_local"]
@@ -727,50 +722,6 @@ fn retired_closures(layout: &Layout) -> Result<BTreeSet<String>, String> {
     Ok(retired)
 }
 
-/// One host-wide archive fence also excludes restores into a different local store. The
-/// stable lock lives outside either managed store so fresh-store recovery shares it.
-pub(crate) fn archive_lock(config: &PipelineConfig) -> Result<File, String> {
-    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-    let binding = format!(
-        "{}\n{}",
-        config
-            .drive
-            .loopback_endpoint
-            .as_deref()
-            .unwrap_or("https://www.googleapis.com"),
-        config.drive.root_folder_id
-    );
-    let path = std::env::temp_dir().join(format!(
-        "binary-alpha-archive-{}.lock",
-        hash(binding.as_bytes())
-    ));
-    let file = match OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(&path)
-    {
-        Ok(file) => file,
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-            let metadata = fs::symlink_metadata(&path).map_err(|e| e.to_string())?;
-            if !metadata.is_file() || metadata.permissions().mode() & 0o077 != 0 {
-                return Err("retire: archive lock is not private regular storage".into());
-            }
-            OpenOptions::new()
-                .read(true)
-                .write(true)
-                .open(&path)
-                .map_err(|e| e.to_string())?
-        }
-        Err(e) => return Err(e.to_string()),
-    };
-    file.try_lock().map_err(|_| {
-        "pipeline: another operation holds this archive root (including a restore)".to_string()
-    })?;
-    Ok(file)
-}
-
 /// Default is plan-only. Apply accepts only an unchanged plan previously sealed in this store.
 pub fn run(
     config_path: &Path,
@@ -780,7 +731,7 @@ pub fn run(
 ) -> Result<(), String> {
     let (config, layout, _) = data_pipeline::load(config_path)?;
     let _lock = data_pipeline::writer_lock(&layout)?;
-    let _archive_lock = archive_lock(&config)?;
+    let _archive_lock = data_pipeline::archive_lock(&config)?;
     let declaration = data_pipeline::declaration(&config)?;
     let access = Access {
         declaration: declaration.as_ref(),
@@ -831,7 +782,7 @@ fn plan(
         return Err("retire: unknown job".into());
     }
     let before = state(config_path, config, layout)?;
-    let already_retired = retired_closures(layout)?;
+    let already_retired = retired_closures(&layout.state)?;
     let remote = remote_state(drive)?;
     let manifests = manifests(layout, access)?;
     let archives = archives(drive, layout, &remote, access)?;
@@ -849,27 +800,46 @@ fn plan(
             return Err("retire: job requires one instrument".into());
         };
         let instrument = format!("{}:{symbol}", history.broker);
-        let newest = archives
+        let candidates: Vec<_> = archives
             .iter()
             .filter(|a| {
                 a.job == job.id
-                    && manifests
-                        .get(&a.dataset)
-                        .is_some_and(|m| m.ordinary && m.daily && m.instrument == instrument)
-                    && manifests
-                        .get(&a.stream)
-                        .is_some_and(|m| m.ordinary && m.daily && m.instrument == instrument)
+                    && a.value["layout"] == "daily-v2"
+                    && a.value["instrument"] == instrument
+                    && a.value["role"] == "development"
             })
-            .max_by(|a, b| {
-                (&a.end, &a.dataset, &a.stream, &a.file.file_id).cmp(&(
-                    &b.end,
-                    &b.dataset,
-                    &b.stream,
-                    &b.file.file_id,
+            .map(|a| {
+                Ok((
+                    a.file.file_id.clone(),
+                    a.file.identity.sha256.clone(),
+                    data_pipeline::Catalog::from_json(
+                        &serde_json::to_vec(&a.value).map_err(|e| e.to_string())?,
+                    )
+                    .map_err(|e| {
+                        format!(
+                            "retire: catalog lacks manifest binding or has invalid envelope: {e}"
+                        )
+                    })?,
                 ))
-            });
-        if let Some(archive) = newest {
-            selected.insert(job.id.clone(), (instrument, archive.file.file_id.clone()));
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        if !candidates.is_empty() {
+            let index = crate::lineage::newest_catalog(
+                &candidates,
+                drive,
+                &layout.state.join("downloads"),
+                access,
+            )?;
+            let catalog = &candidates[index].2;
+            if !manifests.contains_key(&catalog.dataset.generation)
+                || !manifests.contains_key(&catalog.stream.generation)
+            {
+                return Err(
+                    "retire: newest archived closure must be restored locally before planning"
+                        .into(),
+                );
+            }
+            selected.insert(job.id.clone(), (instrument, candidates[index].0.clone()));
         }
     }
     // A daily layout alone does not prove that old history was replaced. Require the root's
@@ -881,6 +851,7 @@ fn plan(
         .cloned()
         .collect();
     let mut replaced = BTreeSet::new();
+    let mut continuation_seeds = BTreeSet::new();
     for (instrument, catalog_id) in selected.values() {
         let archive = archives
             .iter()
@@ -907,7 +878,25 @@ fn plan(
                             &fs::read(layout.store.join(string(object, "key")?))
                                 .map_err(|e| e.to_string())?,
                         )?;
-                        check_parents(&value, &resolved_lineage_names)?;
+                        let mut resolved = resolved_lineage_names.clone();
+                        if value.get("continuation").is_some() {
+                            if let Some(ids) = value.get("ancestors").and_then(Value::as_array) {
+                                resolved.extend(
+                                    ids.iter()
+                                        .filter_map(Value::as_str)
+                                        .filter(|s| hex_id(s))
+                                        .map(str::to_string),
+                                );
+                            }
+                            if let Some(root) = value
+                                .get("root_generation")
+                                .and_then(Value::as_str)
+                                .filter(|s| hex_id(s))
+                            {
+                                resolved.insert(root.into());
+                            }
+                        }
+                        check_parents(&value, &resolved)?;
                         references(&value, &generation_names, &mut refs);
                         lineage.insert(id.clone(), value);
                     }
@@ -921,20 +910,42 @@ fn plan(
                 parents.insert(id.clone(), refs);
             }
         }
-        let continuation_roots: Vec<_> = parents
-            .iter()
-            .filter(|(_, p)| p.is_empty())
-            .map(|(id, _)| id)
-            .collect();
+        let seed = crate::lineage::root(
+            &Store::filesystem(&layout.store),
+            instrument,
+            DatasetRole::Development,
+            access,
+        )?
+        .ok_or_else(|| format!("retire: unresolved continuation lineage for {instrument}"))?;
+        continuation_seeds.insert(seed.clone());
         let mut ancestors = BTreeSet::from([archive.dataset.clone()]);
         expand(&mut ancestors, &parents);
-        if continuation_roots.len() != 1
-            || !ancestors.contains(continuation_roots[0])
-            || !lineage.contains_key(continuation_roots[0])
-        {
+        if !ancestors.contains(&seed) || !lineage.contains_key(&seed) {
             return Err(format!(
                 "retire: unresolved continuation lineage for {instrument}"
             ));
+        }
+        replaced.extend(
+            ancestors
+                .iter()
+                .filter(|id| **id != seed && **id != archive.dataset)
+                .cloned(),
+        );
+        if let Some(value) = lineage.get(&archive.dataset) {
+            let logical_root = value
+                .get("root_generation")
+                .and_then(Value::as_str)
+                .unwrap_or(&seed);
+            replaced.extend(
+                value
+                    .get("ancestors")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(Value::as_str)
+                    .filter(|id| *id != logical_root && *id != seed && *id != archive.dataset)
+                    .map(str::to_string),
+            );
         }
         // Only the selected catalog's ancestry authorizes replacement. The immutable mapping
         // is migration's lossless proof; daily verification above independently checks storage.
@@ -960,8 +971,7 @@ fn plan(
         }
     }
     for (id, m) in &manifests {
-        if !m.daily
-            && !m.dataset
+        if !m.dataset
             && m.ordinary
             && m.value["source_generation"]
                 .as_str()
@@ -990,13 +1000,15 @@ fn plan(
             manifest_key(generation),
             BTreeSet::from([generation.clone()]),
         );
-        if m.ordinary && !m.daily && replaced.contains(generation) {
+        if m.ordinary && replaced.contains(generation) && !continuation_seeds.contains(generation) {
             candidates.insert(generation.clone());
         } else {
             roots.insert(generation.clone());
         }
     }
     for a in &archives {
+        known.insert(a.dataset.clone());
+        known.insert(a.stream.clone());
         known.insert(a.file.file_id.clone());
         known.insert(a.file.key.clone());
         let mut closure: BTreeSet<_> =
@@ -1069,7 +1081,20 @@ fn plan(
             inventory.push((path.display().to_string(), r, "configuration reference"));
         }
     }
-    let mut transfer_reservations = BTreeSet::new();
+    let (mut transfer_reservations, unbound) =
+        crate::registry::in_flight(&layout.state, &config.drive)?;
+    roots.extend(transfer_reservations.iter().cloned());
+    if unbound {
+        roots.extend(manifests.keys().cloned());
+        roots.extend(archives.iter().map(|a| a.file.file_id.clone()));
+    }
+    for root in &transfer_reservations {
+        inventory.push((
+            layout.state.join("registry").display().to_string(),
+            root.clone(),
+            "in-flight transfer",
+        ));
+    }
     let mut registries: BTreeMap<PathBuf, BTreeMap<String, Value>> = BTreeMap::new();
     // Mutable state is a pin. Registry entries have explicit completion status; only unfinished
     // transfers pin data. A torn/unrecognized state document blocks planning instead of deletion.
@@ -1089,6 +1114,18 @@ fn plan(
         )
     });
     for path in mutable_paths {
+        if path
+            .file_name()
+            .is_some_and(|n| n.to_string_lossy().starts_with("reclaim-"))
+        {
+            roots.extend(crate::lineage::reclamation_roots(&path)?);
+            continue;
+        }
+        if path.starts_with(layout.state.join("registry"))
+            || path.file_name().is_some_and(|n| n == "transfers.json")
+        {
+            continue;
+        }
         // Generated execution configs are fingerprints, not operator pins after completion.
         if path.extension().is_some_and(|e| e == "toml") {
             if path

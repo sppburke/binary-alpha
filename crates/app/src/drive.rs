@@ -140,8 +140,6 @@ struct Listing {
     next_page_token: Option<String>,
     #[serde(default)]
     files: Vec<RemoteFile>,
-    #[serde(default, rename = "incompleteSearch")]
-    incomplete_search: bool,
 }
 
 #[derive(Deserialize)]
@@ -518,7 +516,7 @@ impl Drive {
                 .map_err(|_| "drive files.list: malformed response")?;
             if listing.incomplete_search {
                 return Err(
-                    "drive files.list: incompleteSearch; no complete archive inventory".into(),
+                    "drive files.list: incompleteSearch: incomplete search; no complete archive inventory".into(),
                 );
             }
             files.extend(

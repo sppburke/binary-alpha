@@ -2,7 +2,7 @@
 //! a versioned snapshot compacts every 256 changes. Content keys include manifests/catalogs,
 //! so names and job-local aliases never establish content identity.
 use crate::drive::{Drive, DriveSettings};
-use crate::store::{self, ObjectIdentity};
+use crate::store::ObjectIdentity;
 use binary_alpha_engine::dataset::object_key;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -21,6 +21,8 @@ pub struct Entry {
     pub done: bool,
     pub bytes: u64,
     pub sha256: String,
+    #[serde(default)]
+    pub aliases: BTreeSet<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -108,66 +110,8 @@ impl Registry {
         File::open(state_dir)
             .and_then(|f| f.sync_all())
             .map_err(|e| e.to_string())?;
+        let state = load_state(&directory, settings, true)?;
         let snapshot = directory.join("snapshot.json");
-        let mut state: State = match fs::read(&snapshot) {
-            Ok(bytes) => {
-                serde_json::from_slice(&bytes).map_err(|e| format!("registry snapshot: {e}"))?
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => State {
-                version: 1,
-                archive_root: settings.root_folder_id.clone(),
-                endpoint: settings.loopback_endpoint.clone(),
-                ..State::default()
-            },
-            Err(e) => return Err(e.to_string()),
-        };
-        if state.version != 1
-            || state.archive_root != settings.root_folder_id
-            || state.endpoint != settings.loopback_endpoint
-        {
-            return Err(
-                "registry: archive root, endpoint, or version conflicts with snapshot".into(),
-            );
-        }
-        let log = directory.join("events.ndjson");
-        if let Ok(file) = File::open(&log) {
-            let mut reader = BufReader::new(file);
-            let mut valid_bytes = 0;
-            loop {
-                let mut line = Vec::new();
-                let length = reader
-                    .read_until(b'\n', &mut line)
-                    .map_err(|e| e.to_string())?;
-                if length == 0 {
-                    break;
-                }
-                if line.last() != Some(&b'\n') {
-                    // The only discardable record is an uncommitted trailing partial line.
-                    OpenOptions::new()
-                        .write(true)
-                        .open(&log)
-                        .and_then(|f| {
-                            f.set_len(valid_bytes)?;
-                            f.sync_all()
-                        })
-                        .map_err(|e| e.to_string())?;
-                    break;
-                }
-                valid_bytes += length as u64;
-                let record: Record =
-                    serde_json::from_slice(&line).map_err(|e| format!("registry journal: {e}"))?;
-                if record.sequence <= state.sequence {
-                    continue;
-                }
-                if record.sequence != state.sequence + 1 {
-                    return Err("registry: journal sequence gap".into());
-                }
-                state.sequence = record.sequence;
-                state.apply(record.change);
-            }
-        } else if log.exists() {
-            return Err("registry: cannot read journal".into());
-        }
         let registry = Self {
             directory,
             state: Mutex::new(state),
@@ -328,6 +272,7 @@ impl Registry {
                         done: true,
                         bytes: identity.bytes,
                         sha256: identity.sha256.clone(),
+                        aliases: BTreeSet::new(),
                     },
                 },
             )?;
@@ -398,6 +343,7 @@ impl Registry {
                     done: true,
                     bytes: identity.bytes,
                     sha256: identity.sha256,
+                    aliases: BTreeSet::new(),
                 });
         }
         let keys: BTreeSet<_> = self
@@ -446,11 +392,20 @@ impl Registry {
         self.healthy()?;
         let key = object_key(&identity.sha256);
         let mut state = self.state.lock().map_err(|_| "registry lock poisoned")?;
-        if let Some(entry) = state.files.get(&key) {
+        if let Some(mut entry) = state.files.get(&key).cloned() {
             if entry.bytes != identity.bytes || entry.sha256 != identity.sha256 {
                 return Err("registry: content identity conflict".into());
             }
-            return Ok(entry.clone());
+            if entry.aliases.insert(alias.into()) {
+                self.record(
+                    &mut state,
+                    Change::Put {
+                        key,
+                        entry: entry.clone(),
+                    },
+                )?;
+            }
+            return Ok(entry);
         }
         let legacy = state.legacy.get(alias).or_else(|| {
             let (_, key) = alias.split_once('/')?;
@@ -461,7 +416,7 @@ impl Registry {
                 (other.split_once('/').map(|(_, suffix)| suffix) == Some(key)).then_some(entry)
             })
         });
-        let (file_id, session) = if let Some(entry) = legacy {
+        let (file_id, session) = if let Some(entry) = legacy.filter(|e| !e.done) {
             (entry.file_id.clone(), entry.session.clone())
         } else {
             (drive.generate_ids(1)?.remove(0), None)
@@ -472,6 +427,7 @@ impl Registry {
             done: false,
             bytes: identity.bytes,
             sha256: identity.sha256.clone(),
+            aliases: BTreeSet::from([alias.into()]),
         };
         self.record(
             &mut state,
@@ -502,8 +458,26 @@ impl Registry {
         let _lease = lease.lock().map_err(|_| "registry lease poisoned")?;
         let mut entry = self.reserve(drive, identity, alias)?;
         if entry.done {
-            drive.verify(&entry.file_id, identity)?;
-            return Ok(entry.file_id);
+            if drive
+                .metadata(&entry.file_id)?
+                .is_some_and(|file| !file.trashed)
+            {
+                drive.verify(&entry.file_id, identity)?;
+                return Ok(entry.file_id);
+            }
+            // Only this store's completed retirement authorizes releasing a missing binding.
+            // Arbitrary remote loss still fails closed, preserving pinned catalog receipts.
+            let retired =
+                crate::retire::retired_closures(self.directory.parent().expect("state directory"))?
+                    .contains(&entry.file_id);
+            if !retired {
+                drive.verify(&entry.file_id, identity)?;
+            }
+            {
+                let mut state = self.state.lock().map_err(|_| "registry lock poisoned")?;
+                self.record(&mut state, Change::Remove { key: key.clone() })?;
+            }
+            entry = self.reserve(drive, identity, alias)?;
         }
         let file_id = entry.file_id.clone();
         let session = entry.session.clone();
@@ -526,260 +500,144 @@ impl Registry {
     }
 }
 
-/// Select by manifest evidence, independent of migration/update implementation. A restored
-/// descendant is sufficient: no removed v1 generation or local parent closure is required.
-pub fn newest_daily(
-    local: &store::Store,
-    instrument: &str,
-    role: binary_alpha_engine::dataset::DatasetRole,
-    access: binary_alpha_engine::research::Access<'_>,
-) -> Result<String, String> {
-    use binary_alpha_engine::dataset::{GenerationManifest, Layout, manifest_key};
-    let mut candidates = Vec::new();
-    for generation in local.list_manifests()? {
-        access.lookup(&generation)?;
-        let mut bytes = Vec::new();
-        local.read_to(&manifest_key(&generation), None, &mut bytes)?;
-        if crate::verify::manifest_kind(&bytes)?.is_some() {
-            continue;
+fn load_state(directory: &Path, settings: &DriveSettings, repair: bool) -> Result<State, String> {
+    let snapshot = directory.join("snapshot.json");
+    let mut state: State = match fs::read(&snapshot) {
+        Ok(bytes) => {
+            serde_json::from_slice(&bytes).map_err(|e| format!("registry snapshot: {e}"))?
         }
-        let manifest = GenerationManifest::from_json(&bytes)?;
-        if manifest.layout != Some(Layout::DailyV2)
-            || manifest.instrument != instrument
-            || manifest.role != role
-        {
-            continue;
-        }
-        access.permit(Some(role), &generation)?;
-        let end = binary_alpha_engine::market::parse_event_time_micros(
-            &manifest.coverage.last_event_time,
-        )?;
-        candidates.push((end, manifest));
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => State {
+            version: 1,
+            archive_root: settings.root_folder_id.clone(),
+            endpoint: settings.loopback_endpoint.clone(),
+            ..State::default()
+        },
+        Err(e) => return Err(e.to_string()),
+    };
+    if state.version != 1
+        || state.archive_root != settings.root_folder_id
+        || state.endpoint != settings.loopback_endpoint
+    {
+        return Err("registry: archive root, endpoint, or version conflicts with snapshot".into());
     }
-    let end = candidates
-        .iter()
-        .map(|(end, _)| *end)
-        .max()
-        .ok_or_else(|| format!("pipeline: no daily-v2 dataset for {instrument}"))?;
-    candidates.retain(|(candidate_end, _)| *candidate_end == end);
-    let generations: BTreeSet<_> = candidates
-        .iter()
-        .map(|(_, m)| m.generation.clone())
+    let log = directory.join("events.ndjson");
+    if let Ok(file) = File::open(&log) {
+        let mut reader = BufReader::new(file);
+        let mut valid_bytes = 0;
+        loop {
+            let mut line = Vec::new();
+            let length = reader
+                .read_until(b'\n', &mut line)
+                .map_err(|e| e.to_string())?;
+            if length == 0 {
+                break;
+            }
+            if line.last() != Some(&b'\n') {
+                if !repair {
+                    return Err(
+                        "registry: incomplete journal tail; resume producer before retirement"
+                            .into(),
+                    );
+                }
+                // The only discardable record is an uncommitted trailing partial line.
+                OpenOptions::new()
+                    .write(true)
+                    .open(&log)
+                    .and_then(|f| {
+                        f.set_len(valid_bytes)?;
+                        f.sync_all()
+                    })
+                    .map_err(|e| e.to_string())?;
+                break;
+            }
+            valid_bytes += length as u64;
+            let record: Record =
+                serde_json::from_slice(&line).map_err(|e| format!("registry journal: {e}"))?;
+            if record.sequence <= state.sequence {
+                continue;
+            }
+            if record.sequence != state.sequence + 1 {
+                return Err("registry: journal sequence gap".into());
+            }
+            state.sequence = record.sequence;
+            state.apply(record.change);
+        }
+    } else if log.exists() {
+        return Err("registry: cannot read journal".into());
+    }
+    Ok(state)
+}
+
+/// Read-only replay for retirement: the registry owns its snapshot watermark, journal changes,
+/// logical aliases and legacy imports. No registry state changes while a plan is fingerprinted.
+pub(crate) fn in_flight(
+    state_dir: &Path,
+    settings: &DriveSettings,
+) -> Result<(BTreeSet<String>, bool), String> {
+    let directory = state_dir.join("registry");
+    let state = load_state(&directory, settings, false)?;
+    let mut roots = BTreeSet::new();
+    let mut unbound = false;
+    let completed: BTreeSet<_> = state
+        .files
+        .values()
+        .filter(|e| e.done)
+        .map(|e| e.file_id.as_str())
         .collect();
-    let mut ancestors = BTreeSet::new();
-    if generations.len() > 1 {
-        for (_, manifest) in &candidates {
-            if let Some(object) = manifest
-                .objects
-                .iter()
-                .find(|o| o.path == "provenance/lineage.json")
-            {
-                let mut bytes = Vec::new();
-                local.read_to(&object.key, None, &mut bytes)?;
-                confirm_bytes(&bytes, object.bytes, &object.sha256)?;
-                ancestors.extend(lineage_references(
-                    &bytes,
-                    &generations,
-                    &manifest.generation,
-                )?);
+    for (key, entry) in &state.files {
+        if entry.done {
+            continue;
+        }
+        roots.insert(key.clone());
+        roots.insert(entry.file_id.clone());
+        if entry.aliases.is_empty() {
+            unbound = true;
+        }
+        for alias in &entry.aliases {
+            pin_alias(alias, &mut roots)?;
+        }
+    }
+    for (alias, entry) in &state.legacy {
+        if !entry.done && !completed.contains(entry.file_id.as_str()) {
+            roots.insert(entry.file_id.clone());
+            pin_alias(alias, &mut roots)?;
+        }
+    }
+    for job in fs::read_dir(state_dir).map_err(|e| e.to_string())? {
+        let job = job.map_err(|e| e.to_string())?;
+        let path = job.path().join("transfers.json");
+        if !path.is_file() {
+            continue;
+        }
+        let legacy: LegacyTransfers =
+            serde_json::from_slice(&fs::read(path).map_err(|e| e.to_string())?)
+                .map_err(|e| e.to_string())?;
+        for (key, entry) in legacy.files {
+            if !entry.done && !completed.contains(entry.file_id.as_str()) {
+                roots.insert(entry.file_id);
+                pin_key(&key, &mut roots)?;
             }
         }
     }
-    terminal_generation(&generations, &ancestors)
+    Ok((roots, unbound))
 }
-
-fn terminal_generation(
-    generations: &BTreeSet<String>,
-    ancestors: &BTreeSet<String>,
-) -> Result<String, String> {
-    let mut terminals = generations.difference(ancestors);
-    let newest = terminals
-        .next()
-        .ok_or("archive: cyclic daily lineage at newest coverage")?;
-    if terminals.next().is_some() {
-        return Err(
-            "archive: ambiguous daily lineage at equal coverage; no unique descendant is proved"
-                .into(),
-        );
-    }
-    Ok(newest.clone())
+fn pin_alias(alias: &str, roots: &mut BTreeSet<String>) -> Result<(), String> {
+    let (_, key) = alias
+        .split_once('/')
+        .ok_or("registry: malformed logical alias")?;
+    pin_key(key, roots)
 }
-
-fn confirm_bytes(bytes: &[u8], expected_bytes: u64, expected_sha256: &str) -> Result<(), String> {
-    use sha2::{Digest, Sha256};
-    if bytes.len() as u64 != expected_bytes
-        || binary_alpha_engine::hex(&Sha256::digest(bytes)) != expected_sha256
+fn pin_key(key: &str, roots: &mut BTreeSet<String>) -> Result<(), String> {
+    roots.insert(key.into());
+    if let Some(id) = key
+        .strip_prefix("manifests/")
+        .and_then(|s| s.strip_suffix("/ready.json"))
     {
-        return Err("archive: lineage bytes disagree with the pinned manifest".into());
+        roots.insert(id.into());
+    } else if let Some(pair) = key.strip_prefix("catalog/") {
+        roots.extend(pair.split('/').map(str::to_string));
+    } else if !key.starts_with("objects/") && !key.starts_with("records/") {
+        return Err("registry: unresolved logical transfer key".into());
     }
     Ok(())
-}
-
-/// Lineage is owned by migration/acquisition. Its generation references name predecessors;
-/// intersecting those references with ready candidates avoids coupling to either writer's
-/// JSON field names or needing removed ancestor manifests to restore a descendant.
-fn lineage_references(
-    bytes: &[u8],
-    candidates: &BTreeSet<String>,
-    current: &str,
-) -> Result<BTreeSet<String>, String> {
-    fn visit(
-        value: &serde_json::Value,
-        candidates: &BTreeSet<String>,
-        found: &mut BTreeSet<String>,
-    ) {
-        match value {
-            serde_json::Value::String(value) if candidates.contains(value) => {
-                found.insert(value.clone());
-            }
-            serde_json::Value::Array(values) => {
-                values.iter().for_each(|v| visit(v, candidates, found))
-            }
-            serde_json::Value::Object(values) => {
-                values.values().for_each(|v| visit(v, candidates, found))
-            }
-            _ => {}
-        }
-    }
-    let value = serde_json::from_slice(bytes).map_err(|e| format!("archive lineage: {e}"))?;
-    let mut found = BTreeSet::new();
-    visit(&value, candidates, &mut found);
-    found.remove(current);
-    Ok(found)
-}
-
-/// Resolve equal-coverage daily catalogs through their pinned lineage metadata. Catalog
-/// discovery itself still reads catalogs only; acquisition and migration remain separate owners.
-pub fn newest_catalog(
-    catalogs: &[(String, String, crate::data_pipeline::Catalog)],
-    drive: &mut Drive,
-    scratch: &Path,
-    access: binary_alpha_engine::research::Access<'_>,
-) -> Result<usize, String> {
-    use binary_alpha_engine::{dataset::GenerationManifest, market::parse_event_time_micros};
-    let mut candidates = Vec::new();
-    for (index, (_, _, catalog)) in catalogs.iter().enumerate() {
-        candidates.push((
-            (
-                parse_event_time_micros(&catalog.coverage.last_event_time)?,
-                catalog.layout.is_some(),
-            ),
-            index,
-        ));
-    }
-    let newest = candidates
-        .iter()
-        .map(|(key, _)| *key)
-        .max()
-        .ok_or("drive: no archived catalog")?;
-    candidates.retain(|(key, _)| *key == newest);
-    let generations: BTreeSet<_> = candidates
-        .iter()
-        .map(|(_, i)| catalogs[*i].2.dataset.generation.clone())
-        .collect();
-    let mut ancestors = BTreeSet::new();
-    if newest.1 && generations.len() > 1 {
-        for (_, index) in &candidates {
-            let catalog = &catalogs[*index].2;
-            access.permit(Some(catalog.role), &catalog.dataset.generation)?;
-            let read = |drive: &mut Drive,
-                        id: &str,
-                        bytes: u64,
-                        sha256: &str|
-             -> Result<Vec<u8>, String> {
-                let path = scratch.join(format!("{sha256}.lineage"));
-                drive.download(
-                    id,
-                    &path,
-                    &ObjectIdentity {
-                        bytes,
-                        sha256: sha256.into(),
-                        crc32c: 0,
-                    },
-                )?;
-                let bytes = fs::read(&path).map_err(|e| e.to_string())?;
-                fs::remove_file(path).map_err(|e| e.to_string())?;
-                Ok(bytes)
-            };
-            let entry = &catalog.dataset;
-            let manifest = GenerationManifest::from_json(&read(
-                drive,
-                &entry.file_id,
-                entry.bytes,
-                &entry.sha256,
-            )?)?;
-            if manifest.generation != entry.generation
-                || manifest.layout != catalog.layout
-                || manifest.role != catalog.role
-            {
-                return Err("archive: catalog disagrees with lineage manifest".into());
-            }
-            if let Some(object) = manifest
-                .objects
-                .iter()
-                .find(|o| o.path == "provenance/lineage.json")
-            {
-                let entry = catalog
-                    .objects
-                    .iter()
-                    .find(|e| {
-                        e.key == object.key && e.bytes == object.bytes && e.sha256 == object.sha256
-                    })
-                    .ok_or("archive: lineage lies outside pinned catalog closure")?;
-                let bytes = read(drive, &entry.file_id, entry.bytes, &entry.sha256)?;
-                ancestors.extend(lineage_references(
-                    &bytes,
-                    &generations,
-                    &manifest.generation,
-                )?);
-            }
-        }
-    }
-    let terminal = newest
-        .1
-        .then(|| terminal_generation(&generations, &ancestors))
-        .transpose()?;
-    candidates
-        .iter()
-        .map(|(_, i)| *i)
-        .filter(|i| {
-            terminal
-                .as_ref()
-                .is_none_or(|generation| *generation == catalogs[*i].2.dataset.generation)
-        })
-        .max_by_key(|i| &catalogs[*i].2.dataset.generation)
-        .ok_or_else(|| "archive: cyclic daily catalog lineage".into())
-}
-
-/// Archive consumes an already published stream. Computing its identity from the configured
-/// definition avoids regenerating daily files and racing parallel jobs' audit temporaries.
-pub fn verified_daily_stream(
-    local: &store::Store,
-    dataset: &str,
-    config: &binary_alpha_engine::config::Config,
-    access: binary_alpha_engine::research::Access<'_>,
-) -> Result<String, String> {
-    use binary_alpha_engine::{
-        dataset::{GenerationManifest, manifest_key},
-        market::InstrumentId,
-        stream::stream_generation_id_with_layout,
-    };
-    access.permit(None, dataset)?;
-    let key = manifest_key(dataset);
-    let mut bytes = Vec::new();
-    local.read_to(&key, None, &mut bytes)?;
-    let manifest = GenerationManifest::from_json(&bytes)?;
-    access.permit(Some(manifest.role), dataset)?;
-    let instrument = InstrumentId {
-        broker: manifest.broker.clone(),
-        provider_symbol: manifest.provider_symbol.clone(),
-    };
-    let definition = config
-        .instrument(&instrument, manifest.native_granularity)
-        .ok_or_else(|| format!("no configured instrument maps {instrument}"))?;
-    let stream =
-        stream_generation_id_with_layout(dataset, &definition.canonical_toml(), manifest.layout);
-    crate::verify::run_with(&local.uri(&key), access)?;
-    crate::verify::run_with(&local.uri(&manifest_key(&stream)), access)?;
-    Ok(stream)
 }

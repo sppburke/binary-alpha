@@ -177,7 +177,7 @@ fn archive_fixture(
             .entry(o.key.clone())
             .or_insert_with(|| entry(drive, root, &o.key, None));
     }
-    let catalog = json!({"schema_version":1,"job":"deriv","broker":dataset.broker,"provider_symbol":dataset.provider_symbol,"instrument":dataset.instrument,"role":dataset.role,"source_kind":dataset.source_kind,"native_granularity":dataset.native_granularity,"coverage":dataset.coverage,"row_count":dataset.row_count,"dataset":entry(drive,root,&dataset.key(),Some(&dataset.generation)),"stream":entry(drive,root,&stream.key(),Some(&stream.generation)),"objects":objects.into_values().collect::<Vec<_>>()});
+    let catalog = json!({"schema_version":1,"layout":dataset.layout,"job":"deriv","broker":dataset.broker,"provider_symbol":dataset.provider_symbol,"instrument":dataset.instrument,"role":dataset.role,"source_kind":dataset.source_kind,"native_granularity":dataset.native_granularity,"coverage":dataset.coverage,"row_count":dataset.row_count,"dataset":entry(drive,root,&dataset.key(),Some(&dataset.generation)),"stream":entry(drive,root,&stream.key(),Some(&stream.generation)),"objects":objects.into_values().collect::<Vec<_>>()});
     let bytes = serde_json::to_vec_pretty(&catalog).unwrap();
     let sha = sha256(&bytes);
     let id = remote(
@@ -239,6 +239,32 @@ fn fixture() -> Fixture {
     let drive = serve();
     let mut pair = daily::pair(&scratch, false);
     let published = scratch.path("published");
+    let obsolete_coverage = pair
+        .v1
+        .objects
+        .iter()
+        .find(|o| o.path == "provenance/coverage.json")
+        .unwrap()
+        .key
+        .clone();
+    fs::remove_file(published.join(obsolete_coverage)).unwrap();
+    let old_import = published.join(pair.v1.key());
+    fs::remove_dir_all(old_import.parent().unwrap()).unwrap();
+    let shared = pair
+        .v2
+        .objects
+        .iter()
+        .find(|o| o.path == "provenance/coverage.json")
+        .unwrap()
+        .clone();
+    *pair
+        .v1
+        .objects
+        .iter_mut()
+        .find(|o| o.path == "provenance/coverage.json")
+        .unwrap() = shared;
+    daily::publish(&published, &mut pair.v1);
+
     let mut history = pair.v1.clone();
     history.source_kind = SourceKind::BrokerHistory;
     let coverage = scratch.path("history-coverage.json");
@@ -931,4 +957,52 @@ fn retirement_requires_complete_catalog_bindings_and_keeps_extra_manifests() {
             .iter()
             .all(|e| p.retained_objects.contains_key(&e.key))
     );
+}
+
+#[test]
+fn retirement_replays_actual_registry_aliases_watermark_and_removals() {
+    let f = fixture();
+    let config: data_pipeline::PipelineConfig =
+        toml::from_str(&fs::read_to_string(&f.config).unwrap()).unwrap();
+    let state = f.root.join("pipeline_state");
+    let mut drive = binary_alpha_app::drive::Drive::open(&config.drive).unwrap();
+    drop(binary_alpha_app::registry::Registry::open(&state, &config.drive, &mut drive).unwrap());
+    let directory = state.join("registry");
+    let mut snapshot = super::registry_archive::registry_state(&directory);
+    // Compact the actual schema, leaving older journal records to be skipped at its watermark.
+    fs::write(directory.join("snapshot.json"), snapshot.to_string()).unwrap();
+    let mut seq = snapshot["sequence"].as_u64().unwrap();
+    let mut append = |change: Value| {
+        seq += 1;
+        let mut log = std::fs::OpenOptions::new()
+            .append(true)
+            .open(directory.join("events.ndjson"))
+            .unwrap();
+        writeln!(log, "{}", json!({"sequence":seq,"change":change})).unwrap();
+    };
+    let key = format!("objects/{}", "a".repeat(64));
+    let legacy_key = binary_alpha_engine::dataset::manifest_key(&f.old[0]);
+    let entry = json!({"file_id":"reserved-catalog","session":null,"done":false,"bytes":12,"sha256":"a".repeat(64),"aliases":[format!("deriv/catalog/{}/{}",f.old[1],f.old[2])]});
+    append(json!({"kind":"put","key":key,"entry":entry}));
+    append(
+        json!({"kind":"legacy","alias":format!("deriv/{legacy_key}"),"entry":{"file_id":"reserved-manifest","done":false,"session":null}}),
+    );
+    let (_, p) = plan(&f);
+    assert!(
+        !p.delete_local
+            .iter()
+            .any(|d| f.old.iter().any(|id| d.path == format!("manifests/{id}")))
+    );
+    // Completion supersedes the imported in-flight alias, and Remove supersedes reservation.
+    append(
+        json!({"kind":"put","key":format!("objects/{}","b".repeat(64)),"entry":{"file_id":"reserved-manifest","session":null,"done":true,"bytes":12,"sha256":"b".repeat(64),"aliases":[format!("deriv/{legacy_key}")]}}),
+    );
+    append(json!({"kind":"remove","key":key}));
+    let (_, p) = plan(&f);
+    assert_eq!(p.totals.manifest_directories, 3);
+    // A replayed pre-watermark reservation must not resurrect the removed transfer.
+    snapshot = super::registry_archive::registry_state(&directory);
+    fs::write(directory.join("snapshot.json"), snapshot.to_string()).unwrap();
+    let (_, p) = plan(&f);
+    assert_eq!(p.totals.manifest_directories, 3);
 }

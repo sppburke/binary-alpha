@@ -479,7 +479,7 @@ fn archive_parallel_jobs_share_daily_objects_and_descendant_uploads_only_changes
     .unwrap();
     assert!(pulled.contains(&descendant.generation), "{pulled}");
     assert!(
-        !scratch
+        scratch
             .path("descendant-consumer/store")
             .join(pair.v2.key())
             .exists()
@@ -542,7 +542,7 @@ fn archive_daily_fresh_restore_verifies_every_partition_for_both_brokers() {
         }
         assert!(!restored.join(pair.v1.key()).exists());
         assert_eq!(
-            binary_alpha_app::registry::newest_daily(
+            binary_alpha_app::lineage::newest_daily(
                 &store::Store::filesystem(&restored),
                 &pair.v2.instrument,
                 pair.v2.role,

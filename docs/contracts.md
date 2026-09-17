@@ -456,6 +456,9 @@ Embedded metadata is `closed = left`, `frequency = 5s`,
 bars with start at or after the acquisition start and end at or before the cutoff enter the
 new rows. Volume remains the provider's value; first/last tick times are not invented.
 
+The bundle and schema-1 coverage details below describe legacy-v1 publication. Daily-v2
+publication uses the typed coverage and daily occurrence contract in [Market data layout v2](#market-data-layout-v2-daily).
+
 Matched history-page bytes are retained before row decoding. Individual pages stay locally
 retained under `objects/SHA256HEX` for pending-intent replay;
 publication concatenates the acquisition's pages in request order, without framing, into one
@@ -491,7 +494,7 @@ For pipeline advances, the acquisition frontier is the latest retained tick time
 the latest complete bar. A new acquisition starts at
 `max(history.start, frontier - overlap_seconds)`, even when older seed coverage has gaps.
 A pending acquisition instead keeps its pinned baseline, start, cutoff, and retained pages.
-The seed's original manifest is retained as `seed/ready.json`, with its raw/provenance objects
+For legacy v1, the seed's original manifest is retained as `seed/ready.json`, with its raw/provenance objects
 beneath `seed/`; lineage uses generation and source identity without a producer-location
 dependency. Seeds must match instrument, role, native representation, and source identity.
 A seeded lineage is never narrowed: a later `history.start` than its first retained row or a
@@ -499,7 +502,7 @@ cutoff before its retained frontier fails before broker connection. Retained row
 An older inherited gap remains in the retained data and provenance; frontier advancement does
 not establish continuous coverage or repair history outside the overlap.
 
-If a reread adds no rows and leaves verified coverage and shortfalls unchanged, fetch reuses the
+For legacy v1, if a reread adds no rows and leaves verified coverage and shortfalls unchanged, fetch reuses the
 prior dataset and its original manifest. New request receipts still record `anchor`, `sha256`,
 `bytes`, `rows`, and local `receipt_time` in the pipeline operation receipt; identical raw
 bytes do not require duplicate objects or a new dataset. Coverage page counts are retained page
@@ -551,9 +554,9 @@ their instrument streams. Derived research artifacts retain their own formats. T
 dataset and instrument-stream layout documented elsewhere here is **legacy layout v1**, readable
 until verified retirement. An absent manifest `layout` means v1; `layout = "daily-v2"` selects
 this contract. Types, codecs, shared v1/v2 observation readers, v2 audit candle publication,
-v2 verification, the archive-root registry, and daily archive/list/pull/restore are implemented.
-[Retirement](retirement.md) supports explicit local/Drive plans and resumable application.
-Migration and v2 acquisition/continuation belong to separate steps; verification uses fixtures only.
+v2 verification, direct v2 imports and updates, the archive-root registry, daily archive/list/pull/restore,
+and [retirement](retirement.md) are implemented and integrated using deterministic fixtures.
+The separate migration command and operations on existing archives remain outside this integration.
 
 ### 1. Families
 
@@ -621,7 +624,7 @@ Rows sorted canonically (observations and candles by time then original order; p
 
 ### 2. Page occurrences
 
-Columns: `acquisition_id` (import: SHA-256 of the replaced `raw_pages.ndjson`; broker history: the name of the immutable operation receipt record of the invocation that made the request, or for requests only held in a pending progress log, the intent name plus the SHA-256 of that log's header); `intent` (nullable, the intent record name, kept separately); `ordinal` (0-based position in that acquisition's raw source order: NDJSON line number, or request order within the receipt or log); `checkpoint_ordinal` (nullable, the checkpoint line's own 0-based position, which can differ from `ordinal`); `order_kind` (`request_order` or `source_file_order`); `payload_sha256`; `payload` (exact response bytes; for NDJSON lines the bytes without the trailing newline, which is what the checkpoint `payload_sha256` covers); `request_token` (opaque provider anchor as sent, nullable); `request_anchor_utc` (nullable; the historical request boundary, not dispatch time: Pocket `UTC = provider_seconds − recorded_offset_minutes × 60`, Deriv `UTC = epoch_seconds`, both converted with checked arithmetic to microseconds); `receipt_time_utc` (nullable); `receipt_state` (`recorded`, `not_recorded_by_source` for recovered checkpoint lines, `absent_in_legacy_record`); `first_event_time`, `last_event_time` (nullable for empty pages); `rows`; `checkpoint` (exact original checkpoint line bytes, nullable); `disposition` (`indexed`, `diagnostic` for retained responses that failed validation or belong to abandoned acquisitions).
+Columns: `acquisition_id` (import: SHA-256 of the replaced `raw_pages.ndjson`; broker history: the name of an immutable acquisition record created before the invocation's first request, binding the intent and a unique invocation token; every page progress entry and operation receipt records this identity. Replayed pages keep their original identity and ordinal, while new requests on resumption use the new invocation's acquisition record; legacy requests only held in a pending progress log use the intent name plus the SHA-256 of that log's header); `intent` (nullable, the intent record name, kept separately); `ordinal` (0-based position in that acquisition's raw source order: NDJSON line number, or request order within the receipt or log); `checkpoint_ordinal` (nullable, the checkpoint line's own 0-based position, which can differ from `ordinal`); `order_kind` (`request_order` or `source_file_order`); `payload_sha256`; `payload` (exact response bytes; for NDJSON lines the bytes without the trailing newline, which is what the checkpoint `payload_sha256` covers); `request_token` (opaque provider anchor as sent, nullable); `request_anchor_utc` (nullable; the historical request boundary, not dispatch time: Pocket `UTC = provider_seconds − recorded_offset_minutes × 60`, Deriv `UTC = epoch_seconds`, both converted with checked arithmetic to microseconds); `receipt_time_utc` (nullable); `receipt_state` (`recorded`, `not_recorded_by_source` for recovered checkpoint lines, `absent_in_legacy_record`); `first_event_time`, `last_event_time` (nullable for empty pages); `rows`; `checkpoint` (exact original checkpoint line bytes, nullable); `disposition` (`indexed`, `diagnostic` for retained responses that failed validation or belong to abandoned acquisitions).
 
 Rules: one row per response occurrence, never deduplicated by payload hash; the inventory of occurrences covers every completed operation receipt, every published coverage index, every pending progress log, and every import NDJSON/checkpoint pair. Storage aliases of one occurrence (a single-page object, its bundle slice, a replayed checkpoint of the same request) map to that one occurrence through an explicit alias table in the migration record; requests with different recorded receipt times are different occurrences even when anchor and payload are equal. Checkpoint lines are matched to raw lines by payload hash with occurrence counting in source order, never by provider `index` or position alone, and the raw and checkpoint files are each reconstructed from their own ordinal and framing. Import lineage records the NDJSON framing (line terminator, final newline) and both source-file hashes so the original `raw_pages.ndjson` and `checkpoint.ndjson` can be reconstructed byte for byte from the pages of that acquisition.
 
@@ -632,6 +635,17 @@ Rules: one row per response occurrence, never deduplicated by payload hash; the 
 - A descendant references unchanged daily objects by key; it writes new objects only for days whose output changes, per family (new observation days, the previous partial day, and any earlier candle day completed by a newly finalized candle).
 - The five pending v1 acquisitions (8,285 retained pages, 36,198,285 bytes) are migrated first: their retained payloads and progress records become v2 page rows with disposition `diagnostic`, the migration record keeps their intents and the abandonment provenance, and only then are they abandoned by the documented rule. Refetched responses are additional occurrences. The IRRUSD_otc intent record is kept as is (it has no progress pair).
 - The continuation mapping (v1 import, newest history and stream → v2 root and stream) is persisted as an immutable record and archived with the v2 catalog; it preserves source identity, role, requested and verified coverage, shortfalls, and unresolved ranges. `imported_seed`, `prior`, and `pull` select within the v2 lineage (v2 roots and their descendants), prefer it over v1 while both exist, and restore→update works after v1 is removed. The two existing operator fetch configurations that pin v1 seeds (`~/.config/binary-alpha/pipeline/deriv-fetch.toml`, `pocket-fetch.toml`) are rebound to v2 roots or retired before their targets are deleted. The mapping grants no new read authority; existing permit checks still run before object reads.
+
+The daily coverage object is the only authority for requested and verified acquisition ranges,
+shortfalls, unresolved intervals, and day-state evidence. Descendant lineage records contain
+`continuation = {acquisition_id, intent, seed}` to select the typed acquisition used for the next fetch;
+they do not duplicate a legacy coverage object or page index. They preserve `root_generation`,
+`parent_generation`, and the historical `ancestors` identities. Resumed snapshots name prior
+snapshots of the same intent as ancestors only after proving their response occurrences remain
+in the replacement closure. Observation day evidence combines
+retained verified spans with new acquisition evidence; unresolved ranges are their exact UTC-day
+complement. Clipping without a proved covered boundary remains `unknown`. Page completeness
+requires occurrence evidence independently of market coverage.
 
 ### 4. Archive, transfers, and retirement
 
@@ -782,7 +796,9 @@ Under `pipeline_state/`:
 - `registry/snapshot.json` (version `1`) binds `archive_root` and the fixture `endpoint`, and
   stores a `sequence` watermark, `files`, pending `legacy` aliases, imported job names, and
   the completed-rebuild flag. Every `files` key is `objects/SHA256HEX`, including the byte
-  identities of ready manifests and catalogs; values are `{file_id, session, done, bytes, sha256}`.
+  identities of ready manifests and catalogs; values are `{file_id, session, done, bytes, sha256, aliases}`. Logical `job/key` aliases
+  let retirement pin the dataset/stream closure of an unfinished manifest or catalog transfer.
+  Older entries without aliases conservatively retain all local and archived closures.
 - `registry/events.ndjson` appends synced `{sequence, change}` records. Changes are `put`
   (key and entry), `remove` (a stale completed key on rebuild), `legacy` (job/key alias and
   old entry), `imported` (job), or `rebuilt`.
@@ -791,7 +807,7 @@ Under `pipeline_state/`:
   sessions are synced before upload bytes, and a shared per-content lease covers completion.
   A journal or snapshot write failure stops further transfers until the registry is reopened;
   rebuild excludes concurrent transfers. Old `JOB/transfers.json` files are imported once
-  without rewriting them: completed entries require remote identity confirmation, and unfinished
+  without rewriting them; new per-job transfer files are never written: completed entries require remote identity confirmation, and unfinished
   ids/sessions resume on their first use. Started legacy catalogs retain the original per-job
   object and manifest bindings so their resumed bytes do not change during deduplication.
   Session capabilities stay inside the private pipeline-state directory.
@@ -809,6 +825,7 @@ create-once publication; different content at an existing key is a conflict.
 binary-alpha data import --config CORE
 binary-alpha data pipeline update --config PIPELINE [--end END]
 binary-alpha data pipeline archive --config PIPELINE [--job ID]
+binary-alpha data pipeline retire --config PIPELINE [--job ID] [--plan | --apply PLAN_FILE]
 binary-alpha data pipeline list --config PIPELINE --broker BROKER --symbol SYMBOL
 binary-alpha data pipeline pull --config PIPELINE --broker BROKER --symbol SYMBOL
 binary-alpha data pipeline restore --config PIPELINE --catalog FILE_ID --sha256 SHA256 --broker BROKER --symbol SYMBOL
@@ -829,7 +846,19 @@ Existing immutable catalog receipts retain their exact file-id bindings.
 At equal coverage, a generation named in another candidate's hash-confirmed
 `provenance/lineage.json` is a predecessor. Generation references are bare identifiers in JSON
 values; selection does not impose migration/acquisition field names or read ancestor closures.
-The lineage object is archived and restored with the other manifest-owned objects.
+The lineage owner supplies the same daily selection policy to update, archive, pull, and retirement.
+The lineage object is archived and restored with the other manifest-owned objects. Descendant
+catalogs also carry their continuation root and its stream in `lineage_manifests`, with all objects
+in the catalog's shared inventory. Restore authenticates, installs, and verifies every such manifest.
+A legacy daily catalog containing only a descendant may use that self-contained descendant as a
+stable readable seed; subsequent updates preserve the immutable logical root identity.
+
+All producer, pull/restore, and retirement commands acquire the managed-store writer lock and
+then a host-local archive-root lock. Pull holds both continuously from selection through restore.
+Retirement uses the registry owner's read-only replay, including snapshot watermarks, removals,
+logical aliases, and legacy transfer files. Completed reclamation records do not pin removed
+single-page representations. A missing completed remote binding is reusable only after an exact
+completed retirement record authorizes its removal; unrelated remote loss remains an error.
 
 Update requires an imported generation; `END` is `YYYY-MM-DDTHH:MM:SS[.ffffff]Z`. Each job
 acquires a bounded extension, audits and verifies its result, and archives it independently.
@@ -865,6 +894,7 @@ A catalog is pretty-printed JSON with a trailing newline and every field below:
 | --- | --- |
 | `schema_version` | `1` |
 | `layout` | `"daily-v2"` for daily dataset/stream pairs; absent for v1 catalogs |
+| `lineage_manifests` | Optional additional pinned ready manifests: the continuation root and its stream for a daily descendant |
 | `job` | producer job identifier |
 | `broker`, `provider_symbol`, `instrument` | dataset source identifiers |
 | `role` | dataset role, development or evaluation for this workflow |
@@ -914,8 +944,8 @@ catalog FILE_ID sha256 HASH INSTRUMENT ROLE NATIVE layout LAYOUT dataset G strea
 manifests, excluding the catalog itself.
 
 Pull is the consumer's one step: it enumerates the instrument's catalogs exactly as `list` does,
-selects the newest by coverage end (preferring `daily-v2` at equal coverage, then its unique
-lineage descendant; v1 ties use dataset generation), and, unless both of its ready
+prefers the v2 lineage whenever present, then selects by coverage end and its unique
+lineage descendant (v1 ties use dataset generation), and, unless both of its ready
 manifests already exist in this configuration's managed store, restores it exactly as `restore`
 would with that catalog's identifier and digest. It prints the `restored …` line, or
 `pulled INSTRUMENT ROLE dataset URI stream URI catalog FILE_ID (already local)` when nothing was

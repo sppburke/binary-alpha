@@ -757,8 +757,15 @@ fn publish(
     );
 
     let retaining = Instant::now();
+    let mut staging = Vec::new();
     for (file, identity) in dataset.files.iter().zip(&identities) {
-        local.put_new(&object_key(&identity.sha256), &file.absolute, identity)?;
+        let key = object_key(&identity.sha256);
+        if matches!(
+            local.put_new(&key, &file.absolute, identity)?,
+            Put::Created(_)
+        ) {
+            staging.push(key);
+        }
     }
     let retained = retaining.elapsed();
     let retained_path = |object: &ObjectRecord| {
@@ -782,20 +789,41 @@ fn publish(
                     TickRows::Daily { days } => {
                         let paths: Vec<PathBuf> =
                             objects[..days.len()].iter().map(retained_path).collect();
-                        archive::write_ticks(
-                            &temporary,
-                            &dataset.instrument,
-                            *scale,
-                            daily_tick_rows(days, &paths, *scale),
-                        )?
+                        if dataset.role != DatasetRole::Development {
+                            archive::write_ticks(
+                                &temporary,
+                                &dataset.instrument,
+                                *scale,
+                                daily_tick_rows(days, &paths, *scale),
+                            )?
+                        } else {
+                            let mut summary = DataSummary::default();
+                            let mut sequence = binary_alpha_engine::market::TickSequence::default();
+                            for row in daily_tick_rows(days, &paths, *scale) {
+                                let tick = row?;
+                                sequence
+                                    .accept(tick)
+                                    .map_err(|e| format!("{}: {e}", dataset.instrument))?;
+                                summary.rows += 1;
+                                summary
+                                    .first_event_micros
+                                    .get_or_insert(tick.event_time_micros);
+                                summary.last_event_micros = Some(tick.event_time_micros);
+                            }
+                            summary
+                        }
                     }
                 };
-                let identity = store::identify(&temporary)?;
-                local.put_new(&object_key(&identity.sha256), &temporary, &identity)?;
-                fs::remove_file(&temporary)
-                    .map_err(|error| format!("cannot remove {}: {error}", temporary.display()))?;
-                objects.push(record(ObjectRole::Normalized, TICK_OBJECT_PATH, &identity));
-                identities.push(identity);
+                if matches!(rows, TickRows::Csv { .. }) || dataset.role != DatasetRole::Development
+                {
+                    let identity = store::identify(&temporary)?;
+                    local.put_new(&object_key(&identity.sha256), &temporary, &identity)?;
+                    fs::remove_file(&temporary).map_err(|error| {
+                        format!("cannot remove {}: {error}", temporary.display())
+                    })?;
+                    objects.push(record(ObjectRole::Normalized, TICK_OBJECT_PATH, &identity));
+                    identities.push(identity);
+                }
                 (
                     summary,
                     NativeGranularity::Tick,
@@ -843,7 +871,7 @@ fn publish(
     let validated = validating.elapsed();
 
     let (first_event_time, last_event_time) = archive::coverage(&summary)?;
-    let manifest = GenerationManifest {
+    let mut manifest = GenerationManifest {
         layout: None,
         day_inventory: Vec::new(),
         schema_version: MANIFEST_SCHEMA_VERSION,
@@ -877,8 +905,51 @@ fn publish(
         interval,
         objects,
     };
+    if dataset.role == DatasetRole::Development
+        && matches!(
+            source_kind,
+            SourceKind::TickParquetDaily | SourceKind::BarParquet
+        )
+    {
+        manifest = crate::lineage::import_root(local, manifest)?;
+        identities = manifest
+            .objects
+            .iter()
+            .map(|o| store::identify(&retained_path(o)))
+            .collect::<Result<_, _>>()?;
+    }
+    let generation = manifest.generation.clone();
     let publishing = Instant::now();
     let published = publish_generation(manifest, &identities, local, destination)?;
+    if published.manifest.layout.is_some() {
+        // Import staging is not a second retained representation. Remove only this invocation's
+        // newly created staging objects, and only when no ready manifest owns the key.
+        let mut referenced = std::collections::BTreeSet::new();
+        for generation in local.list_manifests()? {
+            let mut bytes = Vec::new();
+            local.read_to(
+                &binary_alpha_engine::dataset::manifest_key(&generation),
+                None,
+                &mut bytes,
+            )?;
+            let value: serde_json::Value =
+                serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
+            if let Some(objects) = value["objects"].as_array() {
+                for o in objects {
+                    if let Some(key) = o["key"].as_str() {
+                        referenced.insert(key.to_string());
+                    }
+                }
+            }
+        }
+        for key in staging {
+            if !referenced.contains(&key) {
+                fs::remove_file(local.local_path(&key).expect("local staging"))
+                    .map_err(|e| e.to_string())?;
+            }
+        }
+    }
+
     let elapsed = publishing.elapsed();
     let report = format!(
         "published {} {} generation {generation} rows {} objects {} reused {}",

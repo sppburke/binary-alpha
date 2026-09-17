@@ -11,15 +11,16 @@ restores to another managed store on this host. This is not a distributed lock a
 
 The implementation reuses `Store`, `Drive`, and `data verify`; it does not duplicate their
 storage or daily decoding rules. A job becomes eligible only when a verified daily dataset
-and matching stream have an archived catalog. The newest catalog is chosen by coverage end,
-then dataset, stream, and file identity. Its dataset ancestry must reach the instrument's one
+and matching stream have an archived catalog. The newest v2 catalog is chosen by the shared lineage selector: coverage end, then proved
+ancestry at equal coverage; ambiguous branches are refused. Its dataset ancestry must reach the instrument's one
 daily continuation root with `provenance/lineage.json`. That immutable mapping is migration's
 authority for which legacy generations were replaced; retirement independently verifies the
 daily storage closure, but does not repeat migration's row/occurrence equality proof.
 
-Retained roots include every daily dataset and stream, the newest eligible catalog and its
+Retained roots include the continuation root and its stream, the newest eligible catalog and its
 exact remote file bindings, configurations, pending acquisitions and pages, and in-flight
-transfers. All other jobs and non-pipeline manifests retain their dependencies. A legacy
+transfers. Proven superseded v2 descendants, streams, catalogs, and replaced partial-day
+objects are candidates only when no retained root needs them. All other jobs and non-pipeline manifests retain their dependencies. A legacy
 generation outside the mapping remains protected. Completed records are inventoried and
 remain on disk even when their mapped closure is retired. Receipt-only pages with no mapped
 manifest closure are protected; an unknown record dependency protects its resolved closure.

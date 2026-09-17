@@ -159,7 +159,7 @@ fn import_publishes_retains_and_verifies_from_either_copy() {
     );
     assert!(
         lines[2].contains("pocket_option:AEDCNY_otc evaluation")
-            && lines[2].contains(" rows 4 objects 9 reused 4 "),
+            && lines[2].contains(" rows 4 objects 9 reused 3 "),
         "provenance bytes shared with the first asset are reused: {}",
         lines[2]
     );
@@ -342,7 +342,7 @@ fn import_publishes_retains_and_verifies_from_either_copy() {
         expected_keys,
         "identical provenance bytes share one object"
     );
-    assert_eq!(expected_keys.len(), 17);
+    assert_eq!(expected_keys.len(), 18);
 
     // Reusing the committed generations from a new historical-data folder retains every child.
     let elsewhere = scratch.config_with(
@@ -946,7 +946,7 @@ fn daily_tick_archives_publish_one_generation_per_listed_directory() {
     assert_eq!(lines.len(), 2, "{lines:?}");
     assert!(
         lines[0].starts_with("published deriv:frxAUDUSD development generation ")
-            && lines[0].contains(" rows 5 objects 6 reused 0 ["),
+            && lines[0].contains(" rows 5 objects 5 reused 0 ["),
         "{}",
         lines[0]
     );
@@ -992,15 +992,15 @@ fn daily_tick_archives_publish_one_generation_per_listed_directory() {
     assert_eq!(
         objects,
         [
-            ("source", "AUDUSD_2025-08-11_ticks.parquet"),
-            ("source", "AUDUSD_2025-08-12_ticks.parquet"),
-            ("provenance", "AUDUSD_2025-08-10_ticks.meta.json"),
-            ("provenance", "AUDUSD_2025-08-11_ticks.meta.json"),
-            ("provenance", "AUDUSD_2025-08-12_ticks.meta.json"),
-            ("normalized", "normalized/ticks.parquet"),
+            ("normalized", "observations/2025-08-10.parquet"),
+            ("normalized", "observations/2025-08-11.parquet"),
+            ("normalized", "observations/2025-08-12.parquet"),
+            ("provenance", "provenance/coverage.json"),
+            ("provenance", "provenance/lineage.json"),
         ],
-        "Parquet days first, then metadata, each in date order"
+        "daily observations and embedded provenance"
     );
+    assert_eq!(json["layout"], "daily-v2");
     let inputs = json["inputs"].as_array().unwrap();
     assert_eq!(inputs.len(), 5);
     let first = scratch.path("sources/deriv/AUDUSD/AUDUSD_2025-08-11_ticks.parquet");
@@ -1011,21 +1011,22 @@ fn daily_tick_archives_publish_one_generation_per_listed_directory() {
         !text.contains("EURUSD") && !text.contains("README"),
         "unlisted root entries are never inventoried"
     );
-    let normalized = scratch
-        .path("published")
-        .join(json["objects"][5]["key"].as_str().unwrap());
-    let reader = SerializedFileReader::new(File::open(&normalized).unwrap()).unwrap();
-    let pairs: Vec<(i64, i64)> = reader
-        .get_row_iter(None)
-        .unwrap()
-        .map(|row| {
-            let row = row.unwrap();
-            (
-                row.get_timestamp_micros(0).unwrap(),
-                row.get_long(1).unwrap(),
-            )
-        })
+    let manifest =
+        binary_alpha_engine::dataset::GenerationManifest::from_json(&fs::read(audusd).unwrap())
+            .unwrap();
+    let pairs: Vec<_> = common::read_normalized_ticks(&scratch.path("published"), &manifest)
+        .into_iter()
+        .map(|t| (t.event_time_micros, t.price_units))
         .collect();
+    let normalized = scratch.path("published").join(
+        &manifest
+            .objects
+            .iter()
+            .find(|o| o.path == "observations/2025-08-11.parquet")
+            .unwrap()
+            .key,
+    );
+    let reader = SerializedFileReader::new(File::open(&normalized).unwrap()).unwrap();
     assert_eq!(
         pairs, NORMALIZED_DAILY_TICKS,
         "exact rows across days, duplicates kept in order"

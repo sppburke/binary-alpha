@@ -201,10 +201,17 @@ pub fn write_collection(root: &Path, assets: &[AssetSpec]) -> PathBuf {
             format!("{{\"asset\": \"{}\"}}\n", spec.asset),
         )
         .unwrap();
-        fs::write(asset_root.join("checkpoint.ndjson"), "{\"page\": 1}\n").unwrap();
+        let raw_page = format!("{{\"asset\": \"{}\", \"data\": []}}", spec.asset);
+        let raw_path = asset_root.join("raw_pages.ndjson");
+        fs::write(&raw_path, &raw_page).unwrap();
+        let payload_sha256 = sha256(&raw_path);
+        fs::write(&raw_path, format!("{raw_page}\n")).unwrap();
         fs::write(
-            asset_root.join("raw_pages.ndjson"),
-            format!("{{\"asset\": \"{}\", \"data\": []}}\n", spec.asset),
+            asset_root.join("checkpoint.ndjson"),
+            format!(
+                "{}\n",
+                json!({"payload_sha256":payload_sha256,"request_token":"1747660500"})
+            ),
         )
         .unwrap();
         fs::write(dataset_root.join("_SUCCESS"), "").unwrap();

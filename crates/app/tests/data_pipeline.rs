@@ -4,6 +4,8 @@
 //! Every broker frame, archive byte, and Drive response here is synthetic.
 
 mod common;
+#[path = "data_pipeline/lineage.rs"]
+mod lineage;
 
 use std::collections::BTreeMap;
 use std::fs::{self, File};
@@ -676,6 +678,12 @@ fn handle_http(
         respond(&mut stream, 401, &[], b"{}");
         return;
     }
+    if request.method == "DELETE" && request.path.starts_with("/drive/v3/files/") {
+        let id = request.path.trim_start_matches("/drive/v3/files/");
+        let existed = state.files.remove(id).is_some();
+        respond(&mut stream, if existed { 204 } else { 404 }, &[], b"");
+        return;
+    }
     // The real service refuses a PUT without `Content-Length` with `411 Length Required`
     // (observed 2026-09-16 on an empty object), even when `Content-Range` says `bytes */0`.
     if request.method == "PUT"
@@ -1343,7 +1351,7 @@ fn pipeline(command: &str, config: &Path, extra: &[&str]) -> Result<String, Stri
 }
 
 fn import(config: &Path) -> Result<String, String> {
-    run(&["data", "import", "--config", config.to_str().unwrap()])
+    lineage::legacy_import(config)
 }
 
 fn imported_generation<'a>(report: &'a str, instrument: &str) -> &'a str {
@@ -4561,3 +4569,6 @@ mod daily_review_fixes;
 mod registry_archive;
 #[path = "data_pipeline/retire.rs"]
 mod retire;
+
+#[path = "data_pipeline/daily_end_to_end.rs"]
+mod daily_end_to_end;
