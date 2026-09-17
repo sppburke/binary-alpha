@@ -236,11 +236,22 @@ fn sha256_hex(bytes: &[u8]) -> String {
 /// The one local writer of an archive root: producer commands hold this nonblocking lock for
 /// their whole run; installing consumers also hold it to exclude retirement.
 pub(crate) fn writer_lock(layout: &Layout) -> Result<File, String> {
-    let path = layout.state.join("writer.lock");
+    retirement_writer_lock(layout, None)
+}
+
+pub(crate) fn retirement_writer_lock(layout: &Layout, plan: Option<&Path>) -> Result<File, String> {
+    writer_lock_at(&layout.state, plan)
+}
+
+fn writer_lock_at(state: &Path, plan: Option<&Path>) -> Result<File, String> {
+    let path = state.join("writer.lock");
     let file = File::create(&path)
         .map_err(|error| format!("cannot create {}: {error}", path.display()))?;
     match file.try_lock() {
-        Ok(()) => Ok(file),
+        Ok(()) => {
+            crate::retire::check_writer(state, plan)?;
+            Ok(file)
+        }
         Err(std::fs::TryLockError::WouldBlock) => Err(format!(
             "pipeline: another producer holds {}",
             path.display()
@@ -249,6 +260,46 @@ pub(crate) fn writer_lock(layout: &Layout) -> Result<File, String> {
             Err(format!("cannot lock {}: {error}", path.display()))
         }
     }
+}
+
+/// Standalone imports may write either copy into a pipeline store. Resolve existing path
+/// aliases, lock each managed store once, and hold all locks until publication finishes.
+pub(crate) fn import_writer_locks(config: &Config, base: &Path) -> Result<Vec<File>, String> {
+    let mut targets = vec![base.join(config.storage.historical_data_dir.as_path())];
+    if let PublicationUri::Filesystem(path) = &config.storage.publication_uri {
+        targets.push(base.join(path));
+    }
+    let mut states = std::collections::BTreeSet::new();
+    for target in targets {
+        let target = if target.is_absolute() {
+            target
+        } else {
+            std::env::current_dir()
+                .map_err(|e| e.to_string())?
+                .join(target)
+        };
+        // A destination can be new beneath an existing store or reached through a symlink.
+        let ancestor = target
+            .ancestors()
+            .find(|p| p.exists())
+            .ok_or("import: destination has no existing ancestor")?;
+        let resolved = ancestor
+            .canonicalize()
+            .map_err(|e| e.to_string())?
+            .join(target.strip_prefix(ancestor).map_err(|e| e.to_string())?);
+        for path in resolved.ancestors() {
+            if path.file_name().is_some_and(|name| name == STORE_DIR)
+                && let Some(parent) = path.parent()
+                && parent.join(STATE_DIR).is_dir()
+            {
+                states.insert(parent.join(STATE_DIR));
+            }
+        }
+    }
+    states
+        .into_iter()
+        .map(|state| writer_lock_at(&state, None))
+        .collect()
 }
 
 /// An immutable record beneath the record store, named by its own content hash; an identical

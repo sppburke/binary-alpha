@@ -479,6 +479,359 @@ fn apply(f: &Fixture, path: &Path) -> Result<String, String> {
     pipeline("retire", &f.config, &["--apply", path.to_str().unwrap()])
 }
 
+fn amend_migration(f: &mut Fixture, field: &str, value: Value) {
+    let path = f.root.join("pipeline_state/records/migration.json");
+    let mut record = read_json(&path);
+    record[field] = value;
+    let bytes = serde_json::to_vec(&record).unwrap();
+    fs::write(&path, &bytes).unwrap();
+    f.original_records.insert(path, bytes);
+    (f.new_catalog, f.new_sha) = archive_fixture(
+        &f.drive,
+        &f.root.join("store"),
+        &f.new_dataset,
+        &f.new_stream,
+    );
+}
+
+#[test]
+fn retirement_unfinished_plan_fences_every_writer_and_resumes() {
+    let f = fixture();
+    common::write_ticks(
+        &f.scratch.path("sources/ticks/ticks.csv"),
+        &["2026-03-22T06:02:39.312Z,AEDCNY,1.80787"],
+    );
+    let import = f
+        .scratch
+        .config("fenced-import.toml", &f.scratch.tick_source());
+    let source = fs::read_to_string(&import).unwrap();
+    fs::write(
+        &import,
+        source.replace(
+            &format!("file://{}", f.scratch.path("published").display()),
+            &format!("file://{}", f.root.join("store").display()),
+        ),
+    )
+    .unwrap();
+    let (path, mut alternative) = plan(&f);
+    alternative.references.reverse();
+    let bytes = serde_json::to_vec(&alternative).unwrap();
+    let other = path.with_file_name(format!("plan-{}.json", sha256(&bytes)));
+    fs::write(&other, bytes).unwrap();
+    f.drive.faults.lock().unwrap().after = Some(1);
+    assert!(apply(&f, &path).unwrap_err().contains("403"));
+    let error = apply(&f, &other).unwrap_err();
+    assert!(error.contains("unfinished retirement"), "{error}");
+    assert!(
+        error.contains(path.file_name().unwrap().to_str().unwrap()),
+        "{error}"
+    );
+    let requests = f.drive.drive.log().len();
+    for command in ["archive", "update", "migrate", "retire"] {
+        let error = pipeline(command, &f.config, &[]).unwrap_err();
+        assert!(
+            error.contains("unfinished retirement"),
+            "{command}: {error}"
+        );
+        assert!(
+            error.contains(path.file_name().unwrap().to_str().unwrap()),
+            "{error}"
+        );
+    }
+    let error =
+        common::command(&["data", "import", "--config", import.to_str().unwrap()]).unwrap_err();
+    assert!(error.contains("unfinished retirement"), "import: {error}");
+    assert!(
+        error.contains(path.file_name().unwrap().to_str().unwrap()),
+        "{error}"
+    );
+    assert_eq!(f.drive.drive.log().len(), requests);
+    f.drive.faults.lock().unwrap().after = None;
+    apply(&f, &path).unwrap();
+    assert!(path.with_extension("retired.json").is_file());
+    plan(&f);
+}
+
+#[test]
+fn retirement_fence_precedes_the_first_deletion_and_survives_torn_progress() {
+    let f = fixture();
+    let (path, _) = plan(&f);
+    let object = f
+        .new_dataset
+        .objects
+        .iter()
+        .find(|o| o.role == ObjectRole::Normalized)
+        .unwrap();
+    let local = f.root.join("store").join(&object.key);
+    let original = fs::read(&local).unwrap();
+    fs::write(&local, b"corrupt retained fixture bytes").unwrap();
+    assert!(apply(&f, &path).is_err());
+    let log = path.with_extension("progress.jsonseq");
+    assert_eq!(fs::read(&log).unwrap(), b"");
+    assert!(
+        !f.drive
+            .drive
+            .log()
+            .iter()
+            .any(|line| line.starts_with("DELETE"))
+    );
+    fs::write(&log, b"\x1e{\"torn\":").unwrap();
+    let error = pipeline("archive", &f.config, &[]).unwrap_err();
+    assert!(error.contains("unfinished retirement"), "{error}");
+    fs::write(local, original).unwrap();
+    apply(&f, &path).unwrap();
+    assert!(fs::read(log).unwrap().starts_with(b"\x1e{\"torn\":"));
+    plan(&f);
+}
+
+#[test]
+fn retirement_duplicate_remote_content_uses_exact_file_ids() {
+    let f = fixture();
+    let original = f.drive.drive.files()[&f.old_catalog].clone();
+    let mut catalog: Value = serde_json::from_slice(&original.bytes).unwrap();
+    let retained: Value =
+        serde_json::from_slice(&f.drive.drive.files()[&f.new_catalog].bytes).unwrap();
+    catalog["objects"].as_array_mut().unwrap().push(
+        retained["objects"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["key"] == f.shared)
+            .unwrap()
+            .clone(),
+    );
+    let object = catalog["objects"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .find(|e| e["key"] == f.shared)
+        .unwrap();
+    let retained_id = object["file_id"].as_str().unwrap().to_string();
+    let duplicate = remote(
+        &f.drive,
+        "obsolete-duplicate",
+        &format!("object-{}", object["sha256"].as_str().unwrap()),
+        fs::read(f.root.join("store").join(&f.shared)).unwrap(),
+    );
+    object["file_id"] = json!(duplicate);
+    f.drive
+        .drive
+        .state
+        .lock()
+        .unwrap()
+        .files
+        .get_mut(&f.old_catalog)
+        .unwrap()
+        .bytes = serde_json::to_vec(&catalog).unwrap();
+    let (_, planned) = plan(&f);
+    assert!(planned.delete_drive.iter().any(|e| e.file_id == duplicate));
+    assert!(
+        planned
+            .retained_drive
+            .iter()
+            .any(|e| e.file_id == retained_id)
+    );
+    assert!(!planned.delete_local.iter().any(|e| e.path == f.shared));
+    let transfers = f.root.join("pipeline_state/deriv/transfers.json");
+    fs::write(
+        &transfers,
+        json!({"files":{&f.shared:{"file_id":duplicate,"done":false}}}).to_string(),
+    )
+    .unwrap();
+    let (_, pinned) = plan(&f);
+    assert!(pinned.retained_drive.iter().any(|e| e.file_id == duplicate));
+    assert!(!pinned.delete_drive.iter().any(|e| e.file_id == duplicate));
+    fs::write(
+        &transfers,
+        json!({"files":{&f.shared:{"file_id":duplicate,"done":true}}}).to_string(),
+    )
+    .unwrap();
+    let (path, _) = plan(&f);
+    apply(&f, &path).unwrap();
+    assert!(!f.drive.drive.files().contains_key(&duplicate));
+    assert!(f.drive.drive.files().contains_key(&retained_id));
+    common::verify(&f.root.join("store").join(f.new_dataset.key())).unwrap();
+}
+
+#[test]
+fn retirement_duplicate_catalog_does_not_pin_obsolete_only_content() {
+    let f = fixture();
+    fs::remove_file(f.root.join("pipeline_state/deriv/progress.json")).unwrap();
+    fs::remove_file(f.root.join("pipeline_state/deriv/progress.pages.jsonl")).unwrap();
+    let files = f.drive.drive.files();
+    let mut duplicate = files[&f.new_catalog].clone();
+    let mut catalog: Value = serde_json::from_slice(&duplicate.bytes).unwrap();
+    catalog["objects"].as_array_mut().unwrap().push(entry(
+        &f.drive,
+        &f.root.join("store"),
+        &f.pending,
+        None,
+    ));
+    duplicate.bytes = serde_json::to_vec(&catalog).unwrap();
+    let duplicate_id = "aaa-obsolete-catalog";
+    f.drive
+        .drive
+        .state
+        .lock()
+        .unwrap()
+        .files
+        .insert(duplicate_id.into(), duplicate);
+    let (path, planned) = plan(&f);
+    assert!(
+        planned
+            .retained_drive
+            .iter()
+            .any(|e| e.file_id == f.new_catalog)
+    );
+    assert!(
+        planned
+            .delete_drive
+            .iter()
+            .any(|e| e.file_id == duplicate_id)
+    );
+    assert!(planned.delete_local.iter().any(|e| e.path == f.pending));
+    apply(&f, &path).unwrap();
+    assert!(!f.root.join("store").join(&f.pending).exists());
+    assert!(!f.drive.drive.files().contains_key(duplicate_id));
+}
+
+#[test]
+fn retirement_verified_predecessor_jobs_retire_their_closures() {
+    let mut f = fixture();
+    let state = f.root.join("pipeline_state");
+    for name in ["old-intent.json", "old-receipt.json"] {
+        let path = state.join("records").join(name);
+        let mut record = read_json(&path);
+        record["job"] = json!("legacy-deriv");
+        let bytes = serde_json::to_vec(&record).unwrap();
+        fs::write(&path, &bytes).unwrap();
+        f.original_records.insert(path, bytes);
+    }
+    {
+        let mut archive = f.drive.drive.state.lock().unwrap();
+        let file = archive.files.get_mut(&f.old_catalog).unwrap();
+        let mut catalog: Value = serde_json::from_slice(&file.bytes).unwrap();
+        catalog["job"] = json!("legacy-deriv");
+        file.bytes = serde_json::to_vec(&catalog).unwrap();
+    }
+    fs::create_dir_all(state.join("legacy-deriv")).unwrap();
+    fs::write(
+        state.join("legacy-deriv/transfers.json"),
+        json!({"files":{
+            format!("catalog/{}/{}", f.old[1], f.old[2]): {"file_id":f.old_catalog,"done":true}
+        }})
+        .to_string(),
+    )
+    .unwrap();
+    let (_, unowned) = plan(&f);
+    assert!(
+        !unowned
+            .delete_drive
+            .iter()
+            .any(|e| e.file_id == f.old_catalog)
+    );
+    amend_migration(&mut f, "predecessor_jobs", json!(["legacy-deriv"]));
+    fs::remove_file(state.join("deriv/progress.json")).unwrap();
+    fs::remove_file(state.join("deriv/progress.pages.jsonl")).unwrap();
+    let alias_bytes = b"standalone migrated payload with no pending acquisition";
+    let alias = format!("objects/{}", sha256(alias_bytes));
+    fs::write(f.root.join("store").join(&alias), alias_bytes).unwrap();
+    amend_migration(&mut f, "storage_aliases", json!([alias]));
+    let (path, planned) = plan(&f);
+    assert!(
+        planned
+            .delete_drive
+            .iter()
+            .any(|e| e.file_id == f.old_catalog)
+    );
+    for id in &f.old {
+        assert!(
+            planned
+                .delete_local
+                .iter()
+                .any(|e| e.path == format!("manifests/{id}"))
+        );
+    }
+    for name in ["old-intent.json", "old-receipt.json", "old-catalog.json"] {
+        assert!(
+            planned
+                .references
+                .iter()
+                .any(|r| r.closure == name && r.status == Status::Retired)
+        );
+    }
+    apply(&f, &path).unwrap();
+    for (path, bytes) in &f.original_records {
+        assert_eq!(fs::read(path).unwrap(), *bytes);
+    }
+    // Complete fixture inventory: only the selected daily families and manifest pair survive.
+    let expected_objects: BTreeSet<_> = f
+        .new_dataset
+        .objects
+        .iter()
+        .chain(&f.new_stream.objects)
+        .map(|o| o.key.clone())
+        .collect();
+    let actual_objects: BTreeSet<_> = fs::read_dir(f.root.join("store/objects"))
+        .unwrap()
+        .map(|e| format!("objects/{}", e.unwrap().file_name().to_string_lossy()))
+        .collect();
+    assert_eq!(actual_objects, expected_objects);
+    let manifests: BTreeSet<_> = fs::read_dir(f.root.join("store/manifests"))
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(
+        manifests,
+        BTreeSet::from([
+            f.new_dataset.generation.clone(),
+            f.new_stream.generation.clone()
+        ])
+    );
+    let remaining = f.drive.drive.files();
+    let catalog: Value = serde_json::from_slice(&remaining[&f.new_catalog].bytes).unwrap();
+    let expected_remote: BTreeSet<_> = std::iter::once(f.new_catalog.clone())
+        .chain(
+            [&catalog["dataset"], &catalog["stream"]]
+                .into_iter()
+                .chain(catalog["objects"].as_array().unwrap())
+                .chain(catalog["records"].as_array().unwrap())
+                .map(|e| e["file_id"].as_str().unwrap().to_string()),
+        )
+        .collect();
+    assert_eq!(
+        remaining.keys().cloned().collect::<BTreeSet<_>>(),
+        expected_remote
+    );
+    common::verify(&f.root.join("store").join(f.new_dataset.key())).unwrap();
+    common::verify(&f.root.join("store").join(f.new_stream.key())).unwrap();
+}
+
+#[test]
+fn retirement_verified_storage_aliases_wait_for_pending_acquisition() {
+    let mut f = fixture();
+    let bytes = b"standalone migrated page payload";
+    let key = format!("objects/{}", sha256(bytes));
+    fs::write(f.root.join("store").join(&key), bytes).unwrap();
+    let (_, unmapped) = plan(&f);
+    assert!(!unmapped.delete_local.iter().any(|e| e.path == key));
+    amend_migration(&mut f, "storage_aliases", json!([key]));
+    let progress = f.root.join("pipeline_state/deriv/progress.pages.jsonl");
+    fs::write(
+        &progress,
+        format!("{}\n", json!({"sha256":sha256(bytes),"rows":0})),
+    )
+    .unwrap();
+    let (_, pinned) = plan(&f);
+    assert!(pinned.retained_objects.contains_key(&key));
+    assert!(!pinned.delete_local.iter().any(|e| e.path == key));
+    fs::remove_file(progress).unwrap();
+    let (path, planned) = plan(&f);
+    assert!(planned.delete_local.iter().any(|e| e.path == key));
+    apply(&f, &path).unwrap();
+    assert!(!f.root.join("store").join(key).exists());
+}
+
 #[test]
 fn retirement_requires_migration_evidence_in_the_retained_catalog() {
     let f = fixture();
@@ -538,12 +891,18 @@ fn retirement_reachability_resume_and_fresh_restore() {
         .collect();
     assert_eq!(planned, expected);
     let old_catalog: Value = serde_json::from_slice(&before_remote[&f.old_catalog].bytes).unwrap();
+    let new_catalog: Value = serde_json::from_slice(&before_remote[&f.new_catalog].bytes).unwrap();
+    let retained_remote: BTreeSet<_> = [&new_catalog["dataset"], &new_catalog["stream"]]
+        .into_iter()
+        .chain(new_catalog["objects"].as_array().unwrap())
+        .map(|e| e["file_id"].as_str().unwrap())
+        .collect();
     let expected_remote: BTreeSet<_> = std::iter::once(f.old_catalog.clone())
         .chain(
             [&old_catalog["dataset"], &old_catalog["stream"]]
                 .into_iter()
                 .chain(old_catalog["objects"].as_array().unwrap())
-                .filter(|e| !kept.contains(e["key"].as_str().unwrap()))
+                .filter(|e| !retained_remote.contains(e["file_id"].as_str().unwrap()))
                 .map(|e| e["file_id"].as_str().unwrap().to_string()),
         )
         .collect();
@@ -559,7 +918,7 @@ fn retirement_reachability_resume_and_fresh_restore() {
         !plan
             .delete_drive
             .iter()
-            .any(|e| e.file_id == f.new_catalog || e.key == f.shared || e.key == f.pending)
+            .any(|e| e.file_id == f.new_catalog || e.key == f.shared)
     );
     assert!(
         plan.references
