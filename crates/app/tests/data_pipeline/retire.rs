@@ -5,10 +5,18 @@ use binary_alpha_engine::dataset::{ObjectRole, SourceKind};
 use common::daily;
 use std::collections::BTreeSet;
 
+enum DeleteChange {
+    Rename,
+    Content,
+    Trash,
+    None,
+}
 struct DeleteFault {
     after: Option<usize>,
     deleted: usize,
     lose_reply: bool,
+    retry_fault: Option<(u16, DeleteChange)>,
+    rename_on_metadata: Option<(String, usize)>,
     incomplete: bool,
     no_checksum: bool,
     hidden: BTreeSet<String>,
@@ -26,6 +34,8 @@ fn serve() -> RetireDrive {
         after: None,
         deleted: 0,
         lose_reply: false,
+        retry_fault: None,
+        rename_on_metadata: None,
         incomplete: false,
         no_checksum: false,
         hidden: BTreeSet::new(),
@@ -82,6 +92,19 @@ fn serve() -> RetireDrive {
             }
             let id = request.path.trim_start_matches("/drive/v3/files/");
             if request.method == "DELETE" {
+                if let Some((status, change)) = faults.retry_fault.take() {
+                    let file = state.files.get_mut(id).unwrap();
+                    match change {
+                        DeleteChange::Rename => file.name = "renamed-after-delete-attempt".into(),
+                        DeleteChange::Content => file.bytes.push(b'!'),
+                        DeleteChange::Trash => file.trashed = true,
+                        DeleteChange::None => (),
+                    }
+                    if status != 0 {
+                        respond(&mut stream, status, &[], b"{}");
+                    }
+                    continue;
+                }
                 if faults.after.is_some_and(|n| faults.deleted >= n) {
                     respond(&mut stream, 403, &[], b"{}");
                     continue;
@@ -96,6 +119,16 @@ fn serve() -> RetireDrive {
                 }
                 respond(&mut stream, if found { 204 } else { 404 }, &[], b"");
                 continue;
+            }
+            if !request.query.contains_key("alt")
+                && let Some((target, remaining)) = &mut faults.rename_on_metadata
+                && target == id
+            {
+                *remaining -= 1;
+                if *remaining == 0 {
+                    state.files.get_mut(id).unwrap().name = "renamed-during-confirmation".into();
+                    faults.rename_on_metadata = None;
+                }
             }
             let Some(entry) = state.files.get(id) else {
                 respond(&mut stream, 404, &[], b"{}");
@@ -331,7 +364,11 @@ fn fixture() -> Fixture {
         ("old-catalog.json", json!({"file_id":old_catalog})),
         (
             "migration.json",
-            json!({"job":"deriv","phase":"verified","old_generation":history.generation,"new_generation":pair.v2.generation}),
+            json!({"schema_version":1,"job":"deriv","phase":"verified",
+                "v1_generations":[pair.v1.generation,history.generation],
+                "v1_stream":old_stream.generation,"v2_root":pair.v2.generation,
+                "v2_stream":new_stream.generation,
+                "equality":{"observations":true,"pages":true,"source_files":true,"candles":true}}),
         ),
         (
             "pending-intent.json",
@@ -618,16 +655,67 @@ fn retirement_pins_unpublished_catalog_transfer_and_accepts_registry_log() {
         .unwrap()
         .files
         .remove(&f.old_catalog);
-    // The catalog is still uploading; completed constituent transfers alone do not pin it.
+    // An unpublished catalog has no completed receipt. Dangling fixture receipts would
+    // independently pin its closure and make the transfer assertions vacuous.
+    for name in ["old-receipt.json", "old-catalog.json"] {
+        fs::remove_file(f.root.join("pipeline_state/records").join(name)).unwrap();
+    }
+    let object = dataset(&f.root.join("store"), &f.old[0])
+        .objects
+        .into_iter()
+        .find(|o| o.role == ObjectRole::Normalized)
+        .unwrap()
+        .key;
+    assert_ne!(object, f.shared);
+    assert_ne!(object, f.pending);
+    assert!(
+        !f.new_dataset
+            .objects
+            .iter()
+            .chain(&f.new_stream.objects)
+            .any(|o| o.key == object)
+    );
+    let original_object = fs::read(f.root.join("store").join(&object)).unwrap();
+    let manifests: BTreeMap<_, _> = [&f.old[1], &f.old[2]]
+        .into_iter()
+        .map(|id| {
+            let key = binary_alpha_engine::dataset::manifest_key(id);
+            (
+                key.clone(),
+                fs::read(f.root.join("store").join(key)).unwrap(),
+            )
+        })
+        .collect();
+    let (_, unpinned) = plan(&f);
+    for id in [&f.old[1], &f.old[2]] {
+        assert!(
+            unpinned
+                .delete_local
+                .iter()
+                .any(|e| e.path == format!("manifests/{id}")),
+            "the no-transfer control must allow deletion of {id}"
+        );
+    }
+    assert!(unpinned.delete_local.iter().any(|e| e.path == object));
+    assert!(!unpinned.retained_objects.contains_key(&object));
+
+    let transfer = f.root.join("pipeline_state/deriv/transfers.json");
     let key = format!("catalog/{}/{}", f.old[1], f.old[2]);
-    fs::write(
-        f.root.join("pipeline_state/deriv/transfers.json"),
-        json!({"files":{key:{"file_id":"reserved","done":false,"session":"fixture"}}}).to_string(),
-    )
-    .unwrap();
-    let object = dataset(&f.root.join("store"), &f.old[0]).objects[0]
-        .key
-        .clone();
+    let transfer_bytes =
+        json!({"files":{key:{"file_id":"reserved","done":false,"session":"fixture"}}}).to_string();
+    fs::write(&transfer, &transfer_bytes).unwrap();
+    let (_, catalog_pinned) = plan(&f);
+    for id in [&f.old[1], &f.old[2]] {
+        assert!(
+            !catalog_pinned
+                .delete_local
+                .iter()
+                .any(|e| e.path == format!("manifests/{id}"))
+        );
+    }
+
+    // Exercise the registry pin independently: no catalog transfer may protect this object.
+    fs::remove_file(&transfer).unwrap();
     fs::write(
         f.root.join("pipeline_state/registry.jsonl"),
         format!(
@@ -636,15 +724,27 @@ fn retirement_pins_unpublished_catalog_transfer_and_accepts_registry_log() {
         ),
     )
     .unwrap();
-    let (_, p) = plan(&f);
+    let (_, object_pinned) = plan(&f);
+    assert!(object_pinned.retained_objects.contains_key(&object));
+    assert!(!object_pinned.delete_local.iter().any(|e| e.path == object));
     for id in [&f.old[1], &f.old[2]] {
         assert!(
-            !p.delete_local
+            object_pinned
+                .delete_local
                 .iter()
                 .any(|e| e.path == format!("manifests/{id}"))
         );
     }
-    assert!(p.retained_objects.contains_key(&object));
+    fs::write(&transfer, transfer_bytes).unwrap();
+    let (path, _) = plan(&f);
+    apply(&f, &path).unwrap();
+    assert_eq!(
+        fs::read(f.root.join("store").join(&object)).unwrap(),
+        original_object
+    );
+    for (key, bytes) in manifests {
+        assert_eq!(fs::read(f.root.join("store").join(key)).unwrap(), bytes);
+    }
 }
 
 #[test]
@@ -1005,4 +1105,312 @@ fn retirement_replays_actual_registry_aliases_watermark_and_removals() {
     fs::write(directory.join("snapshot.json"), snapshot.to_string()).unwrap();
     let (_, p) = plan(&f);
     assert_eq!(p.totals.manifest_directories, 3);
+}
+
+#[test]
+fn retirement_pending_baseline_survives_transfer_named_ancestors() {
+    for name in ["managed-transfers", "managed-registry"] {
+        let mut f = fixture();
+        let moved = f.scratch.path(name);
+        fs::rename(&f.root, &moved).unwrap();
+        let config = fs::read_to_string(&f.config)
+            .unwrap()
+            .replace(f.root.to_str().unwrap(), moved.to_str().unwrap());
+        fs::write(&f.config, config).unwrap();
+        f.root = moved;
+        let state = f.root.join("pipeline_state/deriv");
+        fs::write(
+            state.join("progress.json"),
+            json!({
+                "intent":"pending-intent.json",
+                "progress":{"baseline":f.old[1],"pages":[]}
+            })
+            .to_string(),
+        )
+        .unwrap();
+        fs::write(
+            state.join("update.toml"),
+            format!(
+                "seed_manifest = {:?}\n",
+                daily::uri(
+                    &f.root
+                        .join("store")
+                        .join(binary_alpha_engine::dataset::manifest_key(&f.old[0]))
+                )
+            ),
+        )
+        .unwrap();
+        let baseline = f
+            .root
+            .join("store")
+            .join(binary_alpha_engine::dataset::manifest_key(&f.old[1]));
+        let original = fs::read(&baseline).unwrap();
+        let (path, p) = plan(&f);
+        assert!(
+            !p.delete_local
+                .iter()
+                .any(|e| e.path == format!("manifests/{}", f.old[1])),
+            "pending baseline is a deletion candidate under {name}"
+        );
+        assert!(
+            p.references
+                .iter()
+                .any(|r| r.source.ends_with("progress.json")
+                    && r.closure == "pending-intent.json"
+                    && r.status == Status::Protected)
+        );
+        apply(&f, &path).unwrap();
+        assert_eq!(fs::read(&baseline).unwrap(), original);
+    }
+}
+
+#[test]
+fn retirement_leftover_seal_links_preserve_completed_record() {
+    let f = fixture();
+    let (path, _) = plan(&f);
+    apply(&f, &path).unwrap();
+    let completed = path.with_extension("retired.json");
+    let original = fs::read(&completed).unwrap();
+    // Model a crash after publication, before scratch unlink, followed by PID reuse.
+    let parent = completed.parent().unwrap();
+    for suffix in [String::new(), "-0".into(), "-1".into()] {
+        let alias = parent.join(format!(".seal-{}{suffix}", std::process::id()));
+        fs::hard_link(&completed, alias).unwrap();
+    }
+    let mut report = Vec::new();
+    binary_alpha_app::retire::run(&f.config, None, None, &mut report).unwrap();
+    assert!(
+        fs::read(&completed).unwrap() == original,
+        "allocating a new seal must never truncate a published record through its crash alias"
+    );
+}
+
+#[test]
+fn retirement_refuses_unverified_or_mismatched_migration() {
+    let f = fixture();
+    let path = f.root.join("pipeline_state/records/migration.json");
+    let original = fs::read(&path).unwrap();
+    let verified: Value = serde_json::from_slice(&original).unwrap();
+    let (_, eligible) = plan(&f);
+    for id in &f.old {
+        assert!(
+            eligible
+                .delete_local
+                .iter()
+                .any(|e| e.path == format!("manifests/{id}"))
+        );
+    }
+    let mut invalid = Vec::new();
+    for (pointer, replacement) in [
+        ("/phase", json!("converted")),
+        ("/equality", Value::Null),
+        ("/equality/observations", json!(false)),
+        ("/equality/pages", json!(false)),
+        ("/equality/source_files", json!(false)),
+        ("/equality/candles", json!(false)),
+        ("/v1_generations/0", json!("e".repeat(64))),
+        ("/v1_stream", json!("e".repeat(64))),
+        ("/v2_root", json!("e".repeat(64))),
+        ("/v2_stream", json!("e".repeat(64))),
+    ] {
+        let mut value = verified.clone();
+        *value.pointer_mut(pointer).unwrap() = replacement;
+        invalid.push((pointer.to_string(), Some(value)));
+    }
+    invalid.push(("missing immutable record".into(), None));
+    for (case, evidence) in invalid {
+        if let Some(value) = evidence {
+            fs::write(&path, value.to_string()).unwrap();
+        } else {
+            fs::remove_file(&path).unwrap();
+        }
+        let result = pipeline("retire", &f.config, &["--job", "deriv", "--plan"]);
+        assert!(
+            result.is_err(),
+            "invalid migration evidence {case} authorized retirement: {result:?}"
+        );
+        for id in &f.old {
+            assert!(
+                f.root
+                    .join("store")
+                    .join(binary_alpha_engine::dataset::manifest_key(id))
+                    .is_file()
+            );
+        }
+        assert!(
+            !f.drive
+                .drive
+                .log()
+                .iter()
+                .any(|line| line.starts_with("DELETE"))
+        );
+    }
+    fs::write(&path, original).unwrap();
+    let (path, _) = plan(&f);
+    apply(&f, &path).unwrap();
+    for id in &f.old {
+        assert!(
+            !f.root
+                .join("store")
+                .join(binary_alpha_engine::dataset::manifest_key(id))
+                .exists()
+        );
+    }
+}
+
+#[test]
+fn retirement_rechecks_name_before_every_delete_retry() {
+    // 0 drops the connection without replying; the other cases exercise HTTP retries.
+    for status in [503, 401, 0] {
+        let f = fixture();
+        fs::write(
+            &f.config,
+            pipeline_toml(
+                &f.root,
+                &f.drive.drive.base,
+                &[("deriv", "job.toml")],
+                None,
+                2,
+            ),
+        )
+        .unwrap();
+        let (path, p) = plan(&f);
+        let first = &p.delete_drive[0].file_id;
+        f.drive.faults.lock().unwrap().retry_fault = Some((status, DeleteChange::Rename));
+        let result = apply(&f, &path);
+        assert!(
+            result
+                .as_ref()
+                .is_err_and(|e| e.contains("recorded name mismatch")),
+            "name-changed target must refuse deletion after {status}: {result:?}"
+        );
+        assert_eq!(
+            f.drive.drive.files()[first].name,
+            "renamed-after-delete-attempt"
+        );
+        let log = f.drive.drive.log();
+        let delete = format!("DELETE /drive/v3/files/{first}");
+        let attempt = log.iter().position(|line| line == &delete).unwrap();
+        assert!(
+            log[attempt + 1..]
+                .iter()
+                .any(|line| line == &format!("GET /drive/v3/files/{first}"))
+        );
+        assert!(
+            !log[attempt + 1..]
+                .iter()
+                .any(|line| line.starts_with("DELETE"))
+        );
+    }
+}
+
+#[test]
+fn retirement_refuses_plans_sealed_before_verified_migration_gate() {
+    let f = fixture();
+    let (path, mut p) = plan(&f);
+    // A schema-1 seal predates migration verification and reliable acquisition pinning.
+    p.schema_version = 1;
+    let bytes = serde_json::to_vec_pretty(&p).unwrap();
+    let legacy = path
+        .parent()
+        .unwrap()
+        .join(format!("plan-{}.json", sha256(&bytes)));
+    fs::write(&legacy, bytes).unwrap();
+    let before = f.drive.drive.files();
+    let result = apply(&f, &legacy);
+    assert!(
+        result.as_ref().is_err_and(|e| e.contains("schema")),
+        "an old seal cannot bypass current retirement prerequisites: {result:?}"
+    );
+    for target in &p.delete_local {
+        for (key, expected) in &target.files {
+            let bytes = fs::read(f.root.join("store").join(key)).unwrap();
+            assert_eq!(sha256(&bytes), expected.sha256);
+        }
+    }
+    let after = f.drive.drive.files();
+    for (id, file) in before {
+        assert_eq!(after[&id].bytes, file.bytes);
+        assert_eq!(after[&id].name, file.name);
+    }
+    assert!(
+        !f.drive
+            .drive
+            .log()
+            .iter()
+            .any(|line| line.starts_with("DELETE"))
+    );
+    assert!(!legacy.with_extension("progress.jsonseq").exists());
+}
+
+#[test]
+fn retirement_rechecks_name_after_checksum_free_confirmation() {
+    let f = fixture();
+    f.drive.faults.lock().unwrap().no_checksum = true;
+    let (path, p) = plan(&f);
+    let first = &p.delete_drive[0].file_id;
+    f.drive.faults.lock().unwrap().rename_on_metadata = Some((first.clone(), 2));
+    let result = apply(&f, &path);
+    assert!(
+        result
+            .as_ref()
+            .is_err_and(|e| e.contains("recorded name mismatch")),
+        "confirmation observed a rename and must refuse DELETE: {result:?}"
+    );
+    assert_eq!(
+        f.drive.drive.files()[first].name,
+        "renamed-during-confirmation"
+    );
+    assert!(
+        !f.drive
+            .drive
+            .log()
+            .iter()
+            .any(|line| line.starts_with("DELETE"))
+    );
+}
+
+#[test]
+fn retirement_rechecks_content_and_trash_state_before_delete_retry() {
+    for change in [DeleteChange::Trash, DeleteChange::Content] {
+        let f = fixture();
+        let (path, p) = plan(&f);
+        let first = &p.delete_drive[0].file_id;
+        f.drive.faults.lock().unwrap().retry_fault = Some((503, change));
+        let result = apply(&f, &path);
+        assert!(
+            result.is_err(),
+            "changed target must survive the retry: {result:?}"
+        );
+        assert!(f.drive.drive.files().contains_key(first));
+        let log = f.drive.drive.log();
+        let attempt = log
+            .iter()
+            .position(|line| line == &format!("DELETE /drive/v3/files/{first}"))
+            .unwrap();
+        assert!(
+            !log[attempt + 1..]
+                .iter()
+                .any(|line| line.starts_with("DELETE"))
+        );
+    }
+}
+
+#[test]
+fn retirement_retries_unchanged_delete_after_fresh_metadata() {
+    let f = fixture();
+    let (path, p) = plan(&f);
+    let first = &p.delete_drive[0].file_id;
+    f.drive.faults.lock().unwrap().retry_fault = Some((503, DeleteChange::None));
+    apply(&f, &path).unwrap();
+    assert!(!f.drive.drive.files().contains_key(first));
+    let log = f.drive.drive.log();
+    let delete = format!("DELETE /drive/v3/files/{first}");
+    let first_attempt = log.iter().position(|line| line == &delete).unwrap();
+    let last_attempt = log.iter().rposition(|line| line == &delete).unwrap();
+    assert!(
+        log[first_attempt + 1..last_attempt]
+            .iter()
+            .any(|line| line == &format!("GET /drive/v3/files/{first}"))
+    );
 }

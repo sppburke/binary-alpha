@@ -11,11 +11,28 @@ restores to another managed store on this host. This is not a distributed lock a
 
 The implementation reuses `Store`, `Drive`, and `data verify`; it does not duplicate their
 storage or daily decoding rules. A job becomes eligible only when a verified daily dataset
-and matching stream have an archived catalog. The newest v2 catalog is chosen by the shared lineage selector: coverage end, then proved
-ancestry at equal coverage; ambiguous branches are refused. Its dataset ancestry must reach the instrument's one
-daily continuation root with `provenance/lineage.json`. That immutable mapping is migration's
-authority for which legacy generations were replaced; retirement independently verifies the
-daily storage closure, but does not repeat migration's row/occurrence equality proof.
+and matching stream have an archived catalog. The shared lineage selector chooses the newest
+v2 catalog by coverage end, then proved ancestry at equal coverage; ambiguous branches are
+refused. Its dataset ancestry must reach the instrument's one readable daily continuation
+root with `provenance/lineage.json`. Proven superseded v2 ancestry is independently eligible.
+
+Retiring local legacy manifests additionally requires a completed immutable migration record
+under `pipeline_state/records` matching the root's mapping. Lineage names and coverage
+containment alone grant no v1 deletion authority. Other legacy streams sharing a replaced
+source remain protected unless explicitly verified. Native v2 roots need no migration record;
+a fresh store without legacy manifests can retire proved v2 ancestors while preserving any
+unresolved legacy archive closures.
+
+The migration evidence boundary requires JSON fields `schema_version: 1`, `job`,
+`phase: "verified"`, `v1_generations` (the exact legacy dataset identities in root lineage),
+`v1_stream` (the exact legacy stream in root lineage), `v2_root`, and `v2_stream` (a retained
+daily stream sourced from that root). Its `equality` object must contain Boolean `true` for
+`observations` (ordered rows and multiplicity), `pages` (every occurrence and alias accounted
+for), `source_files` (byte-exact import NDJSON and checkpoint reconstruction), and `candles`.
+When local legacy replacement is requested, missing, converted, failed, or mismatched evidence
+refuses planning. These fields define the
+retirement consumer contract; this branch has no migration producer to test against it.
+The fixture tests exercise this boundary with synthetic records.
 
 Retained roots include the continuation root and its stream, the newest eligible catalog and its
 exact remote file bindings, configurations, pending acquisitions and pages, and in-flight
@@ -28,13 +45,19 @@ Archived `records/` entries are immutable and retained.
 
 Configuration inventory scans the pipeline document, every declared job configuration, and
 TOML files beneath the document's directory, excluding the managed data root. Mutable pending
-state and registry/transfer JSON or newline-delimited JSON are inventoried. Legacy
-`transfers.json` and registry entries use content keys with `file_id` and Boolean `done`;
+state and registry/transfer JSON or newline-delimited JSON are inventoried. The shared registry
+owner replays `registry/snapshot.json` and `registry/events.ndjson`, including watermarks,
+removals, logical aliases, and imported legacy bindings. Legacy
+job-level `transfers.json` and archive-root `registry.json`, `registry.jsonl`,
+`registry.ndjson`, `registry.snapshot.json`, `registry.log.jsonl`, or `registry.log` entries
+use content keys with `file_id` and Boolean `done`; registry identity is relative to
+`pipeline_state`, independent of ancestor directory names. Acquisition progress references
+are inventoried separately. An archive-root `transfers.json` is also supported;
 unfinished catalog transfers pin both generation identities before the catalog exists.
 Unresolved or torn state fails closed. Symlinks in scanned trees are refused.
 
 Plans live at `pipeline_state/retirement/plan-SHA256.json`, where SHA256 hashes the exact
-serialized bytes. Schema version 1 contains:
+serialized bytes. Schema version 2 contains:
 
 | Field | Meaning |
 | --- | --- |
@@ -48,12 +71,17 @@ serialized bytes. Schema version 1 contains:
 | `totals` | Manifest-directory and object counts, local bytes, Drive-file count and Drive bytes |
 
 Apply refuses changes to the sealed plan, scope, manifests, records, registry, configuration,
-governance, remote inventory, or surviving deletion targets. Catalog bindings must belong to
+governance, remote inventory, or surviving deletion targets. Apply rejects schema-1 plans,
+including unfinished ones, because they predate the migration and pending-reference safety
+checks; produce a new plan under the current checks. Completed historical records remain
+readable and immutable. Catalog bindings must belong to
 the complete root listing. Missing checksums are established by readback. The only permitted
 missing deletion targets on resume are operations authorized by durable progress.
 
 Drive deletions precede local deletions. Each file's size/digest and recorded name are checked
-before deletion; 404 is successful resumption. Local removal unlinks only inventoried files
+before every DELETE attempt, including transient, authentication, and lost-reply retries;
+the latest confirmation metadata must still match and be untrashed. A 404 is successful
+resumption. Local removal unlinks only inventoried files
 and then empty manifest directories. Batches contain at most 32 operations, never crossing
 the Drive/local boundary. Full retained verification runs before application/resumption and
 before completion. Each batch checks impact by exact paths (including manifest-directory
@@ -67,6 +95,8 @@ durable `begin` precedes mutation. A torn trailing frame stays untouched; a comp
 continues the operation on resume. `plan-SHA256.retired.json` is an immutable completion
 record containing `plan_sha256`, `removed_drive`, `removed_local`, and `retained_verified`.
 Subsequent inventories recognize historical retired references from these completed plans.
+Seal scratch files use exclusive creation with collision retries, so crash leftovers can
+never truncate an inode linked to an already published plan or completion record.
 
 The retirement integration tests use deterministic multi-day data and a paginated loopback
 Drive server, including fresh-store restoration and verification. They do not run migration,

@@ -859,6 +859,10 @@ Retirement uses the registry owner's read-only replay, including snapshot waterm
 logical aliases, and legacy transfer files. Completed reclamation records do not pin removed
 single-page representations. A missing completed remote binding is reusable only after an exact
 completed retirement record authorizes its removal; unrelated remote loss remains an error.
+Retiring v1 manifests requires a matching immutable, verified migration record as specified in
+[retirement](retirement.md); native v2 ancestry retirement does not require migration evidence.
+Retirement plans use schema 2, refuse older apply plans, and preserve completed evidence when
+seal scratch files survive a crash. Every Drive delete attempt rechecks name and content identity.
 
 Update requires an imported generation; `END` is `YYYY-MM-DDTHH:MM:SS[.ffffff]Z`. Each job
 acquires a bounded extension, audits and verifies its result, and archives it independently.
