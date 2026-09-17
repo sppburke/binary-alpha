@@ -3,16 +3,18 @@
 //! progress, and manifest-last publication of one cumulative generation per instrument. Ticks
 //! and five-second bars share every rule; only the row type differs.
 
-use crate::archive::{self, BAR_OBJECT_PATH, DataSummary, TICK_OBJECT_PATH};
+use crate::archive::DataSummary;
+#[cfg(test)]
+use crate::archive::{self, TICK_OBJECT_PATH};
 use crate::broker::{self, Clock, HistoryRows, MarketDataBroker, SystemClock};
 use crate::import::{self, CODE_REVISION};
-use crate::store::{self, ObjectIdentity, Store};
+use crate::store::{self, Store};
 use crate::verify;
 use binary_alpha_engine::config::{Broker, Config, History, Seed};
 use binary_alpha_engine::dataset::{
-    Capability, Coverage, DatasetRole, GenerationManifest, Input, IntervalContract,
-    MANIFEST_SCHEMA_VERSION, NativeGranularity, ObjectRecord, ObjectRole, PriceRepresentation,
-    SourceKind, TimeUnit, generation_id, manifest_key, object_key,
+    Capability, Coverage, DatasetRole, GenerationManifest, IntervalContract,
+    MANIFEST_SCHEMA_VERSION, NativeGranularity, ObjectRole, PriceRepresentation, SourceKind,
+    TimeUnit, manifest_key, object_key,
 };
 use binary_alpha_engine::market::{
     Bar, BarSequence, InstrumentId, PriceScale, Tick, TickSequence,
@@ -27,8 +29,6 @@ use std::time::Instant;
 
 pub const COVERAGE_PATH: &str = "provenance/coverage.json";
 pub const BUNDLE_PATH: &str = "raw/pages.bin";
-/// Object paths beneath which a seeded generation retains its seed's manifest and objects.
-const SEED_PREFIX: &str = "seed/";
 /// The acquisition outcome that leaves the intent pending for the next invocation.
 pub const BUDGET_SHORTFALL: &str = "budget";
 /// The provider's latest observation lies before the requested end: not a gap in what was
@@ -172,13 +172,8 @@ pub type Persist<'a> = &'a mut dyn FnMut(ProgressEvent<'_>) -> Result<(), String
 
 /// A semantic rejection can implicate an earlier page's deferred overlap boundary. Keep
 /// received evidence, but refetch the indexed acquisition instead of replaying it forever.
-fn validated<T>(
-    result: Result<T, String>,
-    daily: bool,
-    bounds: &mut Bounds<'_>,
-) -> Result<T, String> {
+fn validated<T>(result: Result<T, String>, bounds: &mut Bounds<'_>) -> Result<T, String> {
     if result.is_err()
-        && daily
         && let Some(persist) = bounds.persist.as_mut()
     {
         persist(ProgressEvent::Invalidate)?;
@@ -314,12 +309,6 @@ pub(crate) trait Row: Copy + PartialEq + std::fmt::Debug + Send {
         instrument: &InstrumentId,
         native: &Native,
     ) -> Result<crate::lineage::Observation, String>;
-    fn write(
-        path: &Path,
-        instrument: &InstrumentId,
-        native: &Native,
-        rows: Vec<Self>,
-    ) -> Result<DataSummary, String>;
 }
 
 impl Row for Tick {
@@ -356,14 +345,6 @@ impl Row for Tick {
         _native: &Native,
     ) -> Result<crate::lineage::Observation, String> {
         Ok(crate::lineage::Observation::Tick(self))
-    }
-    fn write(
-        path: &Path,
-        instrument: &InstrumentId,
-        native: &Native,
-        rows: Vec<Self>,
-    ) -> Result<DataSummary, String> {
-        archive::write_ticks(path, instrument, native.scale, rows.into_iter().map(Ok))
     }
 }
 
@@ -403,7 +384,11 @@ impl Row for Bar {
     ) -> Result<crate::lineage::Observation, String> {
         Ok(crate::lineage::Observation::Bar(crate::daily::DailyBar {
             symbol: Some(instrument.provider_symbol.to_string()),
-            symbol_id: native.symbol_id,
+            symbol_id: Some(
+                native
+                    .symbol_id
+                    .ok_or("fetch: bar rows carry no provider identifier")?,
+            ),
             timestamp_utc: Some(
                 self.start_unix_s
                     .checked_mul(1_000_000)
@@ -422,23 +407,6 @@ impl Row for Bar {
             volume: Some(self.volume),
             period_s: Some(self.period_s),
         }))
-    }
-    fn write(
-        path: &Path,
-        instrument: &InstrumentId,
-        native: &Native,
-        rows: Vec<Self>,
-    ) -> Result<DataSummary, String> {
-        let symbol_id = native
-            .symbol_id
-            .ok_or("fetch: bar rows carry no provider identifier")?;
-        archive::write_bars(
-            path,
-            instrument.provider_symbol.as_str(),
-            symbol_id,
-            native.server_offset_s,
-            rows.into_iter().map(Ok),
-        )
     }
 }
 
@@ -617,6 +585,11 @@ fn prior(
         selected = daily.into_iter().find(|b| b.manifest.generation == newest);
     }
     if let Some(prior) = &selected {
+        if prior.manifest.layout.is_none() {
+            return Err(format!(
+                "fetch {instrument}: v1 baseline is read-only; run data pipeline migrate before fetching"
+            ));
+        }
         verify::run_with(
             &local.uri(&prior.manifest.key()),
             Access {
@@ -647,6 +620,20 @@ fn seed_baseline(
         ));
     }
     let uri = seed.manifest.to_string();
+    Access {
+        declaration,
+        certification: None,
+    }
+    .permit(None, seed.manifest.generation())?;
+    let (store, key) = verify::open(&uri)?;
+    let mut bytes = Vec::new();
+    store.read_to(&key, None, &mut bytes)?;
+    let manifest = GenerationManifest::from_json(&bytes)?;
+    if manifest.layout.is_none() {
+        return Err(format!(
+            "fetch {instrument}: v1 seed is read-only; run data pipeline migrate before fetching"
+        ));
+    }
     verify::run_with(
         &uri,
         Access {
@@ -655,10 +642,6 @@ fn seed_baseline(
         },
     )
     .map_err(|reason| format!("fetch {instrument}: seed: {reason}"))?;
-    let (store, key) = verify::open(&uri)?;
-    let mut bytes = Vec::new();
-    store.read_to(&key, None, &mut bytes)?;
-    let manifest = GenerationManifest::from_json(&bytes)?;
     let expected_representation = match history.native_granularity {
         NativeGranularity::Tick => PriceRepresentation::IntegerUnits { scale },
         NativeGranularity::Bar { .. } => PriceRepresentation::BinaryFloat64,
@@ -730,6 +713,12 @@ fn plan<'a>(
         .as_ref()
         .ok_or("fetch: the configuration declares no history table")?;
     history.validate()?;
+    if history.role != DatasetRole::Development {
+        return Err(
+            "fetch: daily-v2 acquisition requires development data; other roles are read-only"
+                .into(),
+        );
+    }
     if let NativeGranularity::Bar { period_seconds } = history.native_granularity
         && period_seconds != 5
     {
@@ -793,10 +782,45 @@ fn plan<'a>(
                 declaration,
             )?);
         }
+        if let Some(seed) = seed {
+            if seed.source_identity != source_identity {
+                return Err(format!(
+                    "fetch {instrument}: seed source identity differs from the configured broker"
+                ));
+            }
+            // A readable explicit legacy seed is refused even when a newer daily prior wins.
+            // Missing/undeclared ancestor closures are optional when a self-contained prior exists.
+            if (Access {
+                declaration,
+                certification: None,
+            })
+            .permit(None, seed.manifest.generation())
+            .is_ok()
+            {
+                let (store, key) = verify::open(&seed.manifest.to_string())?;
+                if store.head(&key)?.is_some() {
+                    let mut bytes = Vec::new();
+                    store.read_to(&key, None, &mut bytes)?;
+                    if GenerationManifest::from_json(&bytes)?.layout.is_none() {
+                        return Err(format!(
+                            "fetch {instrument}: v1 seed is read-only; run data pipeline migrate before fetching"
+                        ));
+                    }
+                }
+            }
+        }
         if pinned.is_some() && baseline.is_none() {
             return Err(format!(
                 "fetch {instrument}: the pending intent's baseline {} is no longer readable",
                 pinned.unwrap_or_default()
+            ));
+        }
+        if baseline
+            .as_ref()
+            .is_some_and(|b| b.manifest.layout.is_none())
+        {
+            return Err(format!(
+                "fetch {instrument}: v1 baseline is read-only; run data pipeline migrate before fetching"
             ));
         }
         let overlap = i64::from(history.overlap_seconds.unwrap_or(0)) * 1_000_000;
@@ -931,7 +955,11 @@ fn publish_retained(
 }
 
 /// Concatenate exactly this acquisition's retained pages, including replayed pages.
-fn bundle_pages(local: &Store, pages: &mut [PageCoverage]) -> Result<Option<ObjectRecord>, String> {
+#[cfg(test)]
+fn bundle_pages(
+    local: &Store,
+    pages: &mut [PageCoverage],
+) -> Result<Option<binary_alpha_engine::dataset::ObjectRecord>, String> {
     if pages.is_empty() {
         return Ok(None);
     }
@@ -960,10 +988,6 @@ fn bundle_pages(local: &Store, pages: &mut [PageCoverage]) -> Result<Option<Obje
     )))
 }
 
-fn carried_bundle_path(generation: &str) -> String {
-    format!("raw/{generation}/pages.bin")
-}
-
 /// Every retained row of the baseline and, for bars, the one provider identifier they carried.
 fn baseline_rows<R: Row>(
     baseline: &Baseline,
@@ -975,49 +999,6 @@ fn baseline_rows<R: Row>(
         Ok(())
     })?;
     Ok((rows, read.symbol_id))
-}
-
-/// The objects a descendant carries forward: a descendant's own raw pages and provenance, or a
-/// seed's manifest and every seed object retained beneath `seed/`, mirrored into the local
-/// store so the descendant closure stands alone.
-fn carried_objects(baseline: &Baseline, local: &Store) -> Result<Vec<ObjectRecord>, String> {
-    if baseline.coverage.is_some() {
-        return Ok(baseline
-            .manifest
-            .objects
-            .iter()
-            .filter(|object| object.role != ObjectRole::Normalized && object.path != COVERAGE_PATH)
-            .cloned()
-            .map(|mut object| {
-                if object.path == BUNDLE_PATH {
-                    object.path = carried_bundle_path(&baseline.manifest.generation);
-                }
-                object
-            })
-            .collect());
-    }
-    let mut carried = Vec::with_capacity(baseline.manifest.objects.len() + 1);
-    for object in &baseline.manifest.objects {
-        if object.role == ObjectRole::Normalized {
-            continue;
-        }
-        let (_, fetched) = verify::fetch(local, object, true)?;
-        let fetched = fetched.expect("decoded objects have a local path");
-        let identity = store::identify(&fetched.path)?;
-        local.put_new(&object.key, &fetched.path, &identity)?;
-        carried.push(import::record(
-            ObjectRole::Provenance,
-            &format!("{SEED_PREFIX}{}", object.path),
-            &identity,
-        ));
-    }
-    let identity = import::retain_bytes(local, &baseline.manifest.to_json(), "seed-manifest")?;
-    carried.push(import::record(
-        ObjectRole::Provenance,
-        &format!("{SEED_PREFIX}ready.json"),
-        &identity,
-    ));
-    Ok(carried)
 }
 
 /// One pass over an explicit range without a budget or durable progress: the standalone
@@ -1123,8 +1104,6 @@ fn acquire_one<R: Row>(
     let requested = plan.requested;
     let overlap = i64::from(history.overlap_seconds.unwrap_or(0)) * 1_000_000;
     let baseline = plan.baseline.as_ref();
-    let daily_layout = baseline
-        .is_some_and(|b| b.manifest.layout == Some(binary_alpha_engine::dataset::Layout::DailyV2));
     let seed_lineage = baseline.and_then(|baseline| baseline.seed.clone());
     let previous_verified = baseline.map(Baseline::verified).transpose()?.flatten();
     // A verified suffix after shortfall must not skip the still-unfetched leading interval; a
@@ -1168,27 +1147,8 @@ fn acquire_one<R: Row>(
     }
     let started = Instant::now();
     let mut rows: Vec<R> = Vec::new();
-    let mut objects = baseline
-        .filter(|_| !daily_layout)
-        .map(|baseline| carried_objects(baseline, local))
-        .transpose()?
-        .unwrap_or_default();
-    let mut pages = baseline
-        .and_then(|baseline| baseline.coverage.as_ref())
-        .map(|coverage| coverage.pages.clone())
-        .unwrap_or_default();
-    if let Some(baseline) = baseline.filter(|baseline| {
-        baseline
-            .coverage
-            .as_ref()
-            .is_some_and(|coverage| coverage.bundle.is_some())
-    }) {
-        for page in &mut pages {
-            if page.path == BUNDLE_PATH {
-                page.path = carried_bundle_path(&baseline.manifest.generation);
-            }
-        }
-    }
+    let mut objects = Vec::new();
+    let pages = Vec::new();
     let mut previous_rows: Vec<R> = Vec::new();
     if let Some(baseline) = baseline {
         let (retained, symbol_id) = baseline_rows::<R>(baseline, local)?;
@@ -1212,7 +1172,7 @@ fn acquire_one<R: Row>(
     {
         persist(ProgressEvent::Started(&progress))?;
     }
-    let acquisition = if daily_layout && bounds.acquisition.is_none() {
+    let acquisition = if bounds.acquisition.is_none() {
         let invocation = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_err(|e| e.to_string())?
@@ -1297,7 +1257,7 @@ fn acquire_one<R: Row>(
                 ordinal: u64::from(requests - 1),
                 ..id.clone()
             });
-            if daily_layout && let Some(persist) = bounds.persist.as_mut() {
+            if let Some(persist) = bounds.persist.as_mut() {
                 persist(ProgressEvent::Received(&PageCoverage {
                     occurrence: occurrence.clone(),
                     path: format!("raw/{}.json", identity.sha256),
@@ -1347,14 +1307,10 @@ fn acquire_one<R: Row>(
             validated(
                 R::accept(&mut sequence, *row)
                     .map_err(|error| format!("fetch {instrument}: {error}")),
-                daily_layout,
                 bounds,
             )?;
         }
-        if !replayed
-            && daily_layout
-            && let Some(persist) = bounds.persist.as_mut()
-        {
+        if !replayed && let Some(persist) = bounds.persist.as_mut() {
             // Preserve decoded bounds even when identity or overlap validation rejects the page.
             persist(ProgressEvent::Received(&coverage_page))?;
         }
@@ -1365,7 +1321,6 @@ fn acquire_one<R: Row>(
                         "fetch {instrument}: the provider identifies this instrument as {symbol_id}, but the retained lineage carries {}",
                         native.symbol_id.unwrap_or_default()
                     )),
-                    daily_layout,
                     bounds,
                 );
             }
@@ -1379,7 +1334,6 @@ fn acquire_one<R: Row>(
             .map_or(floor, |row| row.time().saturating_add(1).max(floor));
         validated(
             check_verified_overlap(instrument, &previous_rows, &received_all, boundary),
-            daily_layout,
             bounds,
         )?;
         let first = page_rows.first().map(Row::time);
@@ -1413,7 +1367,6 @@ fn acquire_one<R: Row>(
                         Err(format!(
                             "fetch {instrument}: conflicting prices at one time"
                         )),
-                        daily_layout,
                         bounds,
                     );
                 }
@@ -1441,7 +1394,6 @@ fn acquire_one<R: Row>(
     };
     validated(
         check_verified_overlap(instrument, &previous_rows, &received_all, floor),
-        daily_layout,
         bounds,
     )?;
     let new_count = rows.len();
@@ -1476,14 +1428,6 @@ fn acquire_one<R: Row>(
         });
     }
 
-    // Rows outside the retained span are the only additions a consistent reread can carry: the
-    // rows inside it were just proven identical to the retained ones.
-    let extends_prior = match (previous_rows.first(), previous_rows.last()) {
-        (Some(old_first), Some(old_last)) => rows
-            .iter()
-            .any(|row| row.time() < old_first.time() || row.time() > old_last.time()),
-        _ => !rows.is_empty(),
-    };
     if let Some(last) = previous_rows.last() {
         let suffix = rows.split_off(rows.partition_point(|row| row.time() <= last.time()));
         rows = if rows
@@ -1529,7 +1473,7 @@ fn acquire_one<R: Row>(
         });
     let mut tail_shortfall = shortfall.as_ref().and(tail.clone());
     let mut shortfall = shortfall.or(tail);
-    if daily_layout && let Some((from, to)) = verified_bounds {
+    if let Some((from, to)) = verified_bounds {
         // A cumulative baseline can already prove the overlap of an interrupted request.
         // Shortfalls describe only the still-unverified part of the requested range.
         for slot in [&mut shortfall, &mut tail_shortfall] {
@@ -1572,39 +1516,17 @@ fn acquire_one<R: Row>(
         native_granularity: native.granularity,
         seed: seed_lineage,
     };
-    let prior = baseline.filter(|baseline| baseline.coverage.is_some());
-    let no_change = !extends_prior
-        && prior.is_some_and(|prior| {
-            let previous = coverage_of(prior);
-            previous.shortfall == coverage.shortfall
-                && previous.tail_shortfall == coverage.tail_shortfall
-                && previous.verified == coverage.verified
-        });
-    if no_change && !daily_layout {
-        let prior = prior.expect("no change has a prior generation");
-        coverage = coverage_of(prior);
-        coverage.requested = Range::new(requested.0, requested.1);
-        publish_retained(&prior.manifest, local, destination)?;
-        let line = report(
-            instrument,
-            history.role,
-            &prior.manifest.generation,
-            &coverage,
-            prior.manifest.objects.len(),
-            0,
-            (started.elapsed().as_secs_f64(), 0.0),
-        );
-        writeln!(out, "{line} (no new data)").map_err(|error| error.to_string())?;
-        return Ok(Outcome {
-            instrument: instrument.clone(),
-            generation: Some(prior.manifest.generation.clone()),
-            coverage,
-            pending,
-            receipts,
-        });
-    }
-    if daily_layout && !rows.is_empty() {
-        let baseline = &baseline.expect("daily baseline").manifest;
+    let mut sequence = R::Sequence::default();
+    validated(
+        rows.iter().try_for_each(|row| {
+            R::accept(&mut sequence, *row).map_err(|e| format!("fetch {instrument}: {e}"))
+        }),
+        bounds,
+    )?;
+    if !rows.is_empty()
+        && let Some(baseline) = baseline
+    {
+        let baseline = &baseline.manifest;
         let mut manifest = baseline.clone();
         manifest.source_kind = SourceKind::BrokerHistory;
         manifest.config_hash = config.content_hash();
@@ -1666,24 +1588,15 @@ fn acquire_one<R: Row>(
             receipts,
         });
     }
-    if !rows.is_empty()
-        && let Some(bundle) = bundle_pages(local, &mut progress.pages)?
-    {
-        coverage.bundle = Some(ObjectIdentitySummary {
-            sha256: bundle.sha256.clone(),
-            bytes: bundle.bytes,
-        });
-        objects.push(bundle);
-    }
     coverage.pages.extend(progress.pages);
-    let coverage_bytes = json_bytes(&coverage)?;
-    let coverage_identity = import::retain_bytes(local, &coverage_bytes, "history-coverage")?;
-    objects.push(import::record(
-        ObjectRole::Provenance,
-        COVERAGE_PATH,
-        &coverage_identity,
-    ));
     if rows.is_empty() {
+        let coverage_identity =
+            import::retain_bytes(local, &json_bytes(&coverage)?, "history-coverage")?;
+        objects.push(import::record(
+            ObjectRole::Provenance,
+            COVERAGE_PATH,
+            &coverage_identity,
+        ));
         // Existing dataset manifests require actual first/last events; retain the unresolved receipt without a ready manifest.
         writeln!(
             out,
@@ -1707,55 +1620,27 @@ fn acquire_one<R: Row>(
             receipts,
         });
     }
-    let (price_representation, time_unit, capability, interval, normalized_path, scale) =
-        match native.granularity {
-            NativeGranularity::Tick => (
-                PriceRepresentation::IntegerUnits {
-                    scale: native.scale,
-                },
-                TimeUnit::Microsecond,
-                Capability::Ticks,
-                None,
-                TICK_OBJECT_PATH,
-                Some(native.scale),
-            ),
-            NativeGranularity::Bar { .. } => (
-                PriceRepresentation::BinaryFloat64,
-                TimeUnit::Second,
-                Capability::Bars,
-                Some(IntervalContract::five_second("parquet_metadata")),
-                BAR_OBJECT_PATH,
-                None,
-            ),
-        };
-    let generation = generation_id(
-        instrument,
-        SourceKind::BrokerHistory,
-        history.role,
-        scale,
-        &objects,
-    );
-    let temporary = import::temporary_path(local, &generation)?;
-    let summary = R::write(&temporary, instrument, &native, rows)?;
-    let normalized = store::identify(&temporary)?;
-    local.put_new(&object_key(&normalized.sha256), &temporary, &normalized)?;
-    fs::remove_file(&temporary)
-        .map_err(|error| format!("cannot remove {}: {error}", temporary.display()))?;
-    objects.push(import::record(
-        ObjectRole::Normalized,
-        normalized_path,
-        &normalized,
-    ));
-    let identities: Vec<ObjectIdentity> = objects
-        .iter()
-        .map(|object| store::identify(&local.local_path(&object.key).expect("local mirror")))
-        .collect::<Result<_, _>>()?;
-    let (first_event_time, last_event_time) = archive::coverage(&summary)?;
+    let (price_representation, time_unit, capability, interval) = match native.granularity {
+        NativeGranularity::Tick => (
+            PriceRepresentation::IntegerUnits {
+                scale: native.scale,
+            },
+            TimeUnit::Microsecond,
+            Capability::Ticks,
+            None,
+        ),
+        NativeGranularity::Bar { .. } => (
+            PriceRepresentation::BinaryFloat64,
+            TimeUnit::Second,
+            Capability::Bars,
+            Some(IntervalContract::five_second("parquet_metadata")),
+        ),
+    };
     let manifest = GenerationManifest {
-        layout: None,
+        layout: Some(binary_alpha_engine::dataset::Layout::DailyV2),
         day_inventory: Vec::new(),
         schema_version: MANIFEST_SCHEMA_VERSION,
-        generation: generation.clone(),
+        generation: String::new(),
         broker: instrument.broker.clone(),
         provider_symbol: instrument.provider_symbol.clone(),
         instrument: instrument.to_string(),
@@ -1765,27 +1650,38 @@ fn acquire_one<R: Row>(
         time_unit,
         price_representation,
         coverage: Coverage {
-            first_event_time,
-            last_event_time,
+            first_event_time: time_text(rows.first().expect("nonempty acquisition").time()),
+            last_event_time: time_text(rows.last().expect("nonempty acquisition").time()),
         },
-        row_count: summary.rows,
+        row_count: rows.len() as u64,
         capabilities: vec![capability],
         config_hash: config.content_hash(),
         code_revision: CODE_REVISION.into(),
-        inputs: objects
-            .iter()
-            .filter(|object| object.role == ObjectRole::Source)
-            .map(|object| Input {
-                path: object.path.clone(),
-                bytes: object.bytes,
-                sha256: object.sha256.clone(),
-            })
-            .collect(),
+        inputs: vec![],
         interval,
         objects,
     };
     let fetched = started.elapsed();
     let publishing = Instant::now();
+    let manifest = initial_daily(
+        local,
+        manifest,
+        rows.into_iter()
+            .map(|r| r.daily(instrument, &native))
+            .collect::<Result<_, _>>()?,
+        &coverage,
+        acquisition
+            .as_ref()
+            .ok_or("daily acquisition identity absent")?,
+        &bounds.diagnostics,
+        native.server_offset_s,
+    )?;
+    let generation = manifest.generation.clone();
+    let identities: Vec<_> = manifest
+        .objects
+        .iter()
+        .map(|o| store::identify(&local.local_path(&o.key).expect("local mirror")))
+        .collect::<Result<_, _>>()?;
     let published = import::publish_generation(manifest, &identities, local, destination)?;
     let line = report(
         instrument,
@@ -1847,6 +1743,323 @@ pub(crate) fn json_bytes(value: &impl Serialize) -> Result<Vec<u8>, String> {
     let mut bytes = serde_json::to_vec_pretty(value).map_err(|error| error.to_string())?;
     bytes.push(b'\n');
     Ok(bytes)
+}
+
+/// Publish an unseeded acquisition directly as a daily root, including its exact response
+/// occurrences and typed coverage. No bundle or whole-history normalized object is written.
+fn initial_daily(
+    local: &Store,
+    mut manifest: GenerationManifest,
+    rows: Vec<crate::lineage::Observation>,
+    history: &HistoryCoverage,
+    acquisition: &OccurrenceIdentity,
+    diagnostics: &[PageCoverage],
+    server_offset_s: i64,
+) -> Result<GenerationManifest, String> {
+    use binary_alpha_engine::dataset::coverage::{
+        AcquisitionCoverage, CoverageRange, CoverageShortfall, DailyCoverage, DayCoverage,
+    };
+    use binary_alpha_engine::dataset::daily::{DayFamily, DayInventoryEntry, day_bounds};
+    use binary_alpha_engine::dataset::{Layout, generation_id_with_layout};
+    use std::collections::BTreeMap;
+    let id = InstrumentId {
+        broker: manifest.broker.clone(),
+        provider_symbol: manifest.provider_symbol.clone(),
+    };
+    let mut ticks = BTreeMap::<String, Vec<Tick>>::new();
+    let mut bars = BTreeMap::<String, Vec<crate::daily::DailyBar>>::new();
+    for row in rows {
+        match row {
+            crate::lineage::Observation::Tick(t) => ticks
+                .entry(time_text(t.event_time_micros)[..10].into())
+                .or_default()
+                .push(t),
+            crate::lineage::Observation::Bar(b) => bars
+                .entry(
+                    time_text(
+                        b.unix_utc_s
+                            .ok_or("bar time absent")?
+                            .checked_mul(1_000_000)
+                            .ok_or("bar time overflow")?,
+                    )[..10]
+                        .into(),
+                )
+                .or_default()
+                .push(b),
+        }
+    }
+    let mut pages = BTreeMap::<String, Vec<crate::daily::PageOccurrence>>::new();
+    for (page, diagnostic) in history
+        .pages
+        .iter()
+        .map(|p| (p, false))
+        .chain(diagnostics.iter().map(|p| (p, true)))
+    {
+        let occurrence = page
+            .occurrence
+            .as_ref()
+            .ok_or("daily acquisition identity absent")?;
+        let mut payload = Vec::new();
+        local.read_to(&object_key(&page.sha256), None, &mut payload)?;
+        let anchor = page
+            .anchor
+            .as_ref()
+            .map(|a| {
+                binary_alpha_engine::market::parse_price_units(a, 6.try_into().expect("scale"))?
+                    .checked_sub(
+                        server_offset_s
+                            .checked_mul(1_000_000)
+                            .ok_or("offset overflow")?,
+                    )
+                    .ok_or_else(|| "anchor overflow".to_string())
+            })
+            .transpose()?;
+        let row = crate::daily::PageOccurrence {
+            acquisition_id: occurrence.acquisition_id.clone(),
+            intent: occurrence.intent.clone(),
+            ordinal: occurrence.ordinal,
+            checkpoint_ordinal: None,
+            order_kind: crate::daily::PageOrderKind::RequestOrder,
+            payload_sha256: page.sha256.clone(),
+            payload,
+            request_token: page.anchor.clone(),
+            request_anchor_utc: anchor,
+            receipt_time_utc: page.receipt_time.as_deref().map(time).transpose()?,
+            receipt_state: if page.receipt_time.is_some() {
+                crate::daily::ReceiptState::Recorded
+            } else {
+                crate::daily::ReceiptState::AbsentInLegacyRecord
+            },
+            first_event_time: page.first.as_deref().map(time).transpose()?,
+            last_event_time: page.last.as_deref().map(time).transpose()?,
+            rows: page.rows,
+            checkpoint: None,
+            disposition: if diagnostic {
+                crate::daily::PageDisposition::Diagnostic
+            } else {
+                crate::daily::PageDisposition::Indexed
+            },
+        };
+        pages
+            .entry(time_text(row.partition_time()?)[..10].into())
+            .or_default()
+            .push(row);
+    }
+    manifest.objects.clear();
+    let range = |r: &Range| CoverageRange {
+        start: r.start.clone(),
+        end: r.end.clone(),
+    };
+    let verified: Vec<_> = history.verified.iter().map(range).collect();
+    let missing = |bounds: (i64, i64)| -> Result<(Vec<CoverageRange>, Vec<CoverageRange>), String> {
+        let mut covered = Vec::new();
+        let mut unresolved = Vec::new();
+        let mut cursor = bounds.0;
+        for r in &verified {
+            let (a, b) = r.bounds()?;
+            let a = a.max(bounds.0);
+            let b = b.min(bounds.1);
+            if a < b {
+                if cursor < a {
+                    unresolved.push(CoverageRange::new(cursor, a));
+                }
+                covered.push(CoverageRange::new(a, b));
+                cursor = b;
+            }
+        }
+        if cursor < bounds.1 {
+            unresolved.push(CoverageRange::new(cursor, bounds.1));
+        }
+        Ok((covered, unresolved))
+    };
+    let mut evidence = DailyCoverage {
+        schema_version: 2,
+        broker: id.broker.clone(),
+        provider_symbol: id.provider_symbol.clone(),
+        role: manifest.role,
+        native_granularity: manifest.native_granularity,
+        acquisitions: vec![AcquisitionCoverage {
+            acquisition_id: acquisition.acquisition_id.clone(),
+            source_identity: history.source_identity.clone(),
+            requested: vec![range(&history.requested)],
+            verified: verified.clone(),
+            unresolved: missing(history.requested.bounds()?)?.1,
+            shortfalls: history
+                .shortfall
+                .iter()
+                .chain(&history.tail_shortfall)
+                .map(|s| CoverageShortfall {
+                    reason: s.reason.clone(),
+                    unresolved: range(&s.unresolved),
+                })
+                .collect(),
+        }],
+        days: vec![],
+    };
+    for rows in pages.values() {
+        for row in rows {
+            if !evidence
+                .acquisitions
+                .iter()
+                .any(|a| a.acquisition_id == row.acquisition_id)
+            {
+                evidence.acquisitions.push(AcquisitionCoverage {
+                    acquisition_id: row.acquisition_id.clone(),
+                    source_identity: history.source_identity.clone(),
+                    requested: vec![],
+                    verified: vec![],
+                    shortfalls: vec![],
+                    unresolved: vec![],
+                });
+            }
+        }
+    }
+    let scale = match manifest.price_representation {
+        PriceRepresentation::IntegerUnits { scale } => Some(scale),
+        _ => None,
+    };
+    let mut retain_day = |date: String,
+                          family: DayFamily,
+                          file: &Path,
+                          data: DataSummary|
+     -> Result<(), String> {
+        let identity = store::identify(file)?;
+        let path = format!("{family}/{date}.parquet");
+        let object = import::record(
+            if family == DayFamily::Pages {
+                ObjectRole::Source
+            } else {
+                ObjectRole::Normalized
+            },
+            &path,
+            &identity,
+        );
+        local.put_new(&object.key, file, &identity)?;
+        fs::remove_file(file).map_err(|e| e.to_string())?;
+        let bounds = day_bounds(&date)?;
+        let (verified, unresolved) = if family == DayFamily::Observations {
+            missing(bounds)?
+        } else {
+            (vec![], vec![CoverageRange::new(bounds.0, bounds.1)])
+        };
+        let day = DayCoverage { date: date.clone(), family, acquisition_ids: evidence.acquisitions.iter().map(|a| a.acquisition_id.clone()).collect(), basis: "retained acquisition range and response occurrences; market coverage does not prove occurrence completeness".into(), reason: (!unresolved.is_empty()).then(|| "acquisition evidence does not cover the whole UTC day".into()), verified, unresolved };
+        manifest.day_inventory.push(DayInventoryEntry {
+            date,
+            family,
+            duration: None,
+            offset: None,
+            object: Some(object.key.clone()),
+            rows: data.rows,
+            first_time: data.first_event_micros.map(time_text),
+            last_time: data.last_event_micros.map(time_text),
+            state: day.state(data.rows)?,
+            reason: day.reason.clone(),
+            unresolved: day
+                .unresolved
+                .iter()
+                .map(
+                    |r| binary_alpha_engine::dataset::daily::UnresolvedInterval {
+                        start: r.start.clone(),
+                        end: r.end.clone(),
+                    },
+                )
+                .collect(),
+        });
+        manifest.objects.push(object);
+        evidence.days.push(day);
+        Ok(())
+    };
+    for (date, rows) in ticks {
+        let file = import::temporary_path(local, "initial-ticks")?;
+        let data = crate::daily::write_ticks(
+            &file,
+            &date,
+            &id,
+            scale.ok_or("tick scale absent")?,
+            [rows],
+        )?;
+        retain_day(date, DayFamily::Observations, &file, data)?;
+    }
+    for (date, rows) in bars {
+        let file = import::temporary_path(local, "initial-bars")?;
+        let data = crate::daily::write_bars(&file, &date, [rows])?;
+        retain_day(date, DayFamily::Observations, &file, data)?;
+    }
+    for (date, mut rows) in pages {
+        rows.sort_by(|a, b| (&a.acquisition_id, a.ordinal).cmp(&(&b.acquisition_id, b.ordinal)));
+        let file = import::temporary_path(local, "initial-pages")?;
+        let data = crate::daily::write_pages(&file, &date, [rows])?;
+        retain_day(date, DayFamily::Pages, &file, data)?;
+    }
+    for range in &verified {
+        let (from, to) = range.bounds()?;
+        let mut start = day_bounds(&time_text(from)[..10])?.0;
+        while start < to {
+            let date = time_text(start)[..10].to_string();
+            let (_, end) = day_bounds(&date)?;
+            if from <= start
+                && end <= to
+                && !manifest
+                    .day_inventory
+                    .iter()
+                    .any(|d| d.family == DayFamily::Observations && d.date == date)
+            {
+                manifest.day_inventory.push(DayInventoryEntry {
+                    date: date.clone(),
+                    family: DayFamily::Observations,
+                    duration: None,
+                    offset: None,
+                    object: None,
+                    rows: 0,
+                    first_time: None,
+                    last_time: None,
+                    state: binary_alpha_engine::dataset::DayState::EmptyKnown,
+                    reason: None,
+                    unresolved: vec![],
+                });
+                evidence.days.push(DayCoverage {
+                    date,
+                    family: DayFamily::Observations,
+                    acquisition_ids: vec![acquisition.acquisition_id.clone()],
+                    basis: "verified acquisition covers the whole UTC day without observations"
+                        .into(),
+                    verified: vec![CoverageRange::new(start, end)],
+                    unresolved: vec![],
+                    reason: None,
+                });
+            }
+            start = end;
+        }
+    }
+    for (path, bytes) in [
+        (COVERAGE_PATH, evidence.to_json()),
+        (
+            crate::lineage::LINEAGE_PATH,
+            json_bytes(
+                &serde_json::json!({"schema_version":1,"kind":"acquisition","continuation":{"acquisition_id":acquisition.acquisition_id,"intent":acquisition.intent,"seed":history.seed}}),
+            )?,
+        ),
+    ] {
+        let identity = import::retain_bytes(local, &bytes, "initial-metadata")?;
+        manifest
+            .objects
+            .push(import::record(ObjectRole::Provenance, path, &identity));
+    }
+    manifest.layout = Some(Layout::DailyV2);
+    manifest.objects.sort_by(|a, b| a.path.cmp(&b.path));
+    manifest
+        .day_inventory
+        .sort_by(|a, b| (a.family, &a.date).cmp(&(b.family, &b.date)));
+    manifest.generation = generation_id_with_layout(
+        &id,
+        manifest.source_kind,
+        manifest.role,
+        scale,
+        &manifest.objects,
+        manifest.layout,
+    );
+    evidence.check_manifest(&manifest)?;
+    Ok(manifest)
 }
 
 #[cfg(test)]

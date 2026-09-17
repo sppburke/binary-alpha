@@ -116,7 +116,11 @@ fn published(name: &str) -> (Scratch, PathBuf, Vec<String>) {
     standard_sources(&scratch);
     let config = scratch.config(
         "import.toml",
-        &format!("{}{}", scratch.tick_source(), scratch.bar_source()),
+        &format!(
+            "{}{}",
+            daily_tick_source(&scratch),
+            scratch.bar_source().replace("evaluation", "development")
+        ),
     );
     let lines = import(&config).unwrap();
     (scratch, config, lines)
@@ -132,7 +136,11 @@ fn import_publishes_retains_and_verifies_from_either_copy() {
         .collect();
     let config = scratch.config(
         "import.toml",
-        &format!("{}{}", scratch.tick_source(), scratch.bar_source()),
+        &format!(
+            "{}{}",
+            daily_tick_source(&scratch),
+            scratch.bar_source().replace("evaluation", "development")
+        ),
     );
 
     let lines = import(&config).unwrap();
@@ -143,23 +151,23 @@ fn import_publishes_retains_and_verifies_from_either_copy() {
         lines[0]
     );
     assert!(
-        lines[0].contains(" rows 4 objects 2 reused 0 "),
+        lines[0].contains(" rows 4 objects 3 reused 0 "),
         "{}",
         lines[0]
     );
     assert!(
-        lines[1].starts_with("published pocket_option:#AAPL evaluation generation "),
+        lines[1].starts_with("published pocket_option:#AAPL development generation "),
         "{}",
         lines[1]
     );
     assert!(
-        lines[1].contains(" rows 5 objects 10 reused 0 "),
+        lines[1].contains(" rows 5 objects 4 reused 0 "),
         "{}",
         lines[1]
     );
     assert!(
-        lines[2].contains("pocket_option:AEDCNY_otc evaluation")
-            && lines[2].contains(" rows 4 objects 9 reused 3 "),
+        lines[2].contains("pocket_option:AEDCNY_otc development")
+            && lines[2].contains(" rows 4 objects 4 reused 0 "),
         "provenance bytes shared with the first asset are reused: {}",
         lines[2]
     );
@@ -187,6 +195,7 @@ fn import_publishes_retains_and_verifies_from_either_copy() {
             "byte-for-byte mirror"
         );
         let json = manifest_json(manifest);
+        assert_eq!(json["layout"], "daily-v2");
         for object in json["objects"].as_array().unwrap() {
             assert!(
                 scratch
@@ -218,7 +227,7 @@ fn import_publishes_retains_and_verifies_from_either_copy() {
     let ticks = manifests
         .iter()
         .map(|path| manifest_json(path))
-        .find(|json| json["source_kind"] == "tick_csv")
+        .find(|json| json["source_kind"] == "tick_parquet_daily")
         .unwrap();
     assert_eq!(ticks["capabilities"], json!(["ticks"]));
     assert_eq!(
@@ -235,14 +244,21 @@ fn import_publishes_retains_and_verifies_from_either_copy() {
         .iter()
         .map(|object| object["path"].as_str().unwrap())
         .collect();
-    assert_eq!(tick_objects, ["ticks.csv", "normalized/ticks.parquet"]);
+    assert_eq!(
+        tick_objects,
+        [
+            "observations/2026-03-22.parquet",
+            "provenance/coverage.json",
+            "provenance/lineage.json"
+        ]
+    );
     assert!(
         !ticks.to_string().contains("mixed.csv"),
         "the undeclared sibling was never inventoried"
     );
     let normalized = scratch
         .path("published")
-        .join(ticks["objects"][1]["key"].as_str().unwrap());
+        .join(ticks["objects"][0]["key"].as_str().unwrap());
     let reader = SerializedFileReader::new(File::open(&normalized).unwrap()).unwrap();
     let pairs: Vec<(i64, i64)> = reader
         .get_row_iter(None)
@@ -295,13 +311,30 @@ fn import_publishes_retains_and_verifies_from_either_copy() {
         .map(|object| object["path"].as_str().unwrap())
         .collect();
     assert_eq!(
-        &paths[..2],
+        paths,
         [
-            "dataset/parquet/year=2025/month=05/part-00000.parquet",
-            "dataset/parquet/year=2025/month=06/part-00000.parquet"
-        ],
-        "source objects first, in manifest order"
+            "observations/2025-05-19.parquet",
+            "pages/2025-05-19.parquet",
+            "provenance/coverage.json",
+            "provenance/lineage.json"
+        ]
     );
+    let lineage: Value = serde_json::from_slice(
+        &fs::read(
+            scratch.path("published").join(
+                apple["objects"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|o| o["path"] == "provenance/lineage.json")
+                    .unwrap()["key"]
+                    .as_str()
+                    .unwrap(),
+            ),
+        )
+        .unwrap(),
+    )
+    .unwrap();
     for provenance in [
         "raw_pages.ndjson",
         "checkpoint.ndjson",
@@ -309,7 +342,14 @@ fn import_publishes_retains_and_verifies_from_either_copy() {
         "dataset/_SUCCESS",
         "collection/collection.json",
     ] {
-        assert!(paths.contains(&provenance), "{paths:?}");
+        assert!(
+            lineage["original_objects"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|o| o["object"]["path"] == provenance),
+            "{provenance}"
+        );
     }
     assert_eq!(
         by_symbol("AEDCNY_otc")["interval"]["provenance"],
@@ -323,7 +363,7 @@ fn import_publishes_retains_and_verifies_from_either_copy() {
             .all(|line| line.ends_with("(already published)")),
         "{again:?}"
     );
-    assert!(again[1].contains(" objects 10 reused 10 "), "{}", again[1]);
+    assert!(again[1].contains(" objects 4 reused 4 "), "{}", again[1]);
     let mut expected_keys: Vec<String> = manifests
         .iter()
         .flat_map(|path| {
@@ -342,13 +382,17 @@ fn import_publishes_retains_and_verifies_from_either_copy() {
         expected_keys,
         "identical provenance bytes share one object"
     );
-    assert_eq!(expected_keys.len(), 18);
+    assert_eq!(expected_keys.len(), 11);
 
     // Reusing the committed generations from a new historical-data folder retains every child.
     let elsewhere = scratch.config_with(
         "elsewhere.toml",
         "retained2",
-        &format!("{}{}", scratch.tick_source(), scratch.bar_source()),
+        &format!(
+            "{}{}",
+            daily_tick_source(&scratch),
+            scratch.bar_source().replace("evaluation", "development")
+        ),
     );
     let reused = import(&elsewhere).unwrap();
     assert!(
@@ -449,9 +493,9 @@ fn interrupted_runs_resume_without_duplicates_or_early_ready_state() {
         .1
         .iter()
         .map(|(path, _)| manifest_json(path))
-        .find(|json| json["source_kind"] == "tick_csv")
+        .find(|json| json["source_kind"] == "tick_parquet_daily")
         .unwrap();
-    let normalized_key = ticks["objects"][1]["key"].as_str().unwrap().to_string();
+    let normalized_key = ticks["objects"][0]["key"].as_str().unwrap().to_string();
     fs::remove_file(scratch.path("published").join(&normalized_key)).unwrap();
     fs::remove_file(scratch.path("retained").join(&normalized_key)).unwrap();
     remove_manifests(&scratch, &before, true);
@@ -470,7 +514,7 @@ fn interrupted_runs_resume_without_duplicates_or_early_ready_state() {
     .unwrap();
     let again = import(&config).unwrap();
     assert!(
-        again[0].contains(" objects 2 reused 1 ["),
+        again[0].contains(" objects 3 reused 2 ["),
         "the normalized object is rebuilt from the retained source: {}",
         again[0]
     );
@@ -488,11 +532,11 @@ fn interrupted_runs_resume_without_duplicates_or_early_ready_state() {
     remove_manifests(&scratch, &before, true);
     let again = import(&config).unwrap();
     assert!(
-        again[1].contains(" objects 10 reused 9 ["),
+        again[1].contains(" objects 4 reused 3 ["),
         "one object re-created: {}",
         again[1]
     );
-    assert!(again[2].contains(" objects 9 reused 9 ["), "{}", again[2]);
+    assert!(again[2].contains(" objects 4 reused 4 ["), "{}", again[2]);
     assert!(removed.is_file());
     assert_recovered(&scratch, &before);
 
@@ -511,7 +555,7 @@ fn interrupted_runs_resume_without_duplicates_or_early_ready_state() {
     }
     remove_manifests(&scratch, &before, true);
     let again = import(&config).unwrap();
-    assert!(again[1].contains(" objects 10 reused "), "{}", again[1]);
+    assert!(again[1].contains(" objects 4 reused "), "{}", again[1]);
     assert_recovered(&scratch, &before);
 
     // 4. Interrupted before ready publication: every object exists at both copies and no ready
@@ -750,7 +794,11 @@ fn malformed_inputs_and_unsafe_layouts_are_rejected() {
     for (name, file_rows, message) in bar_cases {
         let _ = fs::remove_dir_all(scratch.path("sources/bars"));
         write_collection(&scratch.path("sources/bars"), &[apple(vec![file_rows])]);
-        let error = import(&scratch.config("bars.toml", &scratch.bar_source())).unwrap_err();
+        let error = import(&scratch.config(
+            "bars.toml",
+            &scratch.bar_source().replace("evaluation", "development"),
+        ))
+        .unwrap_err();
         assert!(error.contains(message), "{name}: {error}");
     }
 
@@ -762,7 +810,11 @@ fn malformed_inputs_and_unsafe_layouts_are_rejected() {
         let file = scratch
             .path("sources/bars/#AAPL/dataset/parquet/year=2025/month=05/part-00000.parquet");
         change(&file, &manifest);
-        let error = import(&scratch.config("bars.toml", &scratch.bar_source())).unwrap_err();
+        let error = import(&scratch.config(
+            "bars.toml",
+            &scratch.bar_source().replace("evaluation", "development"),
+        ))
+        .unwrap_err();
         assert!(!error.is_empty(), "{name}");
         error
     };
@@ -874,7 +926,7 @@ fn malformed_inputs_and_unsafe_layouts_are_rejected() {
     let inside_asset = scratch.config_with(
         "inside.toml",
         "sources/bars/#AAPL/retained",
-        &scratch.bar_source(),
+        &scratch.bar_source().replace("evaluation", "development"),
     );
     assert!(
         import(&inside_asset)
@@ -900,7 +952,7 @@ fn malformed_inputs_and_unsafe_layouts_are_rejected() {
     let beside = scratch.config_with(
         "beside.toml",
         "sources/bars/retained",
-        &scratch.bar_source(),
+        &scratch.bar_source().replace("evaluation", "development"),
     );
     assert!(
         import(&beside).is_ok(),
@@ -929,11 +981,14 @@ fn malformed_inputs_and_unsafe_layouts_are_rejected() {
         "twice.toml",
         &format!(
             "{}{}",
-            scratch.bar_source(),
-            scratch.bar_source().replace(
-                "\"sources/bars\"",
-                &format!("\"{}\"", scratch.path("sources/bars").display())
-            )
+            scratch.bar_source().replace("evaluation", "development"),
+            scratch
+                .bar_source()
+                .replace("evaluation", "development")
+                .replace(
+                    "\"sources/bars\"",
+                    &format!("\"{}\"", scratch.path("sources/bars").display())
+                )
         ),
     );
     assert!(import(&twice).unwrap_err().contains("declared twice"));
@@ -1008,7 +1063,6 @@ fn daily_tick_archives_publish_one_generation_per_listed_directory() {
         ],
         "daily observations and embedded provenance"
     );
-    assert_eq!(json["layout"], "daily-v2");
     let inputs = json["inputs"].as_array().unwrap();
     assert_eq!(inputs.len(), 5);
     let first = scratch.path("sources/deriv/AUDUSD/AUDUSD_2025-08-11_ticks.parquet");
@@ -1301,9 +1355,7 @@ fn daily_tick_archives_reject_malformed_days_and_layouts() {
 fn verify_rejects_incomplete_or_tampered_generations() {
     let scratch = Scratch::new("verify");
     write_ticks(&scratch.path("sources/ticks/ticks.csv"), &TICK_ROWS);
-    let config = scratch.config("import.toml", &scratch.tick_source());
-    import(&config).unwrap();
-    let manifest = scratch.manifests("published").remove(0);
+    let manifest = legacy_csv_fixture(&scratch);
     let json = manifest_json(&manifest);
     let objects = json["objects"].as_array().unwrap();
 
@@ -1408,7 +1460,11 @@ fn verify_rejects_incomplete_or_tampered_generations() {
             metadata: false,
         }],
     );
-    import(&scratch.config("bars.toml", &scratch.bar_source())).unwrap();
+    import(&scratch.config(
+        "bars.toml",
+        &scratch.bar_source().replace("evaluation", "development"),
+    ))
+    .unwrap();
     let manifest = scratch.manifests("published").remove(0);
     let text = fs::read_to_string(&manifest).unwrap();
     fs::write(
@@ -1435,4 +1491,101 @@ fn walk(root: &Path) -> Vec<PathBuf> {
     }
     files.sort();
     files
+}
+
+#[test]
+fn unsupported_imports_never_publish_v1() {
+    let scratch = Scratch::new("no_v1_imports");
+    standard_sources(&scratch);
+    daily_sources(&scratch);
+    for source in [
+        scratch.tick_source(),
+        scratch.bar_source(),
+        scratch.daily_source().replace("development", "evaluation"),
+    ] {
+        let config = scratch.config("refused.toml", &source);
+        let error = import(&config).unwrap_err();
+        assert!(error.contains("daily-v2"), "{error}");
+        assert!(!scratch.path("published/manifests").exists());
+    }
+}
+
+fn daily_tick_source(scratch: &Scratch) -> String {
+    let values: Vec<_> = NORMALIZED_TICKS
+        .iter()
+        .map(|(t, p)| (t * 1_000, *p as f64 / 1_000_000.))
+        .collect();
+    write_daily_directory(
+        &scratch.path("sources/daily/AEDCNY"),
+        "AEDCNY",
+        "AEDCNY_otc",
+        &[("2026-03-22", &values)],
+    );
+    "\n[[import.sources]]\nkind = \"tick_parquet_daily\"\npath = \"sources/daily\"\nbroker = \"pocket_option\"\nrole = \"development\"\nprice_scale = 6\ninstruments = [\"AEDCNY\"]\n".into()
+}
+
+fn legacy_csv_fixture(scratch: &Scratch) -> PathBuf {
+    use binary_alpha_engine::{dataset::*, market::*};
+    let root = scratch.path("published");
+    let id = InstrumentId {
+        broker: "pocket_option".to_string().try_into().unwrap(),
+        provider_symbol: "AEDCNY_otc".to_string().try_into().unwrap(),
+    };
+    let scale = 6.try_into().unwrap();
+    let file = scratch.path("legacy-ticks.parquet");
+    binary_alpha_app::archive::write_ticks(
+        &file,
+        &id,
+        scale,
+        NORMALIZED_TICKS.iter().map(|(t, p)| {
+            Ok(Tick {
+                event_time_micros: *t,
+                price_units: *p,
+            })
+        }),
+    )
+    .unwrap();
+    let mut objects = vec![
+        common::daily::object(
+            &root,
+            "ticks.csv",
+            ObjectRole::Source,
+            &scratch.path("sources/ticks/ticks.csv"),
+        ),
+        common::daily::object(
+            &root,
+            "normalized/ticks.parquet",
+            ObjectRole::Normalized,
+            &file,
+        ),
+    ];
+    for o in &mut objects {
+        o.crc32c = None;
+    }
+    let mut manifest = GenerationManifest {
+        layout: None,
+        day_inventory: vec![],
+        schema_version: 1,
+        generation: String::new(),
+        broker: id.broker,
+        provider_symbol: id.provider_symbol,
+        instrument: "pocket_option:AEDCNY_otc".into(),
+        role: DatasetRole::Development,
+        source_kind: SourceKind::TickCsv,
+        native_granularity: NativeGranularity::Tick,
+        time_unit: TimeUnit::Microsecond,
+        price_representation: PriceRepresentation::IntegerUnits { scale },
+        coverage: Coverage {
+            first_event_time: format_event_time_micros(NORMALIZED_TICKS[0].0),
+            last_event_time: format_event_time_micros(NORMALIZED_TICKS[3].0),
+        },
+        row_count: 4,
+        capabilities: vec![Capability::Ticks],
+        config_hash: "a".repeat(64),
+        code_revision: "direct-v1-reader-fixture".into(),
+        inputs: vec![],
+        interval: None,
+        objects,
+    };
+    common::daily::publish(&root, &mut manifest)
 }

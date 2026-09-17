@@ -71,6 +71,14 @@ pub struct MigrationRecord {
     pub equality: MigrationEquality,
     #[serde(flatten)]
     pub evidence: BTreeMap<String, Value>,
+    /// Earlier job identifiers whose generations, records, catalogs, and transfers belong to this job's
+    /// instrument and source identity (verified during migration); retirement treats them as this job's.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub predecessor_jobs: Vec<String>,
+    /// Physical store keys holding a byte-identical standalone copy of a migrated page payload
+    /// (`objects/<payload_sha256>`); they are storage aliases of existing occurrences, not occurrences.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub storage_aliases: Vec<String>,
 }
 impl MigrationRecord {
     fn session_proof_consistent(&self) -> bool {
@@ -235,15 +243,167 @@ fn date(t: i64) -> String {
     text(t)[..10].into()
 }
 
+/// Immutable receipt names, rather than proof versions or mutable checkpoints, order
+/// migration roots. The same resolver consumes local records and pinned archive records.
+fn current_migration<'a>(
+    records: &'a BTreeMap<String, MigrationRecord>,
+    job: &str,
+) -> Result<Option<&'a MigrationRecord>, String> {
+    let owned: BTreeMap<_, _> = records
+        .iter()
+        .filter(|(_, r)| r.job == job)
+        .map(|(name, record)| (name.as_str(), record))
+        .collect();
+    if owned.is_empty() {
+        return Ok(None);
+    }
+    let mut superseded = BTreeSet::new();
+    for (name, record) in &owned {
+        if !record.verified() {
+            return Err(format!("missing verified migration evidence: {name}"));
+        }
+        let mut seen = BTreeSet::from([*name]);
+        let mut cursor = *record;
+        while let Some(previous) = cursor.evidence.get("supersedes").filter(|v| !v.is_null()) {
+            let previous = previous
+                .as_str()
+                .ok_or("invalid migration supersession name")?;
+            record_name(&format!("records/{previous}"))?;
+            if !seen.insert(previous) {
+                return Err("cyclic migration supersession".into());
+            }
+            let predecessor = owned.get(previous).ok_or_else(|| {
+                format!("missing verified superseded migration record {previous}")
+            })?;
+            if !predecessor.verified() {
+                return Err(format!("missing verified migration evidence: {previous}"));
+            }
+            superseded.insert(previous);
+            cursor = predecessor;
+        }
+    }
+    let mut newest = owned
+        .keys()
+        .copied()
+        .filter(|name| !superseded.contains(*name));
+    let name = newest.next().ok_or("cyclic migration supersession")?;
+    if newest.next().is_some() {
+        return Err("competing verified migration records; no unique superseding record".into());
+    }
+    Ok(Some(owned[name]))
+}
+
+fn insert_migration(
+    records: &mut BTreeMap<String, MigrationRecord>,
+    name: &str,
+    bytes: &[u8],
+) -> Result<(), String> {
+    let value: Value = serde_json::from_slice(bytes).map_err(err)?;
+    if value.get("v2_root").is_some() {
+        let record: MigrationRecord = serde_json::from_value(value).map_err(err)?;
+        if let Some(existing) = records.get(name)
+            && serde_json::to_value(existing).map_err(err)?
+                != serde_json::to_value(&record).map_err(err)?
+        {
+            return Err(format!("conflicting migration record bytes: {name}"));
+        }
+        records.insert(name.into(), record);
+    }
+    Ok(())
+}
+
+fn migration_family(
+    manifest: &GenerationManifest,
+    lineage: &Value,
+    record: &MigrationRecord,
+) -> Result<bool, String> {
+    let logical_root = lineage["root_generation"]
+        .as_str()
+        .unwrap_or(&manifest.generation);
+    if logical_root != record.v2_root {
+        return Ok(false);
+    }
+    if lineage.get("v1_generations").is_some() {
+        let mapping: MigrationMapping = serde_json::from_value(lineage.clone()).map_err(err)?;
+        if mapping != record.mapping {
+            return Err("selected migration root disagrees with verified mapping".into());
+        }
+    } else if manifest.generation == record.v2_root {
+        return Err("verified migration root is missing its mapping".into());
+    }
+    Ok(true)
+}
+
+fn selected_daily(
+    local: &Store,
+    records_dir: &Path,
+    job: &str,
+    candidates: Vec<GenerationManifest>,
+    access: Access<'_>,
+) -> Result<Vec<GenerationManifest>, String> {
+    let mut records = BTreeMap::new();
+    if records_dir.is_dir() {
+        for entry in fs::read_dir(records_dir).map_err(err)? {
+            let entry = entry.map_err(err)?;
+            if entry.path().extension().is_some_and(|e| e == "json") {
+                insert_migration(
+                    &mut records,
+                    &entry.file_name().to_string_lossy(),
+                    &fs::read(entry.path()).map_err(err)?,
+                )?;
+            }
+        }
+    }
+    let current = current_migration(&records, job)?;
+    let mut selected = Vec::new();
+    for manifest in candidates {
+        let lineage = read_lineage(local, &manifest)?;
+        if let Some(record) = current {
+            if migration_family(&manifest, &lineage, record)? {
+                selected.push(manifest);
+            }
+        } else if lineage.get("v1_generations").is_some() {
+            return Err(format!(
+                "missing verified migration evidence for {}",
+                manifest.generation
+            ));
+        } else {
+            selected.push(manifest);
+        }
+    }
+    if current.is_some() {
+        let first = selected
+            .iter()
+            .find(|m| current.is_some_and(|r| m.generation == r.v2_root))
+            .or_else(|| {
+                selected.iter().find(|m| {
+                    read_lineage(local, m).is_ok_and(|v| v.get("v1_generations").is_some())
+                })
+            })
+            .ok_or("verified migration continuation root and descendants are absent")?;
+        // Reuse the existing mapping, stream, and immutable source-record verifier.
+        migration_records(local, records_dir, first, job, access)?;
+    }
+    Ok(selected)
+}
+
 /// Select a stable readable seed. A restored descendant is a self-contained baseline;
 /// its immutable logical root remains in lineage even if ancestor manifests are absent.
 pub(crate) fn root(
     local: &Store,
+    records: &Path,
+    job: &str,
     instrument: &str,
     role: DatasetRole,
     access: Access<'_>,
 ) -> Result<Option<String>, String> {
-    let candidates = daily_candidates(local, instrument, role, access)?;
+    let candidates = selected_daily(
+        local,
+        records,
+        job,
+        daily_candidates(local, instrument, role, access)?,
+        access,
+    )?;
     if candidates.is_empty() {
         return Ok(None);
     }
@@ -2061,6 +2221,23 @@ pub fn newest_daily(
     let candidates = daily_candidates(local, instrument, role, access)?;
     newest_from(local, candidates.iter().collect())
 }
+pub(crate) fn newest_daily_for_job(
+    local: &Store,
+    records: &Path,
+    job: &str,
+    instrument: &str,
+    role: DatasetRole,
+    access: Access<'_>,
+) -> Result<String, String> {
+    let candidates = selected_daily(
+        local,
+        records,
+        job,
+        daily_candidates(local, instrument, role, access)?,
+        access,
+    )?;
+    newest_from(local, candidates.iter().collect())
+}
 pub(crate) fn newest_from(
     local: &Store,
     manifests: Vec<&GenerationManifest>,
@@ -2161,30 +2338,223 @@ fn lineage_references(
     Ok(found)
 }
 
-/// Resolve equal-coverage daily catalogs through their pinned lineage metadata. Catalog
-/// discovery itself still reads catalogs only; acquisition and migration remain separate owners.
+/// Resolve the active verified migration family before comparing coverage. All remote
+/// evidence is read through the catalog's immutable byte/hash/file-id bindings.
 pub fn newest_catalog(
     catalogs: &[(String, String, crate::data_pipeline::Catalog)],
     drive: &mut Drive,
     scratch: &Path,
-    access: binary_alpha_engine::research::Access<'_>,
+    access: Access<'_>,
 ) -> Result<usize, String> {
-    use binary_alpha_engine::{dataset::GenerationManifest, market::parse_event_time_micros};
+    fn read(
+        drive: &mut Drive,
+        scratch: &Path,
+        id: &str,
+        bytes: u64,
+        sha256: &str,
+    ) -> Result<Vec<u8>, String> {
+        let path = scratch.join(format!("{sha256}.lineage"));
+        drive.download(
+            id,
+            &path,
+            &ObjectIdentity {
+                bytes,
+                sha256: sha256.into(),
+                crc32c: 0,
+            },
+        )?;
+        let bytes = fs::read(&path).map_err(err)?;
+        fs::remove_file(path).map_err(err)?;
+        Ok(bytes)
+    }
+    let mut records = BTreeMap::new();
+    let mut record_bytes = BTreeMap::<String, Vec<u8>>::new();
+    let mut daily = BTreeMap::new();
+    let mut denied = BTreeMap::new();
+    for (index, (_, _, catalog)) in catalogs.iter().enumerate() {
+        if catalog.layout != Some(Layout::DailyV2) {
+            continue;
+        }
+        if let Err(reason) = access.permit(Some(catalog.role), &catalog.dataset.generation) {
+            // Catalog discovery is allowed; opening an unpermitted target is not. Delay
+            // rejection only while permitted lineage may prove that target superseded.
+            denied.insert(index, reason);
+            continue;
+        }
+        let entry = &catalog.dataset;
+        let manifest = GenerationManifest::from_json(&read(
+            drive,
+            scratch,
+            &entry.file_id,
+            entry.bytes,
+            &entry.sha256,
+        )?)?;
+        if manifest.generation != entry.generation
+            || manifest.layout != catalog.layout
+            || manifest.role != catalog.role
+            || manifest.instrument != catalog.instrument
+        {
+            return Err("archive: catalog disagrees with lineage manifest".into());
+        }
+        let lineage = if let Some(object) = manifest.objects.iter().find(|o| o.path == LINEAGE_PATH)
+        {
+            let entry = catalog
+                .objects
+                .iter()
+                .find(|e| {
+                    e.key == object.key && e.bytes == object.bytes && e.sha256 == object.sha256
+                })
+                .ok_or("archive: lineage lies outside pinned catalog closure")?;
+            serde_json::from_slice(&read(
+                drive,
+                scratch,
+                &entry.file_id,
+                entry.bytes,
+                &entry.sha256,
+            )?)
+            .map_err(err)?
+        } else {
+            json!({})
+        };
+        for entry in &catalog.records {
+            let name = record_name(&entry.key)?;
+            if !name.ends_with(".json") {
+                continue;
+            }
+            let bytes = if let Some(bytes) = record_bytes.get(name) {
+                confirm_bytes(bytes, entry.bytes, &entry.sha256)?;
+                bytes.clone()
+            } else {
+                let bytes = read(drive, scratch, &entry.file_id, entry.bytes, &entry.sha256)?;
+                record_bytes.insert(name.into(), bytes.clone());
+                bytes
+            };
+            insert_migration(&mut records, name, &bytes)?;
+        }
+        daily.insert(index, (manifest, lineage));
+    }
     let mut candidates = Vec::new();
     for (index, (_, _, catalog)) in catalogs.iter().enumerate() {
+        if denied.contains_key(&index) {
+            continue;
+        }
+        if let Some((manifest, lineage)) = daily.get(&index) {
+            if let Some(record) = current_migration(&records, &catalog.job)? {
+                if !migration_family(manifest, lineage, record)? {
+                    continue;
+                }
+                if lineage.get("v1_generations").is_none() {
+                    // Some historical descendants bind their root without repeating its
+                    // migration map. Verify that map from the exact pinned root closure.
+                    let root = catalog
+                        .lineage_manifests
+                        .iter()
+                        .find(|e| e.generation == record.v2_root)
+                        .ok_or("catalog omits the verified migration root")?;
+                    access.permit(Some(catalog.role), &root.generation)?;
+                    let root_manifest = GenerationManifest::from_json(&read(
+                        drive,
+                        scratch,
+                        &root.file_id,
+                        root.bytes,
+                        &root.sha256,
+                    )?)?;
+                    if root_manifest.generation != record.v2_root
+                        || root_manifest.instrument != manifest.instrument
+                        || root_manifest.role != manifest.role
+                        || root_manifest.layout != Some(Layout::DailyV2)
+                    {
+                        return Err("catalog migration root binding mismatch".into());
+                    }
+                    let object = root_manifest
+                        .objects
+                        .iter()
+                        .find(|o| o.path == LINEAGE_PATH)
+                        .ok_or("verified migration root is missing its mapping")?;
+                    let entry = catalog
+                        .objects
+                        .iter()
+                        .find(|e| {
+                            e.key == object.key
+                                && e.bytes == object.bytes
+                                && e.sha256 == object.sha256
+                        })
+                        .ok_or("archive: lineage lies outside pinned catalog closure")?;
+                    let root_lineage: Value = serde_json::from_slice(&read(
+                        drive,
+                        scratch,
+                        &entry.file_id,
+                        entry.bytes,
+                        &entry.sha256,
+                    )?)
+                    .map_err(err)?;
+                    if !migration_family(&root_manifest, &root_lineage, record)? {
+                        return Err("catalog migration root binding mismatch".into());
+                    }
+                }
+                // A superseded catalog for the same root may predate the newest receipt.
+                // Only a cumulative closure can restore the complete verified chain.
+                if records
+                    .iter()
+                    .filter(|(_, r)| r.job == catalog.job)
+                    .any(|(name, _)| {
+                        !catalog
+                            .records
+                            .iter()
+                            .any(|entry| entry.key == format!("records/{name}"))
+                    })
+                {
+                    continue;
+                }
+                let entry = std::iter::once(&catalog.stream)
+                    .chain(&catalog.lineage_manifests)
+                    .find(|entry| entry.generation == record.v2_stream)
+                    .ok_or("catalog omits the verified migration stream")?;
+                access.lookup(&entry.generation)?;
+                access.permit(Some(catalog.role), &record.v2_root)?;
+                let stream = binary_alpha_engine::stream::StreamManifest::from_json(&read(
+                    drive,
+                    scratch,
+                    &entry.file_id,
+                    entry.bytes,
+                    &entry.sha256,
+                )?)?;
+                if stream.generation != record.v2_stream
+                    || stream.source_generation != record.v2_root
+                    || stream.instrument != manifest.instrument
+                    || stream.role != manifest.role
+                    || stream.layout != Some(Layout::DailyV2)
+                {
+                    return Err("migration stream does not bind its daily continuation root".into());
+                }
+            } else if lineage.get("v1_generations").is_some() {
+                return Err(format!(
+                    "verified migration evidence is not archived for {}",
+                    manifest.generation
+                ));
+            }
+        }
         candidates.push((
             (
                 catalog.layout.is_some(),
-                parse_event_time_micros(&catalog.coverage.last_event_time)?,
+                time(&catalog.coverage.last_event_time)?,
             ),
             index,
         ));
+    }
+    if candidates.is_empty()
+        && let Some(reason) = denied.values().next()
+    {
+        return Err(reason.clone());
+    }
+    if !daily.is_empty() && !candidates.iter().any(|(key, _)| key.0) {
+        return Err("drive: no archived catalog for the verified migration continuation".into());
     }
     let newest = candidates
         .iter()
         .map(|(key, _)| *key)
         .max()
-        .ok_or("drive: no archived catalog")?;
+        .ok_or("drive: no archived catalog for the verified migration continuation")?;
     candidates.retain(|(key, _)| *key == newest);
     let generations: BTreeSet<_> = candidates
         .iter()
@@ -2193,66 +2563,19 @@ pub fn newest_catalog(
     let mut ancestors = BTreeSet::new();
     if newest.0 && generations.len() > 1 {
         for (_, index) in &candidates {
-            let catalog = &catalogs[*index].2;
-            access.permit(Some(catalog.role), &catalog.dataset.generation)?;
-            let read = |drive: &mut Drive,
-                        id: &str,
-                        bytes: u64,
-                        sha256: &str|
-             -> Result<Vec<u8>, String> {
-                let path = scratch.join(format!("{sha256}.lineage"));
-                drive.download(
-                    id,
-                    &path,
-                    &ObjectIdentity {
-                        bytes,
-                        sha256: sha256.into(),
-                        crc32c: 0,
-                    },
-                )?;
-                let bytes = fs::read(&path).map_err(|e| e.to_string())?;
-                fs::remove_file(path).map_err(|e| e.to_string())?;
-                Ok(bytes)
-            };
-            let entry = &catalog.dataset;
-            let manifest = GenerationManifest::from_json(&read(
-                drive,
-                &entry.file_id,
-                entry.bytes,
-                &entry.sha256,
-            )?)?;
-            if manifest.generation != entry.generation
-                || manifest.layout != catalog.layout
-                || manifest.role != catalog.role
-            {
-                return Err("archive: catalog disagrees with lineage manifest".into());
-            }
-            if let Some(object) = manifest
-                .objects
-                .iter()
-                .find(|o| o.path == "provenance/lineage.json")
-            {
-                let entry = catalog
-                    .objects
-                    .iter()
-                    .find(|e| {
-                        e.key == object.key && e.bytes == object.bytes && e.sha256 == object.sha256
-                    })
-                    .ok_or("archive: lineage lies outside pinned catalog closure")?;
-                let bytes = read(drive, &entry.file_id, entry.bytes, &entry.sha256)?;
-                ancestors.extend(lineage_references(
-                    &bytes,
-                    &generations,
-                    &manifest.generation,
-                )?);
-            }
+            let (manifest, lineage) = &daily[index];
+            ancestors.extend(lineage_references(
+                &serde_json::to_vec(lineage).map_err(err)?,
+                &generations,
+                &manifest.generation,
+            )?);
         }
     }
     let terminal = newest
         .0
         .then(|| terminal_generation(&generations, &ancestors))
         .transpose()?;
-    candidates
+    let selected = candidates
         .iter()
         .map(|(_, i)| *i)
         .filter(|i| {
@@ -2261,7 +2584,30 @@ pub fn newest_catalog(
                 .is_none_or(|generation| *generation == catalogs[*i].2.dataset.generation)
         })
         .max_by_key(|i| &catalogs[*i].2.dataset.generation)
-        .ok_or_else(|| "archive: cyclic daily catalog lineage".into())
+        .ok_or("archive: cyclic daily catalog lineage")?;
+    if !denied.is_empty() {
+        let generations = denied
+            .keys()
+            .map(|i| catalogs[*i].2.dataset.generation.clone())
+            .collect();
+        let superseded = if let Some((manifest, lineage)) = daily.get(&selected) {
+            lineage_references(
+                &serde_json::to_vec(lineage).map_err(err)?,
+                &generations,
+                &manifest.generation,
+            )?
+        } else {
+            BTreeSet::new()
+        };
+        for (index, reason) in denied {
+            // Lower coverage alone cannot prove obsolescence: a proof upgrade may
+            // publish a new root. Unknown denied candidates must never cause fallback.
+            if !superseded.contains(&catalogs[index].2.dataset.generation) {
+                return Err(reason);
+            }
+        }
+    }
+    Ok(selected)
 }
 
 /// Archive consumes an already published stream. Computing its identity from the configured
@@ -2361,4 +2707,84 @@ fn superseded_snapshots(
         }
     }
     Ok(result)
+}
+
+#[cfg(test)]
+mod migration_selection_tests {
+    use super::*;
+
+    fn receipt(root: char, supersedes: Option<&str>) -> MigrationRecord {
+        serde_json::from_value(json!({
+            "schema_version": 1, "job": "fixture", "phase": "verified",
+            "v1_generations": ["a".repeat(64)], "v1_stream": null,
+            "v2_root": root.to_string().repeat(64), "v2_stream": "d".repeat(64),
+            "equality": {"observations": true, "pages": true, "source_files": true, "candles": null},
+            "supersedes": supersedes,
+        })).unwrap()
+    }
+
+    #[test]
+    fn migration_selection_follows_exact_verified_supersession() {
+        // Lexical name ordering and proof version are deliberately irrelevant.
+        let records = BTreeMap::from([
+            ("z-old.json".into(), receipt('b', None)),
+            ("a-new.json".into(), receipt('c', Some("z-old.json"))),
+        ]);
+        assert_eq!(
+            current_migration(&records, "fixture")
+                .unwrap()
+                .unwrap()
+                .v2_root,
+            "c".repeat(64)
+        );
+        assert!(current_migration(&records, "unrelated").unwrap().is_none());
+    }
+
+    #[test]
+    fn migration_selection_refuses_unverified_new_receipt() {
+        let mut new = receipt('c', Some("old.json"));
+        new.equality.pages = false;
+        let records = BTreeMap::from([
+            ("old.json".into(), receipt('b', None)),
+            ("new.json".into(), new),
+        ]);
+        assert!(
+            current_migration(&records, "fixture")
+                .unwrap_err()
+                .contains("missing verified migration evidence")
+        );
+    }
+
+    #[test]
+    fn migration_selection_refuses_competing_roots_and_missing_receipts() {
+        let records = BTreeMap::from([
+            ("first.json".into(), receipt('b', None)),
+            ("second.json".into(), receipt('c', None)),
+        ]);
+        assert!(
+            current_migration(&records, "fixture")
+                .unwrap_err()
+                .contains("competing verified migration records")
+        );
+        let records = BTreeMap::from([("new.json".into(), receipt('c', Some("absent.json")))]);
+        assert!(
+            current_migration(&records, "fixture")
+                .unwrap_err()
+                .contains("missing verified superseded migration record")
+        );
+    }
+
+    #[test]
+    fn migration_selection_refuses_cycles_even_with_another_terminal() {
+        let records = BTreeMap::from([
+            ("first.json".into(), receipt('b', Some("second.json"))),
+            ("second.json".into(), receipt('c', Some("first.json"))),
+            ("independent.json".into(), receipt('e', None)),
+        ]);
+        assert!(
+            current_migration(&records, "fixture")
+                .unwrap_err()
+                .contains("cyclic migration supersession")
+        );
+    }
 }

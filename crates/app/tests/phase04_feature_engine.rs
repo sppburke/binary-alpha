@@ -19,6 +19,7 @@ use binary_alpha_engine::features::{
 };
 use binary_alpha_engine::market::{Tick, format_event_time_micros};
 use binary_alpha_engine::stream::{Observation, Source, StreamManifest};
+use common::current::import;
 use common::*;
 
 /// The report lines of a successful build, or the diagnostic of a failed one.
@@ -836,7 +837,13 @@ fn features_build_fits_publishes_reconstructs_freezes_and_isolates() {
     );
     // An evaluation-role profile is refused before any child object is read: a store holding
     // only the manifests cannot even satisfy a child read.
-    let eval_audit = audit(&audit_config, &eval_manifest);
+    let eval_dataset = GenerationManifest::from_json(&fs::read(&eval_manifest).unwrap()).unwrap();
+    let eval_profile =
+        common::legacy::stream(&audit_config, &scratch.path("published"), &eval_dataset);
+    let eval_audit = format!(
+        "fixture evaluation profile generation {}",
+        eval_profile.generation
+    );
     let eval_stream = scratch.path(&format!(
         "published/manifests/{}/ready.json",
         generation(&eval_audit)

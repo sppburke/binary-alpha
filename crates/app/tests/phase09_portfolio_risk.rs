@@ -12,9 +12,7 @@ use std::process::{Command, Stdio};
 use std::time::Duration;
 
 use binary_alpha_engine::config::StreamKey;
-use binary_alpha_engine::dataset::{
-    DatasetRole, GenerationManifest, PriceRepresentation, generation_id,
-};
+use binary_alpha_engine::dataset::{DatasetRole, GenerationManifest, PriceRepresentation};
 use binary_alpha_engine::execution::{Decimal, EventKind, FinancialEvent, Summary, Threshold};
 use binary_alpha_engine::features::{FeatureManifest, FeaturePlan, PLAN_OBJECT_PATH};
 use binary_alpha_engine::market::{InstrumentId, format_event_time_micros};
@@ -22,7 +20,8 @@ use binary_alpha_engine::portfolio::{
     Selection, SelectionManifest, State, selection_generation_id,
 };
 use binary_alpha_engine::search::Family;
-use common::{Scratch, command, generation, import, verify, write_ticks};
+use common::current::import;
+use common::{Scratch, command, generation, verify, write_ticks};
 use serde_json::Value;
 
 const BASE_MS: i64 = 1_767_571_200_000; // 2026-01-05T00:00:00Z, a Monday
@@ -2075,21 +2074,23 @@ fn later_role_evidence_and_ill_formed_inputs_are_refused_before_output() {
     assert_eq!(snapshot(&scratch), before);
 
     // A holdout-role input is refused on its manifest bytes before any output.
-    let mut holdout = GenerationManifest::from_json(&fs::read(&assessment).unwrap()).unwrap();
-    holdout.role = DatasetRole::Holdout;
-    let PriceRepresentation::IntegerUnits { scale } = holdout.price_representation else {
+    let assessment_manifest =
+        GenerationManifest::from_json(&fs::read(&assessment).unwrap()).unwrap();
+    let PriceRepresentation::IntegerUnits { scale } = assessment_manifest.price_representation
+    else {
         panic!("tick sources carry integer units");
     };
-    holdout.generation = generation_id(
+    let holdout = common::current::ticks(
+        &scratch.path("published"),
         &InstrumentId {
-            broker: holdout.broker.clone(),
-            provider_symbol: holdout.provider_symbol.clone(),
+            broker: assessment_manifest.broker.clone(),
+            provider_symbol: assessment_manifest.provider_symbol.clone(),
         },
-        holdout.source_kind,
         DatasetRole::Holdout,
-        Some(scale),
-        &holdout.objects,
-    );
+        scale,
+        &common::read_normalized_ticks(&scratch.path("published"), &assessment_manifest),
+    )
+    .unwrap();
     let holdout_path = scratch.path(&format!(
         "published/manifests/{}/ready.json",
         holdout.generation

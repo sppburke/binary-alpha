@@ -15,7 +15,9 @@ use binary_alpha_engine::dataset::{
 };
 use binary_alpha_engine::market::InstrumentId;
 use serde_json::{Value, json};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
+
+const PROOF_VERSION: u32 = 1;
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 
 fn err(e: impl std::fmt::Display) -> String {
@@ -76,6 +78,18 @@ struct ImportFiles {
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct State {
+    #[serde(default)]
+    proof_version: u32,
+    #[serde(default)]
+    supersedes: Option<String>,
+    #[serde(default)]
+    predecessor_jobs: Vec<String>,
+    #[serde(default)]
+    unresolved_predecessor_jobs: Vec<Value>,
+    #[serde(default)]
+    storage_aliases: Vec<String>,
+    #[serde(default)]
+    unresolved_objects: Vec<Value>,
     phase: String,
     binding: String,
     dataset: String,
@@ -401,6 +415,7 @@ impl Spool<'_> {
         if let Some(path) = identity_path {
             save(&path, &(page.acquisition_id.clone(), page.ordinal))?;
         }
+        payload_target(&self.work.join("physical-targets"), &alias)?;
         append(&self.aliases, &alias)?;
         self.occurrences += 1;
         Ok(())
@@ -1448,6 +1463,480 @@ fn observations(
     Ok((objects, days.into_values().collect(), peak))
 }
 
+/// All physical objects fall into one counted class. Only proved aliases and diagnostics
+/// enter the occurrence table; unresolved objects never confer retirement authority.
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct PhysicalCensus {
+    objects: u64,
+    manifest_objects: u64,
+    storage_aliases: Vec<String>,
+    diagnostic_objects: u64,
+    other_source_objects: u64,
+    non_response_objects: u64,
+    staging_objects: u64,
+    unresolved_objects: Vec<Value>,
+}
+
+fn payload_target(directory: &Path, alias: &Alias) -> Result<(), String> {
+    mkdir(directory)?;
+    let path = directory.join(&alias.source.sha256);
+    if !path.exists() {
+        save(&path, alias)?;
+    }
+    Ok(())
+}
+
+fn physical_census(
+    layout: &Layout,
+    source: &GenerationManifest,
+    identity: &str,
+    offset_s: i64,
+    targets: &Path,
+    access: Access<'_>,
+    accept: &mut dyn FnMut(Alias, Option<PageOccurrence>) -> Result<(), String>,
+) -> Result<PhysicalCensus, String> {
+    // Read manifest metadata only. Referenced objects of other populations are never opened.
+    let mut referenced = BTreeSet::new();
+    let mut contexts = BTreeSet::from([identity.to_string()]);
+    for generation in layout.store().list_manifests()? {
+        let bytes = fs::read(layout.store.join(manifest_key(&generation))).map_err(err)?;
+        let value: Value = serde_json::from_slice(&bytes).map_err(err)?;
+        for object in value["objects"].as_array().into_iter().flatten() {
+            if let Some(key) = object["key"].as_str() {
+                referenced.insert(key.to_string());
+            }
+        }
+        if value["instrument"] == source.instrument
+            && value["role"] == serde_json::to_value(source.role).map_err(err)?
+            && verify::manifest_kind(&bytes)?.is_none()
+        {
+            access.permit(Some(source.role), &generation)?;
+            let m = GenerationManifest::from_json(&bytes)?;
+            if let Some(o) = m.objects.iter().find(|o| o.path == fetch::COVERAGE_PATH) {
+                let header = document(&object_path(layout, o)?, &mut |_, _| Ok(()))?;
+                if let Some(id) = header["source_identity"].as_str() {
+                    contexts.insert(id.into());
+                }
+            }
+        }
+    }
+    for path in entries(&layout.state.join("records"))? {
+        if path.extension().is_some_and(|e| e == "json") {
+            let header = document(&path, &mut |_, _| Ok(()))?;
+            for seed in header["seeds"].as_array().into_iter().flatten() {
+                if seed["provider_symbol"] == source.provider_symbol.as_str()
+                    && let Some(id) = seed["source_identity"].as_str()
+                {
+                    contexts.insert(id.into());
+                }
+            }
+        }
+    }
+    let mut census = PhysicalCensus::default();
+    for path in entries(&layout.store.join("objects"))? {
+        census.objects += 1;
+        let name = path.file_name().unwrap().to_string_lossy();
+        let key = format!("objects/{name}");
+        // Store::put_new publishes through these private temporary files. A sibling job
+        // may still be writing one; it is not a retained content-addressed object.
+        if name.starts_with(".tmp-") {
+            census.staging_objects += 1;
+            continue;
+        }
+        if !path.is_file() {
+            return Err(format!(
+                "physical census: unexpected object {}",
+                path.display()
+            ));
+        }
+        if let Some(mut alias) = read_json::<Alias>(&targets.join(name.as_ref()))? {
+            let id = store::identify(&path)?;
+            let expected = slice(layout, &alias.source)?;
+            if id.sha256 != alias.source.sha256
+                || id.bytes != alias.source.bytes
+                || fs::read(&path).map_err(err)? != expected
+            {
+                return Err(format!(
+                    "physical storage alias {key}: whole-file bytes mismatch"
+                ));
+            }
+            alias.label = format!("physical:{key}");
+            alias.source = ByteRef {
+                key: key.clone(),
+                offset: 0,
+                bytes: id.bytes,
+                sha256: id.sha256,
+            };
+            alias.checkpoint = None;
+            alias.checkpoint_ordinal = None;
+            alias.raw_suffix.clear();
+            alias.checkpoint_suffix.clear();
+            accept(alias, None)?;
+            census.storage_aliases.push(key);
+            continue;
+        }
+        if referenced.contains(&key) {
+            census.manifest_objects += 1;
+            continue;
+        }
+        let mut reader = BufReader::new(File::open(&path).map_err(err)?);
+        let first = loop {
+            let bytes = reader.fill_buf().map_err(err)?;
+            if let Some(b) = bytes.iter().copied().find(|b| !b.is_ascii_whitespace()) {
+                break Some(b);
+            }
+            if bytes.is_empty() {
+                break None;
+            }
+            let n = bytes.len();
+            reader.consume(n);
+        };
+        if first != Some(b'{') {
+            census.non_response_objects += 1;
+            continue;
+        }
+        let id = store::identify(&path)?;
+        let mut unresolved = |reason: String, attributable: bool| {
+            census.unresolved_objects.push(json!({"key":key,"sha256":id.sha256,"bytes":id.bytes,"reason":reason,"attributable":attributable,"deletion_authorized":false}));
+        };
+        let value: Value = match serde_json::from_reader(reader) {
+            Ok(v) => v,
+            Err(e) => {
+                unresolved(format!("unresolved provider JSON: {e}"), false);
+                continue;
+            }
+        };
+        if !["history", "data", "asset", "symbol", "echo_req", "error"]
+            .iter()
+            .any(|field| value.get(field).is_some())
+        {
+            census.non_response_objects += 1;
+            continue;
+        }
+        let symbols: BTreeSet<_> = [
+            value.get("asset"),
+            value.get("symbol"),
+            value.pointer("/echo_req/ticks_history"),
+        ]
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .collect();
+        if symbols.len() != 1 {
+            unresolved("unresolved payload instrument".into(), false);
+            continue;
+        }
+        let symbol = *symbols.first().unwrap();
+        let declared = value.get("source_identity").and_then(Value::as_str);
+        if value.get("source_identity").is_some() && declared.is_none() {
+            unresolved("unresolved malformed source identity".into(), false);
+            continue;
+        }
+        let other_family = match source.native_granularity {
+            binary_alpha_engine::dataset::NativeGranularity::Tick => value.get("data").is_some(),
+            binary_alpha_engine::dataset::NativeGranularity::Bar { .. } => {
+                value.get("history").is_some()
+            }
+        };
+        if symbol != source.provider_symbol.as_str()
+            || other_family
+            || declared.is_some_and(|v| v != identity)
+        {
+            census.other_source_objects += 1;
+            continue;
+        }
+        if declared.is_none() && contexts.len() != 1 {
+            unresolved(
+                "unresolved source identity: multiple retained contexts for instrument".into(),
+                false,
+            );
+            continue;
+        }
+        if id.sha256 != name {
+            unresolved("unresolved physical content key mismatch".into(), true);
+            continue;
+        }
+        let raw = fs::read(&path).map_err(err)?;
+        let (rows, first, last) = match payload_bounds(&raw, offset_s) {
+            Ok(bounds) => bounds,
+            Err(e) => {
+                unresolved(format!("unresolved event bounds: {e}"), true);
+                continue;
+            }
+        };
+        let Some(last) = last else {
+            unresolved(
+                "unresolved page day: no last event, request anchor or receipt".into(),
+                true,
+            );
+            continue;
+        };
+        let acquisition_id = format!("legacy-physical-{}", id.sha256);
+        let page = PageOccurrence {
+            acquisition_id: acquisition_id.clone(),
+            intent: None,
+            ordinal: 0,
+            checkpoint_ordinal: None,
+            order_kind: PageOrderKind::RequestOrder,
+            payload_sha256: id.sha256.clone(),
+            payload: raw,
+            request_token: None,
+            request_anchor_utc: None,
+            receipt_time_utc: None,
+            receipt_state: ReceiptState::AbsentInLegacyRecord,
+            first_event_time: first.as_deref().map(time).transpose()?,
+            last_event_time: Some(time(&last)?),
+            rows,
+            checkpoint: None,
+            disposition: PageDisposition::Diagnostic,
+        };
+        accept(
+            Alias {
+                label: format!("physical:{key}"),
+                acquisition_id,
+                ordinal: 0,
+                source: ByteRef {
+                    key,
+                    offset: 0,
+                    bytes: id.bytes,
+                    sha256: id.sha256,
+                },
+                checkpoint: None,
+                checkpoint_ordinal: None,
+                raw_suffix: vec![],
+                checkpoint_suffix: vec![],
+            },
+            Some(page),
+        )?;
+        census.diagnostic_objects += 1;
+    }
+    Ok(census)
+}
+
+#[derive(Default)]
+struct JobOwnership {
+    generations: BTreeSet<String>,
+    identities: BTreeSet<String>,
+    symbols: BTreeSet<String>,
+    records: Vec<PathBuf>,
+}
+
+/// Traverse record values and transfer keys, retaining even unresolved generation names.
+/// A candidate job name discovers evidence; it never establishes source ownership.
+fn ownership_references(value: &Value, field: &str, ownership: &mut JobOwnership) {
+    match value {
+        Value::String(s) => {
+            if field == "source_identity" {
+                ownership.identities.insert(s.clone());
+            }
+            if field == "provider_symbol" {
+                ownership.symbols.insert(s.clone());
+            }
+            if field.contains("generation")
+                || matches!(
+                    field,
+                    "baseline"
+                        | "v1_stream"
+                        | "v1_streams"
+                        | "v2_root"
+                        | "v2_stream"
+                        | "newest"
+                        | "old_stream"
+                )
+                || (matches!(field, "dataset" | "stream")
+                    && s.len() == 64
+                    && s.bytes().all(|b| b.is_ascii_hexdigit()))
+            {
+                ownership.generations.insert(s.clone());
+            }
+            let manifest = s
+                .strip_prefix("manifests/")
+                .or_else(|| s.rsplit_once("/manifests/").map(|(_, tail)| tail));
+            if let Some(g) = manifest.and_then(|s| s.strip_suffix("/ready.json")) {
+                ownership.generations.insert(g.into());
+            }
+            if let Some(pair) = s.strip_prefix("catalog/") {
+                ownership
+                    .generations
+                    .extend(pair.split('/').map(str::to_string));
+            }
+        }
+        Value::Array(values) => {
+            for v in values {
+                ownership_references(v, field, ownership);
+            }
+        }
+        Value::Object(values) => {
+            for (key, value) in values {
+                ownership_references(&Value::String(key.clone()), "key", ownership);
+                ownership_references(value, key, ownership);
+            }
+        }
+        _ => {}
+    }
+}
+
+struct Predecessors {
+    jobs: Vec<String>,
+    unresolved: Vec<Value>,
+    records: Vec<Value>,
+}
+
+fn predecessor_jobs(
+    layout: &Layout,
+    job: &str,
+    source: &GenerationManifest,
+    identity: &str,
+    access: Access<'_>,
+) -> Result<Predecessors, String> {
+    let mut candidates = BTreeMap::<String, JobOwnership>::new();
+    for path in entries(&layout.state.join("records"))? {
+        if path.extension().is_none_or(|e| e != "json") {
+            continue;
+        }
+        let header = document(&path, &mut |_, _| Ok(()))?;
+        let name = path.file_name().unwrap().to_string_lossy();
+        if let Some((owner, suffix)) = name.rsplit_once("-catalog-")
+            && owner != job
+            && suffix.ends_with(".json")
+        {
+            candidates.entry(owner.into()).or_default();
+        }
+        if let Some(owner) = header["job"].as_str().filter(|s| *s != job) {
+            let entry = candidates.entry(owner.into()).or_default();
+            ownership_references(&header, "", entry);
+            entry.records.push(path);
+        }
+    }
+    for dir in entries(&layout.state)? {
+        if !dir.is_dir() {
+            continue;
+        }
+        let name = dir.file_name().unwrap().to_string_lossy().to_string();
+        if name == job || matches!(name.as_str(), "records" | "registry" | "retirements") {
+            continue;
+        }
+        for name in ["progress.json", "transfers.json", "migration.json"] {
+            let path = dir.join(name);
+            if path.is_file() {
+                let value = document(&path, &mut |_, _| Ok(()))?;
+                ownership_references(
+                    &value,
+                    "",
+                    candidates
+                        .entry(dir.file_name().unwrap().to_string_lossy().into())
+                        .or_default(),
+                );
+            }
+        }
+    }
+    let generations = layout.store().list_manifests()?;
+    // Catalog receipts bind generation prefixes in their immutable filename. Resolve every
+    // such prefix uniquely; a missing or ambiguous generation cannot authorize a predecessor.
+    for path in entries(&layout.state.join("records"))? {
+        let name = path.file_name().unwrap().to_string_lossy();
+        for (owner, candidate) in &mut candidates {
+            if let Some(pair) = name
+                .strip_prefix(&format!("{owner}-catalog-"))
+                .and_then(|s| s.strip_suffix(".json"))
+            {
+                if !crate::data_pipeline::catalog_receipt_name(&name, owner) {
+                    candidate.generations.insert(format!("unresolved:{name}"));
+                    continue;
+                }
+                // Cumulative archive receipts append an evidence digest after the two
+                // generation prefixes; that digest is not a third generation identity.
+                for prefix in pair.split('-').take(2) {
+                    let matches: Vec<_> = generations
+                        .iter()
+                        .filter(|g| g.starts_with(prefix))
+                        .collect();
+                    if matches.len() == 1 {
+                        candidate.generations.insert(matches[0].clone());
+                    } else {
+                        candidate.generations.insert(format!("unresolved:{prefix}"));
+                    }
+                }
+                candidate.records.push(path.clone());
+            }
+        }
+    }
+    let mut predecessors = Vec::new();
+    let mut unresolved = Vec::new();
+    let mut records = Vec::new();
+    for (owner, candidate) in candidates {
+        let mut reason = None;
+        let mut matching = false;
+        let mut identities = candidate.identities;
+        if candidate.generations.is_empty() {
+            reason = Some("no generation ownership evidence".to_string());
+        }
+        for generation in &candidate.generations {
+            access.lookup(generation)?;
+            let path = layout.store.join(manifest_key(generation));
+            if !path.is_file() {
+                reason = Some(format!("unresolved generation {generation}"));
+                continue;
+            }
+            let bytes = fs::read(path).map_err(err)?;
+            let manifest = if verify::manifest_kind(&bytes)?.is_some() {
+                let m = StreamManifest::from_json(&bytes)?;
+                if m.instrument != source.instrument || m.role != source.role {
+                    reason = Some(format!("foreign stream {generation}"));
+                    continue;
+                }
+                access.permit(Some(m.role), &m.source_generation)?;
+                read_manifest(&layout.store(), &m.source_generation)?.0
+            } else {
+                GenerationManifest::from_json(&bytes)?
+            };
+            if manifest.instrument != source.instrument || manifest.role != source.role {
+                reason = Some(format!("foreign generation {generation}"));
+                continue;
+            }
+            matching = true;
+            access.permit(Some(manifest.role), &manifest.generation)?;
+            if let Some(cov) = manifest
+                .objects
+                .iter()
+                .find(|o| o.path == fetch::COVERAGE_PATH)
+            {
+                let header = document(&object_path(layout, cov)?, &mut |_, _| Ok(()))?;
+                if let Some(id) = header["source_identity"].as_str() {
+                    identities.insert(id.into());
+                }
+            }
+        }
+        if !matching {
+            continue;
+        }
+        if identities.len() != 1
+            || !identities.contains(identity)
+            || candidate
+                .symbols
+                .iter()
+                .any(|s| s != source.provider_symbol.as_str())
+        {
+            reason = Some("unresolved predecessor source identity/instrument".into());
+        }
+        if let Some(reason) = reason {
+            unresolved.push(json!({"job":owner,"reason":reason,"deletion_authorized":false}));
+            continue;
+        }
+        for path in candidate.records {
+            let name = path.file_name().unwrap().to_string_lossy();
+            let id = store::identify(&path)?;
+            records.push(json!({"name":name,"sha256":id.sha256,"bytes":id.bytes,"kind":"predecessor_record"}));
+        }
+        predecessors.push(owner);
+    }
+    Ok(Predecessors {
+        jobs: predecessors,
+        unresolved,
+        records,
+    })
+}
+
 fn convert(
     job: &Job,
     bound: &Bound,
@@ -1455,6 +1944,7 @@ fn convert(
     access: Access<'_>,
     binding: &str,
     work: &Path,
+    superseded: Option<&State>,
 ) -> Result<State, String> {
     let local = layout.store();
     let sources = inventory(&local, bound, access)?;
@@ -1465,6 +1955,11 @@ fn convert(
         .find(|b| b.id() == &bound.core.history.as_ref().unwrap().broker)
         .unwrap();
     let identity = broker::source_identity(settings);
+    let Predecessors {
+        jobs: predecessor_jobs,
+        unresolved: unresolved_predecessor_jobs,
+        records: predecessor_records,
+    } = predecessor_jobs(layout, &job.id, &sources.datasets[0], &identity, access)?;
     let coverage = index_coverage(layout, work, &sources, &identity)?;
     let newest = select_newest(&sources, &coverage, false)?;
     let streamed_source = if sources.streams.is_empty() {
@@ -1589,6 +2084,31 @@ fn convert(
             imports.push(i);
         }
     }
+    let physical = physical_census(
+        layout,
+        newest,
+        &identity,
+        spool.offset_s,
+        &work.join("physical-targets"),
+        access,
+        &mut |alias, page| {
+            if let Some(page) = page {
+                // Physical diagnostics are independent source occurrences, not storage aliases.
+                // Keep them out of the indexed-payload lookup used by the independent proof.
+                spool.add(page, alias.clone(), None)?;
+                fs::remove_file(work.join("physical-targets").join(&alias.source.sha256))
+                    .map_err(err)?;
+            } else {
+                append(&spool.aliases, &alias)?;
+            }
+            Ok(())
+        },
+    )?;
+    for record in predecessor_records {
+        if !records.iter().any(|r| r["name"] == record["name"]) {
+            records.push(record);
+        }
+    }
     let (mut objects, mut days, mut peak_rows) = observations(
         &local,
         work,
@@ -1657,6 +2177,11 @@ fn convert(
             .collect(),
     };
     let mut lineage = json!({"schema_version":1,"kind":"migration","layout":"daily-v2","source_identity":identity,"role":newest.role,"newest_v1_dataset":newest.generation,"objects":replaced,"manifests":manifest_bindings,"imports":imports,"identity_basis":{"recorded":"intent plus request fingerprint and per-receipt occurrence count; shortest receipt then lexical name owns acquisition/ordinal","legacy":"bundle origin and slice, or inherited canonical single-page coverage prefix; legacy-coverage-<coverage SHA-256> and original coverage ordinal"},"ndjson_framing":"per-line terminators, offsets and independent ordinals in immutable alias table","alias_table":{"record":aliases,"sha256":aliases_id.sha256,"bytes":aliases_id.bytes},"records":records});
+    if let Some(previous) = superseded {
+        lineage["supersedes_generation"] = json!(previous.dataset);
+    }
+    lineage["predecessor_jobs"] = json!(predecessor_jobs);
+    lineage["unresolved_objects"] = json!(physical.unresolved_objects);
     lineage.as_object_mut().unwrap().extend(
         serde_json::to_value(&mapping)
             .map_err(err)?
@@ -1712,6 +2237,12 @@ fn convert(
         access,
     )?;
     Ok(State {
+        proof_version: PROOF_VERSION,
+        supersedes: superseded.and_then(|s| s.record.clone()),
+        predecessor_jobs,
+        unresolved_predecessor_jobs,
+        storage_aliases: physical.storage_aliases,
+        unresolved_objects: physical.unresolved_objects,
         phase: "converted".into(),
         binding: binding.into(),
         dataset: manifest.generation,
@@ -1912,6 +2443,9 @@ fn verify_migration(
             return Err(format!("{}: alias mapped more than once", alias.label));
         }
         save(&label_path, &alias)?;
+        if !alias.label.starts_with("physical:") {
+            payload_target(&proof.join("physical-targets"), &alias)?;
+        }
         File::create(proof.join(format!("seen-{key}"))).map_err(err)?;
         if let Some(cp) = &alias.checkpoint {
             let bytes =
@@ -1989,7 +2523,7 @@ fn verify_migration(
                 .push(json!({"path":object.path,"sha256":id.sha256,"bytes":id.bytes,"equal":true}));
         }
     }
-    let source_census = census(layout, state, &proof, &lineage, offset_s)?;
+    let source_census = census(layout, state, &proof, &lineage, offset_s, access)?;
     let stream = read_stream(layout, &state.stream)?;
     let candles = if let Some(old_stream) = &state.old_stream {
         let before = read_stream(layout, old_stream)?;
@@ -2088,33 +2622,69 @@ fn migrate_job_with(
         bound.core.content_hash(),
         &bound.evidence_sha256,
     ))?);
-    let mut state = if let Some(state) = read_json::<State>(&path)? {
+    let previous = read_json::<State>(&path)?;
+    if let Some(state) = &previous {
         if state.binding != binding {
             return Err("migration configuration/evidence changed since converted phase".into());
         }
-        if state.phase == "verified" {
-            return Ok((state, true));
+        if state.proof_version > PROOF_VERSION {
+            return Err("migration checkpoint requires a newer proof executable".into());
         }
-        if state.phase != "converted" {
+        if state.phase == "verified" && state.proof_version == PROOF_VERSION {
+            return Ok((state.clone(), true));
+        }
+        if !matches!(state.phase.as_str(), "converted" | "verified") {
             return Err("unknown migration phase".into());
         }
-        state
+    }
+    let mut state = if let Some(state) = &previous
+        && state.proof_version == PROOF_VERSION
+    {
+        state.clone()
     } else {
         if work.exists() {
             fs::remove_dir_all(&work).map_err(err)?;
         }
         mkdir(&work)?;
-        let state = convert(job, bound, layout, access, &binding, &work)?;
+        let state = convert(
+            job,
+            bound,
+            layout,
+            access,
+            &binding,
+            &work,
+            previous.as_ref(),
+        )?;
         save(&path, &state)?;
         state
     };
     after_converted(&job.id)?;
+    let root = read_manifest(&layout.store(), &state.dataset)?.0;
+    let source_identity = lineage::read_lineage(&layout.store(), &root)?["source_identity"]
+        .as_str()
+        .ok_or("migration source identity missing")?
+        .to_string();
+    let Predecessors {
+        jobs: predecessors,
+        unresolved,
+        ..
+    } = predecessor_jobs(layout, &job.id, &root, &source_identity, access)?;
+    if predecessors != state.predecessor_jobs || unresolved != state.unresolved_predecessor_jobs {
+        return Err("predecessor ownership changed after converted".into());
+    }
     let proofs = verify_migration(layout, &state, access, &work, offset_seconds(bound))?;
     let root = read_manifest(&layout.store(), &state.dataset)?.0;
     let lineage = lineage::read_lineage(&layout.store(), &root)?;
     let mapping: lineage::MigrationMapping = serde_json::from_value(lineage).map_err(err)?;
     let mut evidence = BTreeMap::new();
     evidence.insert("command".into(), json!("migrate"));
+    evidence.insert("proof_version".into(), json!(PROOF_VERSION));
+    evidence.insert("supersedes".into(), json!(state.supersedes));
+    evidence.insert("unresolved_objects".into(), json!(state.unresolved_objects));
+    evidence.insert(
+        "unresolved_predecessor_jobs".into(),
+        json!(state.unresolved_predecessor_jobs),
+    );
     evidence.insert("binding".into(), json!(binding));
     evidence.insert("newest_v1_dataset".into(), json!(state.newest));
     evidence.insert("alias_table".into(), json!(state.aliases));
@@ -2137,6 +2707,8 @@ fn migrate_job_with(
                 candles: state.old_stream.as_ref().map(|_| true),
             },
             evidence,
+            predecessor_jobs: state.predecessor_jobs.clone(),
+            storage_aliases: state.storage_aliases.clone(),
         },
     )?;
     state.record = Some(record);
@@ -2257,6 +2829,7 @@ fn census(
     proof: &Path,
     lineage: &Value,
     offset_s: i64,
+    access: Access<'_>,
 ) -> Result<Value, String> {
     let local = layout.store();
     let newest = read_manifest(&local, &state.newest)?.0;
@@ -2481,8 +3054,49 @@ fn census(
         })?;
         json_lines::<Value>(&dir.join("progress.pages.jsonl"), accept)?;
     }
+    let physical = physical_census(
+        layout,
+        &newest,
+        lineage["source_identity"]
+            .as_str()
+            .ok_or("migration source identity")?,
+        offset_s,
+        &proof.join("physical-targets"),
+        access,
+        &mut |alias, expected| {
+            let row = require(&alias.label)?;
+            if let Some(expected) = expected {
+                if row != expected {
+                    return Err(format!(
+                        "{}: physical diagnostic metadata mismatch",
+                        alias.label
+                    ));
+                }
+            } else if row.payload != slice(layout, &alias.source)? {
+                return Err(format!("{}: physical alias bytes mismatch", alias.label));
+            }
+            Ok(())
+        },
+    )?;
+    if physical.storage_aliases != state.storage_aliases
+        || physical.unresolved_objects != state.unresolved_objects
+    {
+        return Err("physical census changed after converted".into());
+    }
+    if physical
+        .unresolved_objects
+        .iter()
+        .any(|v| v["attributable"] == true)
+    {
+        return Err("physical census: unresolved attributable provider responses".into());
+    }
     Ok(
-        json!({"coverage_entries":pages,"receipt_requests":requests,"single_objects":singles,"pending_pages":pending,"raw_lines":raw_lines,"checkpoint_lines":checkpoint_lines,"all_mapped_once":true}),
+        json!({"coverage_entries":pages,"receipt_requests":requests,"single_objects":singles,"pending_pages":pending,"raw_lines":raw_lines,"checkpoint_lines":checkpoint_lines,"physical":{
+            "objects":physical.objects,"manifest_objects":physical.manifest_objects,
+            "storage_aliases":physical.storage_aliases.len(),"diagnostic_objects":physical.diagnostic_objects,
+            "other_source_objects":physical.other_source_objects,"non_response_objects":physical.non_response_objects,"staging_objects":physical.staging_objects,
+            "unresolved_objects":physical.unresolved_objects.len(),"unaccounted_attributable_objects":0
+        },"all_mapped_once":true}),
     )
 }
 

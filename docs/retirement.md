@@ -8,6 +8,11 @@ Planning performs reads and writes its immutable plan, without deleting data.
 Both modes hold the managed store's writer lock and a host-wide lock for the Drive endpoint
 and archive-root pair. Pipeline producers, pull, and restore share this archive lock, including
 restores to another managed store on this host. This is not a distributed lock across hosts.
+Apply durably creates its progress journal before retained verification or deletion. Until a
+matching verified `.retired.json` exists, the journal fences the managed store: other producer
+commands and new retirement plans refuse with the unfinished plan's path. Empty and torn
+journals also fence the store. Only the identical sealed plan may resume. Keep configurations
+and all writers on other hosts frozen through completion; the persistent fence is local.
 
 The implementation reuses `Store`, `Drive`, and `data verify`; it does not duplicate their
 storage or daily decoding rules. A job becomes eligible only when a verified daily dataset
@@ -44,7 +49,14 @@ a different stream definition, so fresh restoration preserves the verified compa
 A verified migration checkpoint is completed evidence only when it matches that archived receipt;
 converted or mismatched checkpoints and unresolved pending acquisitions remain protected.
 Hash-bound alias entries authorize retirement of replaced standalone page copies as well as bundles;
-unmapped receipt pages remain protected.
+unmapped receipt pages remain protected. The verified receipt's `storage_aliases` additionally
+names byte-identical standalone page keys absent from manifest lists. These keys are local
+candidates, still protected by pending
+acquisitions. They do not create additional response occurrences. The receipt's
+`predecessor_jobs` extends ownership to historical catalogs and records of those jobs;
+only its verified generation mapping grants generation deletion authority. Historical records
+and completed transfer metadata remain intact, with retired closures marked in the plan.
+Only fields from the exact verified receipt bound into the retained catalog grant this authority.
 
 Retained roots include the continuation root and its stream, the newest eligible catalog and its
 exact remote file bindings, configurations, pending acquisitions and pages, and in-flight
@@ -54,6 +66,9 @@ generation outside the mapping remains protected. Completed records are inventor
 remain on disk even when their mapped closure is retired. Receipt-only pages with no mapped
 manifest closure are protected; an unknown record dependency protects its resolved closure.
 Archived `records/` entries are immutable and retained.
+Local reachability uses content keys; remote reachability uses exact file IDs from retained
+catalogs and in-flight transfers. Retaining one remote copy never protects an obsolete duplicate
+with the same content key. A pending local page alone does not retain an obsolete remote copy.
 
 Configuration inventory scans the pipeline document, every declared job configuration, and
 TOML files beneath the document's directory, excluding the managed data root. Mutable pending

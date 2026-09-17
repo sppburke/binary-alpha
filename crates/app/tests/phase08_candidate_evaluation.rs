@@ -10,7 +10,8 @@ use std::path::{Path, PathBuf};
 use binary_alpha_engine::execution::{Decimal, Summary};
 use binary_alpha_engine::market::format_event_time_micros;
 use binary_alpha_engine::search::{Family, FamilyManifest, StabilityOutcome, family_generation_id};
-use common::{Scratch, command, generation, import, read_table, verify, write_ticks};
+use common::current::import;
+use common::{Scratch, command, generation, read_table, verify, write_ticks};
 use serde_json::Value;
 
 const BASE_DEV_MS: i64 = 1_767_571_200_000; // 2026-01-05T00:00:00Z, a Monday

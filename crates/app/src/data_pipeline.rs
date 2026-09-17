@@ -5,7 +5,7 @@
 //! immutable catalog published last, and restores one exact catalog into a fresh store. Every
 //! mutable step is resumable from `pipeline_state/`; every completed record is immutable.
 
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs::{self, File};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -236,11 +236,22 @@ fn sha256_hex(bytes: &[u8]) -> String {
 /// The one local writer of an archive root: producer commands hold this nonblocking lock for
 /// their whole run; installing consumers also hold it to exclude retirement.
 pub(crate) fn writer_lock(layout: &Layout) -> Result<File, String> {
-    let path = layout.state.join("writer.lock");
+    retirement_writer_lock(layout, None)
+}
+
+pub(crate) fn retirement_writer_lock(layout: &Layout, plan: Option<&Path>) -> Result<File, String> {
+    writer_lock_at(&layout.state, plan)
+}
+
+fn writer_lock_at(state: &Path, plan: Option<&Path>) -> Result<File, String> {
+    let path = state.join("writer.lock");
     let file = File::create(&path)
         .map_err(|error| format!("cannot create {}: {error}", path.display()))?;
     match file.try_lock() {
-        Ok(()) => Ok(file),
+        Ok(()) => {
+            crate::retire::check_writer(state, plan)?;
+            Ok(file)
+        }
         Err(std::fs::TryLockError::WouldBlock) => Err(format!(
             "pipeline: another producer holds {}",
             path.display()
@@ -249,6 +260,46 @@ pub(crate) fn writer_lock(layout: &Layout) -> Result<File, String> {
             Err(format!("cannot lock {}: {error}", path.display()))
         }
     }
+}
+
+/// Standalone imports may write either copy into a pipeline store. Resolve existing path
+/// aliases, lock each managed store once, and hold all locks until publication finishes.
+pub(crate) fn import_writer_locks(config: &Config, base: &Path) -> Result<Vec<File>, String> {
+    let mut targets = vec![base.join(config.storage.historical_data_dir.as_path())];
+    if let PublicationUri::Filesystem(path) = &config.storage.publication_uri {
+        targets.push(base.join(path));
+    }
+    let mut states = std::collections::BTreeSet::new();
+    for target in targets {
+        let target = if target.is_absolute() {
+            target
+        } else {
+            std::env::current_dir()
+                .map_err(|e| e.to_string())?
+                .join(target)
+        };
+        // A destination can be new beneath an existing store or reached through a symlink.
+        let ancestor = target
+            .ancestors()
+            .find(|p| p.exists())
+            .ok_or("import: destination has no existing ancestor")?;
+        let resolved = ancestor
+            .canonicalize()
+            .map_err(|e| e.to_string())?
+            .join(target.strip_prefix(ancestor).map_err(|e| e.to_string())?);
+        for path in resolved.ancestors() {
+            if path.file_name().is_some_and(|name| name == STORE_DIR)
+                && let Some(parent) = path.parent()
+                && parent.join(STATE_DIR).is_dir()
+            {
+                states.insert(parent.join(STATE_DIR));
+            }
+        }
+    }
+    states
+        .into_iter()
+        .map(|state| writer_lock_at(&state, None))
+        .collect()
 }
 
 /// An immutable record beneath the record store, named by its own content hash; an identical
@@ -558,14 +609,12 @@ impl Catalog {
             }) {
                 return Err("catalog omits the verified migration stream".into());
             }
-            if bindings.files.len() != self.records.len()
-                || bindings.files.iter().any(|(key, id)| {
-                    !self
-                        .records
-                        .iter()
-                        .any(|r| &r.key == key && r.bytes == id.bytes && r.sha256 == id.sha256)
-                })
-            {
+            if bindings.files.iter().any(|(key, id)| {
+                !self
+                    .records
+                    .iter()
+                    .any(|r| &r.key == key && r.bytes == id.bytes && r.sha256 == id.sha256)
+            }) {
                 return Err("catalog migration records do not match the pinned lineage".into());
             }
             return Ok(bindings);
@@ -612,11 +661,152 @@ impl Catalog {
                 || record.sha256.len() != 64
                 || !record.sha256.bytes().all(|b| b.is_ascii_hexdigit())
             {
-                return Err("catalog requires unique, hash-bound migration records".into());
+                return Err("catalog requires unique, hash-bound evidence records".into());
             }
         }
         Ok(catalog)
     }
+}
+
+/// Record ownership comes from the job field or an owned intent, never a loose filename
+/// prefix. Migration's verified mapping alone grants ownership of predecessor jobs.
+pub(crate) fn evidence_records(
+    layout: &Layout,
+    job: &str,
+    migration: &crate::lineage::MigrationRecords,
+) -> Result<BTreeMap<String, ObjectIdentity>, String> {
+    let directory = layout.state.join("records");
+    let mut jobs = BTreeSet::from([job.to_string()]);
+    for key in migration.files.keys() {
+        let path = directory.join(crate::lineage::record_name(key)?);
+        if path.extension().is_none_or(|e| e != "json") {
+            continue;
+        }
+        let bytes = fs::read(&path).map_err(|e| e.to_string())?;
+        if let Ok(record) = serde_json::from_slice::<crate::lineage::MigrationRecord>(&bytes)
+            && record.verified()
+            && record.job == job
+            && migration.streams.contains_key(&record.v2_stream)
+        {
+            // Older migration receipts omit predecessor ownership. Read the serialized
+            // envelope independently so both historical and current receipts are supported.
+            #[derive(Deserialize)]
+            struct Ownership {
+                #[serde(default)]
+                predecessor_jobs: Vec<String>,
+            }
+            let ownership: Ownership = serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
+            jobs.extend(ownership.predecessor_jobs);
+        }
+    }
+    // Receipt request arrays can cover years of history; selection only needs their header.
+    #[derive(Deserialize)]
+    struct Header {
+        job: Option<String>,
+        intent: Option<String>,
+        acquisition_id: Option<String>,
+        supersedes: Option<String>,
+        alias_table: Option<serde_json::Value>,
+    }
+    let mut headers = BTreeMap::new();
+    if directory.is_dir() {
+        for entry in fs::read_dir(&directory).map_err(|e| e.to_string())? {
+            let entry = entry.map_err(|e| e.to_string())?;
+            let path = entry.path();
+            if !entry.file_type().map_err(|e| e.to_string())?.is_file()
+                || path.extension().is_none_or(|e| e != "json")
+            {
+                continue;
+            }
+            let name = entry.file_name().to_string_lossy().to_string();
+            let value: Header = serde_json::from_reader(std::io::BufReader::new(
+                File::open(&path).map_err(|e| e.to_string())?,
+            ))
+            .map_err(|e| format!("evidence record {name}: {e}"))?;
+            headers.insert(name, value);
+        }
+    }
+    let mut selected: BTreeSet<String> = migration.files.keys().cloned().collect();
+    for (name, value) in &headers {
+        if value.job.as_ref().is_some_and(|j| jobs.contains(j))
+            || jobs.iter().any(|j| catalog_receipt_name(name, j))
+        {
+            selected.insert(format!("records/{name}"));
+        }
+    }
+    loop {
+        let before = selected.len();
+        for (name, value) in &headers {
+            let key = format!("records/{name}");
+            if value
+                .intent
+                .as_deref()
+                .is_some_and(|intent| selected.contains(&format!("records/{intent}")))
+            {
+                selected.insert(key.clone());
+            }
+            if selected.contains(&key) {
+                for name in [&value.intent, &value.acquisition_id, &value.supersedes]
+                    .into_iter()
+                    .flatten()
+                {
+                    let key = format!("records/{name}");
+                    crate::lineage::record_name(&key)?;
+                    selected.insert(key);
+                }
+                if let Some(alias) = &value.alias_table {
+                    let name = alias
+                        .as_str()
+                        .or_else(|| alias["record"].as_str())
+                        .ok_or("migration alias table record name absent")?;
+                    let key = format!("records/{name}");
+                    crate::lineage::record_name(&key)?;
+                    selected.insert(key);
+                }
+            }
+        }
+        if selected.len() == before {
+            break;
+        }
+    }
+    let mut files = BTreeMap::new();
+    for key in selected {
+        let path = directory.join(crate::lineage::record_name(&key)?);
+        let identity = store::identify(&path)?;
+        if migration.files.get(&key).is_some_and(|id| id != &identity) {
+            return Err(format!("migration record identity mismatch: {key}"));
+        }
+        files.insert(key, identity);
+    }
+    Ok(files)
+}
+
+pub(crate) fn catalog_receipt_name(name: &str, job: &str) -> bool {
+    name.strip_prefix(&format!("{job}-catalog-"))
+        .and_then(|s| s.strip_suffix(".json"))
+        .is_some_and(|pair| {
+            let parts: Vec<_> = pair.split('-').collect();
+            (parts.len() == 2 || parts.len() == 3 && parts[2].len() == 64)
+                && parts[..2].iter().all(|s| s.len() == 16)
+                && parts
+                    .iter()
+                    .all(|s| s.bytes().all(|b| b.is_ascii_hexdigit()))
+        })
+}
+
+/// Sorted names and identities bind cumulative evidence independently of remote file IDs.
+fn evidence_digest(files: &BTreeMap<String, ObjectIdentity>, exclude: Option<&str>) -> String {
+    let mut hash = Sha256::new();
+    for (key, identity) in files {
+        if exclude == Some(key) {
+            continue;
+        }
+        hash.update((key.len() as u64).to_be_bytes());
+        hash.update(key.as_bytes());
+        hash.update(identity.bytes.to_be_bytes());
+        hash.update(identity.sha256.as_bytes());
+    }
+    binary_alpha_engine::hex(&hash.finalize())
 }
 
 /// Archives one dataset generation and its stream generation from the managed store: every
@@ -633,7 +823,7 @@ fn archive_generation(
 ) -> Result<CatalogReceipt, String> {
     let local = layout.store();
     let records = layout.records();
-    let receipt_name = format!("{job}-catalog-{}-{}.json", &dataset[..16], &stream[..16]);
+    let receipt_prefix = format!("{job}-catalog-{}-{}", &dataset[..16], &stream[..16]);
     let (dataset_manifest, dataset_bytes) = read_manifest(&local, dataset)?;
     let mut stream_bytes = Vec::new();
     local.read_to(&manifest_key(stream), None, &mut stream_bytes)?;
@@ -655,11 +845,44 @@ fn archive_generation(
         .get_or_init(|| crate::registry::Registry::open(&layout.state, &config.drive, drive))
         .as_ref()
         .map_err(Clone::clone)?;
+    let record_bindings =
+        if dataset_manifest.layout == Some(binary_alpha_engine::dataset::Layout::DailyV2) {
+            crate::lineage::migration_records(
+                &local,
+                &layout.state.join("records"),
+                &dataset_manifest,
+                job,
+                access,
+            )?
+        } else {
+            Default::default()
+        };
+    let record_files = evidence_records(layout, job, &record_bindings)?;
+    let retired = crate::retire::retired_closures(&layout.state)?;
     // Immutable receipts pin exact file ids even if a later rebuild finds duplicate bytes.
-    if let Some(receipt) =
-        read_json::<CatalogReceipt>(&records.local_path(&receipt_name).expect("local records"))?
-    {
+    for key in record_files.keys().filter(|key| {
+        let name = key.strip_prefix("records/").unwrap_or("");
+        catalog_receipt_name(name, job) && name.starts_with(&receipt_prefix)
+    }) {
+        let name = crate::lineage::record_name(key)?;
+        let Some(digest) = name
+            .strip_prefix(&format!("{receipt_prefix}-"))
+            .and_then(|s| s.strip_suffix(".json"))
+        else {
+            // A legacy receipt has no cumulative evidence digest. Retain its exact bytes
+            // in the new closure; its superseded remote catalog need not still exist.
+            continue;
+        };
+        let receipt =
+            read_json::<CatalogReceipt>(&records.local_path(name).expect("local records"))?
+                .ok_or("catalog receipt disappeared")?;
+        if retired.contains(&receipt.file_id) {
+            continue;
+        }
         confirm_remote(drive, &receipt.file_id, receipt.bytes, &receipt.sha256)?;
+        if digest != evidence_digest(&record_files, Some(key)) {
+            continue;
+        }
         let scratch = state.join(".existing-catalog");
         drive.download(
             &receipt.file_id,
@@ -678,6 +901,18 @@ fn archive_generation(
         {
             return Err("catalog receipt does not bind the requested job and generations".into());
         }
+        if record_files.len() != catalog.records.len() + 1
+            || record_files
+                .iter()
+                .filter(|(name, _)| *name != key)
+                .any(|(name, id)| {
+                    !catalog.records.iter().any(|entry| {
+                        &entry.key == name && entry.sha256 == id.sha256 && entry.bytes == id.bytes
+                    })
+                })
+        {
+            continue;
+        }
         catalog.check_migration_records(layout, &dataset_manifest, access)?;
         for entry in catalog.objects.iter().chain(&catalog.records) {
             confirm_remote(drive, &entry.file_id, entry.bytes, &entry.sha256)?;
@@ -690,7 +925,18 @@ fn archive_generation(
         }
         return Ok(receipt);
     }
+    let digest = evidence_digest(&record_files, None);
+    let receipt_name = format!("{receipt_prefix}-{digest}.json");
     let legacy = registry.legacy_catalog_bindings(drive, job, dataset, stream)?;
+    // Preserve an old upload session only when it can carry this entire evidence closure.
+    // Otherwise start a distinct catalog while retaining all old bindings unchanged.
+    let legacy =
+        legacy.filter(|bindings| record_files.keys().all(|key| bindings.contains_key(key)));
+    let catalog_alias = if legacy.is_some() {
+        format!("{job}/catalog/{dataset}/{stream}")
+    } else {
+        format!("{job}/catalog/{dataset}/{stream}/evidence/{digest}")
+    };
     let transfer =
         |drive: &mut Drive, key: &str, name: &str, path: &Path, identity: &ObjectIdentity| {
             if let Some(bindings) = &legacy {
@@ -709,6 +955,8 @@ fn archive_generation(
     if dataset_manifest.layout == Some(binary_alpha_engine::dataset::Layout::DailyV2)
         && let Some(root) = crate::lineage::root(
             &local,
+            &layout.state.join("records"),
+            job,
             &dataset_manifest.instrument,
             dataset_manifest.role,
             access,
@@ -750,18 +998,6 @@ fn archive_generation(
         lineage_objects.extend(root_manifest.objects);
         lineage_manifests.push((root_stream, root_key, bytes));
     }
-    let record_bindings =
-        if dataset_manifest.layout == Some(binary_alpha_engine::dataset::Layout::DailyV2) {
-            crate::lineage::migration_records(
-                &local,
-                &layout.state.join("records"),
-                &dataset_manifest,
-                job,
-                access,
-            )?
-        } else {
-            Default::default()
-        };
     // A changed configured stream cannot replace the stream whose candle equality was
     // proved by migration. Retain that exact manifest and closure for restore and retire.
     for (generation, migrated) in &record_bindings.streams {
@@ -784,51 +1020,48 @@ fn archive_generation(
             closure.push(object);
         }
     }
-    let objects = run_pool(config, &closure, |object, drive| {
-        let path = local
-            .local_path(&object.key)
-            .expect("the managed store is local");
-        let identity = store::identify(&path)?;
-        if identity.bytes != object.bytes || identity.sha256 != object.sha256 {
+    // One worker pool covers both payloads and evidence, sharing the same bounded Drive
+    // sessions. Input order keeps catalog objects and records deterministic after transfer.
+    let files: Vec<_> = closure
+        .iter()
+        .map(|object| {
+            (
+                object.key.as_str(),
+                format!("object-{}", object.sha256),
+                local
+                    .local_path(&object.key)
+                    .expect("the managed store is local"),
+                object.bytes,
+                object.sha256.as_str(),
+            )
+        })
+        .chain(record_files.iter().map(|(key, identity)| {
+            (
+                key.as_str(),
+                format!("record-{}", identity.sha256),
+                layout.state.join(key),
+                identity.bytes,
+                identity.sha256.as_str(),
+            )
+        }))
+        .collect();
+    let mut objects = run_pool(config, &files, |(key, name, path, bytes, sha256), drive| {
+        let identity = store::identify(path)?;
+        if identity.bytes != *bytes || identity.sha256 != *sha256 {
             return Err(format!(
                 "pipeline {job}: {} does not carry its recorded identity",
-                local.uri(&object.key)
+                path.display()
             ));
         }
-        let file_id = transfer(
-            drive,
-            &object.key,
-            &format!("object-{}", object.sha256),
-            &path,
-            &identity,
-        )?;
+        let file_id = transfer(drive, key, name, path, &identity)?;
         Ok(ObjectEntry {
-            key: object.key.clone(),
-            sha256: object.sha256.clone(),
-            bytes: object.bytes,
+            key: key.to_string(),
+            sha256: sha256.to_string(),
+            bytes: *bytes,
             file_id,
         })
     })?;
-    let mut archived_records = Vec::new();
-    for (key, identity) in record_bindings.files {
-        let path = layout
-            .state
-            .join("records")
-            .join(crate::lineage::record_name(&key)?);
-        let file_id = transfer(
-            drive,
-            &key,
-            &format!("record-{}", identity.sha256),
-            &path,
-            &identity,
-        )?;
-        archived_records.push(ObjectEntry {
-            key,
-            sha256: identity.sha256,
-            bytes: identity.bytes,
-            file_id,
-        });
-    }
+    let archived_records = objects.split_off(closure.len());
     let mut manifests = Vec::with_capacity(2 + lineage_manifests.len());
     for (generation, key, bytes) in [
         (dataset, dataset_manifest.key(), &dataset_bytes),
@@ -889,7 +1122,7 @@ fn archive_generation(
     let identity = store::identify(&scratch)?;
     let file_id = registry.transfer(
         drive,
-        &format!("{job}/catalog/{dataset}/{stream}"),
+        &catalog_alias,
         &format!("{CATALOG_PREFIX}{}-{}.json", &dataset[..16], &stream[..16]),
         &scratch,
         &identity,
@@ -984,13 +1217,15 @@ fn confirm_remote(
 /// update extends. Broker-history descendants are found from it by the fetch owner.
 fn imported_seed(
     local: &Store,
+    records: &Path,
+    job: &str,
     broker: &BrokerId,
     symbol: &str,
     role: DatasetRole,
     access: Access<'_>,
 ) -> Result<Option<String>, String> {
     let instrument = format!("{broker}:{symbol}");
-    if let Some(root) = crate::lineage::root(local, &instrument, role, access)? {
+    if let Some(root) = crate::lineage::root(local, records, job, &instrument, role, access)? {
         return Ok(Some(root));
     }
     let mut newest: Option<(String, String)> = None;
@@ -1060,8 +1295,10 @@ pub fn archive(config_path: &Path, job: Option<&str>, out: &mut dyn Write) -> Re
     run_jobs(&config, &layout, out, &|job, bound, drive, access, _out| {
         let local = layout.store();
         let history = bound.core.history.as_ref().expect("bound history");
-        let dataset = crate::lineage::newest_daily(
+        let dataset = crate::lineage::newest_daily_for_job(
             &local,
+            &layout.state.join("records"),
+            &job.id,
             &format!("{}:{}", history.broker, bound.symbol),
             history.role,
             access,
@@ -1268,13 +1505,21 @@ fn update_job(
         .iter()
         .find(|broker| broker.id() == &history.broker)
         .expect("bound broker");
-    let imported = imported_seed(&local, &history.broker, &bound.symbol, history.role, access)?
-        .ok_or_else(|| {
-            format!(
-                "job {}: the store holds no imported generation for {}:{}; run `data import` first",
-                job.id, history.broker, bound.symbol
-            )
-        })?;
+    let imported = imported_seed(
+        &local,
+        &layout.state.join("records"),
+        &job.id,
+        &history.broker,
+        &bound.symbol,
+        history.role,
+        access,
+    )?
+    .ok_or_else(|| {
+        format!(
+            "job {}: the store holds no imported generation for {}:{}; run `data import` first",
+            job.id, history.broker, bound.symbol
+        )
+    })?;
     let pending_path = state.join("progress.json");
     let pages_path = state.join("progress.pages.jsonl");
     let (pending, partial) = read_pending(&pending_path, &pages_path)?;
@@ -1468,15 +1713,11 @@ fn update_job(
     if !outcome.pending && !daily {
         crate::lineage::clear_pending(&state)?;
     }
-    let (stream, catalog) = match &outcome.generation {
-        Some(dataset) => {
-            let stream = finish(&config, layout, &local, dataset, access, out)?;
-            let catalog =
-                archive_generation(pipeline, drive, layout, &job.id, dataset, &stream, access)?;
-            (Some(stream), Some(catalog))
-        }
-        None => (None, None),
-    };
+    let stream = outcome
+        .generation
+        .as_deref()
+        .map(|dataset| finish(&config, layout, &local, dataset, access, out))
+        .transpose()?;
     // A provider tail before the cutoff is ordinary; a shortfall on the start side of the
     // acquisition leaves a gap the archive must report.
     let gaps = outcome
@@ -1484,12 +1725,15 @@ fn update_job(
         .shortfall
         .as_ref()
         .is_some_and(|shortfall| shortfall.reason != fetch::TAIL_SHORTFALL);
-    let status = match (outcome.pending, gaps, &catalog) {
+    let acquisition_status = match (outcome.pending, gaps, &outcome.generation) {
         (true, _, _) => "pending",
         (false, _, None) => "no_data",
-        (false, true, Some(_)) => "archived_with_gaps",
-        (false, false, Some(_)) => "archived",
+        (false, true, Some(_)) => "acquired_with_gaps",
+        (false, false, Some(_)) => "acquired",
     };
+    // The acquisition result is part of the catalog's evidence closure. It cannot name
+    // that catalog without a circular hash; archive_generation publishes its own receipt
+    // afterwards, and the next archive includes that receipt as ordinary prior evidence.
     let receipt = publish(
         &records,
         &format!("{}-receipt", job.id),
@@ -1498,16 +1742,30 @@ fn update_job(
             command: "update".into(),
             job: job.id.clone(),
             intent: intent.clone(),
-            status: status.into(),
+            status: acquisition_status.into(),
             acquisition_id: Some(acquisition_id),
             dataset_generation: outcome.generation.clone(),
             stream_generation: stream.clone(),
             coverage: Some(outcome.coverage.clone()),
             requests: outcome.receipts.clone(),
-            catalog: catalog.clone(),
+            catalog: None,
             pending: outcome.pending,
         },
     )?;
+    let catalog = outcome
+        .generation
+        .as_deref()
+        .zip(stream.as_deref())
+        .map(|(dataset, stream)| {
+            archive_generation(pipeline, drive, layout, &job.id, dataset, stream, access)
+        })
+        .transpose()?;
+    let status = match (outcome.pending, gaps, &catalog) {
+        (true, _, _) => "pending",
+        (false, _, None) => "no_data",
+        (false, true, Some(_)) => "archived_with_gaps",
+        (false, false, Some(_)) => "archived",
+    };
     if !outcome.pending
         && let Some(generation) = &outcome.generation
     {
@@ -1668,12 +1926,7 @@ pub fn pull(
         declaration: declaration.as_ref(),
         certification: None,
     };
-    let selected = crate::lineage::newest_catalog(
-        &found,
-        &mut drive,
-        &layout.state.join("downloads"),
-        access,
-    )?;
+    let selected = newest_catalog(&found, &mut drive, &layout.state.join("downloads"), access)?;
     let (file_id, sha256, catalog) = found.swap_remove(selected);
     let local = layout.store();
     let entries: Vec<_> = [&catalog.dataset, &catalog.stream]
@@ -1693,7 +1946,10 @@ pub fn pull(
             }
             let identity = store::identify(&path)?;
             if identity.sha256 != entry.sha256 || identity.bytes != entry.bytes {
-                return Err("local migration record differs from pinned catalog".to_string());
+                return Err(format!(
+                    "local evidence record {} differs from pinned catalog",
+                    entry.key
+                ));
             }
             Ok(true)
         })
@@ -1728,6 +1984,49 @@ pub fn pull(
         return Ok(());
     }
     restore_locked(&config, &layout, &file_id, &sha256, broker, symbol, out)
+}
+
+/// Refine market-lineage selection by cumulative evidence when multiple immutable catalogs
+/// carry the same generation, independently of discovery order or duplicate remote IDs.
+pub(crate) fn newest_catalog(
+    catalogs: &[(String, String, Catalog)],
+    drive: &mut Drive,
+    scratch: &Path,
+    access: Access<'_>,
+) -> Result<usize, String> {
+    let selected = crate::lineage::newest_catalog(catalogs, drive, scratch, access)?;
+    let same: Vec<_> = catalogs
+        .iter()
+        .enumerate()
+        .filter(|(_, (_, _, candidate))| {
+            let current = &catalogs[selected].2;
+            candidate.job == current.job
+                && candidate.dataset.generation == current.dataset.generation
+                && candidate.stream.generation == current.stream.generation
+        })
+        .map(|(i, _)| i)
+        .collect();
+    same.iter()
+        .copied()
+        .filter(|i| {
+            same.iter().all(|j| {
+                catalogs[*j].2.records.iter().all(|record| {
+                    catalogs[*i].2.records.iter().any(|entry| {
+                        entry.key == record.key
+                            && entry.sha256 == record.sha256
+                            && entry.bytes == record.bytes
+                    })
+                })
+            })
+        })
+        .min_by_key(|i| {
+            (
+                catalogs[*i].2.objects.len(),
+                catalogs[*i].2.lineage_manifests.len(),
+                &catalogs[*i].0,
+            )
+        })
+        .ok_or_else(|| "archive: conflicting evidence closures for the same generation".into())
 }
 
 /// `data pipeline restore`: install exactly one catalog's dataset and stream closure into this
@@ -1934,8 +2233,12 @@ fn restore_locked(
             sha256: entry.sha256.clone(),
             crc32c: 0,
         };
-        drive.download(&entry.file_id, &partial, &identity)?;
-        record_store.put_new(name, &partial, &store::identify(&partial)?)?;
+        drive
+            .download(&entry.file_id, &partial, &identity)
+            .map_err(|e| format!("catalog {catalog_id}: record {}: {e}", entry.key))?;
+        record_store
+            .put_new(name, &partial, &store::identify(&partial)?)
+            .map_err(|e| format!("catalog {catalog_id}: record {}: {e}", entry.key))?;
         fs::remove_file(partial).map_err(|e| e.to_string())?;
     }
     // Manifests last, through the same create-once owner.

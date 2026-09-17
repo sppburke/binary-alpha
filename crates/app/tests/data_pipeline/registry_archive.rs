@@ -454,7 +454,10 @@ fn archive_parallel_jobs_share_daily_objects_and_descendant_uploads_only_changes
     let mut actual = new_keys.clone();
     actual.sort();
     assert_eq!(actual, changed);
-    assert_eq!(uploads(&fake) - before, new_keys.len() + 3);
+    assert_eq!(
+        uploads(&fake) - before,
+        new_keys.len() + 3 + latest.records.len() - old.records.len()
+    );
     let after = uploads(&fake);
     pipeline("archive", &config, &["--job", "first"]).unwrap();
     assert_eq!(uploads(&fake), after);
@@ -1011,6 +1014,10 @@ fn audit_local(scratch: &Scratch, generation: &str) -> String {
         )
         .replace("file:///unused", &fixture::uri(&root));
     fs::write(&config, core).unwrap();
+    let manifest = super::dataset(&root, generation);
+    if manifest.layout.is_none() {
+        return common::legacy::stream(&config, &root, &manifest).generation;
+    }
     let mut report = Vec::new();
     binary_alpha_app::audit::run(
         &config,

@@ -88,6 +88,7 @@ struct Dataset {
 pub fn run(config_path: &Path, out: &mut dyn Write) -> Result<(), String> {
     let config = crate::load_config(config_path)?;
     let base = config_path.parent().unwrap_or(Path::new("."));
+    let _locks = crate::data_pipeline::import_writer_locks(&config, base)?;
     publish_all(&config, base, out).map(|_| ())
 }
 
@@ -906,6 +907,9 @@ fn publish(
         interval,
         objects,
     };
+    if !daily {
+        return Err("data import: this source kind/role cannot publish daily-v2; only development tick_parquet_daily and bar_parquet_collection imports are supported; existing v1 data remains readable and must use data pipeline migrate".into());
+    }
     if daily {
         manifest = crate::lineage::import_root(local, manifest)?;
         identities = manifest
