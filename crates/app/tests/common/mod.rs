@@ -657,24 +657,23 @@ pub fn read_table(path: &Path) -> Table {
 
 /// Every normalized tick of a published dataset generation, through the generic row API.
 pub fn read_normalized_ticks(store: &Path, dataset: &GenerationManifest) -> Vec<Tick> {
-    let path = store.join(
-        &dataset
-            .objects
-            .iter()
-            .find(|object| object.path == "normalized/ticks.parquet")
-            .unwrap()
-            .key,
-    );
-    let reader = SerializedFileReader::new(File::open(path).unwrap()).unwrap();
-    reader
-        .get_row_iter(None)
+    binary_alpha_app::daily::observation_partitions(dataset)
         .unwrap()
-        .map(|row| {
-            let row = row.unwrap();
-            Tick {
-                event_time_micros: row.get_timestamp_micros(0).unwrap(),
-                price_units: row.get_long(1).unwrap(),
-            }
+        .into_iter()
+        .flat_map(|(object, _)| {
+            let reader =
+                SerializedFileReader::new(File::open(store.join(&object.key)).unwrap()).unwrap();
+            reader
+                .get_row_iter(None)
+                .unwrap()
+                .map(|row| {
+                    let row = row.unwrap();
+                    Tick {
+                        event_time_micros: row.get_timestamp_micros(0).unwrap(),
+                        price_units: row.get_long(1).unwrap(),
+                    }
+                })
+                .collect::<Vec<_>>()
         })
         .collect()
 }
@@ -875,3 +874,5 @@ pub fn cli_as(log: &Path, user: &str, args: &[&str]) -> Result<String, String> {
             .unwrap(),
     )
 }
+
+pub mod daily;

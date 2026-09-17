@@ -218,10 +218,20 @@ fn published_stream(store: &Path, manifest: &Path) -> Published {
         .streams
         .iter()
         .map(|summary| {
-            read_rows(&object(&format!(
+            let legacy = format!(
                 "candles/{}s_{}s.parquet",
                 summary.duration_seconds, summary.offset_seconds
-            )))
+            );
+            let prefix = format!(
+                "candles/{}s_{}s/",
+                summary.duration_seconds, summary.offset_seconds
+            );
+            manifest
+                .objects
+                .iter()
+                .filter(|o| o.path == legacy || o.path.starts_with(&prefix))
+                .flat_map(|o| read_rows(&store.join(&o.key)))
+                .collect()
         })
         .collect();
     Published {

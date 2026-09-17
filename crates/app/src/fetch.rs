@@ -275,14 +275,7 @@ pub trait Row: Copy + PartialEq + std::fmt::Debug + Send {
     fn conflicts(&self, other: &Self) -> bool;
     fn accept(sequence: &mut Self::Sequence, row: Self) -> Result<(), String>;
     fn unpack(rows: HistoryRows) -> Result<Vec<Self>, String>;
-    /// Decodes one retained data object of `manifest` in order, returning the provider
-    /// identifier the object carried when its rows carry one.
-    fn read(
-        path: &Path,
-        manifest: &GenerationManifest,
-        scale: PriceScale,
-        sink: &mut dyn FnMut(Self),
-    ) -> Result<Option<i32>, String>;
+    fn from_market(row: crate::daily::MarketRow) -> Result<Self, String>;
     fn write(
         path: &Path,
         instrument: &InstrumentId,
@@ -313,17 +306,11 @@ impl Row for Tick {
             }
         }
     }
-    fn read(
-        path: &Path,
-        _: &GenerationManifest,
-        scale: PriceScale,
-        sink: &mut dyn FnMut(Self),
-    ) -> Result<Option<i32>, String> {
-        archive::read_ticks_with(path, scale, |row| {
-            sink(row);
-            Ok(())
-        })?;
-        Ok(None)
+    fn from_market(row: crate::daily::MarketRow) -> Result<Self, String> {
+        match row {
+            crate::daily::MarketRow::Tick(row) => Ok(row),
+            _ => Err("baseline row granularity mismatch".into()),
+        }
     }
     fn write(
         path: &Path,
@@ -358,18 +345,11 @@ impl Row for Bar {
             }
         }
     }
-    fn read(
-        path: &Path,
-        manifest: &GenerationManifest,
-        _: PriceScale,
-        sink: &mut dyn FnMut(Self),
-    ) -> Result<Option<i32>, String> {
-        let summary =
-            archive::validate_bar_file_with(path, &verify::bar_expectation(manifest)?, |bar| {
-                sink(bar);
-                Ok(())
-            })?;
-        Ok(summary.symbol_id)
+    fn from_market(row: crate::daily::MarketRow) -> Result<Self, String> {
+        match row {
+            crate::daily::MarketRow::Bar(row) => Ok(row),
+            _ => Err("baseline row granularity mismatch".into()),
+        }
     }
     fn write(
         path: &Path,
@@ -871,47 +851,17 @@ fn carried_bundle_path(generation: &str) -> String {
     format!("raw/{generation}/pages.bin")
 }
 
-/// The data objects of a generation in manifest order: its normalized object, or the listed
-/// archive files of an imported bar collection.
-fn data_objects(manifest: &GenerationManifest) -> Vec<&ObjectRecord> {
-    let role = match manifest.source_kind {
-        SourceKind::BarParquet => ObjectRole::Source,
-        _ => ObjectRole::Normalized,
-    };
-    manifest
-        .objects
-        .iter()
-        .filter(|object| object.role == role)
-        .collect()
-}
-
 /// Every retained row of the baseline and, for bars, the one provider identifier they carried.
 fn baseline_rows<R: Row>(
     baseline: &Baseline,
     local: &Store,
-    scale: PriceScale,
 ) -> Result<(Vec<R>, Option<i32>), String> {
     let mut rows = Vec::new();
-    let mut symbol_id = None;
-    for object in data_objects(&baseline.manifest) {
-        let (_, fetched) = verify::fetch(local, object, true)?;
-        let observed = R::read(
-            &fetched.expect("decoded").path,
-            &baseline.manifest,
-            scale,
-            &mut |row| rows.push(row),
-        )?;
-        if let Some(observed) = observed {
-            if symbol_id.is_some_and(|known| known != observed) {
-                return Err(format!(
-                    "fetch: {} carries provider identifiers {symbol_id:?} and {observed}",
-                    baseline.manifest.generation
-                ));
-            }
-            symbol_id = Some(observed);
-        }
-    }
-    Ok((rows, symbol_id))
+    let read = crate::daily::read_generation(local, &baseline.manifest, |row| {
+        rows.push(R::from_market(row)?);
+        Ok(())
+    })?;
+    Ok((rows, read.symbol_id))
 }
 
 /// The objects a descendant carries forward: a descendant's own raw pages and provenance, or a
@@ -1125,7 +1075,7 @@ fn acquire_one<R: Row>(
     }
     let mut previous_rows: Vec<R> = Vec::new();
     if let Some(baseline) = baseline {
-        let (retained, symbol_id) = baseline_rows::<R>(baseline, local, native.scale)?;
+        let (retained, symbol_id) = baseline_rows::<R>(baseline, local)?;
         previous_rows = retained;
         native.symbol_id = symbol_id;
     }
@@ -1711,5 +1661,228 @@ mod bundle_tests {
         let local = Store::filesystem(&root);
         assert!(bundle_pages(&local, &mut []).unwrap().is_none());
         assert!(!root.exists());
+    }
+}
+
+#[cfg(test)]
+mod daily_baseline_tests {
+    use super::*;
+    use binary_alpha_engine::dataset::daily::{DayFamily, DayInventoryEntry, DayState, Layout};
+    use binary_alpha_engine::dataset::generation_id_with_layout;
+    use binary_alpha_engine::market::BarProviderColumns;
+
+    #[test]
+    fn daily_baselines_match_legacy_ticks_and_bars_across_midnight() {
+        let dir = std::env::temp_dir().join(format!(
+            "binary-alpha-daily-baseline-{}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let local = Store::filesystem(&dir);
+        let id = InstrumentId {
+            broker: "fixture".to_string().try_into().unwrap(),
+            provider_symbol: "S".to_string().try_into().unwrap(),
+        };
+        let scale = PriceScale::try_from(4).unwrap();
+        let times = [86_395, 86_400, 86_400, 172_805];
+        let ticks: Vec<_> = times
+            .iter()
+            .map(|t| Tick {
+                event_time_micros: t * 1_000_000,
+                price_units: 12_500,
+            })
+            .collect();
+        let bars: Vec<_> = [86_395, 86_400, 172_805]
+            .into_iter()
+            .map(|start_unix_s| Bar {
+                provider: (),
+                start_unix_s,
+                open: 1.25,
+                high: 1.5,
+                low: 1.,
+                close: 1.375,
+                volume: 2.,
+                period_s: 5,
+            })
+            .collect();
+        for is_bar in [false, true] {
+            let mut results = Vec::new();
+            for daily in [false, true] {
+                let coverage = import::retain_bytes(&local, b"{}", "baseline-coverage").unwrap();
+                let mut objects = vec![import::record(
+                    ObjectRole::Provenance,
+                    COVERAGE_PATH,
+                    &coverage,
+                )];
+                let mut inventory = Vec::new();
+                let dates: Vec<_> = if daily {
+                    vec!["1970-01-01", "1970-01-02", "1970-01-03"]
+                } else {
+                    vec!["legacy"]
+                };
+                for date in dates {
+                    let path = import::temporary_path(&local, "baseline-rows").unwrap();
+                    let bounds = if daily {
+                        binary_alpha_engine::dataset::daily::day_bounds(date).unwrap()
+                    } else {
+                        (i64::MIN, i64::MAX)
+                    };
+                    let summary = if is_bar {
+                        let rows: Vec<_> = bars
+                            .iter()
+                            .filter(|b| {
+                                (bounds.0..bounds.1).contains(&(b.start_unix_s * 1_000_000))
+                            })
+                            .copied()
+                            .collect();
+                        if daily {
+                            crate::daily::write_bars(
+                                &path,
+                                date,
+                                [rows
+                                    .into_iter()
+                                    .map(|b| Bar {
+                                        provider: BarProviderColumns {
+                                            symbol: "S".into(),
+                                            symbol_id: 538,
+                                            timestamp_utc: b.start_unix_s * 1_000_000,
+                                            server_time_s: b.start_unix_s + 7200,
+                                        },
+                                        start_unix_s: b.start_unix_s,
+                                        open: b.open,
+                                        high: b.high,
+                                        low: b.low,
+                                        close: b.close,
+                                        volume: b.volume,
+                                        period_s: b.period_s,
+                                    })
+                                    .collect::<Vec<_>>()],
+                            )
+                            .unwrap()
+                        } else {
+                            archive::write_bars(&path, "S", 538, 7200, rows.into_iter().map(Ok))
+                                .unwrap()
+                        }
+                    } else {
+                        let rows: Vec<_> = ticks
+                            .iter()
+                            .filter(|t| (bounds.0..bounds.1).contains(&t.event_time_micros))
+                            .copied()
+                            .collect();
+                        if daily {
+                            crate::daily::write_ticks(&path, date, &id, scale, [rows]).unwrap()
+                        } else {
+                            archive::write_ticks(&path, &id, scale, rows.into_iter().map(Ok))
+                                .unwrap()
+                        }
+                    };
+                    let identity = store::identify(&path).unwrap();
+                    let logical = if daily {
+                        format!("observations/{date}.parquet")
+                    } else if is_bar {
+                        "source/bars.parquet".into()
+                    } else {
+                        TICK_OBJECT_PATH.into()
+                    };
+                    let role = if is_bar && !daily {
+                        ObjectRole::Source
+                    } else {
+                        ObjectRole::Normalized
+                    };
+                    let object = import::record(role, &logical, &identity);
+                    local.put_new(&object.key, &path, &identity).unwrap();
+                    fs::remove_file(path).unwrap();
+                    if daily {
+                        inventory.push(DayInventoryEntry {
+                            date: date.into(),
+                            family: DayFamily::Observations,
+                            duration: None,
+                            offset: None,
+                            object: Some(object.key.clone()),
+                            rows: summary.rows,
+                            first_time: summary.first_event_micros.map(time_text),
+                            last_time: summary.last_event_micros.map(time_text),
+                            state: DayState::Unknown,
+                            reason: Some("fixture history".into()),
+                            unresolved: vec![],
+                        });
+                    }
+                    objects.push(object);
+                }
+                let mut manifest = GenerationManifest {
+                    layout: daily.then_some(Layout::DailyV2),
+                    day_inventory: inventory,
+                    schema_version: 1,
+                    generation: String::new(),
+                    broker: id.broker.clone(),
+                    provider_symbol: id.provider_symbol.clone(),
+                    instrument: id.to_string(),
+                    role: DatasetRole::Development,
+                    source_kind: if is_bar {
+                        SourceKind::BarParquet
+                    } else {
+                        SourceKind::TickParquetDaily
+                    },
+                    native_granularity: if is_bar {
+                        NativeGranularity::Bar { period_seconds: 5 }
+                    } else {
+                        NativeGranularity::Tick
+                    },
+                    time_unit: if is_bar {
+                        TimeUnit::Second
+                    } else {
+                        TimeUnit::Microsecond
+                    },
+                    price_representation: if is_bar {
+                        PriceRepresentation::BinaryFloat64
+                    } else {
+                        PriceRepresentation::IntegerUnits { scale }
+                    },
+                    coverage: Coverage {
+                        first_event_time: time_text(86_395_000_000),
+                        last_event_time: time_text(172_805_000_000),
+                    },
+                    row_count: if is_bar { 3 } else { 4 },
+                    capabilities: vec![if is_bar {
+                        Capability::Bars
+                    } else {
+                        Capability::Ticks
+                    }],
+                    config_hash: "fixture".into(),
+                    code_revision: "fixture".into(),
+                    inputs: vec![],
+                    interval: is_bar.then(|| IntervalContract::five_second("parquet_metadata")),
+                    objects,
+                };
+                manifest.generation = generation_id_with_layout(
+                    &id,
+                    manifest.source_kind,
+                    manifest.role,
+                    (!is_bar).then_some(scale),
+                    &manifest.objects,
+                    manifest.layout,
+                );
+                let manifest = GenerationManifest::from_json(&manifest.to_json()).unwrap();
+                let baseline = Baseline {
+                    manifest,
+                    coverage: None,
+                    seed: None,
+                };
+                if is_bar {
+                    let (loaded, symbol) = baseline_rows::<Bar>(&baseline, &local).unwrap();
+                    assert_eq!(loaded, bars);
+                    assert_eq!(symbol, Some(538));
+                    results.push(loaded.len());
+                } else {
+                    let (loaded, symbol) = baseline_rows::<Tick>(&baseline, &local).unwrap();
+                    assert_eq!(loaded, ticks);
+                    assert_eq!(symbol, None);
+                    assert_eq!(loaded[1], loaded[2]);
+                    results.push(loaded.len());
+                }
+            }
+            assert_eq!(results[0], results[1]);
+        }
+        fs::remove_dir_all(dir).unwrap();
     }
 }

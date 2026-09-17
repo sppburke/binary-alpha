@@ -982,20 +982,22 @@ pub fn read_candles(
                     path.display()
                 ));
             }
-            if let Some(last) = last_close
-                && candle.open_time_micros < last
-            {
-                return Err(format!(
-                    "{} row {row}: candle opens before the previous candle closed",
-                    path.display()
-                ));
-            }
+            check_candle_order(last_close, &candle)
+                .map_err(|reason| format!("{} row {row}: {reason}", path.display()))?;
             rows += 1;
             first_open.get_or_insert(candle.open_time_micros);
             last_close = Some(candle.close_time_micros);
         }
     }
     Ok((rows, first_open, last_close))
+}
+
+/// Shared non-overlap contract for legacy and daily candle files and partition boundaries.
+pub(crate) fn check_candle_order(last_close: Option<i64>, candle: &Candle) -> Result<(), String> {
+    if last_close.is_some_and(|last| candle.open_time_micros < last) {
+        return Err("candle opens before the previous candle closed".into());
+    }
+    Ok(())
 }
 
 /// Reads every value of one optional column of a row group as `Some` or `None` per row.

@@ -1,6 +1,6 @@
-//! Opt-in daily-v2 codecs. Legacy archive writers and command routing remain unchanged.
-//! A call buffers one day, validates it before creating a file, and segments each column
-//! independently of upstream batches. This module never reads or deletes source objects.
+//! Deterministic daily-v2 codecs and the shared v1/v2 observation partition reader.
+//! Codecs buffer one day and segment columns independently of upstream batches.
+//! Generation reads authenticate objects and preserve one ordered sequence across all days.
 
 use std::{fs::File, path::Path, sync::Arc};
 
@@ -349,63 +349,133 @@ pub fn read_ticks(
     Ok(rows)
 }
 
-fn bar_time(bar: &Bar<BarProviderColumns>) -> Result<i64, String> {
-    bar.validate(5)?;
-    let time = bar
-        .start_unix_s
-        .checked_mul(1_000_000)
-        .ok_or("bar timestamp overflow")?;
-    if bar.provider.timestamp_utc != time {
-        return Err("bar timestamp_utc disagrees with unix_utc_s".into());
-    }
-    Ok(time)
+/// Lossless provider row. Optional Parquet values stay optional; execution still uses `Bar<()>`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DailyBar {
+    pub symbol: Option<String>,
+    pub symbol_id: Option<i32>,
+    pub timestamp_utc: Option<i64>,
+    pub unix_utc_s: Option<i64>,
+    pub server_time_s: Option<i64>,
+    pub open: Option<f64>,
+    pub high: Option<f64>,
+    pub low: Option<f64>,
+    pub close: Option<f64>,
+    pub volume: Option<f64>,
+    pub period_s: Option<u16>,
 }
 
-pub fn write_bars<B: IntoIterator<Item = Bar<BarProviderColumns>>>(
+impl From<Bar<BarProviderColumns>> for DailyBar {
+    fn from(b: Bar<BarProviderColumns>) -> Self {
+        Self {
+            symbol: Some(b.provider.symbol),
+            symbol_id: Some(b.provider.symbol_id),
+            timestamp_utc: Some(b.provider.timestamp_utc),
+            unix_utc_s: Some(b.start_unix_s),
+            server_time_s: Some(b.provider.server_time_s),
+            open: Some(b.open),
+            high: Some(b.high),
+            low: Some(b.low),
+            close: Some(b.close),
+            volume: Some(b.volume),
+            period_s: Some(b.period_s),
+        }
+    }
+}
+
+impl DailyBar {
+    pub fn bar(&self) -> Result<Bar, String> {
+        let bar = Bar {
+            provider: (),
+            start_unix_s: self.unix_utc_s.ok_or("null bar unix_utc_s")?,
+            open: self.open.ok_or("null bar open")?,
+            high: self.high.ok_or("null bar high")?,
+            low: self.low.ok_or("null bar low")?,
+            close: self.close.ok_or("null bar close")?,
+            volume: self.volume.ok_or("null bar volume")?,
+            period_s: self.period_s.ok_or("null bar period_s")?,
+        };
+        bar.validate(5)?;
+        Ok(bar)
+    }
+
+    fn time(&self) -> Result<i64, String> {
+        let unix = self
+            .unix_utc_s
+            .map(|t| t.checked_mul(1_000_000).ok_or("bar timestamp overflow"))
+            .transpose()?;
+        if let (Some(unix), Some(timestamp)) = (unix, self.timestamp_utc)
+            && unix != timestamp
+        {
+            return Err("bar timestamp_utc disagrees with unix_utc_s".into());
+        }
+        // Missing provider values are evidence, not invented defaults. Validate complete
+        // execution fields when available, retaining incomplete rows for lossless archival.
+        if self.unix_utc_s.is_some()
+            && self.open.is_some()
+            && self.high.is_some()
+            && self.low.is_some()
+            && self.close.is_some()
+            && self.volume.is_some()
+            && self.period_s.is_some()
+        {
+            self.bar()?;
+        }
+        unix.or(self.timestamp_utc)
+            .ok_or_else(|| "unresolved bar: no UTC start time; retain source".into())
+    }
+}
+
+pub fn write_bars<B: IntoIterator<Item = R>, R: Into<DailyBar>>(
     path: &Path,
     date: &str,
     batches: impl IntoIterator<Item = B>,
 ) -> Result<DataSummary, String> {
-    let rows: Vec<_> = batches.into_iter().flatten().collect();
-    let summary = summary(date, &rows, bar_time, true)?;
+    let rows: Vec<DailyBar> = batches.into_iter().flatten().map(Into::into).collect();
+    let summary = summary(date, &rows, DailyBar::time, true)?;
     write_file(
         path,
         archive::BAR_SCHEMA,
         bar_metadata(),
         &rows,
         |b, c| match c {
-            0 => Value::Bytes(ByteArray::from(b.provider.symbol.as_str())),
-            1 => Value::Int32(b.provider.symbol_id),
-            2 => Value::Int64(b.provider.timestamp_utc),
-            3 => Value::Int64(b.start_unix_s),
-            4 => Value::Int64(b.provider.server_time_s),
-            5..=9 => Value::Double([b.open, b.high, b.low, b.close, b.volume][c - 5]),
-            10 => Value::Int32(i32::from(b.period_s)),
+            0 => b
+                .symbol
+                .as_deref()
+                .map_or(Value::Null, |s| Value::Bytes(ByteArray::from(s))),
+            1 => b.symbol_id.map_or(Value::Null, Value::Int32),
+            2 => b.timestamp_utc.map_or(Value::Null, Value::Int64),
+            3 => b.unix_utc_s.map_or(Value::Null, Value::Int64),
+            4 => b.server_time_s.map_or(Value::Null, Value::Int64),
+            5..=9 => {
+                [b.open, b.high, b.low, b.close, b.volume][c - 5].map_or(Value::Null, Value::Double)
+            }
+            10 => b
+                .period_s
+                .map_or(Value::Null, |p| Value::Int32(i32::from(p))),
             _ => unreachable!(),
         },
     )?;
     Ok(summary)
 }
 
-pub fn read_bars(path: &Path, date: &str) -> Result<Vec<Bar<BarProviderColumns>>, String> {
+pub fn read_bars(path: &Path, date: &str) -> Result<Vec<DailyBar>, String> {
     let rows = read_file(path, archive::BAR_SCHEMA, bar_metadata(), |r| {
-        Ok(Bar {
-            provider: BarProviderColumns {
-                symbol: r.get_string(0).map_err(err)?.clone(),
-                symbol_id: r.get_int(1).map_err(err)?,
-                timestamp_utc: r.get_timestamp_micros(2).map_err(err)?,
-                server_time_s: r.get_long(4).map_err(err)?,
-            },
-            start_unix_s: r.get_long(3).map_err(err)?,
-            open: r.get_double(5).map_err(err)?,
-            high: r.get_double(6).map_err(err)?,
-            low: r.get_double(7).map_err(err)?,
-            close: r.get_double(8).map_err(err)?,
-            volume: r.get_double(9).map_err(err)?,
-            period_s: r.get_ushort(10).map_err(err)?,
+        Ok(DailyBar {
+            symbol: optional(&r, 0, |r, c| r.get_string(c).cloned())?,
+            symbol_id: optional(&r, 1, RowAccessor::get_int)?,
+            timestamp_utc: optional(&r, 2, RowAccessor::get_timestamp_micros)?,
+            unix_utc_s: optional(&r, 3, RowAccessor::get_long)?,
+            server_time_s: optional(&r, 4, RowAccessor::get_long)?,
+            open: optional(&r, 5, RowAccessor::get_double)?,
+            high: optional(&r, 6, RowAccessor::get_double)?,
+            low: optional(&r, 7, RowAccessor::get_double)?,
+            close: optional(&r, 8, RowAccessor::get_double)?,
+            volume: optional(&r, 9, RowAccessor::get_double)?,
+            period_s: optional(&r, 10, RowAccessor::get_ushort)?,
         })
     })?;
-    summary(date, &rows, bar_time, true)?;
+    summary(date, &rows, DailyBar::time, true)?;
     Ok(rows)
 }
 
@@ -427,6 +497,15 @@ fn candle_time(candle: &Candle) -> Result<i64, String> {
     Ok(candle.open_time_micros)
 }
 
+fn check_candle_intervals(rows: &[Candle]) -> Result<(), String> {
+    let mut last = None;
+    for candle in rows {
+        archive::check_candle_order(last, candle)?;
+        last = Some(candle.close_time_micros);
+    }
+    Ok(())
+}
+
 fn candle_spec(duration: u32, offset: u32) -> Result<(), String> {
     if duration == 0 || offset >= duration {
         return Err("invalid candle duration/offset".into());
@@ -445,6 +524,7 @@ pub fn write_candles<B: IntoIterator<Item = Candle>>(
 ) -> Result<DataSummary, String> {
     candle_spec(duration, offset)?;
     let rows: Vec<_> = batches.into_iter().flatten().collect();
+    check_candle_intervals(&rows)?;
     let summary = summary(date, &rows, candle_time, true)?;
     write_file(
         path,
@@ -535,6 +615,7 @@ pub fn read_candles(
             })
         },
     )?;
+    check_candle_intervals(&rows)?;
     summary(date, &rows, candle_time, true)?;
     Ok(rows)
 }
@@ -643,6 +724,215 @@ pub fn read_pages(path: &Path, date: &str) -> Result<Vec<PageOccurrence>, String
     })?;
     page_summary(date, &rows)?;
     Ok(rows)
+}
+
+/// Raw execution rows, before bar price quantization. Shared by every dataset consumer.
+#[derive(Debug, Clone, Copy)]
+pub enum MarketRow {
+    Tick(Tick),
+    Bar(Bar),
+}
+impl MarketRow {
+    fn time(self) -> i64 {
+        match self {
+            Self::Tick(t) => t.event_time_micros,
+            Self::Bar(b) => b.start_unix_s * 1_000_000,
+        }
+    }
+    pub fn observation(
+        self,
+        scale: PriceScale,
+    ) -> Result<binary_alpha_engine::stream::Observation, String> {
+        use binary_alpha_engine::stream::Observation;
+        match self {
+            Self::Tick(t) => Ok(Observation::Tick(t)),
+            Self::Bar(b) => Observation::from_bar(&b, scale),
+        }
+    }
+}
+
+pub struct GenerationRead {
+    pub data: DataSummary,
+    pub symbol_id: Option<i32>,
+    pub bytes: u64,
+}
+
+/// Canonical observation ownership: inventory order for v2, legacy role order for v1.
+/// Metadata and page objects never become observations.
+pub fn observation_partitions(
+    manifest: &binary_alpha_engine::dataset::GenerationManifest,
+) -> Result<
+    Vec<(
+        &binary_alpha_engine::dataset::ObjectRecord,
+        Option<&binary_alpha_engine::dataset::daily::DayInventoryEntry>,
+    )>,
+    String,
+> {
+    use binary_alpha_engine::dataset::{
+        ObjectRole, SourceKind,
+        daily::{DayFamily, Layout},
+    };
+    if manifest.layout == Some(Layout::DailyV2) {
+        let mut previous = None;
+        let mut partitions = Vec::new();
+        for day in manifest
+            .day_inventory
+            .iter()
+            .filter(|d| d.family == DayFamily::Observations)
+        {
+            day.validate()?;
+            if previous.is_some_and(|p| p >= day.date.as_str()) {
+                return Err("observation inventory dates must be strictly increasing".into());
+            }
+            previous = Some(day.date.as_str());
+            if let Some(key) = &day.object {
+                let path = day.logical_path()?;
+                let object = manifest
+                    .objects
+                    .iter()
+                    .find(|o| o.key == *key && o.path == path && o.role == ObjectRole::Normalized)
+                    .ok_or_else(|| format!("missing observation day object {path}"))?;
+                partitions.push((object, Some(day)));
+            }
+        }
+        Ok(partitions)
+    } else {
+        let role = if manifest.source_kind == SourceKind::BarParquet {
+            ObjectRole::Source
+        } else {
+            ObjectRole::Normalized
+        };
+        Ok(manifest
+            .objects
+            .iter()
+            .filter(|o| o.role == role)
+            .map(|o| (o, None))
+            .collect())
+    }
+}
+
+pub(crate) fn check_inventory(
+    day: &binary_alpha_engine::dataset::daily::DayInventoryEntry,
+    data: &DataSummary,
+) -> Result<(), String> {
+    use binary_alpha_engine::market::format_event_time_micros;
+    if day.rows != data.rows
+        || day.first_time != data.first_event_micros.map(format_event_time_micros)
+        || day.last_time != data.last_event_micros.map(format_event_time_micros)
+    {
+        return Err(format!(
+            "{}: day inventory mismatch: decoded rows {} first {:?} last {:?}, recorded rows {} first {:?} last {:?}",
+            day.logical_path()?,
+            data.rows,
+            data.first_event_micros,
+            data.last_event_micros,
+            day.rows,
+            day.first_time,
+            day.last_time
+        ));
+    }
+    Ok(())
+}
+
+/// Authenticates and traverses every partition with one sequence and provider-ID state.
+/// Ticks are delivered without sorting or deduplication, preserving occurrence multiplicity.
+pub fn read_generation(
+    store: &crate::store::Store,
+    manifest: &binary_alpha_engine::dataset::GenerationManifest,
+    mut sink: impl FnMut(MarketRow) -> Result<(), String>,
+) -> Result<GenerationRead, String> {
+    use binary_alpha_engine::{
+        dataset::PriceRepresentation,
+        market::{BarSequence, TickSequence},
+    };
+    let mut result = GenerationRead {
+        data: DataSummary::default(),
+        symbol_id: None,
+        bytes: 0,
+    };
+    let mut ticks = TickSequence::default();
+    let mut bars = BarSequence::default();
+    let instrument = InstrumentId {
+        broker: manifest.broker.clone(),
+        provider_symbol: manifest.provider_symbol.clone(),
+    };
+    for (object, day) in observation_partitions(manifest)? {
+        let (bytes, local) = crate::verify::fetch(store, object, true)?;
+        result.bytes += bytes;
+        let local = local.expect("decoded partition");
+        let mut data = DataSummary::default();
+        let mut accept = |row: MarketRow| -> Result<(), String> {
+            match row {
+                MarketRow::Tick(t) => ticks.accept(t)?,
+                MarketRow::Bar(b) => bars.accept(b.start_unix_s)?,
+            }
+            let time = row.time();
+            // Legacy verification forbids overlapping objects (ties within a file are retained).
+            if day.is_none()
+                && data.rows == 0
+                && result
+                    .data
+                    .last_event_micros
+                    .is_some_and(|last| time <= last)
+            {
+                return Err("starts at or before the previous object's last event".into());
+            }
+            data.rows += 1;
+            data.first_event_micros.get_or_insert(time);
+            data.last_event_micros = Some(time);
+            sink(row)
+        };
+        let decoded = (|| -> Result<(), String> {
+            match (manifest.price_representation, day) {
+                (PriceRepresentation::IntegerUnits { scale }, Some(day)) => {
+                    for tick in read_ticks(&local.path, &day.date, &instrument, scale)? {
+                        accept(MarketRow::Tick(tick))?;
+                    }
+                }
+                (PriceRepresentation::IntegerUnits { scale }, None) => {
+                    archive::read_ticks_with(&local.path, scale, |t| accept(MarketRow::Tick(t)))?;
+                }
+                (PriceRepresentation::BinaryFloat64, Some(day)) => {
+                    for row in read_bars(&local.path, &day.date)? {
+                        if row.symbol.as_deref() != Some(manifest.provider_symbol.as_str()) {
+                            return Err("bar provider symbol disagrees with manifest".into());
+                        }
+                        let id = row.symbol_id.ok_or("null bar symbol_id")?;
+                        check_symbol_id(&mut result.symbol_id, Some(id))?;
+                        row.timestamp_utc.ok_or("null bar timestamp_utc")?;
+                        row.server_time_s.ok_or("null bar server_time_s")?;
+                        accept(MarketRow::Bar(row.bar()?))?;
+                    }
+                }
+                (PriceRepresentation::BinaryFloat64, None) => {
+                    let summary = archive::validate_bar_file_with(
+                        &local.path,
+                        &crate::verify::bar_expectation(manifest)?,
+                        |b| accept(MarketRow::Bar(b)),
+                    )?;
+                    check_symbol_id(&mut result.symbol_id, summary.symbol_id)?;
+                }
+            }
+            Ok(())
+        })();
+        decoded.map_err(|e| format!("{} ({}): {e}", object.path, store.uri(&object.key)))?;
+        if let Some(day) = day {
+            check_inventory(day, &data)?;
+        }
+        result.data.extend(&data);
+    }
+    Ok(result)
+}
+fn check_symbol_id(known: &mut Option<i32>, observed: Option<i32>) -> Result<(), String> {
+    if let Some(id) = observed {
+        if known.is_some_and(|k| k != id) {
+            return Err(format!(
+                "bar provider identifiers disagree across partitions: {known:?} and {id}"
+            ));
+        }
+        *known = Some(id);
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -855,18 +1145,33 @@ mod tests {
 
     #[test]
     fn all_eleven_bar_columns_round_trip_with_identical_bytes_across_batches() {
-        let rows: Vec<_> = (0..17_003).map(bar).collect();
+        let rows: Vec<_> = (0..17_003).map(|i| DailyBar::from(bar(i))).collect();
         deterministic(
             &rows,
             |p, batches| write_bars(p, DATE, batches),
             |p| {
                 let decoded = read_bars(p, DATE)?;
                 for (actual, expected) in decoded.iter().zip(&rows) {
-                    assert_eq!(actual.volume.to_bits(), expected.volume.to_bits());
-                    assert_eq!(actual.open.to_bits(), expected.open.to_bits());
-                    assert_eq!(actual.high.to_bits(), expected.high.to_bits());
-                    assert_eq!(actual.low.to_bits(), expected.low.to_bits());
-                    assert_eq!(actual.close.to_bits(), expected.close.to_bits());
+                    assert_eq!(
+                        actual.volume.unwrap().to_bits(),
+                        expected.volume.unwrap().to_bits()
+                    );
+                    assert_eq!(
+                        actual.open.unwrap().to_bits(),
+                        expected.open.unwrap().to_bits()
+                    );
+                    assert_eq!(
+                        actual.high.unwrap().to_bits(),
+                        expected.high.unwrap().to_bits()
+                    );
+                    assert_eq!(
+                        actual.low.unwrap().to_bits(),
+                        expected.low.unwrap().to_bits()
+                    );
+                    assert_eq!(
+                        actual.close.unwrap().to_bits(),
+                        expected.close.unwrap().to_bits()
+                    );
                 }
                 Ok(decoded)
             },
@@ -1119,7 +1424,7 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
-        write_bars(&path, DATE, [Vec::new()]).unwrap();
+        write_bars(&path, DATE, [Vec::<DailyBar>::new()]).unwrap();
         assert!(read_bars(&path, DATE).unwrap().is_empty());
         write_candles(&path, DATE, &instrument(), scale(), 1, 0, [Vec::new()]).unwrap();
         assert!(
@@ -1226,5 +1531,218 @@ mod tests {
             }
             assert_eq!(counts, [8_192, 8_192, 3_616]);
         }
+    }
+    #[test]
+    fn review_empty_payloads_and_checkpoints_are_distinct_from_null() {
+        let fixture = Fixture::new();
+        let path = fixture.path("empty-binary.parquet");
+        let mut rows = Vec::new();
+        for (i, bytes) in [vec![], vec![b'\n'], vec![0, 255, b'\n', 128]]
+            .into_iter()
+            .enumerate()
+        {
+            let mut p = page(i as u64);
+            p.payload = bytes.clone();
+            p.payload_sha256 = binary_alpha_engine::hex(&Sha256::digest(&p.payload));
+            p.checkpoint = Some(bytes);
+            p.checkpoint_ordinal = Some(i as u64);
+            rows.push(p);
+        }
+        let mut absent = page(3);
+        absent.checkpoint = None;
+        absent.checkpoint_ordinal = None;
+        rows.push(absent);
+        write_pages(&path, DATE, [rows.clone()]).unwrap();
+        assert_eq!(read_pages(&path, DATE).unwrap(), rows);
+    }
+
+    #[test]
+    fn review_pre_epoch_ticks_pages_bars_and_candles() {
+        let fixture = Fixture::new();
+        let path = fixture.path("pre-epoch.parquet");
+        let rows = vec![
+            Tick {
+                event_time_micros: -DAY_MICROS,
+                price_units: i64::MIN,
+            },
+            Tick {
+                event_time_micros: -1,
+                price_units: 1,
+            },
+            Tick {
+                event_time_micros: -1,
+                price_units: i64::MAX,
+            },
+        ];
+        write_ticks(&path, "1969-12-31", &instrument(), scale(), [rows.clone()]).unwrap();
+        assert_eq!(
+            read_ticks(&path, "1969-12-31", &instrument(), scale()).unwrap(),
+            rows
+        );
+        let old_bytes = fs::read(&path).unwrap();
+        let mut reversed_ties = rows.clone();
+        reversed_ties.swap(1, 2);
+        write_ticks(
+            &path,
+            "1969-12-31",
+            &instrument(),
+            scale(),
+            [reversed_ties.clone()],
+        )
+        .unwrap();
+        assert_eq!(
+            read_ticks(&path, "1969-12-31", &instrument(), scale()).unwrap(),
+            reversed_ties
+        );
+        assert_ne!(
+            fs::read(&path).unwrap(),
+            old_bytes,
+            "Original order is part of tick identity"
+        );
+        let tick = Tick {
+            event_time_micros: 0,
+            price_units: 0,
+        };
+        assert!(write_ticks(&path, "1969-12-31", &instrument(), scale(), [[tick]]).is_err());
+        write_ticks(&path, "1970-01-01", &instrument(), scale(), [[tick]]).unwrap();
+        let mut b = bar(0);
+        b.start_unix_s = -5;
+        b.provider.timestamp_utc = -5_000_000;
+        b.provider.server_time_s = 7_195;
+        write_bars(&path, "1969-12-31", [[b.clone()]]).unwrap();
+        assert_eq!(
+            read_bars(&path, "1969-12-31").unwrap(),
+            vec![DailyBar::from(b)]
+        );
+        let mut c = candle(0);
+        c.open_time_micros = -1_000_000;
+        c.close_time_micros = 0;
+        c.known_at_micros = 10;
+        c.first_event_micros = -1_000_000;
+        c.last_event_micros = -1;
+        write_candles(
+            &path,
+            "1969-12-31",
+            &instrument(),
+            scale(),
+            1,
+            0,
+            [[c.clone()]],
+        )
+        .unwrap();
+        assert_eq!(
+            read_candles(&path, "1969-12-31", &instrument(), scale(), 1, 0).unwrap(),
+            vec![c]
+        );
+        let mut p = page(1);
+        p.first_event_time = Some(-DAY_MICROS - 1);
+        p.last_event_time = Some(-1);
+        p.receipt_time_utc = Some(0);
+        p.receipt_state = ReceiptState::Recorded;
+        p.request_anchor_utc = Some(0);
+        write_pages(&path, "1969-12-31", [[p.clone()]]).unwrap();
+        assert_eq!(read_pages(&path, "1969-12-31").unwrap(), vec![p]);
+    }
+
+    #[test]
+    fn review_pinned_index_bloom_and_binary_encoding_defaults() {
+        let props = properties(page_metadata()).unwrap();
+        assert!(!props.offset_index_disabled());
+        for schema in [
+            PAGE_SCHEMA,
+            archive::BAR_SCHEMA,
+            archive::TICK_SCHEMA,
+            archive::CANDLE_SCHEMA,
+        ] {
+            let parsed = parse_message_type(schema).unwrap();
+            for col in parsed.get_fields() {
+                let name = col.name().into();
+                assert_eq!(props.encoding(&name), Some(Encoding::PLAIN));
+                assert_eq!(props.bloom_filter_properties(&name), None);
+            }
+        }
+        let fixture = Fixture::new();
+        let path = fixture.path("indexes.parquet");
+        write_pages(&path, DATE, [[page(1)]]).unwrap();
+        let reader = SerializedFileReader::new(File::open(path).unwrap()).unwrap();
+        for c in reader.metadata().row_group(0).columns() {
+            assert!(c.offset_index_offset().is_some());
+            assert!(c.column_index_offset().is_none());
+            assert!(c.bloom_filter_offset().is_none());
+        }
+    }
+
+    #[test]
+    fn review_nullable_bar_columns_round_trip() {
+        let fixture = Fixture::new();
+        let path = fixture.path("null-bars.parquet");
+        for null_col in 0..11 {
+            write_file(
+                &path,
+                archive::BAR_SCHEMA,
+                bar_metadata(),
+                &[bar(0)],
+                |b, c| {
+                    if c == null_col {
+                        return Value::Null;
+                    }
+                    match c {
+                        0 => Value::Bytes(ByteArray::from(b.provider.symbol.as_str())),
+                        1 => Value::Int32(b.provider.symbol_id),
+                        2 => Value::Int64(b.provider.timestamp_utc),
+                        3 => Value::Int64(b.start_unix_s),
+                        4 => Value::Int64(b.provider.server_time_s),
+                        5..=9 => Value::Double([b.open, b.high, b.low, b.close, b.volume][c - 5]),
+                        10 => Value::Int32(i32::from(b.period_s)),
+                        _ => unreachable!(),
+                    }
+                },
+            )
+            .unwrap();
+            let rows = read_bars(&path, DATE).unwrap();
+            let original = fs::read(&path).unwrap();
+            write_bars(&path, DATE, [rows.clone()]).unwrap();
+            assert_eq!(fs::read(&path).unwrap(), original, "null column {null_col}");
+            assert_eq!(read_bars(&path, DATE).unwrap(), rows);
+        }
+    }
+
+    #[test]
+    fn review_candle_overlap_rejected_by_daily_writer_and_both_readers() {
+        let fixture = Fixture::new();
+        let path = fixture.path("overlap.parquet");
+        let a = candle(0);
+        let mut b = candle(1);
+        b.open_time_micros = a.open_time_micros + 500_000;
+        let rows = vec![a, b];
+        assert!(
+            write_candles(&path, DATE, &instrument(), scale(), 1, 0, [rows.clone()])
+                .unwrap_err()
+                .contains("before the previous candle closed")
+        );
+        // Bypass the validated writer to exercise the reader independently.
+        write_file(
+            &path,
+            archive::CANDLE_SCHEMA,
+            archive::candle_metadata(&instrument(), scale(), 1, 0),
+            &rows,
+            |c, i| match i {
+                12 => c.volume.map_or(Value::Null, Value::Double),
+                13 => c.gap_before_micros.map_or(Value::Null, Value::Int64),
+                21..=32 => Value::Bool(archive::flag_field(c, i)),
+                _ => Value::Int64(archive::int_field(c, i)),
+            },
+        )
+        .unwrap();
+        assert!(
+            read_candles(&path, DATE, &instrument(), scale(), 1, 0)
+                .unwrap_err()
+                .contains("before the previous candle closed")
+        );
+        assert!(
+            archive::read_candles(&path, &instrument(), scale(), 1, 0)
+                .unwrap_err()
+                .contains("before the previous candle closed")
+        );
     }
 }

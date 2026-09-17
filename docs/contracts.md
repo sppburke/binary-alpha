@@ -550,8 +550,9 @@ ordinary `development` datasets (`tick_parquet_daily`, `bar_parquet`, `broker_hi
 their instrument streams. Derived research artifacts retain their own formats. The historical
 dataset and instrument-stream layout documented elsewhere here is **legacy layout v1**, readable
 until verified retirement. An absent manifest `layout` means v1; `layout = "daily-v2"` selects
-this contract. This foundation adds types and codecs; command routing, migration, continuation,
-archive registry, and retirement are implemented in later steps and are not authorized here.
+this contract. Types, codecs, shared v1/v2 observation readers, v2 audit candle publication,
+and v2 verification are implemented. Migration, v2 acquisition/continuation, archive registry,
+and retirement belong to later steps; this reader/writer step is verified with fixtures only.
 
 ### 1. Families
 
@@ -622,6 +623,19 @@ row counts equal observation inventory totals; stream summary counts equal candl
 totals. Dataset coverage metadata is required; lineage is allowed on descendants and required
 by the migration/root workflow, which owns the root distinction. Streams own only candle
 objects and the normalized aggregate profile.
+
+Daily bar codecs preserve nulls in all eleven optional provider columns. Execution still uses
+the validated legacy `Bar<()>` values; it does not invent values for missing fields. A daily
+bar needs an assignable UTC start, using `unix_utc_s` or `timestamp_utc` and checking agreement
+when both are present. Both daily candle codec directions enforce the archive non-overlap rule.
+
+Every observation consumer traverses the same authenticated partitions in inventory order,
+retaining repeated ticks and continuous stream/feature state. Audit partitions finalized candles
+by open day. An unfinished candle keeps its open day partial even when the last observation
+falls on a later day. Existing unresolved gaps and reasons survive union with that pending tail.
+A complete candle day also requires evidence for later-day inputs affecting candle values or
+finalization time; uncertain coverage through candle close or recorded `known_at` prevents a
+complete claim. V1 datasets continue to produce v1 streams.
 
 For `daily-parquet-v1`, data page row and byte limits are respectively **8,192** and
 **1,048,576**, write batch size is **8,192**, writer version is `PARQUET_1_0`, value encoding

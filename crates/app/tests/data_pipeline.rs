@@ -20,7 +20,7 @@ use std::time::{Duration, Instant};
 use binary_alpha_app::broker::socket_io;
 use binary_alpha_app::data_pipeline::{self, Catalog};
 use binary_alpha_app::fetch::HistoryCoverage;
-use binary_alpha_app::{archive, verify};
+use binary_alpha_app::verify;
 use binary_alpha_engine::dataset::GenerationManifest;
 use binary_alpha_engine::market::{Bar, Tick, format_event_time_micros as time_text};
 use binary_alpha_engine::stream::StreamManifest;
@@ -1385,25 +1385,19 @@ fn ticks(store: &Path, manifest: &GenerationManifest) -> Vec<Tick> {
 }
 
 fn bars(store: &Path, manifest: &GenerationManifest) -> Vec<Bar> {
-    // An imported collection keeps its listed files as data; broker history normalizes once.
-    let role = match manifest.source_kind {
-        binary_alpha_engine::dataset::SourceKind::BarParquet => {
-            binary_alpha_engine::dataset::ObjectRole::Source
-        }
-        _ => binary_alpha_engine::dataset::ObjectRole::Normalized,
-    };
     let mut rows = Vec::new();
-    for object in manifest.objects.iter().filter(|object| object.role == role) {
-        archive::validate_bar_file_with(
-            &store.join(&object.key),
-            &verify::bar_expectation(manifest).unwrap(),
-            |bar| {
-                rows.push(bar);
-                Ok(())
-            },
-        )
-        .unwrap();
-    }
+    binary_alpha_app::daily::read_generation(
+        &binary_alpha_app::store::Store::filesystem(store),
+        manifest,
+        |row| {
+            let binary_alpha_app::daily::MarketRow::Bar(bar) = row else {
+                panic!("expected bar")
+            };
+            rows.push(bar);
+            Ok(())
+        },
+    )
+    .unwrap();
     rows
 }
 
@@ -1554,21 +1548,24 @@ fn assert_bundle(store: &Path, manifest: &GenerationManifest, expected_pages: us
 fn candle_clocks(store: &Path, stream: &StreamManifest) -> Vec<(i64, i64)> {
     use parquet::file::reader::{FileReader, SerializedFileReader};
     use parquet::record::RowAccessor;
-    let object = stream
+    stream
         .objects
         .iter()
-        .find(|object| object.path != "profile.json")
-        .unwrap();
-    let reader = SerializedFileReader::new(File::open(store.join(&object.key)).unwrap()).unwrap();
-    reader
-        .get_row_iter(None)
-        .unwrap()
-        .map(|row| {
-            let row = row.unwrap();
-            (
-                row.get_timestamp_micros(1).unwrap(),
-                row.get_timestamp_micros(2).unwrap(),
-            )
+        .filter(|object| object.path != "profile.json")
+        .flat_map(|object| {
+            let reader =
+                SerializedFileReader::new(File::open(store.join(&object.key)).unwrap()).unwrap();
+            reader
+                .get_row_iter(None)
+                .unwrap()
+                .map(|row| {
+                    let row = row.unwrap();
+                    (
+                        row.get_timestamp_micros(1).unwrap(),
+                        row.get_timestamp_micros(2).unwrap(),
+                    )
+                })
+                .collect::<Vec<_>>()
         })
         .collect()
 }
@@ -4539,3 +4536,11 @@ fn pipeline_schedule() {
             .contains("Normalized form: Sat *-*-* 06:00:00 America/Chicago")
     );
 }
+
+#[path = "data_pipeline/daily_readers.rs"]
+mod daily_readers;
+
+#[path = "common/research.rs"]
+mod fixture_config;
+#[path = "phase12_live_runtime/support.rs"]
+mod live_support;

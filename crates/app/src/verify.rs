@@ -10,8 +10,7 @@ use std::path::PathBuf;
 
 use binary_alpha_engine::config::ManifestUri;
 use binary_alpha_engine::dataset::{
-    GenerationManifest, NativeGranularity, ObjectRecord, ObjectRole, PriceRepresentation,
-    SourceKind,
+    GenerationManifest, NativeGranularity, ObjectRecord, ObjectRole, SourceKind,
 };
 use binary_alpha_engine::execution::REPLAY_MANIFEST_KIND;
 use binary_alpha_engine::features::FEATURE_MANIFEST_KIND;
@@ -278,26 +277,46 @@ fn verify_dataset(uri: &str, store: &Store, key: &str, bytes: &[u8]) -> Result<S
     }
     // Inspect authenticated coverage and page slices before the whole-object digest check so
     // damaged bundles identify the exact page. Every object still receives `fetch` below.
-    let history_report = if manifest.source_kind == SourceKind::BrokerHistory {
-        verify_history_bundles(store, &manifest)?
-    } else {
-        String::new()
-    };
-    let mut summary = DataSummary::default();
-    let mut bytes_verified = 0;
+    let history_report =
+        if manifest.layout.is_none() && manifest.source_kind == SourceKind::BrokerHistory {
+            verify_history_bundles(store, &manifest)?
+        } else {
+            String::new()
+        };
+    let read = crate::daily::read_generation(store, &manifest, |_| Ok(()))?;
+    let summary = read.data;
+    let mut bytes_verified = read.bytes;
+    let partitions = crate::daily::observation_partitions(&manifest)?;
+    let mut occurrences = std::collections::BTreeSet::new();
     for object in &manifest.objects {
-        let decode = matches!(
-            (object.role, manifest.source_kind),
-            (
-                ObjectRole::Normalized,
-                SourceKind::TickCsv | SourceKind::TickParquetDaily | SourceKind::BrokerHistory
-            ) | (ObjectRole::Source, SourceKind::BarParquet)
-        );
-        let (verified, local) = fetch(store, object, decode)?;
+        if partitions.iter().any(|(o, _)| o.path == object.path) {
+            continue;
+        }
+        let page_day = manifest.day_inventory.iter().find(|d| {
+            d.family == binary_alpha_engine::dataset::daily::DayFamily::Pages
+                && d.object.as_ref() == Some(&object.key)
+                && d.logical_path().is_ok_and(|p| p == object.path)
+        });
+        let (verified, local) = fetch(store, object, page_day.is_some())?;
         bytes_verified += verified;
-        if let Some(local) = local {
-            reconstruct(&manifest, &local.path, &mut summary)
-                .map_err(|reason| format!("{}: {reason}", store.uri(&object.key)))?;
+        if let Some(day) = page_day {
+            let pages = crate::daily::read_pages(&local.expect("page partition").path, &day.date)
+                .map_err(|e| format!("{}: {e}", object.path))?;
+            let mut data = DataSummary::default();
+            for page in pages {
+                if !occurrences.insert((page.acquisition_id.clone(), page.ordinal)) {
+                    return Err(format!(
+                        "{}: repeated page occurrence {}/{}",
+                        object.path, page.acquisition_id, page.ordinal
+                    ));
+                }
+                let time = page.partition_time()?;
+                data.rows += 1;
+                data.first_event_micros =
+                    Some(data.first_event_micros.map_or(time, |t| t.min(time)));
+                data.last_event_micros = Some(data.last_event_micros.map_or(time, |t| t.max(time)));
+            }
+            crate::daily::check_inventory(day, &data)?;
         }
     }
     let (first_event_time, last_event_time) = archive::coverage(&summary)?;
@@ -461,37 +480,6 @@ pub fn bar_expectation(manifest: &GenerationManifest) -> Result<BarExpectation, 
     })
 }
 
-/// Decodes one data object and folds its rows into the running summary.
-fn reconstruct(
-    manifest: &GenerationManifest,
-    path: &std::path::Path,
-    summary: &mut DataSummary,
-) -> Result<(), String> {
-    let data = match (manifest.source_kind, manifest.price_representation) {
-        (
-            SourceKind::TickCsv | SourceKind::TickParquetDaily | SourceKind::BrokerHistory,
-            PriceRepresentation::IntegerUnits { scale },
-        ) => archive::read_ticks(path, scale)?,
-        (
-            SourceKind::BarParquet | SourceKind::BrokerHistory,
-            PriceRepresentation::BinaryFloat64,
-        ) => archive::validate_bar_file(path, &bar_expectation(manifest)?)?.data,
-        _ => {
-            return Err(
-                "manifest combines a source kind, price representation, and granularity this checkout cannot decode"
-                    .to_string(),
-            );
-        }
-    };
-    if let (Some(last), Some(first)) = (summary.last_event_micros, data.first_event_micros)
-        && first <= last
-    {
-        return Err("starts at or before the previous object's last event".to_string());
-    }
-    summary.extend(&data);
-    Ok(())
-}
-
 /// Verifies a stream generation: every object's bytes and hashes, the profile's consistency
 /// with the manifest, and every candle object's rows and bounds.
 fn verify_stream(uri: &str, store: &Store, key: &str, bytes: &[u8]) -> Result<String, String> {
@@ -504,7 +492,32 @@ fn verify_stream(uri: &str, store: &Store, key: &str, bytes: &[u8]) -> Result<St
     }
     let mut bytes_verified = 0;
     let mut candles = 0;
-    for object in &manifest.objects {
+    let mut daily_totals =
+        std::collections::BTreeMap::<(u32, u32), (u64, Option<i64>, Option<i64>)>::new();
+    let mut observed_profile = None;
+    let ordered_objects = if manifest.layout.is_some() {
+        let mut objects: Vec<_> = manifest
+            .objects
+            .iter()
+            .filter(|o| o.path == PROFILE_OBJECT_PATH)
+            .collect();
+        for day in &manifest.day_inventory {
+            if let Some(key) = &day.object {
+                let path = day.logical_path()?;
+                objects.push(
+                    manifest
+                        .objects
+                        .iter()
+                        .find(|o| o.key == *key && o.path == path)
+                        .ok_or_else(|| format!("missing candle day object {path}"))?,
+                );
+            }
+        }
+        objects
+    } else {
+        manifest.objects.iter().collect()
+    };
+    for object in ordered_objects {
         let (verified, local) = fetch(store, object, true)?;
         bytes_verified += verified;
         let local = local.expect("decoded objects have a local path");
@@ -542,6 +555,46 @@ fn verify_stream(uri: &str, store: &Store, key: &str, bytes: &[u8]) -> Result<St
                     "{location} does not describe the manifest's instrument, source, observations, coverage, and streams"
                 ));
             }
+            observed_profile = Some(profile);
+            continue;
+        }
+        if manifest.layout.is_some() {
+            let day = manifest
+                .day_inventory
+                .iter()
+                .find(|d| {
+                    d.object.as_ref() == Some(&object.key)
+                        && d.logical_path().is_ok_and(|p| p == object.path)
+                })
+                .ok_or_else(|| format!("{}: missing candle inventory", object.path))?;
+            let spec = (
+                day.duration.expect("validated spec"),
+                day.offset.expect("validated spec"),
+            );
+            let rows = crate::daily::read_candles(
+                &local.path,
+                &day.date,
+                &manifest.definition.id(),
+                manifest.definition.price_scale,
+                spec.0,
+                spec.1,
+            )
+            .map_err(|e| format!("{}: {e}", object.path))?;
+            let data = DataSummary {
+                rows: rows.len() as u64,
+                first_event_micros: rows.first().map(|c| c.open_time_micros),
+                last_event_micros: rows.last().map(|c| c.open_time_micros),
+            };
+            crate::daily::check_inventory(day, &data)?;
+            let total = daily_totals.entry(spec).or_default();
+            for candle in rows {
+                archive::check_candle_order(total.2, &candle)
+                    .map_err(|e| format!("{}: {e}", object.path))?;
+                total.0 += 1;
+                total.1.get_or_insert(candle.open_time_micros);
+                total.2 = Some(candle.close_time_micros);
+                candles += 1;
+            }
             continue;
         }
         let summary = manifest
@@ -570,6 +623,48 @@ fn verify_stream(uri: &str, store: &Store, key: &str, bytes: &[u8]) -> Result<St
             ));
         }
         candles += rows;
+    }
+    if manifest.layout.is_some() {
+        let profile = observed_profile.ok_or("daily stream lacks profile")?;
+        for (index, summary) in manifest.streams.iter().enumerate() {
+            let total = daily_totals
+                .get(&(summary.duration_seconds, summary.offset_seconds))
+                .copied()
+                .unwrap_or_default();
+            if total.0 != summary.rows
+                || total.1.map(format_event_time_micros) != summary.first_open_time
+                || total.2.map(format_event_time_micros) != summary.last_close_time
+            {
+                return Err(format!(
+                    "daily stream {}s_{}s aggregate summary mismatch",
+                    summary.duration_seconds, summary.offset_seconds
+                ));
+            }
+            if let Some(open) = crate::audit::pending_open(&profile, index)? {
+                let date = format_event_time_micros(open)[..10].to_string();
+                let day = manifest
+                    .day_inventory
+                    .iter()
+                    .find(|d| {
+                        d.date == date
+                            && d.duration == Some(summary.duration_seconds)
+                            && d.offset == Some(summary.offset_seconds)
+                    })
+                    .ok_or_else(|| format!("missing partial candle day {date}"))?;
+                if day.state != binary_alpha_engine::dataset::daily::DayState::Partial
+                    || !day.unresolved.iter().any(|i| {
+                        binary_alpha_engine::market::parse_event_time_micros(&i.start)
+                            .is_ok_and(|t| t <= open)
+                            && binary_alpha_engine::market::parse_event_time_micros(&i.end)
+                                .is_ok_and(|t| t > open)
+                    })
+                {
+                    return Err(format!(
+                        "candle day {date} must be partial: last candle may be finalized by later input"
+                    ));
+                }
+            }
+        }
     }
     Ok(format!(
         "verified {} {} generation {} candles {candles} objects {} bytes {bytes_verified}",
