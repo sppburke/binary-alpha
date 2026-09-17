@@ -1358,7 +1358,7 @@ fn pipeline(command: &str, config: &Path, extra: &[&str]) -> Result<String, Stri
 }
 
 fn import(config: &Path) -> Result<String, String> {
-    lineage::legacy_import(config)
+    run(&["data", "import", "--config", config.to_str().unwrap()])
 }
 
 fn imported_generation<'a>(report: &'a str, instrument: &str) -> &'a str {
@@ -1399,6 +1399,19 @@ fn stream(store: &Path, generation: &str) -> StreamManifest {
 }
 
 fn coverage(store: &Path, manifest: &GenerationManifest) -> HistoryCoverage {
+    if manifest.layout.is_some() {
+        let records = store.parent().unwrap().join("pipeline_state/records");
+        for entry in fs::read_dir(records).unwrap() {
+            let path = entry.unwrap().path();
+            if path.extension().is_some_and(|e| e == "json") {
+                let record = read_json(&path);
+                if record["dataset_generation"] == manifest.generation {
+                    return serde_json::from_value(record["coverage"].clone()).unwrap();
+                }
+            }
+        }
+        panic!("missing acquisition receipt for {}", manifest.generation);
+    }
     let object = manifest
         .objects
         .iter()
@@ -1546,6 +1559,45 @@ fn indexed_fixture(
 }
 
 fn assert_bundle(store: &Path, manifest: &GenerationManifest, expected_pages: usize) {
+    if manifest.layout.is_some() {
+        let receipt = coverage(store, manifest);
+        assert_eq!(receipt.pages.len(), expected_pages);
+        let pages: Vec<_> = manifest
+            .day_inventory
+            .iter()
+            .filter(|d| d.family == binary_alpha_engine::dataset::DayFamily::Pages)
+            .flat_map(|d| {
+                binary_alpha_app::daily::read_pages(
+                    &store.join(d.object.as_ref().unwrap()),
+                    &d.date,
+                )
+                .unwrap()
+            })
+            .collect();
+        for p in &receipt.pages {
+            let identity = p.occurrence.as_ref().unwrap();
+            let actual: Vec<_> = pages
+                .iter()
+                .filter(|r| {
+                    r.acquisition_id == identity.acquisition_id && r.ordinal == identity.ordinal
+                })
+                .collect();
+            assert_eq!(actual.len(), 1);
+            let actual = actual[0];
+            assert_eq!(actual.payload_sha256, p.sha256);
+            assert_eq!(actual.payload.len() as u64, p.bytes);
+            assert_eq!(actual.request_token, p.anchor);
+            assert_eq!(actual.rows, p.rows);
+        }
+        assert!(
+            manifest
+                .objects
+                .iter()
+                .filter(|o| o.role == binary_alpha_engine::dataset::ObjectRole::Source)
+                .all(|o| o.path.starts_with("pages/") && o.path.ends_with(".parquet"))
+        );
+        return;
+    }
     let source: Vec<_> = manifest
         .objects
         .iter()
@@ -1696,25 +1748,32 @@ fn pipeline_roundtrip() {
     }
     let pocket_manifest = dataset(&store, &pocket_first);
     assert_bundle(&store, &pocket_manifest, 3);
-    let pocket_closure_objects =
-        pocket_manifest.objects.len() + stream(&store, &pocket_stream).objects.len();
+    assert_archive_inventory(&f.drive);
+    let root = dataset(&store, &pocket_seed);
+    let lineage_object = root
+        .objects
+        .iter()
+        .find(|o| o.path == "provenance/lineage.json")
+        .unwrap();
+    let imported_lineage = read_json(&store.join(&lineage_object.key));
+    assert!(
+        imported_lineage["provenance"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|v| v["object"]["path"]
+                .as_str()
+                .unwrap()
+                .starts_with("collection/"))
+    );
+    let lineage_object = pocket_manifest
+        .objects
+        .iter()
+        .find(|o| o.path == "provenance/lineage.json")
+        .unwrap();
     assert_eq!(
-        f.drive.files().len(),
-        pocket_closure_objects + 2 + 1,
-        "Drive files = dataset objects + stream objects + two ready manifests + one catalog"
-    );
-    assert!(pocket_manifest.objects.len() > 3);
-    assert!(
-        pocket_manifest
-            .objects
-            .iter()
-            .any(|object| object.path == "seed/ready.json")
-    );
-    assert!(
-        pocket_manifest
-            .objects
-            .iter()
-            .any(|object| object.path.starts_with("seed/collection/"))
+        read_json(&store.join(&lineage_object.key))["root_generation"],
+        pocket_seed
     );
     // Exact integer conversion of every provider price at the configured scale.
     for bar in &bars_after {
@@ -1772,14 +1831,7 @@ fn pipeline_roundtrip() {
         &deriv_manifest,
         f.deriv.requests().len() - deriv_requests_before,
     );
-    assert_eq!(
-        f.drive.files().len(),
-        pocket_closure_objects
-            + deriv_manifest.objects.len()
-            + stream(&store, &deriv_stream).objects.len()
-            + 2 * (2 + 1),
-        "Drive files = both closures' manifest objects + two ready manifests and one catalog per broker"
-    );
+    assert_archive_inventory(&f.drive);
     // The seed's last tick lies two seconds before its end; the acquisition starts one overlap
     // before that frontier.
     let deriv_fetch_start = DERIV_SEED_END - 2 - 60;
@@ -1901,9 +1953,10 @@ fn pipeline_roundtrip() {
     .unwrap();
     let dataset_uri = field(&restored, "dataset").to_string();
     let verified = run(&["data", "verify", "--manifest", &dataset_uri]).unwrap();
-    assert!(
-        verified.contains("history bundles 1 pages 3 verified"),
-        "{verified}"
+    assert!(verified.contains(&format!("generation {pocket_first} rows ")), "{verified}");
+    assert_eq!(
+        dataset(&f.scratch.path("elsewhere/consumer/store"), &pocket_first).layout,
+        Some(binary_alpha_engine::dataset::Layout::DailyV2)
     );
     assert!(
         (2..=3).contains(&f.drive.activity.downloads.high_water.load(Ordering::SeqCst)),
@@ -2164,11 +2217,9 @@ fn append_log_recovery() {
         .map(|page| page.anchor.as_ref().unwrap().parse::<i64>().unwrap() - POCKET_OFFSET_S)
         .collect();
     assert_eq!(anchors, [cutoff, cutoff - 197, cutoff - 392]);
-    assert!(
-        verify::run(&format!("file://{}", store.join(manifest.key()).display()))
-            .unwrap()
-            .contains("history bundles 1 pages 3 verified")
-    );
+    let verified = verify::run(&format!("file://{}", store.join(manifest.key()).display())).unwrap();
+    assert!(verified.contains(&format!("generation {} rows {}", manifest.generation, manifest.row_count)), "{verified}");
+    assert_eq!(manifest.layout, Some(binary_alpha_engine::dataset::Layout::DailyV2));
     assert_eq!(
         bars(&store, &manifest),
         expected_bars(POCKET_SEED_END, POCKET_SEED_END - 60, cutoff)
@@ -2178,6 +2229,7 @@ fn append_log_recovery() {
 /// A malformed archived index passes transport checks, but neither restore nor a later pull
 /// may report success merely because both ready manifests have already been installed.
 fn failed_restore_pull(f: &Fixture, catalog_id: &str) {
+    legacy_fixtures::catalog(f, catalog_id);
     use binary_alpha_engine::dataset::{
         ObjectRecord, PriceRepresentation, generation_id, object_key,
     };
@@ -3052,11 +3104,7 @@ fn pipeline_recovery() {
     assert!(!pages_path.exists());
     let final_generation = generations.last().unwrap();
     let final_coverage = coverage(&store, &dataset(&store, final_generation));
-    let acquired: Vec<_> = final_coverage
-        .pages
-        .iter()
-        .filter(|page| page.path == "raw/pages.bin")
-        .collect();
+    let acquired: Vec<_> = final_coverage.pages.iter().collect();
     assert_eq!(acquired.len(), 3);
     let mut offset = 0;
     for (page, anchor) in acquired.iter().zip([cutoff, cutoff - 197, cutoff - 392]) {
@@ -3064,10 +3112,11 @@ fn pipeline_recovery() {
             page.anchor.as_ref().unwrap().parse::<i64>().unwrap() - POCKET_OFFSET_S,
             anchor
         );
-        assert_eq!(page.offset, Some(offset));
+        assert_eq!(page.offset, None);
         offset += page.bytes;
     }
-    assert_eq!(offset, final_coverage.bundle.unwrap().bytes);
+    assert_eq!(offset, acquired.iter().map(|p| p.bytes).sum::<u64>());
+    assert_bundle(&store, &dataset(&store, final_generation), 3);
     assert_eq!(
         bars(&store, &dataset(&store, final_generation)),
         expected_bars(POCKET_SEED_END, POCKET_SEED_END - 60, cutoff)
@@ -3097,12 +3146,19 @@ fn pipeline_recovery() {
         .map(|page| page["anchor"].as_str().unwrap().parse::<i64>().unwrap() - POCKET_OFFSET_S)
         .collect();
     assert_eq!(anchors, [cutoff, cutoff - 197, cutoff - 392]);
-    // The same cutoff again: byte-identical pages, new request receipts, the dataset reused.
+    // The same cutoff retains new response occurrences while reusing unchanged market days.
     let repeat = pipeline("update", &pocket_only, &["--end", &end]).unwrap();
-    assert_eq!(
-        field(job_line(&repeat, "pocket"), "dataset"),
-        final_generation
-    );
+    let repeated_generation = field(job_line(&repeat, "pocket"), "dataset");
+    assert_ne!(repeated_generation, final_generation);
+    let previous = dataset(&store, final_generation);
+    let repeated = dataset(&store, repeated_generation);
+    let market_keys = |m: &GenerationManifest| m.objects.iter().filter(|o|o.path.starts_with("observations/"))
+        .map(|o| (&o.path, &o.key)).map(|(p,k)|(p.clone(),k.clone())).collect::<BTreeMap<_,_>>();
+    assert_eq!(market_keys(&previous), market_keys(&repeated));
+    assert_eq!(bars(&store, &previous), bars(&store, &repeated));
+    let count_pages = |m: &GenerationManifest| m.day_inventory.iter()
+        .filter(|d|d.family == binary_alpha_engine::dataset::DayFamily::Pages).map(|d|d.rows).sum::<u64>();
+    assert!(count_pages(&repeated) > count_pages(&previous));
     assert_eq!(field(job_line(&repeat, "pocket"), "status"), "archived");
     let newest = fs::read_dir(state.join("records"))
         .unwrap()
@@ -3116,7 +3172,7 @@ fn pipeline_recovery() {
         .max_by_key(|path| fs::metadata(path).unwrap().modified().unwrap())
         .unwrap();
     let receipt = read_json(&newest);
-    assert_eq!(receipt["dataset_generation"], json!(final_generation));
+    assert_eq!(receipt["dataset_generation"], json!(repeated_generation));
     assert!(
         !receipt["requests"].as_array().unwrap().is_empty(),
         "{receipt}"
@@ -3186,7 +3242,16 @@ fn pipeline_recovery() {
     );
     f.drive.set(DriveFaults::default());
 
-    // Changed same-size remote content is a conflict that replaces nothing.
+    // Changed same-size remote content is a conflict that replaces nothing: first the archived
+    // catalog that a repeated archive confirms through its receipt, then a market-day object
+    // that the next update reuses by key. A repeated cutoff records new page occurrences, so
+    // it publishes a new generation and never reuses the previous catalog itself.
+    let flip = |id: &str| {
+        let mut state = f.drive.state.lock().unwrap();
+        let entry = state.files.get_mut(id).unwrap();
+        entry.bytes[0] ^= 0x01;
+        entry.bytes.clone()
+    };
     let catalog_id = {
         let files = f.drive.files();
         files
@@ -3197,22 +3262,33 @@ fn pipeline_recovery() {
             .map(|(id, _)| id.clone())
             .unwrap()
     };
-    {
-        let mut state = f.drive.state.lock().unwrap();
-        let entry = state.files.get_mut(&catalog_id).unwrap();
-        let mut bytes = entry.bytes.clone();
-        bytes[0] ^= 0x01;
-        entry.bytes = bytes;
-    }
+    let tampered = flip(&catalog_id);
+    let conflict = pipeline("archive", &pocket_only, &[]).unwrap_err();
+    assert!(conflict.contains("nothing was replaced"), "{conflict}");
+    assert_eq!(f.drive.files()[&catalog_id].bytes, tampered);
+    flip(&catalog_id);
+    let object_id = {
+        let object = dataset(&store, &generation_2)
+            .objects
+            .into_iter()
+            .find(|object| object.path.starts_with("observations/"))
+            .unwrap();
+        let files = f.drive.files();
+        files
+            .iter()
+            .find(|(_, entry)| entry.name == format!("object-{}", object.sha256))
+            .map(|(id, _)| id.clone())
+            .unwrap()
+    };
+    let tampered = flip(&object_id);
     let conflict = pipeline("update", &pocket_only, &["--end", &end_2]).unwrap_err();
     assert!(conflict.contains("nothing was replaced"), "{conflict}");
-    {
-        let mut state = f.drive.state.lock().unwrap();
-        let entry = state.files.get_mut(&catalog_id).unwrap();
-        let mut bytes = entry.bytes.clone();
-        bytes[0] ^= 0x01;
-        entry.bytes = bytes;
-    }
+    assert_eq!(f.drive.files()[&object_id].bytes, tampered);
+    flip(&object_id);
+    // The interrupted operation resumes at its pinned cutoff once the remote content agrees.
+    let resumed = pipeline("update", &pocket_only, &["--end", &end_2]).unwrap();
+    assert_eq!(field(job_line(&resumed, "pocket"), "status"), "archived");
+    assert_ne!(field(job_line(&resumed, "pocket"), "dataset"), generation_2);
 
     // Identifier allocation above the service limit is batched: 1500 identifiers arrive unique
     // through more than one request, and the fake refuses any single request over 1000.
@@ -3428,14 +3504,7 @@ fn pipeline_recovery() {
     let bundled = archived
         .objects
         .iter()
-        .find(|object| object.path == "raw/pages.bin")
-        .unwrap();
-    let index = coverage(&store, &archived);
-    let second_page = index
-        .pages
-        .iter()
-        .filter(|page| page.path == "raw/pages.bin")
-        .nth(1)
+        .find(|object| object.path.starts_with("pages/"))
         .unwrap();
     let bundle_id = f
         .drive
@@ -3446,7 +3515,7 @@ fn pipeline_recovery() {
         .unwrap();
     let original_bundle = f.drive.files()[&bundle_id].bytes.clone();
     let mut corrupt_bundle = original_bundle.clone();
-    corrupt_bundle[second_page.offset.unwrap() as usize] ^= 1;
+    corrupt_bundle[20] ^= 1;
     f.drive
         .state
         .lock()
@@ -3472,11 +3541,23 @@ fn pipeline_recovery() {
     .unwrap();
     assert_eq!(downloaded, corrupt_bundle);
     let restored_bundle = consumer_root.join("store").join(&bundled.key);
-    fs::write(&restored_bundle, downloaded).unwrap();
+    let semantic_fault = f.scratch.path("bad-daily-payload.parquet");
+    common::daily::flip_page_payload(&restored_bundle, &semantic_fault);
+    fs::copy(&semantic_fault, &restored_bundle).unwrap();
     let refused = verify::run(field(&restored, "dataset")).unwrap_err();
+    // A re-encoded day file no longer carries the recorded object identity; verification
+    // names the exact object before decoding. The page-level diagnosis is the reader's.
+    assert!(
+        refused.contains(&format!(
+            "{} does not match the recorded size, generation, and checksum",
+            bundled.key
+        )),
+        "{refused}"
+    );
+    let date = &bundled.path["pages/".len()..][..10];
     assert_eq!(
-        refused,
-        "page 2 of raw/pages.bin does not carry its recorded digest"
+        binary_alpha_app::daily::read_pages(&semantic_fault, date).unwrap_err(),
+        "page payload_sha256 does not match payload"
     );
     fs::write(&restored_bundle, &original_bundle).unwrap();
     f.drive
@@ -3517,24 +3598,39 @@ fn pipeline_recovery() {
     );
     assert!(!other_root.join("store/manifests").exists());
 
-    // A pending intent whose retained pages were validated resumes at its pinned cutoff once the
-    // provider's data is consistent again; the conflicting page was never checkpointed.
+    // A conflicting reread invalidates every checkpoint of the pending intent, because the
+    // deferred overlap boundary of an earlier page may be implicated; the received journal
+    // keeps both responses as evidence and the intent resumes at its pinned cutoff by
+    // refetching once the provider's data is consistent again.
     let pending = read_progress(&state.join("pocket/progress.json"));
     assert_eq!(
         pending["progress"]["cutoff"],
         json!(end_conflict),
         "{pending}"
     );
-    assert_eq!(
-        pending["progress"]["pages"].as_array().unwrap().len(),
-        1,
+    assert!(
+        pending["progress"]["pages"].as_array().unwrap().is_empty(),
         "{pending}"
     );
+    let received = fs::read_to_string(state.join("pocket/progress.received.jsonl")).unwrap();
+    let decoded = received
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .filter(|entry| entry["rows"] == 40)
+        .count();
+    assert_eq!(decoded, 2, "{received}");
     // Its closure carries the seed object deleted remotely above: archival re-confirms every
     // reused transfer and refuses instead of reporting a cached success.
     let missing = pipeline("update", &pocket_only, &[]).unwrap_err();
     assert!(missing.contains("missing or trashed"), "{missing}");
-    assert!(!state.join("pocket/progress.json").exists());
+    // The acquisition stays pinned at its cutoff until reclamation closes it after a
+    // successful archive; a refused archive never discards the acquired evidence.
+    let pending = read_progress(&state.join("pocket/progress.json"));
+    assert_eq!(
+        pending["progress"]["cutoff"],
+        json!(end_conflict),
+        "{pending}"
+    );
     f.drive
         .state
         .lock()
@@ -3552,6 +3648,7 @@ fn pipeline_recovery() {
         "archived",
         "{resumed}"
     );
+    assert!(!state.join("pocket/progress.json").exists(), "{resumed}");
     assert_eq!(
         bars(
             &store,
@@ -3881,7 +3978,10 @@ fn pipeline_scope() {
     let generation = field(job_line(&done, "pocket"), "dataset").to_string();
 
     // A valid outer manifest/object identity does not excuse an invalid bundle index.
-    let original_manifest = dataset(&producer.join("store"), &generation);
+    let original_manifest = common::legacy::dataset(
+        &producer.join("store"),
+        &dataset(&producer.join("store"), &generation),
+    );
     let mut bad_coverage = coverage(&producer.join("store"), &original_manifest);
     bad_coverage.pages.last_mut().unwrap().bytes += 1;
     let bad_root = f.scratch.path("bad-index");
@@ -4691,6 +4791,11 @@ fn pipeline_migration_lossless_resume_and_tamper() {
             ),
         );
     }
+    let mapping = legacy_fixtures::freeze(&f);
+    for (dataset, stream) in source_outputs.values_mut() {
+        *dataset = mapping[dataset].clone();
+        *stream = mapping[stream].clone();
+    }
     let before_generations = binary_alpha_app::store::Store::filesystem(&store)
         .list_manifests()
         .unwrap();
@@ -5237,7 +5342,7 @@ fn pipeline_migration_parallel_jobs_are_deterministic_and_isolate_failures() {
 
     let f = fixture("migration_parallel_jobs");
     for job in ["deriv", "pocket"] {
-        import(&f.scratch.path(&format!("{job}-import.toml"))).unwrap();
+        lineage::legacy_import(&f.scratch.path(&format!("{job}-import.toml"))).unwrap();
     }
     let mut identities = BTreeMap::new();
     for (mode, workers) in [("serial", 1), ("parallel", 2), ("failure", 2)] {
@@ -5346,7 +5451,7 @@ fn pipeline_migration_import_only_and_writer_lock() {
     let mut gap = read_json(&cutoff_meta);
     gap["complete"] = json!(false);
     fs::write(cutoff_meta, gap.to_string()).unwrap();
-    import(&f.scratch.path("deriv-import.toml")).unwrap();
+    lineage::legacy_import(&f.scratch.path("deriv-import.toml")).unwrap();
     let lock = File::create(f.scratch.path("producer/pipeline_state/writer.lock"));
     // The pipeline state directory is normally first created by the command.
     if lock.is_err() {
@@ -5443,6 +5548,11 @@ fn migration_carried_legacy_occurrences(retain_anchor: bool) {
         &["--end", &time_text((DERIV_SEED_END + 200) * 1_000_000)],
     )
     .unwrap();
+    let mapping = legacy_fixtures::freeze(&f);
+    let mut report = report;
+    for (a, b) in mapping {
+        report = report.replace(&a, &b);
+    }
     let store = f.scratch.path("producer/store");
     let mut original = dataset(&store, field(job_line(&report, "deriv"), "dataset"));
     let mut cov = coverage(&store, &original);
@@ -5629,6 +5739,7 @@ fn pipeline_migration_pending_receipt_is_diagnostic() {
     )
     .unwrap_err();
     assert!(pending.contains("status pending"), "{pending}");
+    legacy_fixtures::freeze(&f);
     let header = f
         .scratch
         .path("producer/pipeline_state/deriv/progress.json");
@@ -5693,7 +5804,7 @@ fn pipeline_migration_pending_receipt_is_diagnostic() {
 fn pipeline_migration_checkpoint_only_import_is_unresolved() {
     let f = fixture("review_checkpoint_only");
     let root = f.scratch.path("sources/pocket/AEDCNY_otc");
-    let report = import(&f.scratch.path("pocket-import.toml")).unwrap();
+    let report = lineage::legacy_import(&f.scratch.path("pocket-import.toml")).unwrap();
     let store = f.scratch.path("producer/store");
     let mut manifest = dataset(
         &store,
@@ -5775,6 +5886,11 @@ fn migration_coverage_payload_mismatch(rows_mismatch: bool) {
         &["--end", &time_text((DERIV_SEED_END + 200) * 1_000_000)],
     )
     .unwrap();
+    let mapping = legacy_fixtures::freeze(&f);
+    let mut report = report;
+    for (a, b) in mapping {
+        report = report.replace(&a, &b);
+    }
     let store = f.scratch.path("producer/store");
     let mut m = dataset(&store, field(job_line(&report, "deriv"), "dataset"));
     let mut c = coverage(&store, &m);
@@ -5873,6 +5989,7 @@ fn migration_receipt_without_coverage(case: &str) {
         &["--end", &time_text((DERIV_SEED_END + 200) * 1_000_000)],
     )
     .unwrap();
+    legacy_fixtures::freeze(&f);
     let records = f.scratch.path("producer/pipeline_state/records");
     let receipt_path = fs::read_dir(&records)
         .unwrap()
@@ -6022,6 +6139,7 @@ fn pipeline_migration_pending_bounds_must_match_payload() {
         )
         .unwrap_err();
         assert!(error.contains("status pending"), "{error}");
+        legacy_fixtures::freeze(&f);
         // Retain only the pending evidence, so a modern receipt cannot supply the bounds.
         let records = f.scratch.path("producer/pipeline_state/records");
         for entry in fs::read_dir(&records).unwrap() {
@@ -6090,3 +6208,36 @@ mod retire;
 mod archive_records;
 #[path = "data_pipeline/daily_end_to_end.rs"]
 mod daily_end_to_end;
+
+#[path = "data_pipeline/legacy_fixtures.rs"]
+mod legacy_fixtures;
+
+fn assert_archive_inventory(drive: &FakeDrive) {
+    use std::collections::BTreeSet;
+    let files = drive.files();
+    let mut expected = BTreeSet::new();
+    for (id, file) in &files {
+        if let Ok(catalog) = Catalog::from_json(&file.bytes) {
+            expected.insert(id.clone());
+            expected.extend(
+                catalog
+                    .objects
+                    .iter()
+                    .chain(&catalog.records)
+                    .map(|o| o.file_id.clone()),
+            );
+            expected.extend(
+                [&catalog.dataset, &catalog.stream]
+                    .into_iter()
+                    .chain(&catalog.lineage_manifests)
+                    .map(|m| m.file_id.clone()),
+            );
+        }
+    }
+    assert!(!expected.is_empty());
+    assert_eq!(
+        files.keys().cloned().collect::<BTreeSet<_>>(),
+        expected,
+        "every uploaded file is owned by a complete pinned catalog closure"
+    );
+}

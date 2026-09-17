@@ -343,6 +343,7 @@ fn migration_archive_restores_the_proved_stream_after_configuration_changes() {
         &["--end", &time_text((DERIV_SEED_END + 120) * 1_000_000)],
     )
     .unwrap();
+    legacy_fixtures::freeze(&f);
     pipeline("migrate", &config, &[]).unwrap();
     let state = read_json(&producer.join("pipeline_state/deriv/migration.json"));
     let root = state["dataset"].as_str().unwrap();
@@ -476,6 +477,11 @@ fn v1_migrate_archive_restore_update_twice_retire_and_restore_both_brokers() {
         ("pocket", "pocket_option", "AEDCNY_otc", POCKET_SEED_END),
     ];
     let mut configs = BTreeMap::new();
+    fs::copy(
+        f.scratch.path("evidence/deriv.json"),
+        f.scratch.path("evidence/deriv-old.json"),
+    )
+    .unwrap();
     for (job, _, _, end) in jobs {
         import(&f.scratch.path(&format!("{job}-import.toml"))).unwrap();
         let config = f.scratch.path(&format!("{job}-pipeline.toml"));
@@ -484,7 +490,10 @@ fn v1_migrate_archive_restore_update_twice_retire_and_restore_both_brokers() {
             pipeline_toml(
                 &producer,
                 &f.drive.base,
-                &[(job, &format!("{job}.toml"))],
+                &[(
+                    if job == "deriv" { "deriv-old" } else { job },
+                    &format!("{job}.toml"),
+                )],
                 None,
                 3,
             ),
@@ -505,6 +514,26 @@ fn v1_migrate_archive_restore_update_twice_retire_and_restore_both_brokers() {
         &["--end", &time_text((DERIV_SEED_END + 180) * 1_000_000)],
     )
     .unwrap();
+    legacy_fixtures::freeze(&f);
+    fs::write(
+        &configs["deriv"],
+        pipeline_toml(
+            &producer,
+            &f.drive.base,
+            &[("deriv", "deriv.toml")],
+            None,
+            3,
+        ),
+    )
+    .unwrap();
+    let diagnostic = json!({"echo_req":{"ticks_history":"frxEURUSD"},
+        "history":{"times":[DAY2-1,DAY2],"prices":["invalid","1.2"]}})
+    .to_string()
+    .into_bytes();
+    let diagnostic_key = binary_alpha_engine::dataset::object_key(&binary_alpha_engine::hex(
+        &Sha256::digest(&diagnostic),
+    ));
+    fs::write(store.join(&diagnostic_key), &diagnostic).unwrap();
     let v1_generations = binary_alpha_app::store::Store::filesystem(&store)
         .list_manifests()
         .unwrap();
@@ -552,6 +581,71 @@ fn v1_migrate_archive_restore_update_twice_retire_and_restore_both_brokers() {
         "retirement requires an archived v2 catalog"
     );
     pipeline("archive", &f.pipeline, &[]).unwrap();
+    uploaded_once(&f.drive);
+    let mut old_roots = BTreeMap::new();
+    for (job, broker, symbol, _) in jobs {
+        let path = producer.join(format!("pipeline_state/{job}/migration.json"));
+        let mut state = read_json(&path);
+        let record_path = producer
+            .join("pipeline_state/records")
+            .join(state["record"].as_str().unwrap());
+        let record = fs::read(&record_path).unwrap();
+        let proof: Value = serde_json::from_slice(&record).unwrap();
+        if job == "deriv" {
+            assert_eq!(proof["predecessor_jobs"], json!(["deriv-old"]));
+        }
+        if job == "pocket" {
+            assert!(!proof["storage_aliases"].as_array().unwrap().is_empty());
+        }
+        old_roots.insert(
+            job,
+            (
+                state["dataset"].as_str().unwrap().to_string(),
+                state["stream"].as_str().unwrap().to_string(),
+                catalog_for(
+                    &f.pipeline,
+                    broker,
+                    symbol,
+                    state["dataset"].as_str().unwrap(),
+                ),
+                record_path,
+                record,
+            ),
+        );
+        // Model the checkpoint left by an older proof executable, retaining its immutable receipt.
+        state["proof_version"] = json!(0);
+        fs::write(path, state.to_string()).unwrap();
+    }
+    let recovered_diagnostic = json!({"echo_req":{"ticks_history":"frxEURUSD"},
+        "history":{"times":[DAY2],"prices":["newly-recovered"]}})
+    .to_string()
+    .into_bytes();
+    let recovered_key = binary_alpha_engine::dataset::object_key(&binary_alpha_engine::hex(
+        &Sha256::digest(&recovered_diagnostic),
+    ));
+    fs::write(store.join(&recovered_key), &recovered_diagnostic).unwrap();
+    pipeline("migrate", &f.pipeline, &[]).unwrap();
+    for (job, _, _, _) in jobs {
+        let state = read_json(&producer.join(format!("pipeline_state/{job}/migration.json")));
+        let (_, _, _, path, bytes) = &old_roots[job];
+        assert_eq!(
+            fs::read(path).unwrap(),
+            *bytes,
+            "supersession preserves completed evidence"
+        );
+        assert_ne!(state["dataset"], old_roots[job].0);
+        let record = read_json(
+            &producer
+                .join("pipeline_state/records")
+                .join(state["record"].as_str().unwrap()),
+        );
+        assert_eq!(
+            record["supersedes"],
+            path.file_name().unwrap().to_str().unwrap()
+        );
+    }
+    pipeline("archive", &f.pipeline, &[]).unwrap();
+    uploaded_once(&f.drive);
     let mut roots = BTreeMap::new();
     for (job, broker, symbol, _) in jobs {
         let state = read_json(&producer.join(format!("pipeline_state/{job}/migration.json")));
@@ -623,6 +717,11 @@ fn v1_migrate_archive_restore_update_twice_retire_and_restore_both_brokers() {
     let fresh_store = fresh.path("managed/store");
     let mut descendants = BTreeMap::new();
     let mut superseded = BTreeSet::new();
+    superseded.extend(
+        old_roots
+            .values()
+            .map(|(_, _, catalog, _, _)| catalog.0.clone()),
+    );
     superseded.extend(roots.values().map(|(_, _, catalog)| catalog.0.clone()));
     for (job, broker, symbol, end) in jobs {
         let (root, stream, catalog) = &roots[job];
@@ -632,11 +731,11 @@ fn v1_migrate_archive_restore_update_twice_retire_and_restore_both_brokers() {
             serde_json::from_slice(&f.drive.state.lock().unwrap().files[&catalog.0].bytes).unwrap();
         assert!(!archived.records.is_empty());
         for record in &archived.records {
-            assert!(
-                fresh
-                    .path("managed/pipeline_state")
-                    .join(&record.key)
-                    .is_file()
+            assert_eq!(
+                fs::read(fresh.path("managed/pipeline_state").join(&record.key)).unwrap(),
+                fs::read(producer.join("pipeline_state").join(&record.key)).unwrap(),
+                "restored immutable record {}",
+                record.key
             );
         }
         let missing_record = fresh
@@ -676,6 +775,34 @@ fn v1_migrate_archive_restore_update_twice_retire_and_restore_both_brokers() {
             let generation = field(line, "dataset").to_string();
             let stream = field(line, "stream").to_string();
             let manifest = dataset(&fresh_store, &generation);
+            let lineage = manifest
+                .objects
+                .iter()
+                .find(|o| o.path == "provenance/lineage.json")
+                .unwrap();
+            assert_eq!(
+                read_json(&fresh_store.join(&lineage.key))["root_generation"],
+                *root
+            );
+            if job == "deriv" {
+                let pages: Vec<_> = manifest
+                    .day_inventory
+                    .iter()
+                    .filter(|d| d.family == DayFamily::Pages)
+                    .flat_map(|d| {
+                        binary_alpha_app::daily::read_pages(
+                            &fresh_store.join(d.object.as_ref().unwrap()),
+                            &d.date,
+                        )
+                        .unwrap()
+                    })
+                    .collect();
+                for bytes in [&diagnostic, &recovered_diagnostic] {
+                    assert!(pages.iter().any(|p| &p.payload == bytes
+                        && p.disposition == binary_alpha_app::daily::PageDisposition::Diagnostic));
+                }
+            }
+
             let candles =
                 read_json(&fresh_store.join(binary_alpha_engine::dataset::manifest_key(&stream)));
             let observations_and_candles: BTreeSet<_> = manifest
@@ -712,6 +839,13 @@ fn v1_migrate_archive_restore_update_twice_retire_and_restore_both_brokers() {
         pipeline("archive", &config, &[]).unwrap();
         descendants.insert(job, versions);
     }
+    for entry in fs::read_dir(producer.join("pipeline_state/records")).unwrap().flatten() {
+        if !entry.file_type().unwrap().is_file() { continue; }
+        let bytes = fs::read(entry.path()).unwrap();
+        if serde_json::from_slice::<Value>(&bytes).is_ok_and(|v| roots.values().any(|(_, _, c)| v["file_id"] == c.0)) { continue; }
+        assert_eq!(fs::read(fresh.path("managed/pipeline_state/records").join(entry.file_name())).unwrap(), bytes,
+            "all cumulative records, including superseded alias tables and predecessor records, restore exactly");
+    }
     fs::rename(producer.join("store.saved"), &store).unwrap();
     // Install both daily descendants into the producer that still owns every v1 closure.
     for (job, broker, symbol, _) in jobs {
@@ -742,6 +876,16 @@ fn v1_migrate_archive_restore_update_twice_retire_and_restore_both_brokers() {
     let planned = pipeline("retire", &f.pipeline, &["--plan"]).unwrap();
     let path = PathBuf::from(field(&planned, "plan"));
     let plan: Plan = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    for (root, stream, _, _, _) in old_roots.values() {
+        for generation in [root, stream] {
+            assert!(
+                plan.delete_local
+                    .iter()
+                    .any(|d| d.path == format!("manifests/{generation}")),
+                "superseded migration closure must retire: {generation}"
+            );
+        }
+    }
     for generation in &v1_generations {
         assert!(
             plan.delete_local
@@ -811,6 +955,18 @@ fn v1_migrate_archive_restore_update_twice_retire_and_restore_both_brokers() {
         retained_ids
             .iter()
             .all(|id| f.drive.state.lock().unwrap().files.contains_key(id))
+    );
+    assert_eq!(
+        f.drive
+            .state
+            .lock()
+            .unwrap()
+            .files
+            .keys()
+            .cloned()
+            .collect::<BTreeSet<_>>(),
+        retained_ids,
+        "remote inventory contains only exact retained closure file ids"
     );
     uploaded_once(&f.drive);
     pipeline("retire", &f.pipeline, &["--plan"]).unwrap();

@@ -883,3 +883,6 @@ pub fn cli_as(log: &Path, user: &str, args: &[&str]) -> Result<String, String> {
 }
 
 pub mod daily;
+pub mod legacy;
+
+pub mod current;

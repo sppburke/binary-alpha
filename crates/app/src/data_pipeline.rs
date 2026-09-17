@@ -670,7 +670,7 @@ impl Catalog {
 
 /// Record ownership comes from the job field or an owned intent, never a loose filename
 /// prefix. Migration's verified mapping alone grants ownership of predecessor jobs.
-fn evidence_records(
+pub(crate) fn evidence_records(
     layout: &Layout,
     job: &str,
     migration: &crate::lineage::MigrationRecords,
@@ -705,6 +705,8 @@ fn evidence_records(
         job: Option<String>,
         intent: Option<String>,
         acquisition_id: Option<String>,
+        supersedes: Option<String>,
+        alias_table: Option<serde_json::Value>,
     }
     let mut headers = BTreeMap::new();
     if directory.is_dir() {
@@ -744,7 +746,14 @@ fn evidence_records(
                 selected.insert(key.clone());
             }
             if selected.contains(&key) {
-                for name in [&value.intent, &value.acquisition_id].into_iter().flatten() {
+                for name in [&value.intent, &value.acquisition_id, &value.supersedes].into_iter().flatten() {
+                    let key = format!("records/{name}");
+                    crate::lineage::record_name(&key)?;
+                    selected.insert(key);
+                }
+                if let Some(alias) = &value.alias_table {
+                    let name = alias.as_str().or_else(|| alias["record"].as_str())
+                        .ok_or("migration alias table record name absent")?;
                     let key = format!("records/{name}");
                     crate::lineage::record_name(&key)?;
                     selected.insert(key);
@@ -767,7 +776,7 @@ fn evidence_records(
     Ok(files)
 }
 
-fn catalog_receipt_name(name: &str, job: &str) -> bool {
+pub(crate) fn catalog_receipt_name(name: &str, job: &str) -> bool {
     name.strip_prefix(&format!("{job}-catalog-"))
         .and_then(|s| s.strip_suffix(".json"))
         .is_some_and(|pair| {
@@ -941,6 +950,8 @@ fn archive_generation(
     if dataset_manifest.layout == Some(binary_alpha_engine::dataset::Layout::DailyV2)
         && let Some(root) = crate::lineage::root(
             &local,
+            &layout.state.join("records"),
+            job,
             &dataset_manifest.instrument,
             dataset_manifest.role,
             access,
@@ -1201,13 +1212,15 @@ fn confirm_remote(
 /// update extends. Broker-history descendants are found from it by the fetch owner.
 fn imported_seed(
     local: &Store,
+    records: &Path,
+    job: &str,
     broker: &BrokerId,
     symbol: &str,
     role: DatasetRole,
     access: Access<'_>,
 ) -> Result<Option<String>, String> {
     let instrument = format!("{broker}:{symbol}");
-    if let Some(root) = crate::lineage::root(local, &instrument, role, access)? {
+    if let Some(root) = crate::lineage::root(local, records, job, &instrument, role, access)? {
         return Ok(Some(root));
     }
     let mut newest: Option<(String, String)> = None;
@@ -1277,8 +1290,10 @@ pub fn archive(config_path: &Path, job: Option<&str>, out: &mut dyn Write) -> Re
     run_jobs(&config, &layout, out, &|job, bound, drive, access, _out| {
         let local = layout.store();
         let history = bound.core.history.as_ref().expect("bound history");
-        let dataset = crate::lineage::newest_daily(
+        let dataset = crate::lineage::newest_daily_for_job(
             &local,
+            &layout.state.join("records"),
+            &job.id,
             &format!("{}:{}", history.broker, bound.symbol),
             history.role,
             access,
@@ -1485,13 +1500,21 @@ fn update_job(
         .iter()
         .find(|broker| broker.id() == &history.broker)
         .expect("bound broker");
-    let imported = imported_seed(&local, &history.broker, &bound.symbol, history.role, access)?
-        .ok_or_else(|| {
-            format!(
-                "job {}: the store holds no imported generation for {}:{}; run `data import` first",
-                job.id, history.broker, bound.symbol
-            )
-        })?;
+    let imported = imported_seed(
+        &local,
+        &layout.state.join("records"),
+        &job.id,
+        &history.broker,
+        &bound.symbol,
+        history.role,
+        access,
+    )?
+    .ok_or_else(|| {
+        format!(
+            "job {}: the store holds no imported generation for {}:{}; run `data import` first",
+            job.id, history.broker, bound.symbol
+        )
+    })?;
     let pending_path = state.join("progress.json");
     let pages_path = state.join("progress.pages.jsonl");
     let (pending, partial) = read_pending(&pending_path, &pages_path)?;
@@ -1980,7 +2003,7 @@ pub(crate) fn newest_catalog(
         .collect();
     same.iter()
         .copied()
-        .find(|i| {
+        .filter(|i| {
             same.iter().all(|j| {
                 catalogs[*j].2.records.iter().all(|record| {
                     catalogs[*i].2.records.iter().any(|entry| {
@@ -1990,6 +2013,13 @@ pub(crate) fn newest_catalog(
                     })
                 })
             })
+        })
+        .min_by_key(|i| {
+            (
+                catalogs[*i].2.objects.len(),
+                catalogs[*i].2.lineage_manifests.len(),
+                &catalogs[*i].0,
+            )
         })
         .ok_or_else(|| "archive: conflicting evidence closures for the same generation".into())
 }

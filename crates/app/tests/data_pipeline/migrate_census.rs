@@ -46,7 +46,7 @@ fn diagnostic(job: &str) -> Value {
 fn physical_responses_are_preserved_and_unresolved_are_explicit() {
     for job in ["deriv", "pocket"] {
         let f = fixture("physical_census");
-        import(&f.scratch.path(&format!("{job}-import.toml"))).unwrap();
+        lineage::legacy_import(&f.scratch.path(&format!("{job}-import.toml"))).unwrap();
         let (key, bytes) = put(&f, diagnostic(job));
         let (unknown, _) = put(&f, json!({"history":{"times":[DAY2],"prices":["1.2"]}}));
         pipeline("migrate", &f.pipeline, &["--job", job]).unwrap();
@@ -143,7 +143,7 @@ fn physical_responses_are_preserved_and_unresolved_are_explicit() {
 #[test]
 fn attributable_physical_response_added_after_conversion_blocks_verified() {
     let f = fixture("physical_census_late");
-    import(&f.scratch.path("deriv-import.toml")).unwrap();
+    lineage::legacy_import(&f.scratch.path("deriv-import.toml")).unwrap();
     data_pipeline::migrate_with(
         &f.pipeline,
         Some("deriv"),
@@ -160,7 +160,7 @@ fn attributable_physical_response_added_after_conversion_blocks_verified() {
 #[test]
 fn physical_response_without_day_is_unresolved_and_cannot_verify() {
     let f = fixture("physical_census_empty");
-    import(&f.scratch.path("deriv-import.toml")).unwrap();
+    lineage::legacy_import(&f.scratch.path("deriv-import.toml")).unwrap();
     let (key, _) = put(
         &f,
         json!({"echo_req":{"ticks_history":"frxEURUSD"},"history":{"times":[],"prices":[]}}),
@@ -185,7 +185,7 @@ fn physical_response_without_day_is_unresolved_and_cannot_verify() {
 #[test]
 fn physical_error_response_is_unresolved_instead_of_another_source() {
     let f = fixture("physical_error_response");
-    import(&f.scratch.path("deriv-import.toml")).unwrap();
+    lineage::legacy_import(&f.scratch.path("deriv-import.toml")).unwrap();
     let (key, _) = put(
         &f,
         json!({"echo_req":{"ticks_history":"frxEURUSD"},"error":{"code":"InvalidRequest"}}),
@@ -208,7 +208,7 @@ fn physical_error_response_is_unresolved_instead_of_another_source() {
 #[test]
 fn physical_payload_cannot_choose_between_retained_source_contexts() {
     let f = fixture("physical_source_contexts");
-    import(&f.scratch.path("deriv-import.toml")).unwrap();
+    lineage::legacy_import(&f.scratch.path("deriv-import.toml")).unwrap();
     let records = f.scratch.path("producer/pipeline_state/records");
     fs::create_dir_all(&records).unwrap();
     fs::write(
@@ -250,6 +250,7 @@ fn updated(name: &str) -> Fixture {
         &["--end", &time_text((DERIV_SEED_END + 200) * 1_000_000)],
     )
     .unwrap();
+    legacy_fixtures::freeze(&f);
     f
 }
 
@@ -342,7 +343,7 @@ fn predecessor_job_ownership_and_receipts_are_carried_to_current_job() {
 #[test]
 fn predecessor_with_foreign_generation_is_not_authorized() {
     let f = updated("physical_census_foreign_predecessor");
-    let other = import(&f.scratch.path("pocket-import.toml")).unwrap();
+    let other = lineage::legacy_import(&f.scratch.path("pocket-import.toml")).unwrap();
     let other = imported_generation(&other, "pocket_option:AEDCNY_otc");
     let transfers = f
         .scratch
@@ -413,7 +414,7 @@ fn corrupt_standalone_copy_cannot_be_verified_from_bundle_prefix() {
 #[test]
 fn older_verified_proof_is_superseded_without_rewriting_record() {
     let f = fixture("physical_census_version");
-    import(&f.scratch.path("deriv-import.toml")).unwrap();
+    lineage::legacy_import(&f.scratch.path("deriv-import.toml")).unwrap();
     pipeline("migrate", &f.pipeline, &["--job", "deriv"]).unwrap();
     let (mut state, _, _) = migrated(&f, "deriv");
     let old_path = f
@@ -444,5 +445,50 @@ fn older_verified_proof_is_superseded_without_rewriting_record() {
     assert!(
         report.contains(new["dataset"].as_str().unwrap()),
         "superseding root must remain selectable: {report}"
+    );
+    let config = f.scratch.path("upgrade-update.toml");
+    fs::write(
+        &config,
+        pipeline_toml(
+            &f.scratch.path("producer"),
+            &f.drive.base,
+            &[("deriv", "deriv.toml")],
+            None,
+            2,
+        ),
+    )
+    .unwrap();
+    let update = pipeline(
+        "update",
+        &config,
+        &["--end", &time_text((DERIV_SEED_END + 120) * 1_000_000)],
+    )
+    .unwrap();
+    let m = dataset(
+        &f.scratch.path("producer/store"),
+        field(job_line(&update, "deriv"), "dataset"),
+    );
+    let lineage = m
+        .objects
+        .iter()
+        .find(|o| o.path == "provenance/lineage.json")
+        .unwrap();
+    assert_eq!(
+        read_json(&f.scratch.path("producer/store").join(&lineage.key))["root_generation"],
+        new["dataset"]
+    );
+    assert!(
+        m.day_inventory
+            .iter()
+            .filter(|d| d.family == DayFamily::Pages)
+            .flat_map(|d| binary_alpha_app::daily::read_pages(
+                &f.scratch
+                    .path("producer/store")
+                    .join(d.object.as_ref().unwrap()),
+                &d.date
+            )
+            .unwrap())
+            .any(|p| p.payload == bytes),
+        "post-upgrade continuation lost recovered diagnostics"
     );
 }

@@ -22,6 +22,7 @@ use binary_alpha_engine::execution::{
 };
 use binary_alpha_engine::features::{FeatureManifest, Kind, Value};
 use binary_alpha_engine::market::{Currency, format_event_time_micros};
+use common::current::import;
 use common::*;
 
 /// The rows of one stream: close time, availability, and the bound column values.

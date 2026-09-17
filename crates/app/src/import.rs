@@ -88,6 +88,7 @@ struct Dataset {
 pub fn run(config_path: &Path, out: &mut dyn Write) -> Result<(), String> {
     let config = crate::load_config(config_path)?;
     let base = config_path.parent().unwrap_or(Path::new("."));
+    let _locks = crate::data_pipeline::import_writer_locks(&config, base)?;
     publish_all(&config, base, out).map(|_| ())
 }
 

@@ -481,6 +481,11 @@ pub fn flip_page_payload(source: &Path, target: &Path) {
 
 /// Synthetic acquisition claims for fixtures; production never infers proof from inventory.
 pub fn write_coverage(scratch: &Scratch, manifest: &mut GenerationManifest) {
+    write_coverage_at(&scratch.path("published"), manifest);
+}
+
+/// The same synthetic coverage evidence for a fixture store at an explicit location.
+pub fn write_coverage_at(root: &Path, manifest: &mut GenerationManifest) {
     use binary_alpha_engine::dataset::coverage::*;
     let mut acquisitions = Vec::new();
     let mut days = Vec::new();
@@ -547,16 +552,22 @@ pub fn write_coverage(scratch: &Scratch, manifest: &mut GenerationManifest) {
         days,
     };
     coverage.check_manifest(manifest).unwrap();
-    let file = scratch.path("typed-coverage.json");
+    let file = root.join(".fixture-typed-coverage.json");
     fs::write(&file, coverage.to_json()).unwrap();
-    *manifest
-        .objects
-        .iter_mut()
-        .find(|o| o.path == "provenance/coverage.json")
-        .unwrap() = object(
-        &scratch.path("published"),
+    let coverage = object(
+        root,
         "provenance/coverage.json",
         ObjectRole::Provenance,
         &file,
     );
+    if let Some(previous) = manifest
+        .objects
+        .iter_mut()
+        .find(|o| o.path == coverage.path)
+    {
+        *previous = coverage;
+    } else {
+        manifest.objects.push(coverage);
+    }
+    fs::remove_file(file).unwrap();
 }

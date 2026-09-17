@@ -16,7 +16,7 @@ fn cumulative_records(job: &str, broker: &str, symbol: &str, end: i64) {
         ),
     )
     .unwrap();
-    import(&f.scratch.path(&format!("{job}-import.toml"))).unwrap();
+    lineage::legacy_import(&f.scratch.path(&format!("{job}-import.toml"))).unwrap();
     pipeline("migrate", &config, &[]).unwrap();
     // Model the shared migration writer's verified predecessor ownership without changing
     // lineage.rs, which belongs to the other work groups.
@@ -213,7 +213,7 @@ fn archive_new_evidence_for_same_generation_and_pull_latest_closure() {
         ),
     )
     .unwrap();
-    import(&f.scratch.path("deriv-import.toml")).unwrap();
+    lineage::legacy_import(&f.scratch.path("deriv-import.toml")).unwrap();
     pipeline("migrate", &config, &[]).unwrap();
     let first = pipeline("archive", &config, &[]).unwrap();
     let first_id = field(job_line(&first, "deriv"), "catalog");

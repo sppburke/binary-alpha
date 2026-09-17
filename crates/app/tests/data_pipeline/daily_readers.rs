@@ -17,6 +17,12 @@ fn run(scratch: &Scratch, name: &str, suffix: &str, command: &[&str]) -> Result<
 fn audit(scratch: &Scratch, pair: &Pair, v2: bool) -> PathBuf {
     let config = scratch.config("audit.toml", &pair.instrument());
     let path = pair.path(scratch, v2);
+    if !v2 {
+        let stream = common::legacy::stream(&config, &scratch.path("published"), &pair.v1);
+        return scratch
+            .path("published")
+            .join(manifest_key(&stream.generation));
+    }
     let lines = common::command(&[
         "data",
         "audit",

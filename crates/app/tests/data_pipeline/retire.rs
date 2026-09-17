@@ -265,6 +265,11 @@ fn audit_fixture(
     manifest: &GenerationManifest,
 ) -> StreamManifest {
     let config = scratch.config("audit.toml", &pair.instrument());
+    if manifest.layout.is_none() {
+        let stream = common::legacy::stream(&config, &scratch.path("published"), manifest);
+        fs::remove_file(config).unwrap();
+        return stream;
+    }
     let report = common::command(&[
         "data",
         "audit",
@@ -1865,6 +1870,9 @@ fn retirement_descendant_ancestry_cannot_authorize_unmapped_legacy_deletion() {
         )
         .unwrap();
         let audit = |manifest: &GenerationManifest| {
+            if manifest.layout.is_none() {
+                return common::legacy::stream(&audit_config, &root, manifest);
+            }
             let mut report = Vec::new();
             binary_alpha_app::audit::run(
                 &audit_config,

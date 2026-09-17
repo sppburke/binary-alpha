@@ -1840,7 +1840,13 @@ fn predecessor_jobs(
                 .strip_prefix(&format!("{owner}-catalog-"))
                 .and_then(|s| s.strip_suffix(".json"))
             {
-                for prefix in pair.split('-') {
+                if !crate::data_pipeline::catalog_receipt_name(&name, owner) {
+                    candidate.generations.insert(format!("unresolved:{name}"));
+                    continue;
+                }
+                // Cumulative archive receipts append an evidence digest after the two
+                // generation prefixes; that digest is not a third generation identity.
+                for prefix in pair.split('-').take(2) {
                     let matches: Vec<_> = generations
                         .iter()
                         .filter(|g| g.starts_with(prefix))

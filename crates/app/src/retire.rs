@@ -963,7 +963,7 @@ fn plan(
                 job.id
             ));
         } else {
-            let index = crate::lineage::newest_catalog(
+            let index = data_pipeline::newest_catalog(
                 &candidates,
                 drive,
                 &layout.state.join("downloads"),
@@ -992,6 +992,7 @@ fn plan(
     let mut replaced = BTreeSet::new();
     let mut continuation_seeds = BTreeSet::new();
     let mut completed_records = BTreeSet::new();
+    let mut owned_records = BTreeSet::new();
     let mut migrated_objects = BTreeSet::new();
     let mut job_owners: BTreeMap<_, _> = selected
         .keys()
@@ -1057,6 +1058,8 @@ fn plan(
         }
         let seed = crate::lineage::root(
             &Store::filesystem(&layout.store),
+            &layout.state.join("records"),
+            job,
             instrument,
             DatasetRole::Development,
             access,
@@ -1087,6 +1090,12 @@ fn plan(
                 .into_iter()
                 .flatten()
                 .filter_map(Value::as_str)
+                .chain(
+                    migrations
+                        .iter()
+                        .filter(|r| r.job == *job && r.verified())
+                        .map(|r| r.v2_root.as_str()),
+                )
                 .filter(|id| *id != logical_root && *id != seed && *id != archive.dataset)
             {
                 // An ancestry claim never grants v1 deletion authority. Local daily
@@ -1160,6 +1169,12 @@ fn plan(
             )?;
             let bindings = catalog.check_migration_records(layout, &root_manifest, access)
                 .map_err(|e| format!("retire: verified migration evidence is not archived with the retained v2 catalog: {e}"))?;
+            // The job's cumulative evidence closure (superseded migration receipts, their alias
+            // tables, predecessor jobs' records) is its own immutable history, archived with the
+            // catalog. Owned records never pin the closures a verified superseding record replaced.
+            for key in data_pipeline::evidence_records(layout, job, &bindings)?.keys() {
+                owned_records.insert(crate::lineage::record_name(key)?.to_string());
+            }
             let mapping: MigrationMapping =
                 serde_json::from_value(lineage[&seed].clone()).map_err(|e| e.to_string())?;
             for key in bindings.files.keys() {
@@ -1259,6 +1274,11 @@ fn plan(
     let mut roots = BTreeSet::new();
     let mut candidates = BTreeSet::new();
     known.extend(migrated_objects.iter().cloned());
+    // Keys a verified migration record declares as storage aliases or migrated byte sources
+    // are represented by v2 pages. They are retirement candidates by declaration and never
+    // become retained roots through a record that merely mentions them; after retirement, or
+    // in a fresh restore, their absence is the expected state rather than a lost dependency.
+    let migrated_keys = migrated_objects.clone();
     candidates.extend(migrated_objects);
     let mut inventory = Vec::new();
     for (generation, m) in &manifests {
@@ -1538,7 +1558,7 @@ fn plan(
     let mut eligible = candidates.clone();
     expand(&mut eligible, &graph);
     for (path, id) in &records {
-        let mut selected_record = completed_records.contains(id);
+        let mut selected_record = completed_records.contains(id) || owned_records.contains(id);
         for value in documents(path)? {
             selected_record |= value
                 .get("job")
@@ -1591,7 +1611,11 @@ fn plan(
             roots.extend(
                 closure
                     .iter()
-                    .filter(|d| resolved(d) && !records.iter().any(|(_, id)| id == *d))
+                    .filter(|d| {
+                        resolved(d)
+                            && !migrated_keys.contains(*d)
+                            && !records.iter().any(|(_, id)| id == *d)
+                    })
                     .cloned(),
             );
         }
