@@ -69,6 +69,14 @@ pub struct MigrationRecord {
     pub equality: MigrationEquality,
     #[serde(flatten)]
     pub evidence: BTreeMap<String, Value>,
+    /// Earlier job identifiers whose generations, records, catalogs, and transfers belong to this job's
+    /// instrument and source identity (verified during migration); retirement treats them as this job's.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub predecessor_jobs: Vec<String>,
+    /// Physical store keys holding a byte-identical standalone copy of a migrated page payload
+    /// (`objects/<payload_sha256>`); they are storage aliases of existing occurrences, not occurrences.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub storage_aliases: Vec<String>,
 }
 impl MigrationRecord {
     pub fn verified(&self) -> bool {
