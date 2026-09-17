@@ -6083,5 +6083,7 @@ mod registry_archive;
 #[path = "data_pipeline/retire.rs"]
 mod retire;
 
+#[path = "data_pipeline/archive_records.rs"]
+mod archive_records;
 #[path = "data_pipeline/daily_end_to_end.rs"]
 mod daily_end_to_end;

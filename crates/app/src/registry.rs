@@ -653,7 +653,9 @@ fn pin_key(key: &str, roots: &mut BTreeSet<String>) -> Result<(), String> {
     {
         roots.insert(id.into());
     } else if let Some(pair) = key.strip_prefix("catalog/") {
-        roots.extend(pair.split('/').map(str::to_string));
+        // Evidence revisions share market generations; the trailing evidence digest names
+        // a catalog revision, not another dataset or stream dependency.
+        roots.extend(pair.split('/').take(2).map(str::to_string));
     } else if !key.starts_with("objects/") && !key.starts_with("records/") {
         return Err("registry: unresolved logical transfer key".into());
     }
