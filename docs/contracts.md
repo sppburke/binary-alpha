@@ -456,8 +456,11 @@ Embedded metadata is `closed = left`, `frequency = 5s`,
 bars with start at or after the acquisition start and end at or before the cutoff enter the
 new rows. Volume remains the provider's value; first/last tick times are not invented.
 
-Matched history-page bytes are retained before row decoding. Validated pages appear as source
-objects at logical paths `raw/SHA256HEX.json`, stored under `objects/SHA256HEX`. A matched
+Matched history-page bytes are retained before row decoding. Individual pages stay locally
+retained under `objects/SHA256HEX` for pending-intent replay;
+publication concatenates the acquisition's pages in request order, without framing, into one
+`Source` object at `raw/pages.bin`. Replayed and new pages are included, and local page objects
+are never removed. A reused generation or acquisition without pages adds no bundle. A matched
 response whose rows fail validation remains a retained diagnostic without a ready manifest naming
 it. Envelope mismatches fail before this retention.
 
@@ -471,7 +474,18 @@ written), optional `seed = { generation, source_identity }`, and each page's opt
 its operation receipt). Each shortfall has `reason` and
 an `unresolved` range. Reasons include `empty_page`, `no_progress`, `budget`, and
 `unresolved_tail`; when a primary shortfall and a tail coexist, `tail_shortfall` records the
-tail separately. Missing optional additions are not synthesized into old immutable records.
+tail separately. Optional `bundle = { sha256: string, bytes: u64 }` identifies the current
+acquisition's `raw/pages.bin`; each bundled page has `offset: u64` and its bundle's `path`,
+while `sha256` and `bytes` still identify that page's slice. In Rust these are
+`HistoryCoverage.bundle: Option<ObjectIdentitySummary>` and `PageCoverage.offset: Option<u64>`;
+absent values deserialize to `None` and are omitted when serialized. The cumulative index
+carries previous acquisitions unchanged except that their `raw/pages.bin` paths become
+`raw/BASELINE_GENERATION/pages.bin`, avoiding collisions even for identical bundle bytes.
+Verification binds the current bundle summary to its source object, checks every current and
+carried bundle's index tiles its bytes exactly with contiguous explicit offsets and lengths,
+and verifies each slice's SHA-256 as well as each object's digest. Legacy individual-page
+objects and entries without offsets remain valid and are carried without rebundling.
+Missing optional additions are not synthesized into old immutable records.
 
 For pipeline advances, the acquisition frontier is the latest retained tick time or the end of
 the latest complete bar. A new acquisition starts at
@@ -608,11 +622,15 @@ Under `pipeline_state/`:
   and `bytes`; the generation prefixes are 16 hexadecimal digits.
 - `JOB/update.toml` holds the effective core configuration of the last update.
 - `JOB/progress.json` holds a pending intent name, effective configuration binding, and
-  `progress` with `baseline`, `start`, `cutoff`, and retained `pages`. Pages are retained
+  `progress` with `baseline`, `start`, and `cutoff`, written once.
+  `JOB/progress.pages.jsonl` appends one compact JSON page record and newline per retained page,
+  using one write followed by a flush; replayed pages are not appended again. Old inline
+  `pages` are read first, then complete log lines. A missing log means zero appended pages;
+  a trailing partial line is ignored, reported, and truncated before appending. Pages are retained
   before this checkpoint advances; resumption decodes them and continues backward. A page whose
   rows contradict the retained rows fails the run before it is checkpointed, so a resumed
-  intent never replays a conflicting page; removing `JOB/progress.json` abandons a pending
-  intent (its retained pages stay as unreferenced diagnostics) so a later update may pin a new
+  intent never replays a conflicting page; completion removes both progress files. Removing both
+  files abandons a pending intent (its retained pages stay as unreferenced diagnostics) so a later update may pin a new
   cutoff.
 - `JOB/transfers.json` maps object/manifest/catalog keys to `file_id`, optional secret
   `session`, and `done`. Session status supplies the acknowledged upload offset on resume.

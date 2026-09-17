@@ -2340,7 +2340,8 @@ fn fetch_conflicts_provider_errors_and_interrupted_publication_do_not_advance() 
     assert!(read_manifests(&scratch).is_empty());
     let first = range_page(5, 10);
     let second = range_page(0, 6);
-    let failure_path = scratch.path("published/objects").join(hash(&second.raw));
+    let bundle = [first.raw.as_slice(), second.raw.as_slice()].concat();
+    let failure_path = scratch.path("published/objects").join(hash(&bundle));
     fs::create_dir_all(&failure_path).unwrap();
     assert!(
         fetch::pass(
@@ -2355,7 +2356,7 @@ fn fetch_conflicts_provider_errors_and_interrupted_publication_do_not_advance() 
     );
     assert!(
         scratch
-            .path("published/objects")
+            .path("retained/objects")
             .join(hash(&first.raw))
             .is_file()
     );
@@ -2370,7 +2371,7 @@ fn fetch_conflicts_provider_errors_and_interrupted_publication_do_not_advance() 
         &mut out,
     )
     .unwrap();
-    assert!(String::from_utf8(out).unwrap().contains("reused 1"));
+    assert!(String::from_utf8(out).unwrap().contains("reused 0"));
     assert_eq!(read_manifests(&scratch).len(), 1);
     assert!(
         verify::run(&destination.uri(&read_manifests(&scratch)[0].key()))
@@ -2769,6 +2770,7 @@ fn binary_fetch_verify_and_inspect_both_providers_over_real_local_transports() {
                 ),
             ]);
             assert!(report.starts_with("verified"));
+            assert!(report.contains("history bundles 1"), "{report}");
             let rows = common::read_normalized_ticks(&scratch.path("published"), manifest);
             assert_eq!(rows.len() as u64, manifest.row_count);
             assert_eq!(
@@ -2786,16 +2788,27 @@ fn binary_fetch_verify_and_inspect_both_providers_over_real_local_transports() {
                 assert_eq!(coverage.pages.len(), 3);
             }
             for page in &coverage.pages {
-                let raw = fs::read(
-                    scratch
-                        .path("published")
-                        .join(binary_alpha_engine::dataset::object_key(&page.sha256)),
-                )
-                .unwrap();
-                assert_eq!(hash(&raw), page.sha256);
+                let bundle = manifest
+                    .objects
+                    .iter()
+                    .find(|object| object.path == page.path)
+                    .unwrap();
+                let bytes = fs::read(scratch.path("published").join(&bundle.key)).unwrap();
+                let offset = page.offset.unwrap() as usize;
+                let raw = &bytes[offset..offset + page.bytes as usize];
+                assert_eq!(
+                    raw,
+                    fs::read(
+                        scratch
+                            .path("retained")
+                            .join(binary_alpha_engine::dataset::object_key(&page.sha256))
+                    )
+                    .unwrap()
+                );
+                assert_eq!(hash(raw), page.sha256);
                 let expected = if kind == "deriv" {
                     let envelope: binary_alpha_app::broker::deriv::Envelope =
-                        serde_json::from_slice(&raw).unwrap();
+                        serde_json::from_slice(raw).unwrap();
                     deriv_history_response(
                         manifest.provider_symbol.as_str(),
                         page.anchor.as_deref().unwrap(),
@@ -2806,7 +2819,7 @@ fn binary_fetch_verify_and_inspect_both_providers_over_real_local_transports() {
                     struct Page {
                         index: u64,
                     }
-                    let response: Page = serde_json::from_slice(&raw).unwrap();
+                    let response: Page = serde_json::from_slice(raw).unwrap();
                     let anchor: WireDecimal =
                         serde_json::from_str(page.anchor.as_deref().unwrap()).unwrap();
                     pocket_history_response(

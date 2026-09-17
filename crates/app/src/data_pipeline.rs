@@ -29,7 +29,7 @@ use sha2::{Digest, Sha256};
 use crate::audit;
 use crate::broker::{self, Clock, SystemClock};
 use crate::drive::{Drive, DriveSettings};
-use crate::fetch::{self, Bounds, PageReceipt, Progress, Requested};
+use crate::fetch::{self, Bounds, PageReceipt, Progress, ProgressEvent, Requested};
 use crate::research;
 use crate::store::{self, ObjectIdentity, Store};
 use crate::verify;
@@ -408,6 +408,43 @@ struct Pending {
     intent: String,
     effective_config_hash: String,
     progress: Progress,
+}
+
+/// Read legacy inline pages first, followed by complete append-only page records. Discard a
+/// torn final append before future writes, so a replacement page starts on a clean line.
+fn read_pending(path: &Path, pages_path: &Path) -> Result<(Option<Pending>, bool), String> {
+    let Some(mut pending) = read_json::<Pending>(path)? else {
+        return Ok((None, false));
+    };
+    let bytes = match fs::read(pages_path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(error) => return Err(format!("cannot read {}: {error}", pages_path.display())),
+    };
+    let complete = bytes
+        .iter()
+        .rposition(|byte| *byte == b'\n')
+        .map_or(0, |position| position + 1);
+    for (index, line) in bytes[..complete]
+        .split_inclusive(|byte| *byte == b'\n')
+        .enumerate()
+    {
+        pending
+            .progress
+            .pages
+            .push(serde_json::from_slice(line).map_err(|error| {
+                format!("{} line {}: {error}", pages_path.display(), index + 1)
+            })?);
+    }
+    let partial = complete != bytes.len();
+    if partial {
+        fs::OpenOptions::new()
+            .write(true)
+            .open(pages_path)
+            .and_then(|file| file.set_len(complete as u64))
+            .map_err(|error| format!("cannot truncate {}: {error}", pages_path.display()))?;
+    }
+    Ok((Some(pending), partial))
 }
 
 /// One finished invocation of one job.
@@ -1036,7 +1073,16 @@ fn update_job(
             )
         })?;
     let pending_path = state.join("progress.json");
-    let pending: Option<Pending> = read_json(&pending_path)?;
+    let pages_path = state.join("progress.pages.jsonl");
+    let (pending, partial) = read_pending(&pending_path, &pages_path)?;
+    if partial {
+        writeln!(
+            out,
+            "pipeline job {} progress log: 1 partial line ignored",
+            job.id
+        )
+        .map_err(|error| format!("cannot write the report: {error}"))?;
+    }
     let cutoff = match (&pending, end) {
         (Some(pending), Some(end)) if time(&pending.progress.cutoff)? != end => {
             return Err(format!(
@@ -1111,15 +1157,43 @@ fn update_job(
         .now_micros()
         .saturating_add(i64::from(history.max_elapsed_seconds.expect("bound")) * 1_000_000);
     let intent_name = intent.clone();
-    let mut persist = |progress: &Progress| -> Result<(), String> {
-        write_atomic(
-            &pending_path,
-            &json_bytes(&Pending {
-                intent: intent_name.clone(),
-                effective_config_hash: binding.clone(),
-                progress: progress.clone(),
-            })?,
-        )
+    let mut persist = |event: ProgressEvent<'_>| -> Result<(), String> {
+        match event {
+            ProgressEvent::Started(progress) => {
+                // A crash after removing a completed header can leave its old log behind.
+                File::create(&pages_path)
+                    .map_err(|error| format!("cannot create {}: {error}", pages_path.display()))?;
+                write_atomic(
+                    &pending_path,
+                    &json_bytes(&Pending {
+                        intent: intent_name.clone(),
+                        effective_config_hash: binding.clone(),
+                        progress: progress.clone(),
+                    })?,
+                )
+            }
+            ProgressEvent::Page(page) => {
+                let mut line = serde_json::to_vec(page).map_err(|error| error.to_string())?;
+                line.push(b'\n');
+                let mut file = fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&pages_path)
+                    .map_err(|error| format!("cannot open {}: {error}", pages_path.display()))?;
+                let written = file
+                    .write(&line)
+                    .map_err(|error| format!("cannot append {}: {error}", pages_path.display()))?;
+                if written != line.len() {
+                    return Err(format!(
+                        "short append to {}: {written} of {} bytes",
+                        pages_path.display(),
+                        line.len()
+                    ));
+                }
+                file.flush()
+                    .map_err(|error| format!("cannot flush {}: {error}", pages_path.display()))
+            }
+        }
     };
     let mut adapter = broker::connect(&config)?;
     let outcomes = {
@@ -1146,10 +1220,12 @@ fn update_job(
     };
     if !outcome.pending {
         // The intent closed: reaching its start or a terminal provider shortfall.
-        match fs::remove_file(&pending_path) {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(format!("cannot remove {}: {error}", pending_path.display())),
+        for path in [&pending_path, &pages_path] {
+            match fs::remove_file(path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(format!("cannot remove {}: {error}", path.display())),
+            }
         }
     }
     let (stream, catalog) = match &outcome.generation {
@@ -1310,7 +1386,7 @@ fn catalogs(
 
 /// `data pipeline pull`: the consumer's one step. Select the newest archived catalog of one
 /// instrument (latest coverage end, then generation), restore it unless both of its manifests
-/// are already in this configuration's managed store, and print their local locations.
+/// are already in this configuration's managed store, verify both, and print their locations.
 pub fn pull(
     config_path: &Path,
     broker: &str,
@@ -1329,6 +1405,13 @@ pub fn pull(
     };
     let local = layout.store();
     if local.head(&catalog.dataset.key)?.is_some() && local.head(&catalog.stream.key)?.is_some() {
+        let declaration = declaration(&config)?;
+        let access = Access {
+            declaration: declaration.as_ref(),
+            certification: None,
+        };
+        verify::run_with(&local.uri(&catalog.dataset.key), access)?;
+        verify::run_with(&local.uri(&catalog.stream.key), access)?;
         writeln!(
             out,
             "pulled {} {} dataset {} stream {} catalog {file_id} (already local)",

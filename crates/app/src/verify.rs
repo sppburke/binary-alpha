@@ -24,6 +24,7 @@ use binary_alpha_engine::stream::{
     InstrumentProfile, PROFILE_OBJECT_PATH, STREAM_MANIFEST_KIND, StreamManifest, StreamSummary,
 };
 use serde::Deserialize;
+use sha2::{Digest, Sha256};
 
 use crate::archive::{self, BarExpectation, DataSummary};
 use crate::store::{Hasher, Store, Tee};
@@ -275,6 +276,13 @@ fn verify_dataset(uri: &str, store: &Store, key: &str, bytes: &[u8]) -> Result<S
             manifest.generation
         ));
     }
+    // Inspect authenticated coverage and page slices before the whole-object digest check so
+    // damaged bundles identify the exact page. Every object still receives `fetch` below.
+    let history_report = if manifest.source_kind == SourceKind::BrokerHistory {
+        verify_history_bundles(store, &manifest)?
+    } else {
+        String::new()
+    };
     let mut summary = DataSummary::default();
     let mut bytes_verified = 0;
     for object in &manifest.objects {
@@ -306,13 +314,132 @@ fn verify_dataset(uri: &str, store: &Store, key: &str, bytes: &[u8]) -> Result<S
         ));
     }
     Ok(format!(
-        "verified {} {} generation {} rows {} objects {} bytes {bytes_verified}",
+        "verified {} {} generation {} rows {} objects {} bytes {bytes_verified}{history_report}",
         manifest.instrument,
         manifest.role,
         manifest.generation,
         manifest.row_count,
         manifest.objects.len()
     ))
+}
+
+/// Assert the recorded offsets as well as the lengths, then authenticate every page slice.
+pub(crate) fn verify_bundle_pages(
+    path: &str,
+    bytes: &[u8],
+    pages: &[&crate::fetch::PageCoverage],
+) -> Result<(), String> {
+    let mut end = 0_u64;
+    if pages.is_empty() {
+        return Err(format!(
+            "pages do not tile the bundle {path}: no page entries"
+        ));
+    }
+    for page in pages {
+        if page.offset != Some(end) {
+            return Err(format!(
+                "pages do not tile the bundle {path}: expected offset {end}, recorded {:?}",
+                page.offset
+            ));
+        }
+        end = end
+            .checked_add(page.bytes)
+            .ok_or_else(|| format!("pages do not tile the bundle {path}: length overflow"))?;
+    }
+    if end != bytes.len() as u64 {
+        return Err(format!(
+            "pages do not tile the bundle {path}: indexed {end} bytes, observed {}",
+            bytes.len()
+        ));
+    }
+    for (index, page) in pages.iter().enumerate() {
+        let start = page.offset.expect("checked offset") as usize;
+        let slice = &bytes[start..start + page.bytes as usize];
+        if binary_alpha_engine::hex(&Sha256::digest(slice)) != page.sha256 {
+            return Err(format!(
+                "page {} of {path} does not carry its recorded digest",
+                index + 1
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn verify_history_bundles(store: &Store, manifest: &GenerationManifest) -> Result<String, String> {
+    use crate::fetch::{BUNDLE_PATH, COVERAGE_PATH, HistoryCoverage};
+    let bundle_objects: Vec<_> = manifest
+        .objects
+        .iter()
+        .filter(|object| {
+            object.role == ObjectRole::Source
+                && (object.path == BUNDLE_PATH
+                    || (object.path.starts_with("raw/") && object.path.ends_with("/pages.bin")))
+        })
+        .collect();
+    let Some(record) = manifest
+        .objects
+        .iter()
+        .find(|object| object.path == COVERAGE_PATH)
+    else {
+        if bundle_objects.is_empty() {
+            return Ok(String::new()); // Legacy generations retain individual page objects.
+        }
+        return Err(format!("history bundles require {COVERAGE_PATH}"));
+    };
+    let (_, local) = fetch(store, record, true)?;
+    let coverage: HistoryCoverage = serde_json::from_slice(
+        &fs::read(&local.expect("decoded coverage").path).map_err(|error| error.to_string())?,
+    )
+    .map_err(|error| format!("{COVERAGE_PATH}: {error}"))?;
+    let current = bundle_objects
+        .iter()
+        .find(|object| object.path == BUNDLE_PATH);
+    match (&coverage.bundle, current) {
+        (Some(bundle), Some(object))
+            if bundle.sha256 == object.sha256 && bundle.bytes == object.bytes => {}
+        (None, None) => {}
+        _ => {
+            return Err(format!(
+                "{COVERAGE_PATH}: bundle identity does not match {BUNDLE_PATH}"
+            ));
+        }
+    }
+    for page in coverage.pages.iter().filter(|page| page.offset.is_some()) {
+        if !bundle_objects.iter().any(|object| object.path == page.path) {
+            return Err(format!(
+                "page index names missing source bundle {}",
+                page.path
+            ));
+        }
+    }
+    let mut page_count = 0;
+    for object in &bundle_objects {
+        let pages: Vec<_> = coverage
+            .pages
+            .iter()
+            .filter(|page| page.path == object.path)
+            .collect();
+        let mut bytes = Vec::new();
+        store.read_to(&object.key, object.generation, &mut bytes)?;
+        verify_bundle_pages(&object.path, &bytes, &pages)?;
+        if bytes.len() as u64 != object.bytes {
+            return Err(format!(
+                "pages do not tile the bundle {}: recorded {} bytes, observed {}",
+                object.path,
+                object.bytes,
+                bytes.len()
+            ));
+        }
+        page_count += pages.len();
+    }
+    if bundle_objects.is_empty() {
+        Ok(String::new())
+    } else {
+        Ok(format!(
+            " history bundles {} pages {page_count} verified",
+            bundle_objects.len()
+        ))
+    }
 }
 
 /// What every listed bar file of a published generation must satisfy when it is read back.

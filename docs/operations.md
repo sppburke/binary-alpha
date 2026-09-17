@@ -237,6 +237,11 @@ binary-alpha data pipeline update --config PIPELINE [--end END]
 `END` uses `YYYY-MM-DDTHH:MM:SS[.ffffff]Z`. With no pending acquisition, omission samples the
 current time for each job. Rerun the same command to resume interruption: pending intent preserves
 its cutoff, baseline, start, and retained pages even if a partial snapshot was archived.
+`pipeline_state/JOB/progress.json` is the header written once; `progress.pages.jsonl` beside it
+appends one flushed JSON line per retained page, and completion removes both files.
+Resume reads legacy inline pages first, then complete log lines; a missing log contributes no pages,
+and an interrupted trailing line is discarded with `progress log: 1 partial line ignored` so that
+page is fetched again from its prior cursor.
 A conflicting `--end` or effective core configuration fails with the pending intent identity.
 Page/time budgets may change on resume. Preserve `pipeline_state/` and the managed store; transfer sessions and pre-generated file identifiers reconcile interrupted uploads.
 After acquisition closes, a later update can select a new cutoff. Set `parallel_jobs` in the

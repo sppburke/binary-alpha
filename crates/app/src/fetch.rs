@@ -26,6 +26,7 @@ use std::path::Path;
 use std::time::Instant;
 
 pub const COVERAGE_PATH: &str = "provenance/coverage.json";
+pub const BUNDLE_PATH: &str = "raw/pages.bin";
 /// Object paths beneath which a seeded generation retains its seed's manifest and objects.
 const SEED_PREFIX: &str = "seed/";
 /// The acquisition outcome that leaves the intent pending for the next invocation.
@@ -60,6 +61,9 @@ pub struct PageCoverage {
     pub path: String,
     pub sha256: String,
     pub bytes: u64,
+    /// Byte offset within `path` when it names a bundle; absent for legacy page objects.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub offset: Option<u64>,
     pub anchor: Option<String>,
     pub rows: u64,
     pub first: Option<String>,
@@ -80,6 +84,13 @@ pub struct SeedLineage {
     pub generation: String,
     pub source_identity: String,
 }
+/// The identity of the current acquisition's raw page bundle.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ObjectIdentitySummary {
+    pub sha256: String,
+    pub bytes: u64,
+}
+
 /// Requested, directly observed, and verified coverage are separate immutable facts.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HistoryCoverage {
@@ -93,6 +104,9 @@ pub struct HistoryCoverage {
     pub actual: Option<Actual>,
     pub rows: u64,
     pub pages: Vec<PageCoverage>,
+    /// This acquisition's bundle; carried bundles are bound by their source object records.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bundle: Option<ObjectIdentitySummary>,
     pub shortfall: Option<Shortfall>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tail_shortfall: Option<Shortfall>,
@@ -124,6 +138,7 @@ pub struct Progress {
     pub baseline: Option<String>,
     pub start: String,
     pub cutoff: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub pages: Vec<PageCoverage>,
 }
 
@@ -135,8 +150,12 @@ pub enum Requested {
     Advance { cutoff: i64 },
 }
 
-/// Receives the intent before the first request and the progress after every retained page.
-pub type Persist<'a> = &'a mut dyn FnMut(&Progress) -> Result<(), String>;
+/// The header is emitted once; replayed pages never emit another page event.
+pub enum ProgressEvent<'a> {
+    Started(&'a Progress),
+    Page(&'a PageCoverage),
+}
+pub type Persist<'a> = &'a mut dyn FnMut(ProgressEvent<'_>) -> Result<(), String>;
 
 /// Per-invocation limits and durable progress of a pipeline acquisition.
 pub struct Bounds<'a> {
@@ -818,17 +837,38 @@ fn publish_retained(
     Ok(())
 }
 
-/// The retained raw page a coverage entry describes, as a source object.
-fn page_object(page: &PageCoverage) -> ObjectRecord {
-    ObjectRecord {
-        role: ObjectRole::Source,
-        path: page.path.clone(),
-        key: object_key(&page.sha256),
-        bytes: page.bytes,
-        sha256: page.sha256.clone(),
-        crc32c: None,
-        generation: None,
+/// Concatenate exactly this acquisition's retained pages, including replayed pages.
+fn bundle_pages(local: &Store, pages: &mut [PageCoverage]) -> Result<Option<ObjectRecord>, String> {
+    if pages.is_empty() {
+        return Ok(None);
     }
+    let mut bundle = Vec::new();
+    for page in pages {
+        let mut raw = Vec::new();
+        local.read_to(&object_key(&page.sha256), None, &mut raw)?;
+        let mut hasher = store::Hasher::default();
+        hasher.write_all(&raw).map_err(|error| error.to_string())?;
+        let identity = hasher.finish();
+        if identity.sha256 != page.sha256 || identity.bytes != page.bytes {
+            return Err(format!(
+                "retained page {} does not carry its recorded bytes and digest",
+                page.sha256
+            ));
+        }
+        page.path = BUNDLE_PATH.into();
+        page.offset = Some(bundle.len() as u64);
+        bundle.extend_from_slice(&raw);
+    }
+    let identity = import::retain_bytes(local, &bundle, "history-pages")?;
+    Ok(Some(import::record(
+        ObjectRole::Source,
+        BUNDLE_PATH,
+        &identity,
+    )))
+}
+
+fn carried_bundle_path(generation: &str) -> String {
+    format!("raw/{generation}/pages.bin")
 }
 
 /// The data objects of a generation in manifest order: its normalized object, or the listed
@@ -885,6 +925,12 @@ fn carried_objects(baseline: &Baseline, local: &Store) -> Result<Vec<ObjectRecor
             .iter()
             .filter(|object| object.role != ObjectRole::Normalized && object.path != COVERAGE_PATH)
             .cloned()
+            .map(|mut object| {
+                if object.path == BUNDLE_PATH {
+                    object.path = carried_bundle_path(&baseline.manifest.generation);
+                }
+                object
+            })
             .collect());
     }
     let mut carried = Vec::with_capacity(baseline.manifest.objects.len() + 1);
@@ -1065,6 +1111,18 @@ fn acquire_one<R: Row>(
         .and_then(|baseline| baseline.coverage.as_ref())
         .map(|coverage| coverage.pages.clone())
         .unwrap_or_default();
+    if let Some(baseline) = baseline.filter(|baseline| {
+        baseline
+            .coverage
+            .as_ref()
+            .is_some_and(|coverage| coverage.bundle.is_some())
+    }) {
+        for page in &mut pages {
+            if page.path == BUNDLE_PATH {
+                page.path = carried_bundle_path(&baseline.manifest.generation);
+            }
+        }
+    }
     let mut previous_rows: Vec<R> = Vec::new();
     if let Some(baseline) = baseline {
         let (retained, symbol_id) = baseline_rows::<R>(baseline, local, native.scale)?;
@@ -1086,7 +1144,7 @@ fn acquire_one<R: Row>(
     if bounds.resume.is_none()
         && let Some(persist) = bounds.persist.as_mut()
     {
-        persist(&progress)?;
+        persist(ProgressEvent::Started(&progress))?;
     }
     let mut receipts = Vec::new();
     let mut earliest = None;
@@ -1100,6 +1158,7 @@ fn acquire_one<R: Row>(
     let shortfall = loop {
         // A retained page of the pending intent replays from its bytes; then live requests
         // continue from the durable cursor within this invocation's budget.
+        let replayed = retained_pages.len() > 0;
         let (page_rows, symbol_id, coverage_page) = if let Some(retained) = retained_pages.next() {
             let key = object_key(&retained.sha256);
             let raw = fs::read(local.local_path(&key).expect("local mirror"))
@@ -1156,6 +1215,7 @@ fn acquire_one<R: Row>(
                 sha256: identity.sha256,
                 bytes: identity.bytes,
                 anchor: page.anchor_token,
+                offset: None,
                 rows: page_rows.len() as u64,
                 first: page_rows.first().map(|row| time_text(row.time())),
                 last: page_rows.last().map(|row| time_text(row.time())),
@@ -1194,23 +1254,10 @@ fn acquire_one<R: Row>(
             };
             received_end = Some(received_end.unwrap_or(i64::MIN).max(end));
         }
-        if !objects
-            .iter()
-            .any(|object| object.path == coverage_page.path)
-        {
-            objects.push(page_object(&coverage_page));
-            pages.push(coverage_page.clone());
+        if !replayed && let Some(persist) = bounds.persist.as_mut() {
+            persist(ProgressEvent::Page(&coverage_page))?;
         }
-        if !progress
-            .pages
-            .iter()
-            .any(|page| page.sha256 == coverage_page.sha256)
-        {
-            progress.pages.push(coverage_page);
-            if let Some(persist) = bounds.persist.as_mut() {
-                persist(&progress)?;
-            }
-        }
+        progress.pages.push(coverage_page);
         let Some(first) = first else {
             break Some(Shortfall {
                 reason: "empty_page".into(),
@@ -1272,6 +1319,7 @@ fn acquire_one<R: Row>(
                 actual: None,
                 rows: 0,
                 pages: Vec::new(),
+                bundle: None,
                 shortfall,
                 tail_shortfall: None,
                 native_granularity: native.granularity,
@@ -1349,6 +1397,7 @@ fn acquire_one<R: Row>(
         }),
         rows: rows.len() as u64,
         pages,
+        bundle: None,
         shortfall,
         tail_shortfall,
         native_granularity: native.granularity,
@@ -1385,6 +1434,16 @@ fn acquire_one<R: Row>(
             receipts,
         });
     }
+    if !rows.is_empty()
+        && let Some(bundle) = bundle_pages(local, &mut progress.pages)?
+    {
+        coverage.bundle = Some(ObjectIdentitySummary {
+            sha256: bundle.sha256.clone(),
+            bytes: bundle.bytes,
+        });
+        objects.push(bundle);
+    }
+    coverage.pages.extend(progress.pages);
     let coverage_bytes = json_bytes(&coverage)?;
     let coverage_identity = import::retain_bytes(local, &coverage_bytes, "history-coverage")?;
     objects.push(import::record(
@@ -1554,4 +1613,101 @@ pub(crate) fn json_bytes(value: &impl Serialize) -> Result<Vec<u8>, String> {
     let mut bytes = serde_json::to_vec_pretty(value).map_err(|error| error.to_string())?;
     bytes.push(b'\n');
     Ok(bytes)
+}
+
+#[cfg(test)]
+mod bundle_tests {
+    use super::*;
+
+    #[test]
+    fn bundle_tiles_three_distinct_pages_and_detects_corruption() {
+        let root = std::env::temp_dir().join(format!("binary-alpha-bundle-{}", std::process::id()));
+        let local = Store::filesystem(&root);
+        let raw: [&[u8]; 3] = [b"one", b"second", b"third page"];
+        let mut pages: Vec<_> = raw
+            .iter()
+            .map(|raw| {
+                let identity = import::retain_bytes(&local, raw, "history-page").unwrap();
+                PageCoverage {
+                    path: format!("raw/{}.json", identity.sha256),
+                    sha256: identity.sha256,
+                    bytes: identity.bytes,
+                    offset: None,
+                    anchor: None,
+                    rows: 1,
+                    first: None,
+                    last: None,
+                    receipt_time: None,
+                }
+            })
+            .collect();
+        let bundle = bundle_pages(&local, &mut pages).unwrap().unwrap();
+        let bytes = fs::read(local.local_path(&bundle.key).unwrap()).unwrap();
+        assert_eq!(bytes, raw.concat());
+        assert_eq!(bundle.path, BUNDLE_PATH);
+        assert_eq!(bundle.role, ObjectRole::Source);
+        assert_eq!(
+            pages.iter().map(|page| page.offset).collect::<Vec<_>>(),
+            [Some(0), Some(3), Some(9)]
+        );
+        verify::verify_bundle_pages(BUNDLE_PATH, &bytes, &pages.iter().collect::<Vec<_>>())
+            .unwrap();
+        for page in &pages {
+            assert!(
+                local
+                    .local_path(&object_key(&page.sha256))
+                    .unwrap()
+                    .is_file(),
+                "individual pages remain retained"
+            );
+        }
+        let mut corrupt = bytes.clone();
+        corrupt[4] ^= 1;
+        assert_eq!(
+            verify::verify_bundle_pages(BUNDLE_PATH, &corrupt, &pages.iter().collect::<Vec<_>>())
+                .unwrap_err(),
+            "page 2 of raw/pages.bin does not carry its recorded digest"
+        );
+        let mut bad_length = pages.clone();
+        bad_length[2].bytes += 1;
+        assert!(
+            verify::verify_bundle_pages(
+                BUNDLE_PATH,
+                &bytes,
+                &bad_length.iter().collect::<Vec<_>>()
+            )
+            .unwrap_err()
+            .contains("pages do not tile the bundle")
+        );
+        for offset in [Some(2), Some(4), None] {
+            let mut bad_offset = pages.clone();
+            bad_offset[1].offset = offset;
+            assert!(
+                verify::verify_bundle_pages(
+                    BUNDLE_PATH,
+                    &bytes,
+                    &bad_offset.iter().collect::<Vec<_>>()
+                )
+                .unwrap_err()
+                .contains("pages do not tile the bundle")
+            );
+        }
+        let mut overflow = pages.clone();
+        overflow[1].bytes = u64::MAX;
+        assert!(
+            verify::verify_bundle_pages(BUNDLE_PATH, &bytes, &overflow.iter().collect::<Vec<_>>())
+                .unwrap_err()
+                .contains("length overflow")
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn empty_acquisition_retains_no_bundle() {
+        let root =
+            std::env::temp_dir().join(format!("binary-alpha-empty-bundle-{}", std::process::id()));
+        let local = Store::filesystem(&root);
+        assert!(bundle_pages(&local, &mut []).unwrap().is_none());
+        assert!(!root.exists());
+    }
 }

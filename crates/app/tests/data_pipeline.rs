@@ -885,18 +885,31 @@ fn handle_http(
             let body = &entry.bytes[start.min(entry.bytes.len())..];
             if let Some(limit) = faults.drop_download_at
                 && entry.name.starts_with("object-")
+                && limit < body.len()
             {
+                // Empty markers and short objects cannot exercise a truncated download.
+                // Keep the fault armed until a response can carry the requested prefix.
                 state.faults.drop_download_at = None;
-                let partial = &body[..limit.min(body.len())];
+                let partial = &body[..limit];
                 let head = format!(
                     "HTTP/1.1 {} OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
                     if start > 0 { 206 } else { 200 },
                     body.len()
                 );
-                let _ = stream.write_all(head.as_bytes());
-                let _ = stream.write_all(partial);
-                let _ = stream.flush();
-                let _ = stream.shutdown(std::net::Shutdown::Both);
+                drop(state);
+                stream.write_all(head.as_bytes()).unwrap();
+                stream.write_all(partial).unwrap();
+                stream.flush().unwrap();
+                stream.shutdown(std::net::Shutdown::Write).unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                let mut buffer = [0; 1_024];
+                while let Ok(read) = stream.read(&mut buffer) {
+                    if read == 0 {
+                        break;
+                    }
+                }
                 return;
             }
             respond(&mut stream, if start > 0 { 206 } else { 200 }, &[], body);
@@ -1369,6 +1382,96 @@ fn read_json(path: &Path) -> Value {
     serde_json::from_slice(&fs::read(path).unwrap()).unwrap()
 }
 
+/// Read the old inline prefix followed by the append-only page log.
+fn read_progress(path: &Path) -> Value {
+    let mut pending = read_json(path);
+    let mut pages = pending["progress"]["pages"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    if let Ok(log) = fs::read_to_string(path.with_file_name("progress.pages.jsonl")) {
+        for line in log
+            .split_inclusive('\n')
+            .filter(|line| line.ends_with('\n'))
+        {
+            pages.push(serde_json::from_str(line).unwrap());
+        }
+    }
+    pending["progress"]["pages"] = json!(pages);
+    pending
+}
+
+/// Hand-build a manifest with independently authenticated coverage and object identities.
+fn indexed_fixture(
+    source: &Path,
+    root: &Path,
+    mut manifest: GenerationManifest,
+    coverage: &HistoryCoverage,
+) -> String {
+    use binary_alpha_engine::dataset::{PriceRepresentation, generation_id, object_key};
+    fs::create_dir_all(root.join("objects")).unwrap();
+    for object in &manifest.objects {
+        fs::copy(source.join(&object.key), root.join(&object.key)).unwrap();
+    }
+    let bytes = serde_json::to_vec(coverage).unwrap();
+    let record = manifest
+        .objects
+        .iter_mut()
+        .find(|object| object.path == "provenance/coverage.json")
+        .unwrap();
+    record.sha256 = binary_alpha_engine::hex(&Sha256::digest(&bytes));
+    record.bytes = bytes.len() as u64;
+    record.key = object_key(&record.sha256);
+    record.crc32c = None;
+    record.generation = None;
+    fs::write(root.join(&record.key), bytes).unwrap();
+    let scale = match manifest.price_representation {
+        PriceRepresentation::IntegerUnits { scale } => Some(scale),
+        _ => None,
+    };
+    manifest.generation = generation_id(
+        &binary_alpha_engine::market::InstrumentId {
+            broker: manifest.broker.clone(),
+            provider_symbol: manifest.provider_symbol.clone(),
+        },
+        manifest.source_kind,
+        manifest.role,
+        scale,
+        &manifest.objects,
+    );
+    GenerationManifest::from_json(&manifest.to_json()).unwrap();
+    let path = root.join(manifest.key());
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    fs::write(&path, manifest.to_json()).unwrap();
+    format!("file://{}", path.display())
+}
+
+fn assert_bundle(store: &Path, manifest: &GenerationManifest, expected_pages: usize) {
+    let source: Vec<_> = manifest
+        .objects
+        .iter()
+        .filter(|object| object.role == binary_alpha_engine::dataset::ObjectRole::Source)
+        .collect();
+    assert_eq!(
+        source.len(),
+        1,
+        "one source bundle, no per-page source objects"
+    );
+    assert_eq!(source[0].path, "raw/pages.bin");
+    let coverage = coverage(store, manifest);
+    let bundle = coverage.bundle.as_ref().unwrap();
+    assert_eq!(bundle.sha256, source[0].sha256);
+    assert_eq!(bundle.bytes, source[0].bytes);
+    assert_eq!(coverage.pages.len(), expected_pages);
+    let mut offset = 0;
+    for page in &coverage.pages {
+        assert_eq!(page.path, "raw/pages.bin");
+        assert_eq!(page.offset, Some(offset));
+        offset += page.bytes;
+    }
+    assert_eq!(offset, bundle.bytes);
+}
+
 /// Every `(close_time_micros, known_at_micros)` pair of one candle object.
 fn candle_clocks(store: &Path, stream: &StreamManifest) -> Vec<(i64, i64)> {
     use parquet::file::reader::{FileReader, SerializedFileReader};
@@ -1490,6 +1593,14 @@ fn pipeline_roundtrip() {
         );
     }
     let pocket_manifest = dataset(&store, &pocket_first);
+    assert_bundle(&store, &pocket_manifest, 3);
+    let pocket_closure_objects =
+        pocket_manifest.objects.len() + stream(&store, &pocket_stream).objects.len();
+    assert_eq!(
+        f.drive.files().len(),
+        pocket_closure_objects + 2 + 1,
+        "Drive files = dataset objects + stream objects + two ready manifests + one catalog"
+    );
     assert!(pocket_manifest.objects.len() > 3);
     assert!(
         pocket_manifest
@@ -1536,6 +1647,7 @@ fn pipeline_roundtrip() {
         ),
     )
     .unwrap();
+    let deriv_requests_before = f.deriv.requests().len();
     let second = pipeline(
         "update",
         &deriv_only,
@@ -1552,6 +1664,20 @@ fn pipeline_roundtrip() {
     );
     let deriv_first = field(deriv_line, "dataset").to_string();
     let deriv_stream = field(deriv_line, "stream").to_string();
+    let deriv_manifest = dataset(&store, &deriv_first);
+    assert_bundle(
+        &store,
+        &deriv_manifest,
+        f.deriv.requests().len() - deriv_requests_before,
+    );
+    assert_eq!(
+        f.drive.files().len(),
+        pocket_closure_objects
+            + deriv_manifest.objects.len()
+            + stream(&store, &deriv_stream).objects.len()
+            + 2 * (2 + 1),
+        "Drive files = both closures' manifest objects + two ready manifests and one catalog per broker"
+    );
     // The seed's last tick lies two seconds before its end; the acquisition starts one overlap
     // before that frontier.
     let deriv_fetch_start = DERIV_SEED_END - 2 - 60;
@@ -1672,6 +1798,11 @@ fn pipeline_roundtrip() {
     )
     .unwrap();
     let dataset_uri = field(&restored, "dataset").to_string();
+    let verified = run(&["data", "verify", "--manifest", &dataset_uri]).unwrap();
+    assert!(
+        verified.contains("history bundles 1 pages 3 verified"),
+        "{verified}"
+    );
     assert!(
         (2..=3).contains(&f.drive.activity.downloads.high_water.load(Ordering::SeqCst)),
         "closure object downloads must overlap within the three-worker limit"
@@ -1826,8 +1957,292 @@ outputs = ["candle_direction", "range_bps"]
 // Gate 3
 // ----------------------------------------------------------------------------------------------
 
+fn append_log_recovery() {
+    let f = fixture("pipeline_append_log_recovery");
+    let producer = f.scratch.path("producer");
+    let store = producer.join("store");
+    let state = producer.join("pipeline_state/pocket");
+    let header = state.join("progress.json");
+    let log = state.join("progress.pages.jsonl");
+    fs::write(
+        f.scratch.path("pocket.toml"),
+        pocket_core(&f.pocket.url, "demo", BAR_GRANULARITY, 60, 1, 60),
+    )
+    .unwrap();
+    let config = f.scratch.path("pocket-only.toml");
+    fs::write(
+        &config,
+        pipeline_toml(
+            &producer,
+            &f.drive.base,
+            &[("pocket", "pocket.toml")],
+            None,
+            3,
+        ),
+    )
+    .unwrap();
+    import(&f.scratch.path("pocket-import.toml")).unwrap();
+    let cutoff = POCKET_SEED_END + 362;
+    let end = time_text(cutoff * 1_000_000);
+    fs::create_dir_all(&state).unwrap();
+    fs::write(&log, b"orphan from a completed intent\n").unwrap();
+    pipeline("update", &config, &["--end", &end]).unwrap_err();
+    let original_header = fs::read(&header).unwrap();
+    let first_line = fs::read(&log).unwrap();
+    assert_eq!(first_line.iter().filter(|byte| **byte == b'\n').count(), 1);
+
+    // A header without a log is a valid zero-page pending intent, even though a partial
+    // snapshot already exists. Refetch against its pinned seed, not that partial snapshot.
+    fs::remove_file(&log).unwrap();
+    let before = f.pocket.requests().len();
+    pipeline("update", &config, &["--end", &end]).unwrap_err();
+    let request: Value = serde_json::from_str(&f.pocket.requests()[before]).unwrap();
+    assert_eq!(request["time"].as_i64().unwrap() - POCKET_OFFSET_S, cutoff);
+    assert_eq!(fs::read(&header).unwrap(), original_header);
+    let first_line = fs::read(&log).unwrap();
+    pipeline("update", &config, &["--end", &end]).unwrap_err();
+    let two_lines = fs::read(&log).unwrap();
+    assert!(two_lines.starts_with(&first_line));
+    assert_eq!(two_lines.iter().filter(|byte| **byte == b'\n').count(), 2);
+    assert_eq!(fs::read(&header).unwrap(), original_header);
+    let second_page: Value = serde_json::from_slice(&two_lines[first_line.len()..]).unwrap();
+    let second_digest = second_page["sha256"].as_str().unwrap();
+    assert!(store.join(format!("objects/{second_digest}")).exists());
+
+    // Simulate process death halfway through appending page two, after retaining its bytes.
+    fs::write(
+        &log,
+        &two_lines[..first_line.len() + (two_lines.len() - first_line.len()) / 2],
+    )
+    .unwrap();
+    let before = f.pocket.requests().len();
+    let resumed = pipeline("update", &config, &["--end", &end]).unwrap_err();
+    assert!(
+        resumed.contains("progress log: 1 partial line ignored"),
+        "{resumed}"
+    );
+    let request: Value = serde_json::from_str(&f.pocket.requests()[before]).unwrap();
+    assert_eq!(
+        request["time"].as_i64().unwrap() - POCKET_OFFSET_S,
+        cutoff - 197,
+        "page with interrupted append is fetched again"
+    );
+    assert_eq!(fs::read(&header).unwrap(), original_header);
+    let log_bytes = fs::read(&log).unwrap();
+    assert!(log_bytes.starts_with(&first_line));
+    assert_eq!(log_bytes.iter().filter(|byte| **byte == b'\n').count(), 2);
+
+    // Only an incomplete final line is ignorable; a complete malformed record refuses resume.
+    let before = f.pocket.requests().len();
+    let mut malformed = log_bytes.clone();
+    malformed.extend_from_slice(b"{broken}\n");
+    fs::write(&log, &malformed).unwrap();
+    let refused = pipeline("update", &config, &["--end", &end]).unwrap_err();
+    assert!(refused.contains("progress.pages.jsonl line 3"), "{refused}");
+    assert_eq!(f.pocket.requests().len(), before);
+    assert_eq!(fs::read(&header).unwrap(), original_header);
+    assert_eq!(fs::read(&log).unwrap(), malformed);
+    fs::write(&log, &log_bytes).unwrap();
+
+    // Migrate an old inline prefix while retaining a newer appended page after it.
+    let mut legacy = read_json(&header);
+    legacy["progress"]["pages"] = json!([serde_json::from_slice::<Value>(&first_line).unwrap()]);
+    fs::write(&header, serde_json::to_vec(&legacy).unwrap()).unwrap();
+    fs::write(&log, &log_bytes[first_line.len()..]).unwrap();
+    let done = pipeline("update", &config, &["--end", &end]).unwrap();
+    assert!(!done.contains("partial line ignored"), "{done}");
+    assert!(!header.exists() && !log.exists());
+    let generation = field(job_line(&done, "pocket"), "dataset");
+    let manifest = dataset(&store, generation);
+    assert_bundle(&store, &manifest, 3);
+    let coverage = coverage(&store, &manifest);
+    let anchors: Vec<_> = coverage
+        .pages
+        .iter()
+        .map(|page| page.anchor.as_ref().unwrap().parse::<i64>().unwrap() - POCKET_OFFSET_S)
+        .collect();
+    assert_eq!(anchors, [cutoff, cutoff - 197, cutoff - 392]);
+    assert!(
+        verify::run(&format!("file://{}", store.join(manifest.key()).display()))
+            .unwrap()
+            .contains("history bundles 1 pages 3 verified")
+    );
+    assert_eq!(
+        bars(&store, &manifest),
+        expected_bars(POCKET_SEED_END, POCKET_SEED_END - 60, cutoff)
+    );
+}
+
+/// A malformed archived index passes transport checks, but neither restore nor a later pull
+/// may report success merely because both ready manifests have already been installed.
+fn failed_restore_pull(f: &Fixture, catalog_id: &str) {
+    use binary_alpha_engine::dataset::{
+        ObjectRecord, PriceRepresentation, generation_id, object_key,
+    };
+    use binary_alpha_engine::stream::{PROFILE_OBJECT_PATH, stream_generation_id};
+
+    let files = f.drive.files();
+    let mut catalog = Catalog::from_json(&files[catalog_id].bytes).unwrap();
+    let mut dataset =
+        GenerationManifest::from_json(&files[&catalog.dataset.file_id].bytes).unwrap();
+    let mut stream = StreamManifest::from_json(&files[&catalog.stream.file_id].bytes).unwrap();
+    let object_bytes = |record: &ObjectRecord| {
+        let entry = catalog
+            .objects
+            .iter()
+            .find(|entry| entry.key == record.key)
+            .unwrap();
+        files[&entry.file_id].bytes.clone()
+    };
+    let index_record = dataset
+        .objects
+        .iter_mut()
+        .find(|object| object.path == "provenance/coverage.json")
+        .unwrap();
+    let mut index: HistoryCoverage = serde_json::from_slice(&object_bytes(index_record)).unwrap();
+    let profile_record = stream
+        .objects
+        .iter_mut()
+        .find(|object| object.path == PROFILE_OBJECT_PATH)
+        .unwrap();
+    let mut profile: Value = serde_json::from_slice(&object_bytes(profile_record)).unwrap();
+    let page = index
+        .pages
+        .iter_mut()
+        .filter(|page| page.path == "raw/pages.bin")
+        .nth(1)
+        .unwrap();
+    let expected_offset = page.offset.unwrap();
+    page.offset = Some(expected_offset + 1);
+    let expected = format!(
+        "pages do not tile the bundle raw/pages.bin: expected offset {expected_offset}, recorded Some({})",
+        expected_offset + 1
+    );
+
+    // Rebind the coverage, dataset, stream profile, stream, and catalog identities so the
+    // sole defect is the second page's offset. The archived bundle bytes stay untouched.
+    let mut state = f.drive.state.lock().unwrap();
+    let mut replace_object = |record: &mut ObjectRecord, bytes: Vec<u8>| {
+        let entry = catalog
+            .objects
+            .iter_mut()
+            .find(|entry| entry.key == record.key)
+            .unwrap();
+        record.sha256 = binary_alpha_engine::hex(&Sha256::digest(&bytes));
+        record.bytes = bytes.len() as u64;
+        record.key = object_key(&record.sha256);
+        record.crc32c = None;
+        record.generation = None;
+        entry.key = record.key.clone();
+        entry.sha256 = record.sha256.clone();
+        entry.bytes = record.bytes;
+        let remote = state.files.get_mut(&entry.file_id).unwrap();
+        remote.name = format!("object-{}", record.sha256);
+        remote.bytes = bytes;
+    };
+    replace_object(index_record, serde_json::to_vec(&index).unwrap());
+    let scale = match dataset.price_representation {
+        PriceRepresentation::IntegerUnits { scale } => Some(scale),
+        _ => None,
+    };
+    dataset.generation = generation_id(
+        &binary_alpha_engine::market::InstrumentId {
+            broker: dataset.broker.clone(),
+            provider_symbol: dataset.provider_symbol.clone(),
+        },
+        dataset.source_kind,
+        dataset.role,
+        scale,
+        &dataset.objects,
+    );
+    profile["source"]["generation"] = json!(dataset.generation);
+    replace_object(profile_record, serde_json::to_vec(&profile).unwrap());
+    stream.source_generation = dataset.generation.clone();
+    stream.generation = stream_generation_id(
+        &stream.source_generation,
+        &stream.definition.canonical_toml(),
+    );
+    GenerationManifest::from_json(&dataset.to_json()).unwrap();
+    StreamManifest::from_json(&stream.to_json()).unwrap();
+    for (entry, generation, key, bytes) in [
+        (
+            &mut catalog.dataset,
+            &dataset.generation,
+            dataset.key(),
+            dataset.to_json(),
+        ),
+        (
+            &mut catalog.stream,
+            &stream.generation,
+            stream.key(),
+            stream.to_json(),
+        ),
+    ] {
+        entry.generation = generation.clone();
+        entry.key = key;
+        entry.sha256 = binary_alpha_engine::hex(&Sha256::digest(&bytes));
+        entry.bytes = bytes.len() as u64;
+        state.files.get_mut(&entry.file_id).unwrap().bytes = bytes;
+    }
+    let bytes = serde_json::to_vec(&catalog).unwrap();
+    Catalog::from_json(&bytes).unwrap();
+    let sha = binary_alpha_engine::hex(&Sha256::digest(&bytes));
+    state.files.get_mut(catalog_id).unwrap().bytes = bytes;
+    drop(state);
+
+    let consumer_root = f.scratch.path("bad-index-consumer");
+    let consumer = f.scratch.path("bad-index-consumer.toml");
+    fs::write(
+        &consumer,
+        pipeline_toml(&consumer_root, &f.drive.base, &[], None, 3),
+    )
+    .unwrap();
+    let refused = pipeline(
+        "restore",
+        &consumer,
+        &[
+            "--catalog",
+            catalog_id,
+            "--sha256",
+            &sha,
+            "--broker",
+            "pocket_option",
+            "--symbol",
+            "AEDCNY_otc",
+        ],
+    )
+    .unwrap_err();
+    assert!(refused.contains(&expected), "{refused}");
+    let store = consumer_root.join("store");
+    assert!(store.join(&catalog.dataset.key).is_file());
+    assert!(store.join(&catalog.stream.key).is_file());
+    let bundled = dataset
+        .objects
+        .iter()
+        .find(|object| object.path == "raw/pages.bin")
+        .unwrap();
+    let bundle_entry = catalog
+        .objects
+        .iter()
+        .find(|entry| entry.key == bundled.key)
+        .unwrap();
+    assert_eq!(
+        fs::read(store.join(&bundled.key)).unwrap(),
+        files[&bundle_entry.file_id].bytes
+    );
+    let pulled = pipeline(
+        "pull",
+        &consumer,
+        &["--broker", "pocket_option", "--symbol", "AEDCNY_otc"],
+    )
+    .unwrap_err();
+    assert_eq!(pulled, refused);
+    assert!(!pulled.contains("already local"), "{pulled}");
+}
+
 #[test]
 fn pipeline_recovery() {
+    append_log_recovery();
     let f = fixture("pipeline_recovery");
     let store = f.scratch.path("producer/store");
     let state = f.scratch.path("producer/pipeline_state");
@@ -1954,6 +2369,9 @@ fn pipeline_recovery() {
     let mut statuses = Vec::new();
     let mut generations = Vec::new();
     let mut resumed_anchor = cutoff;
+    let pending_path = state.join("pocket/progress.json");
+    let pages_path = state.join("pocket/progress.pages.jsonl");
+    let mut header_bytes = None;
     for n in 0..3 {
         let requests_before = f.pocket.requests().len();
         let result = pipeline("update", &pocket_only, &["--end", &end]);
@@ -1973,11 +2391,23 @@ fn pipeline_recovery() {
                 let line = job_line(&report, "pocket");
                 statuses.push(field(line, "status").to_string());
                 generations.push(field(line, "dataset").to_string());
-                let pending = read_json(&state.join("pocket/progress.json"));
+                let pending = read_progress(&state.join("pocket/progress.json"));
                 assert_eq!(pending["progress"]["cutoff"], json!(end));
                 assert_eq!(pending["progress"]["baseline"], json!(baseline));
                 let pages = pending["progress"]["pages"].as_array().unwrap();
                 assert_eq!(pages.len(), n + 1);
+                assert_eq!(
+                    fs::read_to_string(&pages_path).unwrap().lines().count(),
+                    n + 1,
+                    "exactly one appended line per new retained page; replay adds none"
+                );
+                let header = fs::read(&pending_path).unwrap();
+                assert!(read_json(&pending_path)["progress"].get("pages").is_none());
+                if let Some(before) = &header_bytes {
+                    assert_eq!(&header, before, "progress.json is written only once");
+                } else {
+                    header_bytes = Some(header);
+                }
                 assert_eq!(pages[n]["rows"], 40);
                 assert_eq!(
                     pages[n]["last"],
@@ -1994,7 +2424,25 @@ fn pipeline_recovery() {
     }
     assert_eq!(statuses, ["pending", "pending", "archived"]);
     assert!(!state.join("pocket/progress.json").exists());
+    assert!(!pages_path.exists());
     let final_generation = generations.last().unwrap();
+    let final_coverage = coverage(&store, &dataset(&store, final_generation));
+    let acquired: Vec<_> = final_coverage
+        .pages
+        .iter()
+        .filter(|page| page.path == "raw/pages.bin")
+        .collect();
+    assert_eq!(acquired.len(), 3);
+    let mut offset = 0;
+    for (page, anchor) in acquired.iter().zip([cutoff, cutoff - 197, cutoff - 392]) {
+        assert_eq!(
+            page.anchor.as_ref().unwrap().parse::<i64>().unwrap() - POCKET_OFFSET_S,
+            anchor
+        );
+        assert_eq!(page.offset, Some(offset));
+        offset += page.bytes;
+    }
+    assert_eq!(offset, final_coverage.bundle.unwrap().bytes);
     assert_eq!(
         bars(&store, &dataset(&store, final_generation)),
         expected_bars(POCKET_SEED_END, POCKET_SEED_END - 60, cutoff)
@@ -2103,7 +2551,8 @@ fn pipeline_recovery() {
         f.drive.log()[log_before..]
             .iter()
             .any(|line| line.starts_with("GET /drive/v3/files/") && line.contains("bytes=1-")),
-        "checksum readback resumes after the streamed prefix without hashing it twice"
+        "checksum readback resumes after the streamed prefix without hashing it twice: {:?}",
+        &f.drive.log()[log_before..]
     );
     f.drive.set(DriveFaults::default());
 
@@ -2176,7 +2625,7 @@ fn pipeline_recovery() {
     });
     let dropped = pipeline("update", &pocket_only, &["--end", &end_3]).unwrap_err();
     assert!(dropped.contains("pipeline job pocket failed"), "{dropped}");
-    let pending = read_json(&state.join("pocket/progress.json"));
+    let pending = read_progress(&state.join("pocket/progress.json"));
     let retained = pending["progress"]["pages"].as_array().unwrap().clone();
     assert_eq!(retained.len(), 1, "{dropped}\n{pending}");
     assert!(retained[0]["receipt_time"].is_string(), "{pending}");
@@ -2264,7 +2713,7 @@ fn pipeline_recovery() {
     );
     let consumer = f.scratch.path("consumer.toml");
     let consumer_root = f.scratch.path("consumer");
-    // Keep the interruption on the first object so the retained partial is deterministic.
+    // One transfer worker makes the interrupted object and retained partial deterministic.
     fs::write(
         &consumer,
         pipeline_toml(&consumer_root, &f.drive.base, &[], None, 1)
@@ -2341,6 +2790,73 @@ fn pipeline_recovery() {
         restored.starts_with("restored pocket_option:AEDCNY_otc development"),
         "{restored}"
     );
+    // Flip a byte in the archived current bundle. Transport identity checking refuses a
+    // fresh restore; then dataset verification diagnoses the exact page in those downloaded
+    // bytes using an otherwise intact restored closure (without changing any recorded digest).
+    let archived = dataset(&store, &generation_2);
+    let bundled = archived
+        .objects
+        .iter()
+        .find(|object| object.path == "raw/pages.bin")
+        .unwrap();
+    let index = coverage(&store, &archived);
+    let second_page = index
+        .pages
+        .iter()
+        .filter(|page| page.path == "raw/pages.bin")
+        .nth(1)
+        .unwrap();
+    let bundle_id = f
+        .drive
+        .files()
+        .iter()
+        .find(|(_, entry)| entry.name == format!("object-{}", bundled.sha256))
+        .map(|(id, _)| id.clone())
+        .unwrap();
+    let original_bundle = f.drive.files()[&bundle_id].bytes.clone();
+    let mut corrupt_bundle = original_bundle.clone();
+    corrupt_bundle[second_page.offset.unwrap() as usize] ^= 1;
+    f.drive
+        .state
+        .lock()
+        .unwrap()
+        .files
+        .get_mut(&bundle_id)
+        .unwrap()
+        .bytes = corrupt_bundle.clone();
+    let damaged_root = f.scratch.path("damaged-consumer");
+    let damaged_config = f.scratch.path("damaged-consumer.toml");
+    fs::write(
+        &damaged_config,
+        pipeline_toml(&damaged_root, &f.drive.base, &[], None, 1),
+    )
+    .unwrap();
+    let refused = pipeline("restore", &damaged_config, &restore_args).unwrap_err();
+    assert!(refused.contains("bytes carry SHA-256"), "{refused}");
+    assert!(!damaged_root.join("store/manifests").exists());
+    let downloaded = fs::read(damaged_root.join(format!(
+        "pipeline_state/downloads/{}.partial",
+        bundled.sha256
+    )))
+    .unwrap();
+    assert_eq!(downloaded, corrupt_bundle);
+    let restored_bundle = consumer_root.join("store").join(&bundled.key);
+    fs::write(&restored_bundle, downloaded).unwrap();
+    let refused = verify::run(field(&restored, "dataset")).unwrap_err();
+    assert_eq!(
+        refused,
+        "page 2 of raw/pages.bin does not carry its recorded digest"
+    );
+    fs::write(&restored_bundle, &original_bundle).unwrap();
+    f.drive
+        .state
+        .lock()
+        .unwrap()
+        .files
+        .get_mut(&bundle_id)
+        .unwrap()
+        .bytes = original_bundle;
+
     let object_ids: Vec<String> = f
         .drive
         .files()
@@ -2372,7 +2888,7 @@ fn pipeline_recovery() {
 
     // A pending intent whose retained pages were validated resumes at its pinned cutoff once the
     // provider's data is consistent again; the conflicting page was never checkpointed.
-    let pending = read_json(&state.join("pocket/progress.json"));
+    let pending = read_progress(&state.join("pocket/progress.json"));
     assert_eq!(
         pending["progress"]["cutoff"],
         json!(end_conflict),
@@ -2412,6 +2928,7 @@ fn pipeline_recovery() {
         ),
         expected_bars(POCKET_SEED_END, POCKET_SEED_END - 60, cutoff_2 + 300)
     );
+    failed_restore_pull(&f, field(job_line(&resumed, "pocket"), "catalog"));
 }
 
 // ----------------------------------------------------------------------------------------------
@@ -2691,7 +3208,7 @@ fn pipeline_scope() {
         !producer
             .join("pipeline_state/pocket/progress.json")
             .exists()
-            || read_json(&producer.join("pipeline_state/pocket/progress.json"))["progress"]["pages"]
+            || read_progress(&producer.join("pipeline_state/pocket/progress.json"))["progress"]["pages"]
                 == json!([])
     );
     f.pocket.set(BrokerFaults::default());
@@ -2731,6 +3248,70 @@ fn pipeline_scope() {
     ));
     let done = pipeline("update", &pocket_only, &["--end", &end]).unwrap();
     let generation = field(job_line(&done, "pocket"), "dataset").to_string();
+
+    // A valid outer manifest/object identity does not excuse an invalid bundle index.
+    let original_manifest = dataset(&producer.join("store"), &generation);
+    let mut bad_coverage = coverage(&producer.join("store"), &original_manifest);
+    bad_coverage.pages.last_mut().unwrap().bytes += 1;
+    let bad_root = f.scratch.path("bad-index");
+    let bad_uri = indexed_fixture(
+        &producer.join("store"),
+        &bad_root,
+        original_manifest.clone(),
+        &bad_coverage,
+    );
+    let refused = verify::run(&bad_uri).unwrap_err();
+    assert!(
+        refused.contains("pages do not tile the bundle raw/pages.bin"),
+        "{refused}"
+    );
+
+    // A pre-bundle manifest still verifies from its individual source page objects. None
+    // fields serialize absent, exactly as in records written by the previous binary.
+    let mut legacy_manifest = original_manifest.clone();
+    let mut legacy_coverage = coverage(&producer.join("store"), &legacy_manifest);
+    legacy_manifest
+        .objects
+        .retain(|object| object.path != "raw/pages.bin");
+    legacy_coverage.bundle = None;
+    for page in &mut legacy_coverage.pages {
+        page.offset = None;
+        page.path = format!("raw/{}.json", page.sha256);
+        legacy_manifest
+            .objects
+            .push(binary_alpha_engine::dataset::ObjectRecord {
+                role: binary_alpha_engine::dataset::ObjectRole::Source,
+                path: page.path.clone(),
+                key: binary_alpha_engine::dataset::object_key(&page.sha256),
+                bytes: page.bytes,
+                sha256: page.sha256.clone(),
+                crc32c: None,
+                generation: None,
+            });
+    }
+    let legacy_uri = indexed_fixture(
+        &producer.join("store"),
+        &f.scratch.path("legacy-pages"),
+        legacy_manifest,
+        &legacy_coverage,
+    );
+    let verified = verify::run(&legacy_uri).unwrap();
+    assert!(!verified.contains("history bundles"), "{verified}");
+
+    // Deleting every page entry cannot downgrade a bundle to opaque legacy source evidence.
+    let mut missing_index = coverage(&producer.join("store"), &original_manifest);
+    missing_index.pages.clear();
+    let missing_uri = indexed_fixture(
+        &producer.join("store"),
+        &f.scratch.path("missing-index"),
+        original_manifest,
+        &missing_index,
+    );
+    assert!(
+        verify::run(&missing_uri)
+            .unwrap_err()
+            .contains("no page entries")
+    );
 
     // Catalog pins: wrong hash, protected role, and targets outside the closure are refused
     // before anything is fetched or installed.
@@ -3210,7 +3791,7 @@ fn pipeline_schedule() {
         time_text(cutoff * 1_000_000)
     );
     let pending_path = producer.join("pipeline_state/pocket/progress.json");
-    let pending = read_json(&pending_path);
+    let pending = read_progress(&pending_path);
     assert_eq!(pending["progress"]["pages"].as_array().unwrap().len(), 1);
     assert_eq!(pending["progress"]["pages"][0]["rows"], 40);
     assert_eq!(
@@ -3227,7 +3808,7 @@ fn pipeline_schedule() {
         "{resumed}"
     );
     assert_eq!(field(job_line(&resumed, "pocket"), "status"), "pending");
-    let pending = read_json(&pending_path);
+    let pending = read_progress(&pending_path);
     let pages = pending["progress"]["pages"].as_array().unwrap();
     assert_eq!(pages.len(), 2);
     assert_eq!(pages[1]["rows"], 40);
