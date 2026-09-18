@@ -2834,33 +2834,44 @@ struct Event {
 
 /// Record-separator framing lets a torn final append remain untouched. A subsequent complete
 /// frame resumes the same operation; all durable frames must still form begin/done pairs.
-fn progress(path: &Path, digest: &str) -> Result<(usize, bool), String> {
+/// Replays the journal: `index` is the first operation without `done`; `begun` holds every
+/// later operation authorized by a `begin` that has no `done` yet. A Drive batch begins all
+/// of its operations before dispatching them, so several may be begun at once; local
+/// operations and older journals begin one at a time.
+fn progress(path: &Path, digest: &str) -> Result<(usize, BTreeSet<usize>), String> {
     let bytes = match fs::read(path) {
         Ok(b) => b,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok((0, false)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok((0, BTreeSet::new())),
         Err(e) => return Err(e.to_string()),
     };
     let mut index = 0;
-    let mut active = false;
+    let mut begun = BTreeSet::new();
     for frame in bytes.split(|b| *b == 0x1e).filter(|b| !b.is_empty()) {
         if !frame.ends_with(b"\n") {
             continue;
         }
         let event: Event =
             serde_json::from_slice(frame).map_err(|e| format!("retire: invalid progress: {e}"))?;
-        if event.plan != digest || event.index != index {
+        if event.plan != digest {
             return Err("retire: progress identity/order mismatch".into());
         }
-        match (event.phase.as_str(), active) {
-            ("begin", false) => active = true,
-            ("done", true) => {
-                active = false;
-                index += 1;
+        let ok = match event.phase.as_str() {
+            "begin" => {
+                event.index >= index && event.index < index + BATCH && begun.insert(event.index)
             }
-            _ => return Err("retire: progress phase mismatch".into()),
+            "done" => {
+                event.index == index && begun.remove(&event.index) && {
+                    index += 1;
+                    true
+                }
+            }
+            _ => false,
+        };
+        if !ok {
+            return Err("retire: progress phase mismatch".into());
         }
     }
-    Ok((index, active))
+    Ok((index, begun))
 }
 fn append(path: &Path, digest: &str, index: usize, phase: &str) -> Result<(), String> {
     let mut file = OpenOptions::new()
@@ -2916,12 +2927,12 @@ fn apply_plan(
         return Err("retire: plan scope mismatch".into());
     }
     let log = sealed.with_extension("progress.jsonseq");
-    let (mut index, mut active) = progress(&log, &digest)?;
+    let (mut index, mut begun) = progress(&log, &digest)?;
     let count = plan.delete_drive.len() + plan.delete_local.len();
     if touches_retained(&plan, 0, count) {
         return Err("retire: deletion inventory overlaps a retained closure".into());
     }
-    if index > count || (index == count && active) {
+    if index > count || begun.last().is_some_and(|last| *last >= count) {
         return Err("retire: invalid progress length".into());
     }
     // Only a write-ahead authorized item may be absent on resumption. Every other state byte
@@ -2930,7 +2941,7 @@ fn apply_plan(
     let mut actual = state(config_path, config, layout)?;
     for (i, item) in plan.delete_local.iter().enumerate() {
         let op = plan.delete_drive.len() + i;
-        if op < index || (op == index && active) {
+        if op < index || begun.contains(&op) {
             for key in item.files.keys() {
                 let p = plan.store.join(key).to_string_lossy().into_owned();
                 if op < index || !actual.contains_key(&p) {
@@ -2944,10 +2955,12 @@ fn apply_plan(
             "retire: stale plan: manifest, configuration, record, or registry changed".into(),
         );
     }
+    // Only a begun deletion may already be absent: a Drive batch begins every operation
+    // before dispatching them, and `delete_named` treats a missing file as deleted on resume.
     let mut expected_remote = plan.remote_state.clone();
     let actual_remote = remote_state(drive)?;
     for (i, item) in plan.delete_drive.iter().enumerate() {
-        if i < index || (i == index && active && !actual_remote.contains_key(&item.file_id)) {
+        if i < index || (begun.contains(&i) && !actual_remote.contains_key(&item.file_id)) {
             expected_remote.remove(&item.file_id);
         }
     }
@@ -2959,7 +2972,7 @@ fn apply_plan(
         let op = plan.delete_drive.len() + i;
         for (key, identity) in &item.files {
             let p = plan.store.join(key);
-            if !p.exists() && (op < index || (op == index && active)) {
+            if !p.exists() && (op < index || begun.contains(&op)) {
                 continue;
             }
             if op < index || Identity::of(&p)? != *identity {
@@ -2989,14 +3002,26 @@ fn apply_plan(
             } else {
                 count
             });
+        if index < plan.delete_drive.len() {
+            for i in index..end {
+                if begun.insert(i) {
+                    append(&log, &digest, i, "begin")?;
+                }
+            }
+            data_pipeline::run_pool(config, &plan.delete_drive[index..end], |item, drive| {
+                drive.delete_named(&item.file_id, &item.name, &item.identity.remote())
+            })?;
+            while index < end {
+                append(&log, &digest, index, "done")?;
+                begun.remove(&index);
+                index += 1;
+            }
+        }
         while index < end {
-            if !active {
+            if begun.insert(index) {
                 append(&log, &digest, index, "begin")?;
             }
-            if index < plan.delete_drive.len() {
-                let item = &plan.delete_drive[index];
-                drive.delete_named(&item.file_id, &item.name, &item.identity.remote())?;
-            } else {
+            {
                 let item = &plan.delete_local[index - plan.delete_drive.len()];
                 for (key, identity) in &item.files {
                     let p = plan.store.join(key);
@@ -3023,7 +3048,7 @@ fn apply_plan(
                 }
             }
             append(&log, &digest, index, "done")?;
-            active = false;
+            begun.remove(&index);
             index += 1;
         }
         if touches_retained(&plan, start, index) {

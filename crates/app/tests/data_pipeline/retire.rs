@@ -484,6 +484,17 @@ fn fixture() -> Fixture {
         original_records,
     }
 }
+/// Per-file retry and recheck semantics are worker-count independent; one transfer session
+/// keeps the fake Drive's first-DELETE faults bound to the plan's first deletion.
+fn serial_transfers(f: &Fixture) {
+    let text = fs::read_to_string(&f.config).unwrap();
+    assert!(text.contains("parallel_transfers = 3"), "{text}");
+    fs::write(
+        &f.config,
+        text.replace("parallel_transfers = 3", "parallel_transfers = 1"),
+    )
+    .unwrap();
+}
 fn plan(f: &Fixture) -> (PathBuf, Plan) {
     let report = pipeline("retire", &f.config, &["--job", "deriv", "--plan"]).unwrap();
     let path = PathBuf::from(report.split_whitespace().nth(2).unwrap());
@@ -1247,6 +1258,7 @@ fn retirement_checks_manifest_and_remote_state_before_deletion() {
 #[test]
 fn retirement_resumes_lost_delete_reply_and_checksum_free_catalogs() {
     let f = fixture();
+    serial_transfers(&f);
     f.drive.faults.lock().unwrap().no_checksum = true;
     let (path, p) = plan(&f);
     {
@@ -1722,6 +1734,7 @@ fn retirement_rechecks_name_before_every_delete_retry() {
             ),
         )
         .unwrap();
+        serial_transfers(&f);
         let (path, p) = plan(&f);
         let first = &p.delete_drive[0].file_id;
         f.drive.faults.lock().unwrap().retry_fault = Some((status, DeleteChange::Rename));
@@ -1794,6 +1807,7 @@ fn retirement_refuses_plans_sealed_before_verified_migration_gate() {
 #[test]
 fn retirement_rechecks_name_after_checksum_free_confirmation() {
     let f = fixture();
+    serial_transfers(&f);
     f.drive.faults.lock().unwrap().no_checksum = true;
     let (path, p) = plan(&f);
     let first = &p.delete_drive[0].file_id;
@@ -1822,6 +1836,7 @@ fn retirement_rechecks_name_after_checksum_free_confirmation() {
 fn retirement_rechecks_content_and_trash_state_before_delete_retry() {
     for change in [DeleteChange::Trash, DeleteChange::Content] {
         let f = fixture();
+        serial_transfers(&f);
         let (path, p) = plan(&f);
         let first = &p.delete_drive[0].file_id;
         f.drive.faults.lock().unwrap().retry_fault = Some((503, change));
@@ -1847,6 +1862,7 @@ fn retirement_rechecks_content_and_trash_state_before_delete_retry() {
 #[test]
 fn retirement_retries_unchanged_delete_after_fresh_metadata() {
     let f = fixture();
+    serial_transfers(&f);
     let (path, p) = plan(&f);
     let first = &p.delete_drive[0].file_id;
     f.drive.faults.lock().unwrap().retry_fault = Some((503, DeleteChange::None));
@@ -2149,4 +2165,75 @@ fn whole_job_includes_remote_only_catalog_closures() {
             .values()
             .all(|entry| entry.name.starts_with("record-"))
     );
+}
+
+/// A Drive batch deletes through the transfer pool. A refusal partway through the first batch
+/// stops the apply with the batch journaled as begun; resuming repeats the batch, where each
+/// already-missing file counts as deleted, and completes with every index journaled in order.
+#[test]
+fn retirement_deletes_each_drive_batch_through_the_transfer_pool() {
+    let f = fixture();
+    let (path, p) = plan(&f);
+    assert!(p.delete_drive.len() >= 3, "{}", p.delete_drive.len());
+    f.drive.faults.lock().unwrap().after = Some(2);
+    let error = apply(&f, &path).unwrap_err();
+    assert!(error.contains("403"), "{error}");
+    let remaining = p
+        .delete_drive
+        .iter()
+        .filter(|e| f.drive.drive.files().contains_key(&e.file_id))
+        .count();
+    assert!(
+        remaining >= 1 && remaining <= p.delete_drive.len() - 2,
+        "{remaining}"
+    );
+    let journal = path.with_extension("progress.jsonseq");
+    let events = |journal: &Path| -> Vec<(usize, String)> {
+        String::from_utf8(fs::read(journal).unwrap())
+            .unwrap()
+            .split('\u{1e}')
+            .filter(|frame| !frame.is_empty())
+            .map(|frame| {
+                let event: Value = serde_json::from_str(frame.trim()).unwrap();
+                (
+                    event["index"].as_u64().unwrap() as usize,
+                    event["phase"].as_str().unwrap().to_string(),
+                )
+            })
+            .collect()
+    };
+    let window = p.delete_drive.len().min(32);
+    assert_eq!(
+        events(&journal),
+        (0..window)
+            .map(|i| (i, "begin".to_string()))
+            .collect::<Vec<_>>()
+    );
+    f.drive.faults.lock().unwrap().after = None;
+    let report = apply(&f, &path).unwrap();
+    assert!(report.contains("retirement complete"), "{report}");
+    assert!(
+        p.delete_drive
+            .iter()
+            .all(|e| !f.drive.drive.files().contains_key(&e.file_id))
+    );
+    // Drive batches begin every operation, then record each completion in order; local
+    // operations begin and complete one at a time.
+    let mut expected: Vec<(usize, String)> = Vec::new();
+    let drive = p.delete_drive.len();
+    let mut start = 0;
+    while start < drive {
+        let end = (start + 32).min(drive);
+        expected.extend((start..end).map(|i| (i, "begin".to_string())));
+        expected.extend((start..end).map(|i| (i, "done".to_string())));
+        start = end;
+    }
+    expected.extend(
+        (drive..drive + p.delete_local.len())
+            .flat_map(|i| [(i, "begin".to_string()), (i, "done".to_string())]),
+    );
+    assert_eq!(events(&journal), expected);
+    for retained in &p.retained_drive {
+        assert!(f.drive.drive.files().contains_key(&retained.file_id));
+    }
 }

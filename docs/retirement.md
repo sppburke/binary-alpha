@@ -214,14 +214,21 @@ before every DELETE attempt, including transient, authentication, and lost-reply
 the latest confirmation metadata must still match and be untrashed. A 404 is successful
 resumption. Local removal unlinks only inventoried files
 and then empty manifest directories. Batches contain at most 32 operations, never crossing
-the Drive/local boundary. Full retained verification runs before application/resumption and
+the Drive/local boundary. A Drive batch deletes its files concurrently through the transfer
+pool (`parallel_transfers` sessions): the journal records `begin` for every operation of the
+batch before any deletion and `done` for each after the whole batch completes, so a resumed
+batch repeats only deletions that a missing file already satisfies, and the stale-plan check
+accepts a missing file only for a begun operation. Full retained verification runs before application/resumption and
 before completion. Each batch checks impact by exact paths (including manifest-directory
 descendants) and remote file IDs and reverifies any retained closure it touches. Reachability
 plans must have disjoint retained/deletion inventories, so normal batches touch none; this
 avoids repeatedly decoding the whole store for each 32 unreachable files.
 
 `plan-SHA256.progress.jsonseq` is append-only: ASCII record separator (`0x1e`), one JSON event,
-and newline. Events contain `plan`, zero-based `index`, and `phase` (`begin` or `done`). A
+and newline. Events contain `plan`, zero-based `index`, and `phase` (`begin` or `done`).
+Completions are recorded in index order; a Drive batch records `begin` for each of its
+operations before dispatching any of them, so several operations may be begun at once, and
+only a begun operation may be found already deleted on resumption. A
 durable `begin` precedes mutation. A torn trailing frame stays untouched; a complete frame
 continues the operation on resume. `plan-SHA256.retired.json` is an immutable completion
 record containing `plan_sha256`, `removed_drive`, `removed_local`, and `retained_verified`.
