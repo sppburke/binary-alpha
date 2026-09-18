@@ -225,6 +225,7 @@ impl Study<'_> {
         Access {
             declaration: Some(&self.declaration),
             certification: None,
+            verified: None,
         }
     }
 
@@ -335,6 +336,7 @@ fn population_uses(
     let access = Access {
         declaration: Some(declaration),
         certification: None,
+        verified: None,
     };
     let mut used: BTreeMap<&str, PopulationUse> = BTreeMap::new();
     let mut note = |role: DatasetRole, instrument: &str, uri: &ManifestUri, field: String| {
@@ -1225,6 +1227,7 @@ fn certify(
     let access = Access {
         declaration: Some(&study.declaration),
         certification: Some(&certification),
+        verified: None,
     };
 
     // A completed result under this grant is terminal: verify it in context and return.

@@ -37,6 +37,7 @@ pub fn run(config_path: &Path, uri: &str, out: &mut dyn Write) -> Result<(), Str
     let access = Access {
         declaration: declaration.as_ref(),
         certification: None,
+        verified: None,
     };
     let line = audit(&config, uri, &local, &destination, access)?.report;
     writeln!(out, "{line}")

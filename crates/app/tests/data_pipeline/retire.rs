@@ -2079,7 +2079,13 @@ fn whole_job_removes_v1_v2_and_completed_uncataloged_uploads_with_fenced_resume(
         json!({"files":{&key:{"file_id":id,"done":true}}}).to_string(),
     )
     .unwrap();
+    let start = f.drive.drive.log().len();
     let (path, planned) = whole_plan(&f).unwrap();
+    // The completed upload's identity comes from the root listing, not a read of its own.
+    metadata_reads_only_download(
+        &f.drive.drive.log()[start..],
+        planned.delete_drive.iter().filter(|e| e.file_id == id),
+    );
     for generation in f
         .old
         .iter()
@@ -2289,44 +2295,88 @@ fn retirement_deletes_each_drive_batch_through_the_transfer_pool() {
 }
 
 /// One root listing confirms every retained and planned Drive file: the plan and the apply
-/// read a listed file's metadata on its own only to download its content, while every
-/// deletion still rechecks its file first.
+/// read a listed file's metadata only to download its content, while every deletion still
+/// rechecks its file first.
 #[test]
 fn retirement_confirms_drive_files_from_the_root_listing() {
     let f = fixture();
-    let metadata_only = |log: &[String], ids: &BTreeSet<String>| -> Vec<String> {
-        log.iter()
-            .filter_map(|line| line.strip_prefix("GET /drive/v3/files/"))
-            .filter(|id| ids.contains(*id))
-            .filter(|id| !log.contains(&format!("GET /drive/v3/files/{id}?alt=media")))
-            .map(str::to_string)
-            .collect()
-    };
     let start = f.drive.drive.log().len();
     let (path, p) = plan(&f);
-    let ids = |entries: &[Remote], catalogs: bool| -> BTreeSet<String> {
-        entries
+    assert!(p.retained_drive.len() > 1 && !p.delete_drive.is_empty());
+    assert!(
+        p.retained_drive
             .iter()
-            .filter(|e| e.name.starts_with("catalog-") == catalogs)
-            .map(|e| e.file_id.clone())
-            .collect()
-    };
-    let retained = ids(&p.retained_drive, false);
-    let deleted = ids(&p.delete_drive, false);
-    assert!(!retained.is_empty() && !deleted.is_empty());
+            .any(|e| e.name.starts_with("catalog-"))
+    );
     let log = f.drive.drive.log()[start..].to_vec();
     assert!(log.iter().any(|line| line == "GET /drive/v3/files"));
-    assert_eq!(metadata_only(&log, &retained), Vec::<String>::new());
-    assert_eq!(metadata_only(&log, &deleted), Vec::<String>::new());
+    metadata_reads_only_download(&log, p.retained_drive.iter().chain(&p.delete_drive));
     let start = f.drive.drive.log().len();
     apply(&f, &path).unwrap();
     let log = f.drive.drive.log()[start..].to_vec();
-    assert_eq!(metadata_only(&log, &retained), Vec::<String>::new());
-    for id in &deleted {
+    metadata_reads_only_download(&log, &p.retained_drive);
+    for e in &p.delete_drive {
+        let id = &e.file_id;
         assert!(log.contains(&format!("GET /drive/v3/files/{id}")), "{id}");
         assert!(
             log.contains(&format!("DELETE /drive/v3/files/{id}")),
             "{id}"
         );
     }
+}
+
+/// A listed file's metadata is read only to download its content: a catalog downloads on the
+/// listed identity alone, and any other file reads its metadata at most once per download.
+fn metadata_reads_only_download<'a>(log: &[String], files: impl IntoIterator<Item = &'a Remote>) {
+    let reads = |line: &str| log.iter().filter(|l| *l == line).count();
+    for file in files {
+        let (id, name) = (&file.file_id, &file.name);
+        let metadata = reads(&format!("GET /drive/v3/files/{id}"));
+        let content = reads(&format!("GET /drive/v3/files/{id}?alt=media"));
+        if name.starts_with("catalog-") {
+            assert_eq!(metadata, 0, "{name} ({id})");
+        } else {
+            assert!(
+                metadata <= content,
+                "{name} ({id}): {metadata} metadata reads, {content} downloads"
+            );
+        }
+    }
+}
+
+/// A phase memo lets shared manifests verify once; a fresh access observes the store again.
+#[test]
+fn verification_memo_is_per_phase() {
+    use binary_alpha_engine::research::{Access, Verified};
+    let f = fixture();
+    let store = f.root.join("store");
+    let uri = format!("file://{}", store.join(f.new_dataset.key()).display());
+    let memo = Verified::default();
+    let phase = Access {
+        verified: Some(&memo),
+        ..Access::ORDINARY
+    };
+    let summary = binary_alpha_app::verify::run_with(&uri, phase).unwrap();
+    assert_eq!(memo.lock().unwrap().get(&uri), Some(&summary));
+    let object = store.join(&f.new_dataset.objects[0].key);
+    let original = fs::read(&object).unwrap();
+    fs::write(&object, b"changed after the phase verified it").unwrap();
+    assert_eq!(
+        binary_alpha_app::verify::run_with(&uri, phase).unwrap(),
+        summary
+    );
+    assert!(binary_alpha_app::verify::run_with(&uri, Access::ORDINARY).is_err());
+    let fresh = Verified::default();
+    assert!(
+        binary_alpha_app::verify::run_with(
+            &uri,
+            Access {
+                verified: Some(&fresh),
+                ..Access::ORDINARY
+            }
+        )
+        .is_err()
+    );
+    assert!(fresh.lock().unwrap().is_empty());
+    fs::write(object, original).unwrap();
 }

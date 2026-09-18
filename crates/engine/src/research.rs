@@ -381,7 +381,14 @@ impl Certification {
 pub struct Access<'a> {
     pub declaration: Option<&'a Declaration>,
     pub certification: Option<&'a Certification>,
+    /// Manifests this phase has already verified, by URI, with each verifier summary. A phase
+    /// that holds the store's writer lock verifies a manifest once however many closures
+    /// share it; a phase that must observe fresh state starts an empty memo.
+    pub verified: Option<&'a Verified>,
 }
+
+/// The memo behind [`Access::verified`].
+pub type Verified = std::sync::Mutex<std::collections::BTreeMap<String, String>>;
 
 impl Access<'_> {
     /// An ordinary reader: development and evaluation only, checked on the manifest after it
@@ -389,6 +396,7 @@ impl Access<'_> {
     pub const ORDINARY: Access<'static> = Access {
         declaration: None,
         certification: None,
+        verified: None,
     };
 
     /// The permit to open the ready manifest of dataset `generation` as `role` (`None` when the
@@ -2236,6 +2244,7 @@ mod tests {
         let access = Access {
             declaration: Some(&declaration),
             certification: None,
+            verified: None,
         };
         assert!(
             access
@@ -2280,6 +2289,7 @@ mod tests {
         let certified = Access {
             declaration: Some(&declaration),
             certification: Some(&certification),
+            verified: None,
         };
         assert!(
             certified

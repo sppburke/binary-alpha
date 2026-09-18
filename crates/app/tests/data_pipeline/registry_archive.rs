@@ -1322,6 +1322,7 @@ fn newest_daily_skips_unrelated_declared_holdout() {
         Access {
             declaration: Some(&declaration),
             certification: None,
+            verified: None,
         },
     );
     assert_eq!(result.unwrap(), pair.v2.generation);
@@ -1332,6 +1333,7 @@ fn newest_daily_skips_unrelated_declared_holdout() {
         Access {
             declaration: Some(&declaration),
             certification: None,
+            verified: None,
         },
     )
     .unwrap_err();

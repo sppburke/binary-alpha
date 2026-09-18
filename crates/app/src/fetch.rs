@@ -525,6 +525,7 @@ fn prior(
         Access {
             declaration,
             certification: None,
+            verified: None,
         }
         .permit(Some(manifest.role), &manifest.generation)?;
         let Some(coverage) = crate::lineage::history_coverage(local, &manifest)? else {
@@ -595,6 +596,7 @@ fn prior(
             Access {
                 declaration,
                 certification: None,
+                verified: None,
             },
         )?;
     }
@@ -623,6 +625,7 @@ fn seed_baseline(
     Access {
         declaration,
         certification: None,
+        verified: None,
     }
     .permit(None, seed.manifest.generation())?;
     let (store, key) = verify::open(&uri)?;
@@ -639,6 +642,7 @@ fn seed_baseline(
         Access {
             declaration,
             certification: None,
+            verified: None,
         },
     )
     .map_err(|reason| format!("fetch {instrument}: seed: {reason}"))?;
@@ -793,6 +797,7 @@ fn plan<'a>(
             if (Access {
                 declaration,
                 certification: None,
+                verified: None,
             })
             .permit(None, seed.manifest.generation())
             .is_ok()
@@ -1567,6 +1572,7 @@ fn acquire_one<R: Row>(
             Access {
                 declaration: bounds.declaration.or(own.as_ref()),
                 certification: None,
+                verified: None,
             },
         )?;
         let generation = published.manifest.generation.clone();

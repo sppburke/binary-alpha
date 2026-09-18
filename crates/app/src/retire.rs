@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use binary_alpha_engine::dataset::{
     DatasetRole, GenerationManifest, Layout as DataLayout, manifest_key,
 };
-use binary_alpha_engine::research::Access;
+use binary_alpha_engine::research::{Access, Verified};
 use binary_alpha_engine::stream::StreamManifest;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -1020,9 +1020,17 @@ pub fn run_scoped(
     let archive_lock = data_pipeline::retirement_archive_lock(&config, apply)?;
     archive_lock.bind_store(&layout.state)?;
     let declaration = data_pipeline::declaration(&config)?;
+    // Planning holds the writer lock and verifies each shared manifest once; every retained
+    // check during application starts its own memo so it observes the store afresh.
+    let verified = Verified::default();
     let access = Access {
         declaration: declaration.as_ref(),
         certification: None,
+        verified: if apply.is_some() {
+            None
+        } else {
+            Some(&verified)
+        },
     };
     let mut drive = Drive::open(&config.drive)?;
     if let Some(path) = apply {
@@ -2750,8 +2758,7 @@ fn plan(
         delete_local,
         totals,
     };
-    let remote = remote_state(drive)?;
-    verify_retained(&plan, &remote, drive, access)?;
+    let remote = verify_retained(&plan, drive, access)?;
     if before != state(config_path, config, layout)? || plan.remote_state != remote {
         return Err("retire: store changed during planning".into());
     }
@@ -2759,14 +2766,19 @@ fn plan(
 }
 
 /// Every retained manifest verifies, every retained object still has its planned identity, and
-/// every retained Drive file is confirmed by the root listing `remote`; only a file the listing
-/// does not confirm is read on its own, which also names one that vanished.
+/// every retained Drive file is confirmed by one root listing taken after that local work, so
+/// no remote observation predates it; only a file the listing does not confirm is read on its
+/// own, which also names one that vanished. Returns the listing.
 fn verify_retained(
     plan: &Plan,
-    remote: &BTreeMap<String, Value>,
     drive: &mut Drive,
     access: Access<'_>,
-) -> Result<(), String> {
+) -> Result<BTreeMap<String, Value>, String> {
+    let verified = Verified::default();
+    let access = Access {
+        verified: Some(access.verified.unwrap_or(&verified)),
+        ..access
+    };
     let local = Store::filesystem(&plan.store);
     for key in &plan.retained_manifests {
         verify::run_with(&local.uri(key), access)?;
@@ -2776,6 +2788,7 @@ fn verify_retained(
             return Err(format!("retire: retained object changed {key}"));
         }
     }
+    let remote = remote_state(drive)?;
     for e in &plan.retained_drive {
         let listed = remote.get(&e.file_id).filter(|file| {
             file["bytes"] == e.identity.bytes
@@ -2795,7 +2808,7 @@ fn verify_retained(
             ));
         }
     }
-    Ok(())
+    Ok(remote)
 }
 
 /// Deleting exact unreachable leaves cannot touch retained closures. Include directory
@@ -3030,7 +3043,7 @@ fn apply_plan(
     File::open(log.parent().expect("progress parent"))
         .and_then(|f| f.sync_all())
         .map_err(|e| e.to_string())?;
-    verify_retained(&plan, &remote_state(drive)?, drive, access)?;
+    verify_retained(&plan, drive, access)?;
     while index < count {
         let start = index;
         let end = (index + BATCH)
@@ -3090,11 +3103,11 @@ fn apply_plan(
             index += 1;
         }
         if touches_retained(&plan, start, index) {
-            verify_retained(&plan, &remote_state(drive)?, drive, access)?;
+            verify_retained(&plan, drive, access)?;
         }
         writeln!(out, "retirement progress {index}/{count}").map_err(|e| e.to_string())?;
     }
-    verify_retained(&plan, &remote_state(drive)?, drive, access)?;
+    verify_retained(&plan, drive, access)?;
     let record = serde_json::json!({"schema_version":SCHEMA,"plan_sha256":digest,"removed_drive":plan.delete_drive,"removed_local":plan.delete_local,"retained_verified":true});
     let record_path = sealed.with_extension("retired.json");
     seal(&record_path, &crate::fetch::json_bytes(&record)?)?;

@@ -64,6 +64,7 @@ pub fn run(config_path: &Path, out: &mut dyn Write) -> Result<(), String> {
     let access = Access {
         declaration: declaration.as_ref(),
         certification: None,
+        verified: None,
     };
     let line = build(settings, &config, &local, &destination, access)
         .map_err(|reason| format!("outcomes: {reason}"))?

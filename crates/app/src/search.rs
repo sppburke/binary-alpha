@@ -117,6 +117,7 @@ pub fn search(config: &Config, local: &Store, destination: &Store) -> Result<Str
         Access {
             declaration: declaration.as_ref(),
             certification: None,
+            verified: None,
         },
     )
     .map(|searched| searched.report)

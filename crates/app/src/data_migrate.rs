@@ -2965,6 +2965,7 @@ pub fn migrate_with(
     let access = Access {
         declaration: declaration.as_ref(),
         certification: None,
+        verified: None,
     };
     let failed = run_job_pool(&config, out, &|job, _out| {
         let bound = bind(job, &layout)?;

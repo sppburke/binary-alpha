@@ -1453,6 +1453,7 @@ fn run_jobs(
     let access = Access {
         declaration: declaration.as_ref(),
         certification: None,
+        verified: None,
     };
     // No acquisition or publication may race reachability checks and single-page deletion.
     let reclaim = || -> Result<(), String> {
@@ -2068,6 +2069,7 @@ pub fn pull(
     let access = Access {
         declaration: declaration.as_ref(),
         certification: None,
+        verified: None,
     };
     let selected = newest_catalog(&found, &mut drive, &layout.state.join("downloads"), access)?;
     let (file_id, sha256, catalog) = found.swap_remove(selected);
@@ -2185,6 +2187,7 @@ pub fn restore_all(config_path: &Path, out: &mut dyn Write) -> Result<(), String
     let access = Access {
         declaration: declaration.as_ref(),
         certification: None,
+        verified: None,
     };
     let mut drive = Drive::open(&config.drive)?;
     let mut instruments: BTreeMap<(String, String), Vec<ArchivedCatalog>> = BTreeMap::new();
@@ -2275,6 +2278,7 @@ fn restore_locked(
     let access = Access {
         declaration: declaration.as_ref(),
         certification: None,
+        verified: None,
     };
     let mut drive = Drive::open(&config.drive)?;
     let downloads = layout.state.join("downloads");

@@ -47,6 +47,7 @@ pub fn run_configured(config: Option<&std::path::Path>, uri: &str) -> Result<Str
         Access {
             declaration: declaration.as_ref(),
             certification: None,
+            verified: None,
         },
     )
 }
@@ -55,6 +56,35 @@ pub fn run_configured(config: Option<&std::path::Path>, uri: &str) -> Result<Str
 /// derived generations keep their own role checks; protected research evidence is verified
 /// only within the matching certification context.
 pub fn run_with(uri: &str, access: Access<'_>) -> Result<String, String> {
+    memo(access, uri, || run_once(uri, access))
+}
+
+/// Runs `verify` for `uri` once per phase: a hit in `access.verified` returns the recorded
+/// summary, a miss records the summary it produces, and no memo means no reuse.
+fn memo(
+    access: Access<'_>,
+    uri: &str,
+    verify: impl FnOnce() -> Result<String, String>,
+) -> Result<String, String> {
+    let Some(verified) = access.verified else {
+        return verify();
+    };
+    if let Some(summary) = verified
+        .lock()
+        .map_err(|_| "verify: memo poisoned")?
+        .get(uri)
+    {
+        return Ok(summary.clone());
+    }
+    let summary = verify()?;
+    verified
+        .lock()
+        .map_err(|_| "verify: memo poisoned")?
+        .insert(uri.to_string(), summary.clone());
+    Ok(summary)
+}
+
+fn run_once(uri: &str, access: Access<'_>) -> Result<String, String> {
     let target: ManifestUri = uri.parse()?;
     access.lookup(target.generation())?;
     let (store, manifest_key) = open(uri)?;
@@ -750,6 +780,9 @@ fn stream_source(
     {
         return Err("stream source dataset identity or summary mismatch".into());
     }
-    verify_dataset(&source_store.uri(&key), source_store, &key, &bytes)?;
+    let uri = source_store.uri(&key);
+    memo(access, &uri, || {
+        verify_dataset(&uri, source_store, &key, &bytes)
+    })?;
     Ok(source)
 }

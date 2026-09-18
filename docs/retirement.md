@@ -220,9 +220,12 @@ batch before any deletion and `done` for each after the whole batch completes, s
 batch repeats only deletions that a missing file already satisfies, and the stale-plan check
 accepts a missing file only for a begun operation. Full retained verification runs before application/resumption and
 before completion, as it does when a plan is sealed: retained manifests verify, retained objects are
-rehashed, and retained Drive files are confirmed by one fresh root listing (name, size, digest,
-untrashed); only a file the listing does not confirm is read on its own, which also names one that
-vanished. Planned deletions and catalogs take their identity from the listing the same way; every
+rehashed, and then retained Drive files are confirmed by one fresh root listing (name, size, digest,
+untrashed) taken after that local work, so no remote observation predates it; only a file the listing
+does not confirm is read on its own, which also names one that vanished. Planning verifies each
+manifest once however many closures share it (one memo for the whole planning phase, which holds the
+writer lock); every retained check during application starts an empty memo so it observes the store
+afresh. Planned deletions and catalogs take their identity from the listing the same way; every
 deletion still rechecks its file before removing it. Each batch checks impact by exact paths (including manifest-directory
 descendants) and remote file IDs and reverifies any retained closure it touches. Reachability
 plans must have disjoint retained/deletion inventories, so normal batches touch none; this
