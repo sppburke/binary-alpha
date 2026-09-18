@@ -10,6 +10,7 @@ use common::*;
 use parquet::file::reader::{FileReader, SerializedFileReader};
 use parquet::record::RowAccessor;
 use serde_json::{Value, json};
+use sha2::Digest;
 
 const TICK_ROWS: [&str; 4] = [
     "2026-03-22T06:02:39.312Z,AEDCNY,1.80787",
@@ -130,15 +131,33 @@ fn published(name: &str) -> (Scratch, PathBuf, Vec<String>) {
 fn import_publishes_retains_and_verifies_from_either_copy() {
     let scratch = Scratch::new("publish");
     standard_sources(&scratch);
-    let originals: Vec<(PathBuf, String)> = walk(&scratch.path("sources"))
-        .into_iter()
-        .map(|path| (path.clone(), sha256(&path)))
-        .collect();
+    let tick_source = daily_tick_source(&scratch);
+    write_ticks(
+        &scratch.path("sources/daily/mixed.csv"),
+        &["invalid excluded sibling"],
+    );
+    // Equal current page occurrences, including framing and checkpoint, must share a key.
+    let shared_page = b"{\"data\":[]}\n";
+    for symbol in ["#AAPL", "AEDCNY_otc"] {
+        let source = scratch.path("sources/bars").join(symbol);
+        fs::write(source.join("raw_pages.ndjson"), shared_page).unwrap();
+        let digest =
+            binary_alpha_engine::hex(&sha2::Sha256::digest(&shared_page[..shared_page.len() - 1]));
+        fs::write(
+            source.join("checkpoint.ndjson"),
+            format!(
+                "{}\n",
+                json!({"payload_sha256":digest,"request_token":"1747660500"})
+            ),
+        )
+        .unwrap();
+    }
+    let originals = snapshot_tree(&scratch.path("sources"));
     let config = scratch.config(
         "import.toml",
         &format!(
             "{}{}",
-            daily_tick_source(&scratch),
+            tick_source,
             scratch.bar_source().replace("evaluation", "development")
         ),
     );
@@ -167,14 +186,16 @@ fn import_publishes_retains_and_verifies_from_either_copy() {
     );
     assert!(
         lines[2].contains("pocket_option:AEDCNY_otc development")
-            && lines[2].contains(" rows 4 objects 4 reused 0 "),
-        "provenance bytes shared with the first asset are reused: {}",
+            && lines[2].contains(" rows 4 objects 4 reused 1 "),
+        "identical daily pages shared with the first bar asset are reused: {}",
         lines[2]
     );
 
-    for (path, digest) in &originals {
-        assert_eq!(&sha256(path), digest, "{} changed", path.display());
-    }
+    assert_eq!(
+        snapshot_tree(&scratch.path("sources")),
+        originals,
+        "all active inputs and excluded siblings stay byte-identical"
+    );
     assert_eq!(scratch.objects("retained"), scratch.objects("published"));
     for name in scratch.objects("published") {
         assert_eq!(
@@ -256,6 +277,39 @@ fn import_publishes_retains_and_verifies_from_either_copy() {
         !ticks.to_string().contains("mixed.csv"),
         "the undeclared sibling was never inventoried"
     );
+    let tick_lineage = ticks["objects"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|o| o["path"] == "provenance/lineage.json")
+        .unwrap();
+    let tick_lineage_bytes = fs::read(
+        scratch
+            .path("published")
+            .join(tick_lineage["key"].as_str().unwrap()),
+    )
+    .unwrap();
+    assert!(
+        !String::from_utf8(tick_lineage_bytes.clone())
+            .unwrap()
+            .contains("mixed.csv")
+    );
+    let tick_lineage: Value = serde_json::from_slice(&tick_lineage_bytes).unwrap();
+    for (path, bytes) in originals.iter().filter(|(path, _)| {
+        path.starts_with("daily/AEDCNY") && path.to_string_lossy().ends_with(".meta.json")
+    }) {
+        let name = path.file_name().unwrap().to_str().unwrap();
+        let entry = tick_lineage["provenance"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|p| p["object"]["path"] == name)
+            .unwrap();
+        assert_eq!(
+            &serde_json::from_value::<Vec<u8>>(entry["bytes_verbatim"].clone()).unwrap(),
+            bytes
+        );
+    }
     let normalized = scratch
         .path("published")
         .join(ticks["objects"][0]["key"].as_str().unwrap());
@@ -342,15 +396,100 @@ fn import_publishes_retains_and_verifies_from_either_copy() {
         "dataset/_SUCCESS",
         "collection/collection.json",
     ] {
-        assert!(
-            lineage["original_objects"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .any(|o| o["object"]["path"] == provenance),
-            "{provenance}"
+        let entry = lineage["original_objects"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|o| o["object"]["path"] == provenance)
+            .unwrap();
+        let path = if provenance == "collection/collection.json" {
+            "bars/collection.json".to_string()
+        } else {
+            format!("bars/#AAPL/{provenance}")
+        };
+        let bytes = &originals[&PathBuf::from(path)];
+        assert_eq!(entry["object"]["bytes"], bytes.len() as u64);
+        assert_eq!(
+            entry["object"]["sha256"],
+            binary_alpha_engine::hex(&sha2::Sha256::digest(bytes))
         );
     }
+    let apple_manifest = binary_alpha_engine::dataset::GenerationManifest::from_json(
+        &serde_json::to_vec(&apple).unwrap(),
+    )
+    .unwrap();
+    for (checkpoint, name) in [(false, "raw_pages.ndjson"), (true, "checkpoint.ndjson")] {
+        assert_eq!(
+            common::daily::reconstruct_import(
+                &scratch.path("published"),
+                &apple_manifest,
+                checkpoint
+            ),
+            originals[&PathBuf::from(format!("bars/#AAPL/{name}"))]
+        );
+    }
+    for name in [
+        "download_manifest.json",
+        "dataset/manifest.json",
+        "dataset/hashes.sha256",
+        "dataset/reports/quality.json",
+    ] {
+        let entry = lineage["provenance"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|p| p["object"]["path"] == name)
+            .unwrap();
+        assert_eq!(
+            serde_json::from_value::<Vec<u8>>(entry["bytes_verbatim"].clone()).unwrap(),
+            originals[&PathBuf::from(format!("bars/#AAPL/{name}"))],
+            "embedded {name}"
+        );
+    }
+    let marker = lineage["provenance"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|p| p["object"]["path"] == "dataset/_SUCCESS")
+        .unwrap();
+    assert!(marker["bytes_verbatim"].is_null());
+    assert_eq!(
+        marker["object"]["sha256"],
+        sha256(&scratch.path("sources/bars/#AAPL/dataset/_SUCCESS"))
+    );
+    let collection = lineage["provenance"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|p| p["object"]["path"] == "collection/collection.json")
+        .unwrap();
+    let original_collection: Value =
+        serde_json::from_slice(&originals[&PathBuf::from("bars/collection.json")]).unwrap();
+    assert_eq!(
+        collection["instrument_entry"],
+        original_collection["assets"]["#AAPL"]
+    );
+    assert_eq!(
+        collection["object"]["sha256"],
+        sha256(&scratch.path("sources/bars/collection.json"))
+    );
+    let other = by_symbol("AEDCNY_otc");
+    let page_key = |manifest: &Value| {
+        manifest["objects"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|o| o["path"].as_str().unwrap().starts_with("pages/"))
+            .unwrap()["key"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    };
+    assert_eq!(
+        page_key(&apple),
+        page_key(&other),
+        "shared content reuses its actual key"
+    );
     assert_eq!(
         by_symbol("AEDCNY_otc")["interval"]["provenance"],
         "legacy_inferred_from_validated_5s_grid"
@@ -382,7 +521,7 @@ fn import_publishes_retains_and_verifies_from_either_copy() {
         expected_keys,
         "identical provenance bytes share one object"
     );
-    assert_eq!(expected_keys.len(), 11);
+    assert_eq!(expected_keys.len(), 10);
 
     // Reusing the committed generations from a new historical-data folder retains every child.
     let elsewhere = scratch.config_with(
@@ -1477,20 +1616,6 @@ fn verify_rejects_incomplete_or_tampered_generations() {
             .unwrap_err()
             .contains("interval contract `closed`")
     );
-}
-
-fn walk(root: &Path) -> Vec<PathBuf> {
-    let mut files = Vec::new();
-    for entry in fs::read_dir(root).unwrap() {
-        let path = entry.unwrap().path();
-        if path.is_dir() {
-            files.extend(walk(&path));
-        } else {
-            files.push(path);
-        }
-    }
-    files.sort();
-    files
 }
 
 #[test]

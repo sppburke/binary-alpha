@@ -744,8 +744,14 @@ fn audit_binds_only_a_configured_matching_instrument() {
     let miscounted_path = tampered.join(miscounted.key());
     fs::create_dir_all(miscounted_path.parent().unwrap()).unwrap();
     fs::write(&miscounted_path, miscounted.to_json()).unwrap();
+    let before = ["published", "retained", "tampered"].map(|dir| snapshot_tree(&scratch.path(dir)));
     let error = audit(&mismatched, &miscounted_path).unwrap_err();
     assert!(error.contains("day inventory mismatch"), "{error}");
+    assert_eq!(
+        before,
+        ["published", "retained", "tampered"].map(|dir| snapshot_tree(&scratch.path(dir))),
+        "refused audit must publish or retain no output"
+    );
     let mut contradicted = StreamManifest::from_json(&fs::read(manifest_path).unwrap()).unwrap();
     contradicted.source_kind = binary_alpha_engine::dataset::SourceKind::BrokerHistory;
     assert!(

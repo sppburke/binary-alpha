@@ -8,13 +8,20 @@ fn uploaded_once(drive: &FakeDrive) {
     let state = drive.state.lock().unwrap();
     let mut counts = BTreeMap::new();
     let mut hashes = BTreeSet::new();
-    for session in state.sessions.values() {
-        assert!(session.completed);
+    for (name, bytes) in state
+        .seeded_uploads
+        .iter()
+        .map(|(name, bytes)| (name, bytes))
+        .chain(state.sessions.values().map(|session| {
+            assert!(session.completed);
+            (&session.name, &session.received)
+        }))
+    {
         assert!(
-            hashes.insert(binary_alpha_engine::hex(&Sha256::digest(&session.received))),
-            "identical bytes uploaded under more than one content binding"
+            hashes.insert(binary_alpha_engine::hex(&Sha256::digest(bytes))),
+            "identical bytes uploaded under more than one content binding: {name}"
         );
-        *counts.entry(&session.name).or_insert(0usize) += 1;
+        *counts.entry(name).or_insert(0usize) += 1;
     }
     assert!(!counts.is_empty());
     assert!(
@@ -559,6 +566,40 @@ fn v1_migrate_archive_restore_update_twice_retire_and_restore_both_brokers() {
     )
     .unwrap();
     legacy_fixtures::freeze(&f);
+    let mut readers = BTreeMap::new();
+    for (job, broker, _, _) in jobs {
+        let generations = binary_alpha_app::store::Store::filesystem(&store)
+            .list_manifests()
+            .unwrap();
+        let newest = generations
+            .iter()
+            .filter_map(|id| {
+                GenerationManifest::from_json(
+                    &fs::read(store.join(binary_alpha_engine::dataset::manifest_key(id))).unwrap(),
+                )
+                .ok()
+            })
+            .filter(|m| {
+                m.broker.as_str() == broker
+                    && m.source_kind == binary_alpha_engine::dataset::SourceKind::BrokerHistory
+            })
+            .max_by_key(|m| m.coverage.last_event_time.clone())
+            .unwrap();
+        let source_stream = generations
+            .iter()
+            .filter_map(|id| {
+                StreamManifest::from_json(
+                    &fs::read(store.join(binary_alpha_engine::dataset::manifest_key(id))).unwrap(),
+                )
+                .ok()
+            })
+            .find(|s| s.source_generation == newest.generation)
+            .unwrap();
+        readers.insert(
+            job,
+            super::daily_readers::LifecycleReaders::new(&store, &newest, &source_stream),
+        );
+    }
     fs::write(
         &configs["deriv"],
         pipeline_toml(
@@ -696,6 +737,11 @@ fn v1_migrate_archive_restore_update_twice_retire_and_restore_both_brokers() {
         let generation = state["dataset"].as_str().unwrap().to_string();
         let stream = state["stream"].as_str().unwrap().to_string();
         verify_closure(&store, &generation, &stream);
+        readers[job].assert_parity(
+            &store,
+            &dataset(&store, &generation),
+            &super::stream(&store, &stream),
+        );
         let manifest = dataset(&store, &generation);
         assert!(
             manifest
@@ -771,6 +817,11 @@ fn v1_migrate_archive_restore_update_twice_retire_and_restore_both_brokers() {
         let (root, stream, catalog) = &roots[job];
         restore_catalog(&fresh_config, catalog, broker, symbol);
         verify_closure(&fresh_store, root, stream);
+        readers[job].assert_parity(
+            &fresh_store,
+            &dataset(&fresh_store, root),
+            &super::stream(&fresh_store, stream),
+        );
         let archived: Catalog =
             serde_json::from_slice(&f.drive.state.lock().unwrap().files[&catalog.0].bytes).unwrap();
         assert!(!archived.records.is_empty());
@@ -1065,6 +1116,119 @@ fn v1_migrate_archive_restore_update_twice_retire_and_restore_both_brokers() {
         verify_closure(&producer.join("retired-store.saved"), generation, stream);
         restore_catalog(&recovered_config, catalog, broker, symbol);
         verify_closure(&recovered.path("managed/store"), generation, stream);
+    }
+    let recovered_store = recovered.path("managed/store");
+    for (job, _, _, end) in jobs {
+        let (generation, stream_id, _) = &descendants[job][1];
+        let before_dataset = dataset(&recovered_store, generation);
+        let before_stream = super::stream(&recovered_store, stream_id);
+        let old_files = common::snapshot_tree(&recovered_store);
+        let sessions: BTreeSet<_> = f
+            .drive
+            .state
+            .lock()
+            .unwrap()
+            .sessions
+            .keys()
+            .cloned()
+            .collect();
+        let remote_hashes: BTreeSet<_> = f
+            .drive
+            .files()
+            .values()
+            .map(|entry| binary_alpha_engine::hex(&Sha256::digest(&entry.bytes)))
+            .collect();
+        let config = recovered.path(&format!("{job}-pipeline.toml"));
+        fs::write(
+            &config,
+            pipeline_toml(
+                &recovered.path("managed"),
+                &f.drive.base,
+                &[(job, &format!("{job}.toml"))],
+                None,
+                3,
+            ),
+        )
+        .unwrap();
+        let cutoff = time_text((end + 600) * 1_000_000);
+        let report = pipeline("update", &config, &["--end", &cutoff]).unwrap();
+        let line = job_line(&report, job);
+        assert_eq!(field(line, "status"), "archived");
+        let after_dataset = dataset(&recovered_store, field(line, "dataset"));
+        let after_stream = super::stream(&recovered_store, field(line, "stream"));
+        assert!(after_dataset.row_count > before_dataset.row_count);
+        assert!(after_dataset.coverage.last_event_time > before_dataset.coverage.last_event_time);
+        verify_closure(
+            &recovered_store,
+            &after_dataset.generation,
+            &after_stream.generation,
+        );
+        let cutoff_day = &cutoff[..10];
+        let mut reused = BTreeSet::new();
+        for (old, new) in [
+            (&before_dataset.objects, &after_dataset.objects),
+            (&before_stream.objects, &after_stream.objects),
+        ] {
+            for object in old.iter().filter(|o| o.path.ends_with(".parquet")) {
+                let date = object
+                    .path
+                    .rsplit('/')
+                    .next()
+                    .unwrap()
+                    .trim_end_matches(".parquet");
+                if date < cutoff_day {
+                    let retained = new.iter().find(|o| o.path == object.path).unwrap();
+                    assert_eq!(
+                        retained.key, object.key,
+                        "unchanged day reused: {}",
+                        object.path
+                    );
+                    reused.insert(object.sha256.clone());
+                }
+            }
+            for object in new.iter().filter(|o| o.path.ends_with(".parquet")) {
+                assert!(
+                    object.path.starts_with("observations/")
+                        || object.path.starts_with("pages/")
+                        || object.path.starts_with("candles/")
+                );
+            }
+        }
+        assert!(!reused.is_empty());
+        for (path, bytes) in old_files {
+            assert_eq!(
+                fs::read(recovered_store.join(path)).unwrap(),
+                bytes,
+                "update only appends immutable daily content and manifests"
+            );
+        }
+        let state = f.drive.state.lock().unwrap();
+        let new_sessions: Vec<_> = state
+            .sessions
+            .iter()
+            .filter(|(id, _)| !sessions.contains(*id))
+            .collect();
+        assert!(!new_sessions.is_empty());
+        for (_, session) in new_sessions {
+            let digest = binary_alpha_engine::hex(&Sha256::digest(&session.received));
+            assert!(
+                !remote_hashes.contains(&digest),
+                "unchanged remote content uploaded again: {}",
+                session.name
+            );
+            assert!(!reused.contains(&digest), "reused day uploaded again");
+        }
+        drop(state);
+        let closure = daily_paths(&recovered_store);
+        let physical: BTreeSet<_> = fs::read_dir(recovered_store.join("objects"))
+            .unwrap()
+            .map(|entry| format!("objects/{}", entry.unwrap().file_name().to_string_lossy()))
+            .collect();
+        assert_eq!(
+            physical, closure,
+            "post-retirement update leaves only daily families and their metadata"
+        );
+        uploaded_once(&f.drive);
     }
     daily_paths(&recovered.path("managed/store"));
     pipeline("retire", &recovered_config, &["--plan"]).unwrap();
