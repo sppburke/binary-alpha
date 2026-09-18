@@ -109,12 +109,12 @@ fn synthetic_ticks(minutes: i64) -> Vec<String> {
 }
 
 fn tick_instrument() -> String {
-    "\n[[instruments]]\nbroker = \"pocket_option\"\nprovider_symbol = \"AEDCNY_otc\"\nbase_currency = \"AED\"\nquote_currency = \"CNY\"\nprice_scale = 6\nnative_granularity = { kind = \"tick\" }\ngap = { max_seconds = 2, reopen_seconds = 60 }\nfrozen = { min_observations = 10, min_seconds = 5 }\njump = { min_basis_points = 5 }\nspan = { min_percent = 75 }\nsessions = [{ name = \"week\", open_seconds = 0, close_seconds = 604800 }]\ncandles = [{ duration_seconds = 15, offset_seconds = 5, min_observations = 20, hard_min_observations = 10 }, { duration_seconds = 60, offset_seconds = 30, min_observations = 80, hard_min_observations = 40 }]\n".to_string()
+    "\n[[instruments]]\nbroker = \"pocket_option\"\nprovider_symbol = \"AEDCNY_otc\"\nbase_currency = \"AED\"\nquote_currency = \"CNY\"\nprice_scale = 6\nsession = { kind = \"always\" }\nnative_granularity = { kind = \"tick\" }\ngap = { max_seconds = 2, reopen_seconds = 60 }\nfrozen = { min_observations = 10, min_seconds = 5 }\njump = { min_basis_points = 5 }\nspan = { min_percent = 75 }\nsessions = [{ name = \"week\", open_seconds = 0, close_seconds = 604800 }]\ncandles = [{ duration_seconds = 15, offset_seconds = 5, min_observations = 20, hard_min_observations = 10 }, { duration_seconds = 60, offset_seconds = 30, min_observations = 80, hard_min_observations = 40 }]\n".to_string()
 }
 
 fn bar_instrument(symbol: &str) -> String {
     format!(
-        "\n[[instruments]]\nbroker = \"pocket_option\"\nprovider_symbol = \"{symbol}\"\nquote_currency = \"USD\"\nprice_scale = 3\nnative_granularity = {{ kind = \"bar\", period_seconds = 5 }}\ngap = {{ max_seconds = 2, reopen_seconds = 60 }}\nfrozen = {{ min_observations = 10, min_seconds = 5 }}\njump = {{ min_basis_points = 5 }}\nspan = {{ min_percent = 75 }}\ncandles = [{{ duration_seconds = 60, offset_seconds = 0 }}]\n"
+        "\n[[instruments]]\nbroker = \"pocket_option\"\nprovider_symbol = \"{symbol}\"\nquote_currency = \"USD\"\nprice_scale = 3\nsession = {{ kind = \"always\" }}\nnative_granularity = {{ kind = \"bar\", period_seconds = 5 }}\ngap = {{ max_seconds = 2, reopen_seconds = 60 }}\nfrozen = {{ min_observations = 10, min_seconds = 5 }}\njump = {{ min_basis_points = 5 }}\nspan = {{ min_percent = 75 }}\ncandles = [{{ duration_seconds = 60, offset_seconds = 0 }}]\n"
     )
 }
 

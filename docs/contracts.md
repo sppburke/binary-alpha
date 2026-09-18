@@ -566,9 +566,83 @@ Every data-bearing object is one Parquet file per UTC day `D` (`YYYY-MM-DD`) and
 | --- | --- | --- | --- |
 | Observations | `observations/D.parquet` | Deriv: normalized ticks (existing tick schema). Pocket: normalized 5 s bars keeping all eleven provider columns (symbol, symbol_id, timestamp_utc, unix_utc_s, server_time_s, open, high, low, close, volume, period_s) | Tick event time, or bar start time, in `[D, D+1)`; repeated ticks keep multiplicity and order |
 | Pages | `pages/D.parquet` | One row per provider response occurrence (section 2) | Nonempty page: UTC day of its last event. Empty page: UTC day of `request_anchor_utc`. Otherwise: UTC day of its receipt time. A page with none of the three is never deleted and is reported as unresolved |
-| Candles | `candles/<N>s_<O>s/D.parquet` | Finalized candles (existing candle schema) | Candle open time; one continuous stream state across all days |
+| Candles | `candles/<N>s_<O>s/D.parquet` | Session grid candles with explicit `fill` provenance | Candle open time; one continuous stream state across all days |
 
 Single per-generation metadata (not market rows): the ready manifest with its ordered day inventory, `provenance/coverage.json` (acquisition coverage and unresolved ranges; no page index), `provenance/lineage.json` (section 5), and the stream `profile.json`.
+
+#### Session-aware continuous candles
+
+New `daily-v2` candle writing requires an explicit `instruments.session`: either
+`{ kind = "always" }`, or `{ kind = "weekly", timezone = "America/New_York",
+open = { day = "sunday", time = "17:00:00" }, close = { day = "friday", time = "17:00:00" },
+closed_dates = [], early_closes = [] }`. Weekdays are lowercase English names; clock values
+are `HH:MM:SS`. Dates and early-close clocks are local to that zone. An early close is
+`{ date = "YYYY-MM-DD", time = "HH:MM:SS" }`; a closed date removes its entire local day.
+Only `UTC` (offset zero) and `America/New_York` are supported; other zones are refused
+when configuration is parsed. New York uses UTC−5 standard time and UTC−4 daylight time,
+from the second Sunday in March at 02:00 local to the first Sunday in November at 02:00 local.
+The explicit US rule applies from 2007 onward; earlier New York dates are refused precisely,
+including dated overrides at parse time. Calendar arithmetic reuses the repository's pure
+Gregorian functions without a timezone dependency or host zoneinfo. Spring local boundaries
+in `[02:00,03:00)` are skipped; autumn ones in `[01:00,02:00)` are ambiguous. Both are refused,
+never shifted or assigned a fold. Recurring boundaries are checked on their occurrence date. The old plural `sessions` field remains
+profile-only windows. Missing singular `session` is never silently defaulted during v2 writing.
+The canonical instrument definition binds this calendar, including exceptions, into identity.
+
+`candles/<N>s_<O>s/D.parquet` contains exactly one row per eligible epoch-grid bucket,
+strictly increasing across UTC partitions. Membership depends on the bucket's open instant:
+`interval_open <= bucket_open <= interval_close`, including both regular weekly and dated
+early closes. The bucket can extend beyond close; its duration and epoch offset are never
+shortened or shifted. A bucket opening before the session open remains excluded even if it
+straddles that open. Closed local dates remove their entire date, while an explicit weekly
+or early close at local midnight includes that instant on a non-closed date.
+For Deriv FX, `[20:55:00,20:55:05)` at Friday close and `[22:00:00,22:00:05)` at an early
+close belong to the session. A 60-second bucket opening at either close also belongs, as does
+an offset bucket opening before close and ending after it. Pocket non-OTC's Friday 17:00:00
+America/New_York bucket belongs; a broker-delivered flat zero-volume bar there is `source`.
+With no observation there, an `engine` fill may be emitted under the coverage and pending
+rules below. Closing quotes therefore remain in finalized candles. Observations outside
+eligible buckets remain losslessly in observations.
+No candle is emitted before the first in-session, non-source-fill finalized candle. After that
+first price is established, later sessions begin filling at their scheduled open from the prior
+session's last close. Carrying that reference price creates no rows during closed time.
+
+Daily candles append required UTF8 `fill`: `none` for market candles, `source` for a delivered
+flat-OHLC, zero-volume candle, `engine` for a created zero-observation candle. Zero volume alone
+is insufficient: historical Pocket bars can change price while reporting zero volume. Source
+fills retain their observation counts, prices, volume, event clocks and feed gap diagnostics;
+`frozen` is additionally true and they are never `clean`. Engine fills have flat OHLC equal to
+the preceding close, observations/duplicates zero, volume zero only for volume-bearing sources
+(null for ticks), zero activity and jump counts, and no invented feed gap measurements:
+`gap_before_micros = null`, `max_gap_inside_micros = 0`, `missing_buckets_before = 0`.
+They have `low_activity`, `hard_low_activity`, `frozen`, and `short_span` true, making both
+`complete` and `clean` false. Their first/last event clocks identify the carried price's last
+source event, possibly in a prior session, and never assert an event inside the filled bucket;
+`active_span_micros = 0`. For a bucket fully covered by verified acquisition ranges, synthetic
+`known_at` is its logical close watermark, stable when a descendant adds later input. It is
+not an invented receipt/event time. In an unresolved range it is the later finalized candle
+bounding the interior absence or the final verified extent bounding the snapshot tail, never
+before bucket close; such days remain partial/unknown.
+The first real candle after engine fills retains its feed diagnostics. Across source fills,
+`InstrumentStream` additionally carries the sum of their actually missing buckets to the next
+real candle and the maximum observed preceding/interior feed gap into its `gap_before_micros`.
+Source rows retain their own diagnostics; the carry clears once consumed by a real candle.
+Contiguous source fills add no missing buckets and no invented elapsed gap. Gap flags are
+evaluated against these preserved measurements, so inserting rows cannot repair missing feed.
+
+Interior empty buckets are proven absent by later finalized input. Trailing fills require the
+exclusive end of authenticated verified acquisition coverage, stop at the last whole bucket
+within it, and never replace the stream's unfinished candle. A partial/unknown source day
+remains partial/unknown; filling never establishes acquisition completeness. The raw profile
+continues to count feed observations and finalized feed candles; its candle count can differ
+from the session product count. The existing pending-candle day rule remains in force.
+Verification reconstructs the session product from authenticated observations and coverage and
+compares every candle and the full reconstructed feed profile, including pending counts,
+leading/trailing limits, prices, quality and all timestamps. Closed feed candles still advance
+feature ordinals, breaking adjacency across rejected market time.
+Legacy immutable daily files without `fill` remain readable. Features exclude session-closed
+feed candles and source fills; fills cannot become eligible feature or outcome evidence.
+
 
 #### Day inventory
 
@@ -659,9 +733,21 @@ requires occurrence evidence independently of market coverage.
 
 ### 6. Verification and acceptance
 
-`data verify` on a v2 dataset decodes every daily file, checks day membership, cross-day order and multiplicity, the day inventory against the files, each page's `payload_sha256`, and aggregate rows and coverage; on a v2 stream it verifies each candle day and the aggregate summary. Migration additionally proves, per instrument, before any deletion: identical observation rows in order to the v1 newest history (or import); every NDJSON line, checkpoint line, bundle slice, and single page accounted for exactly once and both import source files reconstructed byte for byte; identical candles to the v1 stream.
+`data verify` on a v2 dataset decodes every daily file, checks day membership, cross-day order and multiplicity, the day inventory against the files, each page's `payload_sha256`, and aggregate rows and coverage; on a v2 stream it verifies each candle day and the aggregate summary. Migration additionally proves, per instrument, before any deletion: identical observation rows in order to the v1 newest history (or import); every NDJSON line, checkpoint line, bundle slice, and single page accounted for exactly once and both import source files reconstructed byte for byte; exact legacy candle evidence reconstruction
+under the v1 definition, plus independent verification of the new session product.
 
-Named non-live gates (`cargo test -p binary-alpha-app --test data_pipeline` and the affected suites): one multi-day Deriv and one multi-day Pocket fixture through import, migration, history update, audit, feature/outcome/replay readers, archive, fresh-store restore, retirement, and a later update that uploads zero unchanged objects; covering midnight repeats, a cross-midnight page, an empty page, missing receipt metadata, a historical gap, a partial cutoff day, a weekend-delayed candle finalization, pending-acquisition diagnostics, repeated requests under one intent with unchanged observations (which changes only a page day), v1/v2 coexistence with equal coverage, encoding determinism across batch boundaries, interruption at each phase, and archive-registry rebuild. Assertions are on goal-bearing outputs, traversing every daily partition: identical feature rows and engine state, identical global outcome indices and reasons, identical replay ledger and results, identical recorded warm-up state, identical candles and profile, exact page reconstruction, and Pocket's existing rejection of tick-only outcome and replay paths.
+A migration may add a missing singular `session` while preserving every other definition field;
+an existing calendar cannot change. `candles_equal=true` and `MigrationEquality.candles` mean
+that v2 observations reproduce every legacy candle column, summary and profile under the exact
+legacy definition (with only the source-generation substitution). They do not assert equality
+of the filled session product with sparse v1 candles. The durable proof names
+`basis=legacy_definition_reconstruction`, preserves both definitions and stream summaries,
+records the legacy row digest and profile equality, and requires `session_product_verified=true`.
+The new product passes `data verify` independently before the migration record is published;
+a contradictory session proof fails the retirement eligibility predicate.
+
+Named non-live gates (`cargo test -p binary-alpha-app --test data_pipeline` and the affected suites): one multi-day Deriv and one multi-day Pocket fixture through import, migration, history update, audit, feature/outcome/replay readers, archive, fresh-store restore, retirement, and a later update that uploads zero unchanged objects; covering midnight repeats, a cross-midnight page, an empty page, missing receipt metadata, a historical gap, a partial cutoff day, a weekend-delayed candle finalization, pending-acquisition diagnostics, repeated requests under one intent with unchanged observations (which changes only a page day), v1/v2 coexistence with equal coverage, encoding determinism across batch boundaries, interruption at each phase, and archive-registry rebuild. Assertions are on goal-bearing outputs, traversing every daily partition: identical feature rows and engine state, identical global outcome indices and reasons, identical replay ledger and results, identical recorded warm-up state, exact legacy candle/profile reconstruction and independently
+verified session candles, exact page reconstruction, and Pocket's existing rejection of tick-only outcome and replay paths.
 
 ### Foundation representation and encoding choices
 
@@ -745,11 +831,30 @@ configuration, and supplies the seed and update cutoff without editing the opera
 Consumer-only configurations may omit jobs; update requires them. List/restore need no broker
 credentials.
 
-The seed of a job is the newest imported dataset generation of its instrument in the managed
-store (by coverage end): a generation published there by `data import` with a source kind other
-than `broker_history`. Importing is therefore the only entry of raw data, and the raw archive
-may be deleted after import; the store is the one system-owned copy. An update with no imported
-generation fails before any credential is resolved.
+The seed is the readable v2 continuation root of the job's instrument. Existing v1 inputs must
+be migrated first. An empty store instead acquires directly from the configured broker within
+`history.start` and the pinned cutoff, using the existing unseeded daily fetch owner. No import
+or v1 intermediate is needed. A pending intent preserves its original seed list, even when
+an interrupted bootstrap has published partial v2 data.
+
+`add-job --config PIPELINE --template CORE --broker B --symbol S [--quote-currency C]
+[--price-scale N] [--session FILE]` reuses the template's broker settings, history policy and
+instrument candle policy. It requires development/research mode and an explicit singular
+`instruments.session` table. It discovers the requested symbol, uses reported precision where
+available, and otherwise validates a bounded history sample through the adapter at exact
+supported scales. Empty/invalid samples require an explicit scale. Six-uppercase-letter pair
+symbols (optional `frx` prefix / `_otc` suffix) supply the quote currency; ambiguous symbols
+require the option. A scale failure includes the required digits, never rounds the price.
+
+Registration checkpoints its exact core/evidence bytes before create-once file publication and
+appends the pipeline entry last under the writer lock; retry uses that checkpoint and refuses
+different input or output bytes. Generated paths are relative `jobs/JOB.toml` and
+`evidence/JOB.json`. Existing source-bound imported jobs remain readable; empty-store bootstrap
+also requires the explicit calendar. Registration and execution share native validation of
+the singular session shape: `always`, or
+`weekly` with timezone, open/close full weekday names and HH:MM:SS, closed_dates and early_closes.
+Both calendars execute through the session owner; registration does not strip calendar fields.
+Plural `sessions` remains a separate profile field.
 
 The `drive` table requires `root_folder_id` (nonempty, with no ASCII control characters, slash,
 or single quote), `chunk_bytes` (a positive unsigned 64-bit multiple of `262144`),
@@ -770,7 +875,7 @@ operator credentials. See [the example](../configs/data-pipeline.example.toml).
 The managed root separates `store/` (retained and published objects, also the importer's
 retained folder and publication root) and `pipeline_state/`. State and per-job state directories
 have mode `0700`. Update holds the nonblocking `pipeline_state/writer.lock` for the producer run;
-list/restore do not take that lock. Use one writer host per archive root.
+pull/restore also hold that lock and the host-local archive-root lock. Use one writer host per archive root.
 
 Under `pipeline_state/`:
 
@@ -790,9 +895,8 @@ Under `pipeline_state/`:
   a trailing partial line is ignored, reported, and truncated before appending. Pages are retained
   before this checkpoint advances; resumption decodes them and continues backward. A page whose
   rows contradict the retained rows fails the run before it is checkpointed, so a resumed
-  intent never replays a conflicting page; completion removes both progress files. Removing both
-  files abandons a pending intent (its retained pages stay as unreferenced diagnostics) so a later update may pin a new
-  cutoff.
+  intent never replays a conflicting page; completion removes both progress files. Resume with
+  update at the same cutoff; never remove progress files manually to abandon or bypass a binding.
 - `registry/snapshot.json` (version `1`) binds `archive_root` and the fixture `endpoint`, and
   stores a `sequence` watermark, `files`, pending `legacy` aliases, imported job names, and
   the completed-rebuild flag. Every `files` key is `objects/SHA256HEX`, including the byte
@@ -813,6 +917,8 @@ Under `pipeline_state/`:
   Session capabilities stay inside the private pipeline-state directory.
 - `downloads/` holds temporary `FILE_ID.catalog`, `GENERATION.manifest`, and
   `SHA256HEX.partial` downloads.
+- `registrations/JOB.json` seals the requested template/session/options digest and exact
+  generated core/evidence bytes before add-job publishes files and appends its pipeline entry.
 
 A pending intent binds the archive root and the evidence digest it was opened under as well;
 a resumed invocation whose `drive.root_folder_id` or evidence file differs fails with the pending
@@ -826,7 +932,9 @@ binary-alpha data import --config CORE
 binary-alpha data pipeline migrate --config PIPELINE [--job ID]
 binary-alpha data pipeline update --config PIPELINE [--end END]
 binary-alpha data pipeline archive --config PIPELINE [--job ID]
-binary-alpha data pipeline retire --config PIPELINE [--job ID] [--plan | --apply PLAN_FILE]
+binary-alpha data pipeline add-job --config PIPELINE --template CORE --broker B --symbol S [--quote-currency C] [--price-scale N] [--session FILE]
+binary-alpha data pipeline retire --config PIPELINE [--job ID] [--whole-job] [--plan | --apply PLAN_FILE]
+binary-alpha data pipeline remove-job --config PIPELINE --job ID
 binary-alpha data pipeline list --config PIPELINE --broker BROKER --symbol SYMBOL
 binary-alpha data pipeline pull --config PIPELINE --broker BROKER --symbol SYMBOL
 binary-alpha data pipeline restore --config PIPELINE --catalog FILE_ID --sha256 SHA256 --broker BROKER --symbol SYMBOL
@@ -879,7 +987,7 @@ Retiring v1 manifests requires a matching immutable, verified migration record a
 Retirement plans use schema 2, refuse older apply plans, and preserve completed evidence when
 seal scratch files survive a crash. Every Drive delete attempt rechecks name and content identity.
 
-Update requires an imported generation; `END` is `YYYY-MM-DDTHH:MM:SS[.ffffff]Z`. Each job
+Update follows the v2 root or bootstraps an empty job; `END` is `YYYY-MM-DDTHH:MM:SS[.ffffff]Z`. Each job
 acquires a bounded extension, audits and verifies its result, and archives it independently.
 A pending acquisition keeps its original cutoff, baseline, start, and pages on rerun, even after
 a partial snapshot was archived. A conflicting `--end` or effective configuration fails with the

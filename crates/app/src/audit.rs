@@ -140,12 +140,13 @@ pub(crate) fn audit(
             ..DailyCandles::default()
         })
         .collect();
-    let mut finalized = Vec::new();
-    let mut push = |observation: Observation| -> Result<(), String> {
-        stream
-            .push(observation, &mut finalized)
-            .map_err(|rejection| format!("{id}: {rejection}"))?;
-        for (index, candle) in finalized.drain(..) {
+    // SESSION GRID HOOK: the new module owns calendar/fill/coverage; writers stay daily.
+    crate::session_audit::feed(
+        &source_store,
+        &manifest,
+        instrument,
+        &mut stream,
+        |index, candle| {
             if manifest.layout.is_some() {
                 daily_writers[index].push(
                     candle,
@@ -158,10 +159,9 @@ pub(crate) fn audit(
             } else {
                 writers[index].push(&candle)?;
             }
-        }
-        Ok(())
-    };
-    feed_generation(&source_store, &manifest, instrument.price_scale, &mut push)?;
+            Ok(())
+        },
+    )?;
     let profile = stream.profile();
     if profile.observations != manifest.row_count
         || profile.coverage.as_ref() != Some(&manifest.coverage)
@@ -199,7 +199,7 @@ pub(crate) fn audit(
             writer.flush(local, &generation, &id, instrument.price_scale, spec)?;
             encoded_days += writer.encoded;
             reused_days += writer.reused;
-            let pending = pending_open(&profile, index)?;
+            let pending = pending_open(&profile, index, instrument.session.as_ref())?;
             let finalized = writer
                 .days
                 .iter()
@@ -212,6 +212,7 @@ pub(crate) fn audit(
                 pending,
                 &finalized,
                 manifest.native_granularity,
+                instrument.session.as_ref(),
             )? {
                 let date = day.date.clone();
                 let (temporary, data) = match writer.days.remove(&date) {
@@ -447,6 +448,7 @@ fn date(time: i64) -> String {
 pub(crate) fn pending_open(
     profile: &InstrumentProfile,
     index: usize,
+    session: Option<&binary_alpha_engine::session::Session>,
 ) -> Result<Option<i64>, String> {
     let spec = &profile.streams[index];
     if spec.withheld_observations == 0 {
@@ -459,11 +461,18 @@ pub(crate) fn pending_open(
             .ok_or("withheld candle has no coverage")?
             .last_event_time,
     )?;
-    Ok(Some(binary_alpha_engine::stream::interval_open(
+    let duration = i64::from(spec.duration_seconds) * 1_000_000;
+    let open = binary_alpha_engine::stream::interval_open(
         last,
-        i64::from(spec.duration_seconds) * 1_000_000,
+        duration,
         i64::from(spec.offset_seconds) * 1_000_000,
-    )))
+    );
+    if let Some(session) = session
+        && !session.calendar()?.contains(open, open + duration)?
+    {
+        return Ok(None);
+    }
+    Ok(Some(open))
 }
 
 /// Shared writer/verifier derivation, including empty days and cross-day finalizers.
@@ -473,7 +482,11 @@ pub(crate) fn candle_inventory(
     pending: Option<i64>,
     finalized: &std::collections::BTreeMap<String, (u64, i64)>,
     native: binary_alpha_engine::dataset::NativeGranularity,
+    session: Option<&binary_alpha_engine::session::Session>,
 ) -> Result<Vec<DayInventoryEntry>, String> {
+    let calendar = session
+        .map(binary_alpha_engine::session::Session::calendar)
+        .transpose()?;
     let mut dates: std::collections::BTreeSet<_> = source
         .iter()
         .filter(|d| d.family == DayFamily::Observations)
@@ -499,7 +512,7 @@ pub(crate) fn candle_inventory(
                         .ok_or("finalizer event time overflow")
                 })
                 .transpose()?;
-            let mut day = candle_day(&date, spec, source, pending, finalizer)?;
+            let mut day = candle_day(&date, spec, source, pending, finalizer, calendar.as_ref())?;
             if day.state == DayState::EmptyKnown && observed.is_some_and(|(rows, _)| *rows > 0) {
                 day.state = DayState::Complete;
             }
@@ -514,6 +527,7 @@ fn candle_day(
     inventory: &[DayInventoryEntry],
     pending: Option<i64>,
     finalized_at: Option<i64>,
+    calendar: Option<&binary_alpha_engine::session::Calendar>,
 ) -> Result<DayInventoryEntry, String> {
     let (start, end) = day_bounds(date)?;
     let source = inventory
@@ -555,10 +569,14 @@ fn candle_day(
                 .map(|at| at.checked_add(1).ok_or("finalizer time overflow"))
                 .transpose()?
                 .unwrap_or(end);
-            let close = last_open
+            let nominal_close = last_open
                 .checked_add(duration)
-                .ok_or("candle close overflow")?
-                .max(finalizer_end);
+                .ok_or("candle close overflow")?;
+            let eligible = calendar
+                .map(|c| c.contains(last_open, nominal_close))
+                .transpose()?
+                .unwrap_or(true);
+            let close = if eligible { nominal_close } else { end }.max(finalizer_end);
             let mut cursor = end;
             while cursor < close {
                 let next_end = cursor
@@ -681,7 +699,7 @@ impl DailyCandles<'_> {
         let finalized_at = self
             .current
             .iter()
-            .map(|c| c.known_at_micros)
+            .map(crate::session_candles::inventory_finalizer)
             .max()
             .expect("nonempty day");
         if let Some((store, parent)) = self.parent.filter(|_| self.first_changed.is_none()) {
@@ -829,6 +847,7 @@ mod daily_inventory_tests {
             std::slice::from_ref(&source),
             Some(start + 23 * hour),
             None,
+            None,
         )
         .unwrap();
         assert_eq!(
@@ -844,7 +863,7 @@ mod daily_inventory_tests {
                 .unwrap()
                 .contains("two acquisition gaps; last candle")
         );
-        let day = candle_day(date, &spec, &[source], Some(start + 4 * hour), None).unwrap();
+        let day = candle_day(date, &spec, &[source], Some(start + 4 * hour), None, None).unwrap();
         assert_eq!(
             day.unresolved,
             vec![interval(hour, 2 * hour), interval(3 * hour, end - start)]

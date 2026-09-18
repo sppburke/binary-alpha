@@ -4496,6 +4496,7 @@ struct StreamState {
 /// candles enter the feature chain, and a tick path is folded from ordered ticks before its
 /// candle finalizes.
 pub struct FeatureEngine {
+    session: Option<crate::session::Calendar>,
     stream: InstrumentStream,
     states: Vec<StreamState>,
     unit: f64,
@@ -4659,6 +4660,11 @@ impl FeatureEngine {
         }
         let seconds = |value: u32| i64::from(value) * MICROS_PER_SECOND;
         Ok(Self {
+            session: definition
+                .session
+                .as_ref()
+                .map(crate::session::Session::calendar)
+                .transpose()?,
             stream,
             states,
             unit: definition.price_scale.unit() as f64,
@@ -4682,13 +4688,27 @@ impl FeatureEngine {
         self.finalized.clear();
         self.stream.push(observation, &mut self.finalized)?;
         for (definition_index, candle) in self.finalized.drain(..) {
+            // Session-excluded feed bars remain in the profile, never feature evidence.
+            let included = if let Some(calendar) = &self.session {
+                calendar
+                    .contains(candle.open_time_micros, candle.close_time_micros)
+                    .map_err(|detail| Rejection {
+                        reason: crate::stream::RejectionReason::SessionCalendar,
+                        event_micros: candle.open_time_micros,
+                        known_at_micros: candle.known_at_micros,
+                        source: self.stream.profile().source.generation,
+                        detail,
+                    })?
+            } else {
+                true
+            };
             if let Some(index) = self
                 .states
                 .iter()
                 .position(|state| state.definition_index == definition_index)
             {
                 let state = &mut self.states[index];
-                state.accept(&candle, self.unit, self.ticks, index, out);
+                state.accept(&candle, included, self.unit, self.ticks, index, out);
             }
         }
         if let Observation::Tick(tick) = observation
@@ -4730,6 +4750,7 @@ impl StreamState {
     fn accept(
         &mut self,
         candle: &Candle,
+        included: bool,
         unit: f64,
         ticks: bool,
         stream_index: usize,
@@ -4743,7 +4764,7 @@ impl StreamState {
                 None
             }
         };
-        if !candle.flags.clean() {
+        if !included || !candle.flags.clean() {
             return;
         }
         let anatomy = Anatomy::new(candle, unit);
@@ -5259,6 +5280,7 @@ mod tests {
             }),
             span: Some(SpanCheck { min_percent: 75 }),
             sessions: None,
+            session: None,
             candles: candles
                 .iter()
                 .map(|&(duration_seconds, offset_seconds)| CandleSpec {
@@ -6021,6 +6043,70 @@ mod tests {
                 anatomy.lower_wick_units
             ),
             (Some(1), None, Some(0), Some(i64::MAX))
+        );
+    }
+
+    #[test]
+    fn session_exclusion_breaks_clean_feature_adjacency() {
+        use crate::session::{Boundary, Session};
+        let native = NativeGranularity::Bar { period_seconds: 5 };
+        let mut reference = profile(native, false, &[(5, 0)]);
+        reference.definition.candles[0].min_observations = None;
+        reference.definition.candles[0].hard_min_observations = None;
+        reference.definition.session = Some(Session::Weekly {
+            timezone: "UTC".into(),
+            open: Boundary {
+                day: "monday".into(),
+                // Inclusive close keeps 00:00:05; leave 00:00:10 closed to test adjacency.
+                time: "00:00:15".into(),
+            },
+            close: Boundary {
+                day: "monday".into(),
+                time: "00:00:05".into(),
+            },
+            closed_dates: vec![],
+            early_closes: vec![],
+        });
+        let mut request = entry(
+            &[(5, 0)],
+            Outputs::Named(vec!["clean_segment_index".into()]),
+        );
+        request.tick_path_streams = None;
+        let plan = FeaturePlan::resolve(&request, reference, "input").unwrap();
+        let mut engine = FeatureEngine::new(&plan, source(native, false)).unwrap();
+        let start = crate::market::parse_event_time_micros("2026-09-07T00:00:00Z").unwrap();
+        let mut out = FeatureOutput::default();
+        for seconds in [0, 5, 10, 15, 20] {
+            engine
+                .push(
+                    Observation::Bar(crate::stream::BarUnits {
+                        start_micros: start + seconds * MICROS_PER_SECOND,
+                        period_micros: 5 * MICROS_PER_SECOND,
+                        open: 1_000_000,
+                        high: 1_000_002,
+                        low: 999_999,
+                        close: 1_000_001,
+                        volume: 1.0,
+                    }),
+                    &mut out,
+                )
+                .unwrap();
+        }
+        // The inclusive closing bar adds a row to the first segment; the closed bucket
+        // still breaks adjacency, and both bars after reopening share the next segment.
+        assert_eq!(out.rows.len(), 4);
+        let column = plan.streams[0].output_index("clean_segment_index").unwrap();
+        assert_eq!(
+            out.rows
+                .iter()
+                .map(|(_, row)| row.values[column].clone())
+                .collect::<Vec<_>>(),
+            vec![
+                Some(Value::Int(1)),
+                Some(Value::Int(1)),
+                Some(Value::Int(2)),
+                Some(Value::Int(2))
+            ]
         );
     }
 

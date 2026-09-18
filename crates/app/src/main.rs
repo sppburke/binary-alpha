@@ -262,6 +262,31 @@ enum DataCommand {
 
 #[derive(Subcommand)]
 enum PipelineCommand {
+    /// Remove a document entry after its whole-job retirement has completed.
+    RemoveJob {
+        #[arg(long)]
+        config: PathBuf,
+        #[arg(long)]
+        job: String,
+    },
+    /// Register one discovered instrument using a broker/history/candle policy template.
+    AddJob {
+        #[arg(long)]
+        config: PathBuf,
+        #[arg(long)]
+        broker: String,
+        #[arg(long)]
+        symbol: String,
+        #[arg(long)]
+        template: PathBuf,
+        #[arg(long)]
+        quote_currency: Option<String>,
+        #[arg(long)]
+        price_scale: Option<u8>,
+        /// TOML file containing the explicit singular session declaration.
+        #[arg(long)]
+        session: Option<PathBuf>,
+    },
     /// Convert retained v1 generations to a verified daily-v2 continuation root, offline.
     Migrate {
         #[arg(long)]
@@ -286,6 +311,9 @@ enum PipelineCommand {
         plan: bool,
         #[arg(long)]
         apply: Option<PathBuf>,
+        /// Retire the selected instrument completely, including its current continuation root.
+        #[arg(long, requires = "job")]
+        whole_job: bool,
     },
     /// Extend every job's imported generation from its frontier to one pinned cutoff within
     /// its budget, then audit, verify, and archive the result.
@@ -383,6 +411,29 @@ fn main() -> ExitCode {
         Command::Data {
             command: DataCommand::Pipeline { command },
         } => match command {
+            PipelineCommand::RemoveJob { config, job } => {
+                data_pipeline::add_job::remove(&config, &job, &mut std::io::stdout().lock())
+            }
+            PipelineCommand::AddJob {
+                config,
+                broker,
+                symbol,
+                template,
+                quote_currency,
+                price_scale,
+                session,
+            } => data_pipeline::add_job::run(
+                &config,
+                &data_pipeline::add_job::Options {
+                    broker: &broker,
+                    symbol: &symbol,
+                    template: &template,
+                    quote_currency: quote_currency.as_deref(),
+                    price_scale,
+                    session: session.as_deref(),
+                },
+                &mut std::io::stdout().lock(),
+            ),
             PipelineCommand::Migrate { config, job } => {
                 data_pipeline::migrate(&config, job.as_deref(), &mut std::io::stdout().lock())
             }
@@ -394,10 +445,12 @@ fn main() -> ExitCode {
                 job,
                 plan: _,
                 apply,
-            } => binary_alpha_app::retire::run(
+                whole_job,
+            } => binary_alpha_app::retire::run_scoped(
                 &config,
                 job.as_deref(),
                 apply.as_deref(),
+                whole_job,
                 &mut std::io::stdout().lock(),
             ),
             PipelineCommand::Update { config, end } => {

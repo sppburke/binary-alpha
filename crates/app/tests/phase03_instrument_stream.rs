@@ -87,7 +87,7 @@ fn tampered_manifest(store: &Path, manifest: &StreamManifest) -> PathBuf {
 /// The `[[instruments]]` entry the synthetic tests use, with the legacy-shaped checks.
 fn tick_instrument(symbol: &str, scale: u8) -> String {
     format!(
-        "\n[[instruments]]\nbroker = \"pocket_option\"\nprovider_symbol = \"{symbol}\"\nbase_currency = \"AED\"\nquote_currency = \"CNY\"\nprice_scale = {scale}\nnative_granularity = {{ kind = \"tick\" }}\ngap = {{ max_seconds = 2, reopen_seconds = 60 }}\nfrozen = {{ min_observations = 3, min_seconds = 5 }}\njump = {{ min_basis_points = 5 }}\nspan = {{ min_percent = 75 }}\nsessions = [{{ name = \"week\", open_seconds = 0, close_seconds = 604800 }}]\ncandles = [{{ duration_seconds = 5, offset_seconds = 0, min_observations = 3, hard_min_observations = 2 }}, {{ duration_seconds = 15, offset_seconds = 5 }}]\n"
+        "\n[[instruments]]\nbroker = \"pocket_option\"\nprovider_symbol = \"{symbol}\"\nbase_currency = \"AED\"\nquote_currency = \"CNY\"\nprice_scale = {scale}\nsession = {{ kind = \"always\" }}\nnative_granularity = {{ kind = \"tick\" }}\ngap = {{ max_seconds = 2, reopen_seconds = 60 }}\nfrozen = {{ min_observations = 3, min_seconds = 5 }}\njump = {{ min_basis_points = 5 }}\nspan = {{ min_percent = 75 }}\nsessions = [{{ name = \"week\", open_seconds = 0, close_seconds = 604800 }}]\ncandles = [{{ duration_seconds = 5, offset_seconds = 0, min_observations = 3, hard_min_observations = 2 }}, {{ duration_seconds = 15, offset_seconds = 5 }}]\n"
     )
 }
 
@@ -96,7 +96,7 @@ fn bar_instrument(symbol: &str, scale: u8, base: Option<&str>) -> String {
         format!("base_currency = \"{base}\"\n")
     });
     format!(
-        "\n[[instruments]]\nbroker = \"pocket_option\"\nprovider_symbol = \"{symbol}\"\n{base}quote_currency = \"USD\"\nprice_scale = {scale}\nnative_granularity = {{ kind = \"bar\", period_seconds = 5 }}\ngap = {{ max_seconds = 2, reopen_seconds = 60 }}\nfrozen = {{ min_observations = 3, min_seconds = 5 }}\njump = {{ min_basis_points = 5 }}\ncandles = [{{ duration_seconds = 15, offset_seconds = 5 }}]\n"
+        "\n[[instruments]]\nbroker = \"pocket_option\"\nprovider_symbol = \"{symbol}\"\n{base}quote_currency = \"USD\"\nprice_scale = {scale}\nsession = {{ kind = \"always\" }}\nnative_granularity = {{ kind = \"bar\", period_seconds = 5 }}\ngap = {{ max_seconds = 2, reopen_seconds = 60 }}\nfrozen = {{ min_observations = 3, min_seconds = 5 }}\njump = {{ min_basis_points = 5 }}\ncandles = [{{ duration_seconds = 15, offset_seconds = 5 }}]\n"
     )
 }
 
@@ -319,9 +319,10 @@ fn audit_publishes_a_stream_generation_that_verifies_and_matches_a_direct_feed()
         &instrument.canonical_toml(),
         dataset.layout,
     );
+    // The always-open daily product fills the sparse feed: nine 5s and three 15s buckets.
     assert!(
         line.starts_with(&format!(
-            "audited pocket_option:AEDCNY_otc development generation {expected_generation} from {} observations 14 candles 6 objects 3 reused 0 candle days encoded 2 reused 0 [stream ",
+            "audited pocket_option:AEDCNY_otc development generation {expected_generation} from {} observations 14 candles 12 objects 3 reused 0 candle days encoded 2 reused 0 [stream ",
             dataset.generation
         )),
         "{line}"
@@ -379,7 +380,8 @@ fn audit_publishes_a_stream_generation_that_verifies_and_matches_a_direct_feed()
         .iter()
         .map(|summary| summary.rows)
         .collect();
-    assert_eq!(rows, [4, 2]);
+    // Continuous always-session output includes missing buckets; raw profile stays sparse.
+    assert_eq!(rows, [9, 3]);
     for object in &manifest.objects {
         let stored = scratch.path("published").join(&object.key);
         assert_eq!(sha256(&stored), object.sha256, "{}", object.path);
@@ -387,8 +389,8 @@ fn audit_publishes_a_stream_generation_that_verifies_and_matches_a_direct_feed()
         assert!(scratch.path("retained").join(&object.key).is_file());
     }
 
-    // The published rows equal a direct row-at-a-time feed of the normalized object, and so do
-    // chunked and whole-input feeds; the test adapts the input itself.
+    // The published rows equal a direct feed followed by the pure session transformation;
+    // chunked and whole-input raw feeds still match every original candle field.
     let normalized = scratch.path("published").join(
         &dataset
             .objects
@@ -401,13 +403,58 @@ fn audit_publishes_a_stream_generation_that_verifies_and_matches_a_direct_feed()
     assert_eq!(ticks.len(), 14);
     let (direct, profile) = feed(&instrument, &dataset, &ticks);
     assert_eq!(profile, published.profile);
+    for (index, rows) in published.candles.iter().enumerate() {
+        let feed_rows: Vec<_> = rows.iter().filter(|r| r.counts[0] > 0).cloned().collect();
+        let expected: Vec<_> = direct
+            .iter()
+            .filter(|(stream, _)| *stream == index)
+            .map(|(_, c)| Row::from(c))
+            .collect();
+        assert_eq!(
+            feed_rows, expected,
+            "every original feed column is preserved"
+        );
+    }
+    let coverage_object = dataset
+        .objects
+        .iter()
+        .find(|o| o.path == "provenance/coverage.json")
+        .unwrap();
+    let coverage = binary_alpha_engine::dataset::coverage::DailyCoverage::from_json(
+        &fs::read(scratch.path("published").join(&coverage_object.key)).unwrap(),
+    )
+    .unwrap();
+    let verified: Vec<_> = coverage
+        .days
+        .iter()
+        .filter(|d| d.family == binary_alpha_engine::dataset::DayFamily::Observations)
+        .flat_map(|d| d.verified.iter().map(|r| r.bounds().unwrap()))
+        .collect();
     let by_stream: Vec<Vec<Row>> = (0..2)
-        .map(|stream| {
-            direct
-                .iter()
-                .filter(|(index, _)| *index == stream)
-                .map(|(_, candle)| Row::from(candle))
-                .collect()
+        .map(|index| {
+            let spec = &instrument.candles[index];
+            let mut continuous = binary_alpha_engine::continuous::Continuous::new(
+                instrument.session.as_ref().unwrap().calendar().unwrap(),
+                spec,
+                verified.clone(),
+                false,
+            )
+            .unwrap();
+            let mut rows = Vec::new();
+            let mut emit = |c: Candle| {
+                rows.push(Row::from(&c));
+                Ok(())
+            };
+            for (_, candle) in direct.iter().filter(|(stream, _)| *stream == index) {
+                continuous.push(candle.clone(), &mut emit).unwrap();
+            }
+            let pending = binary_alpha_engine::stream::interval_open(
+                ticks.last().unwrap().event_time_micros,
+                i64::from(spec.duration_seconds) * 1_000_000,
+                i64::from(spec.offset_seconds) * 1_000_000,
+            );
+            continuous.finish(Some(pending), &mut emit).unwrap();
+            rows
         })
         .collect();
     assert_eq!(by_stream, published.candles);
@@ -469,7 +516,8 @@ fn audit_publishes_a_stream_generation_that_verifies_and_matches_a_direct_feed()
         (1, 1, 0),
         "one contiguous jump, one after a twenty-second delay"
     );
-    let delayed = &five[3];
+    // Four interior fills precede this market candle under the continuous-grid rule.
+    let delayed = &five[7];
     assert_eq!(delayed.gap_before, Some(20_001_000));
     assert_eq!(
         delayed.facts[5], 5,
@@ -495,10 +543,11 @@ fn audit_publishes_a_stream_generation_that_verifies_and_matches_a_direct_feed()
     );
 
     // Verification reads the generation back from either store; a repeated audit reuses it.
+    // The continuous always-session product has twelve rows, including its six fills.
     assert_eq!(
         verify(manifest_path).unwrap(),
         format!(
-            "verified pocket_option:AEDCNY_otc development generation {expected_generation} candles 6 objects 3 bytes {}",
+            "verified pocket_option:AEDCNY_otc development generation {expected_generation} candles 12 objects 3 bytes {}",
             manifest
                 .objects
                 .iter()
@@ -695,8 +744,14 @@ fn audit_binds_only_a_configured_matching_instrument() {
     let miscounted_path = tampered.join(miscounted.key());
     fs::create_dir_all(miscounted_path.parent().unwrap()).unwrap();
     fs::write(&miscounted_path, miscounted.to_json()).unwrap();
+    let before = ["published", "retained", "tampered"].map(|dir| snapshot_tree(&scratch.path(dir)));
     let error = audit(&mismatched, &miscounted_path).unwrap_err();
     assert!(error.contains("day inventory mismatch"), "{error}");
+    assert_eq!(
+        before,
+        ["published", "retained", "tampered"].map(|dir| snapshot_tree(&scratch.path(dir))),
+        "refused audit must publish or retain no output"
+    );
     let mut contradicted = StreamManifest::from_json(&fs::read(manifest_path).unwrap()).unwrap();
     contradicted.source_kind = binary_alpha_engine::dataset::SourceKind::BrokerHistory;
     assert!(
@@ -1717,8 +1772,9 @@ fn descendant_audit_reuses_days_and_matches_full_weekend_recomputation() {
     ));
     let child_path = publish(&root, &mut child);
     let incremental_line = audit(&config, &child_path).unwrap();
+    // The always-session grid also materializes weekend fills in both configured streams.
     assert!(
-        incremental_line.contains("candle days encoded 5 reused 4"),
+        incremental_line.contains("candle days encoded 8 reused 4"),
         "{incremental_line}"
     );
     let stream_path = root.join(binary_alpha_engine::dataset::manifest_key(&generation(
@@ -1753,8 +1809,9 @@ fn descendant_audit_reuses_days_and_matches_full_weekend_recomputation() {
     fs::remove_file(root.join(parent_stream.manifest.key())).unwrap();
     fs::remove_file(scratch.path("retained").join(parent_stream.manifest.key())).unwrap();
     let full_line = audit(&config, &child_path).unwrap();
+    // Full encoding includes the same twelve day objects as the continuous incremental grid.
     assert!(
-        full_line.contains("candle days encoded 9 reused 0"),
+        full_line.contains("candle days encoded 12 reused 0"),
         "{full_line}"
     );
     let full = published_stream(&root, &stream_path);
@@ -1870,3 +1927,6 @@ fn descendant_bar_candles_preserve_signed_zero_bits_against_full_encoding() {
     audit(&config, &child_path).unwrap();
     common::verify(&child_stream_path).unwrap();
 }
+
+#[path = "phase03_instrument_stream/sessions.rs"]
+mod sessions;

@@ -2090,7 +2090,7 @@ fn pocket_connect_time_namespace_disconnect_keeps_origin_diagnostic() {
 
 fn instrument_text(broker: &str, symbol: &str, digits: u8, currency: &str) -> String {
     format!(
-        "\n[[instruments]]\nbroker = \"{broker}\"\nprovider_symbol = \"{symbol}\"\nquote_currency = \"{currency}\"\nprice_scale = {digits}\nnative_granularity = {{ kind = \"tick\" }}\ngap = {{ max_seconds = 1, reopen_seconds = 10 }}\ncandles = [{{ duration_seconds = 1, offset_seconds = 0, min_observations = 3 }}]\n"
+        "\n[[instruments]]\nbroker = \"{broker}\"\nprovider_symbol = \"{symbol}\"\nquote_currency = \"{currency}\"\nprice_scale = {digits}\nsession = {{ kind = \"always\" }}\nnative_granularity = {{ kind = \"tick\" }}\ngap = {{ max_seconds = 1, reopen_seconds = 10 }}\ncandles = [{{ duration_seconds = 1, offset_seconds = 0, min_observations = 3 }}]\n"
     )
 }
 fn test_config(scratch: &Scratch, kind: &str, endpoint: &str, two: bool) -> Config {
@@ -3038,15 +3038,18 @@ fn pocket_history_response(symbol: &str, before: &WireDecimal, index: u64) -> St
     )
 }
 
-fn serve_broker(kind: &'static str) -> (String, std::thread::JoinHandle<()>) {
+type SentHistory = std::sync::Arc<std::sync::Mutex<Vec<(usize, String, Vec<u8>)>>>;
+fn serve_broker(kind: &'static str) -> (String, std::thread::JoinHandle<()>, SentHistory) {
     use futures_util::{SinkExt, StreamExt};
     use tokio_tungstenite::tungstenite::Message;
     let (listener, url) = loopback_listener();
+    let sent: SentHistory = Default::default();
+    let server_sent = sent.clone();
     let server = std::thread::spawn(move || {
         runtime().block_on(async move {
             let listener = tokio::net::TcpListener::from_std(listener).unwrap();
             // Two fetch invocations (the second reuses the committed range), then one inspection.
-            for _ in 0..3 {
+            for invocation in 0..3 {
                 let (socket, _) =
                     tokio::time::timeout(std::time::Duration::from_secs(15), listener.accept())
                         .await
@@ -3168,14 +3171,17 @@ fn serve_broker(kind: &'static str) -> (String, std::thread::JoinHandle<()>) {
                                 }
                                 let request: Older = serde_json::from_slice(&argument).unwrap();
                                 assert_eq!((request.period, request.offset), (1, 200));
-                                replies.extend(attachment(
-                                    "loadHistoryPeriod",
-                                    pocket_history_response(
-                                        &request.asset,
-                                        &request.time,
-                                        request.index,
-                                    ),
+                                let payload = pocket_history_response(
+                                    &request.asset,
+                                    &request.time,
+                                    request.index,
+                                );
+                                server_sent.lock().unwrap().push((
+                                    invocation,
+                                    request.asset.clone(),
+                                    payload.as_bytes().to_vec(),
                                 ));
+                                replies.extend(attachment("loadHistoryPeriod", payload));
                             }
                             "subscribeSymbol" => {
                                 let symbol: String = serde_json::from_slice(&argument).unwrap();
@@ -3218,7 +3224,7 @@ fn serve_broker(kind: &'static str) -> (String, std::thread::JoinHandle<()>) {
             }
         })
     });
-    (url, server)
+    (url, server, sent)
 }
 
 #[derive(Deserialize)]
@@ -3245,7 +3251,7 @@ struct ReadDetail {
 fn binary_fetch_verify_and_inspect_both_providers_over_real_local_transports() {
     for kind in ["deriv", "pocket_option"] {
         let scratch = Scratch::new(&format!("phase10_binary_{kind}"));
-        let (url, server) = serve_broker(kind);
+        let (url, server, sent) = serve_broker(kind);
         let mut config = test_config(&scratch, kind, &url, true);
         if kind == "deriv" {
             #[derive(Deserialize)]
@@ -3389,17 +3395,105 @@ fn binary_fetch_verify_and_inspect_both_providers_over_real_local_transports() {
             .iter()
             .map(|path| (path.clone(), fs::read(path).unwrap()))
             .collect::<Vec<_>>();
+        let retained_before: std::collections::BTreeSet<_> =
+            scratch.objects("retained").into_iter().collect();
         let second = command(&args);
         assert_eq!(
             second.matches("(already published)").count(),
             if kind == "deriv" { 2 } else { 0 }
         );
+        let mut audited = manifests.clone();
         if kind == "pocket_option" {
+            let all = read_manifests(&scratch);
             assert_eq!(
-                read_manifests(&scratch).len(),
+                all.len(),
                 4,
-                "new response occurrences are retained"
+                "both instruments publish new response evidence"
             );
+            let new: Vec<_> = all
+                .into_iter()
+                .filter(|m| !manifests.iter().any(|old| old.generation == m.generation))
+                .collect();
+            assert_eq!(new.len(), 2);
+            assert_eq!(
+                new.iter()
+                    .map(|m| &m.instrument)
+                    .collect::<std::collections::BTreeSet<_>>(),
+                manifests
+                    .iter()
+                    .map(|m| &m.instrument)
+                    .collect::<std::collections::BTreeSet<_>>(),
+                "one new generation for each original instrument"
+            );
+            let acquisitions: Vec<_> = scratch
+                .objects("retained")
+                .into_iter()
+                .filter(|key| !retained_before.contains(key))
+                .filter_map(|key| {
+                    let bytes = fs::read(scratch.path("retained/objects").join(&key)).unwrap();
+                    let value: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+                    (value["kind"] == "acquisition" && value["instrument"].is_string())
+                        .then_some((format!("objects/{key}"), value))
+                })
+                .collect();
+            assert_eq!(acquisitions.len(), 2);
+            let sent = sent.lock().unwrap();
+            for manifest in &new {
+                common::verify(&scratch.path("published").join(manifest.key())).unwrap();
+                let old = manifests
+                    .iter()
+                    .find(|old| old.instrument == manifest.instrument)
+                    .unwrap();
+                let observations = |m: &GenerationManifest| {
+                    m.objects
+                        .iter()
+                        .filter(|o| o.path.starts_with("observations/"))
+                        .map(|o| (o.path.clone(), o.key.clone()))
+                        .collect::<Vec<_>>()
+                };
+                assert_eq!(observations(manifest), observations(old));
+                assert_eq!(manifest.row_count, old.row_count);
+                assert_eq!(
+                    common::read_normalized_ticks(&scratch.path("published"), manifest),
+                    common::read_normalized_ticks(&scratch.path("published"), old)
+                );
+                let acquisition = &acquisitions
+                    .iter()
+                    .find(|(_, value)| value["instrument"] == manifest.instrument)
+                    .unwrap()
+                    .0;
+                let pages = common::daily::pages(&scratch.path("published"), manifest);
+                let mut received: Vec<_> = pages
+                    .iter()
+                    .filter(|p| &p.acquisition_id == acquisition)
+                    .collect();
+                received.sort_by_key(|p| p.ordinal);
+                let expected: Vec<_> = sent
+                    .iter()
+                    .filter(|(invocation, symbol, _)| {
+                        *invocation == 1 && symbol == manifest.provider_symbol.as_str()
+                    })
+                    .map(|(_, _, bytes)| bytes)
+                    .collect();
+                assert!(!expected.is_empty());
+                assert_eq!(received.len(), expected.len());
+                for (ordinal, (page, bytes)) in received.iter().zip(expected).enumerate() {
+                    assert_eq!(page.ordinal, ordinal as u64);
+                    assert_eq!(&page.payload, bytes);
+                    assert_eq!(page.payload_sha256, hash(bytes));
+                    assert_eq!(
+                        page.disposition,
+                        binary_alpha_app::daily::PageDisposition::Indexed
+                    );
+                    assert!(page.receipt_time_utc.is_some());
+                }
+                let old_pages = common::daily::pages(&scratch.path("published"), old);
+                assert_eq!(pages.len(), old_pages.len() + received.len());
+                for page in old_pages {
+                    assert!(pages.contains(&page), "prior occurrence lost");
+                }
+            }
+            audited.extend(new);
             assert!(scratch.objects("published").len() > objects.len());
         } else {
             assert_eq!(objects, scratch.objects("published"));
@@ -3407,7 +3501,7 @@ fn binary_fetch_verify_and_inspect_both_providers_over_real_local_transports() {
         for (path, bytes) in before {
             assert_eq!(fs::read(path).unwrap(), bytes);
         }
-        for manifest in &manifests {
+        for manifest in &audited {
             let report = command(&[
                 "data",
                 "audit",

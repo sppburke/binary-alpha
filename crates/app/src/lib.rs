@@ -15,6 +15,9 @@ pub mod replay;
 pub mod research;
 pub mod retire;
 pub mod search;
+mod session_audit;
+mod session_candles;
+mod session_migration;
 pub mod store;
 pub mod verify;
 
@@ -52,6 +55,11 @@ pub fn load_config(path: &Path) -> Result<Config, String> {
     let source = std::fs::read_to_string(path)
         .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
     let config = Config::parse(&source).map_err(|error| error.to_string())?;
+    check_config_capabilities(&config)?;
+    Ok(config)
+}
+
+pub(crate) fn check_config_capabilities(config: &Config) -> Result<(), String> {
     if !cfg!(feature = "cuda")
         && config
             .accelerator
@@ -60,5 +68,5 @@ pub fn load_config(path: &Path) -> Result<Config, String> {
     {
         return Err("accelerator.backend: `cuda` requested but this binary was built without the `cuda` feature".into());
     }
-    Ok(config)
+    Ok(())
 }

@@ -130,7 +130,7 @@ fn synthetic_ticks() -> Vec<(i64, i64)> {
 
 fn tick_instrument(symbol: &str, candles: &str) -> String {
     format!(
-        "\n[[instruments]]\nbroker = \"pocket_option\"\nprovider_symbol = \"{symbol}\"\nbase_currency = \"AED\"\nquote_currency = \"CNY\"\nprice_scale = 6\nnative_granularity = {{ kind = \"tick\" }}\ngap = {{ max_seconds = 2, reopen_seconds = 60 }}\nfrozen = {{ min_observations = 10, min_seconds = 5 }}\njump = {{ min_basis_points = 5 }}\nspan = {{ min_percent = 75 }}\nsessions = [{{ name = \"week\", open_seconds = 0, close_seconds = 604800 }}]\ncandles = [{candles}]\n"
+        "\n[[instruments]]\nbroker = \"pocket_option\"\nprovider_symbol = \"{symbol}\"\nbase_currency = \"AED\"\nquote_currency = \"CNY\"\nprice_scale = 6\nsession = {{ kind = \"always\" }}\nnative_granularity = {{ kind = \"tick\" }}\ngap = {{ max_seconds = 2, reopen_seconds = 60 }}\nfrozen = {{ min_observations = 10, min_seconds = 5 }}\njump = {{ min_basis_points = 5 }}\nspan = {{ min_percent = 75 }}\nsessions = [{{ name = \"week\", open_seconds = 0, close_seconds = 604800 }}]\ncandles = [{candles}]\n"
     )
 }
 

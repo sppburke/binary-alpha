@@ -2126,6 +2126,9 @@ pub struct Instrument {
     pub span: Option<SpanCheck>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sessions: Option<Vec<Session>>,
+    /// Trading calendar for the daily continuous candle product (not profile windows).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session: Option<crate::session::Session>,
     pub candles: Vec<CandleSpec>,
 }
 
@@ -2190,6 +2193,9 @@ pub const SECONDS_PER_WEEK: u32 = 7 * 86_400;
 impl Instrument {
     /// The rules a single field's deserializer cannot see; an error names the field.
     pub fn validate(&self) -> Result<(), String> {
+        if let Some(session) = &self.session {
+            session.calendar()?;
+        }
         if self.candles.is_empty() {
             return Err("candles: at least one candle stream is required".to_string());
         }

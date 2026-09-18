@@ -38,6 +38,9 @@ use crate::verify;
 mod migration;
 pub use migration::{migrate, migrate_with};
 
+#[path = "data_pipeline_add.rs"]
+pub mod add_job;
+
 pub const PIPELINE_SCHEMA_VERSION: u32 = 1;
 pub const CATALOG_SCHEMA_VERSION: u32 = 1;
 const STORE_DIR: &str = "store";
@@ -153,6 +156,7 @@ impl Layout {
         let root = absolute(&base.join(&config.local_root))?;
         let store = root.join(STORE_DIR);
         let state = root.join(STATE_DIR);
+        check_managed_store(&store)?;
         for dir in [&store, &state] {
             fs::create_dir_all(dir)
                 .map_err(|error| format!("cannot create {}: {error}", dir.display()))?;
@@ -262,6 +266,78 @@ fn writer_lock_at(state: &Path, plan: Option<&Path>) -> Result<File, String> {
     }
 }
 
+/// A managed store has one lexical state owner. Reject a redirected store before any
+/// writer can mutate its destination using a different owner's retirement lock.
+fn check_managed_store(store: &Path) -> Result<(), String> {
+    match fs::symlink_metadata(store) {
+        Ok(metadata) if metadata.file_type().is_symlink() => Err(format!(
+            "pipeline: symlinked managed store is unsupported: {}",
+            store.display()
+        )),
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(format!(
+            "cannot inspect managed store {}: {error}",
+            store.display()
+        )),
+    }
+}
+
+/// Resolve one link at a time so an alias cannot hide a redirected managed store.
+/// The limit matches Linux's symlink traversal bound and also rejects cyclic aliases.
+fn import_destination(mut target: PathBuf) -> Result<PathBuf, String> {
+    for _ in 0..40 {
+        // A trailing slash makes symlink_metadata follow a directory link on Unix.
+        target = target.components().collect();
+        let mut redirect = None;
+        for path in target.ancestors().collect::<Vec<_>>().into_iter().rev() {
+            if path.file_name().is_some_and(|name| name == STORE_DIR)
+                && path
+                    .parent()
+                    .is_some_and(|parent| parent.join(STATE_DIR).is_dir())
+            {
+                check_managed_store(path)?;
+            }
+            match fs::symlink_metadata(path) {
+                Ok(metadata) if metadata.file_type().is_symlink() => {
+                    let link = fs::read_link(path).map_err(|e| e.to_string())?;
+                    let resolved = if link.is_absolute() {
+                        link
+                    } else {
+                        path.parent()
+                            .ok_or("import: symlink lacks parent")?
+                            .join(link)
+                    };
+                    redirect =
+                        Some(resolved.join(target.strip_prefix(path).map_err(|e| e.to_string())?));
+                    break;
+                }
+                Ok(_) => (),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => (),
+                Err(error) => {
+                    return Err(format!(
+                        "cannot inspect import destination {}: {error}",
+                        path.display()
+                    ));
+                }
+            }
+        }
+        if let Some(path) = redirect {
+            target = path;
+            continue;
+        }
+        let ancestor = target
+            .ancestors()
+            .find(|p| p.exists())
+            .ok_or("import: destination has no existing ancestor")?;
+        return Ok(ancestor
+            .canonicalize()
+            .map_err(|e| e.to_string())?
+            .join(target.strip_prefix(ancestor).map_err(|e| e.to_string())?));
+    }
+    Err("import: too many destination symlinks".into())
+}
+
 /// Standalone imports may write either copy into a pipeline store. Resolve existing path
 /// aliases, lock each managed store once, and hold all locks until publication finishes.
 pub(crate) fn import_writer_locks(config: &Config, base: &Path) -> Result<Vec<File>, String> {
@@ -278,15 +354,7 @@ pub(crate) fn import_writer_locks(config: &Config, base: &Path) -> Result<Vec<Fi
                 .map_err(|e| e.to_string())?
                 .join(target)
         };
-        // A destination can be new beneath an existing store or reached through a symlink.
-        let ancestor = target
-            .ancestors()
-            .find(|p| p.exists())
-            .ok_or("import: destination has no existing ancestor")?;
-        let resolved = ancestor
-            .canonicalize()
-            .map_err(|e| e.to_string())?
-            .join(target.strip_prefix(ancestor).map_err(|e| e.to_string())?);
+        let resolved = import_destination(target)?;
         for path in resolved.ancestors() {
             if path.file_name().is_some_and(|name| name == STORE_DIR)
                 && let Some(parent) = path.parent()
@@ -328,10 +396,17 @@ struct Bound {
     /// The one history instrument the job extends.
     symbol: String,
     evidence_sha256: String,
+    session_binding: Option<String>,
 }
 
 fn bind(job: &Job, layout: &Layout) -> Result<Bound, String> {
-    let core = crate::load_config(&layout.base.join(&job.config))
+    if crate::retire::retired_jobs(&layout.state)?.contains(&job.id) {
+        return Err(format!(
+            "job {} is retired; run data pipeline remove-job",
+            job.id
+        ));
+    }
+    let core = add_job::load_core(&layout.base.join(&job.config))
         .map_err(|reason| format!("job {}: {reason}", job.id))?;
     let field = |reason: String| format!("job {}: {reason}", job.id);
     if core.run_mode != RunMode::Research {
@@ -405,6 +480,7 @@ fn bind(job: &Job, layout: &Layout) -> Result<Bound, String> {
         core,
         symbol,
         evidence_sha256,
+        session_binding: add_job::session_binding(&layout.base.join(&job.config), false)?,
     })
 }
 
@@ -879,10 +955,10 @@ fn archive_generation(
         if retired.contains(&receipt.file_id) {
             continue;
         }
-        confirm_remote(drive, &receipt.file_id, receipt.bytes, &receipt.sha256)?;
         if digest != evidence_digest(&record_files, Some(key)) {
             continue;
         }
+        confirm_remote(drive, &receipt.file_id, receipt.bytes, &receipt.sha256)?;
         let scratch = state.join(".existing-catalog");
         drive.download(
             &receipt.file_id,
@@ -1513,16 +1589,13 @@ fn update_job(
         &bound.symbol,
         history.role,
         access,
-    )?
-    .ok_or_else(|| {
-        format!(
-            "job {}: the store holds no imported generation for {}:{}; run `data import` first",
-            job.id, history.broker, bound.symbol
-        )
-    })?;
+    )?;
     let pending_path = state.join("progress.json");
     let pages_path = state.join("progress.pages.jsonl");
     let (pending, partial) = read_pending(&pending_path, &pages_path)?;
+    if imported.is_none() {
+        add_job::session_binding(&layout.base.join(&job.config), true)?;
+    }
     let (diagnostics, received_partial) = crate::lineage::diagnostics(
         &state,
         pending.as_ref().map(|p| p.progress.pages.as_slice()),
@@ -1552,17 +1625,38 @@ fn update_job(
         (None, Some(end)) => end,
         (None, None) => clock.now_micros(),
     };
-    let seed = Seed {
-        provider_symbol: bound
-            .symbol
-            .clone()
-            .try_into()
-            .expect("a bound symbol is a provider symbol"),
-        manifest: layout.manifest_uri(&imported).parse::<ManifestUri>()?,
-        source_identity: broker::source_identity(settings),
+    let seeds = if let Some(pending) = &pending {
+        // A partial first acquisition can publish a daily root. Resume the original empty
+        // seed binding, rather than accidentally adopting that partial root as a new seed.
+        let mut bytes = Vec::new();
+        layout
+            .records()
+            .read_to(&pending.intent, None, &mut bytes)?;
+        serde_json::from_slice::<Intent>(&bytes)
+            .map_err(|e| e.to_string())?
+            .seeds
+    } else {
+        imported
+            .map(|imported| -> Result<Seed, String> {
+                Ok(Seed {
+                    provider_symbol: bound
+                        .symbol
+                        .clone()
+                        .try_into()
+                        .expect("a bound symbol is a provider symbol"),
+                    manifest: layout.manifest_uri(&imported).parse::<ManifestUri>()?,
+                    source_identity: broker::source_identity(settings),
+                })
+            })
+            .transpose()?
+            .into_iter()
+            .collect()
     };
-    let config = effective(&bound, layout, cutoff, vec![seed.clone()])?;
-    let binding = binding_hash(&config);
+    let config = effective(&bound, layout, cutoff, seeds.clone())?;
+    let binding = match &bound.session_binding {
+        Some(session) => sha256_hex(&json_bytes(&(binding_hash(&config), session))?),
+        None => binding_hash(&config),
+    };
     let records = layout.records();
     if let Some(pending) = &pending {
         if pending.effective_config_hash != binding {
@@ -1599,7 +1693,7 @@ fn update_job(
                 evidence_sha256: bound.evidence_sha256.clone(),
                 archive_root: drive.root().to_string(),
                 cutoff: Some(time_text(cutoff)),
-                seeds: vec![seed],
+                seeds,
             },
         )?,
     };

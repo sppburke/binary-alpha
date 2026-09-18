@@ -445,7 +445,7 @@ fn fixture() -> Fixture {
     )
     .unwrap();
     let core = deriv_core("ws://127.0.0.1:9/", 60, 50, 60);
-    fs::write(scratch.path("job.toml"), core.replace("frxEURUSD", "R_50")).unwrap();
+    fs::write(scratch.path("job.toml"), synthetic_deriv(core)).unwrap();
     let shared = pair
         .v1
         .objects
@@ -1972,4 +1972,171 @@ fn retirement_descendant_ancestry_cannot_authorize_unmapped_legacy_deletion() {
         assert!(root.join(unique.key).exists());
         common::verify(&root.join(descendant.key())).unwrap();
     }
+}
+
+fn completed_whole_fixture() -> Fixture {
+    let f = fixture();
+    // The synthetic acquisition has completed; its immutable receipt and response remain.
+    fs::remove_file(f.root.join("pipeline_state/deriv/progress.json")).unwrap();
+    fs::remove_file(f.root.join("pipeline_state/deriv/progress.pages.jsonl")).unwrap();
+    f
+}
+
+fn whole_plan(f: &Fixture) -> Result<(PathBuf, Plan), String> {
+    let report = pipeline(
+        "retire",
+        &f.config,
+        &["--job", "deriv", "--whole-job", "--plan"],
+    )?;
+    let path = PathBuf::from(report.split_whitespace().nth(2).unwrap());
+    let planned = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    Ok((path, planned))
+}
+
+#[test]
+fn whole_job_removes_v1_v2_and_completed_uncataloged_uploads_with_fenced_resume() {
+    let f = completed_whole_fixture();
+    let bytes = b"completed job upload before catalog publication";
+    let key = format!("objects/{}", sha256(bytes));
+    fs::write(f.root.join("store").join(&key), bytes).unwrap();
+    let id = remote(
+        &f.drive,
+        &key,
+        &format!("object-{}", sha256(bytes)),
+        bytes.to_vec(),
+    );
+    fs::write(
+        f.root.join("pipeline_state/deriv/transfers.json"),
+        json!({"files":{&key:{"file_id":id,"done":true}}}).to_string(),
+    )
+    .unwrap();
+    let (path, planned) = whole_plan(&f).unwrap();
+    for generation in f
+        .old
+        .iter()
+        .chain([&f.new_dataset.generation, &f.new_stream.generation])
+    {
+        assert!(
+            planned
+                .delete_local
+                .iter()
+                .any(|item| item.path == format!("manifests/{generation}"))
+        );
+    }
+    assert!(planned.delete_local.iter().any(|item| item.path == key));
+    assert!(planned.delete_drive.iter().any(|item| item.file_id == id));
+    f.drive.faults.lock().unwrap().after = Some(1);
+    apply(&f, &path).unwrap_err();
+    assert!(
+        pipeline("remove-job", &f.config, &["--job", "deriv"])
+            .unwrap_err()
+            .contains("unfinished")
+    );
+    assert!(
+        pipeline("archive", &f.config, &[])
+            .unwrap_err()
+            .contains("unfinished")
+    );
+    f.drive.faults.lock().unwrap().after = None;
+    apply(&f, &path).unwrap();
+    assert!(
+        binary_alpha_app::store::Store::filesystem(f.root.join("store"))
+            .list_manifests()
+            .unwrap()
+            .is_empty()
+    );
+    assert!(!f.root.join("store").join(key).exists());
+    let state = f.drive.drive.state.lock().unwrap();
+    assert!(
+        state
+            .files
+            .values()
+            .all(|entry| entry.name.starts_with("record-")),
+        "{:?}",
+        state.files.keys()
+    );
+    drop(state);
+    for (path, bytes) in &f.original_records {
+        assert_eq!(&fs::read(path).unwrap(), bytes);
+    }
+    assert!(
+        pipeline("archive", &f.config, &[])
+            .unwrap_err()
+            .contains("is retired")
+    );
+    pipeline("remove-job", &f.config, &["--job", "deriv"]).unwrap();
+}
+
+#[test]
+fn whole_job_refuses_other_record_ownership_and_pinned_standalone_data() {
+    for foreign in [false, true] {
+        let f = completed_whole_fixture();
+        let bytes = b"standalone owned response";
+        let key = format!("objects/{}", sha256(bytes));
+        fs::write(f.root.join("store").join(&key), bytes).unwrap();
+        let records = f.root.join("pipeline_state/records");
+        fs::write(
+            records.join("owned-response.json"),
+            json!({"job":"deriv","requests":[{"sha256":sha256(bytes),"rows":1}]}).to_string(),
+        )
+        .unwrap();
+        if foreign {
+            fs::write(records.join("foreign.json"), json!({"job":"other","intent":"old-intent.json","requests":[{"sha256":sha256(bytes),"rows":1}]}).to_string()).unwrap();
+        } else {
+            fs::write(
+                f.scratch.path("active-reference.toml"),
+                format!("retained = {key:?}\n"),
+            )
+            .unwrap();
+        }
+        let error = whole_plan(&f).unwrap_err();
+        assert!(
+            error.contains("pinned") || error.contains("referenced"),
+            "{error}"
+        );
+        assert_eq!(fs::read(f.root.join("store").join(&key)).unwrap(), bytes);
+        assert_eq!(f.drive.faults.lock().unwrap().deleted, 0);
+    }
+}
+
+#[test]
+fn whole_job_cannot_use_unbound_migration_aliases() {
+    let f = completed_whole_fixture();
+    let path = f.root.join("pipeline_state/records/migration.json");
+    let mut record = read_json(&path);
+    record["storage_aliases"] = json!([f.pending]);
+    // A forged equality summary does not update the exact root's evidence binding.
+    fs::write(path, record.to_string()).unwrap();
+    assert!(whole_plan(&f).is_err());
+    assert_eq!(f.drive.faults.lock().unwrap().deleted, 0);
+}
+
+#[test]
+fn whole_job_includes_remote_only_catalog_closures() {
+    let f = completed_whole_fixture();
+    fs::remove_dir_all(f.root.join("store")).unwrap();
+    fs::create_dir_all(f.root.join("store")).unwrap();
+    let (path, plan) = whole_plan(&f).unwrap();
+    assert!(plan.delete_local.is_empty());
+    assert!(
+        plan.delete_drive
+            .iter()
+            .any(|item| item.file_id == f.old_catalog)
+    );
+    assert!(
+        plan.delete_drive
+            .iter()
+            .any(|item| item.file_id == f.new_catalog)
+    );
+    apply(&f, &path).unwrap();
+    assert!(
+        f.drive
+            .drive
+            .state
+            .lock()
+            .unwrap()
+            .files
+            .values()
+            .all(|entry| entry.name.starts_with("record-"))
+    );
 }

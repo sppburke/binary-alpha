@@ -99,6 +99,8 @@ pub struct Plan {
     pub store: PathBuf,
     pub archive_root: String,
     pub jobs: Vec<String>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub whole_job: bool,
     pub state: BTreeMap<String, Identity>,
     pub remote_state: BTreeMap<String, Value>,
     pub references: Vec<Reference>,
@@ -796,8 +798,41 @@ pub(crate) fn retired_closures(state: &Path) -> Result<BTreeSet<String>, String>
             retired.insert(remote.key);
             retired.insert(remote.file_id);
         }
+        // Fresh-store plans can retire historical references whose byte copies were already
+        // omitted by a verified migration restore. Keep that sealed decision for later jobs.
+        retired.extend(
+            plan.references
+                .into_iter()
+                .filter(|reference| reference.status == Status::Retired)
+                .map(|reference| reference.closure),
+        );
     }
     Ok(retired)
+}
+
+/// Completed whole-job plans are tombstones, preventing a timer from recreating retired
+/// data while the operator finishes removing the document entry.
+pub(crate) fn retired_jobs(state: &Path) -> Result<BTreeSet<String>, String> {
+    retired_closures(state)?;
+    let mut paths = Vec::new();
+    files(&state.join("retirement"), &mut paths)?;
+    let mut jobs = BTreeSet::new();
+    for path in paths
+        .iter()
+        .filter(|p| p.to_string_lossy().ends_with(".retired.json"))
+    {
+        let completed = json(&fs::read(path).map_err(|e| e.to_string())?)?;
+        let digest = string(&completed, "plan_sha256")?;
+        let plan: Plan = serde_json::from_slice(
+            &fs::read(state.join("retirement").join(format!("plan-{digest}.json")))
+                .map_err(|e| e.to_string())?,
+        )
+        .map_err(|e| e.to_string())?;
+        if plan.whole_job {
+            jobs.extend(plan.jobs);
+        }
+    }
+    Ok(jobs)
 }
 
 /// Called under the managed-store writer lock, before any producer can change sealed state.
@@ -948,6 +983,19 @@ pub fn run(
     apply: Option<&Path>,
     out: &mut dyn Write,
 ) -> Result<(), String> {
+    run_scoped(config_path, job, apply, false, out)
+}
+
+pub fn run_scoped(
+    config_path: &Path,
+    job: Option<&str>,
+    apply: Option<&Path>,
+    whole_job: bool,
+    out: &mut dyn Write,
+) -> Result<(), String> {
+    if whole_job && job.is_none() {
+        return Err("retire: --whole-job requires one --job".into());
+    }
     let (config, layout, _) = data_pipeline::load(config_path)?;
     let _lock = data_pipeline::retirement_writer_lock(&layout, apply)?;
     let archive_lock = data_pipeline::retirement_archive_lock(&config, apply)?;
@@ -959,6 +1007,13 @@ pub fn run(
     };
     let mut drive = Drive::open(&config.drive)?;
     if let Some(path) = apply {
+        if whole_job {
+            let plan: Plan = serde_json::from_slice(&fs::read(path).map_err(|e| e.to_string())?)
+                .map_err(|e| e.to_string())?;
+            if !plan.whole_job {
+                return Err("retire: plan is not a whole-job retirement".into());
+            }
+        }
         return apply_plan(
             config_path,
             &config,
@@ -971,7 +1026,15 @@ pub fn run(
             out,
         );
     }
-    let plan = plan(config_path, &config, &layout, &mut drive, access, job)?;
+    let plan = plan(
+        config_path,
+        &config,
+        &layout,
+        &mut drive,
+        access,
+        job,
+        whole_job,
+    )?;
     let bytes = crate::fetch::json_bytes(&plan)?;
     let path = layout
         .state
@@ -1045,6 +1108,7 @@ fn archived_lineage(
     json(&download(&entry.file_id, entry.bytes, &entry.sha256)?)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn plan(
     config_path: &Path,
     config: &PipelineConfig,
@@ -1052,6 +1116,7 @@ fn plan(
     drive: &mut Drive,
     access: Access<'_>,
     job_filter: Option<&str>,
+    whole_job: bool,
 ) -> Result<Plan, String> {
     if job_filter.is_some_and(|id| !config.jobs.iter().any(|job| job.id == id)) {
         return Err("retire: unknown job".into());
@@ -1076,7 +1141,7 @@ fn plan(
         if job_filter.is_some_and(|id| id != job.id) {
             continue;
         }
-        let core = crate::load_config(&layout.base.join(&job.config))?;
+        let core = data_pipeline::add_job::load_core(&layout.base.join(&job.config))?;
         let history = core
             .history
             .as_ref()
@@ -1085,6 +1150,28 @@ fn plan(
             return Err("retire: job requires one instrument".into());
         };
         let instrument = format!("{}:{symbol}", history.broker);
+        if whole_job {
+            if history.role != DatasetRole::Development {
+                return Err("retire: whole-job retirement requires development data".into());
+            }
+            for other in config.jobs.iter().filter(|other| other.id != job.id) {
+                let core = data_pipeline::add_job::load_core(&layout.base.join(&other.config))?;
+                if core
+                    .history
+                    .as_ref()
+                    .is_some_and(|h| h.broker == history.broker && h.instruments.contains(symbol))
+                {
+                    return Err("retire: instrument is also owned by another configured job".into());
+                }
+            }
+            if layout.state.join(&job.id).join("progress.json").exists() {
+                return Err(
+                    "retire: complete the pending acquisition before whole-job retirement".into(),
+                );
+            }
+            selected.insert(job.id.clone(), (instrument, String::new()));
+            continue;
+        }
         let candidates: Vec<_> = archives
             .iter()
             .filter(|a| {
@@ -1145,12 +1232,205 @@ fn plan(
     let mut preserved_catalogs = BTreeSet::new();
     let mut completed_records = BTreeSet::new();
     let mut owned_records = BTreeSet::new();
+    let mut inventory_snapshots = BTreeSet::new();
     let mut migrated_objects = BTreeSet::new();
+    let mut declared_history = BTreeSet::new();
     let mut job_owners: BTreeMap<_, _> = selected
         .keys()
         .map(|job| (job.clone(), job.clone()))
         .collect();
     for (job, (instrument, catalog_id)) in &selected {
+        if whole_job {
+            replaced.extend(
+                manifests
+                    .iter()
+                    .filter(|(_, m)| m.ordinary && &m.instrument == instrument)
+                    .map(|(id, _)| id.clone()),
+            );
+            // Current descendant catalogs retain the cumulative migration evidence even
+            // after ordinary retirement removes the original root catalog and older roots.
+            let mut authenticated_records = BTreeSet::new();
+            let mut covered_records = BTreeSet::new();
+            for archive in archives
+                .iter()
+                .filter(|a| a.job == *job && a.value["instrument"] == *instrument)
+            {
+                let Some(source) = manifests
+                    .get(&archive.dataset)
+                    .filter(|m| m.ordinary && m.daily && m.dataset && &m.instrument == instrument)
+                else {
+                    continue;
+                };
+                let catalog = data_pipeline::Catalog::from_json(
+                    &serde_json::to_vec(&archive.value).map_err(|e| e.to_string())?,
+                )?;
+                let dataset = GenerationManifest::from_json(
+                    &serde_json::to_vec(&source.value).map_err(|e| e.to_string())?,
+                )?;
+                let Ok(bindings) = catalog.check_migration_records(layout, &dataset, access) else {
+                    continue;
+                };
+                covered_records.extend(
+                    bindings
+                        .covered_files
+                        .iter()
+                        .map(|key| layout.state.join(key)),
+                );
+                inventory_snapshots.extend(
+                    bindings
+                        .inventory_snapshots
+                        .iter()
+                        .map(|key| crate::lineage::record_name(key).map(str::to_string))
+                        .collect::<Result<BTreeSet<_>, _>>()?,
+                );
+                for (key, identity) in data_pipeline::evidence_records(layout, job, &bindings)? {
+                    if catalog.records.iter().any(|r| {
+                        r.key == key && r.bytes == identity.bytes && r.sha256 == identity.sha256
+                    }) {
+                        authenticated_records.insert(layout.state.join(key));
+                    }
+                }
+            }
+            for path in &authenticated_records {
+                owned_records.insert(
+                    path.file_name()
+                        .ok_or("retire: record filename absent")?
+                        .to_string_lossy()
+                        .into_owned(),
+                );
+                // Verified migration alias tables name the legacy byte sources represented
+                // losslessly in daily pages. Fresh restores intentionally omit those copies.
+                if covered_records.contains(path) && path.extension().is_some_and(|e| e == "jsonl")
+                {
+                    for alias in documents(path)? {
+                        for field in ["source", "checkpoint"] {
+                            if let Some(key) = alias[field]["key"].as_str() {
+                                if !valid_key(key) || !key.starts_with("objects/") {
+                                    return Err("retire: invalid migrated source key".into());
+                                }
+                                migrated_objects.insert(key.to_string());
+                            }
+                        }
+                    }
+                }
+            }
+            completed_records.extend(covered_records.iter().filter_map(|path| {
+                path.file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+            }));
+            for record in migrations.iter().filter(|r| r.job == *job && r.verified()) {
+                let mut archived = false;
+                let mut authenticated = false;
+                for path in &record_paths {
+                    let bytes = fs::read(path).map_err(|e| e.to_string())?;
+                    if serde_json::from_slice::<MigrationRecord>(&bytes).is_ok_and(|r| {
+                        serde_json::to_value(r).ok() == serde_json::to_value(record).ok()
+                    }) {
+                        authenticated |= covered_records.contains(path);
+                        let key = format!(
+                            "records/{}",
+                            path.file_name()
+                                .ok_or("retire: invalid record path")?
+                                .to_string_lossy()
+                        );
+                        archived |= archives.iter().any(|a| {
+                            a.job == *job
+                                && a.value["instrument"] == *instrument
+                                && a.value["role"] == "development"
+                                && a.entries
+                                    .iter()
+                                    .any(|e| e.key == manifest_key(&record.v2_root))
+                                && a.entries
+                                    .iter()
+                                    .any(|e| e.key == manifest_key(&record.v2_stream))
+                                && a.entries.iter().any(|e| {
+                                    e.key == key
+                                        && e.identity.bytes == bytes.len() as u64
+                                        && e.identity.sha256 == hash(&bytes)
+                                })
+                        });
+                    }
+                }
+                if archived || authenticated {
+                    // Absent historical identities are catalog-bound, not unknown dependencies;
+                    // this grants no authority over another live root.
+                    declared_history.extend(record.mapping.v1_generations.iter().cloned());
+                    declared_history.extend(record.mapping.streams());
+                    declared_history.insert(record.v2_root.clone());
+                    declared_history.insert(record.v2_stream.clone());
+                }
+                if record.predecessor_jobs.is_empty() && record.storage_aliases.is_empty() {
+                    continue;
+                }
+                if !authenticated {
+                    return Err("retire: migration ownership is not bound to verified archived evidence; restore the current catalog first".into());
+                }
+                for predecessor in &record.predecessor_jobs {
+                    if config
+                        .jobs
+                        .iter()
+                        .any(|j| &j.id == predecessor && j.id != *job)
+                    {
+                        return Err("retire: predecessor job is still configured".into());
+                    }
+                    job_owners.insert(predecessor.clone(), job.clone());
+                }
+                for key in &record.storage_aliases {
+                    if !valid_key(key)
+                        || !key.starts_with("objects/")
+                        || (layout.store.join(key).exists()
+                            && Identity::of(&layout.store.join(key))?.sha256
+                                != key["objects/".len()..])
+                    {
+                        return Err("retire: invalid migrated storage alias identity".into());
+                    }
+                    migrated_objects.insert(key.clone());
+                }
+            }
+            // A self-contained descendant explicitly names absent older daily datasets.
+            // Its archived operation receipt supplies the corresponding historical stream.
+            for m in manifests
+                .values()
+                .filter(|m| m.ordinary && m.daily && m.dataset && &m.instrument == instrument)
+            {
+                for object in m.value["objects"]
+                    .as_array()
+                    .ok_or("retire: missing daily objects")?
+                {
+                    if object["path"] != "provenance/lineage.json" {
+                        continue;
+                    }
+                    let path = layout.store.join(string(object, "key")?);
+                    let identity = Identity::of(&path)?;
+                    if object["sha256"] != identity.sha256 || object["bytes"] != identity.bytes {
+                        return Err("retire: lineage object identity mismatch".into());
+                    }
+                    let lineage = json(&fs::read(path).map_err(|e| e.to_string())?)?;
+                    for ancestor in lineage["ancestors"].as_array().into_iter().flatten() {
+                        let id = ancestor
+                            .as_str()
+                            .filter(|id| hex_id(id))
+                            .ok_or("retire: invalid daily ancestor")?;
+                        declared_history.insert(id.to_string());
+                    }
+                }
+            }
+            for path in &authenticated_records {
+                for receipt in documents(path)? {
+                    if receipt["command"] == "update"
+                        && receipt["dataset_generation"]
+                            .as_str()
+                            .is_some_and(|id| declared_history.contains(id))
+                        && let Some(stream) = receipt["stream_generation"]
+                            .as_str()
+                            .filter(|id| hex_id(id))
+                    {
+                        declared_history.insert(stream.to_string());
+                    }
+                }
+            }
+            continue;
+        }
         let archive = archives
             .iter()
             .find(|a| &a.file.file_id == catalog_id)
@@ -1360,37 +1640,24 @@ fn plan(
             )?;
             let bindings = catalog.check_migration_records(layout, &root_manifest, access)
                 .map_err(|e| format!("retire: verified migration evidence is not archived with the retained v2 catalog: {e}"))?;
+            inventory_snapshots.extend(
+                bindings
+                    .inventory_snapshots
+                    .iter()
+                    .map(|key| crate::lineage::record_name(key).map(str::to_string))
+                    .collect::<Result<BTreeSet<_>, _>>()?,
+            );
             // The job's cumulative evidence closure (superseded migration receipts, their alias
             // tables, predecessor jobs' records) is its own immutable history, archived with the
             // catalog. Owned records never pin the closures a verified superseding record replaced.
             for key in data_pipeline::evidence_records(layout, job, &bindings)?.keys() {
                 owned_records.insert(crate::lineage::record_name(key)?.to_string());
             }
-            // Superseded immutable receipts are covered only when the selected proof
-            // names their exact dataset AND stream. Ownership alone cannot release an
-            // unrelated receipt's source aliases after restoration or retirement.
-            for name in &owned_records {
-                for value in documents(&layout.state.join("records").join(name))? {
-                    if let Ok(record) = serde_json::from_value::<MigrationRecord>(value)
-                        && record.job == *job
-                        && record.baseline_verified()
-                        && preservation.iter().any(|p| {
-                            p.dataset == record.v2_root && p.streams.contains(&record.v2_stream)
-                        })
-                    {
-                        completed_records.insert(name.clone());
-                        if let Some(alias) =
-                            record.evidence.get("alias_table").and_then(Value::as_str)
-                            && owned_records.contains(alias)
-                        {
-                            completed_records.insert(alias.to_string());
-                        }
-                    }
-                }
-            }
+            // The shared lineage owner distinguishes the full archived inventory from
+            // censuses covered by the selected proof and exact former root/stream pairs.
             let mapping: MigrationMapping =
                 serde_json::from_value(lineage[&seed].clone()).map_err(|e| e.to_string())?;
-            for key in bindings.files.keys() {
+            for key in &bindings.covered_files {
                 completed_records.insert(crate::lineage::record_name(key)?.to_string());
                 for value in documents(&layout.state.join(key))? {
                     if let Ok(record) = serde_json::from_value::<MigrationRecord>(value)
@@ -1483,9 +1750,31 @@ fn plan(
         }
     }
     let mut known: BTreeSet<String> = manifests.keys().cloned().collect();
+    known.extend(declared_history);
     let mut graph = BTreeMap::new();
     let mut roots = BTreeSet::new();
     let mut candidates = BTreeSet::new();
+    let completed_transfers = if whole_job {
+        crate::registry::completed_aliases(&layout.state, &config.drive)?
+    } else {
+        BTreeMap::new()
+    };
+    for (id, aliases) in &completed_transfers {
+        if already_retired.contains(id) && !remote.contains_key(id) {
+            continue;
+        }
+        for (owner, key) in aliases.iter().filter_map(|alias| alias.split_once('/')) {
+            if key.starts_with("objects/") {
+                known.insert(key.to_string());
+                if job_owners.contains_key(owner) {
+                    candidates.insert(key.to_string());
+                } else {
+                    roots.insert(key.to_string());
+                    roots.insert(id.clone());
+                }
+            }
+        }
+    }
     known.extend(migrated_objects.iter().cloned());
     // Keys a verified migration record declares as storage aliases or migrated byte sources
     // are represented by v2 pages. They are retirement candidates by declaration and never
@@ -1539,18 +1828,25 @@ fn plan(
         closure.remove(&a.file.key);
         closure.extend(a.entries.iter().map(|e| e.file_id.clone()));
         graph.insert(a.file.file_id.clone(), closure);
-        if job_owners
-            .get(&a.job)
-            .and_then(|owner| selected.get(owner))
-            .is_some_and(|(instrument, id)| {
-                id != &a.file.file_id && a.value["instrument"] == *instrument
-            })
-            && a.value["role"] == "development"
-            && if a.value["layout"] == "daily-v2" {
-                preserved_catalogs.contains(&a.file.file_id)
-            } else {
-                replaced.contains(&a.dataset)
-            }
+        let whole_owned = whole_job
+            && job_owners
+                .get(&a.job)
+                .and_then(|owner| selected.get(owner))
+                .is_some_and(|(instrument, _)| a.value["instrument"] == *instrument)
+            && a.value["role"] == "development";
+        if whole_owned
+            || (job_owners
+                .get(&a.job)
+                .and_then(|owner| selected.get(owner))
+                .is_some_and(|(instrument, id)| {
+                    id != &a.file.file_id && a.value["instrument"] == *instrument
+                })
+                && a.value["role"] == "development"
+                && if a.value["layout"] == "daily-v2" {
+                    preserved_catalogs.contains(&a.file.file_id)
+                } else {
+                    replaced.contains(&a.dataset)
+                })
         {
             candidates.insert(a.file.file_id.clone());
         } else {
@@ -1568,13 +1864,185 @@ fn plan(
         known.insert(id.clone());
         records.push((path, id));
     }
+    let mut historical_refs = BTreeMap::new();
+    // A fresh restore carries immutable records for retained jobs but deliberately omits
+    // their legacy byte copies. Only a verified, archived migration can classify those
+    // absent record references as history. Live configuration and pending pins stay strict.
+    let mut historical_record_objects: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    if whole_job {
+        for archive in &archives {
+            let Some(source) = manifests.get(&archive.dataset).filter(|m| {
+                m.ordinary && m.daily && m.dataset && archive.value["instrument"] == m.instrument
+            }) else {
+                continue;
+            };
+            let catalog = data_pipeline::Catalog::from_json(
+                &serde_json::to_vec(&archive.value).map_err(|e| e.to_string())?,
+            )?;
+            let dataset = GenerationManifest::from_json(
+                &serde_json::to_vec(&source.value).map_err(|e| e.to_string())?,
+            )?;
+            let Ok(bindings) = catalog.check_migration_records(layout, &dataset, access) else {
+                continue;
+            };
+            inventory_snapshots.extend(
+                bindings
+                    .inventory_snapshots
+                    .iter()
+                    .map(|key| crate::lineage::record_name(key).map(str::to_string))
+                    .collect::<Result<BTreeSet<_>, _>>()?,
+            );
+            let mut historical = BTreeSet::new();
+            for key in &bindings.covered_files {
+                for value in documents(&layout.state.join(key))? {
+                    for field in ["source", "checkpoint"] {
+                        if let Some(key) = value[field]["key"].as_str() {
+                            if !valid_key(key) || !key.starts_with("objects/") {
+                                return Err("retire: invalid historical source key".into());
+                            }
+                            historical.insert(key.to_string());
+                        }
+                    }
+                    if let Ok(record) = serde_json::from_value::<MigrationRecord>(value)
+                        && record.verified()
+                    {
+                        if record
+                            .storage_aliases
+                            .iter()
+                            .any(|key| !valid_key(key) || !key.starts_with("objects/"))
+                        {
+                            return Err("retire: invalid historical storage alias".into());
+                        }
+                        historical.extend(record.storage_aliases);
+                    }
+                }
+            }
+            historical.retain(|key| !layout.store.join(key).exists());
+            for (key, identity) in data_pipeline::evidence_records(layout, &archive.job, &bindings)?
+            {
+                if bindings.covered_files.contains(&key)
+                    && catalog.records.iter().any(|r| {
+                        r.key == key && r.bytes == identity.bytes && r.sha256 == identity.sha256
+                    })
+                {
+                    let history = historical_record_objects
+                        .entry(crate::lineage::record_name(&key)?.to_string())
+                        .or_default();
+                    history.extend(historical.iter().cloned());
+                    // A verified census may mention another instrument's bytes as
+                    // unattributed metadata. An absent copy independently covered by the
+                    // selected migration is historical, not a live receipt dependency.
+                    // Keep this exemption on authenticated migration metadata only.
+                    for mut value in documents(&layout.state.join(&key))? {
+                        if serde_json::from_value::<MigrationRecord>(value.clone())
+                            .is_ok_and(|record| record.baseline_verified())
+                        {
+                            let mut negative = BTreeSet::new();
+                            if let Some(objects) = value["unresolved_objects"].as_array_mut() {
+                                objects.retain(|object| {
+                                    if object["attributable"] == false
+                                        && object["deletion_authorized"] == false
+                                        && let Some(source) = object["key"].as_str()
+                                        && source.strip_prefix("objects/")
+                                            == object["sha256"].as_str()
+                                        && migrated_keys.contains(source)
+                                        && !layout.store.join(source).exists()
+                                    {
+                                        negative.insert(source.to_string());
+                                        false
+                                    } else {
+                                        true
+                                    }
+                                });
+                            }
+                            let mut dependencies = BTreeSet::new();
+                            references(&value, &known, &mut dependencies);
+                            history.extend(negative.difference(&dependencies).cloned());
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let mut record_history_decisions: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
     for (path, id) in &records {
         let values = documents(path)?;
         let mut refs = BTreeSet::new();
         for value in &values {
             references(value, &known, &mut refs);
+            if inventory_snapshots.contains(id) && value["kind"] == "migration_metadata_snapshot" {
+                let metadata: Value = serde_json::from_str(
+                    value["payload"]
+                        .as_str()
+                        .ok_or("retire: missing snapshot payload")?,
+                )
+                .map_err(|e| e.to_string())?;
+                references(&metadata, &known, &mut refs);
+            }
         }
-        graph.insert(id.clone(), refs);
+        refs.retain(|key| {
+            let historical = historical_record_objects
+                .get(id)
+                .is_some_and(|history| history.contains(key))
+                || (key.starts_with("objects/")
+                    && already_retired.contains(key)
+                    && !layout.store.join(key).exists());
+            if historical {
+                record_history_decisions
+                    .entry(id.clone())
+                    .or_default()
+                    .insert(key.clone());
+            }
+            !historical
+        });
+        // These exact catalog-bound snapshots authenticate superseded inventories. Report
+        // their historical pointers without requiring retired market closures to exist.
+        if inventory_snapshots.contains(id) {
+            historical_refs.insert(id.clone(), refs);
+            graph.insert(id.clone(), BTreeSet::new());
+        } else {
+            graph.insert(id.clone(), refs);
+        }
+    }
+    if whole_job {
+        // Acquisition records reference their job's intent; catalog receipts bind its exact
+        // catalog. Resolve ownership through immutable records, not filename prefixes.
+        for (path, id) in &records {
+            if documents(path)?.iter().any(|v| {
+                v["job"]
+                    .as_str()
+                    .is_some_and(|j| job_owners.contains_key(j))
+            }) {
+                owned_records.insert(id.clone());
+            }
+        }
+        loop {
+            let previous = owned_records.len();
+            for (path, id) in &records {
+                let values = documents(path)?;
+                if values.iter().any(|v| {
+                    v.get("job")
+                        .is_some_and(|j| !j.as_str().is_some_and(|j| job_owners.contains_key(j)))
+                }) {
+                    continue;
+                }
+                if values.iter().any(|v| {
+                    ["intent", "acquisition_id"]
+                        .iter()
+                        .any(|field| v[field].as_str().is_some_and(|r| owned_records.contains(r)))
+                        || v["file_id"].as_str().is_some_and(|id| {
+                            archives
+                                .iter()
+                                .any(|a| job_owners.contains_key(&a.job) && a.file.file_id == id)
+                        })
+                }) {
+                    owned_records.insert(id.clone());
+                }
+            }
+            if previous == owned_records.len() {
+                break;
+            }
+        }
     }
     // Research and other non-pipeline manifests retain their complete explicit dependencies.
     for (id, m) in &manifests {
@@ -1638,6 +2106,20 @@ fn plan(
             .is_some_and(|n| n.to_string_lossy().starts_with("reclaim-"))
         {
             roots.extend(crate::lineage::reclamation_roots(&path)?);
+            continue;
+        }
+        if whole_job
+            && path.file_name().is_some_and(|n| n == "migration.json")
+            && path
+                .parent()
+                .and_then(Path::file_name)
+                .and_then(|n| n.to_str())
+                .is_some_and(|j| job_owners.contains_key(j))
+        {
+            let value = json(&fs::read(&path).map_err(|e| e.to_string())?)?;
+            if value["phase"] != "verified" {
+                return Err("retire: finish pending migration before whole-job retirement".into());
+            }
             continue;
         }
         if path.starts_with(layout.state.join("registry"))
@@ -1775,8 +2257,15 @@ fn plan(
     let mut eligible = candidates.clone();
     expand(&mut eligible, &graph);
     for (path, id) in &records {
+        if inventory_snapshots.contains(id) {
+            continue;
+        }
         let mut selected_record = completed_records.contains(id) || owned_records.contains(id);
+        let mut foreign_job = false;
         for value in documents(path)? {
+            foreign_job |= value
+                .get("job")
+                .is_some_and(|j| !j.as_str().is_some_and(|j| job_owners.contains_key(j)));
             selected_record |= value
                 .get("job")
                 .and_then(Value::as_str)
@@ -1808,7 +2297,7 @@ fn plan(
             }
             let mut required_pages = BTreeSet::new();
             retained_pages(&value, &mut required_pages, &layout.store);
-            if value.get("requests").is_some() && !completed_records.contains(id) {
+            if !whole_job && value.get("requests").is_some() && !completed_records.contains(id) {
                 roots.extend(required_pages.intersection(&migrated_keys).cloned());
             }
             graph.entry(id.clone()).or_default().extend(required_pages);
@@ -1819,6 +2308,17 @@ fn plan(
         selected_record |= archives
             .iter()
             .any(|a| job_owners.contains_key(&a.job) && closure.contains(&a.file.file_id));
+        if whole_job && foreign_job {
+            selected_record = false;
+        }
+        if whole_job && selected_record {
+            // Completed standalone responses are job data too. Other records and live pins
+            // still retain shared objects when reachability is expanded below.
+            for key in closure.iter().filter(|key| key.starts_with("objects/")) {
+                candidates.insert(key.clone());
+                eligible.insert(key.clone());
+            }
+        }
         let resolved = |dependency: &String| {
             graph.contains_key(dependency)
                 || known.contains(dependency)
@@ -1849,6 +2349,36 @@ fn plan(
     }
     expand(&mut roots, &graph);
     expand(&mut candidates, &graph);
+    if whole_job {
+        // A configuration/unknown record pin must not leave owned standalone data behind.
+        // Shared bytes are allowed only when another retained manifest/catalog needs them.
+        for key in candidates
+            .iter()
+            .filter(|k| k.starts_with("objects/") && roots.contains(*k))
+        {
+            let shared = manifests
+                .iter()
+                .any(|(id, m)| roots.contains(id) && m.objects.contains(key))
+                || archives.iter().any(|a| {
+                    roots.contains(&a.file.file_id) && a.entries.iter().any(|e| &e.key == key)
+                });
+            if !shared {
+                return Err(format!("retire: whole-job data remains pinned: {key}"));
+            }
+        }
+    }
+    if whole_job
+        && (manifests.iter().any(|(id, m)| {
+            roots.contains(id)
+                && selected
+                    .values()
+                    .any(|(instrument, _)| m.ordinary && &m.instrument == instrument)
+        }) || archives
+            .iter()
+            .any(|a| roots.contains(&a.file.file_id) && job_owners.contains_key(&a.job)))
+    {
+        return Err("retire: whole job remains referenced by a configuration, pending transfer, or another retained closure".into());
+    }
     // A missing closure is unresolved, including a pinned seed or dangling non-pipeline input.
     // In-flight reservations are the only roots permitted to precede publication.
     for root in &roots {
@@ -1949,6 +2479,70 @@ fn plan(
     for id in retained_drive.keys() {
         delete_drive.remove(id);
     }
+    if whole_job {
+        // Completed uploads can precede catalog publication. Their durable registry aliases
+        // are part of job ownership; inventory them rather than leaving remote orphan data.
+        for (id, aliases) in completed_transfers {
+            let owned: Vec<_> = aliases
+                .iter()
+                .filter_map(|a| a.split_once('/'))
+                .filter(|(job, _)| job_owners.contains_key(*job))
+                .collect();
+            if owned.is_empty()
+                || retained_drive.contains_key(&id)
+                || delete_drive.contains_key(&id)
+            {
+                continue;
+            }
+            if owned.iter().any(|(_, key)| key.starts_with("records/")) {
+                continue;
+            }
+            let Some(metadata) = remote.get(&id) else {
+                if already_retired.contains(&id) {
+                    continue;
+                }
+                return Err(
+                    "retire: completed transfer is missing without retirement proof".into(),
+                );
+            };
+            if aliases.len() != owned.len() {
+                return Err(
+                    "retire: completed unarchived transfer has shared or unresolved job ownership"
+                        .into(),
+                );
+            }
+            if roots.contains(&id) {
+                return Err("retire: whole-job remote data remains pinned".into());
+            }
+            let key = owned[0].1;
+            let checked_name = name(key)?;
+            if string(metadata, "name")? != checked_name {
+                return Err("retire: completed transfer name mismatch".into());
+            }
+            let identity = drive.listed_identity(&crate::drive::RemoteFile {
+                id: id.clone(),
+                name: checked_name.clone(),
+                size: metadata["bytes"].as_u64(),
+                sha256: metadata["sha256"].as_str().map(str::to_string),
+                trashed: metadata["trashed"].as_bool().unwrap_or(false),
+            })?;
+            if key.starts_with("objects/") && key != format!("objects/{}", identity.sha256) {
+                return Err("retire: completed transfer content mismatch".into());
+            }
+            delete_drive.insert(
+                id.clone(),
+                Remote {
+                    file_id: id,
+                    key: key.into(),
+                    name: checked_name,
+                    identity: Identity {
+                        bytes: identity.bytes,
+                        sha256: identity.sha256,
+                    },
+                },
+            );
+        }
+    }
     let mut delete_local = Vec::new();
     for id in manifests
         .keys()
@@ -1996,12 +2590,37 @@ fn plan(
             reason: why.into(),
         });
     }
+    let record_names: BTreeSet<_> = records.iter().map(|(_, id)| id.clone()).collect();
     for (path, id) in records {
+        if let Some(historical) = historical_refs.remove(&id) {
+            refs.push(Reference {
+                source: path.display().to_string(),
+                closure: id,
+                status: Status::Protected,
+                reason: "authenticated inventory snapshot preserved as immutable evidence".into(),
+            });
+            for dependency in historical {
+                let retained = roots.contains(&dependency) || record_names.contains(&dependency);
+                refs.push(Reference {
+                    source: path.display().to_string(),
+                    closure: dependency,
+                    status: if retained { Status::Protected } else { Status::Retired },
+                    reason: if retained {
+                        "historical metadata reference also belongs to retained evidence or content"
+                    } else {
+                        "superseded metadata reference; inventory proof retained, no deletion authority"
+                    }.into(),
+                });
+            }
+            continue;
+        }
         let mut closure = BTreeSet::from([id.clone()]);
         expand(&mut closure, &graph);
-        let any_retired = closure
-            .iter()
-            .any(|r| !roots.contains(r) && (candidates.contains(r) || already_retired.contains(r)));
+        let historical = record_history_decisions.remove(&id).unwrap_or_default();
+        let any_retired = !historical.is_empty()
+            || closure.iter().any(|r| {
+                !roots.contains(r) && (candidates.contains(r) || already_retired.contains(r))
+            });
         refs.push(Reference {
             source: path.display().to_string(),
             closure: id.clone(),
@@ -2017,6 +2636,16 @@ fn plan(
             }
             .into(),
         });
+        for dependency in historical {
+            refs.push(Reference {
+                source: path.display().to_string(),
+                closure: dependency,
+                status: Status::Retired,
+                reason:
+                    "absent historical bytes bound to verified migration or completed retirement"
+                        .into(),
+            });
+        }
         for r in closure.into_iter().filter(|r| r != &id) {
             let retired =
                 !roots.contains(&r) && (candidates.contains(&r) || already_retired.contains(&r));
@@ -2079,6 +2708,7 @@ fn plan(
         store: layout.store.clone(),
         archive_root: config.drive.root_folder_id.clone(),
         jobs: selected.into_keys().collect(),
+        whole_job,
         state: before.clone(),
         remote_state: remote,
         references: refs,

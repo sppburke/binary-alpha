@@ -28,6 +28,47 @@ use std::{
 
 pub const LINEAGE_PATH: &str = "provenance/lineage.json";
 
+pub(crate) use binary_alpha_engine::dataset::daily::ACQUISITION_PREFIX;
+
+/// Standalone invocations name an object instead of a pipeline record. The same content
+/// identity must be owned by every ready manifest that carries any of their occurrences.
+pub(crate) fn retain_acquisitions<'a>(
+    local: &Store,
+    manifest: &mut GenerationManifest,
+    ids: impl IntoIterator<Item = &'a str>,
+) -> Result<(), String> {
+    for key in ids.into_iter().collect::<BTreeSet<_>>() {
+        let Some(hash) = key.strip_prefix("objects/") else {
+            continue;
+        };
+        if hash.len() != 64 || !hash.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err("invalid standalone acquisition object key".into());
+        }
+        let path = local
+            .local_path(key)
+            .ok_or("acquisition evidence requires local store")?;
+        let identity = store::identify(&path)?;
+        if identity.sha256 != hash {
+            return Err(format!("standalone acquisition identity mismatch: {key}"));
+        }
+        let value: Value = serde_json::from_slice(&fs::read(&path).map_err(err)?).map_err(err)?;
+        if value["kind"] != "acquisition" || value["instrument"] != manifest.instrument {
+            return Err(format!(
+                "standalone acquisition does not bind instrument: {key}"
+            ));
+        }
+        let object = import::record(
+            ObjectRole::Provenance,
+            &format!("{ACQUISITION_PREFIX}{hash}.json"),
+            &identity,
+        );
+        if !manifest.objects.iter().any(|o| o == &object) {
+            manifest.objects.push(object);
+        }
+    }
+    Ok(())
+}
+
 /// Immutable legacy closure replaced by one daily continuation root. Dataset and stream
 /// identities remain distinct; every historical stream is included, not only the newest.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -52,6 +93,8 @@ pub struct MigrationEquality {
     pub observations: bool,
     pub pages: bool,
     pub source_files: bool,
+    /// Legacy candle evidence remains exactly reproducible. Session migrations record
+    /// reconstruction under the legacy definition separately from the new product proof.
     /// None means there was no legacy stream to compare, not a measured equality.
     pub candles: Option<bool>,
 }
@@ -120,6 +163,44 @@ impl MigrationRecord {
             .and_then(|p| serde_json::from_value(p.clone()).ok())
             .filter(|p: &ContinuationProof| p.validates(&self.v2_root, &self.v2_stream))
     }
+    fn session_proof_consistent(&self) -> bool {
+        let Some(candles) = self.evidence.get("proofs").and_then(|p| p.get("candles")) else {
+            return true; // Legacy records predate the session-product proof.
+        };
+        match candles.get("basis").and_then(Value::as_str) {
+            Some("legacy_definition_reconstruction") => {}
+            Some("direct_product_equality") => {
+                return candles["equal"] == true
+                    && candles["profile_equal"] == true
+                    && candles["session_product_verified"] == false
+                    && candles["product_definition"].is_object()
+                    && candles["product_definition"]["session"].is_null()
+                    && candles["legacy_definition"] == candles["product_definition"]
+                    && candles["legacy_streams"].is_array()
+                    && candles["legacy_streams"] == candles["product_streams"];
+            }
+            Some(_) => return false,
+            None => {
+                return [
+                    "basis",
+                    "session_product_verified",
+                    "legacy_definition",
+                    "product_definition",
+                    "legacy_streams",
+                    "product_streams",
+                ]
+                .iter()
+                .all(|field| candles.get(field).is_none());
+            }
+        }
+        candles["equal"] == true
+            && candles["profile_equal"] == true
+            && candles["session_product_verified"] == true
+            && candles["legacy_definition"].is_object()
+            && candles["product_definition"]["session"].is_object()
+            && candles["legacy_streams"].is_array()
+            && candles["product_streams"].is_array()
+    }
     pub fn verified(&self) -> bool {
         self.baseline_verified()
             && (self.evidence.get("supersedes").is_none_or(Value::is_null)
@@ -131,6 +212,7 @@ impl MigrationRecord {
             && self.equality.observations
             && self.equality.pages
             && self.equality.source_files
+            && self.session_proof_consistent()
             && if self.mapping.streams().is_empty() {
                 self.equality.candles.is_none()
             } else {
@@ -154,6 +236,10 @@ pub(crate) fn record_name(key: &str) -> Result<&str, String> {
 #[derive(Default)]
 pub(crate) struct MigrationRecords {
     pub files: BTreeMap<String, ObjectIdentity>,
+    /// Records in the selected census or an exactly preserved former root/stream census.
+    pub covered_files: BTreeSet<String>,
+    /// Authenticated historical metadata proves inventories, not live market dependencies.
+    pub inventory_snapshots: BTreeSet<String>,
     pub streams: BTreeMap<String, binary_alpha_engine::stream::StreamManifest>,
 }
 
@@ -174,6 +260,8 @@ pub(crate) fn migration_records(
         .unwrap_or(&manifest.generation);
     let mut selected = BTreeMap::new();
     let mut streams = BTreeMap::new();
+    let mut predecessors = Vec::new();
+    let mut preservation = Vec::new();
     if records.is_dir() {
         for entry in fs::read_dir(records).map_err(err)? {
             let path = entry.map_err(err)?.path();
@@ -189,6 +277,17 @@ pub(crate) fn migration_records(
             {
                 let stream =
                     migration_stream(local, &record, &manifest.instrument, manifest.role, access)?;
+                if let Some(proof) = record.continuation_proof() {
+                    preservation.extend(proof.closures);
+                }
+                if let Some(previous) = record.evidence.get("supersedes").filter(|v| !v.is_null()) {
+                    predecessors.push(
+                        previous
+                            .as_str()
+                            .ok_or("invalid migration supersession name")?
+                            .to_string(),
+                    );
+                }
                 streams.insert(record.v2_stream.clone(), stream);
                 selected.insert(
                     format!("records/{}", path.file_name().unwrap().to_string_lossy()),
@@ -200,6 +299,35 @@ pub(crate) fn migration_records(
     if selected.is_empty() {
         return Err(format!("missing verified migration evidence for {root}"));
     }
+    bind_record_inventory(records, &lineage, &mut selected)?;
+    let mut covered_files = selected.keys().cloned().collect();
+    let mut inventory_snapshots = BTreeSet::new();
+    for previous in predecessors {
+        inventory_snapshots.extend(superseded_records(
+            local,
+            records,
+            manifest,
+            job,
+            previous,
+            &mut selected,
+            &preservation,
+            &mut covered_files,
+            access,
+        )?);
+    }
+    Ok(MigrationRecords {
+        files: selected,
+        covered_files,
+        inventory_snapshots,
+        streams,
+    })
+}
+/// Inventory entries are evidence even when their bytes are not JSON documents.
+fn bind_record_inventory(
+    records: &Path,
+    lineage: &Value,
+    selected: &mut BTreeMap<String, ObjectIdentity>,
+) -> Result<(), String> {
     for binding in lineage["records"]
         .as_array()
         .into_iter()
@@ -218,10 +346,7 @@ pub(crate) fn migration_records(
         }
         selected.insert(key, identity);
     }
-    Ok(MigrationRecords {
-        files: selected,
-        streams,
-    })
+    Ok(())
 }
 
 fn migration_stream(
@@ -251,6 +376,158 @@ fn migration_stream(
     verify::run_with(&local.uri(&key), access)?;
     Ok(stream)
 }
+
+/// Preserve only the immutable metadata needed to prove an older inventory. Superseded
+/// market objects can be retired; a fresh restore resolves the same chain from these records.
+#[allow(clippy::too_many_arguments)]
+fn superseded_records(
+    local: &Store,
+    records: &Path,
+    manifest: &GenerationManifest,
+    job: &str,
+    mut name: String,
+    selected: &mut BTreeMap<String, ObjectIdentity>,
+    preservation: &[PreservedClosure],
+    covered_files: &mut BTreeSet<String>,
+    access: Access<'_>,
+) -> Result<BTreeSet<String>, String> {
+    let record_store = Store::filesystem(records);
+    let mut seen = BTreeSet::new();
+    let mut snapshots = BTreeSet::new();
+    loop {
+        let key = format!("records/{name}");
+        let path = records.join(record_name(&key)?);
+        if !seen.insert(name.clone()) {
+            return Err("cyclic migration supersession".into());
+        }
+        let record: MigrationRecord =
+            serde_json::from_slice(&fs::read(&path).map_err(err)?).map_err(err)?;
+        if !record.baseline_verified()
+            || record.job != job
+            || record.v2_root.len() != 64
+            || !record.v2_root.bytes().all(|b| b.is_ascii_hexdigit())
+        {
+            return Err(format!(
+                "missing verified superseded migration record {name}"
+            ));
+        }
+        let mut inventory = BTreeMap::from([(key, store::identify(&path)?)]);
+        access.lookup(&record.v2_root)?;
+        access.permit(Some(manifest.role), &record.v2_root)?;
+        let root_name = format!("{job}-migration-root-{}.json", record.v2_root);
+        let (root_bytes, root_snapshot) = metadata_snapshot(
+            local,
+            &manifest_key(&record.v2_root),
+            &record_store,
+            &root_name,
+        )?;
+        let root = GenerationManifest::from_json(&root_bytes)?;
+        if root.generation != record.v2_root
+            || root.instrument != manifest.instrument
+            || root.role != manifest.role
+            || root.layout != Some(Layout::DailyV2)
+        {
+            return Err("superseded migration root identity mismatch".into());
+        }
+        let object = root
+            .objects
+            .iter()
+            .find(|o| o.path == LINEAGE_PATH)
+            .ok_or("missing superseded lineage")?;
+        let lineage_name = format!("{job}-migration-lineage-{}.json", object.sha256);
+        let (bytes, lineage_snapshot) =
+            metadata_snapshot(local, &object.key, &record_store, &lineage_name)?;
+        if bytes.len() as u64 != object.bytes || digest(&bytes) != object.sha256 {
+            return Err("superseded migration lineage identity mismatch".into());
+        }
+        let lineage: Value = serde_json::from_slice(&bytes).map_err(err)?;
+        if serde_json::from_value::<MigrationMapping>(lineage.clone()).map_err(err)?
+            != record.mapping
+        {
+            return Err("superseded migration lineage mapping mismatch".into());
+        }
+        for (name, bytes) in [
+            (&root_name, &root_snapshot),
+            (&lineage_name, &lineage_snapshot),
+        ] {
+            crate::research::publish_record(&record_store, &record_store, name, bytes)?;
+            snapshots.insert(format!("records/{name}"));
+            selected.insert(
+                format!("records/{name}"),
+                store::identify(&records.join(name))?,
+            );
+        }
+        bind_record_inventory(records, &lineage, &mut inventory)?;
+        if preservation
+            .iter()
+            .any(|p| p.dataset == record.v2_root && p.streams.contains(&record.v2_stream))
+        {
+            covered_files.extend(inventory.keys().cloned());
+        }
+        selected.extend(inventory);
+        match record.evidence.get("supersedes").filter(|v| !v.is_null()) {
+            Some(previous) => {
+                name = previous
+                    .as_str()
+                    .ok_or("invalid migration supersession name")?
+                    .to_string()
+            }
+            None => return Ok(snapshots),
+        }
+    }
+}
+
+fn metadata_snapshot(
+    local: &Store,
+    key: &str,
+    records: &Store,
+    name: &str,
+) -> Result<(Vec<u8>, Vec<u8>), String> {
+    if records.head(name)?.is_some() {
+        let mut stored = Vec::new();
+        records.read_to(name, None, &mut stored)?;
+        let value: Value = serde_json::from_slice(&stored).map_err(err)?;
+        let bytes = if value["kind"] == "migration_metadata_snapshot" {
+            let bytes = value["payload"]
+                .as_str()
+                .ok_or("missing snapshot payload")?
+                .as_bytes()
+                .to_vec();
+            if value["schema_version"] != 1
+                || value["source_key"] != key
+                || value["bytes"] != bytes.len() as u64
+                || value["sha256"] != digest(&bytes)
+            {
+                return Err("migration metadata snapshot identity mismatch".into());
+            }
+            bytes
+        } else {
+            // Completed raw snapshots from earlier executables stay byte-identical.
+            stored.clone()
+        };
+        if local.head(key)?.is_some() {
+            let mut source = Vec::new();
+            local.read_to(key, None, &mut source)?;
+            if source != bytes {
+                return Err("migration metadata snapshot disagrees with source".into());
+            }
+        }
+        return Ok((bytes, stored));
+    }
+    let mut bytes = Vec::new();
+    local.read_to(key, None, &mut bytes)?;
+    // Domain-separate records from market metadata. The content registry can still
+    // deduplicate every byte identity without retaining a market-named remote alias
+    // solely because a historical inventory needs a snapshot of its former metadata.
+    let stored = serde_json::to_vec(&json!({
+        "schema_version": 1, "kind": "migration_metadata_snapshot", "source_key": key,
+        "bytes": bytes.len(), "sha256": digest(&bytes),
+        "payload": std::str::from_utf8(&bytes).map_err(err)?,
+    }))
+    .map_err(err)?;
+    Ok((bytes, stored))
+}
+
 fn err(e: impl std::fmt::Display) -> String {
     e.to_string()
 }
@@ -917,6 +1194,21 @@ pub(crate) fn descendant(
             });
         }
     }
+    retain_acquisitions(
+        local,
+        &mut manifest,
+        evidence
+            .acquisitions
+            .iter()
+            .map(|a| a.acquisition_id.as_str())
+            .chain(
+                std::iter::once(baseline)
+                    .chain(superseded.iter())
+                    .flat_map(|m| &m.objects)
+                    .filter(|o| o.path.starts_with(ACQUISITION_PREFIX))
+                    .map(|o| o.key.as_str()),
+            ),
+    )?;
     descendant_days(&mut evidence, &mut manifest, &acquisition.acquisition_id)?;
     manifest
         .objects
@@ -2865,6 +3157,55 @@ mod migration_selection_tests {
                 "closures": [{"dataset": if root == 'b' { "c".repeat(64) } else { "b".repeat(64) }, "streams": ["d".repeat(64)]}],
             })),
         })).unwrap()
+    }
+
+    #[test]
+    fn metadata_snapshots_restore_exact_bytes_and_preserve_legacy_records() {
+        let root = std::env::temp_dir().join(format!("migration-snapshot-{}", std::process::id()));
+        fs::create_dir_all(root.join("source/objects")).unwrap();
+        fs::create_dir_all(root.join("records")).unwrap();
+        let local = Store::filesystem(root.join("source"));
+        let records = Store::filesystem(root.join("records"));
+        let bytes = b"{\n  \"fixture\": true\n}\n";
+        let key = object_key(&digest(bytes));
+        fs::write(root.join("source").join(&key), bytes).unwrap();
+        let (decoded, stored) = metadata_snapshot(&local, &key, &records, "new.json").unwrap();
+        assert_eq!(decoded, bytes);
+        assert_ne!(digest(&stored), digest(bytes));
+        fs::write(root.join("records/new.json"), &stored).unwrap();
+        fs::remove_file(root.join("source").join(&key)).unwrap();
+        assert_eq!(
+            metadata_snapshot(&local, &key, &records, "new.json").unwrap(),
+            (bytes.to_vec(), stored.clone())
+        );
+        for (field, bad) in [
+            ("schema_version", json!(2)),
+            ("source_key", json!("objects/wrong")),
+            ("bytes", json!(0)),
+            ("sha256", json!("0".repeat(64))),
+            ("payload", json!("changed")),
+        ] {
+            let mut value: Value = serde_json::from_slice(&stored).unwrap();
+            value[field] = bad;
+            fs::write(
+                root.join("records/tampered.json"),
+                serde_json::to_vec(&value).unwrap(),
+            )
+            .unwrap();
+            assert!(
+                metadata_snapshot(&local, &key, &records, "tampered.json").is_err(),
+                "{field}"
+            );
+        }
+        fs::write(root.join("records/legacy.json"), bytes).unwrap();
+        assert_eq!(
+            metadata_snapshot(&local, &key, &records, "legacy.json").unwrap(),
+            (bytes.to_vec(), bytes.to_vec())
+        );
+        assert_eq!(fs::read(root.join("records/legacy.json")).unwrap(), bytes);
+        fs::write(root.join("source").join(&key), b"different source").unwrap();
+        assert!(metadata_snapshot(&local, &key, &records, "new.json").is_err());
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

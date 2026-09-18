@@ -1,15 +1,12 @@
 # Research market-data pipeline, schema version 1. Credential values never enter this file.
-# Job core configs follow configs/example.toml with a [history] table naming one instrument, whose
-# native_granularity, overlap_seconds, max_pages, and max_elapsed_seconds the pipeline reads; the
-# instrument must already be imported into <local_root>/store by `data import`. Select one instrument per job, use run_mode = "research", omit [research] and foreground
-# refresh, and match history to the import's broker/ordinary role. Deriv uses ticks; Pocket uses
-# native five-second bars. Prepare the sibling core configs and non-secret evidence files first;
-# each evidence file is JSON whose source_identity names the broker source identity the archive
-# was collected under (update refuses a configured broker with a different identity).
+# Register with data pipeline add-job --config PIPELINE --template CORE
+# --broker BROKER --symbol SYMBOL [--quote-currency CURRENCY] [--session SESSION_FILE].
+# Templates: data-pipeline-deriv.example.toml and data-pipeline-pocket.example.toml.
+# Explicit singular instruments.session is required. First update needs no data import.
 schema_version = 1
 local_root = "../historical_data"
 # Instruments worked on concurrently by one producer run; raise gradually (provider rate limits).
-parallel_jobs = 2
+parallel_jobs = 4
 # Object uploads or downloads per job, each worker with its own Drive session (default 8).
 parallel_transfers = 8
 # Supply an existing study declaration when applicable; use its actual authorized location.
@@ -20,18 +17,15 @@ parallel_transfers = 8
 root_folder_id = "REPLACE_WITH_GRANTED_FOLDER_ID"
 # Name of the process variable holding credential JavaScript Object Notation (JSON), never its value.
 credential = "BINARY_ALPHA_DRIVE_CREDENTIAL"
-chunk_bytes = 262144
-request_timeout_seconds = 30
-max_attempts = 3
+chunk_bytes = 8388608
+request_timeout_seconds = 300
+max_attempts = 5
 # Per-request transient retry budget in seconds (default 900), with capped exponential backoff.
 retry_seconds = 900
 
-[[jobs]]
-id = "deriv"
-config = "deriv.toml"
-evidence = "evidence/deriv-source-binding.json"
-
-[[jobs]]
-id = "pocket"
-config = "pocket.toml"
-evidence = "evidence/pocket-source-binding.json"
+# add-job appends [[jobs]] with generated jobs/ and evidence/ relative paths.
+# History budgets in sibling templates: Deriv 6000 pages, Pocket 20000 pages,
+# max_elapsed_seconds = 3600, overlap_seconds = 60. Pocket has 8 pages in flight.
+# These bound one invocation; rerun pending work at the same cutoff for a larger gap.
+# Pocket requires origin = "https://pocketoption.com"; credential_command is a program
+# and argv array, e.g. ["/absolute/path/to/pocket-auth"], never an inline credential.

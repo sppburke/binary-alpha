@@ -425,7 +425,7 @@ fn daily_updates_preserve_days_occurrences_resume_and_reclaim_for_both_brokers()
                     "history_pages_in_flight = 1",
                 )
         } else {
-            deriv_core(&broker.url, 60, 1, 60).replace("frxEURUSD", "R_50")
+            synthetic_deriv(deriv_core(&broker.url, 60, 1, 60))
         };
         core = core
             .replace(

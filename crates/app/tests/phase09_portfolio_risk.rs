@@ -31,7 +31,7 @@ const BASIS: i64 = 1_800_000;
 const ROWS: usize = 32;
 const INSTRUMENT: &str = "pocket_option:AEDCNY_otc";
 const STREAM: &str = "{ duration_seconds = 20, offset_seconds = 0 }";
-const TICK_INSTRUMENT: &str = "\n[[instruments]]\nbroker = \"pocket_option\"\nprovider_symbol = \"AEDCNY_otc\"\nbase_currency = \"AED\"\nquote_currency = \"CNY\"\nprice_scale = 6\nnative_granularity = { kind = \"tick\" }\ngap = { max_seconds = 2, reopen_seconds = 60 }\nfrozen = { min_observations = 10, min_seconds = 5 }\njump = { min_basis_points = 5 }\nspan = { min_percent = 75 }\nsessions = [{ name = \"week\", open_seconds = 0, close_seconds = 604800 }]\ncandles = [{ duration_seconds = 20, offset_seconds = 0, min_observations = 9, hard_min_observations = 5 }]\n";
+const TICK_INSTRUMENT: &str = "\n[[instruments]]\nbroker = \"pocket_option\"\nprovider_symbol = \"AEDCNY_otc\"\nbase_currency = \"AED\"\nquote_currency = \"CNY\"\nprice_scale = 6\nsession = { kind = \"always\" }\nnative_granularity = { kind = \"tick\" }\ngap = { max_seconds = 2, reopen_seconds = 60 }\nfrozen = { min_observations = 10, min_seconds = 5 }\njump = { min_basis_points = 5 }\nspan = { min_percent = 75 }\nsessions = [{ name = \"week\", open_seconds = 0, close_seconds = 604800 }]\ncandles = [{ duration_seconds = 20, offset_seconds = 0, min_observations = 9, hard_min_observations = 5 }]\n";
 /// The settlement rule of the search family's contract and of every alternative.
 const SETTLEMENT: &str = "settlement = { rule = \"price_at_due_v1\", max_settlement_delay_micros = 2000000, max_tick_gap_micros = 2000000 }";
 /// Five seconds of contract plus two seconds of permitted settlement delay.

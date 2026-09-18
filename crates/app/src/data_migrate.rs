@@ -20,7 +20,7 @@ use std::collections::{BTreeMap, BTreeSet};
 #[path = "data_migrate/upgrade.rs"]
 mod upgrade;
 
-const PROOF_VERSION: u32 = 2;
+const PROOF_VERSION: u32 = 3;
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 
 fn err(e: impl std::fmt::Display) -> String {
@@ -396,6 +396,18 @@ impl Spool<'_> {
         alias: Alias,
         identity: Option<String>,
     ) -> Result<(), String> {
+        // Abandoning mutable pending logs does not erase a published occurrence's
+        // diagnostic provenance. A proof upgrade retains that exact classification.
+        if let Some(source) = read_json::<ByteRef>(
+            &self
+                .work
+                .join("daily-occurrences")
+                .join(upgrade::occurrence_key(&page.acquisition_id, page.ordinal)?),
+        )? && upgrade::daily_page(self.layout, &source)?.disposition
+            == PageDisposition::Diagnostic
+        {
+            page.disposition = PageDisposition::Diagnostic;
+        }
         let identity_path = identity.map(|i| self.work.join("identities").join(i));
         if let Some(path) = &identity_path
             && let Some(existing) = read_json::<(String, u64)>(path)?
@@ -1541,6 +1553,45 @@ fn observations(
     Ok((objects, days.into_values().collect(), peak))
 }
 
+/// Legacy coverage may be the only binding of a standalone invocation's object. Read page
+/// identities with the streaming document owner; response bytes remain outside metadata.
+fn acquisition_keys(
+    layout: &Layout,
+    manifest: &GenerationManifest,
+) -> Result<BTreeSet<String>, String> {
+    let mut keys = BTreeSet::new();
+    for object in &manifest.objects {
+        if object.path.starts_with(lineage::ACQUISITION_PREFIX) {
+            keys.insert(object.key.clone());
+        }
+        if object.path == fetch::COVERAGE_PATH {
+            let header = document(&object_path(layout, object)?, &mut |kind, page| {
+                if kind == "pages"
+                    && let Some(id) = page
+                        .pointer("/occurrence/acquisition_id")
+                        .and_then(Value::as_str)
+                {
+                    keys.insert(id.to_string());
+                }
+                Ok(())
+            })?;
+            for claim in header["acquisitions"].as_array().into_iter().flatten() {
+                if let Some(id) = claim["acquisition_id"].as_str() {
+                    keys.insert(id.to_string());
+                }
+            }
+        }
+    }
+    if let Some(id) = lineage::read_lineage(&layout.store(), manifest)?
+        .pointer("/continuation/acquisition_id")
+        .and_then(Value::as_str)
+    {
+        keys.insert(id.to_string());
+    }
+    keys.retain(|key| key.starts_with("objects/"));
+    Ok(keys)
+}
+
 /// All physical objects fall into one counted class. Only proved aliases and diagnostics
 /// enter the occurrence table; unresolved objects never confer retirement authority.
 #[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1551,6 +1602,7 @@ struct PhysicalCensus {
     diagnostic_objects: u64,
     other_source_objects: u64,
     non_response_objects: u64,
+    acquisition_records: u64,
     staging_objects: u64,
     unresolved_objects: Vec<Value>,
 }
@@ -1575,6 +1627,7 @@ fn physical_census(
 ) -> Result<PhysicalCensus, String> {
     // Read manifest metadata only. Referenced objects of other populations are never opened.
     let mut referenced = BTreeSet::new();
+    let mut acquisitions = BTreeSet::new();
     let mut contexts = BTreeSet::from([identity.to_string()]);
     for generation in layout.store().list_manifests()? {
         let bytes = fs::read(layout.store.join(manifest_key(&generation))).map_err(err)?;
@@ -1590,6 +1643,14 @@ fn physical_census(
         {
             access.permit(Some(source.role), &generation)?;
             let m = GenerationManifest::from_json(&bytes)?;
+            let keys = acquisition_keys(layout, &m)?;
+            // Resolve and validate the exact invocation bytes before assigning ownership.
+            lineage::retain_acquisitions(
+                &layout.store(),
+                &mut m.clone(),
+                keys.iter().map(String::as_str),
+            )?;
+            acquisitions.extend(keys);
             if let Some(o) = m.objects.iter().find(|o| o.path == fetch::COVERAGE_PATH) {
                 let header = document(&object_path(layout, o)?, &mut |_, _| Ok(()))?;
                 if let Some(id) = header["source_identity"].as_str() {
@@ -1652,6 +1713,10 @@ fn physical_census(
             alias.checkpoint_suffix.clear();
             accept(alias, None)?;
             census.storage_aliases.push(key);
+            continue;
+        }
+        if acquisitions.contains(&key) {
+            census.acquisition_records += 1;
             continue;
         }
         if referenced.contains(&key) {
@@ -2068,7 +2133,9 @@ fn convert(
             && bound
                 .core
                 .instrument(&m.definition.id(), newest.native_granularity)
-                == Some(&m.definition)
+                .is_some_and(|definition| {
+                    crate::session_migration::compatible(&m.definition, definition)
+                })
     });
     if streamed_source.is_some() && old_stream.is_none() {
         return Err("newest v1 stream definition differs from migration configuration".into());
@@ -2306,6 +2373,15 @@ fn convert(
     manifest.layout = Some(DailyLayout::DailyV2);
     manifest.day_inventory = days;
     manifest.objects = objects;
+    let mut acquisition_ids = BTreeSet::new();
+    for source in &sources.datasets {
+        acquisition_ids.extend(acquisition_keys(layout, source)?);
+    }
+    lineage::retain_acquisitions(
+        &local,
+        &mut manifest,
+        acquisition_ids.iter().map(String::as_str),
+    )?;
     let cov = lineage::migration_coverage(&mut manifest, &coverage, &identity)?;
     manifest
         .objects
@@ -2629,11 +2705,27 @@ fn verify_migration(
     let stream = read_stream(layout, &state.stream)?;
     let candles = if let Some(old_stream) = &state.old_stream {
         let before = read_stream(layout, old_stream)?;
-        if before.streams != stream.streams {
+        // SESSION MIGRATION HOOK: retain exact legacy equality under its original
+        // definition; data verify below independently proves the changed session product.
+        let reconstruction = stream
+            .definition
+            .session
+            .as_ref()
+            .map(|_| {
+                crate::session_migration::reconstruct(&local, &new, &before.definition, &proof)
+            })
+            .transpose()?;
+        let compared = reconstruction
+            .as_ref()
+            .map_or(&stream.streams, |r| &r.streams);
+        if &before.streams != compared {
             return Err("candle summaries differ".into());
         }
         let a = candle_digest(layout, &before)?;
-        let b = candle_digest(layout, &stream)?;
+        let b = match &reconstruction {
+            Some(r) => r.digest.clone(),
+            None => candle_digest(layout, &stream)?,
+        };
         if a != b {
             return Err("candle row equality proof failed".into());
         }
@@ -2646,7 +2738,10 @@ fn verify_migration(
             serde_json::from_reader(File::open(object_path(layout, o)?).map_err(err)?).map_err(err)
         };
         let mut a_profile = profile(&before)?;
-        let b_profile = profile(&stream)?;
+        let b_profile = match &reconstruction {
+            Some(r) => serde_json::to_value(&r.profile).map_err(err)?,
+            None => profile(&stream)?,
+        };
         a_profile["source"]["generation"] = json!(state.dataset);
         for calculation in a_profile["calculations"]
             .as_array_mut()
@@ -2681,7 +2776,7 @@ fn verify_migration(
                     .into(),
             );
         }
-        json!({"equal":true,"sha256":a,"profile_equal":true,"profile_substitution":{"from":before.source_generation,"to":state.dataset,"fields":["source.generation","calculations[*].reason.generation"]}})
+        json!({"equal":true,"sha256":a,"profile_equal":true,"basis":if reconstruction.is_some() {"legacy_definition_reconstruction"} else {"direct_product_equality"},"legacy_definition":before.definition,"legacy_streams":before.streams,"product_definition":stream.definition,"product_streams":stream.streams,"session_product_verified":reconstruction.is_some(),"profile_substitution":{"from":before.source_generation,"to":state.dataset,"fields":["source.generation","calculations[*].reason.generation"]}})
     } else {
         json!({"equal":null,"reason":"no v1 stream exists"})
     };
@@ -2925,6 +3020,7 @@ fn census(
 ) -> Result<Value, String> {
     let local = layout.store();
     let newest = read_manifest(&local, &state.newest)?.0;
+    let migrated = read_manifest(&local, &state.dataset)?.0;
     let require = |label: &str| -> Result<PageOccurrence, String> {
         let alias: Alias = get(&proof.join(format!("alias-{}", sha256_hex(label.as_bytes()))))
             .map_err(|_| format!("page accounting proof: missing source alias {label}"))?;
@@ -2977,6 +3073,21 @@ fn census(
             return Err(format!(
                 "new v1 generation {generation} appeared after converted; migration snapshot is unresolved"
             ));
+        }
+        let mut expected = m.clone();
+        expected.objects.clear();
+        lineage::retain_acquisitions(
+            &local,
+            &mut expected,
+            acquisition_keys(layout, &m)?.iter().map(String::as_str),
+        )?;
+        for object in &expected.objects {
+            if !migrated.objects.contains(object) {
+                return Err(format!(
+                    "{generation}: standalone acquisition missing from migration closure: {}",
+                    object.key
+                ));
+            }
         }
         if let Some((raw, checkpoint)) = import_pair(&m)? {
             if !state.imports.iter().any(|i| {
@@ -3200,7 +3311,7 @@ fn census(
         json!({"coverage_entries":pages,"receipt_requests":requests,"single_objects":singles,"pending_pages":pending,"raw_lines":raw_lines,"checkpoint_lines":checkpoint_lines,"physical":{
             "objects":physical.objects,"manifest_objects":physical.manifest_objects,
             "storage_aliases":physical.storage_aliases.len(),"diagnostic_objects":physical.diagnostic_objects,
-            "other_source_objects":physical.other_source_objects,"non_response_objects":physical.non_response_objects,"staging_objects":physical.staging_objects,
+            "other_source_objects":physical.other_source_objects,"non_response_objects":physical.non_response_objects,"acquisition_records":physical.acquisition_records,"staging_objects":physical.staging_objects,
             "unresolved_objects":physical.unresolved_objects.len(),"unaccounted_attributable_objects":0
         },"all_mapped_once":true}),
     )

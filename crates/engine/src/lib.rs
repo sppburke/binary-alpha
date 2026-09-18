@@ -4,6 +4,7 @@
 //! text and records; it returns validated values, canonical forms, and identities.
 
 pub mod config;
+pub mod continuous;
 pub mod dataset;
 pub mod execution;
 pub mod features;
@@ -12,6 +13,7 @@ pub mod outcomes;
 pub mod portfolio;
 pub mod research;
 pub mod search;
+pub mod session;
 pub mod stream;
 
 /// Lowercase hexadecimal rendering of a digest or checksum.

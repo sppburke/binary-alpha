@@ -206,6 +206,11 @@ pub(super) fn freeze(f: &Fixture) -> BTreeMap<String, String> {
             );
         }
     }
+    remote.seeded_uploads = remote
+        .files
+        .values()
+        .map(|entry| (entry.name.clone(), entry.bytes.clone()))
+        .collect();
     drop(remote);
     for (path, mut v) in records {
         if let Some(receipt) = v["file_id"].as_str().and_then(|id| receipts.get(id)) {

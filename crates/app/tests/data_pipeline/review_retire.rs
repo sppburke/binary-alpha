@@ -401,6 +401,60 @@ fn review_upgrade_after_pending_daily_update() {
 }
 
 #[test]
+fn review_whole_job_removes_owned_alias_outside_migration_census() {
+    let f = updated("review_whole_job_owned_alias");
+    let records = f.scratch.path("producer/pipeline_state/records");
+    let original = fs::read_dir(&records)
+        .unwrap()
+        .map(|p| p.unwrap().path())
+        .find(|p| {
+            p.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("deriv-receipt-")
+        })
+        .unwrap();
+    let mut receipt = read_json(&original);
+    let mut request = receipt["requests"][0].clone();
+    let key = object_key(request["sha256"].as_str().unwrap());
+    pipeline("migrate", &f.pipeline, &[]).unwrap();
+    let (_, record, _) = migrated(&f, "deriv");
+    assert!(
+        record["storage_aliases"]
+            .as_array()
+            .unwrap()
+            .contains(&json!(key))
+    );
+    // A later completed same-job occurrence is outside the proved replacement census.
+    request["receipt_time"] = json!("2026-01-01T00:00:00Z");
+    request["occurrence"] = Value::Null;
+    receipt["requests"] = json!([request]);
+    fs::write(
+        records.join("deriv-receipt-later-alias.json"),
+        receipt.to_string(),
+    )
+    .unwrap();
+    pipeline("archive", &f.pipeline, &[]).unwrap();
+    let report = pipeline("retire", &f.pipeline, &["--job", "deriv", "--plan"]).unwrap();
+    let plan: binary_alpha_app::retire::Plan =
+        serde_json::from_slice(&fs::read(field(&report, "plan")).unwrap()).unwrap();
+    assert!(!plan.delete_local.iter().any(|item| item.path == key));
+    assert!(f.scratch.path("producer/store").join(&key).is_file());
+    let report = pipeline(
+        "retire",
+        &f.pipeline,
+        &["--job", "deriv", "--whole-job", "--plan"],
+    )
+    .unwrap();
+    let path = field(&report, "plan");
+    let plan: binary_alpha_app::retire::Plan =
+        serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
+    assert!(plan.delete_local.iter().any(|item| item.path == key));
+    pipeline("retire", &f.pipeline, &["--apply", path]).unwrap();
+    assert!(!f.scratch.path("producer/store").join(&key).exists());
+}
+
+#[test]
 fn review_actual_migrated_alias_still_needed_by_foreign_receipt() {
     let f = updated("review_foreign_actual_alias");
     let records = f.scratch.path("producer/pipeline_state/records");

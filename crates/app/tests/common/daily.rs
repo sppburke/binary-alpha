@@ -25,6 +25,55 @@ pub fn date(time: i64) -> String {
     format_event_time_micros(time)[..10].to_string()
 }
 
+pub fn pages(root: &Path, manifest: &GenerationManifest) -> Vec<daily::PageOccurrence> {
+    manifest
+        .day_inventory
+        .iter()
+        .filter(|day| day.family == DayFamily::Pages)
+        .flat_map(|day| {
+            daily::read_pages(&root.join(day.object.as_ref().unwrap()), &day.date).unwrap()
+        })
+        .collect()
+}
+
+/// Reconstruct each source from its own ordinal and recorded framing, not a path label.
+pub fn reconstruct_import(root: &Path, manifest: &GenerationManifest, checkpoint: bool) -> Vec<u8> {
+    let lineage = manifest
+        .objects
+        .iter()
+        .find(|o| o.path == "provenance/lineage.json")
+        .unwrap();
+    let lineage: serde_json::Value =
+        serde_json::from_slice(&fs::read(root.join(&lineage.key)).unwrap()).unwrap();
+    let mut pages = pages(root, manifest);
+    pages.sort_by_key(|page| {
+        if checkpoint {
+            page.checkpoint_ordinal.unwrap()
+        } else {
+            page.ordinal
+        }
+    });
+    let name = if checkpoint {
+        "checkpoint"
+    } else {
+        "raw_pages"
+    };
+    let terminators = lineage["framing"][name]["framing"]["line_terminators"]
+        .as_array()
+        .unwrap();
+    assert_eq!(pages.len(), terminators.len());
+    let mut bytes = Vec::new();
+    for (page, terminator) in pages.iter().zip(terminators) {
+        bytes.extend(if checkpoint {
+            page.checkpoint.as_ref().unwrap()
+        } else {
+            &page.payload
+        });
+        bytes.extend(terminator.as_str().unwrap().as_bytes());
+    }
+    bytes
+}
+
 pub struct Pair {
     pub v1: GenerationManifest,
     pub v2: GenerationManifest,
@@ -45,7 +94,7 @@ impl Pair {
             "{ kind = \"bar\", period_seconds = 5 }"
         };
         format!(
-            "\n[[instruments]]\nbroker = \"{}\"\nprovider_symbol = \"{}\"\nquote_currency = \"USD\"\nprice_scale = 4\nnative_granularity = {native}\ngap = {{ max_seconds = 2, reopen_seconds = 60 }}\ncandles = [{{ duration_seconds = 5, offset_seconds = 0 }}, {{ duration_seconds = 15, offset_seconds = 5 }}]\n",
+            "\n[[instruments]]\nbroker = \"{}\"\nprovider_symbol = \"{}\"\nquote_currency = \"USD\"\nprice_scale = 4\nsession = {{ kind = \"always\" }}\nnative_granularity = {native}\ngap = {{ max_seconds = 2, reopen_seconds = 60 }}\ncandles = [{{ duration_seconds = 5, offset_seconds = 0 }}, {{ duration_seconds = 15, offset_seconds = 5 }}]\n",
             self.v1.broker, self.v1.provider_symbol
         )
     }

@@ -428,6 +428,22 @@ pub(super) fn preserve(
             }
         }
     }
+    lineage::retain_acquisitions(
+        &local,
+        &mut manifest,
+        coverage
+            .acquisitions
+            .iter()
+            .map(|a| a.acquisition_id.as_str())
+            .chain(
+                family
+                    .iter()
+                    .chain(std::iter::once(&baseline))
+                    .flat_map(|m| &m.objects)
+                    .filter(|o| o.path.starts_with(lineage::ACQUISITION_PREFIX))
+                    .map(|o| o.key.as_str()),
+            ),
+    )?;
     lineage::upgrade_page_coverage(&mut coverage, &mut manifest)?;
     manifest
         .objects
