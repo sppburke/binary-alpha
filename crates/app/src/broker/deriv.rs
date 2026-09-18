@@ -383,7 +383,10 @@ fn pip_digits(pip_size: &WireDecimal) -> Result<u8, String> {
 fn precision(pip_size: &WireDecimal, scale: PriceScale) -> Result<(), String> {
     let digits = pip_size.require_number()?.rescale(0)?.coefficient();
     if digits < 0 || digits > i128::from(scale.digits()) {
-        return Err("deriv: pip_size exceeds configured price scale".into());
+        return Err(format!(
+            "deriv: pip_size requires {digits} fraction digits, exceeds configured price_scale {}",
+            scale.digits()
+        ));
     }
     Ok(())
 }

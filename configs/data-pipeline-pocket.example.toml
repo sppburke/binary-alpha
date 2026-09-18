@@ -1,0 +1,37 @@
+# add-job policy template. Requires authorization for the selected API/source context.
+schema_version = 1
+run_mode = "research"
+[storage]
+historical_data_dir = "unused"
+publication_uri = "file:///unused"
+[[instruments]]
+broker = "pocket_option"
+provider_symbol = "AEDCNY_otc"
+quote_currency = "CNY"
+price_scale = 6 # placeholder: registration measures the sample, including 11+ digit prices
+native_granularity = { kind = "bar", period_seconds = 5 }
+candles = [{ duration_seconds = 60, offset_seconds = 0 }]
+[instruments.session]
+kind = "always" # explicit operator policy; change for scheduled closures
+[[brokers]]
+id = "pocket_option"
+kind = "pocket_option"
+endpoint = "wss://REPLACE_WITH_AUTHORIZED_ENDPOINT/socket.io/?EIO=4&transport=websocket"
+origin = "https://pocketoption.com"
+credential = "BINARY_ALPHA_POCKET_AUTH"
+# Direct executable and argv; prints one fresh auth JSON object to stdout.
+# Credential values never enter the configuration, logs, or repository.
+credential_command = ["/absolute/path/to/pocket-auth"]
+account_class = "demo" # must match authorized source; never relabel existing data
+server_offset_minutes = 120 # replace with the proved provider clock mapping
+history_pages_in_flight = 8
+[history]
+broker = "pocket_option"
+instruments = ["AEDCNY_otc"]
+role = "development"
+start = "2025-05-19T00:00:00Z"
+end = "2026-09-17T00:00:00Z"
+native_granularity = { kind = "bar", period_seconds = 5 }
+overlap_seconds = 60
+max_pages = 20000 # about 45 days at 195 seconds/page, subject to elapsed/provider limits
+max_elapsed_seconds = 3600

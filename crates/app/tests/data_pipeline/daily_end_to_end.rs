@@ -1068,4 +1068,32 @@ fn v1_migrate_archive_restore_update_twice_retire_and_restore_both_brokers() {
     }
     daily_paths(&recovered.path("managed/store"));
     pipeline("retire", &recovered_config, &["--plan"]).unwrap();
+    // A later instrument removal uses the descendant catalog's cumulative migration
+    // evidence; the original root catalogs and superseded roots have already been retired.
+    for (job, _, _, _) in jobs {
+        let report = pipeline(
+            "retire",
+            &recovered_config,
+            &["--job", job, "--whole-job", "--plan"],
+        )
+        .unwrap();
+        let path = report.split_whitespace().nth(2).unwrap();
+        pipeline("retire", &recovered_config, &["--apply", path]).unwrap();
+        pipeline("remove-job", &recovered_config, &["--job", job]).unwrap();
+    }
+    assert!(
+        binary_alpha_app::store::Store::filesystem(recovered.path("managed/store"))
+            .list_manifests()
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        f.drive
+            .state
+            .lock()
+            .unwrap()
+            .files
+            .values()
+            .all(|entry| entry.name.starts_with("record-"))
+    );
 }

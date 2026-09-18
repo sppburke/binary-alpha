@@ -5,6 +5,35 @@ Omitting `--plan` has the same effect. `--apply PLAN_FILE` applies or resumes th
 it conflicts with `--plan`. Supplying `--job` with apply must match the sealed plan's sole job.
 Planning performs reads and writes its immutable plan, without deleting data.
 
+`--job ID --whole-job` explicitly selects removal of the instrument, including its current
+root and newest catalog, every ordinary v1/v2 dataset and stream, and catalog-backed remote-only
+closures. Normal `--job` retirement still preserves current roots and requires verified
+migration evidence for v1 replacement. Whole-job mode needs no replacement claim because its
+purpose is removal. It refuses a second configured owner for the same instrument and unfinished
+acquisition/migration or retained dependencies. Exact shared content, other consumers, live
+configuration references and in-flight reservations remain protected. Local and archived
+immutable records remain; the plan marks their removed dependencies retired.
+
+Whole-job inventory also replays completed registry aliases, including legacy per-job
+transfers: uploads completed before catalog publication cannot escape the deletion inventory.
+An owned standalone response pinned by a configuration or unknown record refuses the plan.
+Predecessor ownership and storage aliases require exact archived migration evidence binding;
+an equality summary alone grants no additional deletion authority. Shared data is retained
+only through another proved retained closure.
+The current descendant catalog may supply that exact evidence through its lineage manifests
+after ordinary retirement removes the original root catalog. Previously retired registry
+bindings remain evidence and do not pin deleted data during the next instrument's removal.
+On a fresh restore, hash-bound migration evidence identifies legacy byte copies intentionally
+absent from the self-contained v2 closure. Completed sealed plans also preserve decisions for
+already absent historical references. These exemptions apply to immutable records only;
+configuration, pending work, and unknown evidence still pin their dependencies.
+
+Keep the pipeline entry unchanged through plan/review/apply. After the completion record is
+written, `data pipeline remove-job --config PIPELINE --job ID` atomically removes that entry
+and retains the core/evidence files. It refuses before completed whole-job retirement and is
+idempotent afterwards. Completed whole-job plans are tombstones: producer commands refuse that
+job even before its document entry has been removed. Do not reuse the retired identity.
+
 Both modes hold the managed store's writer lock and a host-wide lock for the Drive endpoint
 and archive-root pair. Pipeline producers, pull, and restore share this archive lock, including
 restores to another managed store on this host. This is not a distributed lock across hosts.
@@ -15,7 +44,7 @@ journals also fence the store. Only the identical sealed plan may resume. Keep c
 and all writers on other hosts frozen through completion; the persistent fence is local.
 
 The implementation reuses `Store`, `Drive`, and `data verify`; it does not duplicate their
-storage or daily decoding rules. A job becomes eligible only when a verified daily dataset
+storage or daily decoding rules. For ordinary retirement, a job becomes eligible only when a verified daily dataset
 and matching stream have an archived catalog. The shared lineage selector chooses the newest
 v2 catalog by coverage end, then proved ancestry at equal coverage; ambiguous branches are
 refused. Its dataset ancestry must reach the instrument's one readable daily continuation
@@ -23,7 +52,7 @@ root with `provenance/lineage.json`. Proven superseded v2 ancestry is independen
 An ancestry name is considered v2 only after checking its local manifest or its archived,
 hash-pinned manifest; a descendant cannot expand the root's verified v1 replacement mapping.
 
-Retiring local legacy manifests additionally requires a completed immutable migration record
+Ordinary retirement of local legacy manifests additionally requires a completed immutable migration record
 under `pipeline_state/records` matching the root's mapping. Lineage names and coverage
 containment alone grant no v1 deletion authority. Other legacy streams sharing a replaced
 source remain protected unless explicitly included in the verified mapping. Native v2 roots need no migration record;
@@ -89,6 +118,7 @@ serialized bytes. Schema version 2 contains:
 | Field | Meaning |
 | --- | --- |
 | `store`, `archive_root`, `jobs` | Exact application scope |
+| `whole_job` | Optional Boolean, default false; includes the selected job's current roots in retirement |
 | `state` | Absolute manifest, record, mutable-state, configuration and governance file paths mapped to byte count and SHA-256 |
 | `remote_state` | Complete archive-root listing keyed by Drive file ID, including name, size, checksum when available, and trash state |
 | `references` | Source document, referenced closure, `protected`/`retired`, and reason |
@@ -131,4 +161,4 @@ archive, fresh-store restoration, two updates at the same cutoff, and retirement
 Deriv and Pocket v1 fixtures. All transport is loopback fake data; no production deletion or
 external broker acquisition is exercised.
 
-Production operator tasks for this code delivery: none. Matching linked Sentry issues: none.
+Production operator tasks for this code delivery: none. Matching linked Sentry issues: unknown; none supplied.

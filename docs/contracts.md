@@ -831,11 +831,31 @@ configuration, and supplies the seed and update cutoff without editing the opera
 Consumer-only configurations may omit jobs; update requires them. List/restore need no broker
 credentials.
 
-The seed of a job is the newest imported dataset generation of its instrument in the managed
-store (by coverage end): a generation published there by `data import` with a source kind other
-than `broker_history`. Importing is therefore the only entry of raw data, and the raw archive
-may be deleted after import; the store is the one system-owned copy. An update with no imported
-generation fails before any credential is resolved.
+The seed is the readable v2 continuation root of the job's instrument. Existing v1 inputs must
+be migrated first. An empty store instead acquires directly from the configured broker within
+`history.start` and the pinned cutoff, using the existing unseeded daily fetch owner. No import
+or v1 intermediate is needed. A pending intent preserves its original seed list, even when
+an interrupted bootstrap has published partial v2 data.
+
+`add-job --config PIPELINE --template CORE --broker B --symbol S [--quote-currency C]
+[--price-scale N] [--session FILE]` reuses the template's broker settings, history policy and
+instrument candle policy. It requires development/research mode and an explicit singular
+`instruments.session` table. It discovers the requested symbol, uses reported precision where
+available, and otherwise validates a bounded history sample through the adapter at exact
+supported scales. Empty/invalid samples require an explicit scale. Six-uppercase-letter pair
+symbols (optional `frx` prefix / `_otc` suffix) supply the quote currency; ambiguous symbols
+require the option. A scale failure includes the required digits, never rounds the price.
+
+Registration checkpoints its exact core/evidence bytes before create-once file publication and
+appends the pipeline entry last under the writer lock; retry uses that checkpoint and refuses
+different input or output bytes. Generated paths are relative `jobs/JOB.toml` and
+`evidence/JOB.json`. Existing source-bound imported jobs remain readable; empty-store bootstrap
+also requires the explicit calendar. The `WT-SESSIONS INTEGRATION POINT` in
+`data_pipeline_add.rs` preserves the exact unmerged singular session shape: `always`, or
+`weekly` with timezone, open/close full weekday names and HH:MM:SS, closed_dates and early_closes.
+Until native calendar parsing is integrated, only explicit `always` executes; weekly registration
+is accepted and weekly acquisition refuses. Enable `new_instrument::native_session_contract`
+when that owner merges. Plural `sessions` remains a separate profile field.
 
 The `drive` table requires `root_folder_id` (nonempty, with no ASCII control characters, slash,
 or single quote), `chunk_bytes` (a positive unsigned 64-bit multiple of `262144`),
@@ -856,7 +876,7 @@ operator credentials. See [the example](../configs/data-pipeline.example.toml).
 The managed root separates `store/` (retained and published objects, also the importer's
 retained folder and publication root) and `pipeline_state/`. State and per-job state directories
 have mode `0700`. Update holds the nonblocking `pipeline_state/writer.lock` for the producer run;
-list/restore do not take that lock. Use one writer host per archive root.
+pull/restore also hold that lock and the host-local archive-root lock. Use one writer host per archive root.
 
 Under `pipeline_state/`:
 
@@ -876,9 +896,8 @@ Under `pipeline_state/`:
   a trailing partial line is ignored, reported, and truncated before appending. Pages are retained
   before this checkpoint advances; resumption decodes them and continues backward. A page whose
   rows contradict the retained rows fails the run before it is checkpointed, so a resumed
-  intent never replays a conflicting page; completion removes both progress files. Removing both
-  files abandons a pending intent (its retained pages stay as unreferenced diagnostics) so a later update may pin a new
-  cutoff.
+  intent never replays a conflicting page; completion removes both progress files. Resume with
+  update at the same cutoff; never remove progress files manually to abandon or bypass a binding.
 - `registry/snapshot.json` (version `1`) binds `archive_root` and the fixture `endpoint`, and
   stores a `sequence` watermark, `files`, pending `legacy` aliases, imported job names, and
   the completed-rebuild flag. Every `files` key is `objects/SHA256HEX`, including the byte
@@ -899,6 +918,8 @@ Under `pipeline_state/`:
   Session capabilities stay inside the private pipeline-state directory.
 - `downloads/` holds temporary `FILE_ID.catalog`, `GENERATION.manifest`, and
   `SHA256HEX.partial` downloads.
+- `registrations/JOB.json` seals the requested template/session/options digest and exact
+  generated core/evidence bytes before add-job publishes files and appends its pipeline entry.
 
 A pending intent binds the archive root and the evidence digest it was opened under as well;
 a resumed invocation whose `drive.root_folder_id` or evidence file differs fails with the pending
@@ -912,7 +933,9 @@ binary-alpha data import --config CORE
 binary-alpha data pipeline migrate --config PIPELINE [--job ID]
 binary-alpha data pipeline update --config PIPELINE [--end END]
 binary-alpha data pipeline archive --config PIPELINE [--job ID]
-binary-alpha data pipeline retire --config PIPELINE [--job ID] [--plan | --apply PLAN_FILE]
+binary-alpha data pipeline add-job --config PIPELINE --template CORE --broker B --symbol S [--quote-currency C] [--price-scale N] [--session FILE]
+binary-alpha data pipeline retire --config PIPELINE [--job ID] [--whole-job] [--plan | --apply PLAN_FILE]
+binary-alpha data pipeline remove-job --config PIPELINE --job ID
 binary-alpha data pipeline list --config PIPELINE --broker BROKER --symbol SYMBOL
 binary-alpha data pipeline pull --config PIPELINE --broker BROKER --symbol SYMBOL
 binary-alpha data pipeline restore --config PIPELINE --catalog FILE_ID --sha256 SHA256 --broker BROKER --symbol SYMBOL
@@ -965,7 +988,7 @@ Retiring v1 manifests requires a matching immutable, verified migration record a
 Retirement plans use schema 2, refuse older apply plans, and preserve completed evidence when
 seal scratch files survive a crash. Every Drive delete attempt rechecks name and content identity.
 
-Update requires an imported generation; `END` is `YYYY-MM-DDTHH:MM:SS[.ffffff]Z`. Each job
+Update follows the v2 root or bootstraps an empty job; `END` is `YYYY-MM-DDTHH:MM:SS[.ffffff]Z`. Each job
 acquires a bounded extension, audits and verifies its result, and archives it independently.
 A pending acquisition keeps its original cutoff, baseline, start, and pages on rerun, even after
 a partial snapshot was archived. A conflicting `--end` or effective configuration fails with the
