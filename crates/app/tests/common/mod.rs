@@ -165,6 +165,29 @@ pub fn sha256(path: &Path) -> String {
         .collect()
 }
 
+/// Exact regular-file inventory, including names, for refusal/source-preservation oracles.
+pub fn snapshot_tree(root: &Path) -> std::collections::BTreeMap<PathBuf, Vec<u8>> {
+    fn visit(root: &Path, dir: &Path, files: &mut std::collections::BTreeMap<PathBuf, Vec<u8>>) {
+        if !dir.exists() {
+            return;
+        }
+        for entry in fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                visit(root, &path, files);
+            } else {
+                files.insert(
+                    path.strip_prefix(root).unwrap().to_path_buf(),
+                    fs::read(path).unwrap(),
+                );
+            }
+        }
+    }
+    let mut files = std::collections::BTreeMap::new();
+    visit(root, root, &mut files);
+    files
+}
+
 /// CRC32C of a file, computed independently of the application.
 pub fn crc32c(path: &Path) -> u32 {
     let mut crc = !0u32;

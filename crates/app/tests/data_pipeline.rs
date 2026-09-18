@@ -455,6 +455,8 @@ struct Session {
 struct DriveState {
     files: BTreeMap<String, RemoteEntry>,
     sessions: BTreeMap<String, Session>,
+    /// Directly installed historical fixtures count as already uploaded content.
+    seeded_uploads: Vec<(String, Vec<u8>)>,
     next: usize,
     log: Vec<String>,
     media_requests: Vec<(String, Option<String>)>,
@@ -1748,7 +1750,12 @@ fn pipeline_roundtrip() {
     }
     let pocket_manifest = dataset(&store, &pocket_first);
     assert_bundle(&store, &pocket_manifest, 3);
-    assert_archive_inventory(&f.drive);
+    assert_archive_inventory(
+        &f.drive,
+        &store,
+        &f.scratch.path("producer/pipeline_state/records"),
+        &[field(pocket_line, "catalog")],
+    );
     let root = dataset(&store, &pocket_seed);
     let lineage_object = root
         .objects
@@ -1756,16 +1763,43 @@ fn pipeline_roundtrip() {
         .find(|o| o.path == "provenance/lineage.json")
         .unwrap();
     let imported_lineage = read_json(&store.join(&lineage_object.key));
-    assert!(
-        imported_lineage["provenance"]
+    let collection_path = f.scratch.path("sources/pocket/collection.json");
+    let collection = read_json(&collection_path);
+    let entry = imported_lineage["provenance"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|v| v["object"]["path"] == "collection/collection.json")
+        .unwrap();
+    assert_eq!(
+        entry["instrument_entry"],
+        collection["assets"]["AEDCNY_otc"]
+    );
+    assert_eq!(entry["object"]["sha256"], common::sha256(&collection_path));
+    let asset = f.scratch.path("sources/pocket/AEDCNY_otc");
+    for (checkpoint, name) in [(false, "raw_pages.ndjson"), (true, "checkpoint.ndjson")] {
+        assert_eq!(
+            common::daily::reconstruct_import(&store, &root, checkpoint),
+            fs::read(asset.join(name)).unwrap()
+        );
+    }
+    for name in [
+        "download_manifest.json",
+        "dataset/manifest.json",
+        "dataset/hashes.sha256",
+        "dataset/reports/quality.json",
+    ] {
+        let entry = imported_lineage["provenance"]
             .as_array()
             .unwrap()
             .iter()
-            .any(|v| v["object"]["path"]
-                .as_str()
-                .unwrap()
-                .starts_with("collection/"))
-    );
+            .find(|v| v["object"]["path"] == name)
+            .unwrap();
+        assert_eq!(
+            serde_json::from_value::<Vec<u8>>(entry["bytes_verbatim"].clone()).unwrap(),
+            fs::read(asset.join(name)).unwrap()
+        );
+    }
     let lineage_object = pocket_manifest
         .objects
         .iter()
@@ -1831,7 +1865,12 @@ fn pipeline_roundtrip() {
         &deriv_manifest,
         f.deriv.requests().len() - deriv_requests_before,
     );
-    assert_archive_inventory(&f.drive);
+    assert_archive_inventory(
+        &f.drive,
+        &store,
+        &f.scratch.path("producer/pipeline_state/records"),
+        &[field(pocket_line, "catalog"), field(deriv_line, "catalog")],
+    );
     // The seed's last tick lies two seconds before its end; the acquisition starts one overlap
     // before that frontier.
     let deriv_fetch_start = DERIV_SEED_END - 2 - 60;
@@ -1870,6 +1909,15 @@ fn pipeline_roundtrip() {
         &["--end", &time_text(deriv_cutoff_2 * 1_000_000)],
     )
     .unwrap();
+    assert_archive_inventory(
+        &f.drive,
+        &store,
+        &f.scratch.path("producer/pipeline_state/records"),
+        &[
+            field(pocket_line, "catalog"),
+            field(job_line(&third, "deriv"), "catalog"),
+        ],
+    );
     let deriv_second = field(job_line(&third, "deriv"), "dataset").to_string();
     let rows = ticks(&store, &dataset(&store, &deriv_second));
     assert_eq!(
@@ -2419,6 +2467,48 @@ fn failed_restore_pull(f: &Fixture, catalog_id: &str) {
     ))
     .unwrap_err();
     assert!(legacy.contains(&expected), "{legacy}");
+
+    // Isolate the original refusal property from the daily-preference property above.
+    let mut state = f.drive.state.lock().unwrap();
+    for (id, entry) in &mut state.files {
+        if id != catalog_id
+            && Catalog::from_json(&entry.bytes).is_ok_and(|other| {
+                other.broker == catalog.broker && other.provider_symbol == catalog.provider_symbol
+            })
+        {
+            entry.trashed = true;
+        }
+    }
+    let candidates: Vec<_> = state
+        .files
+        .iter()
+        .filter(|(_, entry)| {
+            !entry.trashed
+                && Catalog::from_json(&entry.bytes).is_ok_and(|other| {
+                    other.broker == catalog.broker
+                        && other.provider_symbol == catalog.provider_symbol
+                })
+        })
+        .map(|(id, _)| id.as_str())
+        .collect();
+    assert_eq!(candidates, [catalog_id]);
+    drop(state);
+    let isolated_root = f.scratch.path("bad-index-only-consumer");
+    let isolated = f.scratch.path("bad-index-only-consumer.toml");
+    fs::write(
+        &isolated,
+        pipeline_toml(&isolated_root, &f.drive.base, &[], None, 3),
+    )
+    .unwrap();
+    assert!(!isolated_root.join("store").exists());
+    let refused = pipeline(
+        "pull",
+        &isolated,
+        &["--broker", "pocket_option", "--symbol", "AEDCNY_otc"],
+    )
+    .unwrap_err();
+    assert!(refused.contains(&expected), "{refused}");
+    assert!(!refused.contains("already local"), "{refused}");
 }
 
 #[test]
@@ -3651,12 +3741,61 @@ fn pipeline_recovery() {
         "{pending}"
     );
     let received = fs::read_to_string(state.join("pocket/progress.received.jsonl")).unwrap();
-    let decoded = received
+    let received: Vec<_> = received
         .lines()
         .map(|line| serde_json::from_str::<Value>(line).unwrap())
         .filter(|entry| entry["rows"] == 40)
-        .count();
-    assert_eq!(decoded, 2, "{received}");
+        .map(|entry| {
+            let page: binary_alpha_app::fetch::PageCoverage =
+                serde_json::from_value(entry).unwrap();
+            let bytes =
+                fs::read(store.join(binary_alpha_engine::dataset::object_key(&page.sha256)))
+                    .unwrap();
+            assert_eq!(bytes.len() as u64, page.bytes);
+            assert_eq!(
+                binary_alpha_engine::hex(&Sha256::digest(&bytes)),
+                page.sha256
+            );
+            (page, bytes)
+        })
+        .collect();
+    assert_eq!(received.len(), 2);
+    assert_ne!(received[0].0.occurrence, received[1].0.occurrence);
+    let assert_diagnostics = |root: &Path, manifest: &GenerationManifest| {
+        let pages = common::daily::pages(root, manifest);
+        for (record, bytes) in &received {
+            let identity = record.occurrence.as_ref().unwrap();
+            let matched: Vec<_> = pages
+                .iter()
+                .filter(|p| {
+                    p.acquisition_id == identity.acquisition_id && p.ordinal == identity.ordinal
+                })
+                .collect();
+            assert_eq!(
+                matched.len(),
+                1,
+                "one diagnostic occurrence for {identity:?}"
+            );
+            let page = matched[0];
+            assert_eq!(page.intent, identity.intent);
+            assert_eq!(&page.payload, bytes);
+            assert_eq!(page.payload_sha256, record.sha256);
+            assert_eq!(page.rows, record.rows);
+            assert_eq!(page.request_token, record.anchor);
+            let time = |text: &Option<String>| {
+                text.as_deref()
+                    .map(|s| binary_alpha_engine::market::parse_event_time_micros(s).unwrap())
+            };
+            assert_eq!(page.receipt_time_utc, time(&record.receipt_time));
+            assert_eq!(page.first_event_time, time(&record.first));
+            assert_eq!(page.last_event_time, time(&record.last));
+            assert_eq!(
+                page.disposition,
+                binary_alpha_app::daily::PageDisposition::Diagnostic
+            );
+        }
+        pages
+    };
     // Its closure carries the seed object deleted remotely above: archival re-confirms every
     // reused transfer and refuses instead of reporting a cached success.
     let missing = pipeline("update", &pocket_only, &[]).unwrap_err();
@@ -3694,6 +3833,49 @@ fn pipeline_recovery() {
         ),
         expected_bars(POCKET_SEED_END, POCKET_SEED_END - 60, cutoff_2 + 300)
     );
+    let line = job_line(&resumed, "pocket");
+    let final_manifest = dataset(&store, field(line, "dataset"));
+    let final_pages = assert_diagnostics(&store, &final_manifest);
+    let fresh_root = f.scratch.path("conflict-diagnostics-restored");
+    let fresh_config = f.scratch.path("conflict-diagnostics-restored.toml");
+    fs::write(
+        &fresh_config,
+        pipeline_toml(&fresh_root, &f.drive.base, &[], None, 3),
+    )
+    .unwrap();
+    pipeline(
+        "restore",
+        &fresh_config,
+        &[
+            "--catalog",
+            field(line, "catalog"),
+            "--sha256",
+            field(line, "sha256"),
+            "--broker",
+            "pocket_option",
+            "--symbol",
+            "AEDCNY_otc",
+        ],
+    )
+    .unwrap();
+    let restored_store = fresh_root.join("store");
+    let restored_manifest = dataset(&restored_store, &final_manifest.generation);
+    assert_eq!(
+        assert_diagnostics(&restored_store, &restored_manifest),
+        final_pages
+    );
+    for day in final_manifest
+        .day_inventory
+        .iter()
+        .filter(|d| d.family == binary_alpha_engine::dataset::DayFamily::Pages)
+    {
+        let key = day.object.as_ref().unwrap();
+        assert_eq!(
+            fs::read(restored_store.join(key)).unwrap(),
+            fs::read(store.join(key)).unwrap(),
+            "archived page partition {key}"
+        );
+    }
     failed_restore_pull(&f, field(job_line(&resumed, "pocket"), "catalog"));
 }
 
@@ -4965,6 +5147,67 @@ fn pipeline_migration_lossless_resume_and_tamper() {
     assert!(error.contains("checkpoint"), "{error}");
     assert_eq!(read_json(&state_path)["phase"], "converted");
     fs::write(cp_path, original).unwrap();
+    // Fail only the atomic checkpoint save: verification publishes its immutable record first.
+    let checkpoint_before = fs::read(&state_path).unwrap();
+    let records_before = common::snapshot_tree(&records);
+    let checkpoint_fault = state_path.with_extension("tmp");
+    let mut interrupted_report = Vec::new();
+    data_pipeline::migrate_with(
+        &f.pipeline,
+        Some("pocket"),
+        &|job| {
+            assert_eq!(job, "pocket");
+            fs::create_dir(&checkpoint_fault).unwrap();
+            Ok(())
+        },
+        &mut interrupted_report,
+    )
+    .unwrap_err();
+    let interrupted_report = String::from_utf8(interrupted_report).unwrap();
+    assert!(
+        interrupted_report.contains(&format!("cannot create {}", checkpoint_fault.display())),
+        "{interrupted_report}"
+    );
+    assert_eq!(fs::read(&state_path).unwrap(), checkpoint_before);
+    assert!(read_json(&state_path)["record"].is_null());
+    assert!(state_path.parent().unwrap().join("migration-work").is_dir());
+    let published_records = common::snapshot_tree(&records);
+    let new_records: Vec<_> = published_records
+        .iter()
+        .filter(|(name, _)| !records_before.contains_key(*name))
+        .collect();
+    assert_eq!(
+        new_records.len(),
+        1,
+        "only the verified record is published before checkpoint failure"
+    );
+    let (verified_name, verified_bytes) = new_records[0];
+    let proof: Value = serde_json::from_slice(verified_bytes).unwrap();
+    assert_eq!(proof["phase"], "verified");
+    assert_eq!(proof["v2_root"], converted["dataset"]);
+    assert_eq!(proof["v2_stream"], converted["stream"]);
+    assert_eq!(
+        proof["equality"],
+        json!({"observations":true,"pages":true,"source_files":true,"candles":true})
+    );
+    let objects_before_resume = common::snapshot_tree(&store.join("objects"));
+    fs::remove_dir(&checkpoint_fault).unwrap();
+    let resumed = pipeline("migrate", &f.pipeline, &["--job", "pocket"]).unwrap();
+    assert!(resumed.contains("status verified"), "{resumed}");
+    let verified = read_json(&state_path);
+    assert_eq!(verified["record"], verified_name.to_str().unwrap());
+    assert_eq!(verified["dataset"], converted["dataset"]);
+    assert_eq!(verified["stream"], converted["stream"]);
+    assert_eq!(
+        common::snapshot_tree(&records),
+        published_records,
+        "resume preserves the exact record without duplicates"
+    );
+    assert_eq!(
+        common::snapshot_tree(&store.join("objects")),
+        objects_before_resume
+    );
+    assert!(!state_path.parent().unwrap().join("migration-work").exists());
     let report = pipeline("migrate", &f.pipeline, &[]).unwrap();
     assert!(report.contains("status verified"), "{report}");
     assert_eq!(
@@ -6250,9 +6493,126 @@ mod daily_end_to_end;
 #[path = "data_pipeline/legacy_fixtures.rs"]
 mod legacy_fixtures;
 
-fn assert_archive_inventory(drive: &FakeDrive) {
+fn assert_archive_inventory(
+    drive: &FakeDrive,
+    store: &Path,
+    records: &Path,
+    newest_catalogs: &[&str],
+) {
     use std::collections::BTreeSet;
     let files = drive.files();
+    // Derive archived instruments from the producer's immutable receipts and local manifests,
+    // never from the catalog whose completeness is under test.
+    let local_records = common::snapshot_tree(records);
+    let manifests: Vec<_> = binary_alpha_app::store::Store::filesystem(store)
+        .list_manifests()
+        .unwrap()
+        .into_iter()
+        .map(|g| {
+            let key = binary_alpha_engine::dataset::manifest_key(&g);
+            (g, key.clone(), read_json(&store.join(key)))
+        })
+        .collect();
+    let mut instruments = BTreeSet::new();
+    let mut jobs = BTreeSet::new();
+    let assert_remote = |label: &str, bytes: &[u8], length: u64, digest: &str| {
+        assert_eq!(bytes.len() as u64, length, "local identity {label}");
+        assert_eq!(
+            binary_alpha_engine::hex(&Sha256::digest(bytes)),
+            digest,
+            "local identity {label}"
+        );
+        assert!(
+            files
+                .values()
+                .any(|entry| !entry.trashed && entry.bytes == bytes),
+            "producer closure missing from Drive: {label} ({digest})"
+        );
+    };
+    for (name, bytes) in &local_records {
+        let name = name.to_str().unwrap();
+        if let Some((job, suffix)) = name.split_once("-catalog-") {
+            let receipt: data_pipeline::CatalogReceipt = serde_json::from_slice(bytes).unwrap();
+            let remote = &files[&receipt.file_id];
+            assert!(!remote.trashed);
+            assert_eq!(remote.bytes.len() as u64, receipt.bytes);
+            assert_eq!(
+                binary_alpha_engine::hex(&Sha256::digest(&remote.bytes)),
+                receipt.sha256
+            );
+            jobs.insert(job.to_string());
+            let matches: Vec<_> = manifests
+                .iter()
+                .filter(|(g, _, _)| suffix.starts_with(&g[..16]))
+                .collect();
+            assert_eq!(
+                matches.len(),
+                1,
+                "local catalog receipt must bind one dataset"
+            );
+            instruments.insert(matches[0].2["instrument"].as_str().unwrap().to_string());
+        }
+    }
+    assert!(!instruments.is_empty());
+    for (_, key, manifest) in &manifests {
+        if !instruments.contains(manifest["instrument"].as_str().unwrap()) {
+            continue;
+        }
+        let bytes = fs::read(store.join(key)).unwrap();
+        assert_remote(
+            key,
+            &bytes,
+            bytes.len() as u64,
+            &binary_alpha_engine::hex(&Sha256::digest(&bytes)),
+        );
+        for object in manifest["objects"].as_array().unwrap() {
+            let key = object["key"].as_str().unwrap();
+            assert_remote(
+                key,
+                &fs::read(store.join(key)).unwrap(),
+                object["bytes"].as_u64().unwrap(),
+                object["sha256"].as_str().unwrap(),
+            );
+        }
+    }
+    for (name, bytes) in &local_records {
+        let value: Value = serde_json::from_slice(bytes).unwrap();
+        // A catalog cannot archive its own receipt. Every older receipt is cumulative
+        // evidence, selected here from local records and the command's newest catalog IDs.
+        let receipt_job = name
+            .to_str()
+            .unwrap()
+            .split_once("-catalog-")
+            .map(|(job, _)| job);
+        if receipt_job.is_some()
+            && value["file_id"]
+                .as_str()
+                .is_some_and(|id| newest_catalogs.contains(&id))
+        {
+            continue;
+        }
+        let owner = if let Some(job) = receipt_job.or_else(|| value["job"].as_str()) {
+            Some(job.to_string())
+        } else {
+            value["intent"]
+                .as_str()
+                .and_then(|intent| local_records.get(Path::new(intent)))
+                .map(|bytes| {
+                    serde_json::from_slice::<Value>(bytes).unwrap()["job"]
+                        .as_str()
+                        .unwrap()
+                        .to_string()
+                })
+        };
+        if owner.is_some_and(|job| jobs.contains(&job)) {
+            assert_remote(
+                name.to_str().unwrap(),
+                bytes,
+                bytes.len() as u64,
+                &binary_alpha_engine::hex(&Sha256::digest(bytes)),
+            );
+        }
+    }
     let mut expected = BTreeSet::new();
     for (id, file) in &files {
         if let Ok(catalog) = Catalog::from_json(&file.bytes) {

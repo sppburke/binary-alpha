@@ -767,3 +767,264 @@ fn daily_offset_candle_completeness_requires_the_next_day_prefix() {
         );
     }
 }
+
+/// Consumer proof over lifecycle artifacts. Outputs live outside the pipeline store so they
+/// cannot introduce research roots into the retirement fixture.
+pub(super) struct LifecycleReaders {
+    scratch: Scratch,
+    profile: PathBuf,
+    frozen: PathBuf,
+    baseline: ReaderOutput,
+}
+
+#[derive(Debug, PartialEq)]
+struct ReaderOutput {
+    features: std::collections::BTreeMap<String, common::Table>,
+    continued: Vec<FeatureOutput>,
+    profile: InstrumentProfile,
+    candles: Vec<Vec<Vec<Option<Value>>>>,
+    outcomes: std::collections::BTreeMap<String, Vec<u8>>,
+    ledger: String,
+    summary: Vec<u8>,
+}
+
+impl LifecycleReaders {
+    pub(super) fn new(root: &Path, dataset: &GenerationManifest, stream: &StreamManifest) -> Self {
+        let scratch = Scratch::new(&format!("lifecycle_readers_{}", dataset.broker));
+        let published = scratch.path("published");
+        // The frozen plan's profile stays reachable even when the producer store is removed.
+        for object in &stream.objects {
+            let target = published.join(&object.key);
+            fs::create_dir_all(target.parent().unwrap()).unwrap();
+            fs::copy(root.join(&object.key), target).unwrap();
+        }
+        let profile = published.join(stream.key());
+        fs::create_dir_all(profile.parent().unwrap()).unwrap();
+        fs::copy(root.join(stream.key()), &profile).unwrap();
+        let (frozen, baseline) = lifecycle_output(&scratch, root, dataset, stream, &profile, None);
+        Self {
+            scratch,
+            profile,
+            frozen,
+            baseline,
+        }
+    }
+
+    pub(super) fn assert_parity(
+        &self,
+        root: &Path,
+        dataset: &GenerationManifest,
+        stream: &StreamManifest,
+    ) {
+        let (_, actual) = lifecycle_output(
+            &self.scratch,
+            root,
+            dataset,
+            stream,
+            &self.profile,
+            Some(&self.frozen),
+        );
+        assert_eq!(
+            actual, self.baseline,
+            "actual lifecycle consumer outputs for {}",
+            dataset.instrument
+        );
+    }
+}
+
+fn lifecycle_output(
+    scratch: &Scratch,
+    input_root: &Path,
+    dataset: &GenerationManifest,
+    stream: &StreamManifest,
+    profile: &Path,
+    frozen: Option<&Path>,
+) -> (PathBuf, ReaderOutput) {
+    use binary_alpha_engine::market::{format_event_time_micros, parse_event_time_micros};
+    use binary_alpha_engine::{
+        execution::ReplayManifest,
+        outcomes::{MISSING_INDEX, OutcomeManifest, stream_object_paths},
+    };
+    use std::collections::{BTreeMap, BTreeSet};
+    let input = input_root.join(dataset.key());
+    common::verify(&input).unwrap();
+    common::verify(&input_root.join(stream.key())).unwrap();
+    let settings = frozen.map(|path| format!("frozen_plan=\"{}\"\n", uri(path))).unwrap_or_else(|| {
+        let streams = stream.streams.iter().map(|s| format!("{{duration_seconds={},offset_seconds={}}}", s.duration_seconds, s.offset_seconds)).collect::<Vec<_>>().join(",");
+        format!("streams=[{streams}]\noutputs=[\"candle_direction\",\"range_bps\",\"return_1_bps\"]\nstructure={{swing_left=2,swing_right=2,rolling_windows=[5,10,20],direction_window=10,trend_efficiency_threshold=0.35,trend_min_abs_momentum_bps=3.0,range_efficiency_threshold=0.25,compression_ratio_threshold=0.7,expanded_ratio_threshold=1.3,extreme_ratio_threshold=1.8,pullback_min_trend_age=3,trend_reset_sideways_bars=3,failed_breakout_max_bars=5}}\n")
+    });
+    let feature_path = run(scratch, "lifecycle-features.toml", &format!(
+        "\n[[features.instruments]]\nrole=\"development\"\ninput_manifest=\"{}\"\nprofile_manifest=\"{}\"\n{settings}", uri(&input), uri(profile)), &["features", "build"]).unwrap();
+    common::verify(&feature_path).unwrap();
+    let feature = FeatureManifest::from_json(&fs::read(&feature_path).unwrap()).unwrap();
+    let root = scratch.path("published");
+    let plan =
+        FeaturePlan::from_json(&fs::read(object(&root, &feature.objects, "plan.json")).unwrap())
+            .unwrap();
+    let features: BTreeMap<_, _> = plan
+        .streams
+        .iter()
+        .flat_map(|s| s.object_paths())
+        .map(|path| {
+            let rows = common::read_table(&object(&root, &feature.objects, &path));
+            if path.starts_with("rows/") {
+                assert!(!rows.1.is_empty(), "nonempty feature partition {path}");
+            }
+            (path, rows)
+        })
+        .collect();
+    let scale = stream.definition.price_scale;
+    let mut engine = FeatureEngine::new(&plan, Source::from_manifest(dataset)).unwrap();
+    let mut last = None;
+    let mut first_day_rows = 0u32;
+    let first_day = &dataset.coverage.first_event_time[..10];
+    binary_alpha_app::daily::read_generation(
+        &binary_alpha_app::store::Store::filesystem(input_root),
+        dataset,
+        |row| {
+            let observation = row.observation(scale)?;
+            let mut output = FeatureOutput::default();
+            engine
+                .push(observation, &mut output)
+                .map_err(|e| format!("{e:?}"))?;
+            let time = match observation {
+                Observation::Tick(t) => t.event_time_micros,
+                Observation::Bar(b) => b.start_micros,
+            };
+            if &format_event_time_micros(time)[..10] == first_day {
+                first_day_rows += 1;
+            }
+            last = Some(observation);
+            Ok(())
+        },
+    )
+    .unwrap();
+    assert_eq!(engine.profile().observations, dataset.row_count);
+    let mut next = last.unwrap();
+    let mut continued = Vec::new();
+    for _ in 0..60 {
+        match &mut next {
+            Observation::Tick(t) => {
+                t.event_time_micros += 2_000_000;
+                t.price_units += 1;
+            }
+            Observation::Bar(b) => {
+                b.start_micros += 5_000_000;
+            }
+        }
+        let mut output = FeatureOutput::default();
+        engine.push(next, &mut output).unwrap();
+        continued.push(output);
+    }
+    assert!(
+        continued.iter().any(|out| !out.rows.is_empty()),
+        "continuation exercises retained engine state"
+    );
+    let profile = normalize_profile(engine.profile(), "source");
+    let candles = stream
+        .streams
+        .iter()
+        .map(|spec| candles(input_root, stream, spec))
+        .collect();
+    let suffix = format!(
+        "\n[outcomes]\nrole=\"development\"\ntick_manifest=\"{}\"\nfeature_manifest=\"{}\"\nexpiry_seconds=[5,10,60]\nmax_entry_delay_ms=2000\nmax_settlement_delay_ms=2000\nmax_tick_gap_ms=2000\ntrue_jump_max_gap_ms=2000\ntrue_jump_basis_points=\"5\"\nfrozen_min_ticks=10\nfrozen_min_ms=5000\n",
+        uri(&input),
+        uri(&feature_path)
+    );
+    let outcome = run(
+        scratch,
+        "lifecycle-outcomes.toml",
+        &suffix,
+        &["outcomes", "build"],
+    );
+    let start = parse_event_time_micros(&dataset.coverage.first_event_time).unwrap();
+    let end = parse_event_time_micros(&dataset.coverage.last_event_time).unwrap() + 1;
+    let spec = &stream.streams[0];
+    let spec_text = format!(
+        "duration_seconds = {}, offset_seconds = {}",
+        spec.duration_seconds, spec.offset_seconds
+    );
+    let suffix = replay_table(&input, &feature_path, &feature.plan_identity)
+        .replace("pocket_option", dataset.broker.as_str())
+        .replace("AEDCNY_otc", dataset.provider_symbol.as_str())
+        .replace("2026-09-17T00:00:00Z", &format_event_time_micros(start))
+        .replace("2026-09-22T00:00:00Z", &format_event_time_micros(end))
+        .replace(
+            "2026-09-18T12:00:00Z",
+            &format_event_time_micros(start + (end - start) / 2),
+        )
+        .replace("duration_seconds = 15, offset_seconds = 5", &spec_text)
+        .replace("duration_seconds = 5, offset_seconds = 0", &spec_text);
+    let replay = run(scratch, "lifecycle-replay.toml", &suffix, &["replay"]);
+    let (outcomes, ledger, summary) = if dataset.capabilities.contains(&Capability::Bars) {
+        for error in [outcome.unwrap_err(), replay.unwrap_err()] {
+            assert!(error.contains("tick"), "{error}");
+        }
+        (BTreeMap::new(), String::new(), Vec::new())
+    } else {
+        let outcome = outcome.unwrap();
+        common::verify(&outcome).unwrap();
+        let outcome = OutcomeManifest::from_json(&fs::read(outcome).unwrap()).unwrap();
+        let outcomes: BTreeMap<_, _> = outcome
+            .objects
+            .iter()
+            .map(|o| (o.path.clone(), fs::read(root.join(&o.key)).unwrap()))
+            .collect();
+        let mut global = false;
+        let mut reasons = BTreeSet::new();
+        for spec in &outcome.streams {
+            let paths = stream_object_paths(spec.duration_seconds, spec.offset_seconds);
+            let indices = common::read_le(
+                &object(&root, &outcome.objects, &paths[1]),
+                u32::from_le_bytes,
+            );
+            global |= indices
+                .iter()
+                .any(|&i| i != MISSING_INDEX && i >= first_day_rows);
+            reasons.extend(outcomes[&paths[3]].iter().copied());
+        }
+        assert!(
+            first_day_rows > 0 && global,
+            "outcomes use global indices beyond the first UTC day"
+        );
+        assert!(
+            reasons.len() > 1,
+            "valid and unavailable outcomes exercised"
+        );
+        let replay = replay.unwrap();
+        common::verify(&replay).unwrap();
+        let replay = ReplayManifest::from_json(&fs::read(replay).unwrap()).unwrap();
+        let ledger =
+            fs::read_to_string(object(&root, &replay.objects, "ledger/events.jsonl")).unwrap();
+        assert!(
+            ledger.lines().count() > 10,
+            "nontrivial replay decisions and settlements"
+        );
+        let (definition, tail) = ledger.split_once('\n').unwrap();
+        let mut definition: serde_json::Value = serde_json::from_str(definition).unwrap();
+        for pointer in [
+            "/definition/config_hash",
+            "/definition/instruments/0/tick_generation",
+            "/definition/instruments/0/feature_generation",
+            "/definition/replay/inputs/0/tick_manifest",
+            "/definition/replay/inputs/0/feature_manifest",
+        ] {
+            *definition.pointer_mut(pointer).unwrap() = "source identity".into();
+        }
+        let ledger = format!("{}\n{tail}", serde_json::to_string(&definition).unwrap());
+        let summary = fs::read(object(&root, &replay.objects, "summary.json")).unwrap();
+        (outcomes, ledger, summary)
+    };
+    (
+        feature_path,
+        ReaderOutput {
+            features,
+            continued,
+            profile,
+            candles,
+            outcomes,
+            ledger,
+            summary,
+        },
+    )
+}
