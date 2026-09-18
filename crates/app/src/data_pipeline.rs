@@ -2011,11 +2011,11 @@ fn catalogs(
         .collect())
 }
 
+/// One archived catalog: its Drive file id, its SHA-256, and its parsed content.
+type ArchivedCatalog = (String, String, Catalog);
+
 /// Every archived catalog on the archive root, whatever its instrument.
-fn all_catalogs(
-    drive: &mut Drive,
-    layout: &Layout,
-) -> Result<Vec<(String, String, Catalog)>, String> {
+fn all_catalogs(drive: &mut Drive, layout: &Layout) -> Result<Vec<ArchivedCatalog>, String> {
     let scratch = layout.state.join("downloads");
     let mut found = Vec::new();
     for file in drive.list(CATALOG_PREFIX)? {
@@ -2181,8 +2181,7 @@ pub fn restore_all(config_path: &Path, out: &mut dyn Write) -> Result<(), String
         certification: None,
     };
     let mut drive = Drive::open(&config.drive)?;
-    let mut instruments: BTreeMap<(String, String), Vec<(String, String, Catalog)>> =
-        BTreeMap::new();
+    let mut instruments: BTreeMap<(String, String), Vec<ArchivedCatalog>> = BTreeMap::new();
     for found in all_catalogs(&mut drive, &layout)? {
         instruments
             .entry((found.2.broker.clone(), found.2.provider_symbol.clone()))
