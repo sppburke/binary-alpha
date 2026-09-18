@@ -60,6 +60,39 @@ fn listed(drive: &mut Drive, remote: crate::drive::RemoteFile) -> Result<ObjectI
     }
 }
 
+/// Runs `check` over every item, `workers` at a time; the first failure is the result.
+fn each_parallel<T: Sync>(
+    items: &[T],
+    workers: usize,
+    check: impl Fn(&T) -> Result<(), String> + Sync,
+) -> Result<(), String> {
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    std::thread::scope(|scope| {
+        let workers: Vec<_> = (0..workers.clamp(1, items.len().max(1)))
+            .map(|_| {
+                scope.spawn(|| {
+                    while let Some(item) =
+                        items.get(next.fetch_add(1, std::sync::atomic::Ordering::SeqCst))
+                    {
+                        check(item)?;
+                    }
+                    Ok(())
+                })
+            })
+            .collect();
+        workers.into_iter().try_for_each(|worker| {
+            worker
+                .join()
+                .map_err(|_| "retire: verification worker panicked".to_string())?
+        })
+    })
+}
+
+/// Verifies every manifest in `uris`, `workers` at a time, filling the phase memo.
+fn verify_all(uris: &[String], workers: usize, access: Access<'_>) -> Result<(), String> {
+    each_parallel(uris, workers, |uri| verify::run_with(uri, access).map(drop))
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Remote {
@@ -1260,6 +1293,21 @@ fn plan(
     let mut preserved_catalogs = BTreeSet::new();
     let mut completed_records = BTreeSet::new();
     let mut owned_records = BTreeSet::new();
+    let workers = usize::try_from(config.parallel_jobs.unwrap_or(1)).unwrap_or(1);
+    // Every selected instrument's daily datasets verify before the walk, `parallel_jobs` at a
+    // time; the walk's own verifications then answer from the phase memo.
+    if !whole_job {
+        let instruments: BTreeSet<&String> = selected
+            .values()
+            .map(|(instrument, _)| instrument)
+            .collect();
+        let uris: Vec<String> = manifests
+            .iter()
+            .filter(|(_, m)| m.daily && m.dataset && instruments.contains(&m.instrument))
+            .map(|(id, _)| Store::filesystem(&layout.store).uri(&manifest_key(id)))
+            .collect();
+        verify_all(&uris, workers, access)?;
+    }
     let mut inventory_snapshots = BTreeSet::new();
     let mut migrated_objects = BTreeSet::new();
     let mut declared_history = BTreeSet::new();
@@ -2436,12 +2484,14 @@ fn plan(
         }
     }
     let mut retained_manifests = Vec::new();
+    let uris: Vec<String> = manifests
+        .iter()
+        .filter(|(id, m)| roots.contains(*id) && m.ordinary)
+        .map(|(id, _)| Store::filesystem(&layout.store).uri(&manifest_key(id)))
+        .collect();
+    verify_all(&uris, workers, access)?;
     for (id, m) in &manifests {
         if roots.contains(id) && m.ordinary {
-            verify::run_with(
-                &Store::filesystem(&layout.store).uri(&manifest_key(id)),
-                access,
-            )?;
             retained_manifests.push(manifest_key(id));
         }
     }
@@ -2758,7 +2808,7 @@ fn plan(
         delete_local,
         totals,
     };
-    let remote = verify_retained(&plan, drive, access)?;
+    let remote = verify_retained(&plan, drive, access, workers)?;
     if before != state(config_path, config, layout)? || plan.remote_state != remote {
         return Err("retire: store changed during planning".into());
     }
@@ -2773,6 +2823,7 @@ fn verify_retained(
     plan: &Plan,
     drive: &mut Drive,
     access: Access<'_>,
+    workers: usize,
 ) -> Result<BTreeMap<String, Value>, String> {
     let verified = Verified::default();
     let access = Access {
@@ -2780,14 +2831,19 @@ fn verify_retained(
         ..access
     };
     let local = Store::filesystem(&plan.store);
-    for key in &plan.retained_manifests {
-        verify::run_with(&local.uri(key), access)?;
-    }
-    for (key, identity) in &plan.retained_objects {
-        if Identity::of(&plan.store.join(key))? != *identity {
+    let uris: Vec<String> = plan
+        .retained_manifests
+        .iter()
+        .map(|key| local.uri(key))
+        .collect();
+    verify_all(&uris, workers, access)?;
+    let objects: Vec<_> = plan.retained_objects.iter().collect();
+    each_parallel(&objects, workers, |(key, identity)| {
+        if Identity::of(&plan.store.join(key))? != **identity {
             return Err(format!("retire: retained object changed {key}"));
         }
-    }
+        Ok(())
+    })?;
     let remote = remote_state(drive)?;
     for e in &plan.retained_drive {
         let listed = remote.get(&e.file_id).filter(|file| {
@@ -2958,6 +3014,7 @@ fn apply_plan(
     archive_lock: &ArchiveLock,
     out: &mut dyn Write,
 ) -> Result<(), String> {
+    let workers = usize::try_from(config.parallel_jobs.unwrap_or(1)).unwrap_or(1);
     let bytes = fs::read(path).map_err(|e| e.to_string())?;
     let digest = hash(&bytes);
     let sealed = layout
@@ -3043,7 +3100,7 @@ fn apply_plan(
     File::open(log.parent().expect("progress parent"))
         .and_then(|f| f.sync_all())
         .map_err(|e| e.to_string())?;
-    verify_retained(&plan, drive, access)?;
+    verify_retained(&plan, drive, access, workers)?;
     while index < count {
         let start = index;
         let end = (index + BATCH)
@@ -3103,11 +3160,11 @@ fn apply_plan(
             index += 1;
         }
         if touches_retained(&plan, start, index) {
-            verify_retained(&plan, drive, access)?;
+            verify_retained(&plan, drive, access, workers)?;
         }
         writeln!(out, "retirement progress {index}/{count}").map_err(|e| e.to_string())?;
     }
-    verify_retained(&plan, drive, access)?;
+    verify_retained(&plan, drive, access, workers)?;
     let record = serde_json::json!({"schema_version":SCHEMA,"plan_sha256":digest,"removed_drive":plan.delete_drive,"removed_local":plan.delete_local,"retained_verified":true});
     let record_path = sealed.with_extension("retired.json");
     seal(&record_path, &crate::fetch::json_bytes(&record)?)?;

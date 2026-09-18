@@ -224,8 +224,9 @@ rehashed, and then retained Drive files are confirmed by one fresh root listing 
 untrashed) taken after that local work, so no remote observation predates it; only a file the listing
 does not confirm is read on its own, which also names one that vanished. Planning verifies each
 manifest once however many closures share it (one memo for the whole planning phase, which holds the
-writer lock); every retained check during application starts an empty memo so it observes the store
-afresh. Planned deletions and catalogs take their identity from the listing the same way; every
+writer lock), `parallel_jobs` manifests at a time; every retained check during application starts an
+empty memo so it observes the store afresh and verifies retained manifests and rehashes retained
+objects `parallel_jobs` at a time. Planned deletions and catalogs take their identity from the listing the same way; every
 deletion still rechecks its file before removing it. Each batch checks impact by exact paths (including manifest-directory
 descendants) and remote file IDs and reverifies any retained closure it touches. Reachability
 plans must have disjoint retained/deletion inventories, so normal batches touch none; this
