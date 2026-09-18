@@ -170,11 +170,11 @@ change; source files, the retained copy, and published generations stay intact.
 Use [the pipeline example](../configs/data-pipeline.example.toml) and
 [the implemented contracts](contracts.md#data-pipeline) to prepare the non-secret pipeline
 document, sibling core configurations, and source-binding evidence. The managed store under
-`local_root/store/` is the one system-owned copy of every dataset; raw archives enter it only
-through `data import` and may be deleted afterwards. Use one writer host per Google Drive
+`local_root/store/` is the one system-owned copy of every dataset. Existing originals enter
+through `data import`; new instruments bootstrap through `update`. Use one writer host per Google Drive
 archive root and the same managed root for manual and timer producers. Update holds
-`pipeline_state/writer.lock`; a second producer fails immediately. Consumers do not acquire that
-lock.
+`pipeline_state/writer.lock`; a second producer fails immediately. Pull and restore also hold
+the store writer lock and host-local archive-root lock.
 
 Set `drive.retry_seconds` to the per-request wall-clock budget for transient transport errors,
 HTTP 429, and 5xx (default 900 seconds); retries wait 250 ms initially, doubling to a 30-second
@@ -203,7 +203,126 @@ relative to the pipeline file; use an absolute managed `local_root` for an insta
 Supply any known study declaration as `governance_manifest`; a pinned catalog never overrides
 its denial. The core job configuration must omit its `research` table.
 
-### Import, update, list, and restore
+### First migration of existing v1 data
+
+Keep the timer inactive and other writers frozen. Preserve the original store and all records
+until every job has passed fresh-store restoration and verification. These steps use the
+pipeline's supported command owners; no conversion, upload, or deletion scripts are required.
+
+1. Run `binary-alpha data pipeline migrate --config PIPELINE`. For a bounded subset add
+   `--job ID`. This is offline and creates verified v2 continuation roots plus migration evidence.
+2. Run `binary-alpha data pipeline archive --config PIPELINE` for every migrated job.
+   Retain the printed catalog IDs and SHA-256 digests.
+3. Create a consumer document with the same archive root and a fresh, empty `local_root`.
+   For **every job**, run `data pipeline restore --config CONSUMER --catalog FILE_ID
+   --sha256 SHA256 --broker BROKER --symbol SYMBOL`, then `data verify --manifest URI`
+   on both printed dataset and stream URIs. Restore also authenticates lineage manifests and
+   the exact immutable evidence-record closure. Inspect the coverage and unresolved ranges.
+4. Rebind active fetch/consumer configurations that still pin v1 manifests, through their
+   documented configuration fields. Keep frozen evidence unchanged. A remaining reference
+   protects its closure and prevents its deletion.
+5. Run `binary-alpha data pipeline retire --config PIPELINE --plan`. Review every
+   `references` entry, retained root, exact local path, remote file ID, digest, and byte total.
+6. Only after that review run `binary-alpha data pipeline retire --config PIPELINE
+   --apply PLAN_FILE`. Preserve the sealed plan, progress journal, and completion record.
+   Ordinary retirement preserves the current v2 root/catalog and requires verified migration
+   evidence before removing v1. It is distinct from whole-instrument removal below.
+
+After interruption, rerun the same migrate, archive, or restore command: each owner resumes
+its checkpoints or verifies identical completed bytes. A changed source/configuration is a
+conflict, never permission to overwrite evidence. After retirement apply starts, keep the
+pipeline, job files, records, and registry fixed and resume **that exact plan**; its durable
+fence rejects other writers until retained verification and the completion record succeed.
+Before apply starts, a stale plan may be replaced by a newly reviewed plan.
+
+### Register a new instrument
+
+Prepare one broker policy template using
+[Deriv](../configs/data-pipeline-deriv.example.toml) or
+[Pocket](../configs/data-pipeline-pocket.example.toml), with the authorized endpoint/source
+context, credential references, history start/end and budgets, and candle policy. Registration
+replaces the template instrument; a separate hand-generated template for each symbol is unnecessary.
+
+```text
+binary-alpha data pipeline add-job --config PIPELINE --template CORE --broker BROKER --symbol SYMBOL
+binary-alpha data pipeline update --config PIPELINE --end END
+```
+
+Use `--quote-currency C` for synthetics, equities, or another ambiguous symbol. Only a
+six-uppercase-letter currency pair (optionally `frx` / `_otc`) supplies an inferred quote.
+Discovery supplies price precision where reported. Pocket reports no precision, so registration
+decodes one bounded native-history sample at supported exact scales. An empty/unusable sample
+requires explicit `--price-scale N`. A later price needing more digits fails with that count;
+never round or edit stored observations. Correct the declared scale only after checking the
+provider evidence; a pending intent retains its original configuration binding.
+
+An explicit singular `[instruments.session]` is mandatory; alternatively `--session FILE`
+reads a TOML file containing the table's fields. `kind = "always"` is an explicit 24/7 policy.
+The exact weekly shape is `kind = "weekly"`, `timezone = "UTC"` or `"America/New_York"`,
+`open = { day = "sunday", time = "17:00:00" }`, `close` in the same shape, and optional
+`closed_dates = ["2026-12-25"]` / `early_closes = [{date="2026-11-27",time="13:00:00"}]`.
+Weekdays are full lowercase English names. Never substitute the old plural profile windows
+`[[instruments.sessions]]`. **Integration pending:** weekly declarations are saved, but weekly
+acquisition refuses until `wt-sessions` supplies the native calendar. The marked shim in
+`data_pipeline_add.rs` and ignored `native_session_contract` test are the merge integration point.
+
+Registration writes `jobs/JOB.toml` and `evidence/JOB.json` and appends the pipeline entry last.
+It checkpoints the exact discovered output under `pipeline_state/registrations` first. On
+interruption repeat the same command/template/options; it completes from those bytes without
+rediscovery. Existing different bytes are a conflict. An already listed instrument is reported
+as already registered. Keep registration records, configuration and source evidence.
+The first update starts at `history.start` and publishes a native v2 continuation root directly:
+there is no `data import` prerequisite. Missing calendars on an empty-store job are refused.
+
+### Remove an instrument
+
+Complete pending acquisition/migration and in-flight transfers first. Keep its job entry and
+configuration intact through apply, and keep other writers frozen. Remove external active
+references through their owning configuration; shared objects and unrelated consumers remain
+protected. This explicitly removes current data as well as obsolete data, unlike ordinary retirement.
+
+```text
+binary-alpha data pipeline retire --config PIPELINE --job ID --whole-job --plan
+# Review PLAN_FILE: all v1/v2 manifests, catalogs, object keys, exact remote IDs and records.
+binary-alpha data pipeline retire --config PIPELINE --job ID --whole-job --apply PLAN_FILE
+binary-alpha data pipeline remove-job --config PIPELINE --job ID
+```
+
+Whole-job retirement makes every owned ordinary v1/v2 dataset, stream, catalog and unshared
+data object eligible, including remote-only catalog closures. It refuses unresolved retained
+dependencies. Immutable local and archived records remain and their dependencies are marked
+retired in the plan. A completed whole-job plan prevents a timer from recreating that job.
+`remove-job` requires that completion and atomically removes its document entry; repeat it
+after a lost reply. It retains configuration/evidence files. Never edit the pipeline document
+between plan and completion. Interrupted deletion resumes with the identical `--apply` plan.
+
+### Weekly update, consumer pull, and original imports
+
+The checked-in example uses `parallel_jobs = 4`, `parallel_transfers = 8`,
+8 MiB chunks, `request_timeout_seconds = 300`, `max_attempts = 5` and explicit
+`retry_seconds = 900`. The broker templates use `overlap_seconds = 60`,
+`max_elapsed_seconds = 3600`, and 6,000 Deriv / 20,000 Pocket pages per invocation.
+Pocket uses `history_pages_in_flight = 8`, `origin = "https://pocketoption.com"` and
+`credential_command = ["/absolute/path/to/pocket-auth"]` (an executable/argv array, not a
+shell string). The operator supplies that executable; it prints auth JSON to stdout.
+These are portable starting settings, not a promise of coverage within an hour:
+20,000 Pocket pages span about 45 days at 195 seconds/page, but provider and elapsed limits
+may stop sooner; Deriv's tick density determines its span.
+
+Run `data pipeline update --config PIPELINE` weekly. It follows the v2 lineage, writes only
+changed daily observation/page/candle partitions, reuses unchanged days by key, and archives
+new objects plus cumulative record closure through the archive-root registry. Partial-day
+and request-evidence changes can require new files even when older observations are unchanged.
+A pending update retains its pinned cutoff and exact seed binding, including an initially empty
+seed list. Repeat the command to resume; do not move the cutoff or delete progress files.
+Page/time budgets may be increased through their declared configuration fields. After a
+completed acquisition whose transfer was interrupted, rerun update or archive and let the
+registry verify/reuse completed transfers. Consumer pull/restore resumes partial downloads.
+
+Never hand-generate per-instrument job files, infer a calendar, round prices to force a job
+through, rewrite immutable manifests/records, clear transfer/progress state to bypass a conflict,
+bulk-upload content with an external script, or delete store/Drive objects by filename or age.
+Use add-job, update, migrate, archive, pull/restore, retire and remove-job for these operations.
 
 Import every raw archive once with the existing importer, pointing both storage fields at the
 managed store, for example:
@@ -215,8 +334,9 @@ binary-alpha data import --config CORE
 where `CORE` declares `[storage] historical_data_dir = "<local_root>/store"` and
 `publication_uri = "file://<local_root>/store"` with the `[[import.sources]]` inventory
 (a `tick_parquet_daily` root with every Deriv symbol directory, a `bar_parquet_collection`
-with its manifest for Pocket Option). Verify the generations (`data verify`), then delete the raw
-archive if a second copy is unwanted; no later command reads it.
+with its manifest for Pocket Option). Verify the generations (`data verify`). The pipeline
+subsequently reads its managed store. Preserve external originals: retirement deletes only
+its exact inventoried managed-store and archive objects, never an arbitrary source directory.
 
 For each source, establish the broker/account class, selected instrument, seed provenance, and
 clock mapping from authorized evidence (the production Pocket Option endpoint closes the
@@ -299,8 +419,9 @@ Real Drive acceptance evidence is not yet retained: it is unavailable, not passi
 of a zero-byte object upload against real Drive is unverified. Before enabling real operation,
 retain a finite source update and small archive/restore acceptance with the actual authorized
 credentials, root, source context, and cutoff. Report source acceptance separately from transfer
-correctness. The four synthetic `data_pipeline` gates cover import/roundtrip, recovery,
-scope denial, and schedule/checkpoint behavior; they do not establish external acceptance.
+correctness. The synthetic `data_pipeline` suite covers empty-store registration, daily updates,
+incremental archive/restore, ordinary and whole-job retirement, interruption, scope denial,
+and the shipped schedule; it does not establish external acceptance.
 
 Timer installation is a later, separately authorized operator action. Install the executable at
 `/usr/local/bin/binary-alpha`, prepare the instance files above, and ensure the configured local
@@ -333,7 +454,7 @@ manifests; keep their prior compatible generations.
 
 Production operator tasks for this research infrastructure: none. Real source/Drive acceptance
 and timer installation above require separate exact authorization. Linked matching Sentry issues:
-none.
+unknown; none supplied for this delivery.
 
 ## Live runtime
 

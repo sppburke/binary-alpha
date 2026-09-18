@@ -6,6 +6,8 @@
 mod common;
 #[path = "data_pipeline/lineage.rs"]
 mod lineage;
+#[path = "data_pipeline/new_instrument.rs"]
+mod new_instrument;
 
 use std::collections::BTreeMap;
 use std::fs::{self, File};
@@ -110,6 +112,8 @@ struct BrokerFaults {
     reject_auth_once: bool,
     /// Reject the synthetic environment session until the fixture renewal command replaces it.
     reject_initial_session: bool,
+    /// Exact decimal prices for discovery/scale regression cases (all four OHLC fields).
+    pocket_price: Option<String>,
 }
 
 struct FakeBroker {
@@ -218,7 +222,17 @@ fn serve_broker(kind: Kind) -> FakeBroker {
                         Kind::Deriv(ticks) => {
                             let fields: BTreeMap<String, Value> = serde_json::from_str(&text).unwrap();
                             let req_id = fields["req_id"].as_u64().unwrap();
-                            if fields.contains_key("ticks_history") {
+                            if fields.contains_key("active_symbols") {
+                                replies.push(Message::Text(json!({
+                                    "msg_type":"active_symbols", "req_id":req_id,
+                                    "active_symbols":[{
+                                        "underlying_symbol":"frxEURUSD",
+                                        "underlying_symbol_name":"Synthetic EUR/USD",
+                                        "pip_size":0.00001, "exchange_is_open":1,
+                                        "is_trading_suspended":0
+                                    }]
+                                }).to_string().into()));
+                            } else if fields.contains_key("ticks_history") {
                                 requests_.lock().unwrap().push(text.clone());
                                 pages += 1;
                                 let end = fields["end"].as_str().unwrap();
@@ -322,12 +336,13 @@ fn serve_broker(kind: Kind) -> FakeBroker {
                                                 if faults.off_second {
                                                     time.push_str(".5");
                                                 }
+                                                let price = |value| faults.pocket_price.clone().unwrap_or_else(|| price_text(value));
                                                 serde_json::from_str::<Value>(&format!(
                                                     r#"{{"symbol_id":{POCKET_SYMBOL_ID},"time":{time},"open":{},"close":{},"high":{},"low":{},"volume":{}}}"#,
-                                                    price_text(open + shift),
-                                                    price_text(close + shift),
-                                                    price_text(high + shift),
-                                                    price_text(low + shift),
+                                                    price(open + shift),
+                                                    price(close + shift),
+                                                    price(high + shift),
+                                                    price(low + shift),
                                                     volume
                                                 ))
                                                 .unwrap()
@@ -1953,7 +1968,10 @@ fn pipeline_roundtrip() {
     .unwrap();
     let dataset_uri = field(&restored, "dataset").to_string();
     let verified = run(&["data", "verify", "--manifest", &dataset_uri]).unwrap();
-    assert!(verified.contains(&format!("generation {pocket_first} rows ")), "{verified}");
+    assert!(
+        verified.contains(&format!("generation {pocket_first} rows ")),
+        "{verified}"
+    );
     assert_eq!(
         dataset(&f.scratch.path("elsewhere/consumer/store"), &pocket_first).layout,
         Some(binary_alpha_engine::dataset::Layout::DailyV2)
@@ -2217,9 +2235,19 @@ fn append_log_recovery() {
         .map(|page| page.anchor.as_ref().unwrap().parse::<i64>().unwrap() - POCKET_OFFSET_S)
         .collect();
     assert_eq!(anchors, [cutoff, cutoff - 197, cutoff - 392]);
-    let verified = verify::run(&format!("file://{}", store.join(manifest.key()).display())).unwrap();
-    assert!(verified.contains(&format!("generation {} rows {}", manifest.generation, manifest.row_count)), "{verified}");
-    assert_eq!(manifest.layout, Some(binary_alpha_engine::dataset::Layout::DailyV2));
+    let verified =
+        verify::run(&format!("file://{}", store.join(manifest.key()).display())).unwrap();
+    assert!(
+        verified.contains(&format!(
+            "generation {} rows {}",
+            manifest.generation, manifest.row_count
+        )),
+        "{verified}"
+    );
+    assert_eq!(
+        manifest.layout,
+        Some(binary_alpha_engine::dataset::Layout::DailyV2)
+    );
     assert_eq!(
         bars(&store, &manifest),
         expected_bars(POCKET_SEED_END, POCKET_SEED_END - 60, cutoff)
@@ -2342,6 +2370,14 @@ fn failed_restore_pull(f: &Fixture, catalog_id: &str) {
     Catalog::from_json(&bytes).unwrap();
     let sha = binary_alpha_engine::hex(&Sha256::digest(&bytes));
     state.files.get_mut(catalog_id).unwrap().bytes = bytes;
+    // This legacy corruption gate must actually select its malformed legacy catalog.
+    // Keep the archive fixture on that lineage; an unrelated valid daily catalog would
+    // correctly win pull's v2 preference and never exercise the installed bad index.
+    state.files.retain(|id, entry| {
+        id == catalog_id
+            || Catalog::from_json(&entry.bytes).is_err()
+            || Catalog::from_json(&entry.bytes).unwrap().instrument != catalog.instrument
+    });
     drop(state);
 
     let consumer_root = f.scratch.path("bad-index-consumer");
@@ -3152,12 +3188,23 @@ fn pipeline_recovery() {
     assert_ne!(repeated_generation, final_generation);
     let previous = dataset(&store, final_generation);
     let repeated = dataset(&store, repeated_generation);
-    let market_keys = |m: &GenerationManifest| m.objects.iter().filter(|o|o.path.starts_with("observations/"))
-        .map(|o| (&o.path, &o.key)).map(|(p,k)|(p.clone(),k.clone())).collect::<BTreeMap<_,_>>();
+    let market_keys = |m: &GenerationManifest| {
+        m.objects
+            .iter()
+            .filter(|o| o.path.starts_with("observations/"))
+            .map(|o| (&o.path, &o.key))
+            .map(|(p, k)| (p.clone(), k.clone()))
+            .collect::<BTreeMap<_, _>>()
+    };
     assert_eq!(market_keys(&previous), market_keys(&repeated));
     assert_eq!(bars(&store, &previous), bars(&store, &repeated));
-    let count_pages = |m: &GenerationManifest| m.day_inventory.iter()
-        .filter(|d|d.family == binary_alpha_engine::dataset::DayFamily::Pages).map(|d|d.rows).sum::<u64>();
+    let count_pages = |m: &GenerationManifest| {
+        m.day_inventory
+            .iter()
+            .filter(|d| d.family == binary_alpha_engine::dataset::DayFamily::Pages)
+            .map(|d| d.rows)
+            .sum::<u64>()
+    };
     assert!(count_pages(&repeated) > count_pages(&previous));
     assert_eq!(field(job_line(&repeat, "pocket"), "status"), "archived");
     let newest = fs::read_dir(state.join("records"))
@@ -3787,7 +3834,7 @@ fn pipeline_scope() {
     }
     assert!(f.pocket.requests().is_empty() && f.deriv.requests().is_empty());
 
-    // An update requires an imported generation before it opens a broker connection.
+    // Empty-store acquisition requires an explicit calendar before any broker connection.
     write_pocket(pocket_core(
         &f.pocket.url,
         "demo",
@@ -3798,7 +3845,9 @@ fn pipeline_scope() {
     ));
     let refused = pipeline("update", &pocket_only, &[]).unwrap_err();
     assert!(
-        refused.contains("job pocket: the store holds no imported generation for pocket_option:AEDCNY_otc; run `data import` first"),
+        refused.contains(
+            "job requires an explicit [instruments.session] table; no calendar is inferred"
+        ),
         "{refused}"
     );
     assert!(f.pocket.requests().is_empty() && f.deriv.requests().is_empty());

@@ -839,12 +839,29 @@ fn v1_migrate_archive_restore_update_twice_retire_and_restore_both_brokers() {
         pipeline("archive", &config, &[]).unwrap();
         descendants.insert(job, versions);
     }
-    for entry in fs::read_dir(producer.join("pipeline_state/records")).unwrap().flatten() {
-        if !entry.file_type().unwrap().is_file() { continue; }
+    for entry in fs::read_dir(producer.join("pipeline_state/records"))
+        .unwrap()
+        .flatten()
+    {
+        if !entry.file_type().unwrap().is_file() {
+            continue;
+        }
         let bytes = fs::read(entry.path()).unwrap();
-        if serde_json::from_slice::<Value>(&bytes).is_ok_and(|v| roots.values().any(|(_, _, c)| v["file_id"] == c.0)) { continue; }
-        assert_eq!(fs::read(fresh.path("managed/pipeline_state/records").join(entry.file_name())).unwrap(), bytes,
-            "all cumulative records, including superseded alias tables and predecessor records, restore exactly");
+        if serde_json::from_slice::<Value>(&bytes)
+            .is_ok_and(|v| roots.values().any(|(_, _, c)| v["file_id"] == c.0))
+        {
+            continue;
+        }
+        assert_eq!(
+            fs::read(
+                fresh
+                    .path("managed/pipeline_state/records")
+                    .join(entry.file_name())
+            )
+            .unwrap(),
+            bytes,
+            "all cumulative records, including superseded alias tables and predecessor records, restore exactly"
+        );
     }
     fs::rename(producer.join("store.saved"), &store).unwrap();
     // Install both daily descendants into the producer that still owns every v1 closure.
@@ -1007,4 +1024,32 @@ fn v1_migrate_archive_restore_update_twice_retire_and_restore_both_brokers() {
     }
     daily_paths(&recovered.path("managed/store"));
     pipeline("retire", &recovered_config, &["--plan"]).unwrap();
+    // A later instrument removal uses the descendant catalog's cumulative migration
+    // evidence; the original root catalogs and superseded roots have already been retired.
+    for (job, _, _, _) in jobs {
+        let report = pipeline(
+            "retire",
+            &recovered_config,
+            &["--job", job, "--whole-job", "--plan"],
+        )
+        .unwrap();
+        let path = report.split_whitespace().nth(2).unwrap();
+        pipeline("retire", &recovered_config, &["--apply", path]).unwrap();
+        pipeline("remove-job", &recovered_config, &["--job", job]).unwrap();
+    }
+    assert!(
+        binary_alpha_app::store::Store::filesystem(recovered.path("managed/store"))
+            .list_manifests()
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        f.drive
+            .state
+            .lock()
+            .unwrap()
+            .files
+            .values()
+            .all(|entry| entry.name.starts_with("record-"))
+    );
 }

@@ -38,6 +38,9 @@ use crate::verify;
 mod migration;
 pub use migration::{migrate, migrate_with};
 
+#[path = "data_pipeline_add.rs"]
+pub mod add_job;
+
 pub const PIPELINE_SCHEMA_VERSION: u32 = 1;
 pub const CATALOG_SCHEMA_VERSION: u32 = 1;
 const STORE_DIR: &str = "store";
@@ -328,10 +331,17 @@ struct Bound {
     /// The one history instrument the job extends.
     symbol: String,
     evidence_sha256: String,
+    session_binding: Option<String>,
 }
 
 fn bind(job: &Job, layout: &Layout) -> Result<Bound, String> {
-    let core = crate::load_config(&layout.base.join(&job.config))
+    if crate::retire::retired_jobs(&layout.state)?.contains(&job.id) {
+        return Err(format!(
+            "job {} is retired; run data pipeline remove-job",
+            job.id
+        ));
+    }
+    let core = add_job::load_core(&layout.base.join(&job.config), true)
         .map_err(|reason| format!("job {}: {reason}", job.id))?;
     let field = |reason: String| format!("job {}: {reason}", job.id);
     if core.run_mode != RunMode::Research {
@@ -405,6 +415,7 @@ fn bind(job: &Job, layout: &Layout) -> Result<Bound, String> {
         core,
         symbol,
         evidence_sha256,
+        session_binding: add_job::session_binding(&layout.base.join(&job.config), false)?,
     })
 }
 
@@ -746,13 +757,18 @@ pub(crate) fn evidence_records(
                 selected.insert(key.clone());
             }
             if selected.contains(&key) {
-                for name in [&value.intent, &value.acquisition_id, &value.supersedes].into_iter().flatten() {
+                for name in [&value.intent, &value.acquisition_id, &value.supersedes]
+                    .into_iter()
+                    .flatten()
+                {
                     let key = format!("records/{name}");
                     crate::lineage::record_name(&key)?;
                     selected.insert(key);
                 }
                 if let Some(alias) = &value.alias_table {
-                    let name = alias.as_str().or_else(|| alias["record"].as_str())
+                    let name = alias
+                        .as_str()
+                        .or_else(|| alias["record"].as_str())
                         .ok_or("migration alias table record name absent")?;
                     let key = format!("records/{name}");
                     crate::lineage::record_name(&key)?;
@@ -1508,16 +1524,13 @@ fn update_job(
         &bound.symbol,
         history.role,
         access,
-    )?
-    .ok_or_else(|| {
-        format!(
-            "job {}: the store holds no imported generation for {}:{}; run `data import` first",
-            job.id, history.broker, bound.symbol
-        )
-    })?;
+    )?;
     let pending_path = state.join("progress.json");
     let pages_path = state.join("progress.pages.jsonl");
     let (pending, partial) = read_pending(&pending_path, &pages_path)?;
+    if imported.is_none() {
+        add_job::session_binding(&layout.base.join(&job.config), true)?;
+    }
     let (diagnostics, received_partial) = crate::lineage::diagnostics(
         &state,
         pending.as_ref().map(|p| p.progress.pages.as_slice()),
@@ -1547,17 +1560,38 @@ fn update_job(
         (None, Some(end)) => end,
         (None, None) => clock.now_micros(),
     };
-    let seed = Seed {
-        provider_symbol: bound
-            .symbol
-            .clone()
-            .try_into()
-            .expect("a bound symbol is a provider symbol"),
-        manifest: layout.manifest_uri(&imported).parse::<ManifestUri>()?,
-        source_identity: broker::source_identity(settings),
+    let seeds = if let Some(pending) = &pending {
+        // A partial first acquisition can publish a daily root. Resume the original empty
+        // seed binding, rather than accidentally adopting that partial root as a new seed.
+        let mut bytes = Vec::new();
+        layout
+            .records()
+            .read_to(&pending.intent, None, &mut bytes)?;
+        serde_json::from_slice::<Intent>(&bytes)
+            .map_err(|e| e.to_string())?
+            .seeds
+    } else {
+        imported
+            .map(|imported| -> Result<Seed, String> {
+                Ok(Seed {
+                    provider_symbol: bound
+                        .symbol
+                        .clone()
+                        .try_into()
+                        .expect("a bound symbol is a provider symbol"),
+                    manifest: layout.manifest_uri(&imported).parse::<ManifestUri>()?,
+                    source_identity: broker::source_identity(settings),
+                })
+            })
+            .transpose()?
+            .into_iter()
+            .collect()
     };
-    let config = effective(&bound, layout, cutoff, vec![seed.clone()])?;
-    let binding = binding_hash(&config);
+    let config = effective(&bound, layout, cutoff, seeds.clone())?;
+    let binding = match &bound.session_binding {
+        Some(session) => sha256_hex(&json_bytes(&(binding_hash(&config), session))?),
+        None => binding_hash(&config),
+    };
     let records = layout.records();
     if let Some(pending) = &pending {
         if pending.effective_config_hash != binding {
@@ -1594,7 +1628,7 @@ fn update_job(
                 evidence_sha256: bound.evidence_sha256.clone(),
                 archive_root: drive.root().to_string(),
                 cutoff: Some(time_text(cutoff)),
-                seeds: vec![seed],
+                seeds,
             },
         )?,
     };

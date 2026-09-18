@@ -588,6 +588,48 @@ fn load_state(directory: &Path, settings: &DriveSettings, repair: bool) -> Resul
 
 /// Read-only replay for retirement: the registry owns its snapshot watermark, journal changes,
 /// logical aliases and legacy imports. No registry state changes while a plan is fingerprinted.
+pub(crate) fn completed_aliases(
+    state_dir: &Path,
+    settings: &DriveSettings,
+) -> Result<BTreeMap<String, BTreeSet<String>>, String> {
+    let state = load_state(&state_dir.join("registry"), settings, false)?;
+    let mut completed: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    for entry in state.files.values().filter(|e| e.done) {
+        completed
+            .entry(entry.file_id.clone())
+            .or_default()
+            .extend(entry.aliases.clone());
+    }
+    for (alias, entry) in state.legacy.iter().filter(|(_, e)| e.done) {
+        completed
+            .entry(entry.file_id.clone())
+            .or_default()
+            .insert(alias.clone());
+    }
+    for job in fs::read_dir(state_dir).map_err(|e| e.to_string())? {
+        let job = job.map_err(|e| e.to_string())?;
+        let path = job.path().join("transfers.json");
+        if !path.is_file() {
+            continue;
+        }
+        let legacy: LegacyTransfers =
+            serde_json::from_slice(&fs::read(path).map_err(|e| e.to_string())?)
+                .map_err(|e| e.to_string())?;
+        for (key, entry) in legacy.files.into_iter().filter(|(_, e)| e.done) {
+            completed
+                .entry(entry.file_id)
+                .or_default()
+                .insert(format!("{}/{key}", job.file_name().to_string_lossy()));
+        }
+    }
+    for aliases in completed.values() {
+        for alias in aliases {
+            pin_alias(alias, &mut BTreeSet::new())?;
+        }
+    }
+    Ok(completed)
+}
+
 pub(crate) fn in_flight(
     state_dir: &Path,
     settings: &DriveSettings,

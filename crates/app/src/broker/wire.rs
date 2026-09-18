@@ -23,7 +23,8 @@ impl WireDecimal {
         Decimal::parse(&self.token()?).map_err(|_| "decimal: invalid amount field".into())
     }
     pub fn price_units(&self, scale: PriceScale) -> Result<i64, String> {
-        parse_price_units(&self.token()?, scale).map_err(|_| "decimal: invalid price field".into())
+        parse_price_units(&self.token()?, scale)
+            .map_err(|reason| format!("decimal: invalid price field: {reason}"))
     }
     pub fn from_decimal(value: Decimal) -> Self {
         Self(RawValue::from_string(value.to_string()).expect("a Decimal is a JSON number"))
