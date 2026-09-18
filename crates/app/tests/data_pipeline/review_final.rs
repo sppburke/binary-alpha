@@ -642,6 +642,7 @@ fn proof_v1_executable() -> &'static Path {
 }
 
 #[test]
+#[ignore = "builds the historical executable from commit 89b1035, which a shallow hosted checkout does not hold; run locally with --ignored (the probe rehearsal exercises the same upgrade with the real old binary)"]
 fn genuine_proof_v1_without_session_upgrades_only_calendar_addition() {
     let old_exe = proof_v1_executable();
     let f = fixture("final_genuine_v1_session_upgrade");
