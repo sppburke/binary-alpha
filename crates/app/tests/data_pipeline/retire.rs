@@ -4,6 +4,7 @@ use binary_alpha_app::retire::{Plan, Status};
 use binary_alpha_engine::dataset::{ObjectRole, SourceKind};
 use common::daily;
 use std::collections::BTreeSet;
+use std::sync::atomic::AtomicUsize;
 
 enum DeleteChange {
     Rename,
@@ -21,9 +22,18 @@ struct DeleteFault {
     no_checksum: bool,
     hidden: BTreeSet<String>,
 }
+/// Decrements the served-connection count when a handler finishes.
+struct Leave<'a>(&'a AtomicUsize);
+impl Drop for Leave<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
 struct RetireDrive {
     drive: FakeDrive,
     faults: Arc<Mutex<DeleteFault>>,
+    /// Connections being served right now and the most ever served at once.
+    in_flight: Arc<(AtomicUsize, AtomicUsize)>,
 }
 fn serve() -> RetireDrive {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -42,123 +52,145 @@ fn serve() -> RetireDrive {
         hidden: BTreeSet::new(),
     }));
     let stop = Arc::new(AtomicBool::new(false));
-    let (shared, fault, stopped) = (Arc::clone(&state), Arc::clone(&faults), Arc::clone(&stop));
+    let in_flight = Arc::new((AtomicUsize::new(0), AtomicUsize::new(0)));
+    let (shared, fault, stopped, activity) = (
+        Arc::clone(&state),
+        Arc::clone(&faults),
+        Arc::clone(&stop),
+        Arc::clone(&in_flight),
+    );
     let thread = std::thread::spawn(move || {
         while !stopped.load(Ordering::SeqCst) {
             let Ok((mut stream, _)) = listener.accept() else {
                 std::thread::sleep(Duration::from_millis(2));
                 continue;
             };
-            let Some(request) = read_request(&mut stream) else {
-                continue;
-            };
-            let mut state = shared.lock().unwrap();
-            let mut faults = fault.lock().unwrap();
-            state
-                .log
-                .push(format!("{} {}", request.method, request.path));
-            if request.path == "/token" {
-                respond(
-                    &mut stream,
-                    200,
-                    &[],
-                    br#"{"access_token":"fixture-token","expires_in":3600}"#,
-                );
-                continue;
-            }
-            if request.path == "/drive/v3/files" {
-                let offset = request
-                    .query
-                    .get("pageToken")
-                    .map_or(0, |v| v.parse::<usize>().unwrap());
-                let all: Vec<_> = state
-                    .files
-                    .iter()
-                    .filter(|(id, e)| !e.trashed && !faults.hidden.contains(*id))
-                    .collect();
-                let entries: Vec<Value> = all
-                    .iter()
-                    .skip(offset)
-                    .take(3)
-                    .map(|(id, e)| {
-                        serde_json::from_slice(&file_json(id, e, faults.no_checksum)).unwrap()
-                    })
-                    .collect();
-                let mut body = json!({"files":entries,"incompleteSearch":faults.incomplete});
-                if offset + 3 < all.len() {
-                    body["nextPageToken"] = json!((offset + 3).to_string());
+            // One thread per connection: the client's transfer pool may hold several requests
+            // open at once, and the most seen together is what the pool tests measure.
+            let (shared, fault, activity) = (
+                Arc::clone(&shared),
+                Arc::clone(&fault),
+                Arc::clone(&activity),
+            );
+            std::thread::spawn(move || {
+                let now = activity.0.fetch_add(1, Ordering::SeqCst) + 1;
+                activity.1.fetch_max(now, Ordering::SeqCst);
+                let _leave = Leave(&activity.0);
+                let Some(request) = read_request(&mut stream) else {
+                    return;
+                };
+                let mut state = shared.lock().unwrap();
+                let mut faults = fault.lock().unwrap();
+                state
+                    .log
+                    .push(format!("{} {}", request.method, request.path));
+                if request.path == "/token" {
+                    respond(
+                        &mut stream,
+                        200,
+                        &[],
+                        br#"{"access_token":"fixture-token","expires_in":3600}"#,
+                    );
+                    return;
                 }
-                respond(&mut stream, 200, &[], body.to_string().as_bytes());
-                continue;
-            }
-            let id = request.path.trim_start_matches("/drive/v3/files/");
-            if request.method == "DELETE" {
-                if let Some((status, change)) = faults.retry_fault.take() {
-                    let file = state.files.get_mut(id).unwrap();
-                    match change {
-                        DeleteChange::Rename => file.name = "renamed-after-delete-attempt".into(),
-                        DeleteChange::Content => file.bytes.push(b'!'),
-                        DeleteChange::Trash => file.trashed = true,
-                        DeleteChange::None => (),
+                if request.path == "/drive/v3/files" {
+                    let offset = request
+                        .query
+                        .get("pageToken")
+                        .map_or(0, |v| v.parse::<usize>().unwrap());
+                    let all: Vec<_> = state
+                        .files
+                        .iter()
+                        .filter(|(id, e)| !e.trashed && !faults.hidden.contains(*id))
+                        .collect();
+                    let entries: Vec<Value> = all
+                        .iter()
+                        .skip(offset)
+                        .take(3)
+                        .map(|(id, e)| {
+                            serde_json::from_slice(&file_json(id, e, faults.no_checksum)).unwrap()
+                        })
+                        .collect();
+                    let mut body = json!({"files":entries,"incompleteSearch":faults.incomplete});
+                    if offset + 3 < all.len() {
+                        body["nextPageToken"] = json!((offset + 3).to_string());
                     }
-                    if status != 0 {
-                        respond(&mut stream, status, &[], b"{}");
+                    respond(&mut stream, 200, &[], body.to_string().as_bytes());
+                    return;
+                }
+                let id = request.path.trim_start_matches("/drive/v3/files/");
+                if request.method == "DELETE" {
+                    if let Some((status, change)) = faults.retry_fault.take() {
+                        let file = state.files.get_mut(id).unwrap();
+                        match change {
+                            DeleteChange::Rename => {
+                                file.name = "renamed-after-delete-attempt".into()
+                            }
+                            DeleteChange::Content => file.bytes.push(b'!'),
+                            DeleteChange::Trash => file.trashed = true,
+                            DeleteChange::None => (),
+                        }
+                        if status != 0 {
+                            respond(&mut stream, status, &[], b"{}");
+                        }
+                        return;
                     }
-                    continue;
+                    if faults.after.is_some_and(|n| faults.deleted >= n) {
+                        respond(&mut stream, 403, &[], b"{}");
+                        return;
+                    }
+                    let found = state.files.remove(id).is_some();
+                    if found {
+                        faults.deleted += 1;
+                    }
+                    if faults.lose_reply {
+                        faults.lose_reply = false;
+                        return;
+                    }
+                    respond(&mut stream, if found { 204 } else { 404 }, &[], b"");
+                    return;
                 }
-                if faults.after.is_some_and(|n| faults.deleted >= n) {
-                    respond(&mut stream, 403, &[], b"{}");
-                    continue;
+                if !request.query.contains_key("alt")
+                    && let Some((target, remaining)) = &mut faults.rename_on_metadata
+                    && target == id
+                {
+                    *remaining -= 1;
+                    if *remaining == 0 {
+                        state.files.get_mut(id).unwrap().name =
+                            "renamed-during-confirmation".into();
+                        faults.rename_on_metadata = None;
+                    }
                 }
-                let found = state.files.remove(id).is_some();
-                if found {
-                    faults.deleted += 1;
+                let Some(entry) = state.files.get(id) else {
+                    respond(&mut stream, 404, &[], b"{}");
+                    return;
+                };
+                if request.query.get("alt").is_some_and(|v| v == "media") {
+                    let from = request.headers.get("range").map_or(0, |s| {
+                        s.trim_start_matches("bytes=")
+                            .trim_end_matches('-')
+                            .parse::<usize>()
+                            .unwrap()
+                    });
+                    respond(
+                        &mut stream,
+                        if from == 0 { 200 } else { 206 },
+                        &[],
+                        &entry.bytes[from..],
+                    );
+                } else {
+                    respond(
+                        &mut stream,
+                        200,
+                        &[],
+                        &file_json(id, entry, faults.no_checksum),
+                    );
                 }
-                if faults.lose_reply {
-                    faults.lose_reply = false;
-                    continue;
-                }
-                respond(&mut stream, if found { 204 } else { 404 }, &[], b"");
-                continue;
-            }
-            if !request.query.contains_key("alt")
-                && let Some((target, remaining)) = &mut faults.rename_on_metadata
-                && target == id
-            {
-                *remaining -= 1;
-                if *remaining == 0 {
-                    state.files.get_mut(id).unwrap().name = "renamed-during-confirmation".into();
-                    faults.rename_on_metadata = None;
-                }
-            }
-            let Some(entry) = state.files.get(id) else {
-                respond(&mut stream, 404, &[], b"{}");
-                continue;
-            };
-            if request.query.get("alt").is_some_and(|v| v == "media") {
-                let from = request.headers.get("range").map_or(0, |s| {
-                    s.trim_start_matches("bytes=")
-                        .trim_end_matches('-')
-                        .parse::<usize>()
-                        .unwrap()
-                });
-                respond(
-                    &mut stream,
-                    if from == 0 { 200 } else { 206 },
-                    &[],
-                    &entry.bytes[from..],
-                );
-            } else {
-                respond(
-                    &mut stream,
-                    200,
-                    &[],
-                    &file_json(id, entry, faults.no_checksum),
-                );
-            }
+            });
         }
     });
     RetireDrive {
+        in_flight,
         drive: FakeDrive {
             base,
             state,
@@ -2217,6 +2249,9 @@ fn retirement_deletes_each_drive_batch_through_the_transfer_pool() {
             .iter()
             .all(|e| !f.drive.drive.files().contains_key(&e.file_id))
     );
+    // The pool held several deletion requests open together, never more than its workers.
+    let most = f.drive.in_flight.1.load(Ordering::SeqCst);
+    assert!((2..=3).contains(&most), "{most}");
     // Drive batches begin every operation, then record each completion in order; local
     // operations begin and complete one at a time.
     let mut expected: Vec<(usize, String)> = Vec::new();

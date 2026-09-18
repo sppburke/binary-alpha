@@ -335,8 +335,12 @@ Page/time budgets may be increased through their declared configuration fields. 
 completed acquisition whose transfer was interrupted, rerun update or archive and let the
 registry verify/reuse completed transfers: the registry lists the archive root once when it
 opens and reuses every completed upload whose listed size and SHA-256 equal the local identity
-without a per-file request; any other case is confirmed per file as before. Drive ids are
-generated 100 at a time. Consumer pull/restore resumes partial downloads.
+without a per-file request; any other case is confirmed per file as before. A remote file
+that changes, vanishes, or is trashed after that listing is not noticed within the same run;
+the next run's listing, fresh-store restore (which hashes every downloaded byte), and
+retirement's per-file retained verification catch it, as they did for a file that changed
+after a per-file confirmation. Drive ids are generated 100 at a time. Consumer pull/restore
+resumes partial downloads.
 
 Never hand-generate per-instrument job files, infer a calendar, round prices to force a job
 through, rewrite immutable manifests/records, clear transfer/progress state to bypass a conflict,

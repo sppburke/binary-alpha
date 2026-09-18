@@ -161,7 +161,7 @@ impl Registry {
             .map_err(|_| "registry lock poisoned")?
             .rebuilt
         {
-            registry.rebuild_from(files, drive)?;
+            registry.rebuild_locked(files, drive)?;
         }
         Ok(registry)
     }
@@ -373,15 +373,18 @@ impl Registry {
     /// Rebuild only from a complete listing. Names narrow candidates, never prove identity.
     /// In-flight/reserved entries retain their original ids and session capabilities.
     pub fn rebuild(&self, drive: &mut Drive) -> Result<(), String> {
-        let files = drive.list("")?;
-        self.rebuild_from(files, drive)
-    }
-
-    fn rebuild_from(&self, files: Vec<RemoteFile>, drive: &mut Drive) -> Result<(), String> {
+        // Exclusive before listing: an upload completing after the listing would otherwise be
+        // removed as unlisted.
         let _operation = self
             .operations
             .write()
             .map_err(|_| "registry operation lock poisoned")?;
+        let files = drive.list("")?;
+        self.rebuild_locked(files, drive)
+    }
+
+    /// The caller holds the operation lock or, at open, the only reference.
+    fn rebuild_locked(&self, files: Vec<RemoteFile>, drive: &mut Drive) -> Result<(), String> {
         self.healthy()?;
         let mut confirmed: BTreeMap<String, Vec<Entry>> = BTreeMap::new();
         for remote in files {
