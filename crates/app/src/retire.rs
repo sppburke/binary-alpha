@@ -47,6 +47,19 @@ impl Identity {
     }
 }
 
+/// The identity the root listing already proves for one file. Only a file listed without a
+/// size or digest is read on its own; every deletion rechecks its file before removing it.
+fn listed(drive: &mut Drive, remote: crate::drive::RemoteFile) -> Result<ObjectIdentity, String> {
+    match (remote.size, &remote.sha256, remote.trashed) {
+        (Some(bytes), Some(sha256), false) => Ok(ObjectIdentity {
+            bytes,
+            sha256: sha256.to_ascii_lowercase(),
+            crc32c: 0,
+        }),
+        _ => drive.listed_identity(&remote),
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Remote {
@@ -485,13 +498,16 @@ fn archives(
         if !string(metadata, "name")?.starts_with("catalog-") {
             continue;
         }
-        let confirmed = drive.listed_identity(&crate::drive::RemoteFile {
-            id: id.clone(),
-            name: string(metadata, "name")?.into(),
-            size: metadata["bytes"].as_u64(),
-            sha256: metadata["sha256"].as_str().map(str::to_string),
-            trashed: metadata["trashed"].as_bool().unwrap_or(false),
-        })?;
+        let confirmed = listed(
+            drive,
+            crate::drive::RemoteFile {
+                id: id.clone(),
+                name: string(metadata, "name")?.into(),
+                size: metadata["bytes"].as_u64(),
+                sha256: metadata["sha256"].as_str().map(str::to_string),
+                trashed: metadata["trashed"].as_bool().unwrap_or(false),
+            },
+        )?;
         let identity = Identity {
             bytes: confirmed.bytes,
             sha256: confirmed.sha256,
@@ -2529,13 +2545,16 @@ fn plan(
             if string(metadata, "name")? != checked_name {
                 return Err("retire: completed transfer name mismatch".into());
             }
-            let identity = drive.listed_identity(&crate::drive::RemoteFile {
-                id: id.clone(),
-                name: checked_name.clone(),
-                size: metadata["bytes"].as_u64(),
-                sha256: metadata["sha256"].as_str().map(str::to_string),
-                trashed: metadata["trashed"].as_bool().unwrap_or(false),
-            })?;
+            let identity = listed(
+                drive,
+                crate::drive::RemoteFile {
+                    id: id.clone(),
+                    name: checked_name.clone(),
+                    size: metadata["bytes"].as_u64(),
+                    sha256: metadata["sha256"].as_str().map(str::to_string),
+                    trashed: metadata["trashed"].as_bool().unwrap_or(false),
+                },
+            )?;
             if key.starts_with("objects/") && key != format!("objects/{}", identity.sha256) {
                 return Err("retire: completed transfer content mismatch".into());
             }
@@ -2731,14 +2750,23 @@ fn plan(
         delete_local,
         totals,
     };
-    verify_retained(&plan, drive, access)?;
-    if before != state(config_path, config, layout)? || plan.remote_state != remote_state(drive)? {
+    let remote = remote_state(drive)?;
+    verify_retained(&plan, &remote, drive, access)?;
+    if before != state(config_path, config, layout)? || plan.remote_state != remote {
         return Err("retire: store changed during planning".into());
     }
     Ok(plan)
 }
 
-fn verify_retained(plan: &Plan, drive: &mut Drive, access: Access<'_>) -> Result<(), String> {
+/// Every retained manifest verifies, every retained object still has its planned identity, and
+/// every retained Drive file is confirmed by the root listing `remote`; only a file the listing
+/// does not confirm is read on its own, which also names one that vanished.
+fn verify_retained(
+    plan: &Plan,
+    remote: &BTreeMap<String, Value>,
+    drive: &mut Drive,
+    access: Access<'_>,
+) -> Result<(), String> {
     let local = Store::filesystem(&plan.store);
     for key in &plan.retained_manifests {
         verify::run_with(&local.uri(key), access)?;
@@ -2749,8 +2777,18 @@ fn verify_retained(plan: &Plan, drive: &mut Drive, access: Access<'_>) -> Result
         }
     }
     for e in &plan.retained_drive {
-        let file = drive.verify(&e.file_id, &e.identity.remote())?;
-        if file.name != e.name {
+        let listed = remote.get(&e.file_id).filter(|file| {
+            file["bytes"] == e.identity.bytes
+                && file["sha256"]
+                    .as_str()
+                    .is_some_and(|sha| sha.eq_ignore_ascii_case(&e.identity.sha256))
+                && file["trashed"] == false
+        });
+        let name = match listed {
+            Some(file) => string(file, "name")?.to_string(),
+            None => drive.verify(&e.file_id, &e.identity.remote())?.name,
+        };
+        if name != e.name {
             return Err(format!(
                 "retire: retained remote name changed {}",
                 e.file_id
@@ -2992,7 +3030,7 @@ fn apply_plan(
     File::open(log.parent().expect("progress parent"))
         .and_then(|f| f.sync_all())
         .map_err(|e| e.to_string())?;
-    verify_retained(&plan, drive, access)?;
+    verify_retained(&plan, &remote_state(drive)?, drive, access)?;
     while index < count {
         let start = index;
         let end = (index + BATCH)
@@ -3052,11 +3090,11 @@ fn apply_plan(
             index += 1;
         }
         if touches_retained(&plan, start, index) {
-            verify_retained(&plan, drive, access)?;
+            verify_retained(&plan, &remote_state(drive)?, drive, access)?;
         }
         writeln!(out, "retirement progress {index}/{count}").map_err(|e| e.to_string())?;
     }
-    verify_retained(&plan, drive, access)?;
+    verify_retained(&plan, &remote_state(drive)?, drive, access)?;
     let record = serde_json::json!({"schema_version":SCHEMA,"plan_sha256":digest,"removed_drive":plan.delete_drive,"removed_local":plan.delete_local,"retained_verified":true});
     let record_path = sealed.with_extension("retired.json");
     seal(&record_path, &crate::fetch::json_bytes(&record)?)?;

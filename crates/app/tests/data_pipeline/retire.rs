@@ -1,6 +1,6 @@
 //! Retirement owns its deletion-capable loopback fake; the other pipeline fixtures are unchanged.
 use super::*;
-use binary_alpha_app::retire::{Plan, Status};
+use binary_alpha_app::retire::{Plan, Remote, Status};
 use binary_alpha_engine::dataset::{ObjectRole, SourceKind};
 use common::daily;
 use std::collections::BTreeSet;
@@ -66,9 +66,15 @@ fn serve() -> RetireDrive {
                 };
                 let mut state = shared.lock().unwrap();
                 let mut faults = fault.lock().unwrap();
+                // Content reads carry their `alt=media` so a log tells them from metadata reads.
+                let media = if request.query.get("alt").is_some_and(|v| v == "media") {
+                    "?alt=media"
+                } else {
+                    ""
+                };
                 state
                     .log
-                    .push(format!("{} {}", request.method, request.path));
+                    .push(format!("{} {}{}", request.method, request.path, media));
                 if request.path == "/token" {
                     respond(
                         &mut stream,
@@ -2279,5 +2285,48 @@ fn retirement_deletes_each_drive_batch_through_the_transfer_pool() {
     assert_eq!(events(&journal), expected);
     for retained in &p.retained_drive {
         assert!(f.drive.drive.files().contains_key(&retained.file_id));
+    }
+}
+
+/// One root listing confirms every retained and planned Drive file: the plan and the apply
+/// read a listed file's metadata on its own only to download its content, while every
+/// deletion still rechecks its file first.
+#[test]
+fn retirement_confirms_drive_files_from_the_root_listing() {
+    let f = fixture();
+    let metadata_only = |log: &[String], ids: &BTreeSet<String>| -> Vec<String> {
+        log.iter()
+            .filter_map(|line| line.strip_prefix("GET /drive/v3/files/"))
+            .filter(|id| ids.contains(*id))
+            .filter(|id| !log.contains(&format!("GET /drive/v3/files/{id}?alt=media")))
+            .map(str::to_string)
+            .collect()
+    };
+    let start = f.drive.drive.log().len();
+    let (path, p) = plan(&f);
+    let ids = |entries: &[Remote], catalogs: bool| -> BTreeSet<String> {
+        entries
+            .iter()
+            .filter(|e| e.name.starts_with("catalog-") == catalogs)
+            .map(|e| e.file_id.clone())
+            .collect()
+    };
+    let retained = ids(&p.retained_drive, false);
+    let deleted = ids(&p.delete_drive, false);
+    assert!(!retained.is_empty() && !deleted.is_empty());
+    let log = f.drive.drive.log()[start..].to_vec();
+    assert!(log.iter().any(|line| line == "GET /drive/v3/files"));
+    assert_eq!(metadata_only(&log, &retained), Vec::<String>::new());
+    assert_eq!(metadata_only(&log, &deleted), Vec::<String>::new());
+    let start = f.drive.drive.log().len();
+    apply(&f, &path).unwrap();
+    let log = f.drive.drive.log()[start..].to_vec();
+    assert_eq!(metadata_only(&log, &retained), Vec::<String>::new());
+    for id in &deleted {
+        assert!(log.contains(&format!("GET /drive/v3/files/{id}")), "{id}");
+        assert!(
+            log.contains(&format!("DELETE /drive/v3/files/{id}")),
+            "{id}"
+        );
     }
 }

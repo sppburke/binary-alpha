@@ -219,7 +219,11 @@ pool (`parallel_transfers` sessions): the journal records `begin` for every oper
 batch before any deletion and `done` for each after the whole batch completes, so a resumed
 batch repeats only deletions that a missing file already satisfies, and the stale-plan check
 accepts a missing file only for a begun operation. Full retained verification runs before application/resumption and
-before completion. Each batch checks impact by exact paths (including manifest-directory
+before completion, as it does when a plan is sealed: retained manifests verify, retained objects are
+rehashed, and retained Drive files are confirmed by one fresh root listing (name, size, digest,
+untrashed); only a file the listing does not confirm is read on its own, which also names one that
+vanished. Planned deletions and catalogs take their identity from the listing the same way; every
+deletion still rechecks its file before removing it. Each batch checks impact by exact paths (including manifest-directory
 descendants) and remote file IDs and reverifies any retained closure it touches. Reachability
 plans must have disjoint retained/deletion inventories, so normal batches touch none; this
 avoids repeatedly decoding the whole store for each 32 unreachable files.
