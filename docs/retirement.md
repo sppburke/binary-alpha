@@ -93,9 +93,28 @@ only its verified generation mapping grants generation deletion authority. Histo
 and completed transfer metadata remain intact, with retired closures marked in the plan.
 Only fields from the exact verified receipt bound into the retained catalog grant this authority.
 
-Migration proof version 3 unifies acquisition evidence, session-product verification, and
-continuation preservation. `migrate` re-proves checkpoints from earlier proof versions;
+Migration proof version 4 adds per-source reconstruction authority to acquisition evidence,
+session-product verification, and continuation preservation. `migrate` re-proves checkpoints from earlier proof versions;
 their completed records remain immutable.
+
+`source_preservation` binds the final root and stream and every mapped v1 dataset/stream.
+Each dataset comparison hashes all provider columns in order, including duplicate occurrences,
+and compares the exact inclusive source-time interval in the replacement. Each stream is
+reconstructed from that interval under its recorded definition, comparing every candle,
+summary, and profile. The aggregate equality fields continue to describe the selected
+baseline comparison; they grant no mapping-wide deletion authority. A missing or unsuccessful
+per-source proof retains the original dataset or stream and its dependency closure. The
+current catalog archives those exact manifests and objects, restore verifies them, and plan
+references explicitly identify the missing preservation proof. Coverage containment alone
+never authorizes legacy deletion.
+
+A completed pre-session checkpoint may upgrade after adding validated singular session
+tables and changing nothing else. Stripping those additions must reproduce its exact original
+configuration/evidence binding and match its immutable predecessor receipt. The superseding
+record seals `configuration_upgrade`: old/new configuration hashes and bindings, exact calendars,
+and predecessor record. Prior daily candles are reconstructed under their recorded definition
+and interval; the session product independently passes `data verify`. Old candle objects
+remain subject to normal reachability, never unconditional removal.
 
 Proof-version upgrades rebuild the root from the strict v1 proof plus the existing daily
 continuation. Re-proving only the v1 root would lose subsequent acquisitions; rewriting old
@@ -108,9 +127,12 @@ page occurrences by acquisition and ordinal across all former roots and descenda
 conflicting metadata. Equal day contents reuse the existing key. Audit replays the continuous
 stream using the latest parent stream to reuse unchanged candle partitions.
 
-Every former observation and finalized candle day must be an ordered subsequence of its
-replacement, including repeated rows and all provider columns; incomparable histories stop
-before supersession. Every predecessor receipt's named daily stream must be present and
+Every former observation must be an ordered subsequence of its replacement, including repeated
+rows and all provider columns. With an unchanged definition, finalized candle days must also
+be ordered subsequences. Calendar addition instead requires exact legacy reconstruction over
+the preserved interval and independent session-product verification, recorded per prior stream
+in `continuation_preservation.reconstructed_streams`. Incomparable histories stop before
+supersession. Every predecessor receipt's named daily stream must be present and
 verified. The published page partitions are independently reread to prove every former page
 occurrence survives exactly. The immutable
 `continuation_preservation` proof binds the old root, new dataset/stream, and each covered

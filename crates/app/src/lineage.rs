@@ -114,6 +114,8 @@ pub(crate) struct ContinuationProof {
     pub pages: bool,
     pub candles: bool,
     pub closures: Vec<PreservedClosure>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub reconstructed_streams: BTreeMap<String, Value>,
 }
 impl ContinuationProof {
     fn validates(&self, root: &str, stream: &str) -> bool {
@@ -131,7 +133,44 @@ impl ContinuationProof {
                 .closures
                 .iter()
                 .all(|c| id(&c.dataset) && c.streams.iter().all(|s| id(s)))
+            && self.reconstructed_streams.iter().all(|(stream, proof)| {
+                self.closures.iter().any(|closure| {
+                    closure.streams.contains(stream)
+                        && proof["candles"]["source_generation"] == closure.dataset
+                }) && observation_interval_verified(&proof["observations"])
+                    && candle_reconstruction_verified(&proof["candles"])
+                    && proof["candles"]["definition"]["session"].is_null()
+                    && proof["session_product_verified"] == true
+            })
     }
+}
+
+fn observation_interval_verified(proof: &Value) -> bool {
+    let original = &proof["original"];
+    proof["equal"] == true
+        && original == &proof["replacement"]
+        && original["rows"].as_u64().is_some_and(|n| n > 0)
+        && original["sha256"]
+            .as_str()
+            .is_some_and(|s| s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit()))
+        && original["first"].as_i64().is_some()
+        && original["last"].as_i64().is_some()
+        && original["instrument"].is_string()
+        && original["native_granularity"].is_object()
+        && original["price_representation"].is_object()
+        && proof["interval_inclusive"] == json!([original["first"], original["last"]])
+}
+
+fn candle_reconstruction_verified(proof: &Value) -> bool {
+    proof["equal"] == true
+        && proof["original"].is_object()
+        && proof["original"] == proof["reconstructed"]
+        && proof["original"]["sha256"]
+            .as_str()
+            .is_some_and(|s| s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit()))
+        && proof["original"]["streams"].is_array()
+        && proof["original"]["profile"].is_object()
+        && proof["definition"].is_object()
 }
 
 /// The migration writer, archive transport, and retirement gate share this exact record.
@@ -157,6 +196,43 @@ pub struct MigrationRecord {
     pub storage_aliases: Vec<String>,
 }
 impl MigrationRecord {
+    /// Aggregate equality from older executables proves only the selected newest source.
+    /// Deletion authority is narrower: every source needs its own measured reconstruction.
+    pub(crate) fn proved_legacy(&self) -> BTreeSet<String> {
+        let mut proved = BTreeSet::new();
+        let Some(proof) = self.evidence.get("source_preservation") else {
+            return proved;
+        };
+        if !self.verified()
+            || self
+                .evidence
+                .get("proof_version")
+                .and_then(Value::as_u64)
+                .is_none_or(|v| v < 4)
+            || proof["target_root"] != self.v2_root
+            || proof["target_stream"] != self.v2_stream
+        {
+            return proved;
+        }
+        for generation in &self.mapping.v1_generations {
+            let p = &proof["datasets"][generation];
+            if observation_interval_verified(p) {
+                proved.insert(generation.clone());
+            }
+        }
+        for generation in self.mapping.streams() {
+            let p = &proof["streams"][&generation];
+            if candle_reconstruction_verified(p)
+                && p["source_generation"]
+                    .as_str()
+                    .is_some_and(|s| proved.contains(s))
+            {
+                proved.insert(generation);
+            }
+        }
+        proved
+    }
+
     pub(crate) fn continuation_proof(&self) -> Option<ContinuationProof> {
         self.evidence
             .get("continuation_preservation")
@@ -205,6 +281,48 @@ impl MigrationRecord {
         self.baseline_verified()
             && (self.evidence.get("supersedes").is_none_or(Value::is_null)
                 || self.continuation_proof().is_some())
+            && self.configuration_upgrade_consistent()
+    }
+    fn configuration_upgrade_consistent(&self) -> bool {
+        let Some(upgrade) = self.evidence.get("configuration_upgrade") else {
+            return true;
+        };
+        let Some(continuation) = self.continuation_proof() else {
+            return false;
+        };
+        upgrade["kind"] == "validated_session_addition"
+            && upgrade.get("predecessor_record") == self.evidence.get("supersedes")
+            && upgrade.get("new_binding") == self.evidence.get("binding")
+            && upgrade["old_binding"] != upgrade["new_binding"]
+            && ["old_binding", "new_binding"].iter().all(|field| {
+                upgrade[field]
+                    .as_str()
+                    .is_some_and(|s| s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit()))
+            })
+            && ["old_config_hash", "new_config_hash"].iter().all(|field| {
+                upgrade[field]
+                    .as_str()
+                    .and_then(|s| s.strip_prefix("v3:sha256:"))
+                    .is_some_and(|s| s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit()))
+            })
+            && upgrade["calendars"].as_array().is_some_and(|calendars| {
+                !calendars.is_empty()
+                    && calendars.iter().all(|c| {
+                        c["instrument"].as_str().is_some_and(|s| !s.is_empty())
+                            && serde_json::from_value::<NativeGranularity>(
+                                c["native_granularity"].clone(),
+                            )
+                            .is_ok()
+                            && serde_json::from_value::<binary_alpha_engine::session::Session>(
+                                c["session"].clone(),
+                            )
+                            .is_ok_and(|session| session.calendar().is_ok())
+                    })
+            })
+            && continuation
+                .reconstructed_streams
+                .values()
+                .any(|p| p["candles"]["source_generation"] == continuation.from_root)
     }
     pub(crate) fn baseline_verified(&self) -> bool {
         self.schema_version == 1
@@ -241,6 +359,8 @@ pub(crate) struct MigrationRecords {
     /// Authenticated historical metadata proves inventories, not live market dependencies.
     pub inventory_snapshots: BTreeSet<String>,
     pub streams: BTreeMap<String, binary_alpha_engine::stream::StreamManifest>,
+    /// Legacy sources without a reconstruction proof remain part of every recovery closure.
+    pub retained_datasets: BTreeMap<String, GenerationManifest>,
 }
 
 pub(crate) fn migration_records(
@@ -262,6 +382,7 @@ pub(crate) fn migration_records(
     let mut streams = BTreeMap::new();
     let mut predecessors = Vec::new();
     let mut preservation = Vec::new();
+    let mut retained_datasets = BTreeMap::new();
     if records.is_dir() {
         for entry in fs::read_dir(records).map_err(err)? {
             let path = entry.map_err(err)?.path();
@@ -277,6 +398,50 @@ pub(crate) fn migration_records(
             {
                 let stream =
                     migration_stream(local, &record, &manifest.instrument, manifest.role, access)?;
+                let proved = record.proved_legacy();
+                let mut retained: BTreeSet<_> = record
+                    .mapping
+                    .v1_generations
+                    .difference(&proved)
+                    .cloned()
+                    .collect();
+                for generation in record.mapping.streams().difference(&proved) {
+                    let key = binary_alpha_engine::dataset::manifest_key(generation);
+                    let mut bytes = Vec::new();
+                    access.lookup(generation)?;
+                    local.read_to(&key, None, &mut bytes)?;
+                    let legacy = binary_alpha_engine::stream::StreamManifest::from_json(&bytes)?;
+                    if legacy.instrument != manifest.instrument
+                        || legacy.role != manifest.role
+                        || legacy.layout.is_some()
+                        || legacy.generation != *generation
+                        || !record
+                            .mapping
+                            .v1_generations
+                            .contains(&legacy.source_generation)
+                    {
+                        return Err("retained legacy stream identity mismatch".into());
+                    }
+                    access.permit(Some(legacy.role), &legacy.source_generation)?;
+                    verify::run_with(&local.uri(&key), access)?;
+                    retained.insert(legacy.source_generation.clone());
+                    streams.insert(generation.clone(), legacy);
+                }
+                for generation in retained {
+                    access.permit(Some(manifest.role), &generation)?;
+                    let mut bytes = Vec::new();
+                    local.read_to(&manifest_key(&generation), None, &mut bytes)?;
+                    let legacy = GenerationManifest::from_json(&bytes)?;
+                    if legacy.instrument != manifest.instrument
+                        || legacy.role != manifest.role
+                        || legacy.layout.is_some()
+                        || legacy.generation != generation
+                    {
+                        return Err("retained legacy dataset identity mismatch".into());
+                    }
+                    verify::run_with(&local.uri(&legacy.key()), access)?;
+                    retained_datasets.insert(generation, legacy);
+                }
                 if let Some(proof) = record.continuation_proof() {
                     preservation.extend(proof.closures);
                 }
@@ -320,6 +485,7 @@ pub(crate) fn migration_records(
         covered_files,
         inventory_snapshots,
         streams,
+        retained_datasets,
     })
 }
 /// Inventory entries are evidence even when their bytes are not JSON documents.

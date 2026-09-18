@@ -738,13 +738,27 @@ under the v1 definition, plus independent verification of the new session produc
 
 A migration may add a missing singular `session` while preserving every other definition field;
 an existing calendar cannot change. `candles_equal=true` and `MigrationEquality.candles` mean
-that v2 observations reproduce every legacy candle column, summary and profile under the exact
-legacy definition (with only the source-generation substitution). They do not assert equality
+that v2 observations reproduce the selected baseline stream's candle columns, summary and
+profile under its exact legacy definition (with only the source-generation substitution).
+They do not assert equality
 of the filled session product with sparse v1 candles. The durable proof names
 `basis=legacy_definition_reconstruction`, preserves both definitions and stream summaries,
 records the legacy row digest and profile equality, and requires `session_product_verified=true`.
 The new product passes `data verify` independently before the migration record is published;
 a contradictory session proof fails the retirement eligibility predicate.
+
+Proof version 4 additionally seals `source_preservation` for every mapped v1 dataset and
+stream against the final continuation root. Dataset proofs compare exact ordered lossless
+rows (including multiplicity and every provider column) over the source's inclusive time
+interval. Stream proofs reconstruct that interval under each recorded definition and compare
+all candles, summaries, and profile. Only successful per-source proofs grant legacy retirement
+authority. Unproved closures remain retained and archived in the catalog's lineage manifests;
+restoration verifies those originals as well. The aggregate equality summary describes the
+selected baseline only. Earlier proof versions are re-proved in superseding immutable records.
+A pre-session configuration may add validated singular session tables only when removing them
+reproduces the completed checkpoint's exact binding; the new record names both configuration
+hashes, both bindings, the calendars, and its preserved predecessor. Old daily products are
+reconstructed separately from verification of the new session product.
 
 Named non-live gates (`cargo test -p binary-alpha-app --test data_pipeline` and the affected suites): one multi-day Deriv and one multi-day Pocket fixture through import, migration, history update, audit, feature/outcome/replay readers, archive, fresh-store restore, retirement, and a later update that uploads zero unchanged objects; covering midnight repeats, a cross-midnight page, an empty page, missing receipt metadata, a historical gap, a partial cutoff day, a weekend-delayed candle finalization, pending-acquisition diagnostics, repeated requests under one intent with unchanged observations (which changes only a page day), v1/v2 coexistence with equal coverage, encoding determinism across batch boundaries, interruption at each phase, and archive-registry rebuild. Assertions are on goal-bearing outputs, traversing every daily partition: identical feature rows and engine state, identical global outcome indices and reasons, identical replay ledger and results, identical recorded warm-up state, exact legacy candle/profile reconstruction and independently
 verified session candles, exact page reconstruction, and Pocket's existing rejection of tick-only outcome and replay paths.
@@ -1092,7 +1106,11 @@ partial is discarded once and downloaded afresh. Identical completed local objec
 conflicts are not replaced. Objects install first, original manifests last, then the existing
 `data verify` owner verifies both dataset and stream. Producer paths are not needed and
 manifest bytes and generation identities do not change. The output supplies local uniform
-resource identifiers (URIs) for a new consumer configuration:
+resource identifiers (URIs) for a new consumer configuration. After all pinned closure checks
+pass, restore publishes the catalog's canonical receipt using the pinned file ID, byte count,
+SHA-256, and evidence inventory. This recovers the newest receipt that cannot be included
+inside its own catalog, preserving every producer record byte for byte. The output supplies
+the verified manifest locations:
 
 ```text
 restored INSTRUMENT ROLE dataset DATASET_URI stream STREAM_URI objects N installed I reused R

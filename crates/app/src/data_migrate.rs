@@ -20,7 +20,10 @@ use std::collections::{BTreeMap, BTreeSet};
 #[path = "data_migrate/upgrade.rs"]
 mod upgrade;
 
-const PROOF_VERSION: u32 = 3;
+#[path = "data_migrate/source_proofs.rs"]
+mod source_proofs;
+
+const PROOF_VERSION: u32 = 4;
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 
 fn err(e: impl std::fmt::Display) -> String {
@@ -103,6 +106,8 @@ struct State {
     unresolved_objects: Vec<Value>,
     #[serde(default)]
     continuations: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    configuration_upgrade: Option<Value>,
     phase: String,
     binding: String,
     dataset: String,
@@ -2421,6 +2426,7 @@ fn convert(
         storage_aliases: physical.storage_aliases,
         unresolved_objects: physical.unresolved_objects,
         continuations: continuations.iter().map(|m| m.generation.clone()).collect(),
+        configuration_upgrade: None,
         phase: "converted".into(),
         binding: binding.into(),
         dataset: manifest.generation,
@@ -2438,8 +2444,26 @@ fn convert(
 }
 
 fn observation_proof(local: &Store, manifest: &GenerationManifest) -> Result<Value, String> {
+    observation_proof_range(local, manifest, None)
+}
+
+fn observation_proof_range(
+    local: &Store,
+    manifest: &GenerationManifest,
+    range: Option<(i64, i64)>,
+) -> Result<Value, String> {
     let mut hash = Sha256::new();
-    let read = daily::read_generation_lossless(local, manifest, |row| {
+    let mut rows = 0u64;
+    let mut first = None;
+    let mut last = None;
+    daily::read_generation_lossless(local, manifest, |row| {
+        let time = row.time()?;
+        if range.is_some_and(|(first, last)| time < first || time > last) {
+            return Ok(());
+        }
+        rows += 1;
+        first.get_or_insert(time);
+        last = Some(time);
         match row {
             LosslessRow::Tick(t) => {
                 hash.update(b"tick");
@@ -2454,7 +2478,9 @@ fn observation_proof(local: &Store, manifest: &GenerationManifest) -> Result<Val
         Ok(())
     })?;
     Ok(
-        json!({"rows":read.data.rows,"sha256":binary_alpha_engine::hex(&hash.finalize()),"first":read.data.first_event_micros,"last":read.data.last_event_micros}),
+        json!({"rows":rows,"sha256":binary_alpha_engine::hex(&hash.finalize()),"first":first,"last":last,
+            "instrument":manifest.instrument,"role":manifest.role,
+            "native_granularity":manifest.native_granularity,"price_representation":manifest.price_representation}),
     )
 }
 fn candle_digest(layout: &Layout, m: &StreamManifest) -> Result<String, String> {
@@ -2802,9 +2828,11 @@ fn migrate_job_with(
         &bound.evidence_sha256,
     ))?);
     let previous = read_json::<State>(&path)?;
+    let mut configuration_upgrade = None;
     if let Some(state) = &previous {
         if state.binding != binding {
-            return Err("migration configuration/evidence changed since converted phase".into());
+            configuration_upgrade =
+                Some(upgrade::configuration(job, bound, layout, state, &binding)?);
         }
         if state.proof_version > PROOF_VERSION {
             return Err("migration checkpoint requires a newer proof executable".into());
@@ -2825,7 +2853,7 @@ fn migrate_job_with(
             fs::remove_dir_all(&work).map_err(err)?;
         }
         mkdir(&work)?;
-        let state = convert(
+        let mut state = convert(
             job,
             bound,
             layout,
@@ -2834,6 +2862,7 @@ fn migrate_job_with(
             &work,
             previous.as_ref(),
         )?;
+        state.configuration_upgrade = configuration_upgrade;
         save(&path, &state)?;
         state
     };
@@ -2854,6 +2883,7 @@ fn migrate_job_with(
     }
     let proofs = verify_migration(layout, &state, access, &work, offset_seconds(bound))?;
     let continuation_proof = upgrade::preserve(job, bound, layout, &mut state, access, &work)?;
+    let source_preservation = source_proofs::prove(layout, &state, access, &work)?;
     let root = read_manifest(&layout.store(), &state.dataset)?.0;
     let lineage = lineage::read_lineage(&layout.store(), &root)?;
     let mapping: lineage::MigrationMapping = serde_json::from_value(lineage).map_err(err)?;
@@ -2870,6 +2900,10 @@ fn migrate_job_with(
     evidence.insert("newest_v1_dataset".into(), json!(state.newest));
     evidence.insert("alias_table".into(), json!(state.aliases));
     evidence.insert("proofs".into(), proofs);
+    evidence.insert("source_preservation".into(), source_preservation);
+    if let Some(binding) = &state.configuration_upgrade {
+        evidence.insert("configuration_upgrade".into(), binding.clone());
+    }
     if let Some(proof) = continuation_proof {
         evidence.insert(
             "continuation_preservation".into(),

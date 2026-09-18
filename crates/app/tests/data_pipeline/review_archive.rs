@@ -166,7 +166,7 @@ fn standalone_pocket_acquisitions(migrate: bool) {
         fs::write(&state_path, serde_json::to_vec_pretty(&prior).unwrap()).unwrap();
         pipeline("migrate", &f.pipeline, &["--job", "pocket"]).unwrap();
         let upgraded = read_json(&state_path);
-        assert_eq!(upgraded["proof_version"], 3);
+        assert_eq!(upgraded["proof_version"], 4);
         assert_ne!(upgraded["record"], state["record"]);
         assert_eq!(
             fs::read(

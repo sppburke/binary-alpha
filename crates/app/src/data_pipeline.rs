@@ -683,6 +683,14 @@ impl Catalog {
             }) {
                 return Err("catalog omits the verified migration stream".into());
             }
+            if bindings.retained_datasets.keys().any(|generation| {
+                !self
+                    .lineage_manifests
+                    .iter()
+                    .any(|entry| &entry.generation == generation)
+            }) {
+                return Err("catalog omits an unproved legacy source".into());
+            }
             if bindings.files.iter().any(|(key, id)| {
                 !self
                     .records
@@ -1082,6 +1090,13 @@ fn archive_generation(
             lineage_objects.extend(migrated.objects.clone());
             lineage_manifests.push((generation.clone(), key, bytes));
         }
+    }
+    for (generation, retained) in &record_bindings.retained_datasets {
+        let key = retained.key();
+        let mut bytes = Vec::new();
+        local.read_to(&key, None, &mut bytes)?;
+        lineage_objects.extend(retained.objects.clone());
+        lineage_manifests.push((generation.clone(), key, bytes));
     }
     let mut closure: Vec<&ObjectRecord> = Vec::new();
     for object in dataset_manifest
@@ -2360,6 +2375,40 @@ fn restore_locked(
         verify::run_with(&local.uri(key), access)?;
     }
     catalog.check_migration_records(layout, &dataset, access)?;
+    // The catalog cannot contain its own receipt. Reconstruct it only after its pinned
+    // closure verifies, using the same cumulative inventory and encoding as publication.
+    let inventory = catalog
+        .records
+        .iter()
+        .map(|entry| {
+            (
+                entry.key.clone(),
+                ObjectIdentity {
+                    bytes: entry.bytes,
+                    sha256: entry.sha256.clone(),
+                    crc32c: 0,
+                },
+            )
+        })
+        .collect();
+    let receipt_name = format!(
+        "{}-catalog-{}-{}-{}.json",
+        catalog.job,
+        &catalog.dataset.generation[..16],
+        &catalog.stream.generation[..16],
+        evidence_digest(&inventory, None)
+    );
+    let receipt = CatalogReceipt {
+        file_id: catalog_id.to_string(),
+        sha256: expected,
+        bytes: size,
+    };
+    research::publish_record(
+        &record_store,
+        &record_store,
+        &receipt_name,
+        &json_bytes(&receipt)?,
+    )?;
     writeln!(
         out,
         "restored {} {} dataset {dataset_uri} stream {stream_uri} objects {} installed {installed} reused {reused}",

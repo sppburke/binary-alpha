@@ -179,8 +179,11 @@ fn verified_replacements(
             "retire: missing verified migration evidence for {root}"
         ));
     }
-    let mut replaced = mapping.v1_generations;
-    replaced.extend(streams);
+    let replaced = records
+        .iter()
+        .filter(|record| record.job == job && record.v2_root == root && record.mapping == mapping)
+        .flat_map(MigrationRecord::proved_legacy)
+        .collect();
     Ok(replaced)
 }
 
@@ -1228,6 +1231,7 @@ fn plan(
         .cloned()
         .collect();
     let mut replaced = BTreeSet::new();
+    let mut unproved_legacy = BTreeSet::new();
     let mut continuation_seeds = BTreeSet::new();
     let mut preserved_catalogs = BTreeSet::new();
     let mut completed_records = BTreeSet::new();
@@ -1435,7 +1439,6 @@ fn plan(
             .iter()
             .find(|a| &a.file.file_id == catalog_id)
             .expect("selected catalog");
-        let newest = &manifests[&archive.dataset];
         let mut lineage = BTreeMap::new();
         let mut parents = BTreeMap::new();
         for (id, m) in &manifests {
@@ -1657,6 +1660,14 @@ fn plan(
             // censuses covered by the selected proof and exact former root/stream pairs.
             let mapping: MigrationMapping =
                 serde_json::from_value(lineage[&seed].clone()).map_err(|e| e.to_string())?;
+            unproved_legacy.extend(
+                mapping
+                    .v1_generations
+                    .iter()
+                    .chain(&mapping.streams())
+                    .filter(|id| !verified.contains(*id))
+                    .cloned(),
+            );
             for key in &bindings.covered_files {
                 completed_records.insert(crate::lineage::record_name(key)?.to_string());
                 for value in documents(&layout.state.join(key))? {
@@ -1718,10 +1729,6 @@ fn plan(
             for id in &verified {
                 if let Some(old) = manifests.get(id)
                     && old.dataset
-                    && newest.value["coverage"]["first_event_time"].as_str()
-                        <= old.value["coverage"]["first_event_time"].as_str()
-                    && newest.value["coverage"]["last_event_time"].as_str()
-                        >= old.value["coverage"]["last_event_time"].as_str()
                 {
                     replaced.insert(id.clone());
                 }
@@ -1845,7 +1852,7 @@ fn plan(
                 && if a.value["layout"] == "daily-v2" {
                     preserved_catalogs.contains(&a.file.file_id)
                 } else {
-                    replaced.contains(&a.dataset)
+                    replaced.contains(&a.dataset) && replaced.contains(&a.stream)
                 })
         {
             candidates.insert(a.file.file_id.clone());
@@ -2678,7 +2685,9 @@ fn plan(
             } else {
                 Status::Retired
             },
-            reason: if m.daily {
+            reason: if unproved_legacy.contains(id) {
+                "no successful per-source preservation proof; original closure retained and archived"
+            } else if m.daily {
                 "daily-v2 lineage"
             } else if roots.contains(id) {
                 "configuration, pending, unselected job, or non-pipeline dependency"

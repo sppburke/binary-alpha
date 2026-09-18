@@ -83,9 +83,6 @@ fn cumulative_records(job: &str, broker: &str, symbol: &str, end: i64) {
                     fs::read(path).unwrap(),
                 )
             })
-            .filter(|(_, bytes)| {
-                !serde_json::from_slice::<Value>(bytes).is_ok_and(|v| v["file_id"] == final_catalog)
-            })
             .filter(|(name, _)| name != "unrelated.json")
             .collect();
     assert!(originals.keys().any(|name| name.contains("-migration-")));
@@ -117,6 +114,14 @@ fn cumulative_records(job: &str, broker: &str, symbol: &str, end: i64) {
         let restored = fresh.join("pipeline_state/records").join(name);
         assert!(restored.is_file(), "archive omitted evidence record {name}");
         assert_eq!(&fs::read(&restored).unwrap(), bytes, "record {name}");
+        if serde_json::from_slice::<Value>(bytes).is_ok_and(|v| v["file_id"] == final_catalog) {
+            assert_eq!(read_json(&restored)["sha256"], final_digest);
+            assert_eq!(
+                read_json(&restored)["bytes"],
+                f.drive.files()[&final_catalog].bytes.len()
+            );
+            continue; // This receipt is derived from the pinned catalog, outside its inventory.
+        }
         let entry = archived
             .records
             .iter()

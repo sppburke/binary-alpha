@@ -234,7 +234,15 @@ pipeline's supported command owners; no conversion, upload, or deletion scripts 
 
 After interruption, rerun the same migrate, archive, or restore command: each owner resumes
 its checkpoints or verifies identical completed bytes. A changed source/configuration is a
-conflict, never permission to overwrite evidence. After retirement apply starts, keep the
+conflict, never permission to overwrite evidence. The explicit exception is a completed
+pre-session migration: adding validated `instruments.session` tables alone may be bound into
+a proof-version-4 superseding receipt. Every other configuration field and evidence byte must
+reproduce the original binding. Predecessor receipts remain unchanged. Migration reconstructs
+old daily candles under their recorded definition and independently verifies the new product.
+Every mapped v1 source needs its own preservation proof; divergent or unproved sources stay
+in the retained archive closure and appear as protected in the retirement plan. Fresh restore
+also reconstructs the current catalog receipt, so record comparisons include that receipt.
+After retirement apply starts, keep the
 pipeline, job files, records, and registry fixed and resume **that exact plan**; its durable
 fence rejects other writers until retained verification and the completion record succeed.
 Before apply starts, a stale plan may be replaced by a newly reviewed plan.

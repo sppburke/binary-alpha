@@ -379,6 +379,14 @@ fn fixture() -> Fixture {
     ));
     daily::publish(&published, &mut pair.v2);
     let new_stream = audit_fixture(&scratch, &pair, &pair.v2);
+    let source_preservation = super::review_final::fixture_source_preservation(
+        &published,
+        &[&pair.v1, &history],
+        &old_stream,
+        &pair.v2,
+        &new_stream,
+        &scratch.root,
+    );
     let (new_catalog, _) = archive_fixture(&drive, &published, &pair.v2, &new_stream);
     let root = scratch.path("managed");
     fs::create_dir_all(&root).unwrap();
@@ -404,6 +412,7 @@ fn fixture() -> Fixture {
         (
             "migration.json",
             json!({"schema_version":1,"job":"deriv","phase":"verified",
+                "proof_version":4,"source_preservation":source_preservation,
                 "v1_generations":[pair.v1.generation,history.generation],
                 "v1_stream":old_stream.generation,"v2_root":pair.v2.generation,
                 "v2_stream":new_stream.generation,

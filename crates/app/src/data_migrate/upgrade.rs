@@ -2,6 +2,52 @@
 //! the daily continuation. Partition reuse and preservation are checked independently.
 use super::*;
 
+/// The pre-session strict schema has exactly the current canonical form with session
+/// absent. Recomputing its original binding proves every other field and evidence byte
+/// unchanged, without trusting a caller-provided historical configuration snapshot.
+pub(super) fn configuration(
+    job: &Job,
+    bound: &Bound,
+    layout: &Layout,
+    state: &State,
+    binding: &str,
+) -> Result<Value, String> {
+    let conflict = "migration configuration/evidence changed since converted phase";
+    if state.phase != "verified" || state.proof_version >= PROOF_VERSION {
+        return Err(conflict.into());
+    }
+    let name = state.record.as_deref().ok_or(conflict)?;
+    lineage::record_name(&format!("records/{name}"))?;
+    let prior: lineage::MigrationRecord = get(&layout.state.join("records").join(name))?;
+    if !prior.baseline_verified()
+        || prior.job != job.id
+        || prior.v2_root != state.dataset
+        || prior.v2_stream != state.stream
+        || prior.evidence.get("binding") != Some(&json!(state.binding))
+    {
+        return Err("calendar upgrade lacks the exact verified predecessor binding".into());
+    }
+    let mut old = bound.core.clone();
+    let mut calendars = Vec::new();
+    for instrument in &mut old.instruments {
+        if let Some(session) = instrument.session.take() {
+            session.calendar()?;
+            calendars.push(json!({"instrument":instrument.id().to_string(),
+                "native_granularity":instrument.native_granularity,"session":session}));
+        }
+    }
+    let old_hash = old.content_hash();
+    let old_binding = sha256_hex(&json_bytes(&(&old_hash, &bound.evidence_sha256))?);
+    if calendars.is_empty() || old_binding != state.binding {
+        return Err(conflict.into());
+    }
+    Ok(
+        json!({"kind":"validated_session_addition","predecessor_record":name,
+        "old_config_hash":old_hash,"new_config_hash":bound.core.content_hash(),
+        "old_binding":old_binding,"new_binding":binding,"calendars":calendars}),
+    )
+}
+
 pub(super) fn index_daily(
     layout: &Layout,
     work: &Path,
@@ -470,6 +516,7 @@ pub(super) fn preserve(
     verify::run_with(&layout.manifest_uri(&manifest.generation), access)?;
     verify::run_with(&layout.manifest_uri(&stream.generation), access)?;
     let mut closures = Vec::new();
+    let mut reconstructed_streams = BTreeMap::new();
     for old in family.iter().chain(std::iter::once(&baseline)) {
         preserve_days(
             layout,
@@ -503,18 +550,38 @@ pub(super) fn preserve(
             if prior.source_generation != old.generation {
                 continue;
             }
-            if prior.definition != stream.definition {
-                return Err("proof upgrade: prior stream definition differs".into());
-            }
             verify::run_with(&layout.manifest_uri(&generation), access)?;
-            preserve_days(
-                layout,
-                &prior.day_inventory,
-                &prior.objects,
-                &stream.day_inventory,
-                &stream.objects,
-                DayFamily::Candles,
-            )?;
+            if prior.definition == stream.definition {
+                preserve_days(
+                    layout,
+                    &prior.day_inventory,
+                    &prior.objects,
+                    &stream.day_inventory,
+                    &stream.objects,
+                    DayFamily::Candles,
+                )?;
+            } else {
+                if prior.definition.session.is_some()
+                    || !crate::session_migration::compatible(&prior.definition, &stream.definition)
+                {
+                    return Err("proof upgrade: prior stream definition differs".into());
+                }
+                let observations = source_proofs::observation(&local, old, &manifest)?;
+                if observations["equal"] != true {
+                    return Err("proof upgrade: legacy stream observation interval changed".into());
+                }
+                let reconstruction = source_proofs::stream(layout, old, &manifest, &prior, work)?;
+                if reconstruction["equal"] != true {
+                    return Err("proof upgrade: legacy daily candle reconstruction differs".into());
+                }
+                reconstructed_streams.insert(
+                    generation.clone(),
+                    json!({
+                        "observations":observations,"candles":reconstruction,
+                        "session_product_verified":true,
+                    }),
+                );
+            }
             old_streams.push(generation);
         }
         closures.push(lineage::PreservedClosure {
@@ -535,6 +602,7 @@ pub(super) fn preserve(
         pages: true,
         candles: true,
         closures,
+        reconstructed_streams,
     };
     state.occurrences = manifest
         .day_inventory

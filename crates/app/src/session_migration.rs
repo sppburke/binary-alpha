@@ -32,6 +32,22 @@ pub(crate) fn reconstruct(
     definition: &Instrument,
     scratch: &Path,
 ) -> Result<Reconstruction, String> {
+    reconstruct_from(store, source, source, definition, scratch)
+}
+
+/// Replay a source's exact observation interval from its replacement. The caller proves
+/// all lossless rows in that interval equal before using this as retirement authority.
+pub(crate) fn reconstruct_from(
+    store: &Store,
+    replacement: &GenerationManifest,
+    source: &GenerationManifest,
+    definition: &Instrument,
+    scratch: &Path,
+) -> Result<Reconstruction, String> {
+    let first =
+        binary_alpha_engine::market::parse_event_time_micros(&source.coverage.first_event_time)?;
+    let last =
+        binary_alpha_engine::market::parse_event_time_micros(&source.coverage.last_event_time)?;
     let mut writers = Vec::new();
     let mut paths = Vec::new();
     for (index, spec) in definition.candles.iter().enumerate() {
@@ -47,15 +63,27 @@ pub(crate) fn reconstruct(
     }
     let mut stream = InstrumentStream::new(definition, Source::from_manifest(source))?;
     let mut finalized = Vec::new();
-    audit::feed_generation(store, source, definition.price_scale, &mut |observation| {
-        stream
-            .push(observation, &mut finalized)
-            .map_err(|e| e.to_string())?;
-        for (index, candle) in finalized.drain(..) {
-            writers[index].push(&candle)?;
-        }
-        Ok(())
-    })?;
+    audit::feed_generation(
+        store,
+        replacement,
+        definition.price_scale,
+        &mut |observation| {
+            let time = match observation {
+                binary_alpha_engine::stream::Observation::Tick(t) => t.event_time_micros,
+                binary_alpha_engine::stream::Observation::Bar(b) => b.start_micros,
+            };
+            if time < first || time > last {
+                return Ok(());
+            }
+            stream
+                .push(observation, &mut finalized)
+                .map_err(|e| e.to_string())?;
+            for (index, candle) in finalized.drain(..) {
+                writers[index].push(&candle)?;
+            }
+            Ok(())
+        },
+    )?;
     let mut streams = Vec::new();
     let mut hash = Sha256::new();
     for ((writer, path), spec) in writers.into_iter().zip(paths).zip(&definition.candles) {
