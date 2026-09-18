@@ -545,17 +545,7 @@ fn serve_drive() -> FakeDrive {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     listener.set_nonblocking(true).unwrap();
     let base = format!("http://{}", listener.local_addr().unwrap());
-    // A freshly bound loopback port can only have belonged to a fixture that is gone. The
-    // host-scoped archive fence keys on endpoint and root id, so a reservation an earlier
-    // fixture left for this endpoint is stale evidence of that fixture, never of this one.
-    let binding = format!("{base}\nfixture-root");
-    let stale = std::env::temp_dir().join(format!(
-        "binary-alpha-archive-{}",
-        binary_alpha_engine::hex(&Sha256::digest(binding.as_bytes()))
-    ));
-    for extension in ["retirement.json", "lock"] {
-        let _ = fs::remove_file(stale.with_extension(extension));
-    }
+    common::clear_archive_fence(&base, "fixture-root");
     let state = Arc::new(Mutex::new(DriveState::default()));
     let activity = Arc::new(DriveActivity::default());
     let activity_ = Arc::clone(&activity);

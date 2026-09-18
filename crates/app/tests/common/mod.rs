@@ -399,6 +399,20 @@ pub fn write_ticks(path: &Path, rows: &[&str]) {
     fs::write(path, text).unwrap();
 }
 
+/// A freshly bound loopback port can only have belonged to a fixture that is gone. The
+/// host-scoped archive fence keys on endpoint and root id, so a reservation or lock an earlier
+/// fixture left for this endpoint is stale evidence of that fixture, never of the new one.
+pub fn clear_archive_fence(base: &str, root: &str) {
+    let binding = format!("{base}\n{root}");
+    let stale = std::env::temp_dir().join(format!(
+        "binary-alpha-archive-{}",
+        binary_alpha_engine::hex(&Sha256::digest(binding.as_bytes()))
+    ));
+    for extension in ["retirement.json", "lock"] {
+        let _ = fs::remove_file(stale.with_extension(extension));
+    }
+}
+
 pub struct Scratch {
     pub root: PathBuf,
 }

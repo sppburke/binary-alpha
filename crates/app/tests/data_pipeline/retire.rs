@@ -29,6 +29,7 @@ fn serve() -> RetireDrive {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     listener.set_nonblocking(true).unwrap();
     let base = format!("http://{}", listener.local_addr().unwrap());
+    common::clear_archive_fence(&base, "fixture-root");
     let state = Arc::new(Mutex::new(DriveState::default()));
     let faults = Arc::new(Mutex::new(DeleteFault {
         after: None,
