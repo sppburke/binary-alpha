@@ -2492,9 +2492,69 @@ fn import_coverage(
 
 /// Translate retained v1 claims into the same typed coverage consumed by daily update and
 /// verification. Observation endpoints never create a completeness claim.
+/// Acquisition claims for every retained v1 history record, plus the lineage entries for
+/// shortfall ranges that an older executable recorded inside already verified coverage.
+/// Before the fetch clip (`fetch.rs`, "still-unverified part"), a budget shortfall began at the
+/// request start, one verified minute before the unverified part. The claim keeps only the part
+/// outside verified coverage, exactly as a current fetch records it, and lineage keeps the
+/// recorded range so the retired record stays reconstructible.
+pub(crate) fn history_claims(
+    histories: &[(String, Value)],
+) -> Result<(Vec<AcquisitionCoverage>, Vec<Value>), String> {
+    let mut claims = Vec::new();
+    let mut legacy = Vec::new();
+    for (generation, value) in histories {
+        let history: HistoryCoverage = serde_json::from_value(value.clone()).map_err(err)?;
+        let range = |r: &crate::fetch::Range| CoverageRange {
+            start: r.start.clone(),
+            end: r.end.clone(),
+        };
+        let acquisition_id = format!("v1-history:{generation}");
+        let requested = vec![range(&history.requested)];
+        let verified: Vec<_> = history.verified.iter().map(range).collect();
+        let unresolved = complement(requested[0].bounds()?, &verified)?;
+        let mut shortfalls = Vec::new();
+        for shortfall in history
+            .shortfall
+            .iter()
+            .chain(history.tail_shortfall.iter())
+        {
+            let recorded = range(&shortfall.unresolved);
+            let retained = clip(recorded.bounds()?, &unresolved)?;
+            if retained.len() == 1 && retained[0].bounds()? == recorded.bounds()? {
+                shortfalls.push(CoverageShortfall {
+                    reason: shortfall.reason.clone(),
+                    unresolved: recorded,
+                });
+                continue;
+            }
+            legacy.push(json!({
+                "generation": generation,
+                "acquisition_id": acquisition_id,
+                "reason": shortfall.reason,
+                "recorded": recorded,
+                "retained": retained,
+                "basis": "the recording executable did not clip shortfalls to the unverified part of the request; the claim keeps only the part outside verified coverage",
+            }));
+            shortfalls.extend(retained.into_iter().map(|unresolved| CoverageShortfall {
+                reason: shortfall.reason.clone(),
+                unresolved,
+            }));
+        }
+        claims.push(AcquisitionCoverage {
+            acquisition_id,
+            source_identity: history.source_identity,
+            requested,
+            verified,
+            unresolved,
+            shortfalls,
+        });
+    }
+    Ok((claims, legacy))
+}
 pub(crate) fn migration_coverage(
     manifest: &mut GenerationManifest,
-    histories: &[(String, Value)],
+    histories: Vec<AcquisitionCoverage>,
     source_identity: &str,
 ) -> Result<DailyCoverage, String> {
     let id = format!("migration-source:{}", manifest.generation);
@@ -2566,32 +2626,7 @@ pub(crate) fn migration_coverage(
         shortfalls: vec![],
         unresolved,
     });
-    for (generation, value) in histories {
-        let history: HistoryCoverage = serde_json::from_value(value.clone()).map_err(err)?;
-        let range = |r: &crate::fetch::Range| CoverageRange {
-            start: r.start.clone(),
-            end: r.end.clone(),
-        };
-        let requested = vec![range(&history.requested)];
-        let verified: Vec<_> = history.verified.iter().map(range).collect();
-        let unresolved = complement(requested[0].bounds()?, &verified)?;
-        evidence.acquisitions.push(AcquisitionCoverage {
-            acquisition_id: format!("v1-history:{generation}"),
-            source_identity: history.source_identity,
-            requested,
-            verified,
-            unresolved,
-            shortfalls: history
-                .shortfall
-                .iter()
-                .chain(history.tail_shortfall.iter())
-                .map(|s| CoverageShortfall {
-                    reason: s.reason.clone(),
-                    unresolved: range(&s.unresolved),
-                })
-                .collect(),
-        });
-    }
+    evidence.acquisitions.extend(histories);
     evidence.validate()?;
     Ok(evidence)
 }

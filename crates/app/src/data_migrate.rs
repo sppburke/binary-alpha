@@ -2349,12 +2349,16 @@ fn convert(
             .map(|m| m.generation.clone())
             .collect(),
     };
+    let (history_claims, legacy_shortfalls) = lineage::history_claims(&coverage)?;
     let mut lineage = json!({"schema_version":1,"kind":"migration","layout":"daily-v2","source_identity":identity,"role":newest.role,"newest_v1_dataset":newest.generation,"objects":replaced,"manifests":manifest_bindings,"imports":imports,"identity_basis":{"recorded":"intent plus request fingerprint and per-receipt occurrence count; shortest receipt then lexical name owns acquisition/ordinal","legacy":"bundle origin and slice, or inherited canonical single-page coverage prefix; legacy-coverage-<coverage SHA-256> and original coverage ordinal"},"ndjson_framing":"per-line terminators, offsets and independent ordinals in immutable alias table","alias_table":{"record":aliases,"sha256":aliases_id.sha256,"bytes":aliases_id.bytes},"records":records});
     if let Some(previous) = superseded {
         lineage["supersedes_generation"] = json!(previous.dataset);
     }
     lineage["predecessor_jobs"] = json!(predecessor_jobs);
     lineage["unresolved_objects"] = json!(physical.unresolved_objects);
+    if !legacy_shortfalls.is_empty() {
+        lineage["legacy_shortfalls"] = json!(legacy_shortfalls);
+    }
     lineage.as_object_mut().unwrap().extend(
         serde_json::to_value(&mapping)
             .map_err(err)?
@@ -2387,7 +2391,7 @@ fn convert(
         &mut manifest,
         acquisition_ids.iter().map(String::as_str),
     )?;
-    let cov = lineage::migration_coverage(&mut manifest, &coverage, &identity)?;
+    let cov = lineage::migration_coverage(&mut manifest, history_claims, &identity)?;
     manifest
         .objects
         .push(retain_json(&local, work, fetch::COVERAGE_PATH, &cov)?);

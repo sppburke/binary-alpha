@@ -5,6 +5,14 @@ use binary_alpha_engine::dataset::{ObjectRole, manifest_key};
 use std::collections::BTreeSet;
 
 pub(super) fn freeze(f: &Fixture) -> BTreeMap<String, String> {
+    freeze_with(f, |_, _| ())
+}
+
+/// `mutate` rewrites each legacy history's coverage before publication; receipts follow it.
+pub(super) fn freeze_with(
+    f: &Fixture,
+    mutate: impl Fn(&GenerationManifest, &mut HistoryCoverage),
+) -> BTreeMap<String, String> {
     let root = f.scratch.path("producer/store");
     let state = f.scratch.path("producer/pipeline_state");
     fs::create_dir_all(state.join("records")).unwrap();
@@ -44,6 +52,7 @@ pub(super) fn freeze(f: &Fixture) -> BTreeMap<String, String> {
                     .cloned()
                     .unwrap_or(seed.generation.clone());
             }
+            mutate(&old, &mut cov);
             let tmp = root.join("fixture-coverage.json");
             fs::write(&tmp, serde_json::to_vec(&cov).unwrap()).unwrap();
             let replaced: Vec<String> = old

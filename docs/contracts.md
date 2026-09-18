@@ -665,6 +665,12 @@ and `unresolved` range), and `unresolved`. Ranges are ordered, nonoverlapping ha
 lists preserve imports that made no request claim. Cumulative verified ranges may extend
 outside the current request. Verified and unresolved acquisition spans cannot overlap;
 every requested span is accounted for, and every shortfall names unresolved coverage.
+Migration derives one `v1-history:<generation>` claim per retained v1 history record. A
+shortfall range that an older executable recorded inside already verified coverage (before
+fetch clipped shortfalls to the unverified part of a request) keeps only its unverified part
+in the claim, exactly as a current fetch records it; the migration `provenance/lineage.json`
+lists each such range under `legacy_shortfalls` (`generation`, `acquisition_id`, `reason`,
+`recorded`, `retained`, `basis`) so the retired record stays reconstructible.
 
 Each `(family, date)` has exactly one `DayCoverage` record: `acquisition_ids`, a nonempty
 `basis` identifying the retained evidence, `verified` spans, `unresolved` spans, and nullable

@@ -819,3 +819,135 @@ fn genuine_proof_v1_without_session_upgrades_only_calendar_addition() {
     assert_eq!(records(&f.scratch.path("producer")), originals);
     assert!(f.deriv.requests().is_empty());
 }
+
+/// Executables before the fetch clip recorded a budget shortfall from the request start, one
+/// verified minute before the unverified part (the frxEURUSD histories of 2026-08 on the
+/// production store). Migration keeps only the unverified part in the v2 claim and records the
+/// recorded range in lineage; a shortfall entirely inside verified coverage is dropped from the
+/// claim but still recorded.
+#[test]
+fn legacy_shortfall_inside_verified_coverage_is_clipped_and_recorded() {
+    use binary_alpha_app::fetch::{Range, Shortfall};
+    use binary_alpha_engine::market::parse_event_time_micros;
+    for dropped in [false, true] {
+        let f = fixture(&format!("final_legacy_shortfall_{dropped}"));
+        only_deriv(&f);
+        let producer = f.scratch.path("producer");
+        let store = producer.join("store");
+        import(&f.scratch.path("deriv-import.toml")).unwrap();
+        let session_config = fs::read_to_string(f.scratch.path("deriv.toml")).unwrap();
+        let legacy_config = session_config
+            .lines()
+            .filter(|line| !line.starts_with("session ="))
+            .collect::<Vec<_>>()
+            .join("\n");
+        // A cutoff past the fake broker's last tick leaves the history an unresolved tail.
+        pipeline(
+            "update",
+            &f.pipeline,
+            &["--end", &time_text((DERIV_SERIES_END + 600) * 1_000_000)],
+        )
+        .unwrap();
+        import_config(&f.scratch, "deriv", &legacy_config);
+        let recorded = std::cell::RefCell::new(None);
+        legacy_fixtures::freeze_with(&f, |_, cov| {
+            let (r0, r1) = (
+                parse_event_time_micros(&cov.requested.start).unwrap(),
+                parse_event_time_micros(&cov.requested.end).unwrap(),
+            );
+            let verified = cov.verified.as_ref().expect("fixture history is verified");
+            let v1 = parse_event_time_micros(&verified.end).unwrap();
+            assert!(
+                r0 < v1 && v1 + 1 < r1,
+                "fixture history overlaps its baseline and leaves an unresolved tail: requested [{}, {}) verified [{}, {})",
+                cov.requested.start,
+                cov.requested.end,
+                verified.start,
+                verified.end
+            );
+            let end = if dropped { v1 } else { v1 + (r1 - v1) / 2 };
+            cov.shortfall = Some(Shortfall {
+                reason: "budget".into(),
+                unresolved: Range {
+                    start: time_text(r0 + 1),
+                    end: time_text(end),
+                },
+            });
+            cov.tail_shortfall = Some(Shortfall {
+                reason: "unresolved_tail".into(),
+                unresolved: Range {
+                    start: time_text(v1),
+                    end: time_text(r1),
+                },
+            });
+            *recorded.borrow_mut() = Some((r0 + 1, end, v1, r1));
+        });
+        let (start, end, v1, r1) = recorded.into_inner().unwrap();
+        import_config(&f.scratch, "deriv", &session_config);
+        let legacy = binary_alpha_app::store::Store::filesystem(&store)
+            .list_manifests()
+            .unwrap()
+            .into_iter()
+            .filter_map(|id| {
+                let key = binary_alpha_engine::dataset::manifest_key(&id);
+                GenerationManifest::from_json(&fs::read(store.join(key)).unwrap()).ok()
+            })
+            .find(|m| {
+                m.layout.is_none()
+                    && m.source_kind == binary_alpha_engine::dataset::SourceKind::BrokerHistory
+            })
+            .expect("frozen legacy history");
+        let history = coverage(&store, &legacy);
+        assert_eq!(
+            history.shortfall.unwrap().unresolved.start,
+            time_text(start)
+        );
+        pipeline("migrate", &f.pipeline, &[]).unwrap();
+        let state = read_json(&producer.join("pipeline_state/deriv/migration.json"));
+        assert_eq!(state["phase"], "verified");
+        let root = dataset(&store, state["dataset"].as_str().unwrap());
+        let object = |path: &str| {
+            read_json(&store.join(&root.objects.iter().find(|o| o.path == path).unwrap().key))
+        };
+        let coverage = object("provenance/coverage.json");
+        let claim = coverage["acquisitions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|a| a["acquisition_id"] == format!("v1-history:{}", legacy.generation))
+            .expect("legacy history claim");
+        let range = |a: i64, b: i64| json!({"start": time_text(a), "end": time_text(b)});
+        let mut expected = vec![];
+        if !dropped {
+            expected.push(json!({"reason": "budget", "unresolved": range(v1, end)}));
+        }
+        expected.push(json!({"reason": "unresolved_tail", "unresolved": range(v1, r1)}));
+        assert_eq!(claim["shortfalls"], json!(expected));
+        assert_eq!(claim["unresolved"], json!([range(v1, r1)]));
+        let lineage = object("provenance/lineage.json");
+        let legacy_shortfalls = lineage["legacy_shortfalls"].as_array().unwrap();
+        assert_eq!(
+            legacy_shortfalls.len(),
+            1,
+            "only the overlapping range is recorded"
+        );
+        let entry = &legacy_shortfalls[0];
+        assert_eq!(entry["generation"], legacy.generation);
+        assert_eq!(
+            entry["acquisition_id"],
+            format!("v1-history:{}", legacy.generation)
+        );
+        assert_eq!(entry["reason"], "budget");
+        assert_eq!(entry["recorded"], range(start, end));
+        assert_eq!(
+            entry["retained"],
+            if dropped {
+                json!([])
+            } else {
+                json!([range(v1, end)])
+            }
+        );
+        assert!(entry["basis"].as_str().unwrap().contains("did not clip"));
+        common::verify(&store.join(root.key())).unwrap();
+    }
+}
