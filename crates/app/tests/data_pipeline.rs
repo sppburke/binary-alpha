@@ -4046,10 +4046,20 @@ fn pipeline_scope() {
     assert!(f.pocket.requests().is_empty() && f.deriv.requests().is_empty());
 
     // Empty-store acquisition requires an explicit calendar before any broker connection.
-    write_pocket(
-        pocket_core(&f.pocket.url, "demo", BAR_GRANULARITY, 60, 50, 60)
-            .replace("session = { kind = \"always\" }\n", ""),
-    );
+    let mut sessionless: toml::Value = toml::from_str(&pocket_core(
+        &f.pocket.url,
+        "demo",
+        BAR_GRANULARITY,
+        60,
+        50,
+        60,
+    ))
+    .unwrap();
+    sessionless["instruments"][0]
+        .as_table_mut()
+        .unwrap()
+        .remove("session");
+    write_pocket(toml::to_string(&sessionless).unwrap());
     let refused = pipeline("update", &pocket_only, &[]).unwrap_err();
     assert!(
         refused.contains(
@@ -6704,6 +6714,9 @@ fn assert_archive_inventory(
         "every uploaded file is owned by a complete pinned catalog closure"
     );
 }
+
+#[path = "data_pipeline/review_retire.rs"]
+mod review_retire;
 
 #[path = "data_pipeline/review_archive.rs"]
 mod review_archive;

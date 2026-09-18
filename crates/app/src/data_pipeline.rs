@@ -2371,7 +2371,14 @@ fn restore_locked(
 }
 
 /// The archive fence also excludes restores into another managed store on this host.
-pub(crate) fn archive_lock(config: &PipelineConfig) -> Result<File, String> {
+pub(crate) fn archive_lock(config: &PipelineConfig) -> Result<crate::retire::ArchiveLock, String> {
+    retirement_archive_lock(config, None)
+}
+
+pub(crate) fn retirement_archive_lock(
+    config: &PipelineConfig,
+    resume: Option<&Path>,
+) -> Result<crate::retire::ArchiveLock, String> {
     use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
     let binding = format!(
         "{}\n{}",
@@ -2410,5 +2417,8 @@ pub(crate) fn archive_lock(config: &PipelineConfig) -> Result<File, String> {
     file.try_lock().map_err(|_| {
         "pipeline: another operation holds this archive root (including a restore)".to_string()
     })?;
-    Ok(file)
+    File::open(path.parent().ok_or("archive lock parent missing")?)
+        .and_then(|f| f.sync_all())
+        .map_err(|e| e.to_string())?;
+    crate::retire::ArchiveLock::open(file, &path, resume)
 }

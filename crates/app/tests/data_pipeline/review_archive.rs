@@ -152,6 +152,33 @@ fn standalone_pocket_acquisitions(migrate: bool) {
         );
         current = Some(dataset(&store, state["dataset"].as_str().unwrap()));
         assert_acquisition_closure(current.as_ref().unwrap(), &acquisitions);
+        // The merged proof replaces both former version-2 proofs. Re-proving must retain
+        // standalone acquisition evidence as well as its daily response occurrences.
+        let state_path = producer.join("pipeline_state/pocket/migration.json");
+        let original_record = fs::read(
+            producer
+                .join("pipeline_state/records")
+                .join(state["record"].as_str().unwrap()),
+        )
+        .unwrap();
+        let mut prior = state.clone();
+        prior["proof_version"] = json!(2);
+        fs::write(&state_path, serde_json::to_vec_pretty(&prior).unwrap()).unwrap();
+        pipeline("migrate", &f.pipeline, &["--job", "pocket"]).unwrap();
+        let upgraded = read_json(&state_path);
+        assert_eq!(upgraded["proof_version"], 3);
+        assert_ne!(upgraded["record"], state["record"]);
+        assert_eq!(
+            fs::read(
+                producer
+                    .join("pipeline_state/records")
+                    .join(state["record"].as_str().unwrap())
+            )
+            .unwrap(),
+            original_record,
+        );
+        current = Some(dataset(&store, upgraded["dataset"].as_str().unwrap()));
+        assert_acquisition_closure(current.as_ref().unwrap(), &acquisitions);
         // The migrated root is also a standalone continuation seed; its descendant must
         // retain the v1 invocation evidence despite its migration coverage identities.
         config.history.as_mut().unwrap().seeds[0].manifest = format!(
@@ -394,6 +421,19 @@ fn review_superseded_pending_log_restores() {
             "retirement still inventories superseded snapshot references"
         );
     }
+    let planned = pipeline(
+        "retire",
+        &config,
+        &["--job", "deriv", "--whole-job", "--plan"],
+    )
+    .unwrap();
+    pipeline("retire", &config, &["--apply", field(&planned, "plan")]).unwrap();
+    assert!(
+        binary_alpha_app::store::Store::filesystem(fresh.join("store"))
+            .list_manifests()
+            .unwrap()
+            .is_empty()
+    );
 }
 
 #[test]

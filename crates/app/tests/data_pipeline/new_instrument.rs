@@ -55,6 +55,12 @@ fn new_jobs(name: &str, pages: u32, pocket_price: Option<&str>) -> NewJobs {
         // Registration must replace the policy's symbol; it cannot require a hand-generated
         // template for the target instrument. Discovery proves the requested target exists.
         core["instruments"][0]["provider_symbol"] = "TEMPLATE".into();
+        // Common fixtures now include native sessions; this template deliberately lacks
+        // one so the existing missing-session refusal still exercises that boundary.
+        core["instruments"][0]
+            .as_table_mut()
+            .unwrap()
+            .remove("session");
         core["history"]["instruments"] = toml::Value::Array(vec!["TEMPLATE".into()]);
         let template = scratch.path(&format!("{broker}-template.toml"));
         fs::write(&template, toml::to_string(&core).unwrap()).unwrap();
