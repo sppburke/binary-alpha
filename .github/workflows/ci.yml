@@ -5,11 +5,13 @@ on:
     branches: [main]
   pull_request:
 
-# Wall-clock is bounded by the slowest job, so lint and four test shards run at once. Every
-# test runs in exactly one shard: the three `data_pipeline` shards name their modules, and
-# `everything-else` runs the other crates, the application's unit tests, and every other
-# integration test with exactly those modules skipped, so a new test file or module runs
-# there by default. Filters are libtest substrings: `retire::` also selects `review_retire::`.
+# Wall-clock is bounded by the slowest job, so lint and four test shards run at once, balanced
+# by measured runtime. Every test runs in exactly one shard: the three `data_pipeline` shards
+# name their modules (`pipeline_` selects that binary's root-level tests), and `everything-else`
+# runs the other crates, the application's unit tests, and every other integration test with
+# exactly those filters skipped, so a new test file or module runs there by default. Filters
+# are libtest substrings: `retire::` also selects `review_retire::`, and `config_validate` runs
+# whole because one of its tests carries the `pipeline_` prefix.
 jobs:
   lint:
     runs-on: ubuntu-latest
@@ -30,20 +32,20 @@ jobs:
           - shard: pipeline-lifecycle
             run: >-
               cargo test -p binary-alpha-app --locked --test data_pipeline --
-              daily_end_to_end:: new_instrument::
+              daily_end_to_end:: new_instrument:: daily_review_fixes::
           - shard: pipeline-migration
             run: >-
               cargo test -p binary-alpha-app --locked --test data_pipeline --
-              review_final:: migrate_census:: lineage:: daily_readers::
+              review_final:: migrate_census:: lineage:: daily_readers:: registry_archive:: archive_records:: pipeline_
           - shard: pipeline-retirement
             run: >-
               cargo test -p binary-alpha-app --locked --test data_pipeline --
-              retire:: review_archive:: registry_archive:: archive_records::
+              retire:: review_archive::
           - shard: everything-else
             run: |
               cargo test --workspace --locked --exclude binary-alpha-app
-              cargo test -p binary-alpha-app --locked --lib --bins
-              cargo test -p binary-alpha-app --locked --test '*' -- --skip daily_end_to_end:: --skip new_instrument:: --skip review_final:: --skip migrate_census:: --skip lineage:: --skip daily_readers:: --skip retire:: --skip review_archive:: --skip registry_archive:: --skip archive_records::
+              cargo test -p binary-alpha-app --locked --lib --bins --test config_validate
+              cargo test -p binary-alpha-app --locked --test '*' -- --skip daily_end_to_end:: --skip new_instrument:: --skip daily_review_fixes:: --skip review_final:: --skip migrate_census:: --skip lineage:: --skip daily_readers:: --skip registry_archive:: --skip archive_records:: --skip pipeline_ --skip retire:: --skip review_archive::
               cargo run --locked -p binary-alpha-app -- config validate --config configs/example.toml
     steps:
       - uses: actions/checkout@v7
