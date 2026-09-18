@@ -343,16 +343,18 @@ fn migration_archive_restores_the_proved_stream_after_configuration_changes() {
         .filter(|line| !line.starts_with("session ="))
         .collect::<Vec<_>>()
         .join("\n");
-    fs::write(f.scratch.path("deriv.toml"), legacy_config).unwrap();
     pipeline(
         "update",
         &config,
         &["--end", &time_text((DERIV_SEED_END + 120) * 1_000_000)],
     )
     .unwrap();
+    // Current daily writes require a calendar. Only the reconstructed historical fixture
+    // uses the sessionless definition; freeze reads deriv-import.toml.
+    import_config(&f.scratch, "deriv", &legacy_config);
     legacy_fixtures::freeze(&f);
     // A calendar may be added to a legacy definition; every other field stays exact.
-    fs::write(f.scratch.path("deriv.toml"), &session_config).unwrap();
+    import_config(&f.scratch, "deriv", &session_config);
     pipeline("migrate", &config, &[]).unwrap();
     let state = read_json(&producer.join("pipeline_state/deriv/migration.json"));
     let record_path = producer

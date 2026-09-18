@@ -336,7 +336,8 @@ mod tests {
         let out = run(week(), vec![c(fri), c(mon + 10_000_000)], None, None);
         assert_eq!(
             out.iter().map(|c| c.open_time_micros).collect::<Vec<_>>(),
-            vec![fri, mon, mon + 5_000_000, mon + 10_000_000]
+            // Inclusive session close adds the Friday 20:55:00 engine fill.
+            vec![fri, fri + 5_000_000, mon, mon + 5_000_000, mon + 10_000_000]
         );
         assert_eq!(fill(&out[1]), Fill::Engine);
     }
@@ -359,16 +360,62 @@ mod tests {
         );
         assert_eq!(
             out.iter().map(|c| c.open_time_micros).collect::<Vec<_>>(),
-            vec![fri, fri + 5_000_000, mon, mon + 5_000_000]
+            // Open-instant membership includes the closing bucket even with no source bar.
+            vec![fri, fri + 5_000_000, fri + 10_000_000, mon, mon + 5_000_000]
         );
         assert_eq!(fill(&out[1]), Fill::Source);
         assert!(!out[1].flags.clean());
         assert!(out[1].flags.complete());
-        assert_eq!(out[2].volume, Some(0.0));
+        assert_eq!(fill(&out[2]), Fill::Engine);
+        // The closing fill moves the first Monday fill from index 2 to index 3.
+        assert_eq!(out[3].volume, Some(0.0));
         assert!(
             out.windows(2)
                 .all(|p| p[0].open_time_micros < p[1].open_time_micros)
         );
+    }
+
+    #[test]
+    fn closing_fills_require_coverage_and_never_replace_pending_quotes() {
+        let mut session = week();
+        if let Session::Weekly { early_closes, .. } = &mut session {
+            early_closes.push(crate::session::EarlyClose {
+                date: "2025-12-24".into(),
+                time: "22:00:00".into(),
+            });
+        }
+        for close in ["2026-09-04T20:55:00Z", "2025-12-24T22:00:00Z"] {
+            let close = time(close).unwrap();
+            let first = c(close - 5_000_000);
+            for end in [None, Some(close), Some(close + 4_999_999)] {
+                assert_eq!(
+                    run(session.clone(), vec![first.clone()], end, None),
+                    vec![first.clone()]
+                );
+            }
+            let filled = run(
+                session.clone(),
+                vec![first.clone()],
+                Some(close + 5_000_000),
+                None,
+            );
+            assert_eq!(filled.len(), 2);
+            assert_eq!(filled[1].open_time_micros, close);
+            assert_eq!(filled[1].close_time_micros, close + 5_000_000);
+            assert_eq!(filled[1].known_at_micros, close + 5_000_000);
+            assert_eq!(fill(&filled[1]), Fill::Engine);
+            assert!(!filled[1].flags.clean());
+            assert!(!filled[1].flags.complete());
+            assert_eq!(
+                run(
+                    session.clone(),
+                    vec![first.clone()],
+                    Some(close + 5_000_000),
+                    Some(close)
+                ),
+                vec![first]
+            );
+        }
     }
     #[test]
     fn unknown_coverage_cannot_extend_tail_and_no_price_means_no_fills() {

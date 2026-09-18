@@ -589,10 +589,20 @@ never shifted or assigned a fold. Recurring boundaries are checked on their occu
 profile-only windows. Missing singular `session` is never silently defaulted during v2 writing.
 The canonical instrument definition binds this calendar, including exceptions, into identity.
 
-`candles/<N>s_<O>s/D.parquet` contains exactly one row per complete epoch-grid bucket within
-open sessions, strictly increasing across UTC partitions. Session intervals are half-open;
-buckets straddling a boundary are excluded, never shortened or shifted. Observations outside
-sessions, including an observation exactly at close, remain losslessly in observations.
+`candles/<N>s_<O>s/D.parquet` contains exactly one row per eligible epoch-grid bucket,
+strictly increasing across UTC partitions. Membership depends on the bucket's open instant:
+`interval_open <= bucket_open <= interval_close`, including both regular weekly and dated
+early closes. The bucket can extend beyond close; its duration and epoch offset are never
+shortened or shifted. A bucket opening before the session open remains excluded even if it
+straddles that open. Closed local dates remove their entire date, while an explicit weekly
+or early close at local midnight includes that instant on a non-closed date.
+For Deriv FX, `[20:55:00,20:55:05)` at Friday close and `[22:00:00,22:00:05)` at an early
+close belong to the session. A 60-second bucket opening at either close also belongs, as does
+an offset bucket opening before close and ending after it. Pocket non-OTC's Friday 17:00:00
+America/New_York bucket belongs; a broker-delivered flat zero-volume bar there is `source`.
+With no observation there, an `engine` fill may be emitted under the coverage and pending
+rules below. Closing quotes therefore remain in finalized candles. Observations outside
+eligible buckets remain losslessly in observations.
 No candle is emitted before the first in-session, non-source-fill finalized candle. After that
 first price is established, later sessions begin filling at their scheduled open from the prior
 session's last close. Carrying that reference price creates no rows during closed time.

@@ -79,6 +79,8 @@ pub(crate) fn feed(
 /// Reproduce the expected session sequence from authenticated observations and coverage,
 /// compare every row and each inventory day in bounded memory. This proves leading/trailing
 /// limits, all internal buckets, prices and diagnostics, not merely equal aggregate counts.
+/// Shared bucket-open membership includes weekly and dated close instants. Omitting a closing
+/// bucket must fail the same row comparison as an interior gap, even with repaired file hashes.
 pub(crate) fn verify_continuity(
     store: &Store,
     manifest: &StreamManifest,

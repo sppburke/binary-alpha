@@ -6057,7 +6057,8 @@ mod tests {
             timezone: "UTC".into(),
             open: Boundary {
                 day: "monday".into(),
-                time: "00:00:10".into(),
+                // Inclusive close keeps 00:00:05; leave 00:00:10 closed to test adjacency.
+                time: "00:00:15".into(),
             },
             close: Boundary {
                 day: "monday".into(),
@@ -6075,7 +6076,7 @@ mod tests {
         let mut engine = FeatureEngine::new(&plan, source(native, false)).unwrap();
         let start = crate::market::parse_event_time_micros("2026-09-07T00:00:00Z").unwrap();
         let mut out = FeatureOutput::default();
-        for seconds in [0, 5, 10, 15] {
+        for seconds in [0, 5, 10, 15, 20] {
             engine
                 .push(
                     Observation::Bar(crate::stream::BarUnits {
@@ -6091,7 +6092,9 @@ mod tests {
                 )
                 .unwrap();
         }
-        assert_eq!(out.rows.len(), 3);
+        // The inclusive closing bar adds a row to the first segment; the closed bucket
+        // still breaks adjacency, and both bars after reopening share the next segment.
+        assert_eq!(out.rows.len(), 4);
         let column = plan.streams[0].output_index("clean_segment_index").unwrap();
         assert_eq!(
             out.rows
@@ -6099,6 +6102,7 @@ mod tests {
                 .map(|(_, row)| row.values[column].clone())
                 .collect::<Vec<_>>(),
             vec![
+                Some(Value::Int(1)),
                 Some(Value::Int(1)),
                 Some(Value::Int(2)),
                 Some(Value::Int(2))

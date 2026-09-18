@@ -63,6 +63,7 @@ pub fn configuration(root: &Path) -> Config {
     config.instruments = (0..2).map(|i| serde_json::from_value(json!({
         "broker":"pocket_option","provider_symbol":SYMBOLS[i],"quote_currency":CURRENCIES[i],
         "price_scale":SCALES[i],"native_granularity":{"kind":"tick"},
+        "session":{"kind":"always"},
         "gap":{"max_seconds":2,"reopen_seconds":60},
         "candles":[{"duration_seconds":20,"offset_seconds":0,"min_observations":9,"hard_min_observations":5}]
     })).unwrap()).collect();

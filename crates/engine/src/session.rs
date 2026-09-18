@@ -1,6 +1,6 @@
-//! Explicit trading calendars. All intervals are half-open; dates and clock times are local
-//! to the named zone. UTC and the post-2007 US New York rule are explicit and independent
-//! of host zoneinfo. Calendar membership never claims acquisition coverage.
+//! Explicit trading calendars. Bucket opens include both session boundaries; dates and
+//! clock times are local to the named zone. UTC and the post-2007 US New York rule are
+//! explicit and independent of host zoneinfo. Membership never claims acquisition coverage.
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::market::{civil_from_days, days_from_civil};
@@ -262,38 +262,29 @@ impl Calendar {
         for (a, b) in spans {
             let from = (a - d).max(0);
             let to = (b - d).min(*self.early.get(&day).unwrap_or(&86400));
-            if from < to {
+            // A close at local midnight contributes that instant even though this day's
+            // intersection has zero length. Closed dates above still remove the whole day.
+            if from <= to {
                 result.push((self.instant(day, from)?, self.instant(day, to)?));
             }
         }
         Ok(result)
     }
-    /// True only if the entire bucket belongs to open time. Partial boundary buckets are
-    /// excluded; the existing epoch duration/offset grid is never shifted or shortened.
+    /// A valid bucket belongs when its open is inside a session, including the close instant.
+    /// Its end may extend past session close; the epoch grid is never shifted or shortened.
+    /// A bucket opening before session open remains excluded even if its end is in session.
     pub fn contains(&self, start: i64, end: i64) -> Result<bool, String> {
         if end <= start {
             return Err(err("bucket end must follow start"));
         }
-        let mut day = self.local_date(start)?;
-        let mut cursor = start;
-        loop {
-            for (a, b) in self.intervals(day)? {
-                if a <= cursor && cursor < b {
-                    cursor = b.min(end);
-                }
-                if cursor == end {
-                    return Ok(true);
-                }
-            }
-            let midnight = self.instant(day, 86400)?;
-            if cursor != midnight {
-                return Ok(false);
-            }
-            day = tomorrow(day)?;
-        }
+        Ok(self
+            .intervals(self.local_date(start)?)?
+            .into_iter()
+            .any(|(open, close)| open <= start && start <= close))
     }
-    /// First full grid bucket at/after `at`, whose close is <= `limit`. Advancing across
-    /// closed time visits local days, not every absent five-second bucket.
+    /// First grid bucket at/after `at` whose open belongs to a session, including its close.
+    /// The bucket's own close must still be <= `limit` (coverage/pending bound). Advancing
+    /// across closed time visits local days, not every absent five-second bucket.
     pub fn next_bucket(
         &self,
         at: i64,
@@ -318,7 +309,7 @@ impl Calendar {
                 let Some(close) = open.checked_add(duration) else {
                     return Err(err("bucket overflow"));
                 };
-                if open < b && close <= limit && self.contains(open, close)? {
+                if open <= b && close <= limit && self.contains(open, close)? {
                     return Ok(Some(open));
                 }
             }
@@ -378,7 +369,9 @@ mod tests {
         ] {
             let close = t(&format!("{date}T{hour}:00:00Z")).unwrap();
             assert!(c.contains(close - 5_000_000, close).unwrap());
-            assert!(!c.contains(close, close + 5_000_000).unwrap());
+            // Inclusive open-instant membership retains the Friday closing bucket.
+            assert!(c.contains(close, close + 5_000_000).unwrap());
+            assert!(!c.contains(close + 1, close + 5_000_000).unwrap());
         }
     }
     #[test]
@@ -398,7 +391,8 @@ mod tests {
         }
         let c = s.calendar().unwrap();
         for time in [
-            "2026-12-24T18:00:00Z",
+            // The early close itself is included; the next bucket is outside the session.
+            "2026-12-24T18:00:05Z",
             "2026-12-25T06:00:00Z",
             "2026-09-05T12:00:00Z",
         ] {
@@ -408,7 +402,129 @@ mod tests {
         let start = t("2026-09-09T03:59:55Z").unwrap();
         assert!(c.contains(start, start + 15_000_000).unwrap());
         let start = t("2026-12-24T17:59:55Z").unwrap();
-        assert!(!c.contains(start, start + 15_000_000).unwrap());
+        // Open-instant membership includes straddling buckets and the early close itself.
+        assert!(c.contains(start, start + 15_000_000).unwrap());
+        assert!(c.contains(start + 5_000_000, start + 20_000_000).unwrap());
+    }
+    fn deriv() -> Session {
+        Session::Weekly {
+            timezone: "UTC".into(),
+            open: Boundary {
+                day: "monday".into(),
+                time: "00:00:00".into(),
+            },
+            close: Boundary {
+                day: "friday".into(),
+                time: "20:55:00".into(),
+            },
+            closed_dates: vec![],
+            early_closes: vec![EarlyClose {
+                date: "2025-12-24".into(),
+                time: "22:00:00".into(),
+            }],
+        }
+    }
+    #[test]
+    fn inclusive_weekly_and_early_closes_preserve_grid_and_coverage_limit() {
+        let c = deriv().calendar().unwrap();
+        for close in ["2026-09-04T20:55:00Z", "2025-12-24T22:00:00Z"] {
+            let close = t(close).unwrap();
+            for duration in [5_000_000, 60_000_000] {
+                assert!(c.contains(close, close + duration).unwrap());
+                assert_eq!(
+                    c.next_bucket(close, duration, 0, close + duration).unwrap(),
+                    Some(close)
+                );
+                // Session membership is inclusive, but verified coverage remains exclusive.
+                assert_eq!(
+                    c.next_bucket(close, duration, 0, close + duration - 1)
+                        .unwrap(),
+                    None
+                );
+                assert!(!c.contains(close + 1, close + duration).unwrap());
+            }
+            // The 15s/5s epoch grid opens ten seconds before this close and ends five after.
+            let open = close - 10_000_000;
+            assert!(c.contains(open, close + 5_000_000).unwrap());
+            assert_eq!(
+                c.next_bucket(open, 15_000_000, 5_000_000, close + 5_000_000)
+                    .unwrap(),
+                Some(open)
+            );
+        }
+        let open = t("2026-09-07T00:00:00Z").unwrap();
+        assert!(!c.contains(open - 10_000_000, open + 5_000_000).unwrap());
+        assert_eq!(
+            c.next_bucket(open - 10_000_000, 15_000_000, 5_000_000, open + 20_000_000)
+                .unwrap(),
+            Some(open + 5_000_000)
+        );
+    }
+    #[test]
+    fn midnight_closes_are_inclusive_without_leaking_into_closed_dates() {
+        let mut s = deriv();
+        if let Session::Weekly {
+            close,
+            early_closes,
+            ..
+        } = &mut s
+        {
+            close.time = "00:00:00".into();
+            early_closes[0].time = "00:00:00".into();
+        }
+        let c = s.calendar().unwrap();
+        for close in ["2026-09-04T00:00:00Z", "2025-12-24T00:00:00Z"] {
+            let close = t(close).unwrap();
+            assert!(c.contains(close, close + 5_000_000).unwrap());
+            assert_eq!(
+                c.next_bucket(close, 5_000_000, 0, close + 5_000_000)
+                    .unwrap(),
+                Some(close)
+            );
+            assert!(!c.contains(close + 1, close + 5_000_000).unwrap());
+        }
+        if let Session::Weekly { closed_dates, .. } = &mut s {
+            closed_dates.push("2026-09-04".into());
+        }
+        let c = s.calendar().unwrap();
+        let close = t("2026-09-04T00:00:00Z").unwrap();
+        assert!(!c.contains(close, close + 5_000_000).unwrap());
+        assert_eq!(
+            c.next_bucket(close, 5_000_000, 0, close + 5_000_000)
+                .unwrap(),
+            None
+        );
+    }
+    #[test]
+    fn complete_week_counts_include_one_closing_bucket() {
+        for (session, open, close, old_five_second_count) in [
+            (
+                deriv(),
+                "2026-09-07T00:00:00Z",
+                "2026-09-11T20:55:00Z",
+                84_180,
+            ),
+            (fx(), "2026-03-08T21:00:00Z", "2026-03-13T21:00:00Z", 86_400),
+            (fx(), "2026-11-01T22:00:00Z", "2026-11-06T22:00:00Z", 86_400),
+        ] {
+            let c = session.calendar().unwrap();
+            let (open, close) = (t(open).unwrap(), t(close).unwrap());
+            for duration in [5_000_000, 60_000_000] {
+                let mut at = open;
+                let mut count = 0;
+                let mut last = None;
+                while let Some(bucket) = c.next_bucket(at, duration, 0, close + duration).unwrap() {
+                    assert_eq!(bucket, open + count * duration);
+                    assert!(c.contains(bucket, bucket + duration).unwrap());
+                    count += 1;
+                    last = Some(bucket);
+                    at = bucket + duration;
+                }
+                // The binding inclusive-close rule adds exactly one aligned closing bucket.
+                assert_eq!(count, old_five_second_count * 5_000_000 / duration + 1);
+                assert_eq!(last, Some(close));
+            }
+        }
     }
     #[test]
     fn explicit_dst_wall_conversion_rejects_both_skips_and_folds() {
