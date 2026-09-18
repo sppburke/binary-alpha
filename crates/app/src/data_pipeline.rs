@@ -153,6 +153,7 @@ impl Layout {
         let root = absolute(&base.join(&config.local_root))?;
         let store = root.join(STORE_DIR);
         let state = root.join(STATE_DIR);
+        check_managed_store(&store)?;
         for dir in [&store, &state] {
             fs::create_dir_all(dir)
                 .map_err(|error| format!("cannot create {}: {error}", dir.display()))?;
@@ -262,6 +263,78 @@ fn writer_lock_at(state: &Path, plan: Option<&Path>) -> Result<File, String> {
     }
 }
 
+/// A managed store has one lexical state owner. Reject a redirected store before any
+/// writer can mutate its destination using a different owner's retirement lock.
+fn check_managed_store(store: &Path) -> Result<(), String> {
+    match fs::symlink_metadata(store) {
+        Ok(metadata) if metadata.file_type().is_symlink() => Err(format!(
+            "pipeline: symlinked managed store is unsupported: {}",
+            store.display()
+        )),
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(format!(
+            "cannot inspect managed store {}: {error}",
+            store.display()
+        )),
+    }
+}
+
+/// Resolve one link at a time so an alias cannot hide a redirected managed store.
+/// The limit matches Linux's symlink traversal bound and also rejects cyclic aliases.
+fn import_destination(mut target: PathBuf) -> Result<PathBuf, String> {
+    for _ in 0..40 {
+        // A trailing slash makes symlink_metadata follow a directory link on Unix.
+        target = target.components().collect();
+        let mut redirect = None;
+        for path in target.ancestors().collect::<Vec<_>>().into_iter().rev() {
+            if path.file_name().is_some_and(|name| name == STORE_DIR)
+                && path
+                    .parent()
+                    .is_some_and(|parent| parent.join(STATE_DIR).is_dir())
+            {
+                check_managed_store(path)?;
+            }
+            match fs::symlink_metadata(path) {
+                Ok(metadata) if metadata.file_type().is_symlink() => {
+                    let link = fs::read_link(path).map_err(|e| e.to_string())?;
+                    let resolved = if link.is_absolute() {
+                        link
+                    } else {
+                        path.parent()
+                            .ok_or("import: symlink lacks parent")?
+                            .join(link)
+                    };
+                    redirect =
+                        Some(resolved.join(target.strip_prefix(path).map_err(|e| e.to_string())?));
+                    break;
+                }
+                Ok(_) => (),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => (),
+                Err(error) => {
+                    return Err(format!(
+                        "cannot inspect import destination {}: {error}",
+                        path.display()
+                    ));
+                }
+            }
+        }
+        if let Some(path) = redirect {
+            target = path;
+            continue;
+        }
+        let ancestor = target
+            .ancestors()
+            .find(|p| p.exists())
+            .ok_or("import: destination has no existing ancestor")?;
+        return Ok(ancestor
+            .canonicalize()
+            .map_err(|e| e.to_string())?
+            .join(target.strip_prefix(ancestor).map_err(|e| e.to_string())?));
+    }
+    Err("import: too many destination symlinks".into())
+}
+
 /// Standalone imports may write either copy into a pipeline store. Resolve existing path
 /// aliases, lock each managed store once, and hold all locks until publication finishes.
 pub(crate) fn import_writer_locks(config: &Config, base: &Path) -> Result<Vec<File>, String> {
@@ -278,15 +351,7 @@ pub(crate) fn import_writer_locks(config: &Config, base: &Path) -> Result<Vec<Fi
                 .map_err(|e| e.to_string())?
                 .join(target)
         };
-        // A destination can be new beneath an existing store or reached through a symlink.
-        let ancestor = target
-            .ancestors()
-            .find(|p| p.exists())
-            .ok_or("import: destination has no existing ancestor")?;
-        let resolved = ancestor
-            .canonicalize()
-            .map_err(|e| e.to_string())?
-            .join(target.strip_prefix(ancestor).map_err(|e| e.to_string())?);
+        let resolved = import_destination(target)?;
         for path in resolved.ancestors() {
             if path.file_name().is_some_and(|name| name == STORE_DIR)
                 && let Some(parent) = path.parent()
@@ -879,10 +944,10 @@ fn archive_generation(
         if retired.contains(&receipt.file_id) {
             continue;
         }
-        confirm_remote(drive, &receipt.file_id, receipt.bytes, &receipt.sha256)?;
         if digest != evidence_digest(&record_files, Some(key)) {
             continue;
         }
+        confirm_remote(drive, &receipt.file_id, receipt.bytes, &receipt.sha256)?;
         let scratch = state.join(".existing-catalog");
         drive.download(
             &receipt.file_id,

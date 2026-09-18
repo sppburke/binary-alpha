@@ -1392,14 +1392,18 @@ fn acquire_one<R: Row>(
         }
         anchor = Some(first);
     };
-    validated(
-        check_verified_overlap(instrument, &previous_rows, &received_all, floor),
-        bounds,
-    )?;
-    let new_count = rows.len();
     let pending = shortfall
         .as_ref()
         .is_some_and(|shortfall| shortfall.reason == BUDGET_SHORTFALL);
+    // Budget termination leaves the oldest timestamp incomplete. Its persisted pages replay
+    // before new requests on resume, when the following page can finish multiplicity proof.
+    if !pending {
+        validated(
+            check_verified_overlap(instrument, &previous_rows, &received_all, floor),
+            bounds,
+        )?;
+    }
+    let new_count = rows.len();
     if pending && progress.pages.is_empty() {
         // The budget expired before the first page: nothing was acquired, so nothing is
         // published; the intent stays pending for the next invocation.
@@ -1429,11 +1433,13 @@ fn acquire_one<R: Row>(
     }
 
     if let Some(last) = previous_rows.last() {
+        // Equal-start rereads contribute no prefix. In particular, a budget can leave that
+        // timestamp's multiplicity incomplete; the retained baseline owns it until resume.
         let suffix = rows.split_off(rows.partition_point(|row| row.time() <= last.time()));
         rows = if rows
             .first()
             .zip(previous_rows.first())
-            .is_some_and(|(new, old)| new.time() <= old.time())
+            .is_some_and(|(new, old)| new.time() < old.time())
         {
             prepend_page(rows, previous_rows)
         } else {
@@ -2045,6 +2051,14 @@ fn initial_daily(
             .objects
             .push(import::record(ObjectRole::Provenance, path, &identity));
     }
+    crate::lineage::retain_acquisitions(
+        local,
+        &mut manifest,
+        evidence
+            .acquisitions
+            .iter()
+            .map(|a| a.acquisition_id.as_str()),
+    )?;
     manifest.layout = Some(Layout::DailyV2);
     manifest.objects.sort_by(|a, b| a.path.cmp(&b.path));
     manifest

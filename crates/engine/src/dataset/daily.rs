@@ -7,6 +7,8 @@ use serde::{Deserialize, Serialize};
 use super::{ObjectRecord, ObjectRole};
 use crate::market::parse_event_time_micros;
 
+pub const ACQUISITION_PREFIX: &str = "provenance/acquisitions/";
+
 pub const DAILY_PARQUET_PROFILE: &str = "daily-parquet-v1";
 pub const DAY_MICROS: i64 = 86_400_000_000;
 
@@ -193,10 +195,10 @@ pub(crate) fn validate_inventory(
         let allowed = match owner {
             DailyOwner::Dataset => {
                 object.role == ObjectRole::Provenance
-                    && matches!(
+                    && (matches!(
                         object.path.as_str(),
                         "provenance/coverage.json" | "provenance/lineage.json"
-                    )
+                    ) || object.path == format!("{ACQUISITION_PREFIX}{}.json", object.sha256))
             }
             DailyOwner::Stream(_) => {
                 object.role == ObjectRole::Normalized && object.path == "profile.json"

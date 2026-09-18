@@ -28,6 +28,47 @@ use std::{
 
 pub const LINEAGE_PATH: &str = "provenance/lineage.json";
 
+pub(crate) use binary_alpha_engine::dataset::daily::ACQUISITION_PREFIX;
+
+/// Standalone invocations name an object instead of a pipeline record. The same content
+/// identity must be owned by every ready manifest that carries any of their occurrences.
+pub(crate) fn retain_acquisitions<'a>(
+    local: &Store,
+    manifest: &mut GenerationManifest,
+    ids: impl IntoIterator<Item = &'a str>,
+) -> Result<(), String> {
+    for key in ids.into_iter().collect::<BTreeSet<_>>() {
+        let Some(hash) = key.strip_prefix("objects/") else {
+            continue;
+        };
+        if hash.len() != 64 || !hash.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err("invalid standalone acquisition object key".into());
+        }
+        let path = local
+            .local_path(key)
+            .ok_or("acquisition evidence requires local store")?;
+        let identity = store::identify(&path)?;
+        if identity.sha256 != hash {
+            return Err(format!("standalone acquisition identity mismatch: {key}"));
+        }
+        let value: Value = serde_json::from_slice(&fs::read(&path).map_err(err)?).map_err(err)?;
+        if value["kind"] != "acquisition" || value["instrument"] != manifest.instrument {
+            return Err(format!(
+                "standalone acquisition does not bind instrument: {key}"
+            ));
+        }
+        let object = import::record(
+            ObjectRole::Provenance,
+            &format!("{ACQUISITION_PREFIX}{hash}.json"),
+            &identity,
+        );
+        if !manifest.objects.iter().any(|o| o == &object) {
+            manifest.objects.push(object);
+        }
+    }
+    Ok(())
+}
+
 /// Immutable legacy closure replaced by one daily continuation root. Dataset and stream
 /// identities remain distinct; every historical stream is included, not only the newest.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -108,6 +149,8 @@ pub(crate) fn record_name(key: &str) -> Result<&str, String> {
 #[derive(Default)]
 pub(crate) struct MigrationRecords {
     pub files: BTreeMap<String, ObjectIdentity>,
+    /// Authenticated historical metadata proves inventories, not live market dependencies.
+    pub inventory_snapshots: BTreeSet<String>,
     pub streams: BTreeMap<String, binary_alpha_engine::stream::StreamManifest>,
 }
 
@@ -128,6 +171,7 @@ pub(crate) fn migration_records(
         .unwrap_or(&manifest.generation);
     let mut selected = BTreeMap::new();
     let mut streams = BTreeMap::new();
+    let mut predecessors = Vec::new();
     if records.is_dir() {
         for entry in fs::read_dir(records).map_err(err)? {
             let path = entry.map_err(err)?.path();
@@ -161,6 +205,14 @@ pub(crate) fn migration_records(
                     return Err("migration stream does not bind its daily continuation root".into());
                 }
                 verify::run_with(&local.uri(&key), access)?;
+                if let Some(previous) = record.evidence.get("supersedes").filter(|v| !v.is_null()) {
+                    predecessors.push(
+                        previous
+                            .as_str()
+                            .ok_or("invalid migration supersession name")?
+                            .to_string(),
+                    );
+                }
                 streams.insert(record.v2_stream.clone(), stream);
                 selected.insert(
                     format!("records/{}", path.file_name().unwrap().to_string_lossy()),
@@ -172,6 +224,31 @@ pub(crate) fn migration_records(
     if selected.is_empty() {
         return Err(format!("missing verified migration evidence for {root}"));
     }
+    bind_record_inventory(records, &lineage, &mut selected)?;
+    let mut inventory_snapshots = BTreeSet::new();
+    for previous in predecessors {
+        inventory_snapshots.extend(superseded_records(
+            local,
+            records,
+            manifest,
+            job,
+            previous,
+            &mut selected,
+            access,
+        )?);
+    }
+    Ok(MigrationRecords {
+        files: selected,
+        inventory_snapshots,
+        streams,
+    })
+}
+/// Inventory entries are evidence even when their bytes are not JSON documents.
+fn bind_record_inventory(
+    records: &Path,
+    lineage: &Value,
+    selected: &mut BTreeMap<String, ObjectIdentity>,
+) -> Result<(), String> {
     for binding in lineage["records"]
         .as_array()
         .into_iter()
@@ -190,11 +267,110 @@ pub(crate) fn migration_records(
         }
         selected.insert(key, identity);
     }
-    Ok(MigrationRecords {
-        files: selected,
-        streams,
-    })
+    Ok(())
 }
+
+/// Preserve only the immutable metadata needed to prove an older inventory. Superseded
+/// market objects can be retired; a fresh restore resolves the same chain from these records.
+fn superseded_records(
+    local: &Store,
+    records: &Path,
+    manifest: &GenerationManifest,
+    job: &str,
+    mut name: String,
+    selected: &mut BTreeMap<String, ObjectIdentity>,
+    access: Access<'_>,
+) -> Result<BTreeSet<String>, String> {
+    let record_store = Store::filesystem(records);
+    let mut seen = BTreeSet::new();
+    let mut snapshots = BTreeSet::new();
+    loop {
+        let key = format!("records/{name}");
+        let path = records.join(record_name(&key)?);
+        if !seen.insert(name.clone()) {
+            return Err("cyclic migration supersession".into());
+        }
+        let record: MigrationRecord =
+            serde_json::from_slice(&fs::read(&path).map_err(err)?).map_err(err)?;
+        if !record.verified()
+            || record.job != job
+            || record.v2_root.len() != 64
+            || !record.v2_root.bytes().all(|b| b.is_ascii_hexdigit())
+        {
+            return Err(format!(
+                "missing verified superseded migration record {name}"
+            ));
+        }
+        selected.insert(key, store::identify(&path)?);
+        access.lookup(&record.v2_root)?;
+        access.permit(Some(manifest.role), &record.v2_root)?;
+        let root_name = format!("{job}-migration-root-{}.json", record.v2_root);
+        let root_bytes = metadata_snapshot(
+            local,
+            &manifest_key(&record.v2_root),
+            &record_store,
+            &root_name,
+        )?;
+        let root = GenerationManifest::from_json(&root_bytes)?;
+        if root.generation != record.v2_root
+            || root.instrument != manifest.instrument
+            || root.role != manifest.role
+            || root.layout != Some(Layout::DailyV2)
+        {
+            return Err("superseded migration root identity mismatch".into());
+        }
+        let object = root
+            .objects
+            .iter()
+            .find(|o| o.path == LINEAGE_PATH)
+            .ok_or("missing superseded lineage")?;
+        let lineage_name = format!("{job}-migration-lineage-{}.json", object.sha256);
+        let bytes = metadata_snapshot(local, &object.key, &record_store, &lineage_name)?;
+        if bytes.len() as u64 != object.bytes || digest(&bytes) != object.sha256 {
+            return Err("superseded migration lineage identity mismatch".into());
+        }
+        let lineage: Value = serde_json::from_slice(&bytes).map_err(err)?;
+        if serde_json::from_value::<MigrationMapping>(lineage.clone()).map_err(err)?
+            != record.mapping
+        {
+            return Err("superseded migration lineage mapping mismatch".into());
+        }
+        for (name, bytes) in [(&root_name, &root_bytes), (&lineage_name, &bytes)] {
+            crate::research::publish_record(&record_store, &record_store, name, bytes)?;
+            snapshots.insert(format!("records/{name}"));
+            selected.insert(
+                format!("records/{name}"),
+                store::identify(&records.join(name))?,
+            );
+        }
+        bind_record_inventory(records, &lineage, selected)?;
+        match record.evidence.get("supersedes").filter(|v| !v.is_null()) {
+            Some(previous) => {
+                name = previous
+                    .as_str()
+                    .ok_or("invalid migration supersession name")?
+                    .to_string()
+            }
+            None => return Ok(snapshots),
+        }
+    }
+}
+
+fn metadata_snapshot(
+    local: &Store,
+    key: &str,
+    records: &Store,
+    name: &str,
+) -> Result<Vec<u8>, String> {
+    let mut bytes = Vec::new();
+    if local.head(key)?.is_some() {
+        local.read_to(key, None, &mut bytes)?;
+    } else {
+        records.read_to(name, None, &mut bytes)?;
+    }
+    Ok(bytes)
+}
+
 fn err(e: impl std::fmt::Display) -> String {
     e.to_string()
 }
@@ -835,6 +1011,21 @@ pub(crate) fn descendant(
             });
         }
     }
+    retain_acquisitions(
+        local,
+        &mut manifest,
+        evidence
+            .acquisitions
+            .iter()
+            .map(|a| a.acquisition_id.as_str())
+            .chain(
+                std::iter::once(baseline)
+                    .chain(superseded.iter())
+                    .flat_map(|m| &m.objects)
+                    .filter(|o| o.path.starts_with(ACQUISITION_PREFIX))
+                    .map(|o| o.key.as_str()),
+            ),
+    )?;
     descendant_days(&mut evidence, &mut manifest, &acquisition.acquisition_id)?;
     manifest
         .objects
