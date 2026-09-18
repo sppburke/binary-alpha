@@ -15,153 +15,6 @@ pub struct Options<'a> {
     pub session: Option<&'a Path>,
 }
 
-// WT-SESSIONS INTEGRATION POINT: these are registration syntax only. Once the session
-// branch is merged Config::parse below owns validation and calendar semantics. Remove this
-// shim and enable native_session_contract in new_instrument.rs. Never execute a weekly
-// calendar after stripping it. Existing imported jobs may remain sessionless; add-job and
-// empty-store bootstrap always require an explicit singular instruments.session.
-#[derive(Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
-enum SessionDeclaration {
-    Always,
-    Weekly {
-        timezone: String,
-        open: Boundary,
-        close: Boundary,
-        #[serde(default)]
-        closed_dates: Vec<String>,
-        #[serde(default)]
-        early_closes: Vec<EarlyClose>,
-    },
-}
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct Boundary {
-    day: String,
-    time: String,
-}
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct EarlyClose {
-    date: String,
-    time: String,
-}
-
-fn session_declaration(value: &toml::Value) -> Result<bool, String> {
-    let session: SessionDeclaration = value
-        .clone()
-        .try_into()
-        .map_err(|e| format!("session: {e}"))?;
-    let SessionDeclaration::Weekly {
-        timezone,
-        open,
-        close,
-        closed_dates,
-        early_closes,
-    } = session
-    else {
-        return Ok(false);
-    };
-    if !["UTC", "America/New_York"].contains(&timezone.as_str()) {
-        return Err("session.timezone: expected UTC or America/New_York".into());
-    }
-    let clock = |text: &str| -> Result<(), String> {
-        if text.len() != 8 {
-            return Err("session time must be HH:MM:SS".into());
-        }
-        time(&format!("2025-01-01T{text}Z")).map(|_| ())
-    };
-    for boundary in [&open, &close] {
-        if ![
-            "monday",
-            "tuesday",
-            "wednesday",
-            "thursday",
-            "friday",
-            "saturday",
-            "sunday",
-        ]
-        .contains(&boundary.day.as_str())
-        {
-            return Err("session day must be monday through sunday".into());
-        }
-        clock(&boundary.time)?;
-    }
-    if open.day == close.day && open.time == close.time {
-        return Err("session open and close must differ".into());
-    }
-    let mut dates = std::collections::BTreeSet::new();
-    for date in closed_dates
-        .iter()
-        .chain(early_closes.iter().map(|c| &c.date))
-    {
-        binary_alpha_engine::dataset::daily::day_bounds(date)?;
-        if !dates.insert(date) || (timezone == "America/New_York" && date.as_str() < "2007-01-01") {
-            return Err(
-                "session dates must be distinct and New York overrides must be from 2007 onward"
-                    .into(),
-            );
-        }
-    }
-    for close in early_closes {
-        clock(&close.time)?;
-    }
-    Ok(true)
-}
-
-pub(crate) fn parse_core(text: &str, execution: bool) -> Result<Config, String> {
-    if let Ok(config) = Config::parse(text) {
-        crate::check_config_capabilities(&config)?;
-        return Ok(config);
-    }
-    let mut document: toml::Value = toml::from_str(text).map_err(|e| format!("job config: {e}"))?;
-    if let Some(instruments) = document
-        .get_mut("instruments")
-        .and_then(toml::Value::as_array_mut)
-    {
-        for instrument in instruments {
-            if let Some(session) = instrument.as_table_mut().and_then(|t| t.remove("session")) {
-                let weekly = session_declaration(&session)?;
-                if execution && weekly {
-                    return Err("session: weekly acquisition requires the wt-sessions calendar integration; registration is preserved".into());
-                }
-            }
-        }
-    }
-    let config = Config::parse(&toml::to_string(&document).map_err(|e| e.to_string())?)
-        .map_err(|e| e.to_string())?;
-    crate::check_config_capabilities(&config)?;
-    Ok(config)
-}
-
-pub(crate) fn load_core(path: &Path, execution: bool) -> Result<Config, String> {
-    parse_core(
-        &fs::read_to_string(path).map_err(|e| e.to_string())?,
-        execution,
-    )
-}
-
-pub(crate) fn session_binding(path: &Path, required: bool) -> Result<Option<String>, String> {
-    let text = fs::read_to_string(path).map_err(|e| e.to_string())?;
-    let document: toml::Value = toml::from_str(&text).map_err(|e| e.to_string())?;
-    let sessions: Vec<_> = document
-        .get("instruments")
-        .and_then(toml::Value::as_array)
-        .into_iter()
-        .flatten()
-        .map(|i| i.get("session"))
-        .collect();
-    if required && (sessions.len() != 1 || sessions[0].is_none()) {
-        return Err(
-            "job requires an explicit [instruments.session] table; no calendar is inferred".into(),
-        );
-    }
-    if sessions.iter().all(|s| s.is_none()) {
-        return Ok(None);
-    }
-    Ok(Some(sha256_hex(&json_bytes(&sessions)?)))
-}
-
 fn quote(symbol: &str) -> Result<String, String> {
     let pair = symbol.strip_prefix("frx").unwrap_or(symbol);
     let pair = pair.strip_suffix("_otc").unwrap_or(pair);
@@ -260,15 +113,14 @@ pub fn run(config_path: &Path, options: &Options<'_>, out: &mut dyn Write) -> Re
                 .map_err(|e| e.to_string())?;
         instrument.insert("session".into(), session);
     }
-    let session = instrument
-        .get("session")
-        .cloned()
-        .ok_or("add-job requires an explicit [instruments.session] table or --session FILE")?;
-    session_declaration(&session)?;
-    let mut core = parse_core(
-        &toml::to_string(&document).map_err(|e| e.to_string())?,
-        false,
-    )?;
+    let mut core = Config::parse(&toml::to_string(&document).map_err(|e| e.to_string())?)
+        .map_err(|e| e.to_string())?;
+    crate::check_config_capabilities(&core)?;
+    core.instruments[0]
+        .session
+        .as_ref()
+        .ok_or("add-job requires an explicit [instruments.session] table or --session FILE")?
+        .calendar()?;
     core.instruments[0].base_currency = None;
     core.instruments[0].broker = broker_id.clone();
     core.instruments[0].provider_symbol = symbol.clone();
@@ -324,7 +176,7 @@ pub fn run(config_path: &Path, options: &Options<'_>, out: &mut dyn Write) -> Re
         &sha256_hex(options.symbol.as_bytes())[..8]
     );
     for job in &pipeline.jobs {
-        let existing = load_core(&layout.base.join(&job.config), false)?;
+        let existing = crate::load_config(&layout.base.join(&job.config))?;
         if existing
             .history
             .as_ref()
@@ -346,11 +198,7 @@ pub fn run(config_path: &Path, options: &Options<'_>, out: &mut dyn Write) -> Re
     }
     pipeline.jobs.push(job.clone());
     pipeline.validate()?;
-    let request_hash = sha256_hex(&json_bytes(&(
-        core.canonical_toml(),
-        &session,
-        options.price_scale,
-    ))?);
+    let request_hash = sha256_hex(&json_bytes(&(core.canonical_toml(), options.price_scale))?);
     let checkpoint = layout
         .state
         .join("registrations")
@@ -406,16 +254,8 @@ pub fn run(config_path: &Path, options: &Options<'_>, out: &mut dyn Write) -> Re
         }
     };
     core.instruments[0].price_scale = scale.try_into()?;
-    let mut output: toml::Value =
-        toml::from_str(&core.canonical_toml()).map_err(|e| e.to_string())?;
-    output["instruments"]
-        .as_array_mut()
-        .expect("core instruments")[0]
-        .as_table_mut()
-        .expect("instrument")
-        .insert("session".into(), session);
-    let output = toml::to_string_pretty(&output).map_err(|e| e.to_string())?;
-    parse_core(&output, false)?;
+    let output = core.canonical_toml();
+    Config::parse(&output).map_err(|e| e.to_string())?;
     let evidence = json_bytes(&serde_json::json!({
         "source_identity": source_identity, "discovery": discovered, "price_scale": scale,
         "precision_basis": if options.price_scale.is_some() { "explicit" } else if discovered.precision.is_some() { "discovery" } else { "bounded_history_sample" }
@@ -462,26 +302,25 @@ mod tests {
     use super::*;
 
     #[test]
-    fn examples_use_explicit_calendar_shape_and_weekly_execution_waits_for_integration() {
+    fn examples_use_native_calendars_and_reject_malformed_declarations() {
         let weekly = include_str!("../../../configs/data-pipeline-deriv.example.toml");
-        let always = include_str!("../../../configs/data-pipeline-pocket.example.toml");
-        assert!(parse_core(weekly, false).is_ok());
-        assert!(parse_core(always, true).is_ok());
-        // Once the native calendar merges, the same example must parse through that owner.
-        if Config::parse(weekly).is_err() {
-            assert!(
-                parse_core(weekly, true)
-                    .unwrap_err()
-                    .contains("wt-sessions")
-            );
+        let pocket = include_str!("../../../configs/data-pipeline-pocket.example.toml");
+        let always = include_str!("../../../configs/example.toml");
+        for text in [weekly, pocket, always] {
+            let core = Config::parse(text).unwrap();
+            core.instruments[0]
+                .session
+                .as_ref()
+                .unwrap()
+                .calendar()
+                .unwrap();
+            assert_eq!(Config::parse(&core.canonical_toml()).unwrap(), core);
         }
-        let malformed = weekly.replace("sunday", "sun");
-        assert!(parse_core(&malformed, false).is_err());
-        let missing_timezone = weekly.replace(
-            "timezone = \"America/New_York\"",
-            "timezone = \"unsupported\"",
-        );
-        assert!(parse_core(&missing_timezone, false).is_err());
+        let malformed = weekly.replace("monday", "mon");
+        assert!(Config::parse(&malformed).is_err());
+        let unsupported_timezone =
+            weekly.replace("timezone = \"UTC\"", "timezone = \"unsupported\"");
+        assert!(Config::parse(&unsupported_timezone).is_err());
         let pipeline =
             PipelineConfig::parse(include_str!("../../../configs/data-pipeline.example.toml"))
                 .unwrap();
@@ -489,5 +328,36 @@ mod tests {
         assert_eq!(pipeline.parallel_transfers, Some(8));
         assert_eq!(pipeline.drive.request_timeout_seconds, 300);
         assert_eq!(pipeline.drive.chunk_bytes, 8 * 1024 * 1024);
+    }
+
+    #[test]
+    fn canonical_session_changes_the_intent_binding() {
+        let text = include_str!("../../../configs/data-pipeline-deriv.example.toml");
+        let core = Config::parse(text).unwrap();
+        let binding = binding_hash(&core);
+        assert_eq!(
+            binding,
+            binding_hash(&Config::parse(&core.canonical_toml()).unwrap())
+        );
+        for (from, to) in [
+            ("timezone = \"UTC\"", "timezone = \"America/New_York\""),
+            ("monday", "sunday"),
+            ("20:55:00", "20:50:00"),
+            ("2025-12-25", "2025-12-26"),
+            ("22:00:00", "21:00:00"),
+        ] {
+            let changed = Config::parse(&text.replace(from, to)).unwrap();
+            assert_ne!(core.canonical_toml(), changed.canonical_toml(), "{from}");
+            assert_ne!(binding, binding_hash(&changed), "{from}");
+        }
+        let mut changed = core.clone();
+        changed.instruments[0].session = Some(binary_alpha_engine::session::Session::Always);
+        assert_ne!(binding, binding_hash(&changed));
+        changed.instruments[0].session = None;
+        assert_ne!(binding, binding_hash(&changed));
+        let mut budgets = core;
+        budgets.history.as_mut().unwrap().max_pages = Some(1);
+        budgets.history.as_mut().unwrap().max_elapsed_seconds = Some(1);
+        assert_eq!(binding, binding_hash(&budgets));
     }
 }

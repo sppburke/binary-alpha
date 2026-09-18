@@ -11,15 +11,14 @@ quote_currency = "USD"
 price_scale = 5 # replaced from discovery for the new instrument
 native_granularity = { kind = "tick" }
 candles = [{ duration_seconds = 60, offset_seconds = 0 }]
-# Explicit example policy; choose the actual instrument calendar.
-# Weekly acquisition awaits wt-sessions integration; registration preserves this shape.
+# Session evidence: 2026-09-17 (sessions_validation_v2.md, Deriv FX).
 [instruments.session]
 kind = "weekly"
-timezone = "America/New_York"
-open = { day = "sunday", time = "17:00:00" }
-close = { day = "friday", time = "17:00:00" }
-closed_dates = []
-early_closes = []
+timezone = "UTC"
+open = { day = "monday", time = "00:00:00" }
+close = { day = "friday", time = "20:55:00" }
+closed_dates = ["2025-12-25", "2026-01-01"]
+early_closes = [{ date = "2025-12-24", time = "22:00:00" }, { date = "2025-12-31", time = "22:00:00" }]
 [[brokers]]
 id = "deriv"
 kind = "deriv"

@@ -266,9 +266,9 @@ The exact weekly shape is `kind = "weekly"`, `timezone = "UTC"` or `"America/New
 `open = { day = "sunday", time = "17:00:00" }`, `close` in the same shape, and optional
 `closed_dates = ["2026-12-25"]` / `early_closes = [{date="2026-11-27",time="13:00:00"}]`.
 Weekdays are full lowercase English names. Never substitute the old plural profile windows
-`[[instruments.sessions]]`. **Integration pending:** weekly declarations are saved, but weekly
-acquisition refuses until `wt-sessions` supplies the native calendar. The marked shim in
-`data_pipeline_add.rs` and ignored `native_session_contract` test are the merge integration point.
+`[[instruments.sessions]]`. The engine validates both `always` and weekly calendars through
+`Config::parse` and `Session::calendar()`. Registration and acquisition preserve the session
+in canonical core TOML, so a calendar change changes the pending intent's configuration binding.
 
 Registration writes `jobs/JOB.toml` and `evidence/JOB.json` and appends the pipeline entry last.
 It checkpoints the exact discovered output under `pipeline_state/registrations` first. On

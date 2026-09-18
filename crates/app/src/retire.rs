@@ -990,7 +990,7 @@ fn plan(
         if job_filter.is_some_and(|id| id != job.id) {
             continue;
         }
-        let core = data_pipeline::add_job::load_core(&layout.base.join(&job.config), false)?;
+        let core = crate::load_config(&layout.base.join(&job.config))?;
         let history = core
             .history
             .as_ref()
@@ -1004,8 +1004,7 @@ fn plan(
                 return Err("retire: whole-job retirement requires development data".into());
             }
             for other in config.jobs.iter().filter(|other| other.id != job.id) {
-                let core =
-                    data_pipeline::add_job::load_core(&layout.base.join(&other.config), false)?;
+                let core = crate::load_config(&layout.base.join(&other.config))?;
                 if core
                     .history
                     .as_ref()
@@ -1671,6 +1670,16 @@ fn plan(
             let Ok(bindings) = catalog.check_migration_records(layout, &dataset, access) else {
                 continue;
             };
+            // Both retirement modes classify authenticated snapshots as historical metadata,
+            // including retained jobs whose superseded byte copies a fresh restore omits.
+            // Their current manifests/catalogs remain roots independently of these snapshots.
+            inventory_snapshots.extend(
+                bindings
+                    .inventory_snapshots
+                    .iter()
+                    .map(|key| crate::lineage::record_name(key).map(str::to_string))
+                    .collect::<Result<BTreeSet<_>, _>>()?,
+            );
             let mut historical = BTreeSet::new();
             for key in bindings.files.keys() {
                 for value in documents(&layout.state.join(key))? {

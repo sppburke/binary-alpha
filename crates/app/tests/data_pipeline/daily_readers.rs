@@ -821,7 +821,7 @@ pub(super) struct LifecycleReaders {
     baseline: ReaderOutput,
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 struct ReaderOutput {
     features: std::collections::BTreeMap<String, common::Table>,
     continued: Vec<FeatureOutput>,
@@ -852,6 +852,44 @@ impl LifecycleReaders {
             frozen,
             baseline,
         }
+    }
+
+    pub(super) fn assert_legacy_parity(
+        &self,
+        root: &Path,
+        dataset: &GenerationManifest,
+        stream: &StreamManifest,
+    ) {
+        assert!(dataset.layout.is_none() && stream.layout.is_none());
+        let (_, actual) = lifecycle_output(
+            &self.scratch,
+            root,
+            dataset,
+            stream,
+            &self.profile,
+            Some(&self.frozen),
+        );
+        // Legacy files have the 33 feed columns. Assert every feed value against the
+        // pre-migration daily product; keep that full 34-column product for all later checks.
+        let mut expected = self.baseline.clone();
+        expected.candles = expected
+            .candles
+            .iter()
+            .map(|rows| {
+                rows.iter()
+                    .filter(|row| {
+                        assert_eq!(row.len(), 34);
+                        row[10] != Some(Value::Int(0))
+                    })
+                    .map(|row| row[..33].to_vec())
+                    .collect()
+            })
+            .collect();
+        assert_eq!(
+            actual, expected,
+            "legacy lifecycle consumer outputs for {}",
+            dataset.instrument
+        );
     }
 
     pub(super) fn assert_parity(

@@ -396,7 +396,6 @@ struct Bound {
     /// The one history instrument the job extends.
     symbol: String,
     evidence_sha256: String,
-    session_binding: Option<String>,
 }
 
 fn bind(job: &Job, layout: &Layout) -> Result<Bound, String> {
@@ -406,7 +405,7 @@ fn bind(job: &Job, layout: &Layout) -> Result<Bound, String> {
             job.id
         ));
     }
-    let core = add_job::load_core(&layout.base.join(&job.config), true)
+    let core = crate::load_config(&layout.base.join(&job.config))
         .map_err(|reason| format!("job {}: {reason}", job.id))?;
     let field = |reason: String| format!("job {}: {reason}", job.id);
     if core.run_mode != RunMode::Research {
@@ -480,7 +479,6 @@ fn bind(job: &Job, layout: &Layout) -> Result<Bound, String> {
         core,
         symbol,
         evidence_sha256,
-        session_binding: add_job::session_binding(&layout.base.join(&job.config), false)?,
     })
 }
 
@@ -1594,7 +1592,19 @@ fn update_job(
     let pages_path = state.join("progress.pages.jsonl");
     let (pending, partial) = read_pending(&pending_path, &pages_path)?;
     if imported.is_none() {
-        add_job::session_binding(&layout.base.join(&job.config), true)?;
+        bound
+            .core
+            .instruments
+            .iter()
+            .find(|instrument| {
+                instrument.broker == history.broker
+                    && instrument.provider_symbol.as_str() == bound.symbol
+                    && instrument.native_granularity == history.native_granularity
+            })
+            .and_then(|instrument| instrument.session.as_ref())
+            .ok_or(
+                "job requires an explicit [instruments.session] table; no calendar is inferred",
+            )?;
     }
     let (diagnostics, received_partial) = crate::lineage::diagnostics(
         &state,
@@ -1653,10 +1663,7 @@ fn update_job(
             .collect()
     };
     let config = effective(&bound, layout, cutoff, seeds.clone())?;
-    let binding = match &bound.session_binding {
-        Some(session) => sha256_hex(&json_bytes(&(binding_hash(&config), session))?),
-        None => binding_hash(&config),
-    };
+    let binding = binding_hash(&config);
     let records = layout.records();
     if let Some(pending) = &pending {
         if pending.effective_config_hash != binding {

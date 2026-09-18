@@ -565,8 +565,10 @@ fn v1_migrate_archive_restore_update_twice_retire_and_restore_both_brokers() {
         &["--end", &time_text((DERIV_SEED_END + 180) * 1_000_000)],
     )
     .unwrap();
-    legacy_fixtures::freeze(&f);
+    // Freeze the full session product before constructing legacy migration inputs.
+    // Migration, restore and retirement must reproduce these exact daily candle rows.
     let mut readers = BTreeMap::new();
+    let mut reader_sources = BTreeMap::new();
     for (job, broker, _, _) in jobs {
         let generations = binary_alpha_app::store::Store::filesystem(&store)
             .list_manifests()
@@ -595,9 +597,21 @@ fn v1_migrate_archive_restore_update_twice_retire_and_restore_both_brokers() {
             })
             .find(|s| s.source_generation == newest.generation)
             .unwrap();
+        reader_sources.insert(
+            job,
+            (newest.generation.clone(), source_stream.generation.clone()),
+        );
         readers.insert(
             job,
             super::daily_readers::LifecycleReaders::new(&store, &newest, &source_stream),
+        );
+    }
+    let legacy_mapping = legacy_fixtures::freeze(&f);
+    for (job, (source, stream)) in &reader_sources {
+        readers[job].assert_legacy_parity(
+            &store,
+            &dataset(&store, &legacy_mapping[source]),
+            &super::stream(&store, &legacy_mapping[stream]),
         );
     }
     fs::write(
@@ -1232,6 +1246,26 @@ fn v1_migrate_archive_restore_update_twice_retire_and_restore_both_brokers() {
     }
     daily_paths(&recovered.path("managed/store"));
     pipeline("retire", &recovered_config, &["--plan"]).unwrap();
+    // The shared registry may reuse an object/manifest upload as an immutable record.
+    // Pin the exact record inventory and bytes; remote filename prefixes do not own semantics.
+    let mut retained_records = BTreeMap::new();
+    for file in f.drive.files().values() {
+        if let Ok(catalog) = Catalog::from_json(&file.bytes) {
+            for record in catalog.records {
+                let bytes =
+                    fs::read(recovered.path("managed/pipeline_state").join(&record.key)).unwrap();
+                assert_eq!(bytes.len() as u64, record.bytes);
+                assert_eq!(
+                    binary_alpha_engine::hex(&Sha256::digest(&bytes)),
+                    record.sha256
+                );
+                if let Some(previous) = retained_records.insert(record.file_id, bytes.clone()) {
+                    assert_eq!(previous, bytes);
+                }
+            }
+        }
+    }
+    assert!(!retained_records.is_empty());
     // A later instrument removal uses the descendant catalog's cumulative migration
     // evidence; the original root catalogs and superseded roots have already been retired.
     for (job, _, _, _) in jobs {
@@ -1251,13 +1285,16 @@ fn v1_migrate_archive_restore_update_twice_retire_and_restore_both_brokers() {
             .unwrap()
             .is_empty()
     );
-    assert!(
-        f.drive
-            .state
-            .lock()
-            .unwrap()
-            .files
-            .values()
-            .all(|entry| entry.name.starts_with("record-"))
+    let remaining = f.drive.files();
+    assert_eq!(
+        remaining.keys().collect::<BTreeSet<_>>(),
+        retained_records.keys().collect::<BTreeSet<_>>(),
+        "only the exact catalog-bound immutable record files survive both removals"
     );
+    for (id, bytes) in retained_records {
+        assert_eq!(
+            remaining[&id].bytes, bytes,
+            "immutable record {id} retained byte for byte"
+        );
+    }
 }

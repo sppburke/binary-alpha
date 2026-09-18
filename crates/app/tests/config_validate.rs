@@ -53,7 +53,7 @@ fn existing_equivalent_preserves_the_fixed_report() {
 }
 
 #[test]
-fn checked_in_example_adds_validated_broker_history() {
+fn checked_in_example_adds_validated_broker_history_and_session() {
     let output = validate(&example());
     assert!(
         output.status.success(),
@@ -66,7 +66,12 @@ fn checked_in_example_adds_validated_broker_history() {
         config.history.as_ref().unwrap().instruments[0].as_str(),
         "AEDCNY_otc"
     );
+    assert_eq!(
+        config.instruments[0].session,
+        Some(binary_alpha_engine::session::Session::Always)
+    );
     let mut original = config;
+    original.instruments[0].session = None;
     original.brokers.clear();
     original.history = None;
     assert_eq!(
@@ -77,6 +82,41 @@ fn checked_in_example_adds_validated_broker_history() {
         ),
         EXPECTED_REPORT
     );
+}
+
+#[test]
+fn pipeline_examples_validate_the_reviewed_session_tables() {
+    use binary_alpha_engine::{config::Config, session::Session};
+    for (name, expected) in [
+        (
+            "deriv",
+            "kind='weekly'\ntimezone='UTC'\nopen={day='monday',time='00:00:00'}\nclose={day='friday',time='20:55:00'}\nclosed_dates=['2025-12-25','2026-01-01']\nearly_closes=[{date='2025-12-24',time='22:00:00'},{date='2025-12-31',time='22:00:00'}]",
+        ),
+        (
+            "pocket",
+            "kind='weekly'\ntimezone='America/New_York'\nopen={day='sunday',time='17:00:00'}\nclose={day='friday',time='17:00:00'}\nclosed_dates=[]\nearly_closes=[]",
+        ),
+    ] {
+        let path = format!(
+            "{}/../../configs/data-pipeline-{name}.example.toml",
+            env!("CARGO_MANIFEST_DIR")
+        );
+        let output = validate(&path);
+        assert!(
+            output.status.success(),
+            "{name}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(output.stderr.is_empty());
+        let core = Config::parse(&String::from_utf8(output.stdout).unwrap()).unwrap();
+        let expected: Session = toml::from_str(expected).unwrap();
+        assert_eq!(core.instruments[0].session.as_ref(), Some(&expected));
+        assert_eq!(
+            core.history.as_ref().unwrap().instruments,
+            vec![core.instruments[0].provider_symbol.clone()]
+        );
+        assert_eq!(Config::parse(&core.canonical_toml()).unwrap(), core);
+    }
 }
 
 #[test]

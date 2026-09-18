@@ -6,13 +6,19 @@ historical_data_dir = "unused"
 publication_uri = "file:///unused"
 [[instruments]]
 broker = "pocket_option"
-provider_symbol = "AEDCNY_otc"
-quote_currency = "CNY"
+provider_symbol = "EURUSD"
+quote_currency = "USD"
 price_scale = 6 # placeholder: registration measures the sample, including 11+ digit prices
 native_granularity = { kind = "bar", period_seconds = 5 }
 candles = [{ duration_seconds = 60, offset_seconds = 0 }]
+# Session evidence: 2026-09-17 (sessions_validation_v2.md, Pocket non-OTC).
 [instruments.session]
-kind = "always" # explicit operator policy; change for scheduled closures
+kind = "weekly"
+timezone = "America/New_York"
+open = { day = "sunday", time = "17:00:00" }
+close = { day = "friday", time = "17:00:00" }
+closed_dates = []
+early_closes = []
 [[brokers]]
 id = "pocket_option"
 kind = "pocket_option"
@@ -27,7 +33,7 @@ server_offset_minutes = 120 # replace with the proved provider clock mapping
 history_pages_in_flight = 8
 [history]
 broker = "pocket_option"
-instruments = ["AEDCNY_otc"]
+instruments = ["EURUSD"]
 role = "development"
 start = "2025-05-19T00:00:00Z"
 end = "2026-09-17T00:00:00Z"

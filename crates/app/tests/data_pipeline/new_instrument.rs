@@ -42,6 +42,14 @@ fn new_jobs(name: &str, pages: u32, pocket_price: Option<&str>) -> NewJobs {
         ),
     ] {
         let mut core: toml::Value = toml::from_str(&core).unwrap();
+        // Shared core fixtures have native calendars; this negative case must omit one.
+        assert!(
+            core["instruments"][0]
+                .as_table_mut()
+                .unwrap()
+                .remove("session")
+                .is_some()
+        );
         core["history"]["start"] = time_text(start * 1_000_000).into();
         core["history"]["end"] = time_text((DAY2 + 100) * 1_000_000).into();
         // Registration must replace the policy's symbol; it cannot require a hand-generated
@@ -394,6 +402,7 @@ fn interrupted_empty_store_keeps_original_seed_binding() {
     let f = new_jobs("new_instrument_resume", 1, None);
     let cutoff = time_text((DAY2 + 100) * 1_000_000);
     let mut completed = None;
+    let mut checked_binding = false;
     for _ in 0..10 {
         match pipeline("update", &f.config, &["--end", &cutoff]) {
             Ok(report) => {
@@ -406,9 +415,61 @@ fn interrupted_empty_store_keeps_original_seed_binding() {
                     !reason.contains("configuration") || !reason.contains("conflicts"),
                     "{reason}"
                 );
+                if !checked_binding {
+                    let requests = (f.deriv.requests(), f._pocket.requests());
+                    let mut originals = Vec::new();
+                    for job in &f.jobs {
+                        let path = f.scratch.path(job.config.to_str().unwrap());
+                        let original = fs::read_to_string(&path).unwrap();
+                        let state = f
+                            .scratch
+                            .path(&format!("producer/pipeline_state/{}", job.id));
+                        let pending = fs::read(state.join("progress.json")).unwrap();
+                        let mut effective =
+                            binary_alpha_app::load_config(&state.join("update.toml")).unwrap();
+                        effective.history.as_mut().unwrap().max_pages = None;
+                        effective.history.as_mut().unwrap().max_elapsed_seconds = None;
+                        assert_eq!(
+                            serde_json::from_slice::<Value>(&pending).unwrap()["effective_config_hash"],
+                            effective.content_hash(),
+                            "intent binds canonical core directly, including its calendar"
+                        );
+                        let mut changed =
+                            binary_alpha_engine::config::Config::parse(&original).unwrap();
+                        changed.instruments[0].session =
+                            binary_alpha_engine::config::Config::parse(&deriv_core(
+                                &f.deriv.url,
+                                60,
+                                1,
+                                600,
+                            ))
+                            .unwrap()
+                            .instruments[0]
+                                .session
+                                .clone();
+                        fs::write(&path, changed.canonical_toml()).unwrap();
+                        originals.push((path, original, state, pending));
+                    }
+                    let refused = pipeline("update", &f.config, &["--end", &cutoff]).unwrap_err();
+                    assert!(
+                        refused.contains("current effective configuration")
+                            && refused.contains("conflicts"),
+                        "{refused}"
+                    );
+                    assert_eq!((f.deriv.requests(), f._pocket.requests()), requests);
+                    for (path, original, state, pending) in originals {
+                        assert_eq!(fs::read(state.join("progress.json")).unwrap(), pending);
+                        fs::write(path, original).unwrap();
+                    }
+                    checked_binding = true;
+                }
             }
         }
     }
+    assert!(
+        checked_binding,
+        "fixture must exercise a pending calendar conflict"
+    );
     let report = completed.expect("bounded first acquisition eventually completes");
     let store = f.scratch.path("producer/store");
     daily_only(&store);
@@ -563,7 +624,6 @@ fn price_scale_failure_reports_required_digits() {
 }
 
 #[test]
-#[ignore = "WT-SESSIONS integration: enable after the singular session field and calendar owner merge"]
 fn native_session_contract() {
     let core = deriv_core("ws://127.0.0.1:1/", 60, 6000, 3600);
     let mut doc: toml::Value = toml::from_str(&core).unwrap();

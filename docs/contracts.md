@@ -850,12 +850,10 @@ Registration checkpoints its exact core/evidence bytes before create-once file p
 appends the pipeline entry last under the writer lock; retry uses that checkpoint and refuses
 different input or output bytes. Generated paths are relative `jobs/JOB.toml` and
 `evidence/JOB.json`. Existing source-bound imported jobs remain readable; empty-store bootstrap
-also requires the explicit calendar. The `WT-SESSIONS INTEGRATION POINT` in
-`data_pipeline_add.rs` preserves the exact unmerged singular session shape: `always`, or
-`weekly` with timezone, open/close full weekday names and HH:MM:SS, closed_dates and early_closes.
-Until native calendar parsing is integrated, only explicit `always` executes; weekly registration
-is accepted and weekly acquisition refuses. Enable `new_instrument::native_session_contract`
-when that owner merges. Plural `sessions` remains a separate profile field.
+also requires the explicit calendar. The engine's `Config::parse` and `Session::calendar()`
+validate the singular session declaration for registration and acquisition. Canonical core TOML
+includes the entire calendar, so the effective configuration hash binds it without a separate
+session digest. Plural `sessions` remains a separate profile field.
 
 The `drive` table requires `root_folder_id` (nonempty, with no ASCII control characters, slash,
 or single quote), `chunk_bytes` (a positive unsigned 64-bit multiple of `262144`),
