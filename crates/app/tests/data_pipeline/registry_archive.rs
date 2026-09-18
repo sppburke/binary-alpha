@@ -355,7 +355,43 @@ fn archive_parallel_jobs_share_daily_objects_and_descendant_uploads_only_changes
     }
     drop(state);
     let before = uploads(&fake);
+    let requests = fake.log().len();
     pipeline("archive", &config, &[]).unwrap();
+    assert_eq!(uploads(&fake), before);
+    // Unchanged content is confirmed from the opening root listing: the only per-file reads
+    // are each job's existing catalog, re-read to compare its record closure.
+    let per_file: Vec<_> = fake.log()[requests..]
+        .iter()
+        .filter(|line| {
+            line.starts_with("GET /drive/v3/files/") && !line.contains("/files/generateIds")
+        })
+        .map(|line| line.split(' ').nth(1).unwrap()["/drive/v3/files/".len()..].to_string())
+        .collect();
+    assert!(
+        per_file.len() <= catalogs.len()
+            && per_file
+                .iter()
+                .all(|id| catalogs.iter().any(|(catalog_id, _)| catalog_id == id)),
+        "{per_file:?}"
+    );
+    // A remote object whose bytes changed no longer matches the listing and fails closed.
+    let tampered = catalogs[0].1.objects[0].file_id.clone();
+    let original = {
+        let mut state = fake.state.lock().unwrap();
+        let file = state.files.get_mut(&tampered).unwrap();
+        let original = file.bytes.clone();
+        file.bytes.push(b'!');
+        original
+    };
+    let error = pipeline("archive", &config, &[]).unwrap_err();
+    assert!(error.contains("nothing was replaced"), "{error}");
+    fake.state
+        .lock()
+        .unwrap()
+        .files
+        .get_mut(&tampered)
+        .unwrap()
+        .bytes = original;
     assert_eq!(uploads(&fake), before);
     let root = scratch.path("producer/store");
     let mut descendant = pair.v2.clone();

@@ -333,7 +333,10 @@ A pending update retains its pinned cutoff and exact seed binding, including an 
 seed list. Repeat the command to resume; do not move the cutoff or delete progress files.
 Page/time budgets may be increased through their declared configuration fields. After a
 completed acquisition whose transfer was interrupted, rerun update or archive and let the
-registry verify/reuse completed transfers. Consumer pull/restore resumes partial downloads.
+registry verify/reuse completed transfers: the registry lists the archive root once when it
+opens and reuses every completed upload whose listed size and SHA-256 equal the local identity
+without a per-file request; any other case is confirmed per file as before. Drive ids are
+generated 100 at a time. Consumer pull/restore resumes partial downloads.
 
 Never hand-generate per-instrument job files, infer a calendar, round prices to force a job
 through, rewrite immutable manifests/records, clear transfer/progress state to bypass a conflict,

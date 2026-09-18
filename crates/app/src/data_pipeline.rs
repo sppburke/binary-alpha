@@ -964,7 +964,13 @@ fn archive_generation(
         if digest != evidence_digest(&record_files, Some(key)) {
             continue;
         }
-        confirm_remote(drive, &receipt.file_id, receipt.bytes, &receipt.sha256)?;
+        confirm_remote(
+            registry,
+            drive,
+            &receipt.file_id,
+            receipt.bytes,
+            &receipt.sha256,
+        )?;
         let scratch = state.join(".existing-catalog");
         drive.download(
             &receipt.file_id,
@@ -997,13 +1003,13 @@ fn archive_generation(
         }
         catalog.check_migration_records(layout, &dataset_manifest, access)?;
         for entry in catalog.objects.iter().chain(&catalog.records) {
-            confirm_remote(drive, &entry.file_id, entry.bytes, &entry.sha256)?;
+            confirm_remote(registry, drive, &entry.file_id, entry.bytes, &entry.sha256)?;
         }
         for entry in [&catalog.dataset, &catalog.stream]
             .into_iter()
             .chain(&catalog.lineage_manifests)
         {
-            confirm_remote(drive, &entry.file_id, entry.bytes, &entry.sha256)?;
+            confirm_remote(registry, drive, &entry.file_id, entry.bytes, &entry.sha256)?;
         }
         return Ok(receipt);
     }
@@ -1025,7 +1031,7 @@ fn archive_generation(
                 let file_id = bindings
                     .get(key)
                     .ok_or_else(|| format!("legacy catalog: missing binding for {key}"))?;
-                confirm_remote(drive, file_id, identity.bytes, &identity.sha256)?;
+                confirm_remote(registry, drive, file_id, identity.bytes, &identity.sha256)?;
                 return Ok(file_id.clone());
             }
             registry.transfer(drive, &format!("{job}/{key}"), name, path, identity)
@@ -1229,7 +1235,7 @@ fn archive_generation(
 
 /// Transfers objects with one Drive session per worker. A failure stops new work; in-flight
 /// transfers finish and checkpoint before results (including failures) return in input order.
-fn run_pool<T: Sync, R: Send>(
+pub(crate) fn run_pool<T: Sync, R: Send>(
     config: &PipelineConfig,
     items: &[T],
     work: impl Fn(&T, &mut Drive) -> Result<R, String> + Sync,
@@ -1285,21 +1291,21 @@ fn run_pool<T: Sync, R: Send>(
 
 /// A remote file the index claims complete still carries exactly the local identity.
 fn confirm_remote(
+    registry: &crate::registry::Registry,
     drive: &mut Drive,
     file_id: &str,
     bytes: u64,
     sha256: &str,
 ) -> Result<(), String> {
-    drive
-        .verify(
-            file_id,
-            &ObjectIdentity {
-                bytes,
-                sha256: sha256.to_string(),
-                crc32c: 0,
-            },
-        )
-        .map(|_| ())
+    registry.confirm(
+        drive,
+        file_id,
+        &ObjectIdentity {
+            bytes,
+            sha256: sha256.to_string(),
+            crc32c: 0,
+        },
+    )
 }
 
 /// The newest imported dataset generation of one instrument in the store: the seed every

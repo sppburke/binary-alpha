@@ -1,7 +1,7 @@
 //! Archive-root transfer ownership. A synced JSON-lines journal records individual changes;
 //! a versioned snapshot compacts every 256 changes. Content keys include manifests/catalogs,
 //! so names and job-local aliases never establish content identity.
-use crate::drive::{Drive, DriveSettings};
+use crate::drive::{Drive, DriveSettings, RemoteFile};
 use crate::store::ObjectIdentity;
 use binary_alpha_engine::dataset::object_key;
 use serde::{Deserialize, Serialize};
@@ -13,6 +13,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
 const COMPACT_EVERY: u64 = 256;
+/// Ids generated per `generateIds` request when the pool runs dry.
+const ID_POOL: usize = 100;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Entry {
@@ -94,6 +96,13 @@ pub struct Registry {
     leases: Mutex<BTreeMap<String, Arc<Mutex<()>>>>,
     operations: RwLock<()>,
     failed: AtomicBool,
+    /// The archive root as listed when this registry opened: file id to the size and SHA-256
+    /// Drive reports for every untrashed file that reports one. A completed entry whose listed
+    /// identity equals the local identity is confirmed without another request; anything
+    /// else keeps the per-file confirmation path.
+    listed: BTreeMap<String, ObjectIdentity>,
+    /// Generated Drive ids not yet bound: one `generateIds` request serves many reservations.
+    ids: Mutex<Vec<String>>,
 }
 
 impl Registry {
@@ -112,12 +121,14 @@ impl Registry {
             .map_err(|e| e.to_string())?;
         let state = load_state(&directory, settings, true)?;
         let snapshot = directory.join("snapshot.json");
-        let registry = Self {
+        let mut registry = Self {
             directory,
             state: Mutex::new(state),
             leases: Mutex::new(BTreeMap::new()),
             operations: RwLock::new(()),
             failed: AtomicBool::new(false),
+            listed: BTreeMap::new(),
+            ids: Mutex::new(Vec::new()),
         };
         if !snapshot.exists() {
             registry.snapshot(
@@ -128,15 +139,63 @@ impl Registry {
             )?;
         }
         registry.import_legacy(state_dir, drive)?;
+        // One complete listing per run confirms completed bindings and feeds the rebuild.
+        let files = drive.list("")?;
+        registry.listed = files
+            .iter()
+            .filter(|file| !file.trashed)
+            .filter_map(|file| {
+                Some((
+                    file.id.clone(),
+                    ObjectIdentity {
+                        bytes: file.size?,
+                        sha256: file.sha256.as_ref()?.to_ascii_lowercase(),
+                        crc32c: 0,
+                    },
+                ))
+            })
+            .collect();
         if !registry
             .state
             .lock()
             .map_err(|_| "registry lock poisoned")?
             .rebuilt
         {
-            registry.rebuild(drive)?;
+            registry.rebuild_from(files, drive)?;
         }
         Ok(registry)
+    }
+
+    /// A remote file the index claims complete still carries exactly the local identity: by
+    /// the opening listing when it agrees, otherwise by Drive's per-file confirmation.
+    pub fn confirm(
+        &self,
+        drive: &mut Drive,
+        file_id: &str,
+        identity: &ObjectIdentity,
+    ) -> Result<(), String> {
+        if self.listed_matches(file_id, identity) {
+            return Ok(());
+        }
+        drive.verify(file_id, identity).map(|_| ())
+    }
+
+    /// One unbound generated id, refilling the pool `ID_POOL` at a time. An unused id costs
+    /// nothing: Drive ids bind only when a file is created under them.
+    fn next_id(&self, drive: &mut Drive) -> Result<String, String> {
+        let mut ids = self.ids.lock().map_err(|_| "registry id pool poisoned")?;
+        if ids.is_empty() {
+            *ids = drive.generate_ids(ID_POOL)?;
+        }
+        ids.pop()
+            .ok_or_else(|| "drive generateIds: empty pool".into())
+    }
+
+    /// The listed identity confirms a completed binding when it equals the local identity.
+    fn listed_matches(&self, file_id: &str, identity: &ObjectIdentity) -> bool {
+        self.listed.get(file_id).is_some_and(|listed| {
+            listed.bytes == identity.bytes && listed.sha256 == identity.sha256
+        })
     }
 
     fn snapshot(&self, state: &State) -> Result<(), String> {
@@ -314,12 +373,16 @@ impl Registry {
     /// Rebuild only from a complete listing. Names narrow candidates, never prove identity.
     /// In-flight/reserved entries retain their original ids and session capabilities.
     pub fn rebuild(&self, drive: &mut Drive) -> Result<(), String> {
+        let files = drive.list("")?;
+        self.rebuild_from(files, drive)
+    }
+
+    fn rebuild_from(&self, files: Vec<RemoteFile>, drive: &mut Drive) -> Result<(), String> {
         let _operation = self
             .operations
             .write()
             .map_err(|_| "registry operation lock poisoned")?;
         self.healthy()?;
-        let files = drive.list("")?;
         let mut confirmed: BTreeMap<String, Vec<Entry>> = BTreeMap::new();
         for remote in files {
             if !(remote.name.starts_with("object-")
@@ -432,12 +495,12 @@ impl Registry {
         let (file_id, session, done) = if let Some(entry) = legacy {
             // A completed legacy receipt is still binding even when its remote file is
             // missing or trashed. Verify it before recording or allocating anything.
-            if entry.done {
+            if entry.done && !self.listed_matches(&entry.file_id, identity) {
                 drive.verify(&entry.file_id, identity)?;
             }
             (entry.file_id.clone(), entry.session.clone(), entry.done)
         } else {
-            (drive.generate_ids(1)?.remove(0), None, false)
+            (self.next_id(drive)?, None, false)
         };
         let entry = Entry {
             file_id,
@@ -476,6 +539,9 @@ impl Registry {
         let _lease = lease.lock().map_err(|_| "registry lease poisoned")?;
         let mut entry = self.reserve(drive, identity, alias)?;
         if entry.done {
+            if self.listed_matches(&entry.file_id, identity) {
+                return Ok(entry.file_id);
+            }
             if drive
                 .metadata(&entry.file_id)?
                 .is_some_and(|file| !file.trashed)
