@@ -233,6 +233,10 @@ pipeline's supported command owners; no conversion, upload, or deletion scripts 
    `references` entry, retained root, exact local path, remote file ID, digest, and byte total.
 6. Only after that review run `binary-alpha data pipeline retire --config PIPELINE
    --apply PLAN_FILE`. Preserve the sealed plan, progress journal, and completion record.
+   The plan fingerprints every `.toml` under the pipeline configuration directory, the job
+   files, `pipeline_state`, and `store/manifests`: adding, editing, or removing any of them
+   (a temporary batch document included) between sealing and the completion record makes
+   apply refuse with `stale plan`, so clean up only after `plan-SHA256.retired.json` exists.
    Ordinary retirement preserves the current v2 root/catalog and requires verified migration
    evidence before removing v1. It is distinct from whole-instrument removal below.
 
