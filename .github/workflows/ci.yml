@@ -43,10 +43,7 @@ jobs:
             run: |
               cargo test --workspace --locked --exclude binary-alpha-app
               cargo test -p binary-alpha-app --locked --lib --bins
-              cargo test -p binary-alpha-app --locked --test '*' --
-                --skip daily_end_to_end:: --skip new_instrument:: --skip review_final:: --skip migrate_census::
-                --skip lineage:: --skip daily_readers:: --skip retire:: --skip review_archive::
-                --skip registry_archive:: --skip archive_records::
+              cargo test -p binary-alpha-app --locked --test '*' -- --skip daily_end_to_end:: --skip new_instrument:: --skip review_final:: --skip migrate_census:: --skip lineage:: --skip daily_readers:: --skip retire:: --skip review_archive:: --skip registry_archive:: --skip archive_records::
               cargo run --locked -p binary-alpha-app -- config validate --config configs/example.toml
     steps:
       - uses: actions/checkout@v7
