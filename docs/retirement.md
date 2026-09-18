@@ -8,9 +8,14 @@ Planning performs reads and writes its immutable plan, without deleting data.
 Both modes hold the managed store's writer lock and a host-wide lock for the Drive endpoint
 and archive-root pair. Pipeline producers, pull, and restore share this archive lock, including
 restores to another managed store on this host. This is not a distributed lock across hosts.
-Apply durably creates its progress journal before retained verification or deletion. Until a
-matching verified `.retired.json` exists, the journal fences the managed store: other producer
-commands and new retirement plans refuse with the unfinished plan's path. Empty and torn
+Apply seals an archive reservation beside the shared lock before creating its progress journal
+and before retained verification or deletion. The reservation binds the canonical owner plan
+and its SHA-256; every store checks it under the same archive lock. An immutable store binding
+also fences the owner if a crash occurs before its local journal is created. Reservation seals
+use atomic publication with file and directory sync; torn temporary files grant no ownership.
+Only verified completion releases the reservation, including recovery after completion was
+sealed but the process stopped before release. Until matching verified `.retired.json` exists,
+other producer commands and new retirement plans refuse with the unfinished plan's path. Empty and torn
 journals also fence the store. Only the identical sealed plan may resume. Keep configurations
 and all writers on other hosts frozen through completion; the persistent fence is local.
 
@@ -51,12 +56,43 @@ converted or mismatched checkpoints and unresolved pending acquisitions remain p
 Hash-bound alias entries authorize retirement of replaced standalone page copies as well as bundles;
 unmapped receipt pages remain protected. The verified receipt's `storage_aliases` additionally
 names byte-identical standalone page keys absent from manifest lists. These keys are local
-candidates, still protected by pending
-acquisitions. They do not create additional response occurrences. The receipt's
+candidates, still protected by pending acquisitions and by receipt occurrences outside the
+selected migration census. Sharing a content hash with a migrated occurrence does not exempt
+another instrument, job, or unproved receipt from retaining its required source. They do not create additional response occurrences. The receipt's
 `predecessor_jobs` extends ownership to historical catalogs and records of those jobs;
 only its verified generation mapping grants generation deletion authority. Historical records
 and completed transfer metadata remain intact, with retired closures marked in the plan.
 Only fields from the exact verified receipt bound into the retained catalog grant this authority.
+
+Proof-version upgrades rebuild the root from the strict v1 proof plus the existing daily
+continuation. Re-proving only the v1 root would lose subsequent acquisitions; rewriting old
+roots or descendants would break immutable identities. The converter therefore keeps the
+strict v1 observation/page/source-file/candle equality proof, names its baseline manifests,
+and separately measures continuation preservation before publishing the superseding receipt.
+It selects the latest observation-complete daily history and keeps its observation keys and
+coverage (including the current acquisition, shortfalls, and unresolved ranges). It unions
+page occurrences by acquisition and ordinal across all former roots and descendants, rejecting
+conflicting metadata. Equal day contents reuse the existing key. Audit replays the continuous
+stream using the latest parent stream to reuse unchanged candle partitions.
+
+Every former observation and finalized candle day must be an ordered subsequence of its
+replacement, including repeated rows and all provider columns; incomparable histories stop
+before supersession. Every predecessor receipt's named daily stream must be present and
+verified. The published page partitions are independently reread to prove every former page
+occurrence survives exactly. The immutable
+`continuation_preservation` proof binds the old root, new dataset/stream, and each covered
+former dataset/stream closure. Selection checks that proof; retirement requires its exact
+closure bindings before a former migration catalog becomes a candidate. Unproved catalogs
+remain retained. Legacy supersession records without this proof can enter only migration's
+full-chain repair census, with all former roots present locally; they cannot authorize
+ordinary selection or retirement. Completed records are never rewritten.
+After restoration, a superseded receipt and its bound alias table receive the migrated-source
+exemption only when the selected preservation proof covers that receipt's exact root and stream.
+
+Receipt resolution authenticates daily page closures as well as v1 bundles and standalone
+payloads. Daily aliases name the page object, day, acquisition, and ordinal, so verification
+never needs to recreate a reclaimed standalone object. A worker caches one authenticated
+page day and discards that cache at the independent proof boundary and on every job exit.
 
 Retained roots include the continuation root and its stream, the newest eligible catalog and its
 exact remote file bindings, configurations, pending acquisitions and pages, and in-flight
@@ -131,4 +167,4 @@ archive, fresh-store restoration, two updates at the same cutoff, and retirement
 Deriv and Pocket v1 fixtures. All transport is loopback fake data; no production deletion or
 external broker acquisition is exercised.
 
-Production operator tasks for this code delivery: none. Matching linked Sentry issues: none.
+Production operator tasks for this code delivery: none. Matching Sentry issues: unknown; none supplied.

@@ -805,6 +805,23 @@ pub(crate) fn retired_closures(state: &Path) -> Result<BTreeSet<String>, String>
 pub(crate) fn check_writer(state: &Path, resume: Option<&Path>) -> Result<(), String> {
     let mut paths = Vec::new();
     files(&state.join("retirement"), &mut paths)?;
+    for binding in paths.iter().filter(|p| {
+        p.file_name().is_some_and(|n| {
+            n.to_string_lossy().starts_with("archive-lock-")
+                && n.to_string_lossy().ends_with(".json")
+        })
+    }) {
+        let path: PathBuf = serde_json::from_slice(&fs::read(binding).map_err(|e| e.to_string())?)
+            .map_err(|e| e.to_string())?;
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .map_err(|e| e.to_string())?;
+        file.try_lock()
+            .map_err(|_| "pipeline: another operation holds this archive root".to_string())?;
+        ArchiveLock::open(file, &path, resume)?;
+    }
     let mut resume_digest = None;
     let mut checked_completions = false;
     for path in paths {
@@ -846,6 +863,84 @@ pub(crate) fn check_writer(state: &Path, resume: Option<&Path>) -> Result<(), St
     Ok(())
 }
 
+// The OS lock coordinates live processes; its immutable sibling reservation survives a
+// process exit. Sealing and unlinking sync the directory and never replace the lock inode.
+pub(crate) struct ArchiveLock {
+    _file: File,
+    owner: PathBuf,
+}
+#[derive(Serialize, Deserialize)]
+struct ArchiveReservation {
+    plan: PathBuf,
+    digest: String,
+}
+impl ArchiveLock {
+    pub(crate) fn open(file: File, path: &Path, resume: Option<&Path>) -> Result<Self, String> {
+        let guard = Self {
+            _file: file,
+            owner: path.with_extension("retirement.json"),
+        };
+        guard.check(resume)?;
+        Ok(guard)
+    }
+    fn check(&self, resume: Option<&Path>) -> Result<(), String> {
+        let bytes = match fs::read(&self.owner) {
+            Ok(bytes) => bytes,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(e.to_string()),
+        };
+        let owner: ArchiveReservation =
+            serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
+        if !owner.plan.is_absolute()
+            || !hex_id(&owner.digest)
+            || hash(&fs::read(&owner.plan).map_err(|e| e.to_string())?) != owner.digest
+        {
+            return Err("pipeline: archive retirement owner plan changed".into());
+        }
+        if owner.plan.with_extension("retired.json").exists() {
+            let state = owner
+                .plan
+                .parent()
+                .and_then(Path::parent)
+                .ok_or("retirement owner state missing")?;
+            retired_closures(state)?;
+            self.release()?;
+        } else if resume.is_none_or(|p| p.canonicalize().ok().as_ref() != Some(&owner.plan)) {
+            return Err(format!(
+                "pipeline: unfinished retirement {}; resume this exact archive owner plan",
+                owner.plan.display()
+            ));
+        }
+        Ok(())
+    }
+    fn reserve(&self, plan: &Path) -> Result<(), String> {
+        let plan = plan.canonicalize().map_err(|e| e.to_string())?;
+        let owner = ArchiveReservation {
+            digest: hash(&fs::read(&plan).map_err(|e| e.to_string())?),
+            plan,
+        };
+        seal(&self.owner, &crate::fetch::json_bytes(&owner)?)
+    }
+    fn release(&self) -> Result<(), String> {
+        fs::remove_file(&self.owner).map_err(|e| e.to_string())?;
+        File::open(self.owner.parent().ok_or("archive owner parent absent")?)
+            .and_then(|f| f.sync_all())
+            .map_err(|e| e.to_string())
+    }
+    fn bind_store(&self, state: &Path) -> Result<(), String> {
+        // Installed before reservation; lets the local writer also see the crash boundary
+        // between durable archive reservation and creation of the local progress journal.
+        let bytes =
+            crate::fetch::json_bytes(&self.owner.with_extension("").with_extension("lock"))?;
+        seal(
+            &state
+                .join("retirement")
+                .join(format!("archive-lock-{}.json", hash(&bytes))),
+            &bytes,
+        )
+    }
+}
+
 /// Default is plan-only. Apply accepts only an unchanged plan previously sealed in this store.
 pub fn run(
     config_path: &Path,
@@ -855,7 +950,8 @@ pub fn run(
 ) -> Result<(), String> {
     let (config, layout, _) = data_pipeline::load(config_path)?;
     let _lock = data_pipeline::retirement_writer_lock(&layout, apply)?;
-    let _archive_lock = data_pipeline::archive_lock(&config)?;
+    let archive_lock = data_pipeline::retirement_archive_lock(&config, apply)?;
+    archive_lock.bind_store(&layout.state)?;
     let declaration = data_pipeline::declaration(&config)?;
     let access = Access {
         declaration: declaration.as_ref(),
@@ -871,6 +967,7 @@ pub fn run(
             access,
             job,
             path,
+            &archive_lock,
             out,
         );
     }
@@ -892,6 +989,60 @@ pub fn run(
         plan.totals.drive_bytes
     )
     .map_err(|e| e.to_string())
+}
+
+/// Classify remote-only ancestors from their hash-pinned lineage, never their job or age.
+fn archived_lineage(
+    layout: &Layout,
+    drive: &mut Drive,
+    archive: &Archive,
+    access: Access<'_>,
+) -> Result<Value, String> {
+    let catalog = data_pipeline::Catalog::from_json(
+        &serde_json::to_vec(&archive.value).map_err(|e| e.to_string())?,
+    )?;
+    access.permit(Some(catalog.role), &catalog.dataset.generation)?;
+    let mut download = |id: &str, bytes: u64, sha256: &str| -> Result<Vec<u8>, String> {
+        let path = layout
+            .state
+            .join("retirement/downloads")
+            .join(format!("{sha256}.lineage"));
+        drive.download(
+            id,
+            &path,
+            &ObjectIdentity {
+                bytes,
+                sha256: sha256.into(),
+                crc32c: 0,
+            },
+        )?;
+        let bytes = fs::read(&path).map_err(|e| e.to_string())?;
+        fs::remove_file(path).map_err(|e| e.to_string())?;
+        Ok(bytes)
+    };
+    let manifest = GenerationManifest::from_json(&download(
+        &catalog.dataset.file_id,
+        catalog.dataset.bytes,
+        &catalog.dataset.sha256,
+    )?)?;
+    if manifest.generation != archive.dataset
+        || manifest.layout != Some(DataLayout::DailyV2)
+        || manifest.instrument != catalog.instrument
+        || manifest.role != DatasetRole::Development
+    {
+        return Err("retire: archived daily ancestor identity mismatch".into());
+    }
+    let object = manifest
+        .objects
+        .iter()
+        .find(|o| o.path == crate::lineage::LINEAGE_PATH)
+        .ok_or("retire: archived ancestor lacks lineage")?;
+    let entry = catalog
+        .objects
+        .iter()
+        .find(|e| e.key == object.key && e.bytes == object.bytes && e.sha256 == object.sha256)
+        .ok_or("retire: archived ancestor omits lineage binding")?;
+    json(&download(&entry.file_id, entry.bytes, &entry.sha256)?)
 }
 
 fn plan(
@@ -991,6 +1142,7 @@ fn plan(
         .collect();
     let mut replaced = BTreeSet::new();
     let mut continuation_seeds = BTreeSet::new();
+    let mut preserved_catalogs = BTreeSet::new();
     let mut completed_records = BTreeSet::new();
     let mut owned_records = BTreeSet::new();
     let mut migrated_objects = BTreeSet::new();
@@ -1150,6 +1302,45 @@ fn plan(
                 }
             }
         }
+        // A former migration family is retired only with the selected root's measured
+        // preservation proof. Timestamps and the mere daily layout grant no such authority.
+        let preservation = migrations
+            .iter()
+            .filter(|r| r.job == *job && r.v2_root == seed && r.verified())
+            .filter_map(MigrationRecord::continuation_proof)
+            .flat_map(|p| p.closures)
+            .collect::<Vec<_>>();
+        for prior in archives
+            .iter()
+            .filter(|a| a.value["instrument"] == *instrument)
+        {
+            let logical_root = lineage[&seed]["root_generation"].as_str().unwrap_or(&seed);
+            let remote_lineage = if !lineage.contains_key(&prior.dataset)
+                && replaced.contains(&prior.dataset)
+                && prior.value["layout"] == "daily-v2"
+            {
+                Some(archived_lineage(layout, drive, prior, access)?)
+            } else {
+                None
+            };
+            let same_family = lineage
+                .get(&prior.dataset)
+                .or(remote_lineage.as_ref())
+                .is_some_and(|v| {
+                    v["root_generation"].as_str().unwrap_or(&prior.dataset) == logical_root
+                });
+            if (same_family
+                && (replaced.contains(&prior.dataset)
+                    || prior.dataset == archive.dataset
+                    || prior.dataset == seed
+                    || prior.dataset == logical_root))
+                || preservation
+                    .iter()
+                    .any(|p| p.dataset == prior.dataset && p.streams.contains(&prior.stream))
+            {
+                preserved_catalogs.insert(prior.file.file_id.clone());
+            }
+        }
         // Native daily roots need no migration authorization. If legacy manifests are
         // present, only the root's verified migration mapping can authorize their removal.
         let mut legacy_refs = BTreeSet::new();
@@ -1174,6 +1365,28 @@ fn plan(
             // catalog. Owned records never pin the closures a verified superseding record replaced.
             for key in data_pipeline::evidence_records(layout, job, &bindings)?.keys() {
                 owned_records.insert(crate::lineage::record_name(key)?.to_string());
+            }
+            // Superseded immutable receipts are covered only when the selected proof
+            // names their exact dataset AND stream. Ownership alone cannot release an
+            // unrelated receipt's source aliases after restoration or retirement.
+            for name in &owned_records {
+                for value in documents(&layout.state.join("records").join(name))? {
+                    if let Ok(record) = serde_json::from_value::<MigrationRecord>(value)
+                        && record.job == *job
+                        && record.baseline_verified()
+                        && preservation.iter().any(|p| {
+                            p.dataset == record.v2_root && p.streams.contains(&record.v2_stream)
+                        })
+                    {
+                        completed_records.insert(name.clone());
+                        if let Some(alias) =
+                            record.evidence.get("alias_table").and_then(Value::as_str)
+                            && owned_records.contains(alias)
+                        {
+                            completed_records.insert(alias.to_string());
+                        }
+                    }
+                }
             }
             let mapping: MigrationMapping =
                 serde_json::from_value(lineage[&seed].clone()).map_err(|e| e.to_string())?;
@@ -1276,8 +1489,8 @@ fn plan(
     known.extend(migrated_objects.iter().cloned());
     // Keys a verified migration record declares as storage aliases or migrated byte sources
     // are represented by v2 pages. They are retirement candidates by declaration and never
-    // become retained roots through a record that merely mentions them; after retirement, or
-    // in a fresh restore, their absence is the expected state rather than a lost dependency.
+    // lose a source dependency only for records bound by the selected migration census.
+    // An unselected or unresolved record still pins shared payload bytes.
     let migrated_keys = migrated_objects.clone();
     candidates.extend(migrated_objects);
     let mut inventory = Vec::new();
@@ -1333,7 +1546,11 @@ fn plan(
                 id != &a.file.file_id && a.value["instrument"] == *instrument
             })
             && a.value["role"] == "development"
-            && (replaced.contains(&a.dataset) || manifests.get(&a.dataset).is_some_and(|m| m.daily))
+            && if a.value["layout"] == "daily-v2" {
+                preserved_catalogs.contains(&a.file.file_id)
+            } else {
+                replaced.contains(&a.dataset)
+            }
         {
             candidates.insert(a.file.file_id.clone());
         } else {
@@ -1589,7 +1806,12 @@ fn plan(
                     _ => (),
                 }
             }
-            retained_pages(&value, graph.entry(id.clone()).or_default(), &layout.store);
+            let mut required_pages = BTreeSet::new();
+            retained_pages(&value, &mut required_pages, &layout.store);
+            if value.get("requests").is_some() && !completed_records.contains(id) {
+                roots.extend(required_pages.intersection(&migrated_keys).cloned());
+            }
+            graph.entry(id.clone()).or_default().extend(required_pages);
         }
         let mut closure = BTreeSet::from([id.clone()]);
         expand(&mut closure, &graph);
@@ -1613,7 +1835,7 @@ fn plan(
                     .iter()
                     .filter(|d| {
                         resolved(d)
-                            && !migrated_keys.contains(*d)
+                            && !(completed_records.contains(id) && migrated_keys.contains(*d))
                             && !records.iter().any(|(_, id)| id == *d)
                     })
                     .cloned(),
@@ -1919,6 +2141,7 @@ fn touches_retained(plan: &Plan, start: usize, end: usize) -> bool {
 }
 
 fn seal(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    use std::os::unix::fs::OpenOptionsExt;
     let parent = path.parent().ok_or("retire: missing record parent")?;
     fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     // Publish via hard link: a crash during the scratch write can never leave a partial sealed
@@ -1929,6 +2152,7 @@ fn seal(path: &Path, bytes: &[u8]) -> Result<(), String> {
         match OpenOptions::new()
             .write(true)
             .create_new(true)
+            .mode(0o600)
             .open(&scratch)
         {
             Ok(file) => break (scratch, file),
@@ -2027,6 +2251,7 @@ fn apply_plan(
     access: Access<'_>,
     job: Option<&str>,
     path: &Path,
+    archive_lock: &ArchiveLock,
     out: &mut dyn Write,
 ) -> Result<(), String> {
     let bytes = fs::read(path).map_err(|e| e.to_string())?;
@@ -2100,6 +2325,7 @@ fn apply_plan(
             }
         }
     }
+    archive_lock.reserve(&sealed)?;
     // Install the fence before verification/first mutation; an empty or torn journal still
     // reserves this store for the identical plan until its verified completion is sealed.
     OpenOptions::new()
@@ -2167,5 +2393,51 @@ fn apply_plan(
     let record = serde_json::json!({"schema_version":SCHEMA,"plan_sha256":digest,"removed_drive":plan.delete_drive,"removed_local":plan.delete_local,"retained_verified":true});
     let record_path = sealed.with_extension("retired.json");
     seal(&record_path, &crate::fetch::json_bytes(&record)?)?;
+    archive_lock.release()?;
     writeln!(out, "retirement complete {}", record_path.display()).map_err(|e| e.to_string())
+}
+
+#[cfg(test)]
+mod archive_ownership_tests {
+    use super::*;
+
+    #[test]
+    fn archive_reservation_survives_exit_before_local_journal() {
+        let dir = std::env::temp_dir().join(format!("retire-owner-{}", std::process::id()));
+        fs::create_dir(&dir).unwrap();
+        let state = dir.join("pipeline_state");
+        let plan = state.join("retirement/plan-fixture.json");
+        seal(&plan, b"fixture sealed plan").unwrap();
+        let lock_path = dir.join("archive.lock");
+        let open = || {
+            let file = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(&lock_path)
+                .unwrap();
+            file.try_lock().unwrap();
+            file
+        };
+        let guard = ArchiveLock::open(open(), &lock_path, None).unwrap();
+        guard.bind_store(&state).unwrap();
+        guard.reserve(&plan).unwrap();
+        assert!(!plan.with_extension("progress.jsonseq").exists());
+        // A partial unpublished seal is harmless; the published reservation remains exact.
+        fs::write(dir.join("unpublished-owner.tmp"), b"{\"plan\":").unwrap();
+        drop(guard);
+        assert!(
+            check_writer(&state, None)
+                .unwrap_err()
+                .contains("unfinished retirement")
+        );
+        assert!(ArchiveLock::open(open(), &lock_path, None).is_err());
+        check_writer(&state, Some(&plan)).unwrap();
+        let resumed = ArchiveLock::open(open(), &lock_path, Some(&plan)).unwrap();
+        resumed.release().unwrap();
+        drop(resumed);
+        check_writer(&state, None).unwrap();
+        fs::remove_dir_all(dir).unwrap();
+    }
 }

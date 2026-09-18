@@ -17,7 +17,10 @@ use binary_alpha_engine::market::InstrumentId;
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
 
-const PROOF_VERSION: u32 = 1;
+#[path = "data_migrate/upgrade.rs"]
+mod upgrade;
+
+const PROOF_VERSION: u32 = 2;
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 
 fn err(e: impl std::fmt::Display) -> String {
@@ -48,7 +51,15 @@ fn entries(path: &Path) -> Result<Vec<PathBuf>, String> {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+struct DailyPageRef {
+    date: String,
+    acquisition_id: String,
+    ordinal: u64,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct ByteRef {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    daily: Option<DailyPageRef>,
     key: String,
     offset: u64,
     bytes: u64,
@@ -90,6 +101,8 @@ struct State {
     storage_aliases: Vec<String>,
     #[serde(default)]
     unresolved_objects: Vec<Value>,
+    #[serde(default)]
+    continuations: Vec<String>,
     phase: String,
     binding: String,
     dataset: String,
@@ -173,6 +186,9 @@ fn object_path(layout: &Layout, object: &ObjectRecord) -> Result<PathBuf, String
     Ok(path)
 }
 fn slice(layout: &Layout, source: &ByteRef) -> Result<Vec<u8>, String> {
+    if source.daily.is_some() {
+        return Ok(upgrade::daily_page(layout, source)?.payload);
+    }
     let mut f = File::open(layout.store.join(&source.key)).map_err(err)?;
     f.seek(SeekFrom::Start(source.offset)).map_err(err)?;
     let mut bytes = vec![0; usize::try_from(source.bytes).map_err(err)?];
@@ -428,6 +444,28 @@ impl Spool<'_> {
         diagnostic: bool,
     ) -> Result<(), String> {
         let p = &indexed.page;
+        // V1 indexes retain their established receipt/fingerprint canonical identities.
+        // A verified daily closure already owns the acquisition identity and ordinal.
+        let occurrence = p.occurrence.as_ref().filter(|o| {
+            indexed
+                .source
+                .daily
+                .as_ref()
+                .is_some_and(|d| d.acquisition_id == o.acquisition_id && d.ordinal == o.ordinal)
+        });
+        let intent = if let Some(occurrence) = occurrence {
+            if intent
+                .as_ref()
+                .is_some_and(|i| occurrence.intent.as_ref() != Some(i))
+            {
+                return Err("receipt occurrence intent mismatch".into());
+            }
+            occurrence.intent.clone()
+        } else {
+            intent
+        };
+        let ordinal = occurrence.map_or(ordinal, |o| o.ordinal);
+        let acquisition = occurrence.map_or(&indexed.acquisition, |o| &o.acquisition_id);
         let (rows, first, last) =
             payload_bounds(&slice(self.layout, &indexed.source)?, self.offset_s)?;
         let first = first.as_deref().map(time).transpose()?;
@@ -479,7 +517,9 @@ impl Spool<'_> {
                 }
             }
         }
-        let identity = if let Some(identity) = pending_match {
+        let identity = if let Some(occurrence) = occurrence {
+            upgrade::occurrence_key(&occurrence.acquisition_id, occurrence.ordinal)?
+        } else if let Some(identity) = pending_match {
             identity
         } else if let Some(intent) = &intent {
             sha256_hex(&json_bytes(&(
@@ -509,7 +549,7 @@ impl Spool<'_> {
         let has_intent = intent.is_some();
         let receipt_time_utc = p.receipt_time.as_deref().map(receipt_time).transpose()?;
         let page = PageOccurrence {
-            acquisition_id: indexed.acquisition.clone(),
+            acquisition_id: acquisition.clone(),
             intent,
             ordinal,
             checkpoint_ordinal: None,
@@ -538,7 +578,7 @@ impl Spool<'_> {
             page,
             Alias {
                 label: indexed.label.clone(),
-                acquisition_id: indexed.acquisition.clone(),
+                acquisition_id: acquisition.clone(),
                 ordinal,
                 source: indexed.source.clone(),
                 checkpoint: None,
@@ -653,6 +693,7 @@ fn index_coverage(
                     .ok_or("bundle offset overflow")?;
             }
             let source = ByteRef {
+                daily: None,
                 key: obj.key.clone(),
                 offset: page.offset.unwrap_or(0),
                 bytes: page.bytes,
@@ -857,8 +898,25 @@ fn add_receipts(
             ))?);
             let request_occurrence =
                 next_count(&spool.work.join("receipt-counts").join(&name), &fingerprint)?;
-            let source = read_json::<ByteRef>(&spool.work.join("payloads").join(&request.sha256))?
+            let daily_source = request
+                .occurrence
+                .as_ref()
+                .map(|o| {
+                    read_json::<ByteRef>(
+                        &spool
+                            .work
+                            .join("daily-occurrences")
+                            .join(upgrade::occurrence_key(&o.acquisition_id, o.ordinal)?),
+                    )
+                })
+                .transpose()?
+                .flatten();
+            let source = daily_source
+                .or(read_json::<ByteRef>(
+                    &spool.work.join("payloads").join(&request.sha256),
+                )?)
                 .unwrap_or(ByteRef {
+                    daily: None,
                     key: object_key(&request.sha256),
                     offset: 0,
                     bytes: request.bytes,
@@ -873,7 +931,7 @@ fn add_receipts(
                 return Err(format!("{name} request {ordinal}: rows mismatch"));
             }
             let page = fetch::PageCoverage {
-                occurrence: None,
+                occurrence: request.occurrence,
                 path: String::new(),
                 offset: None,
                 sha256: request.sha256,
@@ -958,6 +1016,7 @@ fn add_import(
             &Checkpoint {
                 ordinal,
                 source: ByteRef {
+                    daily: None,
                     key: checkpoint.key.clone(),
                     offset,
                     bytes: bytes.len() as u64,
@@ -996,6 +1055,7 @@ fn add_import(
                 acquisition_id: raw.sha256.clone(),
                 ordinal,
                 source: ByteRef {
+                    daily: None,
                     key: raw.key.clone(),
                     offset,
                     bytes: bytes.len() as u64,
@@ -1065,6 +1125,7 @@ fn add_pending(
         let mut accept = |value: Value| -> Result<(), String> {
             let p: fetch::PageCoverage = serde_json::from_value(value).map_err(err)?;
             let source = ByteRef {
+                daily: None,
                 key: object_key(&p.sha256),
                 offset: 0,
                 bytes: p.bytes,
@@ -1271,6 +1332,7 @@ fn observations(
     newest: &GenerationManifest,
     metas: &BTreeMap<String, Value>,
     coverage: Option<&Value>,
+    reuse: &[GenerationManifest],
 ) -> Result<(Vec<ObjectRecord>, Vec<DayInventoryEntry>, u64), String> {
     let id = InstrumentId {
         broker: newest.broker.clone(),
@@ -1286,6 +1348,22 @@ fn observations(
             return Ok(());
         }
         peak = peak.max(rows.len() as u64);
+        if let Some(object) = upgrade::reuse_observations(local, reuse, d, newest, rows)? {
+            let mut day = new_day(d, DayFamily::Observations);
+            set_data(
+                &mut day,
+                &archive::DataSummary {
+                    rows: rows.len() as u64,
+                    first_event_micros: rows.first().map(LosslessRow::time).transpose()?,
+                    last_event_micros: rows.last().map(LosslessRow::time).transpose()?,
+                },
+                &object,
+            );
+            objects.push(object);
+            days.insert(d.to_string(), day);
+            rows.clear();
+            return Ok(());
+        }
         let path = work.join("observations.parquet");
         let data = match newest.price_representation {
             PriceRepresentation::IntegerUnits { scale } => daily::write_ticks(
@@ -1562,6 +1640,7 @@ fn physical_census(
             }
             alias.label = format!("physical:{key}");
             alias.source = ByteRef {
+                daily: None,
                 key: key.clone(),
                 offset: 0,
                 bytes: id.bytes,
@@ -1696,6 +1775,7 @@ fn physical_census(
                 acquisition_id,
                 ordinal: 0,
                 source: ByteRef {
+                    daily: None,
                     key,
                     offset: 0,
                     bytes: id.bytes,
@@ -1961,6 +2041,22 @@ fn convert(
         records: predecessor_records,
     } = predecessor_jobs(layout, &job.id, &sources.datasets[0], &identity, access)?;
     let coverage = index_coverage(layout, work, &sources, &identity)?;
+    let continuations = if superseded.and_then(|s| s.record.as_ref()).is_some() {
+        lineage::upgrade_family(
+            &local,
+            &layout.state.join("records"),
+            superseded
+                .and_then(|s| s.record.as_deref())
+                .expect("superseded record"),
+            &job.id,
+            &sources.datasets[0].instrument,
+            sources.datasets[0].role,
+            access,
+        )?
+    } else {
+        vec![]
+    };
+    upgrade::index_daily(layout, work, &continuations, access)?;
     let newest = select_newest(&sources, &coverage, false)?;
     let streamed_source = if sources.streams.is_empty() {
         None
@@ -2042,6 +2138,7 @@ fn convert(
                         let mut p = p;
                         p.label = format!("single:{}/{}", m.generation, o.path);
                         p.source = ByteRef {
+                            daily: None,
                             key: o.key.clone(),
                             offset: 0,
                             bytes: o.bytes,
@@ -2116,6 +2213,7 @@ fn convert(
             .iter()
             .find(|(g, _)| g == &newest.generation)
             .map(|(_, c)| c),
+        &continuations,
     )?;
     let mut peak_bytes = 0;
     for dir in entries(&work.join("days"))? {
@@ -2132,6 +2230,11 @@ fn convert(
                 .map(|p| (p.payload.len() + p.checkpoint.as_ref().map_or(0, Vec::len)) as u64)
                 .sum(),
         );
+        if let Some((day, object)) = upgrade::reuse_pages(layout, &continuations, &d, &pages)? {
+            objects.push(object);
+            days.push(day);
+            continue;
+        }
         let path = work.join("pages.parquet");
         let data = daily::write_pages(&path, &d, [pages])?;
         let mut day = new_day(&d, DayFamily::Pages);
@@ -2241,6 +2344,7 @@ fn convert(
         unresolved_predecessor_jobs,
         storage_aliases: physical.storage_aliases,
         unresolved_objects: physical.unresolved_objects,
+        continuations: continuations.iter().map(|m| m.generation.clone()).collect(),
         phase: "converted".into(),
         binding: binding.into(),
         dataset: manifest.generation,
@@ -2584,7 +2688,7 @@ fn verify_migration(
     let dataset_verified = verify::run_with(&layout.manifest_uri(&state.dataset), access)?;
     let stream_verified = verify::run_with(&layout.manifest_uri(&state.stream), access)?;
     Ok(
-        json!({"observations":{"equal":true,"v1":old_rows,"v2":new_rows},"pages":{"equal":true,"occurrences":count,"aliases":aliases,"checkpoint_lines":checkpoint_count,"source_census":source_census},"import_files":reconstructed,"candles":candles,"data_verify":{"dataset":dataset_verified,"stream":stream_verified}}),
+        json!({"baseline_dataset":state.dataset,"baseline_stream":state.stream,"observations":{"equal":true,"v1":old_rows,"v2":new_rows},"pages":{"equal":true,"occurrences":count,"aliases":aliases,"checkpoint_lines":checkpoint_count,"source_census":source_census},"import_files":reconstructed,"candles":candles,"data_verify":{"dataset":dataset_verified,"stream":stream_verified}}),
     )
 }
 fn migrate_job_with(
@@ -2594,6 +2698,7 @@ fn migrate_job_with(
     access: Access<'_>,
     after_converted: &(dyn Fn(&str) -> Result<(), String> + Sync),
 ) -> Result<(State, bool), String> {
+    let _cache = upgrade::CacheScope::enter();
     let dir = layout.job_state(&job.id)?;
     let path = dir.join("migration.json");
     let work = dir.join("migration-work");
@@ -2638,6 +2743,7 @@ fn migrate_job_with(
         state
     };
     after_converted(&job.id)?;
+    upgrade::CacheScope::clear();
     let root = read_manifest(&layout.store(), &state.dataset)?.0;
     let source_identity = lineage::read_lineage(&layout.store(), &root)?["source_identity"]
         .as_str()
@@ -2652,6 +2758,7 @@ fn migrate_job_with(
         return Err("predecessor ownership changed after converted".into());
     }
     let proofs = verify_migration(layout, &state, access, &work, offset_seconds(bound))?;
+    let continuation_proof = upgrade::preserve(job, bound, layout, &mut state, access, &work)?;
     let root = read_manifest(&layout.store(), &state.dataset)?.0;
     let lineage = lineage::read_lineage(&layout.store(), &root)?;
     let mapping: lineage::MigrationMapping = serde_json::from_value(lineage).map_err(err)?;
@@ -2668,6 +2775,12 @@ fn migrate_job_with(
     evidence.insert("newest_v1_dataset".into(), json!(state.newest));
     evidence.insert("alias_table".into(), json!(state.aliases));
     evidence.insert("proofs".into(), proofs);
+    if let Some(proof) = continuation_proof {
+        evidence.insert(
+            "continuation_preservation".into(),
+            serde_json::to_value(proof).map_err(err)?,
+        );
+    }
     evidence.insert("memory".into(), json!({"bound":"one UTC observation/page day plus one provider response and Parquet column buffers; audit holds one candle day per configured stream; manifests/lineage and verification occurrence IDs are additional metadata; conversion page/checkpoint indexes are on disk","peak_day_rows":state.peak_day_rows,"peak_day_payload_bytes":state.peak_day_payload_bytes}));
     let record = publish(
         &layout.records(),
@@ -2967,7 +3080,21 @@ fn census(
                 let p: PageReceipt = serde_json::from_value(value).map_err(err)?;
                 let label = format!("receipt:{name}/{ordinal}");
                 let row = require(&label)?;
-                if row.payload_sha256 != p.sha256
+                let alias: Alias =
+                    get(&proof.join(format!("alias-{}", sha256_hex(label.as_bytes()))))?;
+                if p.occurrence
+                    .as_ref()
+                    .filter(|o| {
+                        alias.source.daily.as_ref().is_some_and(|d| {
+                            d.acquisition_id == o.acquisition_id && d.ordinal == o.ordinal
+                        })
+                    })
+                    .is_some_and(|o| {
+                        row.acquisition_id != o.acquisition_id
+                            || row.ordinal != o.ordinal
+                            || row.intent != o.intent
+                    })
+                    || row.payload_sha256 != p.sha256
                     || row.payload.len() as u64 != p.bytes
                     || row.rows != p.rows
                     || row.request_token != p.anchor

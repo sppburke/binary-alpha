@@ -6279,3 +6279,6 @@ fn assert_archive_inventory(drive: &FakeDrive) {
         "every uploaded file is owned by a complete pinned catalog closure"
     );
 }
+
+#[path = "data_pipeline/review_retire.rs"]
+mod review_retire;
