@@ -790,6 +790,112 @@ fn v1_migrate_archive_restore_update_twice_retire_and_restore_both_brokers() {
     pipeline("archive", &f.pipeline, &[]).unwrap();
     assert_eq!(uploads, f.drive.state.lock().unwrap().sessions.len());
 
+    // `restore --all` restores every archived instrument in one command, `parallel_jobs` at a
+    // time, selecting each newest verified catalog exactly as `pull` does.
+    {
+        let consumer = |name: &str| {
+            let scratch = Scratch::new(name);
+            let config = scratch.path("pipeline.toml");
+            fs::write(
+                &config,
+                pipeline_toml(&scratch.path("managed"), &f.drive.base, &[], None, 3).replacen(
+                    "schema_version = 1\n",
+                    "schema_version = 1\nparallel_jobs = 2\n",
+                    1,
+                ),
+            )
+            .unwrap();
+            (scratch, config)
+        };
+        let (all, all_config) = consumer("migration_daily_restored_all");
+        let report = pipeline("restore", &all_config, &["--all"]).unwrap();
+        assert_eq!(
+            report
+                .lines()
+                .filter(|l| l.starts_with("selected "))
+                .count(),
+            jobs.len(),
+            "{report}"
+        );
+        for (job, broker, symbol, _) in jobs {
+            let (root, stream, catalog) = &roots[job];
+            let selected = report
+                .lines()
+                .find(|l| l.starts_with("selected ") && field(l, "catalog") == catalog.0)
+                .unwrap_or_else(|| panic!("selected line for {job} in {report}"));
+            assert_eq!(field(selected, "sha256"), catalog.1);
+            assert_eq!(field(selected, "dataset"), root);
+            assert_eq!(field(selected, "stream"), stream);
+            let restored = report
+                .lines()
+                .find(|l| l.starts_with(&format!("restored {broker}:{symbol} ")))
+                .unwrap_or_else(|| panic!("restored line for {job} in {report}"));
+            assert_ne!(field(restored, "installed"), "0");
+            verify_closure(&all.path("managed/store"), root, stream);
+            let archived: Catalog =
+                serde_json::from_slice(&f.drive.state.lock().unwrap().files[&catalog.0].bytes)
+                    .unwrap();
+            assert!(!archived.records.is_empty());
+            for record in &archived.records {
+                assert_eq!(
+                    fs::read(all.path("managed/pipeline_state").join(&record.key)).unwrap(),
+                    fs::read(producer.join("pipeline_state").join(&record.key)).unwrap(),
+                    "restored immutable record {}",
+                    record.key
+                );
+            }
+        }
+        // Rerunning reuses every installed object and downloads nothing new.
+        let again = pipeline("restore", &all_config, &["--all"]).unwrap();
+        assert_eq!(
+            again.lines().filter(|l| l.starts_with("restored ")).count(),
+            jobs.len()
+        );
+        assert!(
+            again
+                .lines()
+                .filter(|l| l.starts_with("restored "))
+                .all(|l| field(l, "installed") == "0"),
+            "{again}"
+        );
+        // One damaged remote object fails only its own instrument; the other still restores.
+        let (_, damaged_config) = consumer("migration_daily_restored_all_damaged");
+        let pocket_catalog: Catalog = serde_json::from_slice(
+            &f.drive.state.lock().unwrap().files[&roots["pocket"].2.0].bytes,
+        )
+        .unwrap();
+        let damaged_id = pocket_catalog.objects[0].file_id.clone();
+        let original = {
+            let mut state = f.drive.state.lock().unwrap();
+            let file = state.files.get_mut(&damaged_id).unwrap();
+            let original = file.bytes.clone();
+            file.bytes = b"damaged remote object".to_vec();
+            original
+        };
+        let error = pipeline("restore", &damaged_config, &["--all"]).unwrap_err();
+        assert!(
+            error.contains("pipeline restore pocket_option:AEDCNY_otc failed:"),
+            "{error}"
+        );
+        assert!(
+            error.contains("pipeline: 1 restore(s) failed: pocket_option:AEDCNY_otc"),
+            "{error}"
+        );
+        assert!(
+            error
+                .lines()
+                .any(|l| l.starts_with("restored deriv:frxEURUSD ")),
+            "{error}"
+        );
+        f.drive
+            .state
+            .lock()
+            .unwrap()
+            .files
+            .get_mut(&damaged_id)
+            .unwrap()
+            .bytes = original;
+    }
     let fresh = Scratch::new("migration_daily_restored");
     fs::create_dir_all(fresh.path("evidence")).unwrap();
     for (job, _, _, _) in jobs {

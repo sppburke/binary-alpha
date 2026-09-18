@@ -345,20 +345,25 @@ enum PipelineCommand {
         symbol: String,
     },
     /// Install exactly one catalog's dataset and stream closure into this document's managed
-    /// store and print their local ready-manifest locations.
+    /// store and print their local ready-manifest locations; with `--all`, select and install
+    /// the newest archived catalog of every instrument on the archive root, `parallel_jobs`
+    /// at a time.
     Restore {
         #[arg(long)]
         config: PathBuf,
         /// The catalog's Drive file identifier.
-        #[arg(long)]
-        catalog: String,
+        #[arg(long, required_unless_present = "all", conflicts_with = "all")]
+        catalog: Option<String>,
         /// The catalog's expected SHA-256.
+        #[arg(long, required_unless_present = "all", conflicts_with = "all")]
+        sha256: Option<String>,
+        #[arg(long, required_unless_present = "all", conflicts_with = "all")]
+        broker: Option<String>,
+        #[arg(long, required_unless_present = "all", conflicts_with = "all")]
+        symbol: Option<String>,
+        /// Every instrument archived on the archive root, newest verified catalog each.
         #[arg(long)]
-        sha256: String,
-        #[arg(long)]
-        broker: String,
-        #[arg(long)]
-        symbol: String,
+        all: bool,
     },
 }
 
@@ -472,14 +477,26 @@ fn main() -> ExitCode {
                 sha256,
                 broker,
                 symbol,
-            } => data_pipeline::restore(
-                &config,
-                &catalog,
-                &sha256,
-                &broker,
-                &symbol,
-                &mut std::io::stdout().lock(),
-            ),
+                all,
+            } => {
+                if all {
+                    data_pipeline::restore_all(&config, &mut std::io::stdout().lock())
+                } else {
+                    match (catalog, sha256, broker, symbol) {
+                        (Some(catalog), Some(sha256), Some(broker), Some(symbol)) => {
+                            data_pipeline::restore(
+                                &config,
+                                &catalog,
+                                &sha256,
+                                &broker,
+                                &symbol,
+                                &mut std::io::stdout().lock(),
+                            )
+                        }
+                        _ => Err("restore: --catalog, --sha256, --broker and --symbol are required without --all".into()),
+                    }
+                }
+            }
         },
         Command::Features {
             command: FeaturesCommand::Build { config },

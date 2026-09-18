@@ -958,6 +958,7 @@ binary-alpha data pipeline remove-job --config PIPELINE --job ID
 binary-alpha data pipeline list --config PIPELINE --broker BROKER --symbol SYMBOL
 binary-alpha data pipeline pull --config PIPELINE --broker BROKER --symbol SYMBOL
 binary-alpha data pipeline restore --config PIPELINE --catalog FILE_ID --sha256 SHA256 --broker BROKER --symbol SYMBOL
+binary-alpha data pipeline restore --config PIPELINE --all
 ```
 
 Import is the existing command (see [Historical datasets](#historical-datasets)) run with

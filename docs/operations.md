@@ -217,10 +217,14 @@ pipeline's supported command owners; no conversion, upload, or deletion scripts 
    `--job ID`. This is offline and creates verified v2 continuation roots plus migration evidence.
 2. Run `binary-alpha data pipeline archive --config PIPELINE` for every migrated job.
    Retain the printed catalog IDs and SHA-256 digests.
-3. Create a consumer document with the same archive root and a fresh, empty `local_root`.
-   For **every job**, run `data pipeline restore --config CONSUMER --catalog FILE_ID
-   --sha256 SHA256 --broker BROKER --symbol SYMBOL`, then `data verify --manifest URI`
-   on both printed dataset and stream URIs. Restore also authenticates lineage manifests and
+3. Create a consumer document with the same archive root, a fresh, empty `local_root`, and
+   `parallel_jobs` set to the number of instruments to restore at once. Run
+   `data pipeline restore --config CONSUMER --all`: it selects every instrument's newest
+   verified catalog (the same selection as `pull`), prints `selected ... catalog FILE_ID
+   sha256 SHA256` and `restored ...` for each, and fails at the end naming any instrument
+   that did not restore. To pin one catalog instead, run `restore --catalog FILE_ID
+   --sha256 SHA256 --broker BROKER --symbol SYMBOL`. Then run `data verify --manifest URI`
+   on the printed dataset and stream URIs. Restore also authenticates lineage manifests and
    the exact immutable evidence-record closure. Inspect the coverage and unresolved ranges.
 4. Rebind active fetch/consumer configurations that still pin v1 manifests, through their
    documented configuration fields. Keep frozen evidence unchanged. A remaining reference
@@ -413,7 +417,13 @@ then restore a chosen identifier and SHA-256 (Secure Hash Algorithm, 256-bit) di
 ```text
 binary-alpha data pipeline list --config PIPELINE --broker BROKER --symbol SYMBOL
 binary-alpha data pipeline restore --config CONSUMER --catalog FILE_ID --sha256 SHA256 --broker BROKER --symbol SYMBOL
+binary-alpha data pipeline restore --config CONSUMER --all
 ```
+
+`restore --all` restores every instrument archived on the root, selecting each newest verified
+catalog exactly as `pull` does, `parallel_jobs` instruments at a time with `parallel_transfers`
+workers each; each instrument's report lines stay together and the final failure summary lists
+every instrument that failed. Rerunning it resumes partial downloads and reuses installed objects.
 
 For example, the initial selectors are `deriv`/`frxEURUSD` and
 `pocket_option`/`AEDCNY_otc`; the job identifier `pocket` is not the broker selector.

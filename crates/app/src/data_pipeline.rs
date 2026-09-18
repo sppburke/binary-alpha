@@ -1478,26 +1478,38 @@ fn run_job_pool(
     out: &mut dyn Write,
     run: &(dyn Fn(&Job, &mut dyn Write) -> Result<String, String> + Sync),
 ) -> Result<Vec<usize>, String> {
-    let workers = usize::try_from(config.parallel_jobs.unwrap_or(1))
-        .unwrap_or(1)
-        .min(config.jobs.len())
-        .max(1);
+    let workers = usize::try_from(config.parallel_jobs.unwrap_or(1)).unwrap_or(1);
+    report_pool(workers, &config.jobs, out, run, &|job, reason| {
+        format!("pipeline job {} failed: {reason}", job.id)
+    })
+}
+
+/// Runs `items` through `run` on up to `workers` threads: each item's report lines stay
+/// contiguous, one failure never masks another, and the failed indices come back for the
+/// caller's summary. An empty `Ok` line is not printed.
+fn report_pool<T: Sync>(
+    workers: usize,
+    items: &[T],
+    out: &mut dyn Write,
+    run: &(dyn Fn(&T, &mut dyn Write) -> Result<String, String> + Sync),
+    failure: &(dyn Fn(&T, &str) -> String + Sync),
+) -> Result<Vec<usize>, String> {
+    let workers = workers.min(items.len()).max(1);
     let queue = std::sync::Mutex::new(
-        config
-            .jobs
+        items
             .iter()
             .enumerate()
             .collect::<std::collections::VecDeque<_>>(),
     );
     let (reports, finished) = std::sync::mpsc::channel();
-    let one = |job: &Job| {
+    let one = |item: &T| {
         let mut lines = Vec::new();
-        let result = run(job, &mut lines);
+        let result = run(item, &mut lines);
         match &result {
+            Ok(line) if line.is_empty() => {}
             Ok(line) => writeln!(lines, "{line}").expect("writing to a Vec cannot fail"),
             Err(reason) => {
-                writeln!(lines, "pipeline job {} failed: {reason}", job.id)
-                    .expect("writing to a Vec cannot fail");
+                writeln!(lines, "{}", failure(item, reason)).expect("writing to a Vec cannot fail");
             }
         }
         (lines, result.is_err())
@@ -1509,12 +1521,12 @@ fn run_job_pool(
             let one = &one;
             scope.spawn(move || {
                 loop {
-                    let job = match queue.lock() {
+                    let item = match queue.lock() {
                         Ok(mut queue) => queue.pop_front(),
                         Err(_) => None,
                     };
-                    let Some((index, job)) = job else { break };
-                    let (lines, failed) = one(job);
+                    let Some((index, item)) = item else { break };
+                    let (lines, failed) = one(item);
                     if reports.send((index, lines, failed)).is_err() {
                         break;
                     }
@@ -1523,11 +1535,11 @@ fn run_job_pool(
         }
         drop(reports);
         let mut failed = Vec::new();
-        for (index, lines, job_failed) in finished {
+        for (index, lines, item_failed) in finished {
             out.write_all(&lines)
                 .and_then(|()| out.flush())
                 .map_err(|error| format!("cannot write the report: {error}"))?;
-            if job_failed {
+            if item_failed {
                 failed.push(index);
             }
         }
@@ -1993,6 +2005,17 @@ fn catalogs(
     broker: &str,
     symbol: &str,
 ) -> Result<Vec<(String, String, Catalog)>, String> {
+    Ok(all_catalogs(drive, layout)?
+        .into_iter()
+        .filter(|(_, _, catalog)| catalog.broker == broker && catalog.provider_symbol == symbol)
+        .collect())
+}
+
+/// Every archived catalog on the archive root, whatever its instrument.
+fn all_catalogs(
+    drive: &mut Drive,
+    layout: &Layout,
+) -> Result<Vec<(String, String, Catalog)>, String> {
     let scratch = layout.state.join("downloads");
     let mut found = Vec::new();
     for file in drive.list(CATALOG_PREFIX)? {
@@ -2013,9 +2036,7 @@ fn catalogs(
         fs::remove_file(&partial).map_err(|error| error.to_string())?;
         let catalog =
             Catalog::from_json(&bytes).map_err(|error| format!("{}: {error}", file.id))?;
-        if catalog.broker == broker && catalog.provider_symbol == symbol {
-            found.push((file.id, sha256, catalog));
-        }
+        found.push((file.id, sha256, catalog));
     }
     Ok(found)
 }
@@ -2145,6 +2166,77 @@ pub(crate) fn newest_catalog(
         .ok_or_else(|| "archive: conflicting evidence closures for the same generation".into())
 }
 
+/// `data pipeline restore --all`: select the newest archived catalog of every instrument on
+/// the archive root (the same selection as `pull`) and install each closure into this
+/// configuration's managed store, `parallel_jobs` at a time, each with its own Drive session
+/// and transfer pool. Every instrument's lines stay contiguous; one failure never masks
+/// another, and the command fails when any instrument did.
+pub fn restore_all(config_path: &Path, out: &mut dyn Write) -> Result<(), String> {
+    let (config, layout, _) = load(config_path)?;
+    let _lock = writer_lock(&layout)?;
+    let _archive_lock = archive_lock(&config)?;
+    let declaration = declaration(&config)?;
+    let access = Access {
+        declaration: declaration.as_ref(),
+        certification: None,
+    };
+    let mut drive = Drive::open(&config.drive)?;
+    let mut instruments: BTreeMap<(String, String), Vec<(String, String, Catalog)>> =
+        BTreeMap::new();
+    for found in all_catalogs(&mut drive, &layout)? {
+        instruments
+            .entry((found.2.broker.clone(), found.2.provider_symbol.clone()))
+            .or_default()
+            .push(found);
+    }
+    if instruments.is_empty() {
+        return Err("drive: no archived catalog on this archive root".into());
+    }
+    let scratch = layout.state.join("downloads");
+    let mut selected = Vec::new();
+    for ((broker, symbol), mut found) in instruments {
+        let index = newest_catalog(&found, &mut drive, &scratch, access)?;
+        let (file_id, sha256, catalog) = found.swap_remove(index);
+        selected.push((broker, symbol, file_id, sha256, catalog));
+    }
+    drop(drive);
+    let workers = usize::try_from(config.parallel_jobs.unwrap_or(1)).unwrap_or(1);
+    let failed = report_pool(
+        workers,
+        &selected,
+        out,
+        &|(broker, symbol, file_id, sha256, catalog), lines| {
+            writeln!(
+                lines,
+                "selected {} {} catalog {file_id} sha256 {sha256} dataset {} stream {}",
+                catalog.instrument,
+                catalog.role,
+                catalog.dataset.generation,
+                catalog.stream.generation
+            )
+            .map_err(|error| format!("cannot write the report: {error}"))?;
+            restore_locked(&config, &layout, file_id, sha256, broker, symbol, lines)?;
+            Ok(String::new())
+        },
+        &|(broker, symbol, ..), reason| {
+            format!("pipeline restore {broker}:{symbol} failed: {reason}")
+        },
+    )?;
+    if failed.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "pipeline: {} restore(s) failed: {}",
+            failed.len(),
+            failed
+                .iter()
+                .map(|index| format!("{}:{}", selected[*index].0, selected[*index].1))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ))
+    }
+}
+
 /// `data pipeline restore`: install exactly one catalog's dataset and stream closure into this
 /// configuration's managed store, verify both, and print their local ready-manifest locations.
 pub fn restore(
@@ -2213,6 +2305,7 @@ fn restore_locked(
     let local = layout.store();
     let fetch_entry = |drive: &mut Drive, entry: &ManifestEntry| -> Result<Vec<u8>, String> {
         let partial = downloads.join(format!("{}.manifest", entry.generation));
+        let _claim = claim_partial(&partial)?;
         drive.download(
             &entry.file_id,
             &partial,
@@ -2330,6 +2423,10 @@ fn restore_locked(
             return Ok(false);
         }
         let partial = downloads.join(format!("{}.partial", entry.sha256));
+        let _claim = claim_partial(&partial)?;
+        if local.head(&entry.key)?.is_some() {
+            return Ok(false);
+        }
         drive.download(&entry.file_id, &partial, &identity)?;
         let identity = store::identify(&partial)?;
         local.put_new(&entry.key, &partial, &identity)?;
@@ -2344,6 +2441,7 @@ fn restore_locked(
     for entry in &catalog.records {
         let name = crate::lineage::record_name(&entry.key)?;
         let partial = downloads.join(format!("{}.record", entry.sha256));
+        let _claim = claim_partial(&partial)?;
         let identity = ObjectIdentity {
             bytes: entry.bytes,
             sha256: entry.sha256.clone(),
@@ -2417,6 +2515,39 @@ fn restore_locked(
         catalog.objects.len()
     )
     .map_err(|error| format!("cannot write the report: {error}"))
+}
+
+/// Parallel restores may download one shared object or record at the same moment; the partial
+/// file name is the resume key, so the second downloader waits for the first instead of
+/// writing the same file. Names stay unchanged for resumption.
+static IN_FLIGHT: OnceLock<(Mutex<BTreeSet<PathBuf>>, std::sync::Condvar)> = OnceLock::new();
+
+struct PartialClaim(PathBuf);
+
+fn claim_partial(path: &Path) -> Result<PartialClaim, String> {
+    let (set, wake) =
+        IN_FLIGHT.get_or_init(|| (Mutex::new(BTreeSet::new()), std::sync::Condvar::new()));
+    let mut guard = set
+        .lock()
+        .map_err(|_| "partial download registry poisoned")?;
+    while guard.contains(path) {
+        guard = wake
+            .wait(guard)
+            .map_err(|_| "partial download registry poisoned")?;
+    }
+    guard.insert(path.to_path_buf());
+    Ok(PartialClaim(path.to_path_buf()))
+}
+
+impl Drop for PartialClaim {
+    fn drop(&mut self) {
+        if let Some((set, wake)) = IN_FLIGHT.get()
+            && let Ok(mut guard) = set.lock()
+        {
+            guard.remove(&self.0);
+            wake.notify_all();
+        }
+    }
 }
 
 /// The archive fence also excludes restores into another managed store on this host.
