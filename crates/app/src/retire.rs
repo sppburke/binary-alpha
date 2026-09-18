@@ -993,6 +993,7 @@ fn plan(
     let mut continuation_seeds = BTreeSet::new();
     let mut completed_records = BTreeSet::new();
     let mut owned_records = BTreeSet::new();
+    let mut inventory_snapshots = BTreeSet::new();
     let mut migrated_objects = BTreeSet::new();
     let mut job_owners: BTreeMap<_, _> = selected
         .keys()
@@ -1169,6 +1170,13 @@ fn plan(
             )?;
             let bindings = catalog.check_migration_records(layout, &root_manifest, access)
                 .map_err(|e| format!("retire: verified migration evidence is not archived with the retained v2 catalog: {e}"))?;
+            inventory_snapshots.extend(
+                bindings
+                    .inventory_snapshots
+                    .iter()
+                    .map(|key| crate::lineage::record_name(key).map(str::to_string))
+                    .collect::<Result<BTreeSet<_>, _>>()?,
+            );
             // The job's cumulative evidence closure (superseded migration receipts, their alias
             // tables, predecessor jobs' records) is its own immutable history, archived with the
             // catalog. Owned records never pin the closures a verified superseding record replaced.
@@ -1351,13 +1359,21 @@ fn plan(
         known.insert(id.clone());
         records.push((path, id));
     }
+    let mut historical_refs = BTreeMap::new();
     for (path, id) in &records {
         let values = documents(path)?;
         let mut refs = BTreeSet::new();
         for value in &values {
             references(value, &known, &mut refs);
         }
-        graph.insert(id.clone(), refs);
+        // These exact catalog-bound snapshots authenticate superseded inventories. Report
+        // their historical pointers without requiring retired market closures to exist.
+        if inventory_snapshots.contains(id) {
+            historical_refs.insert(id.clone(), refs);
+            graph.insert(id.clone(), BTreeSet::new());
+        } else {
+            graph.insert(id.clone(), refs);
+        }
     }
     // Research and other non-pipeline manifests retain their complete explicit dependencies.
     for (id, m) in &manifests {
@@ -1558,6 +1574,9 @@ fn plan(
     let mut eligible = candidates.clone();
     expand(&mut eligible, &graph);
     for (path, id) in &records {
+        if inventory_snapshots.contains(id) {
+            continue;
+        }
         let mut selected_record = completed_records.contains(id) || owned_records.contains(id);
         for value in documents(path)? {
             selected_record |= value
@@ -1774,7 +1793,30 @@ fn plan(
             reason: why.into(),
         });
     }
+    let record_names: BTreeSet<_> = records.iter().map(|(_, id)| id.clone()).collect();
     for (path, id) in records {
+        if let Some(historical) = historical_refs.remove(&id) {
+            refs.push(Reference {
+                source: path.display().to_string(),
+                closure: id,
+                status: Status::Protected,
+                reason: "authenticated inventory snapshot preserved as immutable evidence".into(),
+            });
+            for dependency in historical {
+                let retained = roots.contains(&dependency) || record_names.contains(&dependency);
+                refs.push(Reference {
+                    source: path.display().to_string(),
+                    closure: dependency,
+                    status: if retained { Status::Protected } else { Status::Retired },
+                    reason: if retained {
+                        "historical metadata reference also belongs to retained evidence or content"
+                    } else {
+                        "superseded metadata reference; inventory proof retained, no deletion authority"
+                    }.into(),
+                });
+            }
+            continue;
+        }
         let mut closure = BTreeSet::from([id.clone()]);
         expand(&mut closure, &graph);
         let any_retired = closure

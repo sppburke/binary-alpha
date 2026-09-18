@@ -172,7 +172,11 @@ Use [the pipeline example](../configs/data-pipeline.example.toml) and
 document, sibling core configurations, and source-binding evidence. The managed store under
 `local_root/store/` is the one system-owned copy of every dataset; raw archives enter it only
 through `data import` and may be deleted afterwards. Use one writer host per Google Drive
-archive root and the same managed root for manual and timer producers. Update holds
+archive root and the same managed root for manual and timer producers. One archive root must
+have one producer registry (`local_root/pipeline_state/registry`). Separate managed roots keep
+independent reservations and cached listings: if one registry was initialized before another
+producer uploaded content, it can upload unchanged content again under new file IDs. Sharing
+an archive root across those registries does not deduplicate uploads. Update holds
 `pipeline_state/writer.lock`; a second producer fails immediately. Consumers do not acquire that
 lock.
 

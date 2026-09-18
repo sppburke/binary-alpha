@@ -17,7 +17,7 @@ use binary_alpha_engine::market::InstrumentId;
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
 
-const PROOF_VERSION: u32 = 1;
+const PROOF_VERSION: u32 = 2;
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 
 fn err(e: impl std::fmt::Display) -> String {
@@ -1463,6 +1463,45 @@ fn observations(
     Ok((objects, days.into_values().collect(), peak))
 }
 
+/// Legacy coverage may be the only binding of a standalone invocation's object. Read page
+/// identities with the streaming document owner; response bytes remain outside metadata.
+fn acquisition_keys(
+    layout: &Layout,
+    manifest: &GenerationManifest,
+) -> Result<BTreeSet<String>, String> {
+    let mut keys = BTreeSet::new();
+    for object in &manifest.objects {
+        if object.path.starts_with(lineage::ACQUISITION_PREFIX) {
+            keys.insert(object.key.clone());
+        }
+        if object.path == fetch::COVERAGE_PATH {
+            let header = document(&object_path(layout, object)?, &mut |kind, page| {
+                if kind == "pages"
+                    && let Some(id) = page
+                        .pointer("/occurrence/acquisition_id")
+                        .and_then(Value::as_str)
+                {
+                    keys.insert(id.to_string());
+                }
+                Ok(())
+            })?;
+            for claim in header["acquisitions"].as_array().into_iter().flatten() {
+                if let Some(id) = claim["acquisition_id"].as_str() {
+                    keys.insert(id.to_string());
+                }
+            }
+        }
+    }
+    if let Some(id) = lineage::read_lineage(&layout.store(), manifest)?
+        .pointer("/continuation/acquisition_id")
+        .and_then(Value::as_str)
+    {
+        keys.insert(id.to_string());
+    }
+    keys.retain(|key| key.starts_with("objects/"));
+    Ok(keys)
+}
+
 /// All physical objects fall into one counted class. Only proved aliases and diagnostics
 /// enter the occurrence table; unresolved objects never confer retirement authority.
 #[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1473,6 +1512,7 @@ struct PhysicalCensus {
     diagnostic_objects: u64,
     other_source_objects: u64,
     non_response_objects: u64,
+    acquisition_records: u64,
     staging_objects: u64,
     unresolved_objects: Vec<Value>,
 }
@@ -1497,6 +1537,7 @@ fn physical_census(
 ) -> Result<PhysicalCensus, String> {
     // Read manifest metadata only. Referenced objects of other populations are never opened.
     let mut referenced = BTreeSet::new();
+    let mut acquisitions = BTreeSet::new();
     let mut contexts = BTreeSet::from([identity.to_string()]);
     for generation in layout.store().list_manifests()? {
         let bytes = fs::read(layout.store.join(manifest_key(&generation))).map_err(err)?;
@@ -1512,6 +1553,14 @@ fn physical_census(
         {
             access.permit(Some(source.role), &generation)?;
             let m = GenerationManifest::from_json(&bytes)?;
+            let keys = acquisition_keys(layout, &m)?;
+            // Resolve and validate the exact invocation bytes before assigning ownership.
+            lineage::retain_acquisitions(
+                &layout.store(),
+                &mut m.clone(),
+                keys.iter().map(String::as_str),
+            )?;
+            acquisitions.extend(keys);
             if let Some(o) = m.objects.iter().find(|o| o.path == fetch::COVERAGE_PATH) {
                 let header = document(&object_path(layout, o)?, &mut |_, _| Ok(()))?;
                 if let Some(id) = header["source_identity"].as_str() {
@@ -1573,6 +1622,10 @@ fn physical_census(
             alias.checkpoint_suffix.clear();
             accept(alias, None)?;
             census.storage_aliases.push(key);
+            continue;
+        }
+        if acquisitions.contains(&key) {
+            census.acquisition_records += 1;
             continue;
         }
         if referenced.contains(&key) {
@@ -2205,6 +2258,15 @@ fn convert(
     manifest.layout = Some(DailyLayout::DailyV2);
     manifest.day_inventory = days;
     manifest.objects = objects;
+    let mut acquisition_ids = BTreeSet::new();
+    for source in &sources.datasets {
+        acquisition_ids.extend(acquisition_keys(layout, source)?);
+    }
+    lineage::retain_acquisitions(
+        &local,
+        &mut manifest,
+        acquisition_ids.iter().map(String::as_str),
+    )?;
     let cov = lineage::migration_coverage(&mut manifest, &coverage, &identity)?;
     manifest
         .objects
@@ -2833,6 +2895,7 @@ fn census(
 ) -> Result<Value, String> {
     let local = layout.store();
     let newest = read_manifest(&local, &state.newest)?.0;
+    let migrated = read_manifest(&local, &state.dataset)?.0;
     let require = |label: &str| -> Result<PageOccurrence, String> {
         let alias: Alias = get(&proof.join(format!("alias-{}", sha256_hex(label.as_bytes()))))
             .map_err(|_| format!("page accounting proof: missing source alias {label}"))?;
@@ -2885,6 +2948,21 @@ fn census(
             return Err(format!(
                 "new v1 generation {generation} appeared after converted; migration snapshot is unresolved"
             ));
+        }
+        let mut expected = m.clone();
+        expected.objects.clear();
+        lineage::retain_acquisitions(
+            &local,
+            &mut expected,
+            acquisition_keys(layout, &m)?.iter().map(String::as_str),
+        )?;
+        for object in &expected.objects {
+            if !migrated.objects.contains(object) {
+                return Err(format!(
+                    "{generation}: standalone acquisition missing from migration closure: {}",
+                    object.key
+                ));
+            }
         }
         if let Some((raw, checkpoint)) = import_pair(&m)? {
             if !state.imports.iter().any(|i| {
@@ -3094,7 +3172,7 @@ fn census(
         json!({"coverage_entries":pages,"receipt_requests":requests,"single_objects":singles,"pending_pages":pending,"raw_lines":raw_lines,"checkpoint_lines":checkpoint_lines,"physical":{
             "objects":physical.objects,"manifest_objects":physical.manifest_objects,
             "storage_aliases":physical.storage_aliases.len(),"diagnostic_objects":physical.diagnostic_objects,
-            "other_source_objects":physical.other_source_objects,"non_response_objects":physical.non_response_objects,"staging_objects":physical.staging_objects,
+            "other_source_objects":physical.other_source_objects,"non_response_objects":physical.non_response_objects,"acquisition_records":physical.acquisition_records,"staging_objects":physical.staging_objects,
             "unresolved_objects":physical.unresolved_objects.len(),"unaccounted_attributable_objects":0
         },"all_mapped_once":true}),
     )
