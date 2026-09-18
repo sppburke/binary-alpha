@@ -845,7 +845,7 @@ fn v1_migrate_archive_restore_update_twice_retire_and_restore_both_brokers() {
                 );
             }
         }
-        // Rerunning reuses every installed object and downloads nothing new.
+        // Rerunning reuses every installed object and installs no new object.
         let again = pipeline("restore", &all_config, &["--all"]).unwrap();
         assert_eq!(
             again.lines().filter(|l| l.starts_with("restored ")).count(),
@@ -893,6 +893,39 @@ fn v1_migrate_archive_restore_update_twice_retire_and_restore_both_brokers() {
             .unwrap()
             .files
             .get_mut(&damaged_id)
+            .unwrap()
+            .bytes = original;
+        // A damaged dependency met while selecting a catalog fails that instrument alone.
+        let (_, selection_config) = consumer("migration_daily_restored_all_selection");
+        let manifest_id = pocket_catalog.dataset.file_id.clone();
+        let original = {
+            let mut state = f.drive.state.lock().unwrap();
+            let file = state.files.get_mut(&manifest_id).unwrap();
+            let original = file.bytes.clone();
+            file.bytes = b"damaged remote manifest".to_vec();
+            original
+        };
+        let error = pipeline("restore", &selection_config, &["--all"]).unwrap_err();
+        assert!(
+            error.contains("pipeline restore pocket_option:AEDCNY_otc failed:"),
+            "{error}"
+        );
+        assert!(
+            error.contains("pipeline: 1 restore(s) failed: pocket_option:AEDCNY_otc"),
+            "{error}"
+        );
+        assert!(
+            error
+                .lines()
+                .any(|l| l.starts_with("restored deriv:frxEURUSD ")),
+            "{error}"
+        );
+        f.drive
+            .state
+            .lock()
+            .unwrap()
+            .files
+            .get_mut(&manifest_id)
             .unwrap()
             .bytes = original;
     }

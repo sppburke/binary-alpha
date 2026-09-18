@@ -2191,12 +2191,14 @@ pub fn restore_all(config_path: &Path, out: &mut dyn Write) -> Result<(), String
     if instruments.is_empty() {
         return Err("drive: no archived catalog on this archive root".into());
     }
+    // Selection reads shared lineage scratch paths, so it stays sequential; a failed selection
+    // is that instrument's failure alone and never stops the others from restoring.
     let scratch = layout.state.join("downloads");
     let mut selected = Vec::new();
     for ((broker, symbol), mut found) in instruments {
-        let index = newest_catalog(&found, &mut drive, &scratch, access)?;
-        let (file_id, sha256, catalog) = found.swap_remove(index);
-        selected.push((broker, symbol, file_id, sha256, catalog));
+        let selection = newest_catalog(&found, &mut drive, &scratch, access)
+            .map(|index| found.swap_remove(index));
+        selected.push((broker, symbol, selection));
     }
     drop(drive);
     let workers = usize::try_from(config.parallel_jobs.unwrap_or(1)).unwrap_or(1);
@@ -2204,7 +2206,8 @@ pub fn restore_all(config_path: &Path, out: &mut dyn Write) -> Result<(), String
         workers,
         &selected,
         out,
-        &|(broker, symbol, file_id, sha256, catalog), lines| {
+        &|(broker, symbol, selection), lines| {
+            let (file_id, sha256, catalog) = selection.as_ref().map_err(Clone::clone)?;
             writeln!(
                 lines,
                 "selected {} {} catalog {file_id} sha256 {sha256} dataset {} stream {}",
@@ -2217,7 +2220,7 @@ pub fn restore_all(config_path: &Path, out: &mut dyn Write) -> Result<(), String
             restore_locked(&config, &layout, file_id, sha256, broker, symbol, lines)?;
             Ok(String::new())
         },
-        &|(broker, symbol, ..), reason| {
+        &|(broker, symbol, _), reason| {
             format!("pipeline restore {broker}:{symbol} failed: {reason}")
         },
     )?;
