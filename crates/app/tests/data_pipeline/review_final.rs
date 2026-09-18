@@ -937,6 +937,7 @@ fn legacy_shortfall_inside_verified_coverage_is_clipped_and_recorded() {
             entry["acquisition_id"],
             format!("v1-history:{}", legacy.generation)
         );
+        assert_eq!(entry["field"], "shortfall");
         assert_eq!(entry["reason"], "budget");
         assert_eq!(entry["recorded"], range(start, end));
         assert_eq!(

@@ -2495,9 +2495,10 @@ fn import_coverage(
 /// Acquisition claims for every retained v1 history record, plus the lineage entries for
 /// shortfall ranges that an older executable recorded inside already verified coverage.
 /// Before the fetch clip (`fetch.rs`, "still-unverified part"), a budget shortfall began at the
-/// request start, one verified minute before the unverified part. The claim keeps only the part
-/// outside verified coverage, exactly as a current fetch records it, and lineage keeps the
-/// recorded range so the retired record stays reconstructible.
+/// request start, one verified minute before the unverified part. The claim keeps the
+/// intersection of the recorded range with the request's unverified part (a current fetch trims
+/// only the endpoints), and lineage keeps the recorded field, reason, and range so the retired
+/// record stays reconstructible.
 pub(crate) fn history_claims(
     histories: &[(String, Value)],
 ) -> Result<(Vec<AcquisitionCoverage>, Vec<Value>), String> {
@@ -2514,11 +2515,12 @@ pub(crate) fn history_claims(
         let verified: Vec<_> = history.verified.iter().map(range).collect();
         let unresolved = complement(requested[0].bounds()?, &verified)?;
         let mut shortfalls = Vec::new();
-        for shortfall in history
+        let fields = history
             .shortfall
             .iter()
-            .chain(history.tail_shortfall.iter())
-        {
+            .map(|s| ("shortfall", s))
+            .chain(history.tail_shortfall.iter().map(|s| ("tail_shortfall", s)));
+        for (field, shortfall) in fields {
             let recorded = range(&shortfall.unresolved);
             let retained = clip(recorded.bounds()?, &unresolved)?;
             if retained.len() == 1 && retained[0].bounds()? == recorded.bounds()? {
@@ -2531,6 +2533,7 @@ pub(crate) fn history_claims(
             legacy.push(json!({
                 "generation": generation,
                 "acquisition_id": acquisition_id,
+                "field": field,
                 "reason": shortfall.reason,
                 "recorded": recorded,
                 "retained": retained,
