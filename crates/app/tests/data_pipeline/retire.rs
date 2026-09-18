@@ -21,19 +21,15 @@ struct DeleteFault {
     incomplete: bool,
     no_checksum: bool,
     hidden: BTreeSet<String>,
-}
-/// Decrements the served-connection count when a handler finishes.
-struct Leave<'a>(&'a AtomicUsize);
-impl Drop for Leave<'_> {
-    fn drop(&mut self) {
-        self.0.fetch_sub(1, Ordering::SeqCst);
-    }
+    /// Hold every DELETE until this many are waiting at the same time (or two seconds pass);
+    /// the client's deletions are concurrent exactly when the rendezvous is met.
+    rendezvous: Option<usize>,
+    waiting: usize,
+    rendezvous_met: bool,
 }
 struct RetireDrive {
     drive: FakeDrive,
     faults: Arc<Mutex<DeleteFault>>,
-    /// Connections being served right now and the most ever served at once.
-    in_flight: Arc<(AtomicUsize, AtomicUsize)>,
 }
 fn serve() -> RetireDrive {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -50,32 +46,21 @@ fn serve() -> RetireDrive {
         incomplete: false,
         no_checksum: false,
         hidden: BTreeSet::new(),
+        rendezvous: None,
+        waiting: 0,
+        rendezvous_met: false,
     }));
     let stop = Arc::new(AtomicBool::new(false));
-    let in_flight = Arc::new((AtomicUsize::new(0), AtomicUsize::new(0)));
-    let (shared, fault, stopped, activity) = (
-        Arc::clone(&state),
-        Arc::clone(&faults),
-        Arc::clone(&stop),
-        Arc::clone(&in_flight),
-    );
+    let (shared, fault, stopped) = (Arc::clone(&state), Arc::clone(&faults), Arc::clone(&stop));
     let thread = std::thread::spawn(move || {
         while !stopped.load(Ordering::SeqCst) {
             let Ok((mut stream, _)) = listener.accept() else {
                 std::thread::sleep(Duration::from_millis(2));
                 continue;
             };
-            // One thread per connection: the client's transfer pool may hold several requests
-            // open at once, and the most seen together is what the pool tests measure.
-            let (shared, fault, activity) = (
-                Arc::clone(&shared),
-                Arc::clone(&fault),
-                Arc::clone(&activity),
-            );
+            // One thread per connection: a held DELETE must not stop the next from being read.
+            let (shared, fault) = (Arc::clone(&shared), Arc::clone(&fault));
             std::thread::spawn(move || {
-                let now = activity.0.fetch_add(1, Ordering::SeqCst) + 1;
-                activity.1.fetch_max(now, Ordering::SeqCst);
-                let _leave = Leave(&activity.0);
                 let Some(request) = read_request(&mut stream) else {
                     return;
                 };
@@ -120,6 +105,27 @@ fn serve() -> RetireDrive {
                 }
                 let id = request.path.trim_start_matches("/drive/v3/files/");
                 if request.method == "DELETE" {
+                    if let Some(needed) = faults.rendezvous {
+                        // Wait outside both locks so the other deletions can arrive; only
+                        // deletions waiting at the same moment count.
+                        faults.waiting += 1;
+                        drop(faults);
+                        drop(state);
+                        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+                        let met = loop {
+                            if fault.lock().unwrap().waiting >= needed {
+                                break true;
+                            }
+                            if std::time::Instant::now() > deadline {
+                                break false;
+                            }
+                            std::thread::sleep(Duration::from_millis(5));
+                        };
+                        state = shared.lock().unwrap();
+                        faults = fault.lock().unwrap();
+                        faults.waiting -= 1;
+                        faults.rendezvous_met |= met;
+                    }
                     if let Some((status, change)) = faults.retry_fault.take() {
                         let file = state.files.get_mut(id).unwrap();
                         match change {
@@ -190,7 +196,6 @@ fn serve() -> RetireDrive {
         }
     });
     RetireDrive {
-        in_flight,
         drive: FakeDrive {
             base,
             state,
@@ -2207,7 +2212,11 @@ fn retirement_deletes_each_drive_batch_through_the_transfer_pool() {
     let f = fixture();
     let (path, p) = plan(&f);
     assert!(p.delete_drive.len() >= 3, "{}", p.delete_drive.len());
-    f.drive.faults.lock().unwrap().after = Some(2);
+    {
+        let mut faults = f.drive.faults.lock().unwrap();
+        faults.after = Some(2);
+        faults.rendezvous = Some(2);
+    }
     let error = apply(&f, &path).unwrap_err();
     assert!(error.contains("403"), "{error}");
     let remaining = p
@@ -2249,9 +2258,9 @@ fn retirement_deletes_each_drive_batch_through_the_transfer_pool() {
             .iter()
             .all(|e| !f.drive.drive.files().contains_key(&e.file_id))
     );
-    // The pool held several deletion requests open together, never more than its workers.
-    let most = f.drive.in_flight.1.load(Ordering::SeqCst);
-    assert!((2..=3).contains(&most), "{most}");
+    // Two deletions reached the fake together: serial deletion would have timed out the
+    // rendezvous, because the second request cannot arrive before the first is answered.
+    assert!(f.drive.faults.lock().unwrap().rendezvous_met);
     // Drive batches begin every operation, then record each completion in order; local
     // operations begin and complete one at a time.
     let mut expected: Vec<(usize, String)> = Vec::new();
