@@ -7,6 +7,7 @@ pub const PONG: &str = "3";
 pub enum Packet {
     Open,
     Connected,
+    Disconnected,
     Ping,
     Event { name: String, argument: Vec<u8> },
     BinaryHeader { name: String },
@@ -24,6 +25,9 @@ pub fn decode(text: &str) -> Result<Packet, String> {
     }
     if text.starts_with("40") {
         return Ok(Packet::Connected);
+    }
+    if text.starts_with("41") {
+        return Ok(Packet::Disconnected);
     }
     let (body, binary) = if let Some(body) = text.strip_prefix("451-") {
         (body, true)

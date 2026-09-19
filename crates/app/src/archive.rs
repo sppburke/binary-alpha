@@ -21,11 +21,15 @@ use parquet::file::metadata::KeyValue;
 use parquet::file::properties::WriterProperties;
 use parquet::file::reader::{FileReader, RowGroupReader, SerializedFileReader};
 use parquet::file::writer::SerializedFileWriter;
+use parquet::record::RowAccessor;
 use parquet::schema::parser::parse_message_type;
 use parquet::schema::printer::print_schema;
 
 /// The path of the normalized tick object inside a tick generation.
 pub const TICK_OBJECT_PATH: &str = "normalized/ticks.parquet";
+
+/// The path of the normalized bar object inside a broker bar generation.
+pub const BAR_OBJECT_PATH: &str = "normalized/bars.parquet";
 
 /// Rows per normalized row group.
 const ROW_GROUP_ROWS: usize = 1 << 20;
@@ -34,7 +38,7 @@ const ROW_GROUP_ROWS: usize = 1 << 20;
 const BATCH: usize = 1 << 16;
 
 /// The exact schema every archive file must carry, as the direct reader prints it.
-const BAR_SCHEMA: &str = "message duckdb_schema {
+pub(crate) const BAR_SCHEMA: &str = "message duckdb_schema {
   OPTIONAL BYTE_ARRAY symbol (UTF8);
   OPTIONAL INT32 symbol_id (INT_32);
   OPTIONAL INT64 timestamp_utc (TIMESTAMP(MICROS,true));
@@ -49,7 +53,7 @@ const BAR_SCHEMA: &str = "message duckdb_schema {
 }
 ";
 
-const TICK_SCHEMA: &str = "message binary_alpha_ticks {
+pub(crate) const TICK_SCHEMA: &str = "message binary_alpha_ticks {
   REQUIRED INT64 event_time_micros (TIMESTAMP(MICROS,true));
   REQUIRED INT64 price_units;
 }
@@ -63,7 +67,7 @@ const DAILY_TICK_SCHEMA: &str = "message schema {
 ";
 
 /// The exact schema of one candle object.
-const CANDLE_SCHEMA: &str = "message binary_alpha_candles {
+pub(crate) const CANDLE_SCHEMA: &str = "message binary_alpha_candles {
   REQUIRED INT64 open_time_micros (TIMESTAMP(MICROS,true));
   REQUIRED INT64 close_time_micros (TIMESTAMP(MICROS,true));
   REQUIRED INT64 known_at_micros (TIMESTAMP(MICROS,true));
@@ -213,6 +217,124 @@ pub fn write_ticks(
     Ok(summary)
 }
 
+/// Writes validated native bars as one Zstandard Parquet object in the exact archive shape,
+/// embedding the approved interval contract, and returns what was written. The sequence rules
+/// (strictly increasing starts on the period grid) are applied here; `server_offset_s` is the
+/// declared provider clock offset recorded beside every Unix start.
+pub fn write_bars(
+    path: &Path,
+    symbol: &str,
+    symbol_id: i32,
+    server_offset_s: i64,
+    bars: impl Iterator<Item = Result<Bar, String>>,
+) -> Result<DataSummary, String> {
+    let schema = Arc::new(parse_message_type(BAR_SCHEMA).map_err(|error| error.to_string())?);
+    let metadata = IntervalContract::five_second("parquet_metadata")
+        .metadata()
+        .into_iter()
+        .map(|(key, value)| KeyValue::new(key.to_string(), value))
+        .collect();
+    let properties = Arc::new(
+        WriterProperties::builder()
+            .set_compression(Compression::ZSTD(
+                ZstdLevel::try_new(3).map_err(|error| error.to_string())?,
+            ))
+            .set_key_value_metadata(Some(metadata))
+            .build(),
+    );
+    let file =
+        File::create(path).map_err(|error| format!("cannot create {}: {error}", path.display()))?;
+    let mut writer =
+        SerializedFileWriter::new(file, schema, properties).map_err(|error| error.to_string())?;
+    let mut sequence = BarSequence::default();
+    let mut summary = DataSummary::default();
+    let mut rows: Vec<Bar> = Vec::new();
+    let flush = |writer: &mut SerializedFileWriter<File>,
+                 rows: &mut Vec<Bar>|
+     -> Result<(), String> {
+        let levels = vec![1i16; rows.len()];
+        let mut group = writer.next_row_group().map_err(|error| error.to_string())?;
+        let mut index = 0;
+        while let Some(mut column) = group.next_column().map_err(|error| error.to_string())? {
+            let written = match column.untyped() {
+                ColumnWriter::ByteArrayColumnWriter(typed) => typed.write_batch(
+                    &vec![ByteArray::from(symbol); rows.len()],
+                    Some(&levels),
+                    None,
+                ),
+                ColumnWriter::Int32ColumnWriter(typed) => typed.write_batch(
+                    &rows
+                        .iter()
+                        .map(|bar| {
+                            if index == 1 {
+                                symbol_id
+                            } else {
+                                i32::from(bar.period_s)
+                            }
+                        })
+                        .collect::<Vec<_>>(),
+                    Some(&levels),
+                    None,
+                ),
+                ColumnWriter::Int64ColumnWriter(typed) => typed.write_batch(
+                    &rows
+                        .iter()
+                        .map(|bar| match index {
+                            2 => bar.start_unix_s * 1_000_000,
+                            3 => bar.start_unix_s,
+                            _ => bar.start_unix_s + server_offset_s,
+                        })
+                        .collect::<Vec<_>>(),
+                    Some(&levels),
+                    None,
+                ),
+                ColumnWriter::DoubleColumnWriter(typed) => typed.write_batch(
+                    &rows
+                        .iter()
+                        .map(|bar| [bar.open, bar.high, bar.low, bar.close, bar.volume][index - 5])
+                        .collect::<Vec<_>>(),
+                    Some(&levels),
+                    None,
+                ),
+                _ => unreachable!("the archive schema has no other column type"),
+            };
+            written.map_err(|error| error.to_string())?;
+            column.close().map_err(|error| error.to_string())?;
+            index += 1;
+        }
+        group.close().map_err(|error| error.to_string())?;
+        rows.clear();
+        Ok(())
+    };
+    for bar in bars {
+        let bar = bar?;
+        bar.validate(bar.period_s)?;
+        sequence.accept(bar.start_unix_s)?;
+        let start_micros = bar
+            .start_unix_s
+            .checked_mul(1_000_000)
+            .filter(|_| bar.start_unix_s.checked_add(server_offset_s).is_some())
+            .ok_or_else(|| {
+                format!(
+                    "bar at {} lies outside the representable time range",
+                    bar.start_unix_s
+                )
+            })?;
+        summary.observe(start_micros);
+        rows.push(bar);
+        if rows.len() == ROW_GROUP_ROWS {
+            flush(&mut writer, &mut rows)?;
+        }
+    }
+    if !rows.is_empty() {
+        flush(&mut writer, &mut rows)?;
+    }
+    let file = writer.into_inner().map_err(|error| error.to_string())?;
+    file.sync_all()
+        .map_err(|error| format!("cannot close {}: {error}", path.display()))?;
+    Ok(summary)
+}
+
 /// Reads a normalized tick object back, re-applying the schema and sequence rules.
 pub fn read_ticks(path: &Path, scale: PriceScale) -> Result<DataSummary, String> {
     read_ticks_with(path, scale, |_| Ok(()))
@@ -248,27 +370,15 @@ pub fn read_ticks_with(
     }
     let mut sequence = TickSequence::default();
     let mut summary = DataSummary::default();
-    for index in 0..reader.num_row_groups() {
-        let group = reader
-            .get_row_group(index)
-            .map_err(|error| error.to_string())?;
-        let times = read_column::<Int64Type>(&*group, 0, None)?;
-        let prices = read_column::<Int64Type>(&*group, 1, None)?;
-        if times.len() != prices.len() {
-            return Err(format!(
-                "{} row group {index} has ragged columns",
-                path.display()
-            ));
-        }
-        for (event_time_micros, price_units) in times.into_iter().zip(prices) {
-            let tick = Tick {
-                event_time_micros,
-                price_units,
-            };
-            sequence.accept(tick)?;
-            summary.observe(event_time_micros);
-            sink(tick)?;
-        }
+    for row in reader.get_row_iter(None).map_err(|e| e.to_string())? {
+        let row = row.map_err(|e| e.to_string())?;
+        let tick = Tick {
+            event_time_micros: row.get_timestamp_micros(0).map_err(|e| e.to_string())?,
+            price_units: row.get_long(1).map_err(|e| e.to_string())?,
+        };
+        sequence.accept(tick)?;
+        summary.observe(tick.event_time_micros);
+        sink(tick)?;
     }
     Ok(summary)
 }
@@ -343,6 +453,8 @@ pub struct BarExpectation {
 pub struct BarFileSummary {
     pub data: DataSummary,
     pub embedded_interval: bool,
+    /// The one provider identifier every row carried, absent for an empty file.
+    pub symbol_id: Option<i32>,
 }
 
 /// Validates one archive file row by row without rewriting it.
@@ -358,6 +470,15 @@ pub fn validate_bar_file_with(
     path: &Path,
     expectation: &BarExpectation,
     mut sink: impl FnMut(Bar) -> Result<(), String>,
+) -> Result<BarFileSummary, String> {
+    validate_bar_file_lossless_with(path, expectation, |row| sink(row.bar()?))
+}
+
+/// Streams all eleven provider columns with a bounded Parquet row iterator.
+pub fn validate_bar_file_lossless_with(
+    path: &Path,
+    expectation: &BarExpectation,
+    mut sink: impl FnMut(crate::daily::DailyBar) -> Result<(), String>,
 ) -> Result<BarFileSummary, String> {
     let reader = open(path)?;
     let schema = printed_schema(&reader);
@@ -400,93 +521,95 @@ pub fn validate_bar_file_with(
         }
         None => false,
     };
+    // Parquet's record decoder casts physical INT32 values annotated UINT_16 with `as`.
+    // Validate that narrowing separately in bounded batches before decoding provider rows.
+    for group_index in 0..reader.num_row_groups() {
+        let group = reader
+            .get_row_group(group_index)
+            .map_err(|e| e.to_string())?;
+        let mut periods = get_typed_column_reader::<Int32Type>(
+            group.get_column_reader(10).map_err(|e| e.to_string())?,
+        );
+        let mut values = Vec::new();
+        let mut levels = Vec::new();
+        loop {
+            values.clear();
+            levels.clear();
+            let (records, _, _) = periods
+                .read_records(
+                    crate::daily::COLUMN_SEGMENT_VALUES,
+                    Some(&mut levels),
+                    None,
+                    &mut values,
+                )
+                .map_err(|e| e.to_string())?;
+            if records == 0 {
+                break;
+            }
+            for value in &values {
+                u16::try_from(*value).map_err(|_| format!(
+                    "{} row group {group_index}: period {value} is not an unsigned 16-bit value",
+                    path.display(),
+                ))?;
+            }
+        }
+    }
     let mut sequence = BarSequence::default();
     let mut summary = DataSummary::default();
     let mut symbol_id = expectation.symbol_id;
-    for index in 0..reader.num_row_groups() {
-        let group = reader
-            .get_row_group(index)
-            .map_err(|error| error.to_string())?;
-        let rows = group.metadata().num_rows() as usize;
-        let symbols = read_column::<ByteArrayType>(&*group, 0, Some(rows))?;
-        let ids = read_column::<Int32Type>(&*group, 1, Some(rows))?;
-        let timestamps = read_column::<Int64Type>(&*group, 2, Some(rows))?;
-        let unix = read_column::<Int64Type>(&*group, 3, Some(rows))?;
-        let server = read_column::<Int64Type>(&*group, 4, Some(rows))?;
-        let prices: Vec<Vec<f64>> = (5..10)
-            .map(|column| read_column::<DoubleType>(&*group, column, Some(rows)))
-            .collect::<Result<_, _>>()?;
-        let periods = read_column::<Int32Type>(&*group, 10, Some(rows))?;
-        for row in 0..rows {
-            let symbol = symbols[row].as_utf8().map_err(|error| error.to_string())?;
-            if symbol != expectation.symbol {
-                return Err(format!(
-                    "{} row {row} carries symbol `{symbol}`, expected `{}`",
-                    path.display(),
-                    expectation.symbol
-                ));
-            }
-            match symbol_id {
-                Some(expected) if ids[row] != expected => {
-                    return Err(format!(
-                        "{} row {row} carries symbol identifier {}, expected {expected}",
-                        path.display(),
-                        ids[row]
-                    ));
-                }
-                Some(_) => {}
-                None => symbol_id = Some(ids[row]),
-            }
-            if timestamps[row]
-                != unix[row]
-                    .checked_mul(1_000_000)
-                    .ok_or("timestamp overflow")?
-            {
-                return Err(format!(
-                    "{} row {row}: timestamp {} does not equal Unix seconds {}",
-                    path.display(),
-                    timestamps[row],
-                    unix[row]
-                ));
-            }
-            if let Some(offset) = expectation.server_offset_s
-                && server[row].checked_sub(unix[row]) != Some(offset)
-            {
-                return Err(format!(
-                    "{} row {row}: server seconds {} minus Unix seconds {} is not the recorded offset {offset}",
-                    path.display(),
-                    server[row],
-                    unix[row]
-                ));
-            }
-            let period_s = u16::try_from(periods[row]).map_err(|_| {
-                format!(
-                    "{} row {row}: period {} is not an unsigned 16-bit value",
-                    path.display(),
-                    periods[row]
-                )
-            })?;
-            let bar = Bar {
-                start_unix_s: unix[row],
-                open: prices[0][row],
-                high: prices[1][row],
-                low: prices[2][row],
-                close: prices[3][row],
-                volume: prices[4][row],
-                period_s,
-            };
-            bar.validate(expectation.period_s)
-                .map_err(|reason| format!("{}: {reason}", path.display()))?;
-            sequence
-                .accept(bar.start_unix_s)
-                .map_err(|reason| format!("{}: {reason}", path.display()))?;
-            summary.observe(bar.start_unix_s * 1_000_000);
-            sink(bar)?;
+    for (index, row) in reader
+        .get_row_iter(None)
+        .map_err(|e| e.to_string())?
+        .enumerate()
+    {
+        let row = crate::daily::decode_bar(row.map_err(|e| e.to_string())?)?;
+        let symbol = row.symbol.as_deref().ok_or("null bar symbol")?;
+        if symbol != expectation.symbol {
+            return Err(format!(
+                "{} row {index} carries symbol `{symbol}`, expected `{}`",
+                path.display(),
+                expectation.symbol
+            ));
         }
+        let id = row.symbol_id.ok_or("null bar symbol_id")?;
+        if let Some(expected) = symbol_id
+            && expected != id
+        {
+            return Err(format!(
+                "{} row {index} carries symbol identifier {id}, expected {expected}",
+                path.display()
+            ));
+        }
+        symbol_id = Some(id);
+        let unix = row.unix_utc_s.ok_or("null bar unix_utc_s")?;
+        let timestamp = unix.checked_mul(1_000_000).ok_or("timestamp overflow")?;
+        if row.timestamp_utc != Some(timestamp) {
+            return Err(format!(
+                "{} row {index}: timestamp {:?} does not equal Unix seconds {unix}",
+                path.display(),
+                row.timestamp_utc
+            ));
+        }
+        let server = row.server_time_s.ok_or("null bar server_time_s")?;
+        if let Some(offset) = expectation.server_offset_s
+            && server.checked_sub(unix) != Some(offset)
+        {
+            return Err(format!(
+                "{} row {index}: server seconds {server} minus Unix seconds {unix} is not the recorded offset {offset}",
+                path.display()
+            ));
+        }
+        let context = |reason| format!("{} row {index}: {reason}", path.display());
+        let bar = row.bar().map_err(context)?;
+        bar.validate(expectation.period_s).map_err(context)?;
+        sequence.accept(unix).map_err(context)?;
+        summary.observe(timestamp);
+        sink(row)?;
     }
     Ok(BarFileSummary {
         data: summary,
         embedded_interval,
+        symbol_id,
     })
 }
 
@@ -684,7 +807,7 @@ impl CandleWriter {
 
 /// The integer columns of the candle schema in order; optional `gap_before_micros` is written
 /// through its own definition levels.
-fn int_field(candle: &Candle, column: usize) -> i64 {
+pub(crate) fn int_field(candle: &Candle, column: usize) -> i64 {
     match column {
         0 => candle.open_time_micros,
         1 => candle.close_time_micros,
@@ -715,7 +838,7 @@ fn count(value: u64) -> i64 {
     i64::try_from(value).expect("candle counts stay below the column's limit")
 }
 
-fn flag_field(candle: &Candle, column: usize) -> bool {
+pub(crate) fn flag_field(candle: &Candle, column: usize) -> bool {
     let flags = candle.flags;
     match column {
         21 => flags.low_activity,
@@ -736,7 +859,7 @@ fn flag_field(candle: &Candle, column: usize) -> bool {
 
 /// The footer metadata every candle object carries: the instrument, scale, and stream it
 /// belongs to, so a read-back is bound to exactly one stream of one instrument.
-fn candle_metadata(
+pub(crate) fn candle_metadata(
     instrument: &InstrumentId,
     scale: PriceScale,
     duration_seconds: u32,
@@ -857,20 +980,22 @@ pub fn read_candles(
                     path.display()
                 ));
             }
-            if let Some(last) = last_close
-                && candle.open_time_micros < last
-            {
-                return Err(format!(
-                    "{} row {row}: candle opens before the previous candle closed",
-                    path.display()
-                ));
-            }
+            check_candle_order(last_close, &candle)
+                .map_err(|reason| format!("{} row {row}: {reason}", path.display()))?;
             rows += 1;
             first_open.get_or_insert(candle.open_time_micros);
             last_close = Some(candle.close_time_micros);
         }
     }
     Ok((rows, first_open, last_close))
+}
+
+/// Shared non-overlap contract for legacy and daily candle files and partition boundaries.
+pub(crate) fn check_candle_order(last_close: Option<i64>, candle: &Candle) -> Result<(), String> {
+    if last_close.is_some_and(|last| candle.open_time_micros < last) {
+        return Err("candle opens before the previous candle closed".into());
+    }
+    Ok(())
 }
 
 /// Reads every value of one optional column of a row group as `Some` or `None` per row.
@@ -1314,6 +1439,60 @@ mod tests {
     use super::*;
     use binary_alpha_engine::market::{BrokerId, ProviderSymbol};
     use parquet::record::RowAccessor;
+
+    #[test]
+    fn bars_round_trip_through_parquet_with_source_and_interval_metadata() {
+        let dir =
+            std::env::temp_dir().join(format!("binary-alpha-archive-bars-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("bars.parquet");
+        let bars = [0, 5, 15].map(|start_unix_s| Bar {
+            provider: (),
+            start_unix_s,
+            open: 1.25,
+            high: 1.5,
+            low: 1.0,
+            close: 1.375,
+            volume: start_unix_s as f64,
+            period_s: 5,
+        });
+        let written = write_bars(&path, "S", 538, 7_200, bars.into_iter().map(Ok)).unwrap();
+        let expectation = BarExpectation {
+            symbol: "S".to_string(),
+            symbol_id: Some(538),
+            period_s: 5,
+            server_offset_s: Some(7_200),
+            interval: IntervalContract::five_second("parquet_metadata"),
+            metadata_required: true,
+        };
+        let mut decoded = Vec::new();
+        let read = validate_bar_file_with(&path, &expectation, |bar| {
+            decoded.push(bar);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(decoded, bars);
+        assert_eq!(read.data, written);
+        assert_eq!(read.symbol_id, Some(538));
+        assert!(read.embedded_interval);
+        let reader = open(&path).unwrap();
+        for row in reader.get_row_iter(None).unwrap() {
+            let row = row.unwrap();
+            assert_eq!(row.get_string(0).unwrap(), "S");
+            assert_eq!(row.get_int(1).unwrap(), 538);
+            assert_eq!(row.get_long(4).unwrap() - row.get_long(3).unwrap(), 7_200);
+        }
+        let pairs = reader
+            .metadata()
+            .file_metadata()
+            .key_value_metadata()
+            .unwrap();
+        assert_eq!(
+            embedded_interval(pairs, "parquet_metadata").unwrap(),
+            expectation.interval
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 
     #[test]
     fn ticks_round_trip_through_parquet() {

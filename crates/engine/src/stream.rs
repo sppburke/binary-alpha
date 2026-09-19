@@ -11,8 +11,9 @@ use sha2::{Digest, Sha256};
 
 use crate::config::{CandleSpec, Instrument};
 use crate::dataset::{
-    Capability, CapabilityError, Coverage, DatasetRole, GenerationManifest, NativeGranularity,
-    ObjectRecord, ObjectRole, PriceRepresentation, SourceKind, manifest_key,
+    Capability, CapabilityError, Coverage, DatasetRole, DayInventoryEntry, GenerationManifest,
+    Layout, NativeGranularity, ObjectRecord, ObjectRole, PriceRepresentation, SourceKind, daily,
+    manifest_key,
 };
 use crate::market::{
     Bar, BrokerId, Currency, PriceScale, ProviderSymbol, Tick, float_price_units,
@@ -66,7 +67,7 @@ pub struct BarUnits {
 impl Observation {
     /// Converts an archive bar exactly to units at `scale`; a price whose shortest decimal
     /// rendering needs more fraction digits is rejected, never rounded.
-    pub fn from_bar(bar: &Bar, scale: PriceScale) -> Result<Self, String> {
+    pub fn from_bar<P>(bar: &Bar<P>, scale: PriceScale) -> Result<Self, String> {
         bar.validate(bar.period_s)?;
         let units = |value: f64| {
             float_price_units(value, scale)
@@ -147,6 +148,7 @@ impl Record {
 crate::string_enum! {
     /// Why a record was refused; the stream state is unchanged by a refusal.
     RejectionReason "rejection" {
+        SessionCalendar => "session_calendar",
         BackwardsTime => "backwards_time",
         ConflictingDuplicate => "conflicting_duplicate",
         WrongGranularity => "wrong_granularity",
@@ -532,6 +534,9 @@ struct CandleStream {
     hard_min_observations: Option<u32>,
     working: Option<Working>,
     previous_open_time: Option<i64>,
+    // Actual missing-feed evidence on source fills is also carried to the next real candle.
+    source_fill_missing: u64,
+    source_fill_gap: Option<i64>,
     facts: StreamFacts,
 }
 
@@ -550,6 +555,7 @@ pub fn interval_open(event: i64, duration: i64, offset: i64) -> i64 {
 /// The thresholds of the enabled checks, in the stream's units.
 #[derive(Debug, Clone, Copy)]
 struct Checks {
+    source_fill_quality: bool,
     /// The gap and reopen thresholds.
     gap_micros: Option<(i64, i64)>,
     frozen: Option<(u32, i64)>,
@@ -633,6 +639,7 @@ impl InstrumentStream {
             .collect();
         let seconds = |value: u32| i64::from(value) * MICROS_PER_SECOND;
         let checks = Checks {
+            source_fill_quality: instrument.session.is_some(),
             gap_micros: instrument
                 .gap
                 .as_ref()
@@ -666,6 +673,8 @@ impl InstrumentStream {
                 hard_min_observations: spec.hard_min_observations,
                 working: None,
                 previous_open_time: None,
+                source_fill_missing: 0,
+                source_fill_gap: None,
                 facts: StreamFacts {
                     duration_seconds: spec.duration_seconds,
                     offset_seconds: spec.offset_seconds,
@@ -1030,7 +1039,25 @@ impl InstrumentStream {
 
     /// Closes the stream's working candle, evaluates its checks, and records its facts.
     fn finalize(stream: &mut CandleStream, checks: &Checks, known_at: i64) -> Candle {
-        let working = stream.working.take().expect("a working candle");
+        let mut working = stream.working.take().expect("a working candle");
+        let source_fill = checks.source_fill_quality
+            && working.volume == Some(0.0)
+            && working.open == working.high
+            && working.open == working.low
+            && working.open == working.close;
+        if checks.source_fill_quality {
+            if source_fill {
+                stream.source_fill_missing += working.missing_before;
+                stream.source_fill_gap = stream.source_fill_gap.max(working.gap_before);
+                if working.max_gap_inside > 0 {
+                    stream.source_fill_gap =
+                        stream.source_fill_gap.max(Some(working.max_gap_inside));
+                }
+            } else {
+                working.missing_before += std::mem::take(&mut stream.source_fill_missing);
+                working.gap_before = working.gap_before.max(stream.source_fill_gap.take());
+            }
+        }
         stream.previous_open_time = Some(working.open_time);
         let active_span = working.last_known_at - working.first_event;
         let flags = Flags {
@@ -1047,10 +1074,11 @@ impl InstrumentStream {
                 .gap_micros
                 .is_some_and(|(max, _)| working.max_gap_inside > max),
             missing_before: working.missing_before > 0,
-            frozen: checks.frozen.is_some_and(|(observations, micros)| {
-                working.frozen_observations >= u64::from(observations)
-                    || working.frozen_micros >= micros
-            }),
+            frozen: source_fill
+                || checks.frozen.is_some_and(|(observations, micros)| {
+                    working.frozen_observations >= u64::from(observations)
+                        || working.frozen_micros >= micros
+                }),
             jump: checks
                 .jump_basis_points
                 .is_some_and(|min| working.max_jump[0] >= u64::from(min)),
@@ -1220,8 +1248,20 @@ impl StreamSummary {
 /// The identity of a stream generation: the source generation and the instrument's canonical
 /// definition, so the same source audited under the same definition names the same generation.
 pub fn stream_generation_id(source_generation: &str, definition: &str) -> String {
+    stream_generation_id_with_layout(source_generation, definition, None)
+}
+
+/// Layout-aware stream identity, preserving the legacy recipe for an absent marker.
+pub fn stream_generation_id_with_layout(
+    source_generation: &str,
+    definition: &str,
+    layout: Option<Layout>,
+) -> String {
     let mut hasher = Sha256::new();
     hasher.update(STREAM_GENERATION_DOMAIN_V1);
+    if let Some(layout) = layout {
+        hasher.update(format!("layout {layout}\n").as_bytes());
+    }
     hasher.update(source_generation.as_bytes());
     hasher.update(b"\n");
     hasher.update(definition.as_bytes());
@@ -1232,6 +1272,10 @@ pub fn stream_generation_id(source_generation: &str, definition: &str) -> String
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct StreamManifest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub layout: Option<Layout>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub day_inventory: Vec<DayInventoryEntry>,
     pub kind: String,
     pub schema_version: u32,
     pub generation: String,
@@ -1240,6 +1284,9 @@ pub struct StreamManifest {
     pub instrument: String,
     pub role: DatasetRole,
     pub source_generation: String,
+    /// Original source location; restored closures may resolve the same generation locally.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_manifest_uri: Option<String>,
     pub source_kind: SourceKind,
     pub definition: Instrument,
     pub config_hash: String,
@@ -1282,6 +1329,12 @@ impl StreamManifest {
     }
 
     fn validate(&self) -> Result<(), String> {
+        if let Some(uri) = &self.source_manifest_uri {
+            let target: crate::config::ManifestUri = uri.parse()?;
+            if target.generation() != self.source_generation {
+                return Err("stream source reference does not name its source generation".into());
+            }
+        }
         let definition = &self.definition;
         if self.broker != definition.broker
             || self.provider_symbol != definition.provider_symbol
@@ -1296,7 +1349,11 @@ impl StreamManifest {
             .validate()
             .map_err(|reason| format!("definition: {reason}"))?;
         if self.generation
-            != stream_generation_id(&self.source_generation, &definition.canonical_toml())
+            != stream_generation_id_with_layout(
+                &self.source_generation,
+                &definition.canonical_toml(),
+                self.layout,
+            )
         {
             return Err(format!(
                 "generation `{}` does not match the source generation and definition",
@@ -1325,10 +1382,39 @@ impl StreamManifest {
         {
             return Err("streams do not match the definition's candle list".to_string());
         }
-        for summary in &self.streams {
-            let path = StreamSummary::object_path(summary.duration_seconds, summary.offset_seconds);
-            if !self.objects.iter().any(|object| object.path == path) {
-                return Err(format!("expected a `{path}` object"));
+        if self.layout == Some(Layout::DailyV2) {
+            if self.role != DatasetRole::Development || self.source_kind == SourceKind::TickCsv {
+                return Err("daily-v2 requires a development daily/archive/history source".into());
+            }
+            let specs: Vec<_> = self
+                .streams
+                .iter()
+                .map(|s| (s.duration_seconds, s.offset_seconds))
+                .collect();
+            daily::validate_inventory(
+                &self.day_inventory,
+                &self.objects,
+                daily::DailyOwner::Stream(&specs),
+            )?;
+            for summary in &self.streams {
+                if daily::inventory_rows(self.day_inventory.iter().filter(|day| {
+                    day.duration == Some(summary.duration_seconds)
+                        && day.offset == Some(summary.offset_seconds)
+                }))? != summary.rows
+                {
+                    return Err("candle inventory rows disagree with stream summary".into());
+                }
+            }
+        } else {
+            if !self.day_inventory.is_empty() {
+                return Err("day_inventory requires layout daily-v2".into());
+            }
+            for summary in &self.streams {
+                let path =
+                    StreamSummary::object_path(summary.duration_seconds, summary.offset_seconds);
+                if !self.objects.iter().any(|object| object.path == path) {
+                    return Err(format!("expected a `{path}` object"));
+                }
             }
         }
         if self
@@ -1379,6 +1465,7 @@ mod tests {
                 min_basis_points: 5,
             }),
             span: Some(SpanCheck { min_percent: 75 }),
+            session: None,
             sessions: Some(vec![Session {
                 name: "week".to_string(),
                 open_seconds: 0,
@@ -1680,6 +1767,63 @@ mod tests {
     }
 
     #[test]
+    fn missing_feed_evidence_survives_source_fills_to_next_real_candle() {
+        let granularity = NativeGranularity::Bar { period_seconds: 5 };
+        let mut definition = instrument(granularity, &[(5, 0)]);
+        definition.session = Some(crate::session::Session::Always);
+        definition.candles[0].min_observations = None;
+        definition.candles[0].hard_min_observations = None;
+        let mut stream = InstrumentStream::new(&definition, source(granularity, None)).unwrap();
+        let raw = feed(
+            &mut stream,
+            &[
+                bar(0, [100_000, 100_002, 99_999, 100_001], 1.0),
+                bar(15, [100_001; 4], 0.0),
+                bar(20, [100_001; 4], 0.0),
+                bar(25, [100_001, 100_002, 99_999, 100_001], 1.0),
+                bar(30, [100_001, 100_002, 99_999, 100_001], 1.0),
+                bar(35, [100_001; 4], 0.0),
+                bar(40, [100_001, 100_002, 99_999, 100_001], 1.0),
+            ],
+        );
+        let mut transform = crate::continuous::Continuous::new(
+            definition.session.as_ref().unwrap().calendar().unwrap(),
+            &definition.candles[0],
+            vec![(0, 45 * SECOND)],
+            true,
+        )
+        .unwrap();
+        let mut rows = Vec::new();
+        for (_, candle) in raw {
+            transform
+                .push(candle, &mut |c| {
+                    rows.push(c);
+                    Ok(())
+                })
+                .unwrap();
+        }
+        assert_eq!(
+            rows.iter()
+                .map(|c| c.open_time_micros / SECOND)
+                .collect::<Vec<_>>(),
+            (0..45).step_by(5).collect::<Vec<_>>()
+        );
+        assert_eq!(rows[3].missing_buckets_before, 2);
+        assert_eq!(rows[5].missing_buckets_before, 2);
+        assert_eq!(rows[5].gap_before_micros, Some(10 * SECOND));
+        assert!(rows[5].flags.gap_before && rows[5].flags.missing_before);
+        assert!(rows[1..=5].iter().all(|c| !c.flags.clean()));
+        for i in [6, 8] {
+            assert_eq!(rows[i].missing_buckets_before, 0);
+            assert_eq!(rows[i].gap_before_micros, Some(0));
+            assert!(
+                rows[i].flags.clean(),
+                "contiguous source rows never count as missing feed"
+            );
+        }
+    }
+
+    #[test]
     fn bars_aggregate_and_close_at_their_own_end() {
         let granularity = NativeGranularity::Bar { period_seconds: 5 };
         let mut stream = InstrumentStream::new(
@@ -1813,6 +1957,7 @@ mod tests {
                     .contains("\"required\":\"ticks\"")
         }));
         let archive = Bar {
+            provider: (),
             start_unix_s: 65,
             open: 1.25,
             high: 1.3,
@@ -1991,6 +2136,7 @@ mod tests {
         // The start converts to micros, but its end would not fit; a tick stream refuses the
         // same bar for its range before its granularity.
         let far = Bar {
+            provider: (),
             start_unix_s: 9_223_372_036_850,
             open: 1.0,
             high: 1.0,
@@ -2354,9 +2500,95 @@ mod tests {
     }
 
     #[test]
+    fn daily_stream_manifest_owns_daily_candles_and_profile() {
+        let definition = instrument(NativeGranularity::Tick, &[(5, 0)]);
+        let day = daily::tests::entry(crate::dataset::DayFamily::Candles);
+        let mut manifest = StreamManifest {
+            layout: Some(Layout::DailyV2),
+            day_inventory: vec![day.clone()],
+            kind: STREAM_MANIFEST_KIND.into(),
+            schema_version: STREAM_SCHEMA_VERSION,
+            generation: stream_generation_id_with_layout(
+                "source",
+                &definition.canonical_toml(),
+                Some(Layout::DailyV2),
+            ),
+            broker: definition.broker.clone(),
+            provider_symbol: definition.provider_symbol.clone(),
+            instrument: definition.id().to_string(),
+            role: DatasetRole::Development,
+            source_generation: "source".into(),
+            source_manifest_uri: None,
+            source_kind: SourceKind::TickParquetDaily,
+            definition: definition.clone(),
+            config_hash: "config".into(),
+            code_revision: "fixture".into(),
+            observations: 2,
+            coverage: None,
+            streams: vec![StreamSummary {
+                duration_seconds: 5,
+                offset_seconds: 0,
+                rows: 2,
+                first_open_time: day.first_time.clone(),
+                last_close_time: Some("2026-09-18T00:00:00Z".into()),
+            }],
+            objects: vec![
+                daily::tests::object(&day.logical_path().unwrap(), ObjectRole::Normalized),
+                daily::tests::object("profile.json", ObjectRole::Normalized),
+            ],
+        };
+        assert_eq!(
+            StreamManifest::from_json(&manifest.to_json()).unwrap(),
+            manifest
+        );
+        let legacy_id = stream_generation_id("source", &definition.canonical_toml());
+        assert_ne!(manifest.generation, legacy_id);
+        let mut bad = manifest.clone();
+        bad.streams[0].rows += 1;
+        assert!(
+            StreamManifest::from_json(&bad.to_json())
+                .unwrap_err()
+                .contains("inventory rows")
+        );
+        let mut bad = manifest.clone();
+        bad.day_inventory[0].duration = Some(10);
+        assert!(StreamManifest::from_json(&bad.to_json()).is_err());
+        let mut bad = manifest.clone();
+        bad.layout = None;
+        bad.generation = legacy_id;
+        assert!(
+            StreamManifest::from_json(&bad.to_json())
+                .unwrap_err()
+                .contains("requires layout")
+        );
+        let mut bad = manifest.clone();
+        bad.objects.pop();
+        assert!(
+            StreamManifest::from_json(&bad.to_json())
+                .unwrap_err()
+                .contains("profile.json")
+        );
+        manifest.objects.push(daily::tests::object(
+            "provenance/lineage.json",
+            ObjectRole::Provenance,
+        ));
+        assert!(StreamManifest::from_json(&manifest.to_json()).is_err());
+    }
+
+    #[test]
+    fn legacy_stream_identity_is_pinned() {
+        assert_eq!(
+            stream_generation_id("source", "definition"),
+            "cbcfcf95ac592ee678061c858cbc3236be8d410335d971441960f16751cb18ea"
+        );
+    }
+
+    #[test]
     fn stream_manifests_bind_identity_and_round_trip() {
         let definition = instrument(NativeGranularity::Tick, &[(5, 0), (15, 5)]);
         let manifest = StreamManifest {
+            layout: None,
+            day_inventory: Vec::new(),
             kind: STREAM_MANIFEST_KIND.to_string(),
             schema_version: STREAM_SCHEMA_VERSION,
             generation: stream_generation_id("source-generation", &definition.canonical_toml()),
@@ -2365,6 +2597,7 @@ mod tests {
             instrument: "b:S".to_string(),
             role: DatasetRole::Development,
             source_generation: "source-generation".to_string(),
+            source_manifest_uri: None,
             source_kind: SourceKind::TickCsv,
             definition: definition.clone(),
             config_hash: "v3:sha256:0".to_string(),

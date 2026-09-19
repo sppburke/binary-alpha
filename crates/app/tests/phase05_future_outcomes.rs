@@ -17,6 +17,7 @@ use binary_alpha_engine::outcomes::{
     InvalidReason, MISSING_INDEX, Outcome, OutcomeBuilder, OutcomeManifest, OutcomeRule,
     TICK_PRICE_OBJECT_PATH, TICK_TIME_OBJECT_PATH, outcome_generation_id, stream_object_paths,
 };
+use common::current::import;
 use common::*;
 use parquet::file::reader::{FileReader, SerializedFileReader};
 use parquet::record::RowAccessor;
@@ -129,7 +130,7 @@ fn synthetic_ticks() -> Vec<(i64, i64)> {
 
 fn tick_instrument(symbol: &str, candles: &str) -> String {
     format!(
-        "\n[[instruments]]\nbroker = \"pocket_option\"\nprovider_symbol = \"{symbol}\"\nbase_currency = \"AED\"\nquote_currency = \"CNY\"\nprice_scale = 6\nnative_granularity = {{ kind = \"tick\" }}\ngap = {{ max_seconds = 2, reopen_seconds = 60 }}\nfrozen = {{ min_observations = 10, min_seconds = 5 }}\njump = {{ min_basis_points = 5 }}\nspan = {{ min_percent = 75 }}\nsessions = [{{ name = \"week\", open_seconds = 0, close_seconds = 604800 }}]\ncandles = [{candles}]\n"
+        "\n[[instruments]]\nbroker = \"pocket_option\"\nprovider_symbol = \"{symbol}\"\nbase_currency = \"AED\"\nquote_currency = \"CNY\"\nprice_scale = 6\nsession = {{ kind = \"always\" }}\nnative_granularity = {{ kind = \"tick\" }}\ngap = {{ max_seconds = 2, reopen_seconds = 60 }}\nfrozen = {{ min_observations = 10, min_seconds = 5 }}\njump = {{ min_basis_points = 5 }}\nspan = {{ min_percent = 75 }}\nsessions = [{{ name = \"week\", open_seconds = 0, close_seconds = 604800 }}]\ncandles = [{candles}]\n"
     )
 }
 
@@ -842,7 +843,17 @@ fn outcomes_build_publishes_reconstructs_and_reuses() {
     // A tick manifest declaring more ticks than the missing index admits is refused before
     // anything is allocated or read.
     let mut oversized = manifest_json(&tick_manifest);
+    let declared = oversized["row_count"].as_u64().unwrap();
     oversized["row_count"] = json!(4_294_967_296u64);
+    // The daily manifest's own inventory must agree with the declared total so that the
+    // refusal under test is the outcome index bound, not manifest self-consistency.
+    let first_day = oversized["day_inventory"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .find(|day| day["family"] == "observations")
+        .unwrap();
+    first_day["rows"] = json!(first_day["rows"].as_u64().unwrap() + 4_294_967_296u64 - declared);
     let oversized_path = scratch.path(&format!(
         "oversized/manifests/{}/ready.json",
         oversized["generation"].as_str().unwrap()

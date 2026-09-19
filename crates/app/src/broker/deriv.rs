@@ -5,13 +5,21 @@ pub use options::{
     to_observation,
 };
 
+/// The largest tick page the provider serves; the last that many ticks at or before the page
+/// anchor within its window.
+const HISTORY_PAGE_TICKS: u32 = 1000;
+/// The explicit window a backward page names before its anchor: without `start`, the provider
+/// ignores an `end` older than the current session and answers with the latest ticks.
+const HISTORY_WINDOW_SECONDS: i64 = 7 * 86_400;
+
 use super::transport::{Connector, Frame, Http, Transport};
 use super::wire::WireDecimal;
 use super::{
-    Cancellation, Clock, Continuity, DiscoveredInstrument, HistoryPage, LiveEvent, LiveObservation,
-    MarketDataBroker, RateBudget, RateGroup, payload_hash,
+    Cancellation, Clock, Continuity, DiscoveredInstrument, HistoryPage, HistoryRows, LiveEvent,
+    LiveObservation, MarketDataBroker, RateBudget, RateGroup, payload_hash,
 };
 use binary_alpha_engine::config::{AccountClass, DerivSettings, RateBudgets};
+use binary_alpha_engine::dataset::NativeGranularity;
 use binary_alpha_engine::execution::Decimal;
 use binary_alpha_engine::market::{BrokerId, Currency, InstrumentId, PriceScale, Tick};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -214,7 +222,9 @@ impl DerivConnection {
                 .receive(remaining)?
                 .ok_or_else(|| format!("deriv {expected}: response timeout"))?;
             if response.header.req_id == Some(id) {
-                if response.header.msg_type != expected {
+                // A provider error echoes the request under its own message type; the caller
+                // owns its meaning (a rejected purchase is an outcome, a history error a fault).
+                if response.header.msg_type != expected && response.header.error.is_none() {
                     return Err(format!("deriv {expected}: unexpected msg_type field"));
                 }
                 return Ok(response);
@@ -301,6 +311,10 @@ struct Contracts {
 struct HistoryRequest<'a> {
     ticks_history: &'a str,
     style: &'static str,
+    /// The provider serves an `end` older than the current session only inside an explicit
+    /// window; a page therefore names the week before its anchor as its start.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    start: Option<String>,
     end: String,
     count: u32,
     req_id: u64,
@@ -369,7 +383,10 @@ fn pip_digits(pip_size: &WireDecimal) -> Result<u8, String> {
 fn precision(pip_size: &WireDecimal, scale: PriceScale) -> Result<(), String> {
     let digits = pip_size.require_number()?.rescale(0)?.coefficient();
     if digits < 0 || digits > i128::from(scale.digits()) {
-        return Err("deriv: pip_size exceeds configured price scale".into());
+        return Err(format!(
+            "deriv: pip_size requires {digits} fraction digits, exceeds configured price_scale {}",
+            scale.digits()
+        ));
     }
     Ok(())
 }
@@ -502,23 +519,91 @@ impl MarketDataBroker for DerivMarketData {
         instrument: &InstrumentId,
         scale: PriceScale,
         before_micros: Option<i64>,
+        granularity: NativeGranularity,
     ) -> Result<HistoryPage, String> {
+        // Public ticks_history measurement (2026-09-16): "sustained aggregate throughput
+        // settles at roughly 4 to 5 pages per second across all connections" after RateLimit.
+        const INITIAL_BACKOFF_MICROS: i64 = 1_000_000;
+        const MAX_BACKOFF_MICROS: i64 = 8_000_000;
+        const BACKOFF_BUDGET_MICROS: i64 = 120_000_000;
+
         self.check_instrument(instrument)?;
+        if granularity != NativeGranularity::Tick {
+            return Err(format!(
+                "deriv history: {granularity} history is not supported; only ticks are"
+            ));
+        }
         let end = before_micros.map_or_else(
             || "latest".to_string(),
             |t| t.div_euclid(1_000_000).to_string(),
         );
-        let response = self
-            .connection
-            .request(RateGroup::Other, "history", |req_id| HistoryRequest {
-                ticks_history: instrument.provider_symbol.as_str(),
-                style: "ticks",
-                end,
-                // ticks_history_request.schema.json:20-24 declares no maximum; the retained request used 100.
-                count: 100,
-                req_id,
-            })?;
-        let body: HistoryResponse = decode(&response.raw, "history")?;
+        let start = before_micros.map(|t| {
+            t.div_euclid(1_000_000)
+                .saturating_sub(HISTORY_WINDOW_SECONDS)
+                .to_string()
+        });
+        let mut backoff_micros = INITIAL_BACKOFF_MICROS;
+        let mut deadline = None;
+        let exhausted = || "deriv history: RateLimit (retried for 120 s)".to_string();
+        let response = loop {
+            if deadline.is_some_and(|end| self.connection.clock.now_micros() >= end) {
+                return Err(exhausted());
+            }
+            let (req_id, text) =
+                self.connection
+                    .prepare(RateGroup::Other, |req_id| HistoryRequest {
+                        ticks_history: instrument.provider_symbol.as_str(),
+                        style: "ticks",
+                        start: start.clone(),
+                        end: end.clone(),
+                        // The provider returns at most 1000 ticks per page (observed against the
+                        // public endpoint on 2026-09-16; a request for 5000 returned 1000).
+                        count: HISTORY_PAGE_TICKS,
+                        req_id,
+                    })?;
+            if deadline.is_some_and(|end| self.connection.clock.now_micros() >= end) {
+                return Err(exhausted());
+            }
+            self.connection.transport.send(Frame::Text(text))?;
+            let response = self.connection.response(req_id, "history");
+            if deadline.is_some_and(|end| self.connection.clock.now_micros() >= end) {
+                return Err(exhausted());
+            }
+            let response = response?;
+            let Some(error) = &response.header.error else {
+                break response;
+            };
+            let reason = format!("deriv history: {}", error.code);
+            self.connection.last_rejection = Some(reason.clone());
+            if error.code != "RateLimit" {
+                return Err(reason);
+            }
+            let now = self.connection.clock.now_micros();
+            let end = *deadline.get_or_insert_with(|| now.saturating_add(BACKOFF_BUDGET_MICROS));
+            let wait_micros = backoff_micros.min(end.saturating_sub(now));
+            self.connection.clock.sleep(wait_micros);
+            backoff_micros = (backoff_micros * 2).min(MAX_BACKOFF_MICROS);
+        };
+        let _ = scale;
+        Ok(HistoryPage {
+            raw: response.raw,
+            anchor_token: before_micros.map(|t| t.div_euclid(1_000_000).to_string()),
+            receipt_micros: response.receipt_micros,
+        })
+    }
+    fn decode_history(
+        &self,
+        _: &InstrumentId,
+        raw: &[u8],
+        scale: PriceScale,
+        granularity: NativeGranularity,
+    ) -> Result<(Option<i32>, HistoryRows), String> {
+        if granularity != NativeGranularity::Tick {
+            return Err(format!(
+                "deriv history: {granularity} history is not supported; only ticks are"
+            ));
+        }
+        let body: HistoryResponse = decode(raw, "history")?;
         precision(&body.pip_size, scale)?;
         if body.history.prices.len() != body.history.times.len() {
             return Err("deriv history: ragged prices and times arrays".into());
@@ -536,11 +621,7 @@ impl MarketDataBroker for DerivMarketData {
                 })
             })
             .collect::<Result<Vec<_>, String>>()?;
-        Ok(HistoryPage {
-            raw: response.raw,
-            anchor_token: before_micros.map(|t| t.div_euclid(1_000_000).to_string()),
-            rows,
-        })
+        Ok((None, HistoryRows::Ticks(rows)))
     }
     fn subscribe(&mut self, instrument: &InstrumentId, scale: PriceScale) -> Result<(), String> {
         self.check_instrument(instrument)?;

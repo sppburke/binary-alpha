@@ -799,8 +799,18 @@ impl broker::MarketDataBroker for BreakMarket {
         id: &binary_alpha_engine::market::InstrumentId,
         scale: binary_alpha_engine::market::PriceScale,
         before: Option<i64>,
+        granularity: binary_alpha_engine::dataset::NativeGranularity,
     ) -> Result<broker::HistoryPage, String> {
-        self.inner.history_page(id, scale, before)
+        self.inner.history_page(id, scale, before, granularity)
+    }
+    fn decode_history(
+        &self,
+        id: &binary_alpha_engine::market::InstrumentId,
+        raw: &[u8],
+        scale: binary_alpha_engine::market::PriceScale,
+        granularity: binary_alpha_engine::dataset::NativeGranularity,
+    ) -> Result<(Option<i32>, broker::HistoryRows), String> {
+        self.inner.decode_history(id, raw, scale, granularity)
     }
     fn subscribe(
         &mut self,

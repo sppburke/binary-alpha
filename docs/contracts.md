@@ -98,8 +98,9 @@ with distinct authorizations; none implies the next.
 
 ## Configuration
 
-The configuration document is TOML. The engine package owns its meaning, validation, canonical form,
-and content hash; the application package owns reading it from a path.
+The configuration document uses Tom's Obvious, Minimal Language (TOML). The engine package owns its
+meaning, validation, canonical form, and content hash; the application package owns reading it
+from a path.
 
 ### Schema version 1
 
@@ -108,7 +109,7 @@ and content hash; the application package owns reading it from a path.
 | `schema_version` | integer | `1` |
 | `run_mode` | string | `research`, `replay`, `paper`, `live` |
 | `storage.historical_data_dir` | string | a non-empty path of the retained historical-data folder; a relative path resolves against the configuration file's directory |
-| `storage.publication_uri` | string | `gs://BUCKET` or `gs://BUCKET/PREFIX` in every run mode; `file:///ABSOLUTE/DIR` only with `run_mode = "research"`, as the non-live test boundary |
+| `storage.publication_uri` | string | `gs://BUCKET` or `gs://BUCKET/PREFIX` in every run mode; `file:///ABSOLUTE/DIR` only with `run_mode = "research"`, for non-live tests and the research data pipeline |
 | `import.sources` | array of tables | optional; consumed only by `data import`, which requires at least one entry |
 | `instruments` | array of tables | optional; maps audit generations and selected broker history/live instruments |
 | `features.instruments` | array of tables | optional; consumed only by `features build`, which requires at least one entry |
@@ -131,14 +132,39 @@ contains `public_endpoint`, `bootstrap_endpoint`, `app_id`, optional `credential
 `budgets` contains `trade`, `account`, `portfolio`, and `other`, each with positive `per_minute`
 and `per_hour` no greater than the limits in [Broker access](#broker-access); absence uses those
 limits. A Pocket Option entry instead contains `endpoint`, optional `origin`, required
-`credential`, `account_class` (`demo` or `real`), and `server_offset_minutes` (no default).
+`credential`, `account_class` (`demo` or `real`), `server_offset_minutes` (no default), and
+optional `credential_command` (a program and its arguments, first element nonempty). The
+program prints a fresh authentication object to standard output; the application runs it when
+the referenced variable is unset and once more after a first connection fails, then retries the
+connection with the printed object. The program is operator tooling outside this repository and
+its output never enters a diagnostic.
 Credentials are environment-variable names, never their values.
 
 `history` declares `broker`, a nonempty unique list of provider-symbol `instruments`, `role`
 (`development` or `evaluation`; `holdout` is rejected), `start`, `end`, and optional positive
 `refresh_interval_seconds`. Start and end are universal-time text forming a nonempty half-open
 range. Every selection must resolve to a declared broker and a matching `[[instruments]]` entry
-with tick native granularity. `inspect` declares positive `live_observations` and `live_seconds`,
+with the same native granularity. The additional history fields are:
+
+- `native_granularity`: `{ kind = "tick" }` by default, or
+  `{ kind = "bar", period_seconds = N }` with a positive unsigned 16-bit period. No other keys
+  are accepted; `period_seconds` is required for bars and forbidden for ticks. Fetch admits only
+  five-second bars.
+- `seeds`: an empty list by default. Each entry contains `provider_symbol`, `manifest` (a
+  `file://` or `gs://` ready-manifest location), and `source_identity` (exactly sixty-four
+  lowercase hexadecimal digits). The symbol must occur in `history.instruments` and may have
+  only one seed. The binding is checked against the configured broker before broker connection;
+  a digest alone does not establish that an operator's archive came from that source context.
+- `overlap_seconds`, `max_pages`, and `max_elapsed_seconds`: optional positive unsigned 32-bit
+  integers with no configured default. The pipeline requires all three and uses them for
+  frontier overlap and per-invocation acquisition limits. Standalone `data fetch` retains its
+  explicit-range, foreground behavior without these page/time limits.
+
+Canonical output omits tick `native_granularity`, empty `seeds`, and absent overlap/page/time
+limits. A seed entry rejects unknown keys. Existing configurations that omit these fields keep
+their canonical form.
+
+`inspect` declares positive `live_observations` and `live_seconds`,
 then optional `proposal = { stake = "10", duration_seconds = 15 }` with positive exact stake and
 duration. Proposal inspection requires the history broker to support execution and have a
 credential reference. Capability checks run in `Config::validate`, before connection. `ws://` and
@@ -157,7 +183,12 @@ configuration file's directory), `broker`, and `role` (`development` or `evaluat
 rejected). Kind `tick_csv` names one native tick file and also declares `provider_symbol`,
 `source_symbol` (the symbol text every row must carry), and `price_scale` (`0` to `18`). Kind
 `bar_parquet_collection` names one collection root and also declares `manifest` (the collection
-manifest inside that root) and an optional `provenance` list of further files inside that root.
+manifest inside that root), an optional `provenance` list of further files inside that root, and
+optional `instruments` containing collection asset names. An absent selection imports every
+listed asset and is omitted from canonical output. A present selection must be nonempty, contain
+unique nonempty names without ASCII (American Standard Code for Information Interchange) control
+characters, and name assets present in the collection. Configuration validates the names and
+duplicates; import checks membership and filters before opening unselected asset trees.
 Kind `tick_parquet_daily` names one daily tick archive root and also declares `price_scale` and
 `instruments`, a non-empty list of unique directory names beneath that root. `manifest` and
 `provenance` entries contain only normal path components; each `instruments` entry is one normal
@@ -314,8 +345,9 @@ then one line `ROLE`, tab, `PATH`, tab, `SHA256HEX`, tab, `BYTES`, line feed per
 by path, where `ROLE` is `source` or `provenance` and `PATH` is the object's path relative to its
 dataset root. Normalized outputs are not part of the identity, so equal inputs always name the same
 generation. Its ready manifest lives at `manifests/GENERATION/ready.json` beneath the same two roots
-and is the sole publication record; there is no other catalog or authority. Object paths, broker, and
-provider symbol contain no ASCII control character.
+and is the dataset's publication record. The research data pipeline's archive catalog references
+these original ready manifests without changing them. Object paths, broker, and provider symbol
+contain no ASCII control character.
 
 ### Ready manifest
 
@@ -375,7 +407,8 @@ generation. Archive bytes are never re-encoded.
 
 ### Bar sources
 
-A collection manifest lists assets; each asset root lies inside the collection root and holds
+A collection manifest lists assets; an optional source `instruments` selection limits the assets
+opened. Each selected asset root lies inside the collection root and holds
 `dataset/` with the listed monthly Parquet files. Every listed file must carry exactly the archive
 schema (symbol, symbol identifier, timestamp, Unix seconds, server seconds, five doubles, period)
 with Zstandard column chunks. Embedded interval metadata, when present, must equal the declared
@@ -394,6 +427,86 @@ The collection manifest must declare exactly the approved contract (left-closed,
 manifest, and the declared `provenance` files follow as `provenance` objects, the collection-level
 ones at `collection/NAME`. Symbolic links anywhere in the declared inventory are rejected. Parquet
 bytes are never re-encoded. A bar generation provides only `bars`.
+
+### Broker-history bars and coverage
+
+A native broker-history bar generation admits exactly `source_kind = "broker_history"`,
+`price_representation = { kind = "binary_float64" }`,
+`native_granularity = { kind = "bar", period_seconds = 5 }`, `time_unit = "second"`, the
+five-second interval contract, and `capabilities = ["bars"]`. It contains source objects,
+`provenance/coverage.json`, and exactly one normalized object, `normalized/bars.parquet`.
+Tick generations keep `normalized/ticks.parquet` and their existing representation.
+
+`write_bars` writes Zstandard Parquet with these eleven optional columns, populated without nulls:
+
+| Column | Physical type and annotation | Value |
+| --- | --- | --- |
+| `symbol` | byte array, UTF8 (Unicode Transformation Format, 8-bit) | provider symbol |
+| `symbol_id` | int32, signed 32-bit | constant provider identifier |
+| `timestamp_utc` | int64, `TIMESTAMP(MICROS,true)` | bar start in Unix microseconds |
+| `unix_utc_s` | int64, signed 64-bit | bar start in Unix seconds |
+| `server_time_s` | int64, signed 64-bit | bar start plus configured server offset in seconds |
+| `open`, `high`, `low`, `close`, `volume` | double | provider bar values |
+| `period_s` | int32, unsigned 16-bit | `5` |
+
+Embedded metadata is `closed = left`, `frequency = 5s`,
+`interval = [timestamp,timestamp+5s)`, `label = left`, `offset_seconds = 0`,
+`origin = unix_epoch_utc`, and `timestamp_semantics = bar_start`. Interval provenance is
+`parquet_metadata` in the ready manifest; it is not an extra file-metadata key. Only complete
+bars with start at or after the acquisition start and end at or before the cutoff enter the
+new rows. Volume remains the provider's value; first/last tick times are not invented.
+
+The bundle and schema-1 coverage details below describe legacy-v1 publication. Daily-v2
+publication uses the typed coverage and daily occurrence contract in [Market data layout v2](#market-data-layout-v2-daily).
+
+Matched history-page bytes are retained before row decoding. Individual pages stay locally
+retained under `objects/SHA256HEX` for pending-intent replay;
+publication concatenates the acquisition's pages in request order, without framing, into one
+`Source` object at `raw/pages.bin`. Replayed and new pages are included, and local page objects
+are never removed. A reused generation or acquisition without pages adds no bundle. A matched
+response whose rows fail validation remains a retained diagnostic without a ready manifest naming
+it. Envelope mismatches fail before this retention.
+
+The JavaScript Object Notation (JSON) coverage record remains schema version 1. It records
+`source_identity`, `broker`, `provider_symbol`, `role`, `requested` and optional `verified`
+ranges (`start`, `end`), optional `actual` (`first`, `last`), `rows`, `pages`, and
+`shortfall`. Each page has `path`, `sha256`, `bytes`, optional `anchor`, `rows`, and optional
+`first`/`last`. Additions are `native_granularity` (absent means tick; tick is omitted when
+written), optional `seed = { generation, source_identity }`, and each page's optional
+`receipt_time` (the local receipt time of its request, which a resumed acquisition carries into
+its operation receipt). Each shortfall has `reason` and
+an `unresolved` range. Reasons include `empty_page`, `no_progress`, `budget`, and
+`unresolved_tail`; when a primary shortfall and a tail coexist, `tail_shortfall` records the
+tail separately. Optional `bundle = { sha256: string, bytes: u64 }` identifies the current
+acquisition's `raw/pages.bin`; each bundled page has `offset: u64` and its bundle's `path`,
+while `sha256` and `bytes` still identify that page's slice. In Rust these are
+`HistoryCoverage.bundle: Option<ObjectIdentitySummary>` and `PageCoverage.offset: Option<u64>`;
+absent values deserialize to `None` and are omitted when serialized. The cumulative index
+carries previous acquisitions unchanged except that their `raw/pages.bin` paths become
+`raw/BASELINE_GENERATION/pages.bin`, avoiding collisions even for identical bundle bytes.
+Verification binds the current bundle summary to its source object, checks every current and
+carried bundle's index tiles its bytes exactly with contiguous explicit offsets and lengths,
+and verifies each slice's SHA-256 as well as each object's digest. Legacy individual-page
+objects and entries without offsets remain valid and are carried without rebundling.
+Missing optional additions are not synthesized into old immutable records.
+
+For pipeline advances, the acquisition frontier is the latest retained tick time or the end of
+the latest complete bar. A new acquisition starts at
+`max(history.start, frontier - overlap_seconds)`, even when older seed coverage has gaps.
+A pending acquisition instead keeps its pinned baseline, start, cutoff, and retained pages.
+For legacy v1, the seed's original manifest is retained as `seed/ready.json`, with its raw/provenance objects
+beneath `seed/`; lineage uses generation and source identity without a producer-location
+dependency. Seeds must match instrument, role, native representation, and source identity.
+A seeded lineage is never narrowed: a later `history.start` than its first retained row or a
+cutoff before its retained frontier fails before broker connection. Retained rows are not clipped.
+An older inherited gap remains in the retained data and provenance; frontier advancement does
+not establish continuous coverage or repair history outside the overlap.
+
+For legacy v1, if a reread adds no rows and leaves verified coverage and shortfalls unchanged, fetch reuses the
+prior dataset and its original manifest. New request receipts still record `anchor`, `sha256`,
+`bytes`, `rows`, and local `receipt_time` in the pipeline operation receipt; identical raw
+bytes do not require duplicate objects or a new dataset. Coverage page counts are retained page
+entries, not a count of all requests.
 
 ### Commands
 
@@ -433,6 +546,584 @@ permits the target before it is opened and refuses an undeclared dataset (see
 write nothing further to standard output, write one diagnostic to standard error, and exit with
 status 1. None removes source files, retained objects, or published objects.
 
+## Market data layout v2 (daily)
+
+The following is the normative owner-adopted layout standard, revision 3. It applies to
+ordinary `development` datasets (`tick_parquet_daily`, `bar_parquet`, `broker_history`) and
+their instrument streams. Derived research artifacts retain their own formats. The historical
+dataset and instrument-stream layout documented elsewhere here is **legacy layout v1**, readable
+until verified retirement. An absent manifest `layout` means v1; `layout = "daily-v2"` selects
+this contract. Types, codecs, shared v1/v2 observation readers, v2 audit candle publication,
+v2 verification, offline v1 migration, direct v2 imports and updates, the archive-root registry, daily archive/list/pull/restore,
+and [retirement](retirement.md) are implemented and integrated using deterministic fixtures.
+Operations on existing operator archives require separate authorization and are not exercised by these fixtures.
+
+### 1. Families
+
+Every data-bearing object is one Parquet file per UTC day `D` (`YYYY-MM-DD`) and per family. Dataset manifests own observations and pages; stream manifests own candles and the aggregate profile. Existing object roles are kept (`normalized` for observations and candles, `source` for pages).
+
+| Family | Logical path | Rows | Day rule |
+| --- | --- | --- | --- |
+| Observations | `observations/D.parquet` | Deriv: normalized ticks (existing tick schema). Pocket: normalized 5 s bars keeping all eleven provider columns (symbol, symbol_id, timestamp_utc, unix_utc_s, server_time_s, open, high, low, close, volume, period_s) | Tick event time, or bar start time, in `[D, D+1)`; repeated ticks keep multiplicity and order |
+| Pages | `pages/D.parquet` | One row per provider response occurrence (section 2) | Nonempty page: UTC day of its last event. Empty page: UTC day of `request_anchor_utc`. Otherwise: UTC day of its receipt time. A page with none of the three is never deleted and is reported as unresolved |
+| Candles | `candles/<N>s_<O>s/D.parquet` | Session grid candles with explicit `fill` provenance | Candle open time; one continuous stream state across all days |
+
+Single per-generation metadata (not market rows): the ready manifest with its ordered day inventory, `provenance/coverage.json` (acquisition coverage and unresolved ranges; no page index), `provenance/lineage.json` (section 5), and the stream `profile.json`.
+
+#### Session-aware continuous candles
+
+New `daily-v2` candle writing requires an explicit `instruments.session`: either
+`{ kind = "always" }`, or `{ kind = "weekly", timezone = "America/New_York",
+open = { day = "sunday", time = "17:00:00" }, close = { day = "friday", time = "17:00:00" },
+closed_dates = [], early_closes = [] }`. Weekdays are lowercase English names; clock values
+are `HH:MM:SS`. Dates and early-close clocks are local to that zone. An early close is
+`{ date = "YYYY-MM-DD", time = "HH:MM:SS" }`; a closed date removes its entire local day.
+Only `UTC` (offset zero) and `America/New_York` are supported; other zones are refused
+when configuration is parsed. New York uses UTC−5 standard time and UTC−4 daylight time,
+from the second Sunday in March at 02:00 local to the first Sunday in November at 02:00 local.
+The explicit US rule applies from 2007 onward; earlier New York dates are refused precisely,
+including dated overrides at parse time. Calendar arithmetic reuses the repository's pure
+Gregorian functions without a timezone dependency or host zoneinfo. Spring local boundaries
+in `[02:00,03:00)` are skipped; autumn ones in `[01:00,02:00)` are ambiguous. Both are refused,
+never shifted or assigned a fold. Recurring boundaries are checked on their occurrence date. The old plural `sessions` field remains
+profile-only windows. Missing singular `session` is never silently defaulted during v2 writing.
+The canonical instrument definition binds this calendar, including exceptions, into identity.
+
+`candles/<N>s_<O>s/D.parquet` contains exactly one row per eligible epoch-grid bucket,
+strictly increasing across UTC partitions. Membership depends on the bucket's open instant:
+`interval_open <= bucket_open <= interval_close`, including both regular weekly and dated
+early closes. The bucket can extend beyond close; its duration and epoch offset are never
+shortened or shifted. A bucket opening before the session open remains excluded even if it
+straddles that open. Closed local dates remove their entire date, while an explicit weekly
+or early close at local midnight includes that instant on a non-closed date.
+For Deriv FX, `[20:55:00,20:55:05)` at Friday close and `[22:00:00,22:00:05)` at an early
+close belong to the session. A 60-second bucket opening at either close also belongs, as does
+an offset bucket opening before close and ending after it. Pocket non-OTC's Friday 17:00:00
+America/New_York bucket belongs; a broker-delivered flat zero-volume bar there is `source`.
+With no observation there, an `engine` fill may be emitted under the coverage and pending
+rules below. Closing quotes therefore remain in finalized candles. Observations outside
+eligible buckets remain losslessly in observations.
+No candle is emitted before the first in-session, non-source-fill finalized candle. After that
+first price is established, later sessions begin filling at their scheduled open from the prior
+session's last close. Carrying that reference price creates no rows during closed time.
+
+Daily candles append required UTF8 `fill`: `none` for market candles, `source` for a delivered
+flat-OHLC, zero-volume candle, `engine` for a created zero-observation candle. Zero volume alone
+is insufficient: historical Pocket bars can change price while reporting zero volume. Source
+fills retain their observation counts, prices, volume, event clocks and feed gap diagnostics;
+`frozen` is additionally true and they are never `clean`. Engine fills have flat OHLC equal to
+the preceding close, observations/duplicates zero, volume zero only for volume-bearing sources
+(null for ticks), zero activity and jump counts, and no invented feed gap measurements:
+`gap_before_micros = null`, `max_gap_inside_micros = 0`, `missing_buckets_before = 0`.
+They have `low_activity`, `hard_low_activity`, `frozen`, and `short_span` true, making both
+`complete` and `clean` false. Their first/last event clocks identify the carried price's last
+source event, possibly in a prior session, and never assert an event inside the filled bucket;
+`active_span_micros = 0`. For a bucket fully covered by verified acquisition ranges, synthetic
+`known_at` is its logical close watermark, stable when a descendant adds later input. It is
+not an invented receipt/event time. In an unresolved range it is the later finalized candle
+bounding the interior absence or the final verified extent bounding the snapshot tail, never
+before bucket close; such days remain partial/unknown.
+The first real candle after engine fills retains its feed diagnostics. Across source fills,
+`InstrumentStream` additionally carries the sum of their actually missing buckets to the next
+real candle and the maximum observed preceding/interior feed gap into its `gap_before_micros`.
+Source rows retain their own diagnostics; the carry clears once consumed by a real candle.
+Contiguous source fills add no missing buckets and no invented elapsed gap. Gap flags are
+evaluated against these preserved measurements, so inserting rows cannot repair missing feed.
+
+Interior empty buckets are proven absent by later finalized input. Trailing fills require the
+exclusive end of authenticated verified acquisition coverage, stop at the last whole bucket
+within it, and never replace the stream's unfinished candle. A partial/unknown source day
+remains partial/unknown; filling never establishes acquisition completeness. The raw profile
+continues to count feed observations and finalized feed candles; its candle count can differ
+from the session product count. The existing pending-candle day rule remains in force.
+Verification reconstructs the session product from authenticated observations and coverage and
+compares every candle and the full reconstructed feed profile, including pending counts,
+leading/trailing limits, prices, quality and all timestamps. Closed feed candles still advance
+feature ordinals, breaking adjacency across rejected market time.
+Legacy immutable daily files without `fill` remain readable. Features exclude session-closed
+feed candles and source fills; fills cannot become eligible feature or outcome evidence.
+
+
+#### Day inventory
+
+Each entry: `date`, `family` (and candle `duration`/`offset`), `object` key or null, `rows`, first/last time or null, and `state`:
+
+- `complete`: evidence covers the whole day and no later input can change this family's output for the day;
+- `partial`: some of the day is covered (reason and unresolved intervals recorded; includes the cutoff day and any candle day whose last candle may still be finalized by a later observation);
+- `unknown`: source evidence exists without a completeness claim (reason recorded, for example a Deriv historical gap with `complete: false`);
+- `empty_known`: evidence covers the whole day with zero rows (for example Deriv `market_closed: true` without clipping); `object` is null.
+
+#### Typed v2 acquisition coverage
+
+For `daily-v2`, `provenance/coverage.json` is the engine-owned
+`dataset::coverage::DailyCoverage` contract with `schema_version = 2`. Its required fields are
+`broker`, `provider_symbol`, `role`, `native_granularity`, `acquisitions`, and `days`.
+It rejects unknown fields and contains no page index. Each acquisition preserves
+`acquisition_id`, `source_identity`, `requested`, `verified`, `shortfalls` (each a `reason`
+and `unresolved` range), and `unresolved`. Ranges are ordered, nonoverlapping half-open
+`{start, end}` UTC intervals, measured in observation event time (bar starts). Empty request
+lists preserve imports that made no request claim. Cumulative verified ranges may extend
+outside the current request. Verified and unresolved acquisition spans cannot overlap;
+every requested span is accounted for, and every shortfall names unresolved coverage.
+Migration derives one `v1-history:<generation>` claim per retained v1 history record. A
+shortfall range that an older executable recorded inside already verified coverage (before
+fetch clipped shortfalls to the unverified part of a request) contributes only its
+intersection with the request's unverified part to the claim, one shortfall per remaining
+piece (a current fetch trims only the endpoints); the migration `provenance/lineage.json`
+lists each such range under `legacy_shortfalls` (`generation`, `acquisition_id`, `field`,
+`reason`, `recorded`, `retained`, `basis`) so the retired record stays reconstructible.
+
+Each `(family, date)` has exactly one `DayCoverage` record: `acquisition_ids`, a nonempty
+`basis` identifying the retained evidence, `verified` spans, `unresolved` spans, and nullable
+`reason`. Only observations and pages belong here. Verified day spans lie within that UTC
+day; unresolved spans must be their exact complement. No verified span derives `unknown`,
+a proper verified subset derives `partial`, and a fully verified day derives `complete`
+for nonzero rows or `empty_known` for zero rows. Incomplete days require a reason; complete
+days have none. Observation verification must be supported by the referenced acquisitions'
+verified ranges. Page evidence independently establishes retention of response occurrences;
+market coverage alone never proves page completeness. Producers must leave page days unknown
+when that evidence is unavailable. Rows can exist within unresolved spans: unresolved means
+incomplete acquisition, not proven absence. Unknown days record the whole day as unresolved.
+
+Verification authenticates and decodes this object, binds its instrument, role and native
+granularity to the dataset, and checks the exact day set, every state, reason and unresolved
+interval against the inventory, including zero-row days. The evidence is a retained source
+claim, not a new inference from sparse observations or authority to read external data.
+
+V2 stream manifests also record `source_manifest_uri`. Verification first resolves their
+`source_generation` in the stream store (supporting fresh-store restores), then uses that
+explicit original reference if the local source is absent. Existing access checks precede
+source reads. The source dataset must verify and match the stream's identity and summary;
+unavailable evidence fails verification. Audit and verification share candle-day derivation
+for every source day, finalized candle-open day and pending day. Coverage through a finalizing
+bar concerns its event time (`known_at` minus native period), while retaining the candle-close
+bound. Old manifests without a source URI remain verifiable with their source in the same store.
+
+#### Deterministic encoding profile `daily-parquet-v1`
+
+Rows sorted canonically (observations and candles by time then original order; pages by `acquisition_id` then `ordinal`); fixed schema and semantic metadata per family; no generation, cutoff, or run metadata inside daily files; `parquet` crate 59.3.0 as pinned in `Cargo.lock`; Zstandard level 3; dictionary encoding off; statistics setting fixed; one row group per file; fixed numeric data page row and byte limits; every column written in canonical segments of exactly 8,192 values (the last shorter) regardless of how rows arrive upstream; writer `created_by` fixed to the profile name. Equal rows, schema, semantic metadata, and profile produce equal bytes; hash-equality tests vary upstream batch boundaries (777, 1,024, and 65,536 rows) and repeat writes. An unchanged day is referenced by key and never regenerated. A later profile version is a new layout input.
+
+### 2. Page occurrences
+
+Columns: `acquisition_id` (import: SHA-256 of the replaced `raw_pages.ndjson`; broker history: the name of an immutable acquisition record created before the invocation's first request, binding the intent and a unique invocation token; every page progress entry and operation receipt records this identity. Replayed pages keep their original identity and ordinal, while new requests on resumption use the new invocation's acquisition record; legacy requests only held in a pending progress log use the intent name plus the SHA-256 of that log's header); `intent` (nullable, the intent record name, kept separately); `ordinal` (0-based position in that acquisition's raw source order: NDJSON line number, or request order within the receipt or log); `checkpoint_ordinal` (nullable, the checkpoint line's own 0-based position, which can differ from `ordinal`); `order_kind` (`request_order` or `source_file_order`); `payload_sha256`; `payload` (exact response bytes; for NDJSON lines the bytes without the trailing newline, which is what the checkpoint `payload_sha256` covers); `request_token` (opaque provider anchor as sent, nullable); `request_anchor_utc` (nullable; the historical request boundary, not dispatch time: Pocket `UTC = provider_seconds − recorded_offset_minutes × 60`, Deriv `UTC = epoch_seconds`, both converted with checked arithmetic to microseconds); `receipt_time_utc` (nullable); `receipt_state` (`recorded`, `not_recorded_by_source` for recovered checkpoint lines, `absent_in_legacy_record`); `first_event_time`, `last_event_time` (nullable for empty pages); `rows`; `checkpoint` (exact original checkpoint line bytes, nullable); `disposition` (`indexed`, `diagnostic` for retained responses that failed validation or belong to abandoned acquisitions).
+
+Rules: one row per response occurrence, never deduplicated by payload hash; the inventory of occurrences covers every completed operation receipt, every published coverage index, every pending progress log, and every import NDJSON/checkpoint pair. Storage aliases of one occurrence (a single-page object, its bundle slice, a replayed checkpoint of the same request) map to that one occurrence through an explicit alias table in the migration record; requests with different recorded receipt times are different occurrences even when anchor and payload are equal. Checkpoint lines are matched to raw lines by payload hash with occurrence counting in source order, never by provider `index` or position alone, and the raw and checkpoint files are each reconstructed from their own ordinal and framing. Import lineage records the NDJSON framing (line terminator, final newline) and both source-file hashes so the original `raw_pages.ndjson` and `checkpoint.ndjson` can be reconstructed byte for byte from the pages of that acquisition.
+
+### 3. Identity and continuation
+
+- Dataset and stream identities gain the input `layout daily-v2`; v1 identities and every completed record are never rewritten.
+- Each instrument gets exactly one v2 continuation root: a v2 dataset carrying all history (import plus every acquisition to date) and its stream. `data pipeline update` seeds and selects priors from the v2 continuation root instead of the v1 import. A migration record per instrument binds v1 generations (import, newest history, stream) to the v2 root with the equality results.
+- A descendant references unchanged daily objects by key; it writes new objects only for days whose output changes, per family (new observation days, the previous partial day, and any earlier candle day completed by a newly finalized candle).
+- The five pending v1 acquisitions (8,285 retained pages, 36,198,285 bytes) are migrated first: their retained payloads and progress records become v2 page rows with disposition `diagnostic`, the migration record keeps their intents and the abandonment provenance, and only then are they abandoned by the documented rule. Refetched responses are additional occurrences. The IRRUSD_otc intent record is kept as is (it has no progress pair).
+- The continuation mapping (v1 import, newest history and stream → v2 root and stream) is persisted as an immutable record and archived with the v2 catalog; it preserves source identity, role, requested and verified coverage, shortfalls, and unresolved ranges. `imported_seed`, `prior`, and `pull` select within the v2 lineage (v2 roots and their descendants), prefer it over v1 while both exist, and restore→update works after v1 is removed. The two existing operator fetch configurations that pin v1 seeds (`~/.config/binary-alpha/pipeline/deriv-fetch.toml`, `pocket-fetch.toml`) are rebound to v2 roots or retired before their targets are deleted. The mapping grants no new read authority; existing permit checks still run before object reads.
+
+The daily coverage object is the only authority for requested and verified acquisition ranges,
+shortfalls, unresolved intervals, and day-state evidence. Descendant lineage records contain
+`continuation = {acquisition_id, intent, seed}` to select the typed acquisition used for the next fetch;
+they do not duplicate a legacy coverage object or page index. They preserve `root_generation`,
+`parent_generation`, and the historical `ancestors` identities. Resumed snapshots name prior
+snapshots of the same intent as ancestors only after proving their response occurrences remain
+in the replacement closure. Observation day evidence combines
+retained verified spans with new acquisition evidence; unresolved ranges are their exact UTC-day
+complement. Clipping without a proved covered boundary remains `unknown`. Page completeness
+requires occurrence evidence independently of market coverage.
+
+### 4. Archive, transfers, and retirement
+
+- Transfers move to one archive-root registry: content key → `{file_id, session, done, bytes, sha256}`, with atomic reservation across concurrent jobs, persisted incrementally (append-only log plus periodic compact snapshot, never a full rewrite per transfer). Completed entries can be rebuilt from a complete paginated Drive listing (no incomplete results; restart on rejected tokens) and are reused only after size and SHA-256 confirmation (readback when Drive reports no checksum).
+- Before retirement, every completed record (intents, operation receipts, catalog receipts) and every configuration reference to a generation, stream, or catalog is inventoried, and each referenced closure is recorded as `protected` or `retired` with the reason; immutable records are never rewritten, retained catalogs keep their exact file-id bindings, and an unresolved dependency is never a deletion candidate.
+- Retirement is by reachability, never by age or file name. Retained roots: the newest v2 catalog per job (the catalog file itself, its manifests, and its objects), v2 continuation roots and their streams, pending acquisitions and their retained pages, and in-flight transfers. Under the writer lock an exact deletion inventory (local keys and Drive file ids) is computed, recorded, applied in resumable batches, and each retained closure is re-verified afterwards. Superseded v2 catalogs and replaced partial-day objects are retired by the same rule on later updates.
+
+### 5. Lineage
+
+`provenance/lineage.json` per v2 root: for each replaced v1 object its logical path, key, SHA-256, bytes, and row count; Deriv per-day `.meta.json` contents; Pocket per-instrument `download_manifest.json`, `dataset/manifest.json`, `dataset/hashes.sha256`, `dataset/reports/quality.json` embedded verbatim and the instrument's entry of the shared collection manifest; NDJSON framing; the v1 generation identities it replaces. Markers (`_SUCCESS`, `.conversion.lock`) and the empty shared `gaps.parquet` are recorded by hash only.
+
+### 6. Verification and acceptance
+
+`data verify` on a v2 dataset decodes every daily file, checks day membership, cross-day order and multiplicity, the day inventory against the files, each page's `payload_sha256`, and aggregate rows and coverage; on a v2 stream it verifies each candle day and the aggregate summary. Migration additionally proves, per instrument, before any deletion: identical observation rows in order to the v1 newest history (or import); every NDJSON line, checkpoint line, bundle slice, and single page accounted for exactly once and both import source files reconstructed byte for byte; exact legacy candle evidence reconstruction
+under the v1 definition, plus independent verification of the new session product.
+
+A migration may add a missing singular `session` while preserving every other definition field;
+an existing calendar cannot change. `candles_equal=true` and `MigrationEquality.candles` mean
+that v2 observations reproduce the selected baseline stream's candle columns, summary and
+profile under its exact legacy definition (with only the source-generation substitution).
+They do not assert equality
+of the filled session product with sparse v1 candles. The durable proof names
+`basis=legacy_definition_reconstruction`, preserves both definitions and stream summaries,
+records the legacy row digest and profile equality, and requires `session_product_verified=true`.
+The new product passes `data verify` independently before the migration record is published;
+a contradictory session proof fails the retirement eligibility predicate.
+
+Proof version 4 additionally seals `source_preservation` for every mapped v1 dataset and
+stream against the final continuation root. Dataset proofs compare exact ordered lossless
+rows (including multiplicity and every provider column) over the source's inclusive time
+interval. Stream proofs reconstruct that interval under each recorded definition and compare
+all candles, summaries, and profile. Only successful per-source proofs grant legacy retirement
+authority. Unproved closures remain retained and archived in the catalog's lineage manifests;
+restoration verifies those originals as well. The aggregate equality summary describes the
+selected baseline only. Earlier proof versions are re-proved in superseding immutable records.
+A pre-session configuration may add validated singular session tables only when removing them
+reproduces the completed checkpoint's exact binding; the new record names both configuration
+hashes, both bindings, the calendars, and its preserved predecessor. Old daily products are
+reconstructed separately from verification of the new session product.
+
+Named non-live gates (`cargo test -p binary-alpha-app --test data_pipeline` and the affected suites): one multi-day Deriv and one multi-day Pocket fixture through import, migration, history update, audit, feature/outcome/replay readers, archive, fresh-store restore, retirement, and a later update that uploads zero unchanged objects; covering midnight repeats, a cross-midnight page, an empty page, missing receipt metadata, a historical gap, a partial cutoff day, a weekend-delayed candle finalization, pending-acquisition diagnostics, repeated requests under one intent with unchanged observations (which changes only a page day), v1/v2 coexistence with equal coverage, encoding determinism across batch boundaries, interruption at each phase, and archive-registry rebuild. Assertions are on goal-bearing outputs, traversing every daily partition: identical feature rows and engine state, identical global outcome indices and reasons, identical replay ledger and results, identical recorded warm-up state, exact legacy candle/profile reconstruction and independently
+verified session candles, exact page reconstruction, and Pocket's existing rejection of tick-only outcome and replay paths.
+
+### Foundation representation and encoding choices
+
+`day_inventory` entries use `first_time` and `last_time` as inclusive bounds of the row's
+partition timestamp: event time, bar start, candle open, or the page's day-assignment time.
+They are not the page's first event (which may lie on an earlier day), nor candle close.
+Times are UTC strings in the existing manifest timestamp format. `unresolved` intervals have
+`start` (inclusive) and `end` (exclusive), within the entry's day, sorted and nonoverlapping.
+`partial` requires a nonempty reason and intervals; `unknown` requires a nonempty reason.
+Zero rows require null time bounds. Only `empty_known` has a null object. Date ordering is
+strict within `(family, duration, offset)`; candle duration and offset are seconds. Dataset
+row counts equal observation inventory totals; stream summary counts equal candle inventory
+totals. Dataset coverage metadata is required; lineage is allowed on descendants and required
+by the migration/root workflow, which owns the root distinction. Streams own only candle
+objects and the normalized aggregate profile.
+
+Daily bar codecs preserve nulls in all eleven optional provider columns. Execution still uses
+the validated legacy `Bar<()>` values; it does not invent values for missing fields. A daily
+bar needs an assignable UTC start, using `unix_utc_s` or `timestamp_utc` and checking agreement
+when both are present. Both daily candle codec directions enforce the archive non-overlap rule.
+
+Every observation consumer traverses the same authenticated partitions in inventory order,
+retaining repeated ticks and continuous stream/feature state. Audit partitions finalized candles
+by open day. An unfinished candle keeps its open day partial even when the last observation
+falls on a later day. Existing unresolved gaps and reasons survive union with that pending tail.
+A complete candle day also requires evidence for later-day inputs affecting candle values or
+finalization time; uncertain coverage through candle close or recorded `known_at` prevents a
+complete claim. V1 datasets continue to produce v1 streams.
+
+For `daily-parquet-v1`, data page row and byte limits are respectively **8,192** and
+**1,048,576**, write batch size is **8,192**, writer version is `PARQUET_1_0`, value encoding
+is `PLAIN`, and statistics are **disabled**. Canonical segments count logical column positions,
+including nulls; each optional segment supplies its matching definition levels and present
+values. Page limits are Parquet's thresholds checked at a write batch boundary, not a hard
+maximum on a single binary value. These fixed settings bound page construction without
+payload min/max statistics or dependence on caller batch sizes. Readers validate schema,
+semantic metadata, profile, ordering and day membership. Equal-time rows retain input order;
+no codec sorts or deduplicates them. Checkpoint bytes and their independent ordinal must
+be present together. Codecs buffer at most the single daily input passed to a call; bounded
+whole-history conversion belongs to the later migration workflow. Unassignable pages return an unresolved error to the
+caller, which must retain the source; codecs perform no source deletion.
+
+## Data pipeline
+
+The application-owned research pipeline imports selected originals, extends Deriv ticks or Pocket
+Option five-second bars, and archives a dataset plus its matching instrument stream in private
+Google Drive. Local filesystem publication is supported for this workflow. Google Cloud Storage
+retains production, certification, and holdout authority. Catalogs cover only dataset and stream
+ready manifests and their object dependencies, including raw data, provenance, normalized data,
+profiles, and candles. They do not archive feature/model, outcome, replay, research, or
+certification generations, and introduce no Google Drive artifact-store address scheme.
+
+### Pipeline document
+
+The separate Tom's Obvious, Minimal Language (TOML) document has `schema_version = 1`, a required
+nonempty `local_root`, required `drive`, optional `governance_manifest`, optional positive
+`parallel_jobs` (default 1: how many jobs one producer run works on at a time, each with its own
+broker connection and Drive session; per-job report lines stay contiguous and the failure summary
+keeps document order), optional positive `parallel_transfers` (default 8: concurrent object uploads
+or downloads per job, each worker with its own Drive session), and `jobs` (default empty).
+Unknown fields are rejected in the document, Drive settings, and jobs. Relative
+`local_root` resolves against this document's directory. Each job requires:
+
+- `id`: unique, nonempty ASCII (American Standard Code for Information Interchange) letters,
+  digits, underscores, or hyphens.
+- `config`: the core configuration path relative to the pipeline document.
+- `evidence`: a readable non-secret source-binding evidence file relative to the pipeline
+  document. It is a JSON document whose `source_identity` names the broker source identity
+  (see [broker access](#broker-access)) the archive was collected under; other keys are
+  free-form notes. Binding refuses a job whose configured broker has a different identity, and
+  the file's bytes are hashed into the intent.
+
+Both job paths must be relative, without empty, `.`, or `..` segments. Each core
+configuration must use `run_mode = "research"` and declare exactly one history instrument with
+an ordinary role; any `import` table it carries is ignored by the pipeline. The core `research`
+table is rejected; supply an existing declaration through the pipeline's `governance_manifest`
+instead. The pipeline requires tick history for Deriv and five-second bar history for Pocket
+Option, positive `overlap_seconds`, `max_pages`, and `max_elapsed_seconds`, and no
+`refresh_interval_seconds`. It replaces storage paths with `local_root/store` in an effective
+configuration, and supplies the seed and update cutoff without editing the operator's core file.
+Consumer-only configurations may omit jobs; update requires them. List/restore need no broker
+credentials.
+
+The seed is the readable v2 continuation root of the job's instrument. Existing v1 inputs must
+be migrated first. An empty store instead acquires directly from the configured broker within
+`history.start` and the pinned cutoff, using the existing unseeded daily fetch owner. No import
+or v1 intermediate is needed. A pending intent preserves its original seed list, even when
+an interrupted bootstrap has published partial v2 data.
+
+`add-job --config PIPELINE --template CORE --broker B --symbol S [--quote-currency C]
+[--price-scale N] [--session FILE]` reuses the template's broker settings, history policy and
+instrument candle policy. It requires development/research mode and an explicit singular
+`instruments.session` table. It discovers the requested symbol, uses reported precision where
+available, and otherwise validates a bounded history sample through the adapter at exact
+supported scales. Empty/invalid samples require an explicit scale. Six-uppercase-letter pair
+symbols (optional `frx` prefix / `_otc` suffix) supply the quote currency; ambiguous symbols
+require the option. A scale failure includes the required digits, never rounds the price.
+
+Registration checkpoints its exact core/evidence bytes before create-once file publication and
+appends the pipeline entry last under the writer lock; retry uses that checkpoint and refuses
+different input or output bytes. Generated paths are relative `jobs/JOB.toml` and
+`evidence/JOB.json`. Existing source-bound imported jobs remain readable; empty-store bootstrap
+also requires the explicit calendar. The engine's `Config::parse` and `Session::calendar()`
+validate the singular session declaration for registration and acquisition. Canonical core TOML
+includes the entire calendar, so the effective configuration hash binds it without a separate
+session digest. Plural `sessions` remains a separate profile field.
+
+The `drive` table requires `root_folder_id` (nonempty, with no ASCII control characters, slash,
+or single quote), `chunk_bytes` (a positive unsigned 64-bit multiple of `262144`),
+`request_timeout_seconds`, and `max_attempts` (positive unsigned 32-bit integers). Optional
+`retry_seconds` is a positive unsigned 32-bit per-request transient retry budget, defaulting to
+900 wall-clock seconds; the other transfer limits have no defaults. Operator mode also requires
+`credential`, an environment-variable name
+containing only letters, digits, and underscores, with no leading digit. The process variable
+holds user OAuth (Open Authorization) refresh credentials as a JSON (JavaScript Object Notation)
+object with string `client_id`, `client_secret`, and `refresh_token` fields. Operator transport
+uses Google's fixed secure web endpoints. Optional `loopback_endpoint` is a test fixture only:
+a literal `http://127.0.0.1:PORT` or `http://[::1]:PORT` base without whitespace or trailing
+slash, with `credential` absent and synthetic credentials supplied internally. It never resolves
+operator credentials. See [the example](../configs/data-pipeline.example.toml).
+
+### Local state and commands
+
+The managed root separates `store/` (retained and published objects, also the importer's
+retained folder and publication root) and `pipeline_state/`. State and per-job state directories
+have mode `0700`. Update holds the nonblocking `pipeline_state/writer.lock` for the producer run;
+pull/restore also hold that lock and the host-local archive-root lock. Use one writer host per archive root.
+
+Under `pipeline_state/`:
+
+- `records/JOB-intent-HASH32.json` and `records/JOB-receipt-HASH32.json` are immutable,
+  content-named records; `HASH32` is the first 32 hexadecimal digits of the record's SHA-256
+  (Secure Hash Algorithm, 256-bit). Intents retain command/job, configuration hashes, evidence
+  digest, and update cutoff/seed binding. Receipts retain status, generations, coverage, request
+  receipts, catalog receipt, and pending state.
+- `records/JOB-catalog-DATASET16-STREAM16.json` records the catalog's `file_id`, `sha256`,
+  and `bytes`; the generation prefixes are 16 hexadecimal digits.
+- `JOB/update.toml` holds the effective core configuration of the last update.
+- `JOB/progress.json` holds a pending intent name, effective configuration binding, and
+  `progress` with `baseline`, `start`, and `cutoff`, written once.
+  `JOB/progress.pages.jsonl` appends one compact JSON page record and newline per retained page,
+  using one write followed by a flush; replayed pages are not appended again. Old inline
+  `pages` are read first, then complete log lines. A missing log means zero appended pages;
+  a trailing partial line is ignored, reported, and truncated before appending. Pages are retained
+  before this checkpoint advances; resumption decodes them and continues backward. A page whose
+  rows contradict the retained rows fails the run before it is checkpointed, so a resumed
+  intent never replays a conflicting page; completion removes both progress files. Resume with
+  update at the same cutoff; never remove progress files manually to abandon or bypass a binding.
+- `registry/snapshot.json` (version `1`) binds `archive_root` and the fixture `endpoint`, and
+  stores a `sequence` watermark, `files`, pending `legacy` aliases, imported job names, and
+  the completed-rebuild flag. Every `files` key is `objects/SHA256HEX`, including the byte
+  identities of ready manifests and catalogs; values are `{file_id, session, done, bytes, sha256, aliases}`. Logical `job/key` aliases
+  let retirement pin the dataset/stream closure of an unfinished manifest or catalog transfer.
+  Older entries without aliases conservatively retain all local and archived closures.
+- `registry/events.ndjson` appends synced `{sequence, change}` records. Changes are `put`
+  (key and entry), `remove` (a stale completed key on rebuild), `legacy` (job/key alias and
+  old entry), `imported` (job), or `rebuilt`.
+  A flushed, atomically renamed snapshot compacts every 256 events before truncating the log;
+  replay skips its watermark and discards only an unfinished trailing line. Reservations and
+  sessions are synced before upload bytes, and a shared per-content lease covers completion.
+  A journal or snapshot write failure stops further transfers until the registry is reopened;
+  rebuild excludes concurrent transfers. Old `JOB/transfers.json` files are imported once
+  without rewriting them; new per-job transfer files are never written: completed entries require remote identity confirmation, and unfinished
+  ids/sessions resume on their first use. Started legacy catalogs retain the original per-job
+  object and manifest bindings so their resumed bytes do not change during deduplication.
+  Session capabilities stay inside the private pipeline-state directory.
+- `downloads/` holds temporary `FILE_ID.catalog`, `GENERATION.manifest`, and
+  `SHA256HEX.partial` downloads.
+- `registrations/JOB.json` seals the requested template/session/options digest and exact
+  generated core/evidence bytes before add-job publishes files and appends its pipeline entry.
+
+A pending intent binds the archive root and the evidence digest it was opened under as well;
+a resumed invocation whose `drive.root_folder_id` or evidence file differs fails with the pending
+intent identity.
+
+Mutable checkpoints use flushed atomic replacement. Completed records and store objects use
+create-once publication; different content at an existing key is a conflict.
+
+```text
+binary-alpha data import --config CORE
+binary-alpha data pipeline migrate --config PIPELINE [--job ID]
+binary-alpha data pipeline update --config PIPELINE [--end END]
+binary-alpha data pipeline archive --config PIPELINE [--job ID]
+binary-alpha data pipeline add-job --config PIPELINE --template CORE --broker B --symbol S [--quote-currency C] [--price-scale N] [--session FILE]
+binary-alpha data pipeline retire --config PIPELINE [--job ID] [--whole-job] [--plan | --apply PLAN_FILE]
+binary-alpha data pipeline remove-job --config PIPELINE --job ID
+binary-alpha data pipeline list --config PIPELINE --broker BROKER --symbol SYMBOL
+binary-alpha data pipeline pull --config PIPELINE --broker BROKER --symbol SYMBOL
+binary-alpha data pipeline restore --config PIPELINE --catalog FILE_ID --sha256 SHA256 --broker BROKER --symbol SYMBOL
+binary-alpha data pipeline restore --config PIPELINE --all
+```
+
+Import is the existing command (see [Historical datasets](#historical-datasets)) run with
+`storage.historical_data_dir` and a `file://` `storage.publication_uri` both naming
+`local_root/store`; it may import every instrument of an archive in one run.
+
+Archive selects the newest local `daily-v2` dataset for each selected job by coverage end,
+then lineage (ambiguous daily ancestry is refused), verifies its existing
+matching stream, and publishes the closure without
+broker acquisition. It shares update's archive owner and archive-root registry. Registry loss
+rebuilds completed entries from a full root listing; `incompleteSearch` is refused, rejected
+page tokens restart pagination, and every candidate requires size/SHA-256 confirmation (byte
+readback without a reported checksum). Unfinished reservations survive explicit rebuilds.
+Existing immutable catalog receipts retain their exact file-id bindings.
+At equal coverage, a generation named in another candidate's hash-confirmed
+`provenance/lineage.json` is a predecessor. Generation references are bare identifiers in JSON
+values; selection does not impose migration/acquisition field names or read ancestor closures.
+The lineage owner supplies the same daily selection policy to update, archive, pull, and retirement.
+The lineage object is archived and restored with the other manifest-owned objects. Descendant
+catalogs also carry their continuation root and its stream in `lineage_manifests`, with all objects
+in the catalog's shared inventory. Restore authenticates, installs, and verifies every such manifest. Migration roots and their descendants also carry a `records` inventory: hash/size/file-id bindings for
+the shared verified migration receipt, its alias JSONL, and immutable source intents/receipts named
+by root lineage. These bytes are restored unchanged under `pipeline_state/records`; record keys
+must be one safe filename beneath `records/`. Registry rebuild and archive reuse include these
+records. Pull repairs a missing record even when all manifests are already local.
+
+Migration uses `DailyCoverage`, the same typed coverage owner as import, update, and verify.
+Retained requested/verified ranges and shortfalls stay in acquisition records; day states and
+unresolved intervals are validated against that contract. A cutoff with no independently verified
+interval remains `unknown`. Both legacy and current import checkpoint field names use the same
+page occurrence decoder, including checked provider offsets and recorded receipt timestamps.
+A legacy daily catalog containing only a descendant may use that self-contained descendant as a
+stable readable seed; subsequent updates preserve the immutable logical root identity.
+
+All producer, pull/restore, and retirement commands acquire the managed-store writer lock and
+then a host-local archive-root lock. Pull holds both continuously from selection through restore.
+Retirement uses the registry owner's read-only replay, including snapshot watermarks, removals,
+logical aliases, and legacy transfer files. Completed reclamation records do not pin removed
+single-page representations. A missing completed remote binding is reusable only after an exact
+completed retirement record authorizes its removal; unrelated remote loss remains an error.
+Deferred single-page cleanup can use a verified descendant after its original publication is
+retired, but only when it retains every exact receipt occurrence. Missing replacement proof
+defers cleanup. Daily import staging has a durable ownership journal so interrupted imports can
+reclaim their own unreferenced source copies on retry without adopting pre-existing objects.
+Retiring v1 manifests requires a matching immutable, verified migration record as specified in
+[retirement](retirement.md); native v2 ancestry retirement does not require migration evidence.
+Retirement plans use schema 2, refuse older apply plans, and preserve completed evidence when
+seal scratch files survive a crash. Every Drive delete attempt rechecks name and content identity.
+
+Update follows the v2 root or bootstraps an empty job; `END` is `YYYY-MM-DDTHH:MM:SS[.ffffff]Z`. Each job
+acquires a bounded extension, audits and verifies its result, and archives it independently.
+A pending acquisition keeps its original cutoff, baseline, start, and pages on rerun, even after
+a partial snapshot was archived. A conflicting `--end` or effective configuration fails with the
+pending intent identity. Page/time budgets are excluded from that configuration binding and may
+change for a resumed invocation. For a job with no pending acquisition, `--end` supplies the
+cutoff or, if omitted, the job samples the clock. Reaching the acquisition start or a terminal
+provider shortfall closes acquisition; it does not certify complete historical coverage.
+
+Producer output includes the existing import/fetch/audit lines and these pipeline lines:
+
+```text
+pipeline update JOB INSTRUMENT cutoff END status STATUS requested START END verified START END shortfall REASON dataset G stream S catalog FILE_ID sha256 HASH
+pipeline job JOB failed: REASON
+```
+
+Missing verified bounds are `none none`; missing shortfall, generations, or catalog fields are
+`none`. Update status is `pending` while acquisition remains open, `no_data` when closed
+without a catalog, `archived_with_gaps` when a catalog exists with a primary shortfall other than
+`unresolved_tail`, and `archived` otherwise. A tail alone can therefore be `archived`;
+read coverage and provenance to assess gaps. A pending or archived-with-gaps update line appears
+inside `pipeline job JOB failed: pipeline update ...`. Other jobs still run. Successful commands
+exit 0; operation failures exit 1 with a diagnostic on standard error, including
+`pipeline: N job(s) failed: JOB, ...` for per-job failures. `no_data` is a successful command
+outcome, not evidence of acquired data.
+
+### Archive catalog and transfer
+
+A catalog is pretty-printed JSON with a trailing newline and every field below:
+
+| Field | Meaning |
+| --- | --- |
+| `schema_version` | `1` |
+| `layout` | `"daily-v2"` for daily dataset/stream pairs; absent for v1 catalogs |
+| `lineage_manifests` | Optional additional pinned ready manifests: the continuation root and its stream for a daily descendant |
+| `job` | producer job identifier |
+| `broker`, `provider_symbol`, `instrument` | dataset source identifiers |
+| `role` | dataset role, development or evaluation for this workflow |
+| `source_kind`, `native_granularity` | original dataset kind and native representation |
+| `coverage` | `first_event_time`, `last_event_time` from the dataset |
+| `row_count` | dataset rows |
+| `dataset`, `stream` | each has `generation`, `key`, `sha256`, `bytes`, `file_id` |
+| `objects` | unique dependencies, each with `key`, `sha256`, `bytes`, `file_id` |
+
+The manifest keys are `manifests/GENERATION/ready.json`; object keys are
+`objects/SHA256HEX`. Catalog coverage describes actual endpoints; detailed acquisition coverage
+remains in the dataset's provenance object. The remote catalog name is
+`catalog-DATASET16-STREAM16.json`, objects are named `object-SHA256HEX`, and manifests
+`manifest-GENERATION.json`. Names are not unique authority: retain the catalog file identifier
+and expected digest.
+
+The producer derives the closure from validated dataset/stream manifests and checks their source
+generation, instrument, and role linkage. It persists pre-generated Drive file identifiers before
+uploading. Resumable sessions are checkpointed before sending bytes; resumed sessions query status
+for their acknowledged offset. Expired sessions restart under the same file identifier; an
+ambiguous completion or status 409 reconciles that identifier. Transport failures, HTTP 429, and
+5xx retry within `retry_seconds` from the first attempt, waiting 250 ms then doubling up to 30 s;
+`max_attempts` limits 401 token refresh attempts and resumable-session restarts. Upload completion
+compares size and SHA-256,
+reading back and hashing when Drive supplies no checksum. Different content is never replaced.
+Objects upload before manifests, and the catalog uploads last after those transfers confirm.
+The local catalog receipt is then published.
+
+Every reused transfer, including a previously archived closure, is confirmed again through the
+same owner as a completed upload: an existing non-trashed remote file with the recorded size and
+SHA-256, hashing the bytes read back when Drive supplies no checksum. Drive is not
+provider-enforced immutable storage.
+Refresh/access tokens, response bodies that might echo them, and resumable session locations
+are not printed.
+
+### List and restore
+
+List follows archive-root catalog listing pages to completion, confirms each catalog's remote size
+and checksum (with readback when absent), downloads and validates the catalog documents, filters by broker/symbol, and sorts
+the resulting lines. It reads no market-data objects. The line is:
+
+```text
+catalog FILE_ID sha256 HASH INSTRUMENT ROLE NATIVE layout LAYOUT dataset G stream S coverage FIRST LAST rows N bytes B
+```
+
+`NATIVE` is `tick` or `5-second bar`; bytes sum unique catalog objects and both ready
+manifests, excluding the catalog itself.
+
+Pull is the consumer's one step: it enumerates the instrument's catalogs exactly as `list` does,
+prefers the v2 lineage whenever present, then selects by coverage end and its unique
+lineage descendant (v1 ties use dataset generation), and, unless both of its ready
+manifests already exist in this configuration's managed store, restores it exactly as `restore`
+would with that catalog's identifier and digest. It prints the `restored …` line, or
+`pulled INSTRUMENT ROLE dataset URI stream URI catalog FILE_ID (already local)` when nothing was
+fetched. It fails when the archive holds no catalog for the instrument.
+
+Restore pins one catalog file identifier and expected SHA-256, checks broker/symbol assertions,
+and uses that catalog's finite set of manifests and objects as its allowset. A supplied
+`governance_manifest` is loaded first; its declaration permits the dataset before its manifest
+read and checks the stream generation. Without a declaration, ordinary metadata classification
+still rejects holdout before child-object reads. The dataset manifest must describe the ordinary
+catalog generation, and the stream must derive from it with the same role. Every dependency must
+match a catalog object key, hash, and size, and every catalog object must be named by one of the
+two manifests, before object downloads. A catalog pin cannot override
+a declaration's denial; supply any known study binding.
+
+Partial downloads resume by byte range and require the final byte count and SHA-256. A corrupt
+partial is discarded once and downloaded afresh. Identical completed local objects are reused;
+conflicts are not replaced. Objects install first, original manifests last, then the existing
+`data verify` owner verifies both dataset and stream. Producer paths are not needed and
+manifest bytes and generation identities do not change. The output supplies local uniform
+resource identifiers (URIs) for a new consumer configuration. After all pinned closure checks
+pass, restore publishes the catalog's canonical receipt using the pinned file ID, byte count,
+SHA-256, and evidence inventory. This recovers the newest receipt that cannot be included
+inside its own catalog, preserving every producer record byte for byte. The output supplies
+the verified manifest locations:
+
+```text
+restored INSTRUMENT ROLE dataset DATASET_URI stream STREAM_URI objects N installed I reused R
+```
+
 ## Broker access
 
 `crates/app/src/broker` owns synchronous market-data and options method groups over the shared
@@ -441,7 +1132,7 @@ WebSocket transport. Engine records remain neutral; only app wire readers know p
 | Adapter | History | Live market data | Options execution contract |
 | --- | --- | --- | --- |
 | `deriv` | raw ticks | ticks, acknowledged cancellation | proposals, claimed purchases, account transactions, contract facts, portfolio and statement |
-| `pocket_option` | raw ticks | streams, cancellation sent without acknowledgement | unsupported |
+| `pocket_option` | raw ticks and native five-second bars | streams, cancellation sent without acknowledgement | unsupported |
 
 The Deriv public connection supplies discovery, tick history and subscriptions. Authenticated
 connections first GET `{bootstrap_endpoint}/accounts` with a resolved bearer credential and
@@ -466,6 +1157,18 @@ resolved from the named environment variable. Fresh `successauth` and
 `successupdateBalance.isDemo` matching the declared class precede market commands; selected symbols
 must occur in the observed 19-element `updateAssets` rows. Incomplete attachments never become
 observations. The adapter does not log authentication, renew credentials or generate chart points.
+
+For candle history, Pocket Option sends `loadHistoryPeriod` with `asset`, incrementing
+`index`, a provider-clock `time` anchor, `offset = 200`, and `period = 5`. It accepts
+`loadHistoryPeriodFast` only with matching asset, index, and period. Row objects carry
+`symbol_id`, `time`, `open`, `high`, `low`, `close`, and `volume`; unknown row keys fail.
+Price text converts to exact integer units at the configured scale, and its persisted double
+must round-trip to those units. The configured provider offset is subtracted before checking a
+whole-second bar start on the five-second grid. Prices and volume must be finite, volume
+non-negative, price bounds consistent, and time strictly increasing. The symbol identifier must
+be constant within pages and across the retained lineage. These checks do not independently
+establish the operator's clock/source mapping. This research pipeline acquires no Pocket ticks
+and makes no tick subscription or order request.
 
 Live records retain provider event time, local receipt time, the same full source identity as fetch, connection
 generation, receipt sequence and payload SHA-256. Neither pinned provider has a durable tick
@@ -510,16 +1213,19 @@ is requested again from the merged verified end. If a prefix and tail are both u
 records the tail; neither is skipped.
 
 The shared import publication owner retains and publishes immutable `broker_history` generations:
-raw response objects, `normalized/ticks.parquet`, and `provenance/coverage.json`. The coverage
-record's version 1 separates requested range, verified range, actual first/last times, row count,
+raw response objects, `normalized/ticks.parquet` (or `normalized/bars.parquet` for native bars),
+and `provenance/coverage.json`. The coverage record's version 1 separates requested range,
+verified range, actual first/last times, row count,
 page hashes/anchors and shortfalls. The `broker_history` dataset manifest stays at schema version 1
-with the versioned `provenance/coverage.json` object. The source kind requires tick capability and
-those objects. Only ready publication advances verified progress.
+with the versioned `provenance/coverage.json` object. The source kind requires the native capability
+and corresponding objects described under [Historical datasets](#historical-datasets).
+Only ready publication advances verified progress.
 Interrupted objects remain reusable; restarting repairs an unresolved prefix before extending the
 suffix. A refresh interval completes the initial range, then waits between sequential passes whose
 new end is sampled once. Unchanged content/coverage reuses the generation and ensures its objects
-and manifest exist at the current destination, without refetching a completed range. No scheduler
-or service is introduced.
+and manifest exist at the current destination, without refetching a completed range. Standalone
+fetch stays in the foreground; the research pipeline's optional weekly service is described in
+[operations](operations.md#data-pipeline).
 
 Each instrument reports
 `fetch ROLE INSTRUMENT generation G requested START END verified START END rows N pages P objects O reused R shortfall REASON [fetch S publish S]`,

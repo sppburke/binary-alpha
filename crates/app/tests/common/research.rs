@@ -63,6 +63,7 @@ pub fn configuration(root: &Path) -> Config {
     config.instruments = (0..2).map(|i| serde_json::from_value(json!({
         "broker":"pocket_option","provider_symbol":SYMBOLS[i],"quote_currency":CURRENCIES[i],
         "price_scale":SCALES[i],"native_granularity":{"kind":"tick"},
+        "session":{"kind":"always"},
         "gap":{"max_seconds":2,"reopen_seconds":60},
         "candles":[{"duration_seconds":20,"offset_seconds":0,"min_observations":9,"hard_min_observations":5}]
     })).unwrap()).collect();
@@ -237,7 +238,8 @@ pub fn ticks_at_scale(base: i64, rows: &[Row], scale: u8) -> Vec<String> {
     lines
 }
 
-/// Imports invented ticks through the CLI, including synthetic-only holdout role binding.
+/// Writes invented consumer inputs directly. Development uses daily-v2; synthetic-only
+/// evaluation and holdout use the supported legacy reader format without a CLI writer.
 pub fn import_ticks(
     root: &Path,
     name: &str,
@@ -247,68 +249,34 @@ pub fn import_ticks(
     scales: &[u8],
     lines: &[Vec<String>],
 ) -> Vec<binary_alpha_engine::dataset::GenerationManifest> {
-    use binary_alpha_engine::dataset::{
-        DatasetRole, GenerationManifest, PriceRepresentation, generation_id, manifest_key,
-    };
-    use binary_alpha_engine::market::InstrumentId;
-    use std::fs;
-    fn write(path: &Path, bytes: impl AsRef<[u8]>) {
-        fs::create_dir_all(path.parent().unwrap()).unwrap();
-        fs::write(path, bytes).unwrap();
-    }
-    let mut sources = String::new();
-    for (i, lines) in lines.iter().enumerate() {
-        let relative = format!("sources/{name}-{i}.csv");
-        crate::common::write_ticks(
-            &root.join(&relative),
-            &lines.iter().map(String::as_str).collect::<Vec<_>>(),
-        );
-        sources.push_str(&format!("\n[[import.sources]]\nkind = \"tick_csv\"\npath = \"{relative}\"\nbroker = \"{broker}\"\nrole = \"{}\"\nprovider_symbol = \"{}\"\nsource_symbol = \"SYNTHETIC\"\nprice_scale = {}\n",
-            if role==DatasetRole::Holdout {DatasetRole::Development} else {role},symbols[i],scales[i]));
-    }
-    let config = root.join(format!("import-{name}.toml"));
-    write(
-        &config,
-        format!(
-            "schema_version = 1\nrun_mode = \"research\"\n[storage]\nhistorical_data_dir = \"retained\"\npublication_uri = \"file://{}/published\"\n{sources}",
-            root.display()
-        ),
-    );
-    crate::common::command(&["data", "import", "--config", config.to_str().unwrap()])
-        .unwrap()
+    use binary_alpha_engine::market::{InstrumentId, ProviderSymbol, parse_tick_line};
+    let source_symbol: ProviderSymbol = "SYNTHETIC".to_string().try_into().unwrap();
+    lines
         .iter()
-        .filter(|line| line.starts_with("published "))
-        .map(|line| {
-            let generation = crate::common::generation(line);
-            let mut manifest = GenerationManifest::from_json(
-                &fs::read(root.join("published").join(manifest_key(&generation))).unwrap(),
+        .enumerate()
+        .map(|(i, lines)| {
+            // Keep the independent invented source inventory available to fixture oracles.
+            crate::common::write_ticks(
+                &root.join(format!("sources/{name}-{i}.csv")),
+                &lines.iter().map(String::as_str).collect::<Vec<_>>(),
+            );
+            let scale = scales[i].try_into().unwrap();
+            let rows = lines
+                .iter()
+                .map(|line| parse_tick_line(line, &source_symbol, scale).unwrap())
+                .collect::<Vec<_>>();
+            crate::common::current::ticks_with_source(
+                &root.join("published"),
+                &InstrumentId {
+                    broker: broker.to_string().try_into().unwrap(),
+                    provider_symbol: symbols[i].to_string().try_into().unwrap(),
+                },
+                role,
+                scale,
+                &rows,
+                Some(&root.join(format!("sources/{name}-{i}.csv"))),
             )
-            .unwrap();
-            if role == DatasetRole::Holdout {
-                // SYNTHETIC FIXTURE ONLY: data import deliberately refuses holdout. Reuse the
-                // invented content-addressed objects in a second ready manifest with its true
-                // fixture role and recompute the role-bearing dataset generation identity.
-                let PriceRepresentation::IntegerUnits { scale } = manifest.price_representation
-                else {
-                    panic!("tick scale")
-                };
-                manifest.role = role;
-                manifest.generation = generation_id(
-                    &InstrumentId {
-                        broker: manifest.broker.clone(),
-                        provider_symbol: manifest.provider_symbol.clone(),
-                    },
-                    manifest.source_kind,
-                    role,
-                    Some(scale),
-                    &manifest.objects,
-                );
-                write(
-                    &root.join("published").join(manifest.key()),
-                    manifest.to_json(),
-                );
-            }
-            manifest
+            .unwrap()
         })
         .collect()
 }

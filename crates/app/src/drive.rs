@@ -1,0 +1,1004 @@
+//! The narrow private Google Drive transport of the research market-data archive: user OAuth
+//! refresh, pre-generated file identities, resumable uploads that survive interruption and
+//! session expiry, ranged downloads, metadata, and paginated listing. Nothing here decides what
+//! is archived; `data_pipeline` owns the catalog and its closure.
+//!
+//! Official contracts: files/create with a pre-generated `id` (a reused identity answers 409
+//! rather than creating a duplicate), resumable uploads in 256 KiB multiples with `308 Resume
+//! Incomplete` status queries, `alt=media` byte-range downloads, and `files.list` pagination.
+
+use crate::broker::resolve_secret;
+use crate::store::{Hasher, ObjectIdentity};
+use binary_alpha_engine::config::credential_name;
+use serde::{Deserialize, Serialize};
+use std::fs::{self, File, OpenOptions};
+use std::io::{Read, Seek, SeekFrom, Write};
+use std::path::Path;
+use std::time::{Duration, Instant};
+
+/// Resumable upload chunks are multiples of 256 KiB.
+/// The largest identifier batch `files.generateIds` accepts.
+const GENERATE_IDS_LIMIT: usize = 1000;
+pub const CHUNK_UNIT: u64 = 256 * 1024;
+const GOOGLE_API: &str = "https://www.googleapis.com/drive/v3";
+const GOOGLE_UPLOAD: &str = "https://www.googleapis.com/upload/drive/v3";
+const GOOGLE_TOKEN: &str = "https://oauth2.googleapis.com/token";
+/// The synthetic credential a loopback fixture accepts; operator references are never read in
+/// fixture mode.
+const FIXTURE_CREDENTIAL: &str =
+    r#"{"client_id":"fixture","client_secret":"fixture","refresh_token":"fixture"}"#;
+
+/// The archive root and transfer limits; credentials are environment names only.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct DriveSettings {
+    /// The Drive folder the application created or was explicitly granted; an identifier
+    /// alone grants nothing.
+    pub root_folder_id: String,
+    /// Environment variable holding the user OAuth credential JSON (`client_id`,
+    /// `client_secret`, `refresh_token`); required unless `loopback_endpoint` is set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credential: Option<String>,
+    pub chunk_bytes: u64,
+    pub request_timeout_seconds: u32,
+    pub max_attempts: u32,
+    /// Per-request transient retry budget in wall-clock seconds; defaults to 900.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry_seconds: Option<u32>,
+    /// A literal loopback `http://` base that replaces every Google endpoint and uses a
+    /// synthetic credential: the integration-test fixture, never an operator setting.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub loopback_endpoint: Option<String>,
+}
+
+impl DriveSettings {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.root_folder_id.is_empty()
+            || self
+                .root_folder_id
+                .bytes()
+                .any(|byte| byte.is_ascii_control() || byte == b'/' || byte == b'\'')
+        {
+            return Err("root_folder_id must be a Drive file identifier".into());
+        }
+        if self.chunk_bytes == 0 || !self.chunk_bytes.is_multiple_of(CHUNK_UNIT) {
+            return Err(format!(
+                "chunk_bytes must be a positive multiple of {CHUNK_UNIT}"
+            ));
+        }
+        if self.request_timeout_seconds == 0 || self.max_attempts == 0 {
+            return Err("request_timeout_seconds and max_attempts must be positive".into());
+        }
+        if self.retry_seconds == Some(0) {
+            return Err("retry_seconds must be positive".into());
+        }
+        match (&self.loopback_endpoint, &self.credential) {
+            (None, None) => return Err("credential is required without loopback_endpoint".into()),
+            (None, Some(reference)) if !credential_name(reference) => {
+                return Err("credential must be an environment variable name".into());
+            }
+            (Some(_), Some(_)) => {
+                return Err("credential must be absent with loopback_endpoint".into());
+            }
+            (Some(endpoint), None)
+                if !(endpoint.starts_with("http://127.0.0.1:")
+                    || endpoint.starts_with("http://[::1]:"))
+                    || endpoint.ends_with('/')
+                    || endpoint.chars().any(char::is_whitespace) =>
+            {
+                return Err(
+                    "loopback_endpoint must be a literal http://127.0.0.1:PORT or http://[::1]:PORT base"
+                        .into(),
+                );
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+}
+
+#[derive(Deserialize)]
+struct Credential {
+    client_id: String,
+    client_secret: String,
+    refresh_token: String,
+}
+
+#[derive(Deserialize)]
+struct Token {
+    access_token: String,
+}
+
+/// What Drive reports about one file.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct RemoteFile {
+    pub id: String,
+    #[serde(default)]
+    pub name: String,
+    #[serde(default, deserialize_with = "decimal_text")]
+    pub size: Option<u64>,
+    #[serde(default, rename = "sha256Checksum")]
+    pub sha256: Option<String>,
+    #[serde(default)]
+    pub trashed: bool,
+}
+
+/// Drive renders `size` as decimal text.
+fn decimal_text<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<u64>, D::Error> {
+    let text: Option<String> = Option::deserialize(deserializer)?;
+    text.map(|text| text.parse().map_err(serde::de::Error::custom))
+        .transpose()
+}
+
+#[derive(Deserialize)]
+struct Listing {
+    #[serde(default, rename = "incompleteSearch")]
+    incomplete_search: bool,
+    #[serde(default, rename = "nextPageToken")]
+    next_page_token: Option<String>,
+    #[serde(default)]
+    files: Vec<RemoteFile>,
+}
+
+#[derive(Deserialize)]
+struct GeneratedIds {
+    ids: Vec<String>,
+}
+
+/// One response with the parts the transport decides on.
+struct Reply {
+    status: u16,
+    location: Option<String>,
+    range_end: Option<u64>,
+    body: Vec<u8>,
+}
+
+/// Retain the service's diagnostic, without including the full response body.
+fn error_reason(body: &[u8]) -> Option<String> {
+    let body: serde_json::Value = serde_json::from_slice(body).ok()?;
+    body.pointer("/error/errors/0/reason")
+        .and_then(serde_json::Value::as_str)
+        .or_else(|| body.pointer("/error/message")?.as_str())
+        .map(str::to_owned)
+}
+
+fn reason_suffix(reason: Option<&str>) -> String {
+    reason.map_or_else(String::new, |reason| format!(" ({reason})"))
+}
+
+fn transient_status(status: u16, reason: Option<&str>) -> bool {
+    status == 429
+        || (500..=599).contains(&status)
+        || (status == 403 && matches!(reason, Some("userRateLimitExceeded" | "rateLimitExceeded")))
+}
+
+impl Reply {
+    fn error(&self, what: &str) -> String {
+        format!(
+            "drive {what}: status {}{}",
+            self.status,
+            reason_suffix(error_reason(&self.body).as_deref())
+        )
+    }
+}
+
+enum TransientFailure {
+    Transport(reqwest::Error),
+    Http(u16, Option<String>),
+}
+
+/// One logical request owns its elapsed-time budget and exponential backoff.
+struct RetryBudget {
+    started: Instant,
+    limit: Duration,
+    delay: Duration,
+    attempts: u64,
+}
+
+impl RetryBudget {
+    fn new(limit: Duration) -> Self {
+        Self {
+            started: Instant::now(),
+            limit,
+            delay: Duration::from_millis(250),
+            attempts: 0,
+        }
+    }
+
+    fn retry(&mut self, what: &str, failure: TransientFailure) -> Result<(), String> {
+        let remaining = self.limit.saturating_sub(self.started.elapsed());
+        if !remaining.is_zero() {
+            std::thread::sleep(self.delay.min(remaining));
+            self.delay = (self.delay * 2).min(Duration::from_secs(30));
+            if self.started.elapsed() < self.limit {
+                return Ok(());
+            }
+        }
+        let elapsed = self.started.elapsed().as_secs();
+        let attempts = self.attempts;
+        Err(match failure {
+            // A reqwest URL can contain a resumable-session capability. Keep Display's error
+            // text, but never expose that URL, request headers, tokens, or response bodies.
+            TransientFailure::Transport(error) => format!(
+                "drive {what}: transport failure after {attempts} attempts over {elapsed} s: {}",
+                error.without_url()
+            ),
+            TransientFailure::Http(status, reason) => {
+                format!(
+                    "drive {what}: HTTP {status} after {attempts} attempts over {elapsed} s{}",
+                    reason_suffix(reason.as_deref())
+                )
+            }
+        })
+    }
+}
+
+/// The connected transport; every method is synchronous over one runtime.
+pub struct Drive {
+    runtime: tokio::runtime::Runtime,
+    client: reqwest::Client,
+    api: String,
+    upload: String,
+    token_endpoint: String,
+    credential: Credential,
+    root: String,
+    chunk_bytes: u64,
+    max_attempts: u32,
+    retry_budget: Duration,
+    access_token: Option<String>,
+}
+
+impl Drive {
+    /// Opens the transport; the credential is resolved here and only here.
+    pub fn open(settings: &DriveSettings) -> Result<Self, String> {
+        settings.validate()?;
+        let (api, upload, token_endpoint, credential) = match &settings.loopback_endpoint {
+            Some(base) => (
+                format!("{base}/drive/v3"),
+                format!("{base}/upload/drive/v3"),
+                format!("{base}/token"),
+                FIXTURE_CREDENTIAL.to_string(),
+            ),
+            None => (
+                GOOGLE_API.into(),
+                GOOGLE_UPLOAD.into(),
+                GOOGLE_TOKEN.into(),
+                resolve_secret(settings.credential.as_deref().expect("validated reference"))?,
+            ),
+        };
+        let credential: Credential = serde_json::from_str(&credential).map_err(
+            |_| "drive: credential must be JSON with client_id, client_secret, and refresh_token",
+        )?;
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|_| "drive: cannot start the transport runtime")?;
+        let timeout = Duration::from_secs(u64::from(settings.request_timeout_seconds));
+        let client = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .connect_timeout(timeout)
+            .read_timeout(timeout)
+            .build()
+            .map_err(|_| "drive: cannot initialize the transport")?;
+        Ok(Self {
+            runtime,
+            client,
+            api,
+            upload,
+            token_endpoint,
+            credential,
+            root: settings.root_folder_id.clone(),
+            chunk_bytes: settings.chunk_bytes,
+            max_attempts: settings.max_attempts,
+            retry_budget: Duration::from_secs(u64::from(settings.retry_seconds.unwrap_or(900))),
+            access_token: None,
+        })
+    }
+
+    fn token(&mut self) -> Result<String, String> {
+        if let Some(token) = &self.access_token {
+            return Ok(token.clone());
+        }
+        let form = [
+            ("client_id", self.credential.client_id.as_str()),
+            ("client_secret", self.credential.client_secret.as_str()),
+            ("refresh_token", self.credential.refresh_token.as_str()),
+            ("grant_type", "refresh_token"),
+        ];
+        let request = self.client.post(&self.token_endpoint).form(&form);
+        let reply = self.runtime.block_on(async {
+            let response = request
+                .send()
+                .await
+                .map_err(|_| "drive token: request failed".to_string())?;
+            let status = response.status().as_u16();
+            let body = response
+                .bytes()
+                .await
+                .map_err(|_| "drive token: response read failed".to_string())?;
+            Ok::<_, String>((status, body))
+        })?;
+        if reply.0 != 200 {
+            // The body can echo the credential and is never included.
+            return Err(format!("drive token: status {}", reply.0));
+        }
+        let token: Token =
+            serde_json::from_slice(&reply.1).map_err(|_| "drive token: malformed response")?;
+        self.access_token = Some(token.access_token.clone());
+        Ok(token.access_token)
+    }
+
+    /// Sends one authenticated request, limiting 401 attempts with `max_attempts` and
+    /// transient transport, rate-limit 403, 429, and 5xx retries with a wall-clock budget.
+    fn send(
+        &mut self,
+        what: &str,
+        build: &dyn Fn(&reqwest::Client) -> reqwest::RequestBuilder,
+    ) -> Result<Reply, String> {
+        self.send_with_rate_limit_retry(what, true, build)
+    }
+
+    fn send_with_rate_limit_retry(
+        &mut self,
+        what: &str,
+        retry_rate_limits: bool,
+        build: &dyn Fn(&reqwest::Client) -> reqwest::RequestBuilder,
+    ) -> Result<Reply, String> {
+        let mut retry = RetryBudget::new(self.retry_budget);
+        let mut unauthorized = 0;
+        loop {
+            retry.attempts += 1;
+            let token = self.token()?;
+            let request = build(&self.client).bearer_auth(&token);
+            let sent = self.send_once(request);
+            match sent {
+                Ok(reply) if reply.status == 401 => {
+                    unauthorized += 1;
+                    if unauthorized >= self.max_attempts {
+                        return Ok(reply);
+                    }
+                    self.access_token = None;
+                }
+                Ok(reply)
+                    if (retry_rate_limits || reply.status != 403)
+                        && transient_status(reply.status, error_reason(&reply.body).as_deref()) =>
+                {
+                    retry.retry(
+                        what,
+                        TransientFailure::Http(reply.status, error_reason(&reply.body)),
+                    )?;
+                }
+                Ok(reply) => return Ok(reply),
+                Err(error) => retry.retry(what, TransientFailure::Transport(error))?,
+            }
+        }
+    }
+
+    /// One transport attempt; callers own retries and any required preconditions.
+    fn send_once(&self, request: reqwest::RequestBuilder) -> Result<Reply, reqwest::Error> {
+        self.runtime.block_on(async {
+            let response = request.send().await?;
+            let status = response.status().as_u16();
+            let header = |name: &str| {
+                response
+                    .headers()
+                    .get(name)
+                    .and_then(|value| value.to_str().ok())
+                    .map(str::to_string)
+            };
+            let location = header("location");
+            let range_end = header("range").and_then(|range| {
+                range
+                    .strip_prefix("bytes=0-")
+                    .and_then(|end| end.parse::<u64>().ok())
+            });
+            let body = response.bytes().await?.to_vec();
+            Ok(Reply {
+                status,
+                location,
+                range_end,
+                body,
+            })
+        })
+    }
+
+    /// Pre-generates `count` file identifiers so a creation can be reconciled by identity,
+    /// in requests of at most `GENERATE_IDS_LIMIT` (the service rejects larger ones with 400;
+    /// observed 2026-09-16 with a 1249-object closure).
+    pub fn generate_ids(&mut self, count: usize) -> Result<Vec<String>, String> {
+        let url = format!("{}/files/generateIds", self.api);
+        let mut ids = Vec::with_capacity(count);
+        while ids.len() < count {
+            let batch = (count - ids.len()).min(GENERATE_IDS_LIMIT);
+            let query = [("count", batch.to_string()), ("space", "drive".into())];
+            let reply = self.send("generateIds", &|client| client.get(&url).query(&query))?;
+            if reply.status != 200 {
+                return Err(reply.error("generateIds"));
+            }
+            let generated: GeneratedIds = serde_json::from_slice(&reply.body)
+                .map_err(|_| "drive generateIds: malformed response")?;
+            if generated.ids.len() != batch {
+                return Err("drive generateIds: wrong identifier count".into());
+            }
+            ids.extend(generated.ids);
+        }
+        Ok(ids)
+    }
+
+    /// The archive root this transport writes beneath.
+    pub fn root(&self) -> &str {
+        &self.root
+    }
+
+    /// Confirms that the existing, untrashed file `id` carries `identity`, hashing its bytes
+    /// when Drive reports no checksum.
+    pub fn verify(&mut self, id: &str, identity: &ObjectIdentity) -> Result<RemoteFile, String> {
+        let remote = self
+            .metadata(id)?
+            .filter(|remote| !remote.trashed)
+            .ok_or_else(|| format!("drive: archived file {id} is missing or trashed"))?;
+        self.confirm(id, remote, identity)
+    }
+
+    /// The metadata of file `id`, or `None` when it does not exist.
+    pub fn metadata(&mut self, id: &str) -> Result<Option<RemoteFile>, String> {
+        let url = format!("{}/files/{id}", self.api);
+        let query = [("fields", "id,name,size,sha256Checksum,trashed")];
+        let reply = self.send(&format!("files.get {id}"), &|client| {
+            client.get(&url).query(&query)
+        })?;
+        match reply.status {
+            200 => serde_json::from_slice(&reply.body)
+                .map(Some)
+                .map_err(|_| "drive files.get: malformed response".into()),
+            404 => Ok(None),
+            _ => Err(reply.error(&format!("files.get {id}"))),
+        }
+    }
+
+    /// Delete one planned file, rechecking identity and name before every transport attempt.
+    /// Missing files are successful resumptions of a previous deletion.
+    pub fn delete_named(
+        &mut self,
+        id: &str,
+        name: &str,
+        identity: &ObjectIdentity,
+    ) -> Result<(), String> {
+        let url = format!("{}/files/{id}", self.api);
+        let what = format!("files.delete {id}");
+        let mut retry = RetryBudget::new(self.retry_budget);
+        let mut unauthorized = 0;
+        loop {
+            let Some(file) = self.metadata(id)? else {
+                return Ok(());
+            };
+            if file.id != id || file.name != name {
+                return Err(format!(
+                    "drive: refusing to delete {id}: recorded name mismatch"
+                ));
+            }
+            let file = self.confirm(id, file, identity)?;
+            // Confirmation can refresh missing metadata. Check the latest observed name
+            // and preserve verify's refusal to permanently remove a trashed target.
+            if file.id != id || file.name != name {
+                return Err(format!(
+                    "drive: refusing to delete {id}: recorded name mismatch"
+                ));
+            }
+            if file.trashed {
+                return Err(format!("drive: refusing to delete {id}: file is trashed"));
+            }
+            retry.attempts += 1;
+            let token = self.token()?;
+            let request = self.client.delete(&url).bearer_auth(&token);
+            match self.send_once(request) {
+                Ok(reply) if matches!(reply.status, 200 | 204 | 404) => return Ok(()),
+                Ok(reply) if reply.status == 401 => {
+                    unauthorized += 1;
+                    if unauthorized >= self.max_attempts {
+                        return Err(reply.error(&what));
+                    }
+                    self.access_token = None;
+                }
+                Ok(reply)
+                    if transient_status(reply.status, error_reason(&reply.body).as_deref()) =>
+                {
+                    retry.retry(
+                        &what,
+                        TransientFailure::Http(reply.status, error_reason(&reply.body)),
+                    )?;
+                }
+                Ok(reply) => return Err(reply.error(&what)),
+                Err(error) => retry.retry(&what, TransientFailure::Transport(error))?,
+            }
+        }
+    }
+
+    /// Every non-trashed file beneath the root whose name starts with `prefix`, following
+    /// pagination to the end.
+    pub fn list(&mut self, prefix: &str) -> Result<Vec<RemoteFile>, String> {
+        let url = format!("{}/files", self.api);
+        let mut filter = format!("'{}' in parents and trashed = false", self.root);
+        if !prefix.is_empty() {
+            filter.push_str(&format!(
+                " and name contains '{}'",
+                prefix.replace('\\', "\\\\").replace('\'', "\\'")
+            ));
+        }
+        let mut files = Vec::new();
+        let mut page_token: Option<String> = None;
+        let mut restarts = 0;
+        let mut seen_tokens = std::collections::BTreeSet::new();
+        loop {
+            let mut query = vec![
+                ("q".to_string(), filter.clone()),
+                (
+                    "fields".to_string(),
+                    "nextPageToken,incompleteSearch,files(id,name,size,sha256Checksum,trashed)"
+                        .to_string(),
+                ),
+                ("pageSize".to_string(), "1000".to_string()),
+            ];
+            if let Some(token) = &page_token {
+                query.push(("pageToken".to_string(), token.clone()));
+            }
+            let reply = self.send("files.list", &|client| client.get(&url).query(&query))?;
+            if reply.status == 400 && page_token.is_some() && restarts < self.max_attempts {
+                // Drive page tokens can expire. Discard the partial view and restart.
+                restarts += 1;
+                files.clear();
+                seen_tokens.clear();
+                page_token = None;
+                continue;
+            }
+            if reply.status != 200 {
+                return Err(reply.error("files.list"));
+            }
+            let listing: Listing = serde_json::from_slice(&reply.body)
+                .map_err(|_| "drive files.list: malformed response")?;
+            if listing.incomplete_search {
+                return Err(
+                    "drive files.list: incompleteSearch: incomplete search; no complete archive inventory".into(),
+                );
+            }
+            files.extend(
+                listing
+                    .files
+                    .into_iter()
+                    .filter(|file| file.name.starts_with(prefix)),
+            );
+            match listing.next_page_token {
+                Some(token) => {
+                    if !seen_tokens.insert(token.clone()) {
+                        return Err("drive files.list: repeated page token".into());
+                    }
+                    page_token = Some(token);
+                }
+                None => return Ok(files),
+            }
+        }
+    }
+
+    /// Uploads `path` as file `id` named `name` beneath the root and returns the remote file
+    /// once its size and SHA-256 are confirmed. `session` is the resumable session recorded by
+    /// an earlier attempt; `checkpoint` receives every session change before bytes flow through
+    /// it. A file already completed under `id` is reconciled by content, never duplicated.
+    pub fn upload(
+        &mut self,
+        id: &str,
+        name: &str,
+        path: &Path,
+        identity: &ObjectIdentity,
+        mut session: Option<String>,
+        checkpoint: &mut dyn FnMut(Option<&str>) -> Result<(), String>,
+    ) -> Result<RemoteFile, String> {
+        let total = identity.bytes;
+        let mut file =
+            File::open(path).map_err(|error| format!("cannot open {}: {error}", path.display()))?;
+        let mut offset;
+        let mut started = 0;
+        let mut last_rate_limit = None;
+        loop {
+            if started == self.max_attempts {
+                let last = last_rate_limit
+                    .as_deref()
+                    .map_or_else(String::new, |reason| format!(" (last: 403 {reason})"));
+                return Err(format!(
+                    "drive upload {name}: session restarted too often{last}"
+                ));
+            }
+            if last_rate_limit.take().is_some() {
+                // Pace replacement sessions too when the account itself may be throttled.
+                std::thread::sleep(Duration::from_secs((1 << (started - 1).min(5)).min(30)));
+            }
+            started += 1;
+            let uri = match session.take() {
+                Some(uri) => match self.status(&uri, total)? {
+                    Resume::At(next) => {
+                        offset = next;
+                        uri
+                    }
+                    Resume::Completed(remote) => return self.confirm(id, remote, identity),
+                    Resume::Exists => return self.confirm_existing(id, name, identity),
+                    Resume::Abandoned if self.metadata(id)?.is_some() => {
+                        return self.confirm_existing(id, name, identity);
+                    }
+                    Resume::Expired | Resume::Abandoned => {
+                        checkpoint(None)?;
+                        continue;
+                    }
+                },
+                None => match self.begin(id, name, total)? {
+                    Some(uri) => {
+                        checkpoint(Some(&uri))?;
+                        offset = 0;
+                        uri
+                    }
+                    None => {
+                        // The identity was already created: reconcile the existing file.
+                        return self.confirm_existing(id, name, identity);
+                    }
+                },
+            };
+            let mut chunk = vec![0u8; self.chunk_bytes as usize];
+            let outcome = loop {
+                if offset > total {
+                    break Err(format!("drive upload {name}: acknowledged beyond the file"));
+                }
+                let length = (total - offset).min(self.chunk_bytes);
+                file.seek(SeekFrom::Start(offset))
+                    .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
+                file.read_exact(&mut chunk[..length as usize])
+                    .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
+                // An empty file has nothing to send: the status form of the request finalizes it.
+                let range = if length == 0 {
+                    format!("bytes */{total}")
+                } else {
+                    format!("bytes {offset}-{}/{total}", offset + length - 1)
+                };
+                let body = chunk[..length as usize].to_vec();
+                // The client omits `Content-Length` for an empty body, and the real service
+                // answers `411 Length Required` (observed 2026-09-16), so it is set explicitly.
+                let reply = self.send_with_rate_limit_retry("upload", false, &|client| {
+                    client
+                        .put(&uri)
+                        .header("Content-Range", &range)
+                        .header("Content-Length", length.to_string())
+                        .body(body.clone())
+                })?;
+                match reply.status {
+                    308 if length == 0 => {
+                        break Err(format!(
+                            "drive upload {name}: the session holds every byte but did not complete"
+                        ));
+                    }
+                    308 => offset = reply.range_end.map_or(0, |end| end + 1),
+                    200 | 201 => {
+                        let remote: RemoteFile = serde_json::from_slice(&reply.body)
+                            .map_err(|_| "drive upload: malformed completion")?;
+                        break Ok(Some(remote));
+                    }
+                    404 | 410 => break Ok(None),
+                    403 if transient_status(reply.status, error_reason(&reply.body).as_deref()) => {
+                        last_rate_limit = error_reason(&reply.body);
+                        break Ok(None);
+                    }
+                    _ => break Err(reply.error(&format!("upload {name}"))),
+                }
+            };
+            match outcome? {
+                Some(remote) => return self.confirm(id, remote, identity),
+                None => {
+                    // The session expired or was rate limited: restart under the same identity.
+                    checkpoint(None)?;
+                }
+            }
+        }
+    }
+
+    /// Starts a resumable session for a new file `id`; `None` when that identity already exists.
+    fn begin(&mut self, id: &str, name: &str, total: u64) -> Result<Option<String>, String> {
+        let url = format!("{}/files", self.upload);
+        let query = [
+            ("uploadType", "resumable"),
+            ("fields", "id,name,size,sha256Checksum,trashed"),
+        ];
+        let metadata =
+            serde_json::json!({ "id": id, "name": name, "parents": [self.root.clone()] });
+        let total = total.to_string();
+        let reply = self.send("upload begin", &|client| {
+            client
+                .post(&url)
+                .query(&query)
+                .header("X-Upload-Content-Length", &total)
+                .header("X-Upload-Content-Type", "application/octet-stream")
+                .json(&metadata)
+        })?;
+        match reply.status {
+            200 => reply
+                .location
+                .map(Some)
+                .ok_or("drive upload begin: no session location".into()),
+            409 => Ok(None),
+            _ => Err(reply.error(&format!("upload begin {name}"))),
+        }
+    }
+
+    /// Queries a recorded session; a rate-limit 403 abandons it after identity reconciliation.
+    fn status(&mut self, uri: &str, total: u64) -> Result<Resume, String> {
+        let range = format!("bytes */{total}");
+        let reply = self.send_with_rate_limit_retry("upload status", false, &|client| {
+            client
+                .put(uri)
+                .header("Content-Range", &range)
+                .header("Content-Length", "0")
+        })?;
+        match reply.status {
+            308 => Ok(Resume::At(reply.range_end.map_or(0, |end| end + 1))),
+            200 | 201 => serde_json::from_slice(&reply.body)
+                .map(Resume::Completed)
+                .map_err(|_| "drive upload status: malformed completion".into()),
+            404 | 410 => Ok(Resume::Expired),
+            403 if transient_status(reply.status, error_reason(&reply.body).as_deref()) => {
+                Ok(Resume::Abandoned)
+            }
+            409 if error_reason(&reply.body).as_deref() == Some("fileIdInUse") => {
+                Ok(Resume::Exists)
+            }
+            _ => Err(reply.error("upload status")),
+        }
+    }
+
+    fn confirm_existing(
+        &mut self,
+        id: &str,
+        name: &str,
+        identity: &ObjectIdentity,
+    ) -> Result<RemoteFile, String> {
+        let remote = self
+            .metadata(id)?
+            .ok_or_else(|| format!("drive upload {name}: {id} was created but is unreadable"))?;
+        self.confirm(id, remote, identity)
+    }
+
+    /// The remote file is the uploaded bytes: equal size and SHA-256, read back and hashed when
+    /// Drive reports no checksum. Different content is a conflict that replaces nothing.
+    fn confirm(
+        &mut self,
+        id: &str,
+        remote: RemoteFile,
+        identity: &ObjectIdentity,
+    ) -> Result<RemoteFile, String> {
+        let remote = match (remote.size, &remote.sha256) {
+            (Some(_), Some(_)) => remote,
+            _ => self
+                .metadata(id)?
+                .ok_or_else(|| format!("drive: {id} vanished after completion"))?,
+        };
+        if remote.trashed {
+            return Err(format!("drive: archived file {id} is trashed"));
+        }
+        let sha256 = match &remote.sha256 {
+            Some(sha256) => sha256.to_ascii_lowercase(),
+            None => self.hash(id)?.sha256,
+        };
+        if remote.size != Some(identity.bytes) || sha256 != identity.sha256 {
+            return Err(format!(
+                "drive: {id} holds {} bytes with SHA-256 {sha256}, expected {} bytes and {}; nothing was replaced",
+                remote
+                    .size
+                    .map_or("unknown".to_string(), |size| size.to_string()),
+                identity.bytes,
+                identity.sha256
+            ));
+        }
+        Ok(RemoteFile {
+            sha256: Some(sha256),
+            ..remote
+        })
+    }
+
+    /// Confirms a listed file's size and checksum, reading bytes when Drive omits SHA-256.
+    pub fn listed_identity(&mut self, remote: &RemoteFile) -> Result<ObjectIdentity, String> {
+        if remote.trashed {
+            return Err(format!("drive: {} is trashed", remote.id));
+        }
+        let bytes = remote
+            .size
+            .ok_or_else(|| format!("drive: {} reports no size", remote.id))?;
+        if let Some(sha256) = &remote.sha256 {
+            let identity = ObjectIdentity {
+                bytes,
+                sha256: sha256.to_ascii_lowercase(),
+                crc32c: 0,
+            };
+            self.verify(&remote.id, &identity)?;
+            Ok(identity)
+        } else {
+            let identity = self.hash(&remote.id)?;
+            if identity.bytes != bytes {
+                return Err(format!(
+                    "drive: {} readback size disagrees with listing",
+                    remote.id
+                ));
+            }
+            // Recheck current metadata against the measured bytes without downloading them
+            // a second time when Drive still reports no checksum.
+            let current = self
+                .metadata(&remote.id)?
+                .ok_or_else(|| format!("drive: {} vanished after readback", remote.id))?;
+            self.confirm(
+                &remote.id,
+                RemoteFile {
+                    sha256: current.sha256.or_else(|| Some(identity.sha256.clone())),
+                    ..current
+                },
+                &identity,
+            )?;
+            Ok(identity)
+        }
+    }
+
+    /// Reads file `id` back completely and returns its identity without keeping the bytes.
+    pub(crate) fn hash(&mut self, id: &str) -> Result<ObjectIdentity, String> {
+        let mut hasher = Hasher::default();
+        self.read(id, 0, &mut hasher)?;
+        Ok(hasher.finish())
+    }
+
+    /// Streams the bytes of file `id` from `offset` into `sink`, returning the bytes written.
+    fn read(&mut self, id: &str, offset: u64, sink: &mut dyn Write) -> Result<u64, String> {
+        let url = format!("{}/files/{id}", self.api);
+        let query = [("alt", "media")];
+        let mut retry = RetryBudget::new(self.retry_budget);
+        let mut unauthorized = 0;
+        let mut written = 0;
+        loop {
+            retry.attempts += 1;
+            let token = self.token()?;
+            let mut request = self.client.get(&url).query(&query).bearer_auth(&token);
+            // A failed body read may already have written bytes, including into a hasher.
+            // Resume after them so a retry never appends the same prefix twice.
+            let offset = offset + written;
+            if offset > 0 {
+                request = request.header("Range", format!("bytes={offset}-"));
+            }
+            let outcome = self.runtime.block_on(async {
+                let mut response = request.send().await?;
+                let status = response.status().as_u16();
+                match (status, offset) {
+                    (206, _) | (200, 0) => {}
+                    (200, _) => return Err(Failure::RangeIgnored),
+                    (status, _) => {
+                        let reason = error_reason(&response.bytes().await?);
+                        if status == 401 {
+                            return Err(Failure::Unauthorized(reason));
+                        }
+                        if transient_status(status, reason.as_deref()) {
+                            return Err(Failure::Transient(TransientFailure::Http(status, reason)));
+                        }
+                        if status == 404 {
+                            return Err(Failure::Fatal(format!(
+                                "drive files.get {id}: missing{}",
+                                reason_suffix(reason.as_deref())
+                            )));
+                        }
+                        return Err(Failure::Fatal(format!(
+                            "drive files.get {id}: status {status}{}",
+                            reason_suffix(reason.as_deref())
+                        )));
+                    }
+                }
+                while let Some(chunk) = response.chunk().await? {
+                    sink.write_all(&chunk)
+                        .map_err(|error| Failure::Fatal(format!("cannot write: {error}")))?;
+                    written += chunk.len() as u64;
+                }
+                Ok(written)
+            });
+            match outcome {
+                Ok(written) => return Ok(written),
+                Err(Failure::Unauthorized(reason)) => {
+                    unauthorized += 1;
+                    if unauthorized >= self.max_attempts {
+                        return Err(format!(
+                            "drive files.get {id}: HTTP 401 after {} attempts{}",
+                            retry.attempts,
+                            reason_suffix(reason.as_deref())
+                        ));
+                    }
+                    self.access_token = None;
+                }
+                Err(Failure::Transient(failure)) => {
+                    retry.retry(&format!("files.get {id}"), failure)?;
+                }
+                Err(Failure::RangeIgnored) => {
+                    return Err(format!(
+                        "drive files.get {id}: the byte range was not honoured"
+                    ));
+                }
+                Err(Failure::Fatal(reason)) => return Err(reason),
+            }
+        }
+    }
+
+    /// Downloads file `id` into `partial`, resuming its existing bytes by range, until the
+    /// complete file carries exactly `expected`. A partial file that no longer matches is
+    /// discarded once and fetched again from the start.
+    pub fn download(
+        &mut self,
+        id: &str,
+        partial: &Path,
+        expected: &ObjectIdentity,
+    ) -> Result<(), String> {
+        if let Some(parent) = partial.parent() {
+            fs::create_dir_all(parent)
+                .map_err(|error| format!("cannot create {}: {error}", parent.display()))?;
+        }
+        for restart in 0..2 {
+            let have = fs::metadata(partial)
+                .map(|metadata| metadata.len())
+                .unwrap_or(0);
+            let have = if have > expected.bytes { 0 } else { have };
+            let mut file = OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(partial)
+                .map_err(|error| format!("cannot open {}: {error}", partial.display()))?;
+            if have == 0 {
+                file.set_len(0)
+                    .map_err(|error| format!("cannot truncate {}: {error}", partial.display()))?;
+            }
+            if have < expected.bytes {
+                let written = self.read(id, have, &mut file)?;
+                file.sync_all()
+                    .map_err(|error| format!("cannot flush {}: {error}", partial.display()))?;
+                if have + written != expected.bytes {
+                    return Err(format!(
+                        "drive files.get {id}: received {} bytes, expected {}",
+                        have + written,
+                        expected.bytes
+                    ));
+                }
+            }
+            drop(file);
+            let identity = crate::store::identify(partial)?;
+            if identity.bytes == expected.bytes && identity.sha256 == expected.sha256 {
+                return Ok(());
+            }
+            if restart == 0 {
+                fs::remove_file(partial)
+                    .map_err(|error| format!("cannot remove {}: {error}", partial.display()))?;
+                continue;
+            }
+            return Err(format!(
+                "drive files.get {id}: bytes carry SHA-256 {}, expected {}",
+                identity.sha256, expected.sha256
+            ));
+        }
+        unreachable!("the download loop returns")
+    }
+}
+
+enum Resume {
+    At(u64),
+    Completed(RemoteFile),
+    Exists,
+    Expired,
+    Abandoned,
+}
+
+enum Failure {
+    Transient(TransientFailure),
+    Unauthorized(Option<String>),
+    RangeIgnored,
+    Fatal(String),
+}
+
+impl From<reqwest::Error> for Failure {
+    fn from(error: reqwest::Error) -> Self {
+        Self::Transient(TransientFailure::Transport(error))
+    }
+}

@@ -1,0 +1,36 @@
+# add-job policy template. Replace endpoint/application placeholders and history bounds.
+schema_version = 1
+run_mode = "research"
+[storage]
+historical_data_dir = "unused"
+publication_uri = "file:///unused"
+[[instruments]]
+broker = "deriv"
+provider_symbol = "frxEURUSD"
+quote_currency = "USD"
+price_scale = 5 # replaced from discovery for the new instrument
+native_granularity = { kind = "tick" }
+candles = [{ duration_seconds = 60, offset_seconds = 0 }]
+# Session evidence: 2026-09-17 (sessions_validation_v2.md, Deriv FX).
+[instruments.session]
+kind = "weekly"
+timezone = "UTC"
+open = { day = "monday", time = "00:00:00" }
+close = { day = "friday", time = "20:55:00" }
+closed_dates = ["2025-12-25", "2026-01-01"]
+early_closes = [{ date = "2025-12-24", time = "22:00:00" }, { date = "2025-12-31", time = "22:00:00" }]
+[[brokers]]
+id = "deriv"
+kind = "deriv"
+public_endpoint = "wss://REPLACE_WITH_AUTHORIZED_PUBLIC_ENDPOINT"
+bootstrap_endpoint = "https://REPLACE_WITH_AUTHORIZED_BOOTSTRAP_ENDPOINT"
+app_id = "REPLACE_WITH_REGISTERED_APP_ID"
+[history]
+broker = "deriv"
+instruments = ["frxEURUSD"]
+role = "development"
+start = "2025-08-01T00:00:00Z"
+end = "2026-09-17T00:00:00Z"
+overlap_seconds = 60
+max_pages = 6000
+max_elapsed_seconds = 3600

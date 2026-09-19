@@ -232,7 +232,7 @@ fn days_in_month(year: i64, month: i64) -> i64 {
 }
 
 /// Days since 1970-01-01 of a proleptic Gregorian date (Howard Hinnant's algorithm).
-fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
+pub(crate) fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
     let year = if month <= 2 { year - 1 } else { year };
     let era = year.div_euclid(400);
     let year_of_era = year - era * 400;
@@ -242,7 +242,7 @@ fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
     era * 146_097 + day_of_era - 719_468
 }
 
-fn civil_from_days(days: i64) -> (i64, i64, i64) {
+pub(crate) fn civil_from_days(days: i64) -> (i64, i64, i64) {
     let days = days + 719_468;
     let era = days.div_euclid(146_097);
     let day_of_era = days - era * 146_097;
@@ -359,7 +359,10 @@ impl TickSequence {
 /// the archive's binary floating point and never cross a money, order, accounting, or risk
 /// boundary.
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub struct Bar {
+pub struct Bar<P = ()> {
+    /// Optional at the type level: legacy calculations use `()`, daily archives retain the
+    /// provider columns without changing legacy bar equality or copy semantics.
+    pub provider: P,
     pub start_unix_s: i64,
     pub open: f64,
     pub high: f64,
@@ -369,7 +372,7 @@ pub struct Bar {
     pub period_s: u16,
 }
 
-impl Bar {
+impl<P> Bar<P> {
     /// Finite values, non-negative volume, consistent price relationships, the expected period,
     /// and a start on the period grid.
     pub fn validate(&self, period_s: u16) -> Result<(), String> {
@@ -406,6 +409,15 @@ impl Bar {
         }
         Ok(())
     }
+}
+
+/// Provider columns retained by daily bar archives in addition to the normalized bar fields.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BarProviderColumns {
+    pub symbol: String,
+    pub symbol_id: i32,
+    pub timestamp_utc: i64,
+    pub server_time_s: i64,
 }
 
 /// Requires strictly increasing bar start times across one dataset.
@@ -582,6 +594,7 @@ mod tests {
     #[test]
     fn bars_validate_values_grid_and_order() {
         let bar = Bar {
+            provider: (),
             start_unix_s: 1_747_653_300,
             open: 181.05,
             high: 181.1,

@@ -164,6 +164,7 @@ pub fn run(config_path: &Path, out: &mut dyn Write) -> Result<(), String> {
     let access = Access {
         declaration: declaration.as_ref(),
         certification: None,
+        verified: None,
     };
     // Every entry resolves, and every resolved instrument and stream has one owner in one role,
     // before anything is streamed or published.

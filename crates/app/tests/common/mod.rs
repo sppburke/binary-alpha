@@ -165,6 +165,29 @@ pub fn sha256(path: &Path) -> String {
         .collect()
 }
 
+/// Exact regular-file inventory, including names, for refusal/source-preservation oracles.
+pub fn snapshot_tree(root: &Path) -> std::collections::BTreeMap<PathBuf, Vec<u8>> {
+    fn visit(root: &Path, dir: &Path, files: &mut std::collections::BTreeMap<PathBuf, Vec<u8>>) {
+        if !dir.exists() {
+            return;
+        }
+        for entry in fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                visit(root, &path, files);
+            } else {
+                files.insert(
+                    path.strip_prefix(root).unwrap().to_path_buf(),
+                    fs::read(path).unwrap(),
+                );
+            }
+        }
+    }
+    let mut files = std::collections::BTreeMap::new();
+    visit(root, root, &mut files);
+    files
+}
+
 /// CRC32C of a file, computed independently of the application.
 pub fn crc32c(path: &Path) -> u32 {
     let mut crc = !0u32;
@@ -201,10 +224,17 @@ pub fn write_collection(root: &Path, assets: &[AssetSpec]) -> PathBuf {
             format!("{{\"asset\": \"{}\"}}\n", spec.asset),
         )
         .unwrap();
-        fs::write(asset_root.join("checkpoint.ndjson"), "{\"page\": 1}\n").unwrap();
+        let raw_page = format!("{{\"asset\": \"{}\", \"data\": []}}", spec.asset);
+        let raw_path = asset_root.join("raw_pages.ndjson");
+        fs::write(&raw_path, &raw_page).unwrap();
+        let payload_sha256 = sha256(&raw_path);
+        fs::write(&raw_path, format!("{raw_page}\n")).unwrap();
         fs::write(
-            asset_root.join("raw_pages.ndjson"),
-            format!("{{\"asset\": \"{}\", \"data\": []}}\n", spec.asset),
+            asset_root.join("checkpoint.ndjson"),
+            format!(
+                "{}\n",
+                json!({"payload_sha256":payload_sha256,"request_token":"1747660500"})
+            ),
         )
         .unwrap();
         fs::write(dataset_root.join("_SUCCESS"), "").unwrap();
@@ -275,6 +305,90 @@ pub fn write_collection(root: &Path, assets: &[AssetSpec]) -> PathBuf {
     manifest
 }
 
+/// The exact schema of one daily tick archive file.
+pub const DAILY_SCHEMA: &str = "message schema {
+  OPTIONAL INT64 datetime_utc (TIMESTAMP(NANOS,true));
+  OPTIONAL DOUBLE price;
+}
+";
+
+/// Writes one Snappy daily archive file of `(nanoseconds, price)` rows; `null_row` leaves both
+/// cells of that row null.
+pub fn write_daily_file(path: &Path, rows: &[(i64, f64)], null_row: Option<usize>) {
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let schema = Arc::new(parse_message_type(DAILY_SCHEMA).unwrap());
+    let properties = Arc::new(
+        WriterProperties::builder()
+            .set_compression(Compression::SNAPPY)
+            .build(),
+    );
+    let mut writer =
+        SerializedFileWriter::new(File::create(path).unwrap(), schema, properties).unwrap();
+    let mut group = writer.next_row_group().unwrap();
+    let present: Vec<&(i64, f64)> = rows
+        .iter()
+        .enumerate()
+        .filter(|(row, _)| Some(*row) != null_row)
+        .map(|(_, cells)| cells)
+        .collect();
+    let levels: Vec<i16> = (0..rows.len())
+        .map(|row| i16::from(Some(row) != null_row))
+        .collect();
+    let times: Vec<i64> = present.iter().map(|(nanos, _)| *nanos).collect();
+    let prices: Vec<f64> = present.iter().map(|(_, price)| *price).collect();
+    let mut column = group.next_column().unwrap().unwrap();
+    if let ColumnWriter::Int64ColumnWriter(typed) = column.untyped() {
+        typed.write_batch(&times, Some(&levels), None).unwrap();
+    }
+    column.close().unwrap();
+    let mut column = group.next_column().unwrap().unwrap();
+    if let ColumnWriter::DoubleColumnWriter(typed) = column.untyped() {
+        typed.write_batch(&prices, Some(&levels), None).unwrap();
+    }
+    column.close().unwrap();
+    group.close().unwrap();
+    writer.close().unwrap();
+}
+
+/// The metadata document of one archive day, with every field the observed archive records.
+pub fn daily_metadata(symbol: &str, date: &str, ticks: u64) -> String {
+    json!({
+        "symbol": symbol,
+        "date": date,
+        "calendar": "UTC",
+        "ticks": ticks,
+        "windows_requested": 96,
+        "windows_skipped_closed": 0,
+        "gaps": [],
+        "clipped_by_retention": false,
+        "clipped_by_now": false,
+        "market_closed": false,
+        "complete": true,
+        "written_at": "2026-08-10T07:18:42.882488+00:00"
+    })
+    .to_string()
+}
+
+/// Writes one listed directory: a metadata file per day and a Parquet file for each day with
+/// rows.
+pub fn write_daily_directory(dir: &Path, name: &str, symbol: &str, days: &[(&str, &[(i64, f64)])]) {
+    fs::create_dir_all(dir).unwrap();
+    for (date, rows) in days {
+        fs::write(
+            dir.join(format!("{name}_{date}_ticks.meta.json")),
+            daily_metadata(symbol, date, rows.len() as u64),
+        )
+        .unwrap();
+        if !rows.is_empty() {
+            write_daily_file(
+                &dir.join(format!("{name}_{date}_ticks.parquet")),
+                rows,
+                None,
+            );
+        }
+    }
+}
+
 pub fn write_ticks(path: &Path, rows: &[&str]) {
     fs::create_dir_all(path.parent().unwrap()).unwrap();
     let mut text = String::from("time_utc,symbol,price\n");
@@ -283,6 +397,20 @@ pub fn write_ticks(path: &Path, rows: &[&str]) {
         text.push('\n');
     }
     fs::write(path, text).unwrap();
+}
+
+/// A freshly bound loopback port can only have belonged to a fixture that is gone. The
+/// host-scoped archive fence keys on endpoint and root id, so a reservation or lock an earlier
+/// fixture left for this endpoint is stale evidence of that fixture, never of the new one.
+pub fn clear_archive_fence(base: &str, root: &str) {
+    let binding = format!("{base}\n{root}");
+    let stale = std::env::temp_dir().join(format!(
+        "binary-alpha-archive-{}",
+        binary_alpha_engine::hex(&Sha256::digest(binding.as_bytes()))
+    ));
+    for extension in ["retirement.json", "lock"] {
+        let _ = fs::remove_file(stale.with_extension(extension));
+    }
 }
 
 pub struct Scratch {
@@ -573,24 +701,23 @@ pub fn read_table(path: &Path) -> Table {
 
 /// Every normalized tick of a published dataset generation, through the generic row API.
 pub fn read_normalized_ticks(store: &Path, dataset: &GenerationManifest) -> Vec<Tick> {
-    let path = store.join(
-        &dataset
-            .objects
-            .iter()
-            .find(|object| object.path == "normalized/ticks.parquet")
-            .unwrap()
-            .key,
-    );
-    let reader = SerializedFileReader::new(File::open(path).unwrap()).unwrap();
-    reader
-        .get_row_iter(None)
+    binary_alpha_app::daily::observation_partitions(dataset)
         .unwrap()
-        .map(|row| {
-            let row = row.unwrap();
-            Tick {
-                event_time_micros: row.get_timestamp_micros(0).unwrap(),
-                price_units: row.get_long(1).unwrap(),
-            }
+        .into_iter()
+        .flat_map(|(object, _)| {
+            let reader =
+                SerializedFileReader::new(File::open(store.join(&object.key)).unwrap()).unwrap();
+            reader
+                .get_row_iter(None)
+                .unwrap()
+                .map(|row| {
+                    let row = row.unwrap();
+                    Tick {
+                        event_time_micros: row.get_timestamp_micros(0).unwrap(),
+                        price_units: row.get_long(1).unwrap(),
+                    }
+                })
+                .collect::<Vec<_>>()
         })
         .collect()
 }
@@ -791,3 +918,8 @@ pub fn cli_as(log: &Path, user: &str, args: &[&str]) -> Result<String, String> {
             .unwrap(),
     )
 }
+
+pub mod daily;
+pub mod legacy;
+
+pub mod current;

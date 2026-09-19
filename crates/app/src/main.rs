@@ -4,8 +4,8 @@
 //! verification, and the external adapters those commands need.
 
 use binary_alpha_app::{
-    audit, features, fetch, import, inspect, live, load_config, outcomes, portfolio, replay,
-    research, search, verify,
+    audit, data_pipeline, features, fetch, import, inspect, live, load_config, outcomes, portfolio,
+    replay, research, search, verify,
 };
 
 use std::path::{Path, PathBuf};
@@ -251,6 +251,120 @@ enum DataCommand {
         #[arg(long)]
         config: Option<PathBuf>,
     },
+    /// Stage, import, extend, archive, list, and restore research market data through one
+    /// managed local store and a private Drive archive.
+    #[command(disable_help_subcommand = true)]
+    Pipeline {
+        #[command(subcommand)]
+        command: PipelineCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum PipelineCommand {
+    /// Remove a document entry after its whole-job retirement has completed.
+    RemoveJob {
+        #[arg(long)]
+        config: PathBuf,
+        #[arg(long)]
+        job: String,
+    },
+    /// Register one discovered instrument using a broker/history/candle policy template.
+    AddJob {
+        #[arg(long)]
+        config: PathBuf,
+        #[arg(long)]
+        broker: String,
+        #[arg(long)]
+        symbol: String,
+        #[arg(long)]
+        template: PathBuf,
+        #[arg(long)]
+        quote_currency: Option<String>,
+        #[arg(long)]
+        price_scale: Option<u8>,
+        /// TOML file containing the explicit singular session declaration.
+        #[arg(long)]
+        session: Option<PathBuf>,
+    },
+    /// Convert retained v1 generations to a verified daily-v2 continuation root, offline.
+    Migrate {
+        #[arg(long)]
+        config: PathBuf,
+        #[arg(long)]
+        job: Option<String>,
+    },
+    /// Archive the newest local daily dataset without acquiring broker history.
+    Archive {
+        #[arg(long)]
+        config: PathBuf,
+        #[arg(long)]
+        job: Option<String>,
+    },
+    /// Plan unreachable local and Drive data retirement, or resume one immutable plan.
+    Retire {
+        #[arg(long)]
+        config: PathBuf,
+        #[arg(long)]
+        job: Option<String>,
+        #[arg(long, conflicts_with = "apply")]
+        plan: bool,
+        #[arg(long)]
+        apply: Option<PathBuf>,
+        /// Retire the selected instrument completely, including its current continuation root.
+        #[arg(long, requires = "job")]
+        whole_job: bool,
+    },
+    /// Extend every job's imported generation from its frontier to one pinned cutoff within
+    /// its budget, then audit, verify, and archive the result.
+    Update {
+        /// Path of the TOML pipeline document.
+        #[arg(long)]
+        config: PathBuf,
+        /// The pinned cutoff as `YYYY-MM-DDTHH:MM:SS[.ffffff]Z`; absent means now.
+        #[arg(long)]
+        end: Option<String>,
+    },
+    /// Select the newest archived catalog of one instrument and restore it unless it is already
+    /// in this document's managed store; print the local ready-manifest locations.
+    Pull {
+        #[arg(long)]
+        config: PathBuf,
+        #[arg(long)]
+        broker: String,
+        #[arg(long)]
+        symbol: String,
+    },
+    /// List every archived catalog of one instrument.
+    List {
+        #[arg(long)]
+        config: PathBuf,
+        #[arg(long)]
+        broker: String,
+        #[arg(long)]
+        symbol: String,
+    },
+    /// Install exactly one catalog's dataset and stream closure into this document's managed
+    /// store and print their local ready-manifest locations; with `--all`, select and install
+    /// the newest archived catalog of every instrument on the archive root, `parallel_jobs`
+    /// at a time.
+    Restore {
+        #[arg(long)]
+        config: PathBuf,
+        /// The catalog's Drive file identifier.
+        #[arg(long, required_unless_present = "all", conflicts_with = "all")]
+        catalog: Option<String>,
+        /// The catalog's expected SHA-256.
+        #[arg(long, required_unless_present = "all", conflicts_with = "all")]
+        sha256: Option<String>,
+        #[arg(long, required_unless_present = "all", conflicts_with = "all")]
+        broker: Option<String>,
+        #[arg(long, required_unless_present = "all", conflicts_with = "all")]
+        symbol: Option<String>,
+        /// Every instrument archived on the archive root, newest verified catalog each.
+        #[arg(long)]
+        all: bool,
+    },
 }
 
 fn main() -> ExitCode {
@@ -299,6 +413,91 @@ fn main() -> ExitCode {
         Command::Data {
             command: DataCommand::Verify { manifest, config },
         } => verify::run_configured(config.as_deref(), &manifest).map(|line| println!("{line}")),
+        Command::Data {
+            command: DataCommand::Pipeline { command },
+        } => match command {
+            PipelineCommand::RemoveJob { config, job } => {
+                data_pipeline::add_job::remove(&config, &job, &mut std::io::stdout().lock())
+            }
+            PipelineCommand::AddJob {
+                config,
+                broker,
+                symbol,
+                template,
+                quote_currency,
+                price_scale,
+                session,
+            } => data_pipeline::add_job::run(
+                &config,
+                &data_pipeline::add_job::Options {
+                    broker: &broker,
+                    symbol: &symbol,
+                    template: &template,
+                    quote_currency: quote_currency.as_deref(),
+                    price_scale,
+                    session: session.as_deref(),
+                },
+                &mut std::io::stdout().lock(),
+            ),
+            PipelineCommand::Migrate { config, job } => {
+                data_pipeline::migrate(&config, job.as_deref(), &mut std::io::stdout().lock())
+            }
+            PipelineCommand::Archive { config, job } => {
+                data_pipeline::archive(&config, job.as_deref(), &mut std::io::stdout().lock())
+            }
+            PipelineCommand::Retire {
+                config,
+                job,
+                plan: _,
+                apply,
+                whole_job,
+            } => binary_alpha_app::retire::run_scoped(
+                &config,
+                job.as_deref(),
+                apply.as_deref(),
+                whole_job,
+                &mut std::io::stdout().lock(),
+            ),
+            PipelineCommand::Update { config, end } => {
+                data_pipeline::update(&config, end.as_deref(), &mut std::io::stdout().lock())
+            }
+            PipelineCommand::Pull {
+                config,
+                broker,
+                symbol,
+            } => data_pipeline::pull(&config, &broker, &symbol, &mut std::io::stdout().lock()),
+            PipelineCommand::List {
+                config,
+                broker,
+                symbol,
+            } => data_pipeline::list(&config, &broker, &symbol, &mut std::io::stdout().lock()),
+            PipelineCommand::Restore {
+                config,
+                catalog,
+                sha256,
+                broker,
+                symbol,
+                all,
+            } => {
+                if all {
+                    data_pipeline::restore_all(&config, &mut std::io::stdout().lock())
+                } else {
+                    match (catalog, sha256, broker, symbol) {
+                        (Some(catalog), Some(sha256), Some(broker), Some(symbol)) => {
+                            data_pipeline::restore(
+                                &config,
+                                &catalog,
+                                &sha256,
+                                &broker,
+                                &symbol,
+                                &mut std::io::stdout().lock(),
+                            )
+                        }
+                        _ => Err("restore: --catalog, --sha256, --broker and --symbol are required without --all".into()),
+                    }
+                }
+            }
+        },
         Command::Features {
             command: FeaturesCommand::Build { config },
         } => features::run(&config, &mut std::io::stdout().lock()),

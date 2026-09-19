@@ -602,6 +602,7 @@ pub fn replay(config: &Config, local: &Store, destination: &Store) -> Result<Str
     let access = Access {
         declaration: declaration.as_ref(),
         certification: None,
+        verified: None,
     };
     publish(config, local, destination, false, access).map(|published| published.report)
 }

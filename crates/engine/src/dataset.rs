@@ -3,6 +3,10 @@
 //! A generation is identified by its inputs; its ready manifest is the sole publication record.
 //! `docs/contracts.md`, section "Historical datasets", is the normative description.
 
+pub mod coverage;
+pub mod daily;
+pub use daily::{DayFamily, DayInventoryEntry, DayState, Layout, UnresolvedInterval};
+
 use std::fmt;
 
 use serde::{Deserialize, Serialize};
@@ -61,11 +65,14 @@ crate::string_enum! {
 }
 
 /// The native granularity of the source.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum NativeGranularity {
+    #[default]
     Tick,
-    Bar { period_seconds: u16 },
+    Bar {
+        period_seconds: u16,
+    },
 }
 
 impl<'de> Deserialize<'de> for NativeGranularity {
@@ -90,6 +97,20 @@ impl<'de> Deserialize<'de> for NativeGranularity {
             (kind, _) => Err(serde::de::Error::custom(format!(
                 "unknown kind `{kind}`, expected one of `tick`, `bar`"
             ))),
+        }
+    }
+}
+
+impl NativeGranularity {
+    pub fn is_tick(&self) -> bool {
+        *self == Self::Tick
+    }
+
+    /// The normalized data object a broker-history generation of this granularity carries.
+    pub fn normalized_object_path(self) -> &'static str {
+        match self {
+            Self::Tick => "normalized/ticks.parquet",
+            Self::Bar { .. } => "normalized/bars.parquet",
         }
     }
 }
@@ -144,6 +165,34 @@ pub struct IntervalContract {
 }
 
 impl IntervalContract {
+    /// The one contract this checkout admits, observed under `provenance`.
+    pub fn five_second(provenance: &str) -> Self {
+        Self {
+            closed: "left".into(),
+            frequency: "5s".into(),
+            interval: "[timestamp,timestamp+5s)".into(),
+            label: "left".into(),
+            offset_seconds: 0,
+            origin: "unix_epoch_utc".into(),
+            timestamp_semantics: "bar_start".into(),
+            provenance: provenance.into(),
+        }
+    }
+
+    /// The key-value pairs a bar file embeds for this contract; provenance is recorded by the
+    /// manifest, never by the file.
+    pub fn metadata(&self) -> [(&'static str, String); 7] {
+        [
+            ("closed", self.closed.clone()),
+            ("frequency", self.frequency.clone()),
+            ("interval", self.interval.clone()),
+            ("label", self.label.clone()),
+            ("offset_seconds", self.offset_seconds.to_string()),
+            ("origin", self.origin.clone()),
+            ("timestamp_semantics", self.timestamp_semantics.clone()),
+        ]
+    }
+
     /// The exact contract this checkout admits: left-closed five-second bars whose timestamp is
     /// the bar start on the Unix epoch grid, with a non-empty provenance.
     pub fn validate(&self) -> Result<(), String> {
@@ -200,7 +249,7 @@ pub struct ObjectRecord {
     pub generation: Option<i64>,
 }
 
-fn is_hex64(text: &str) -> bool {
+pub(crate) fn is_hex64(text: &str) -> bool {
     text.len() == 64
         && text
             .bytes()
@@ -226,8 +275,23 @@ pub fn generation_id(
     price_scale: Option<PriceScale>,
     inputs: &[ObjectRecord],
 ) -> String {
+    generation_id_with_layout(instrument, source_kind, role, price_scale, inputs, None)
+}
+
+/// Layout-aware identity; the absent marker follows the exact legacy hash recipe.
+pub fn generation_id_with_layout(
+    instrument: &InstrumentId,
+    source_kind: SourceKind,
+    role: DatasetRole,
+    price_scale: Option<PriceScale>,
+    inputs: &[ObjectRecord],
+    layout: Option<Layout>,
+) -> String {
     let mut hasher = Sha256::new();
     hasher.update(GENERATION_DOMAIN_V1);
+    if let Some(layout) = layout {
+        hasher.update(format!("layout {layout}\n").as_bytes());
+    }
     for line in [
         instrument.broker.as_str(),
         instrument.provider_symbol.as_str(),
@@ -262,6 +326,10 @@ pub fn generation_id(
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct GenerationManifest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub layout: Option<Layout>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub day_inventory: Vec<DayInventoryEntry>,
     pub schema_version: u32,
     pub generation: String,
     pub broker: BrokerId,
@@ -323,7 +391,9 @@ impl GenerationManifest {
                 self.instrument
             ));
         }
-        let scale = match (
+        // Imported bar archives keep their listed files as the data objects; every other
+        // admitted combination normalizes into exactly one object.
+        let (scale, expected) = match (
             self.source_kind,
             self.price_representation,
             self.native_granularity,
@@ -338,7 +408,7 @@ impl GenerationManifest {
                 TimeUnit::Microsecond,
                 false,
                 [Capability::Ticks],
-            ) => Some(scale),
+            ) => (Some(scale), 1),
             (
                 SourceKind::BarParquet,
                 PriceRepresentation::BinaryFloat64,
@@ -346,7 +416,15 @@ impl GenerationManifest {
                 TimeUnit::Second,
                 true,
                 [Capability::Bars],
-            ) => None,
+            ) => (None, 0),
+            (
+                SourceKind::BrokerHistory,
+                PriceRepresentation::BinaryFloat64,
+                NativeGranularity::Bar { period_seconds: 5 },
+                TimeUnit::Second,
+                true,
+                [Capability::Bars],
+            ) => (None, 1),
             _ => {
                 return Err(format!(
                     "source kind {}, price representation, granularity, time unit, interval, and capabilities disagree",
@@ -358,35 +436,61 @@ impl GenerationManifest {
             interval.validate()?;
         }
         validate_objects(&self.objects)?;
-        let normalized = self
-            .objects
-            .iter()
-            .filter(|object| object.role == ObjectRole::Normalized)
-            .count();
-        let expected = usize::from(scale.is_some());
-        if normalized != expected || self.objects.len() == normalized {
-            return Err(format!(
-                "expected {expected} normalized object among {} objects, found {normalized}",
-                self.objects.len()
-            ));
+        if self.layout == Some(Layout::DailyV2) {
+            if self.role != DatasetRole::Development || self.source_kind == SourceKind::TickCsv {
+                return Err("daily-v2 requires development tick_parquet_daily, bar_parquet, or broker_history".into());
+            }
+            daily::validate_inventory(
+                &self.day_inventory,
+                &self.objects,
+                daily::DailyOwner::Dataset,
+            )?;
+            if daily::inventory_rows(
+                self.day_inventory
+                    .iter()
+                    .filter(|day| day.family == DayFamily::Observations),
+            )? != self.row_count
+            {
+                return Err("observation inventory rows disagree with row_count".into());
+            }
+        } else {
+            if !self.day_inventory.is_empty() {
+                return Err("day_inventory requires layout daily-v2".into());
+            }
+            let normalized = self
+                .objects
+                .iter()
+                .filter(|object| object.role == ObjectRole::Normalized)
+                .count();
+            if normalized != expected || self.objects.len() == normalized {
+                return Err(format!(
+                    "expected {expected} normalized object among {} objects, found {normalized}",
+                    self.objects.len()
+                ));
+            }
+            let normalized_path = self.native_granularity.normalized_object_path();
+            if self.source_kind == SourceKind::BrokerHistory
+                && (!self.objects.iter().any(|o| o.role == ObjectRole::Source)
+                    || !self.objects.iter().any(|o| {
+                        o.role == ObjectRole::Provenance && o.path == "provenance/coverage.json"
+                    })
+                    || !self
+                        .objects
+                        .iter()
+                        .any(|o| o.role == ObjectRole::Normalized && o.path == normalized_path))
+            {
+                return Err(format!(
+                    "broker_history requires raw source pages, provenance/coverage.json, and {normalized_path}"
+                ));
+            }
         }
-        if self.source_kind == SourceKind::BrokerHistory
-            && (!self.objects.iter().any(|o| o.role == ObjectRole::Source)
-                || !self.objects.iter().any(|o| {
-                    o.role == ObjectRole::Provenance && o.path == "provenance/coverage.json"
-                })
-                || !self.objects.iter().any(|o| {
-                    o.role == ObjectRole::Normalized && o.path == "normalized/ticks.parquet"
-                }))
-        {
-            return Err("broker_history requires raw source pages, provenance/coverage.json, and normalized/ticks.parquet".into());
-        }
-        if generation_id(
+        if generation_id_with_layout(
             &instrument,
             self.source_kind,
             self.role,
             scale,
             &self.objects,
+            self.layout,
         ) != self.generation
         {
             return Err(format!(
@@ -496,6 +600,8 @@ mod tests {
             ),
         ];
         GenerationManifest {
+            layout: None,
+            day_inventory: Vec::new(),
             schema_version: MANIFEST_SCHEMA_VERSION,
             generation: generation_id(
                 &instrument,
@@ -536,6 +642,88 @@ mod tests {
     }
 
     #[test]
+    fn daily_manifest_round_trips_without_changing_legacy_bytes_or_identity() {
+        let legacy = manifest();
+        let legacy_bytes = legacy.to_json();
+        assert!(!String::from_utf8_lossy(&legacy_bytes).contains("layout"));
+        assert!(!String::from_utf8_lossy(&legacy_bytes).contains("day_inventory"));
+        assert_eq!(
+            GenerationManifest::from_json(&legacy_bytes)
+                .unwrap()
+                .to_json(),
+            legacy_bytes
+        );
+        assert_eq!(
+            legacy.generation,
+            "c81fe40d17a4bd2914e0b941bdc895147ef9f21cc713e7e1d910e652dbab867e"
+        );
+        let mut daily = legacy.clone();
+        daily.layout = Some(Layout::DailyV2);
+        let day = daily::tests::entry(DayFamily::Observations);
+        daily.row_count = day.rows;
+        daily.coverage = Coverage {
+            first_event_time: day.first_time.clone().unwrap(),
+            last_event_time: day.last_time.clone().unwrap(),
+        };
+        daily.objects = vec![
+            daily::tests::object(&day.logical_path().unwrap(), ObjectRole::Normalized),
+            daily::tests::object("provenance/coverage.json", ObjectRole::Provenance),
+            daily::tests::object("provenance/lineage.json", ObjectRole::Provenance),
+        ];
+        daily.day_inventory = vec![day];
+        let instrument = InstrumentId {
+            broker: daily.broker.clone(),
+            provider_symbol: daily.provider_symbol.clone(),
+        };
+        daily.generation = generation_id_with_layout(
+            &instrument,
+            daily.source_kind,
+            daily.role,
+            None,
+            &daily.objects,
+            daily.layout,
+        );
+        assert_ne!(
+            daily.generation,
+            generation_id(
+                &instrument,
+                daily.source_kind,
+                daily.role,
+                None,
+                &daily.objects
+            )
+        );
+        assert_eq!(
+            GenerationManifest::from_json(&daily.to_json()).unwrap(),
+            daily
+        );
+        let mut bad = daily.clone();
+        bad.row_count += 1;
+        assert!(
+            GenerationManifest::from_json(&bad.to_json())
+                .unwrap_err()
+                .contains("row_count")
+        );
+        let mut bad = daily.clone();
+        bad.layout = None;
+        assert!(
+            GenerationManifest::from_json(&bad.to_json())
+                .unwrap_err()
+                .contains("requires layout")
+        );
+        let mut bad = daily.clone();
+        bad.role = DatasetRole::Evaluation;
+        assert!(
+            GenerationManifest::from_json(&bad.to_json())
+                .unwrap_err()
+                .contains("requires development")
+        );
+        let mut bad = serde_json::to_value(daily).unwrap();
+        bad["layout"] = "future".into();
+        assert!(GenerationManifest::from_json(&serde_json::to_vec(&bad).unwrap()).is_err());
+    }
+
+    #[test]
     fn generation_identity_ignores_object_order_and_normalized_outputs() {
         let manifest = manifest();
         let instrument = InstrumentId {
@@ -572,6 +760,55 @@ mod tests {
         assert_eq!(
             manifest().generation,
             "c81fe40d17a4bd2914e0b941bdc895147ef9f21cc713e7e1d910e652dbab867e"
+        );
+    }
+
+    #[test]
+    fn broker_history_bars_require_one_normalized_bar_object_and_an_interval() {
+        let mut valid = manifest();
+        valid.source_kind = SourceKind::BrokerHistory;
+        valid.objects[0].path = "provenance/coverage.json".to_string();
+        valid.objects.push(object(
+            ObjectRole::Normalized,
+            "normalized/bars.parquet",
+            "cc",
+        ));
+        let instrument = InstrumentId {
+            broker: valid.broker.clone(),
+            provider_symbol: valid.provider_symbol.clone(),
+        };
+        valid.generation = generation_id(
+            &instrument,
+            valid.source_kind,
+            valid.role,
+            None,
+            &valid.objects,
+        );
+        assert_eq!(
+            GenerationManifest::from_json(&valid.to_json()).unwrap(),
+            valid
+        );
+
+        let mut wrong_path = valid.clone();
+        wrong_path.objects[2].path = "normalized/ticks.parquet".to_string();
+        assert_eq!(
+            GenerationManifest::from_json(&wrong_path.to_json()).unwrap_err(),
+            "broker_history requires raw source pages, provenance/coverage.json, and normalized/bars.parquet"
+        );
+        let mut two_normalized = valid.clone();
+        two_normalized.objects.push(object(
+            ObjectRole::Normalized,
+            "normalized/extra.parquet",
+            "dd",
+        ));
+        assert_eq!(
+            GenerationManifest::from_json(&two_normalized.to_json()).unwrap_err(),
+            "expected 1 normalized object among 4 objects, found 2"
+        );
+        valid.interval = None;
+        assert_eq!(
+            GenerationManifest::from_json(&valid.to_json()).unwrap_err(),
+            "source kind broker_history, price representation, granularity, time unit, interval, and capabilities disagree"
         );
     }
 

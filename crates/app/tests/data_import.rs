@@ -5,17 +5,12 @@ mod common;
 
 use std::fs::{self, File};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 
 use common::*;
-use parquet::basic::Compression;
-use parquet::column::writer::ColumnWriter;
-use parquet::file::properties::WriterProperties;
 use parquet::file::reader::{FileReader, SerializedFileReader};
-use parquet::file::writer::SerializedFileWriter;
 use parquet::record::RowAccessor;
-use parquet::schema::parser::parse_message_type;
 use serde_json::{Value, json};
+use sha2::Digest;
 
 const TICK_ROWS: [&str; 4] = [
     "2026-03-22T06:02:39.312Z,AEDCNY,1.80787",
@@ -32,95 +27,11 @@ const NORMALIZED_TICKS: [(i64, i64); 4] = [
     (1_774_159_360_001_000, 1_914_290),
 ];
 
-/// The exact schema of one daily tick archive file.
-const DAILY_SCHEMA: &str = "message schema {
-  OPTIONAL INT64 datetime_utc (TIMESTAMP(NANOS,true));
-  OPTIONAL DOUBLE price;
-}
-";
-
 /// Unix seconds at 2025-08-11T00:00:00Z.
 const DAY_2025_08_11: i64 = 1_754_870_400;
 
 fn ns(seconds: i64) -> i64 {
     seconds * 1_000_000_000
-}
-
-/// Writes one Snappy daily archive file of `(nanoseconds, price)` rows; `null_row` leaves both
-/// cells of that row null.
-fn write_daily_file(path: &Path, rows: &[(i64, f64)], null_row: Option<usize>) {
-    fs::create_dir_all(path.parent().unwrap()).unwrap();
-    let schema = Arc::new(parse_message_type(DAILY_SCHEMA).unwrap());
-    let properties = Arc::new(
-        WriterProperties::builder()
-            .set_compression(Compression::SNAPPY)
-            .build(),
-    );
-    let mut writer =
-        SerializedFileWriter::new(File::create(path).unwrap(), schema, properties).unwrap();
-    let mut group = writer.next_row_group().unwrap();
-    let present: Vec<&(i64, f64)> = rows
-        .iter()
-        .enumerate()
-        .filter(|(row, _)| Some(*row) != null_row)
-        .map(|(_, cells)| cells)
-        .collect();
-    let levels: Vec<i16> = (0..rows.len())
-        .map(|row| i16::from(Some(row) != null_row))
-        .collect();
-    let times: Vec<i64> = present.iter().map(|(nanos, _)| *nanos).collect();
-    let prices: Vec<f64> = present.iter().map(|(_, price)| *price).collect();
-    let mut column = group.next_column().unwrap().unwrap();
-    if let ColumnWriter::Int64ColumnWriter(typed) = column.untyped() {
-        typed.write_batch(&times, Some(&levels), None).unwrap();
-    }
-    column.close().unwrap();
-    let mut column = group.next_column().unwrap().unwrap();
-    if let ColumnWriter::DoubleColumnWriter(typed) = column.untyped() {
-        typed.write_batch(&prices, Some(&levels), None).unwrap();
-    }
-    column.close().unwrap();
-    group.close().unwrap();
-    writer.close().unwrap();
-}
-
-/// The metadata document of one archive day, with every field the observed archive records.
-fn daily_metadata(symbol: &str, date: &str, ticks: u64) -> String {
-    json!({
-        "symbol": symbol,
-        "date": date,
-        "calendar": "UTC",
-        "ticks": ticks,
-        "windows_requested": 96,
-        "windows_skipped_closed": 0,
-        "gaps": [],
-        "clipped_by_retention": false,
-        "clipped_by_now": false,
-        "market_closed": false,
-        "complete": true,
-        "written_at": "2026-08-10T07:18:42.882488+00:00"
-    })
-    .to_string()
-}
-
-/// Writes one listed directory: a metadata file per day and a Parquet file for each day with
-/// rows.
-fn write_daily_directory(dir: &Path, name: &str, symbol: &str, days: &[(&str, &[(i64, f64)])]) {
-    fs::create_dir_all(dir).unwrap();
-    for (date, rows) in days {
-        fs::write(
-            dir.join(format!("{name}_{date}_ticks.meta.json")),
-            daily_metadata(symbol, date, rows.len() as u64),
-        )
-        .unwrap();
-        if !rows.is_empty() {
-            write_daily_file(
-                &dir.join(format!("{name}_{date}_ticks.parquet")),
-                rows,
-                None,
-            );
-        }
-    }
 }
 
 /// A two-directory daily archive beside entries that are never inspected.
@@ -206,7 +117,11 @@ fn published(name: &str) -> (Scratch, PathBuf, Vec<String>) {
     standard_sources(&scratch);
     let config = scratch.config(
         "import.toml",
-        &format!("{}{}", scratch.tick_source(), scratch.bar_source()),
+        &format!(
+            "{}{}",
+            daily_tick_source(&scratch),
+            scratch.bar_source().replace("evaluation", "development")
+        ),
     );
     let lines = import(&config).unwrap();
     (scratch, config, lines)
@@ -216,13 +131,35 @@ fn published(name: &str) -> (Scratch, PathBuf, Vec<String>) {
 fn import_publishes_retains_and_verifies_from_either_copy() {
     let scratch = Scratch::new("publish");
     standard_sources(&scratch);
-    let originals: Vec<(PathBuf, String)> = walk(&scratch.path("sources"))
-        .into_iter()
-        .map(|path| (path.clone(), sha256(&path)))
-        .collect();
+    let tick_source = daily_tick_source(&scratch);
+    write_ticks(
+        &scratch.path("sources/daily/mixed.csv"),
+        &["invalid excluded sibling"],
+    );
+    // Equal current page occurrences, including framing and checkpoint, must share a key.
+    let shared_page = b"{\"data\":[]}\n";
+    for symbol in ["#AAPL", "AEDCNY_otc"] {
+        let source = scratch.path("sources/bars").join(symbol);
+        fs::write(source.join("raw_pages.ndjson"), shared_page).unwrap();
+        let digest =
+            binary_alpha_engine::hex(&sha2::Sha256::digest(&shared_page[..shared_page.len() - 1]));
+        fs::write(
+            source.join("checkpoint.ndjson"),
+            format!(
+                "{}\n",
+                json!({"payload_sha256":digest,"request_token":"1747660500"})
+            ),
+        )
+        .unwrap();
+    }
+    let originals = snapshot_tree(&scratch.path("sources"));
     let config = scratch.config(
         "import.toml",
-        &format!("{}{}", scratch.tick_source(), scratch.bar_source()),
+        &format!(
+            "{}{}",
+            tick_source,
+            scratch.bar_source().replace("evaluation", "development")
+        ),
     );
 
     let lines = import(&config).unwrap();
@@ -233,30 +170,32 @@ fn import_publishes_retains_and_verifies_from_either_copy() {
         lines[0]
     );
     assert!(
-        lines[0].contains(" rows 4 objects 2 reused 0 "),
+        lines[0].contains(" rows 4 objects 3 reused 0 "),
         "{}",
         lines[0]
     );
     assert!(
-        lines[1].starts_with("published pocket_option:#AAPL evaluation generation "),
+        lines[1].starts_with("published pocket_option:#AAPL development generation "),
         "{}",
         lines[1]
     );
     assert!(
-        lines[1].contains(" rows 5 objects 10 reused 0 "),
+        lines[1].contains(" rows 5 objects 4 reused 0 "),
         "{}",
         lines[1]
     );
     assert!(
-        lines[2].contains("pocket_option:AEDCNY_otc evaluation")
-            && lines[2].contains(" rows 4 objects 9 reused 4 "),
-        "provenance bytes shared with the first asset are reused: {}",
+        lines[2].contains("pocket_option:AEDCNY_otc development")
+            && lines[2].contains(" rows 4 objects 4 reused 1 "),
+        "identical daily pages shared with the first bar asset are reused: {}",
         lines[2]
     );
 
-    for (path, digest) in &originals {
-        assert_eq!(&sha256(path), digest, "{} changed", path.display());
-    }
+    assert_eq!(
+        snapshot_tree(&scratch.path("sources")),
+        originals,
+        "all active inputs and excluded siblings stay byte-identical"
+    );
     assert_eq!(scratch.objects("retained"), scratch.objects("published"));
     for name in scratch.objects("published") {
         assert_eq!(
@@ -277,6 +216,7 @@ fn import_publishes_retains_and_verifies_from_either_copy() {
             "byte-for-byte mirror"
         );
         let json = manifest_json(manifest);
+        assert_eq!(json["layout"], "daily-v2");
         for object in json["objects"].as_array().unwrap() {
             assert!(
                 scratch
@@ -308,7 +248,7 @@ fn import_publishes_retains_and_verifies_from_either_copy() {
     let ticks = manifests
         .iter()
         .map(|path| manifest_json(path))
-        .find(|json| json["source_kind"] == "tick_csv")
+        .find(|json| json["source_kind"] == "tick_parquet_daily")
         .unwrap();
     assert_eq!(ticks["capabilities"], json!(["ticks"]));
     assert_eq!(
@@ -325,14 +265,54 @@ fn import_publishes_retains_and_verifies_from_either_copy() {
         .iter()
         .map(|object| object["path"].as_str().unwrap())
         .collect();
-    assert_eq!(tick_objects, ["ticks.csv", "normalized/ticks.parquet"]);
+    assert_eq!(
+        tick_objects,
+        [
+            "observations/2026-03-22.parquet",
+            "provenance/coverage.json",
+            "provenance/lineage.json"
+        ]
+    );
     assert!(
         !ticks.to_string().contains("mixed.csv"),
         "the undeclared sibling was never inventoried"
     );
+    let tick_lineage = ticks["objects"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|o| o["path"] == "provenance/lineage.json")
+        .unwrap();
+    let tick_lineage_bytes = fs::read(
+        scratch
+            .path("published")
+            .join(tick_lineage["key"].as_str().unwrap()),
+    )
+    .unwrap();
+    assert!(
+        !String::from_utf8(tick_lineage_bytes.clone())
+            .unwrap()
+            .contains("mixed.csv")
+    );
+    let tick_lineage: Value = serde_json::from_slice(&tick_lineage_bytes).unwrap();
+    for (path, bytes) in originals.iter().filter(|(path, _)| {
+        path.starts_with("daily/AEDCNY") && path.to_string_lossy().ends_with(".meta.json")
+    }) {
+        let name = path.file_name().unwrap().to_str().unwrap();
+        let entry = tick_lineage["provenance"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|p| p["object"]["path"] == name)
+            .unwrap();
+        assert_eq!(
+            &serde_json::from_value::<Vec<u8>>(entry["bytes_verbatim"].clone()).unwrap(),
+            bytes
+        );
+    }
     let normalized = scratch
         .path("published")
-        .join(ticks["objects"][1]["key"].as_str().unwrap());
+        .join(ticks["objects"][0]["key"].as_str().unwrap());
     let reader = SerializedFileReader::new(File::open(&normalized).unwrap()).unwrap();
     let pairs: Vec<(i64, i64)> = reader
         .get_row_iter(None)
@@ -385,13 +365,30 @@ fn import_publishes_retains_and_verifies_from_either_copy() {
         .map(|object| object["path"].as_str().unwrap())
         .collect();
     assert_eq!(
-        &paths[..2],
+        paths,
         [
-            "dataset/parquet/year=2025/month=05/part-00000.parquet",
-            "dataset/parquet/year=2025/month=06/part-00000.parquet"
-        ],
-        "source objects first, in manifest order"
+            "observations/2025-05-19.parquet",
+            "pages/2025-05-19.parquet",
+            "provenance/coverage.json",
+            "provenance/lineage.json"
+        ]
     );
+    let lineage: Value = serde_json::from_slice(
+        &fs::read(
+            scratch.path("published").join(
+                apple["objects"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|o| o["path"] == "provenance/lineage.json")
+                    .unwrap()["key"]
+                    .as_str()
+                    .unwrap(),
+            ),
+        )
+        .unwrap(),
+    )
+    .unwrap();
     for provenance in [
         "raw_pages.ndjson",
         "checkpoint.ndjson",
@@ -399,8 +396,100 @@ fn import_publishes_retains_and_verifies_from_either_copy() {
         "dataset/_SUCCESS",
         "collection/collection.json",
     ] {
-        assert!(paths.contains(&provenance), "{paths:?}");
+        let entry = lineage["original_objects"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|o| o["object"]["path"] == provenance)
+            .unwrap();
+        let path = if provenance == "collection/collection.json" {
+            "bars/collection.json".to_string()
+        } else {
+            format!("bars/#AAPL/{provenance}")
+        };
+        let bytes = &originals[&PathBuf::from(path)];
+        assert_eq!(entry["object"]["bytes"], bytes.len() as u64);
+        assert_eq!(
+            entry["object"]["sha256"],
+            binary_alpha_engine::hex(&sha2::Sha256::digest(bytes))
+        );
     }
+    let apple_manifest = binary_alpha_engine::dataset::GenerationManifest::from_json(
+        &serde_json::to_vec(&apple).unwrap(),
+    )
+    .unwrap();
+    for (checkpoint, name) in [(false, "raw_pages.ndjson"), (true, "checkpoint.ndjson")] {
+        assert_eq!(
+            common::daily::reconstruct_import(
+                &scratch.path("published"),
+                &apple_manifest,
+                checkpoint
+            ),
+            originals[&PathBuf::from(format!("bars/#AAPL/{name}"))]
+        );
+    }
+    for name in [
+        "download_manifest.json",
+        "dataset/manifest.json",
+        "dataset/hashes.sha256",
+        "dataset/reports/quality.json",
+    ] {
+        let entry = lineage["provenance"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|p| p["object"]["path"] == name)
+            .unwrap();
+        assert_eq!(
+            serde_json::from_value::<Vec<u8>>(entry["bytes_verbatim"].clone()).unwrap(),
+            originals[&PathBuf::from(format!("bars/#AAPL/{name}"))],
+            "embedded {name}"
+        );
+    }
+    let marker = lineage["provenance"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|p| p["object"]["path"] == "dataset/_SUCCESS")
+        .unwrap();
+    assert!(marker["bytes_verbatim"].is_null());
+    assert_eq!(
+        marker["object"]["sha256"],
+        sha256(&scratch.path("sources/bars/#AAPL/dataset/_SUCCESS"))
+    );
+    let collection = lineage["provenance"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|p| p["object"]["path"] == "collection/collection.json")
+        .unwrap();
+    let original_collection: Value =
+        serde_json::from_slice(&originals[&PathBuf::from("bars/collection.json")]).unwrap();
+    assert_eq!(
+        collection["instrument_entry"],
+        original_collection["assets"]["#AAPL"]
+    );
+    assert_eq!(
+        collection["object"]["sha256"],
+        sha256(&scratch.path("sources/bars/collection.json"))
+    );
+    let other = by_symbol("AEDCNY_otc");
+    let page_key = |manifest: &Value| {
+        manifest["objects"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|o| o["path"].as_str().unwrap().starts_with("pages/"))
+            .unwrap()["key"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    };
+    assert_eq!(
+        page_key(&apple),
+        page_key(&other),
+        "shared content reuses its actual key"
+    );
     assert_eq!(
         by_symbol("AEDCNY_otc")["interval"]["provenance"],
         "legacy_inferred_from_validated_5s_grid"
@@ -413,7 +502,7 @@ fn import_publishes_retains_and_verifies_from_either_copy() {
             .all(|line| line.ends_with("(already published)")),
         "{again:?}"
     );
-    assert!(again[1].contains(" objects 10 reused 10 "), "{}", again[1]);
+    assert!(again[1].contains(" objects 4 reused 4 "), "{}", again[1]);
     let mut expected_keys: Vec<String> = manifests
         .iter()
         .flat_map(|path| {
@@ -432,13 +521,17 @@ fn import_publishes_retains_and_verifies_from_either_copy() {
         expected_keys,
         "identical provenance bytes share one object"
     );
-    assert_eq!(expected_keys.len(), 17);
+    assert_eq!(expected_keys.len(), 10);
 
     // Reusing the committed generations from a new historical-data folder retains every child.
     let elsewhere = scratch.config_with(
         "elsewhere.toml",
         "retained2",
-        &format!("{}{}", scratch.tick_source(), scratch.bar_source()),
+        &format!(
+            "{}{}",
+            daily_tick_source(&scratch),
+            scratch.bar_source().replace("evaluation", "development")
+        ),
     );
     let reused = import(&elsewhere).unwrap();
     assert!(
@@ -539,16 +632,20 @@ fn interrupted_runs_resume_without_duplicates_or_early_ready_state() {
         .1
         .iter()
         .map(|(path, _)| manifest_json(path))
-        .find(|json| json["source_kind"] == "tick_csv")
+        .find(|json| json["source_kind"] == "tick_parquet_daily")
         .unwrap();
-    let normalized_key = ticks["objects"][1]["key"].as_str().unwrap().to_string();
+    let normalized_key = ticks["objects"][0]["key"].as_str().unwrap().to_string();
     fs::remove_file(scratch.path("published").join(&normalized_key)).unwrap();
     fs::remove_file(scratch.path("retained").join(&normalized_key)).unwrap();
     remove_manifests(&scratch, &before, true);
-    fs::write(scratch.path("retained/objects/.tmp-leftover-1"), b"partial").unwrap();
+    fs::write(
+        scratch.path("retained/objects/.tmp-leftover-1-0"),
+        b"partial",
+    )
+    .unwrap();
     fs::write(
         scratch.path(&format!(
-            "retained/objects/.tmp-{}-1",
+            "retained/objects/.tmp-{}-1-1",
             generation(&lines[0])
         )),
         b"partial normalized",
@@ -556,7 +653,7 @@ fn interrupted_runs_resume_without_duplicates_or_early_ready_state() {
     .unwrap();
     let again = import(&config).unwrap();
     assert!(
-        again[0].contains(" objects 2 reused 1 ["),
+        again[0].contains(" objects 3 reused 2 ["),
         "the normalized object is rebuilt from the retained source: {}",
         again[0]
     );
@@ -574,11 +671,11 @@ fn interrupted_runs_resume_without_duplicates_or_early_ready_state() {
     remove_manifests(&scratch, &before, true);
     let again = import(&config).unwrap();
     assert!(
-        again[1].contains(" objects 10 reused 9 ["),
+        again[1].contains(" objects 4 reused 3 ["),
         "one object re-created: {}",
         again[1]
     );
-    assert!(again[2].contains(" objects 9 reused 9 ["), "{}", again[2]);
+    assert!(again[2].contains(" objects 4 reused 4 ["), "{}", again[2]);
     assert!(removed.is_file());
     assert_recovered(&scratch, &before);
 
@@ -597,7 +694,7 @@ fn interrupted_runs_resume_without_duplicates_or_early_ready_state() {
     }
     remove_manifests(&scratch, &before, true);
     let again = import(&config).unwrap();
-    assert!(again[1].contains(" objects 10 reused "), "{}", again[1]);
+    assert!(again[1].contains(" objects 4 reused "), "{}", again[1]);
     assert_recovered(&scratch, &before);
 
     // 4. Interrupted before ready publication: every object exists at both copies and no ready
@@ -802,6 +899,14 @@ fn malformed_inputs_and_unsafe_layouts_are_rejected() {
             "period 60 seconds",
         ),
         (
+            "period overflows its logical unsigned width",
+            vec![BarRow {
+                period: 65_541,
+                ..rows[0].clone()
+            }],
+            "not an unsigned 16-bit value",
+        ),
+        (
             "timestamp drift",
             vec![BarRow {
                 timestamp: Some(1),
@@ -828,7 +933,11 @@ fn malformed_inputs_and_unsafe_layouts_are_rejected() {
     for (name, file_rows, message) in bar_cases {
         let _ = fs::remove_dir_all(scratch.path("sources/bars"));
         write_collection(&scratch.path("sources/bars"), &[apple(vec![file_rows])]);
-        let error = import(&scratch.config("bars.toml", &scratch.bar_source())).unwrap_err();
+        let error = import(&scratch.config(
+            "bars.toml",
+            &scratch.bar_source().replace("evaluation", "development"),
+        ))
+        .unwrap_err();
         assert!(error.contains(message), "{name}: {error}");
     }
 
@@ -840,7 +949,11 @@ fn malformed_inputs_and_unsafe_layouts_are_rejected() {
         let file = scratch
             .path("sources/bars/#AAPL/dataset/parquet/year=2025/month=05/part-00000.parquet");
         change(&file, &manifest);
-        let error = import(&scratch.config("bars.toml", &scratch.bar_source())).unwrap_err();
+        let error = import(&scratch.config(
+            "bars.toml",
+            &scratch.bar_source().replace("evaluation", "development"),
+        ))
+        .unwrap_err();
         assert!(!error.is_empty(), "{name}");
         error
     };
@@ -952,7 +1065,7 @@ fn malformed_inputs_and_unsafe_layouts_are_rejected() {
     let inside_asset = scratch.config_with(
         "inside.toml",
         "sources/bars/#AAPL/retained",
-        &scratch.bar_source(),
+        &scratch.bar_source().replace("evaluation", "development"),
     );
     assert!(
         import(&inside_asset)
@@ -978,7 +1091,7 @@ fn malformed_inputs_and_unsafe_layouts_are_rejected() {
     let beside = scratch.config_with(
         "beside.toml",
         "sources/bars/retained",
-        &scratch.bar_source(),
+        &scratch.bar_source().replace("evaluation", "development"),
     );
     assert!(
         import(&beside).is_ok(),
@@ -1007,11 +1120,14 @@ fn malformed_inputs_and_unsafe_layouts_are_rejected() {
         "twice.toml",
         &format!(
             "{}{}",
-            scratch.bar_source(),
-            scratch.bar_source().replace(
-                "\"sources/bars\"",
-                &format!("\"{}\"", scratch.path("sources/bars").display())
-            )
+            scratch.bar_source().replace("evaluation", "development"),
+            scratch
+                .bar_source()
+                .replace("evaluation", "development")
+                .replace(
+                    "\"sources/bars\"",
+                    &format!("\"{}\"", scratch.path("sources/bars").display())
+                )
         ),
     );
     assert!(import(&twice).unwrap_err().contains("declared twice"));
@@ -1032,7 +1148,7 @@ fn daily_tick_archives_publish_one_generation_per_listed_directory() {
     assert_eq!(lines.len(), 2, "{lines:?}");
     assert!(
         lines[0].starts_with("published deriv:frxAUDUSD development generation ")
-            && lines[0].contains(" rows 5 objects 6 reused 0 ["),
+            && lines[0].contains(" rows 5 objects 5 reused 0 ["),
         "{}",
         lines[0]
     );
@@ -1078,14 +1194,13 @@ fn daily_tick_archives_publish_one_generation_per_listed_directory() {
     assert_eq!(
         objects,
         [
-            ("source", "AUDUSD_2025-08-11_ticks.parquet"),
-            ("source", "AUDUSD_2025-08-12_ticks.parquet"),
-            ("provenance", "AUDUSD_2025-08-10_ticks.meta.json"),
-            ("provenance", "AUDUSD_2025-08-11_ticks.meta.json"),
-            ("provenance", "AUDUSD_2025-08-12_ticks.meta.json"),
-            ("normalized", "normalized/ticks.parquet"),
+            ("normalized", "observations/2025-08-10.parquet"),
+            ("normalized", "observations/2025-08-11.parquet"),
+            ("normalized", "observations/2025-08-12.parquet"),
+            ("provenance", "provenance/coverage.json"),
+            ("provenance", "provenance/lineage.json"),
         ],
-        "Parquet days first, then metadata, each in date order"
+        "daily observations and embedded provenance"
     );
     let inputs = json["inputs"].as_array().unwrap();
     assert_eq!(inputs.len(), 5);
@@ -1097,21 +1212,22 @@ fn daily_tick_archives_publish_one_generation_per_listed_directory() {
         !text.contains("EURUSD") && !text.contains("README"),
         "unlisted root entries are never inventoried"
     );
-    let normalized = scratch
-        .path("published")
-        .join(json["objects"][5]["key"].as_str().unwrap());
-    let reader = SerializedFileReader::new(File::open(&normalized).unwrap()).unwrap();
-    let pairs: Vec<(i64, i64)> = reader
-        .get_row_iter(None)
-        .unwrap()
-        .map(|row| {
-            let row = row.unwrap();
-            (
-                row.get_timestamp_micros(0).unwrap(),
-                row.get_long(1).unwrap(),
-            )
-        })
+    let manifest =
+        binary_alpha_engine::dataset::GenerationManifest::from_json(&fs::read(audusd).unwrap())
+            .unwrap();
+    let pairs: Vec<_> = common::read_normalized_ticks(&scratch.path("published"), &manifest)
+        .into_iter()
+        .map(|t| (t.event_time_micros, t.price_units))
         .collect();
+    let normalized = scratch.path("published").join(
+        &manifest
+            .objects
+            .iter()
+            .find(|o| o.path == "observations/2025-08-11.parquet")
+            .unwrap()
+            .key,
+    );
+    let reader = SerializedFileReader::new(File::open(&normalized).unwrap()).unwrap();
     assert_eq!(
         pairs, NORMALIZED_DAILY_TICKS,
         "exact rows across days, duplicates kept in order"
@@ -1378,9 +1494,7 @@ fn daily_tick_archives_reject_malformed_days_and_layouts() {
 fn verify_rejects_incomplete_or_tampered_generations() {
     let scratch = Scratch::new("verify");
     write_ticks(&scratch.path("sources/ticks/ticks.csv"), &TICK_ROWS);
-    let config = scratch.config("import.toml", &scratch.tick_source());
-    import(&config).unwrap();
-    let manifest = scratch.manifests("published").remove(0);
+    let manifest = legacy_csv_fixture(&scratch);
     let json = manifest_json(&manifest);
     let objects = json["objects"].as_array().unwrap();
 
@@ -1485,7 +1599,11 @@ fn verify_rejects_incomplete_or_tampered_generations() {
             metadata: false,
         }],
     );
-    import(&scratch.config("bars.toml", &scratch.bar_source())).unwrap();
+    import(&scratch.config(
+        "bars.toml",
+        &scratch.bar_source().replace("evaluation", "development"),
+    ))
+    .unwrap();
     let manifest = scratch.manifests("published").remove(0);
     let text = fs::read_to_string(&manifest).unwrap();
     fs::write(
@@ -1500,16 +1618,99 @@ fn verify_rejects_incomplete_or_tampered_generations() {
     );
 }
 
-fn walk(root: &Path) -> Vec<PathBuf> {
-    let mut files = Vec::new();
-    for entry in fs::read_dir(root).unwrap() {
-        let path = entry.unwrap().path();
-        if path.is_dir() {
-            files.extend(walk(&path));
-        } else {
-            files.push(path);
-        }
+#[test]
+fn unsupported_imports_never_publish_v1() {
+    let scratch = Scratch::new("no_v1_imports");
+    standard_sources(&scratch);
+    daily_sources(&scratch);
+    for source in [
+        scratch.tick_source(),
+        scratch.bar_source(),
+        scratch.daily_source().replace("development", "evaluation"),
+    ] {
+        let config = scratch.config("refused.toml", &source);
+        let error = import(&config).unwrap_err();
+        assert!(error.contains("daily-v2"), "{error}");
+        assert!(!scratch.path("published/manifests").exists());
     }
-    files.sort();
-    files
+}
+
+fn daily_tick_source(scratch: &Scratch) -> String {
+    let values: Vec<_> = NORMALIZED_TICKS
+        .iter()
+        .map(|(t, p)| (t * 1_000, *p as f64 / 1_000_000.))
+        .collect();
+    write_daily_directory(
+        &scratch.path("sources/daily/AEDCNY"),
+        "AEDCNY",
+        "AEDCNY_otc",
+        &[("2026-03-22", &values)],
+    );
+    "\n[[import.sources]]\nkind = \"tick_parquet_daily\"\npath = \"sources/daily\"\nbroker = \"pocket_option\"\nrole = \"development\"\nprice_scale = 6\ninstruments = [\"AEDCNY\"]\n".into()
+}
+
+fn legacy_csv_fixture(scratch: &Scratch) -> PathBuf {
+    use binary_alpha_engine::{dataset::*, market::*};
+    let root = scratch.path("published");
+    let id = InstrumentId {
+        broker: "pocket_option".to_string().try_into().unwrap(),
+        provider_symbol: "AEDCNY_otc".to_string().try_into().unwrap(),
+    };
+    let scale = 6.try_into().unwrap();
+    let file = scratch.path("legacy-ticks.parquet");
+    binary_alpha_app::archive::write_ticks(
+        &file,
+        &id,
+        scale,
+        NORMALIZED_TICKS.iter().map(|(t, p)| {
+            Ok(Tick {
+                event_time_micros: *t,
+                price_units: *p,
+            })
+        }),
+    )
+    .unwrap();
+    let mut objects = vec![
+        common::daily::object(
+            &root,
+            "ticks.csv",
+            ObjectRole::Source,
+            &scratch.path("sources/ticks/ticks.csv"),
+        ),
+        common::daily::object(
+            &root,
+            "normalized/ticks.parquet",
+            ObjectRole::Normalized,
+            &file,
+        ),
+    ];
+    for o in &mut objects {
+        o.crc32c = None;
+    }
+    let mut manifest = GenerationManifest {
+        layout: None,
+        day_inventory: vec![],
+        schema_version: 1,
+        generation: String::new(),
+        broker: id.broker,
+        provider_symbol: id.provider_symbol,
+        instrument: "pocket_option:AEDCNY_otc".into(),
+        role: DatasetRole::Development,
+        source_kind: SourceKind::TickCsv,
+        native_granularity: NativeGranularity::Tick,
+        time_unit: TimeUnit::Microsecond,
+        price_representation: PriceRepresentation::IntegerUnits { scale },
+        coverage: Coverage {
+            first_event_time: format_event_time_micros(NORMALIZED_TICKS[0].0),
+            last_event_time: format_event_time_micros(NORMALIZED_TICKS[3].0),
+        },
+        row_count: 4,
+        capabilities: vec![Capability::Ticks],
+        config_hash: "a".repeat(64),
+        code_revision: "direct-v1-reader-fixture".into(),
+        inputs: vec![],
+        interval: None,
+        objects,
+    };
+    common::daily::publish(&root, &mut manifest)
 }

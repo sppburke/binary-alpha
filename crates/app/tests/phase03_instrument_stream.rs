@@ -7,6 +7,21 @@
 
 mod common;
 
+#[test]
+fn legacy_audit_requires_migration_but_legacy_dataset_remains_readable() {
+    let scratch = common::Scratch::new("legacy_audit_refused");
+    let pair = common::daily::pair(&scratch, false);
+    let path = pair.path(&scratch, false);
+    common::verify(&path).unwrap();
+    let config = scratch.config("audit.toml", &pair.instrument());
+    let error = audit(&config, &path).unwrap_err();
+    assert!(error.contains("data pipeline migrate"), "{error}");
+    assert_eq!(
+        common::read_normalized_ticks(&scratch.path("published"), &pair.v1),
+        pair.ticks
+    );
+}
+
 use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -17,7 +32,7 @@ use binary_alpha_engine::dataset::{GenerationManifest, ObjectRole, PriceRepresen
 use binary_alpha_engine::market::{PriceScale, Tick, parse_event_time_micros, parse_price_units};
 use binary_alpha_engine::stream::{
     Candle, InstrumentProfile, InstrumentStream, MAX_BASIS_POINTS, Observation, Source,
-    StreamManifest, stream_generation_id,
+    StreamManifest, stream_generation_id_with_layout,
 };
 use common::*;
 use parquet::file::reader::{FileReader, SerializedFileReader};
@@ -72,7 +87,7 @@ fn tampered_manifest(store: &Path, manifest: &StreamManifest) -> PathBuf {
 /// The `[[instruments]]` entry the synthetic tests use, with the legacy-shaped checks.
 fn tick_instrument(symbol: &str, scale: u8) -> String {
     format!(
-        "\n[[instruments]]\nbroker = \"pocket_option\"\nprovider_symbol = \"{symbol}\"\nbase_currency = \"AED\"\nquote_currency = \"CNY\"\nprice_scale = {scale}\nnative_granularity = {{ kind = \"tick\" }}\ngap = {{ max_seconds = 2, reopen_seconds = 60 }}\nfrozen = {{ min_observations = 3, min_seconds = 5 }}\njump = {{ min_basis_points = 5 }}\nspan = {{ min_percent = 75 }}\nsessions = [{{ name = \"week\", open_seconds = 0, close_seconds = 604800 }}]\ncandles = [{{ duration_seconds = 5, offset_seconds = 0, min_observations = 3, hard_min_observations = 2 }}, {{ duration_seconds = 15, offset_seconds = 5 }}]\n"
+        "\n[[instruments]]\nbroker = \"pocket_option\"\nprovider_symbol = \"{symbol}\"\nbase_currency = \"AED\"\nquote_currency = \"CNY\"\nprice_scale = {scale}\nsession = {{ kind = \"always\" }}\nnative_granularity = {{ kind = \"tick\" }}\ngap = {{ max_seconds = 2, reopen_seconds = 60 }}\nfrozen = {{ min_observations = 3, min_seconds = 5 }}\njump = {{ min_basis_points = 5 }}\nspan = {{ min_percent = 75 }}\nsessions = [{{ name = \"week\", open_seconds = 0, close_seconds = 604800 }}]\ncandles = [{{ duration_seconds = 5, offset_seconds = 0, min_observations = 3, hard_min_observations = 2 }}, {{ duration_seconds = 15, offset_seconds = 5 }}]\n"
     )
 }
 
@@ -81,7 +96,7 @@ fn bar_instrument(symbol: &str, scale: u8, base: Option<&str>) -> String {
         format!("base_currency = \"{base}\"\n")
     });
     format!(
-        "\n[[instruments]]\nbroker = \"pocket_option\"\nprovider_symbol = \"{symbol}\"\n{base}quote_currency = \"USD\"\nprice_scale = {scale}\nnative_granularity = {{ kind = \"bar\", period_seconds = 5 }}\ngap = {{ max_seconds = 2, reopen_seconds = 60 }}\nfrozen = {{ min_observations = 3, min_seconds = 5 }}\njump = {{ min_basis_points = 5 }}\ncandles = [{{ duration_seconds = 15, offset_seconds = 5 }}]\n"
+        "\n[[instruments]]\nbroker = \"pocket_option\"\nprovider_symbol = \"{symbol}\"\n{base}quote_currency = \"USD\"\nprice_scale = {scale}\nsession = {{ kind = \"always\" }}\nnative_granularity = {{ kind = \"bar\", period_seconds = 5 }}\ngap = {{ max_seconds = 2, reopen_seconds = 60 }}\nfrozen = {{ min_observations = 3, min_seconds = 5 }}\njump = {{ min_basis_points = 5 }}\ncandles = [{{ duration_seconds = 15, offset_seconds = 5 }}]\n"
     )
 }
 
@@ -218,10 +233,20 @@ fn published_stream(store: &Path, manifest: &Path) -> Published {
         .streams
         .iter()
         .map(|summary| {
-            read_rows(&object(&format!(
+            let legacy = format!(
                 "candles/{}s_{}s.parquet",
                 summary.duration_seconds, summary.offset_seconds
-            )))
+            );
+            let prefix = format!(
+                "candles/{}s_{}s/",
+                summary.duration_seconds, summary.offset_seconds
+            );
+            manifest
+                .objects
+                .iter()
+                .filter(|o| o.path == legacy || o.path.starts_with(&prefix))
+                .flat_map(|o| read_rows(&store.join(&o.key)))
+                .collect()
         })
         .collect();
     Published {
@@ -235,11 +260,7 @@ fn stream_manifests(scratch: &Scratch, store: &str) -> Vec<PathBuf> {
     scratch
         .manifests(store)
         .into_iter()
-        .filter(|path| {
-            fs::read_to_string(path)
-                .unwrap()
-                .starts_with("{\n  \"kind\": \"instrument_stream\"")
-        })
+        .filter(|path| manifest_json(path)["kind"] == "instrument_stream")
         .collect()
 }
 
@@ -282,7 +303,7 @@ fn audit_publishes_a_stream_generation_that_verifies_and_matches_a_direct_feed()
         "audit.toml",
         &format!(
             "{}{}",
-            scratch.tick_source(),
+            daily_tick_source(&scratch, &SYNTHETIC_TICKS),
             tick_instrument("AEDCNY_otc", 6)
         ),
     );
@@ -293,11 +314,15 @@ fn audit_publishes_a_stream_generation_that_verifies_and_matches_a_direct_feed()
     assert_eq!(generation(&lines[0]), dataset.generation);
     let parsed = Config::parse(&fs::read_to_string(&config).unwrap()).unwrap();
     let instrument = parsed.instruments[0].clone();
-    let expected_generation =
-        stream_generation_id(&dataset.generation, &instrument.canonical_toml());
+    let expected_generation = stream_generation_id_with_layout(
+        &dataset.generation,
+        &instrument.canonical_toml(),
+        dataset.layout,
+    );
+    // The always-open daily product fills the sparse feed: nine 5s and three 15s buckets.
     assert!(
         line.starts_with(&format!(
-            "audited pocket_option:AEDCNY_otc development generation {expected_generation} from {} observations 14 candles 6 objects 3 reused 0 [stream ",
+            "audited pocket_option:AEDCNY_otc development generation {expected_generation} from {} observations 14 candles 12 objects 3 reused 0 candle days encoded 2 reused 0 [stream ",
             dataset.generation
         )),
         "{line}"
@@ -323,12 +348,19 @@ fn audit_publishes_a_stream_generation_that_verifies_and_matches_a_direct_feed()
     let path = swapped.objects[candles[0]].path.clone();
     swapped.objects[candles[0]].path =
         std::mem::replace(&mut swapped.objects[candles[1]].path, path);
+    for day in &mut swapped.day_inventory {
+        day.object = swapped
+            .objects
+            .iter()
+            .find(|o| day.logical_path().is_ok_and(|p| o.path == p))
+            .map(|o| o.key.clone());
+    }
     let swapped_path = tampered_manifest(&store_sharing_objects(&scratch, "swapped"), &swapped);
+    let swapped_error = verify(&swapped_path).unwrap_err();
     assert!(
-        verify(&swapped_path)
-            .unwrap_err()
-            .contains("carries metadata"),
-        "a candle object of another stream fails verification"
+        swapped_error
+            .contains("daily file schema, semantic metadata, profile, or row-group count mismatch"),
+        "{swapped_error}"
     );
 
     let published = published_stream(&scratch.path("published"), manifest_path);
@@ -348,7 +380,8 @@ fn audit_publishes_a_stream_generation_that_verifies_and_matches_a_direct_feed()
         .iter()
         .map(|summary| summary.rows)
         .collect();
-    assert_eq!(rows, [4, 2]);
+    // Continuous always-session output includes missing buckets; raw profile stays sparse.
+    assert_eq!(rows, [9, 3]);
     for object in &manifest.objects {
         let stored = scratch.path("published").join(&object.key);
         assert_eq!(sha256(&stored), object.sha256, "{}", object.path);
@@ -356,13 +389,13 @@ fn audit_publishes_a_stream_generation_that_verifies_and_matches_a_direct_feed()
         assert!(scratch.path("retained").join(&object.key).is_file());
     }
 
-    // The published rows equal a direct row-at-a-time feed of the normalized object, and so do
-    // chunked and whole-input feeds; the test adapts the input itself.
+    // The published rows equal a direct feed followed by the pure session transformation;
+    // chunked and whole-input raw feeds still match every original candle field.
     let normalized = scratch.path("published").join(
         &dataset
             .objects
             .iter()
-            .find(|object| object.path == "normalized/ticks.parquet")
+            .find(|object| object.path == "observations/2026-03-22.parquet")
             .unwrap()
             .key,
     );
@@ -370,13 +403,58 @@ fn audit_publishes_a_stream_generation_that_verifies_and_matches_a_direct_feed()
     assert_eq!(ticks.len(), 14);
     let (direct, profile) = feed(&instrument, &dataset, &ticks);
     assert_eq!(profile, published.profile);
+    for (index, rows) in published.candles.iter().enumerate() {
+        let feed_rows: Vec<_> = rows.iter().filter(|r| r.counts[0] > 0).cloned().collect();
+        let expected: Vec<_> = direct
+            .iter()
+            .filter(|(stream, _)| *stream == index)
+            .map(|(_, c)| Row::from(c))
+            .collect();
+        assert_eq!(
+            feed_rows, expected,
+            "every original feed column is preserved"
+        );
+    }
+    let coverage_object = dataset
+        .objects
+        .iter()
+        .find(|o| o.path == "provenance/coverage.json")
+        .unwrap();
+    let coverage = binary_alpha_engine::dataset::coverage::DailyCoverage::from_json(
+        &fs::read(scratch.path("published").join(&coverage_object.key)).unwrap(),
+    )
+    .unwrap();
+    let verified: Vec<_> = coverage
+        .days
+        .iter()
+        .filter(|d| d.family == binary_alpha_engine::dataset::DayFamily::Observations)
+        .flat_map(|d| d.verified.iter().map(|r| r.bounds().unwrap()))
+        .collect();
     let by_stream: Vec<Vec<Row>> = (0..2)
-        .map(|stream| {
-            direct
-                .iter()
-                .filter(|(index, _)| *index == stream)
-                .map(|(_, candle)| Row::from(candle))
-                .collect()
+        .map(|index| {
+            let spec = &instrument.candles[index];
+            let mut continuous = binary_alpha_engine::continuous::Continuous::new(
+                instrument.session.as_ref().unwrap().calendar().unwrap(),
+                spec,
+                verified.clone(),
+                false,
+            )
+            .unwrap();
+            let mut rows = Vec::new();
+            let mut emit = |c: Candle| {
+                rows.push(Row::from(&c));
+                Ok(())
+            };
+            for (_, candle) in direct.iter().filter(|(stream, _)| *stream == index) {
+                continuous.push(candle.clone(), &mut emit).unwrap();
+            }
+            let pending = binary_alpha_engine::stream::interval_open(
+                ticks.last().unwrap().event_time_micros,
+                i64::from(spec.duration_seconds) * 1_000_000,
+                i64::from(spec.offset_seconds) * 1_000_000,
+            );
+            continuous.finish(Some(pending), &mut emit).unwrap();
+            rows
         })
         .collect();
     assert_eq!(by_stream, published.candles);
@@ -438,7 +516,8 @@ fn audit_publishes_a_stream_generation_that_verifies_and_matches_a_direct_feed()
         (1, 1, 0),
         "one contiguous jump, one after a twenty-second delay"
     );
-    let delayed = &five[3];
+    // Four interior fills precede this market candle under the continuous-grid rule.
+    let delayed = &five[7];
     assert_eq!(delayed.gap_before, Some(20_001_000));
     assert_eq!(
         delayed.facts[5], 5,
@@ -464,10 +543,11 @@ fn audit_publishes_a_stream_generation_that_verifies_and_matches_a_direct_feed()
     );
 
     // Verification reads the generation back from either store; a repeated audit reuses it.
+    // The continuous always-session product has twelve rows, including its six fills.
     assert_eq!(
         verify(manifest_path).unwrap(),
         format!(
-            "verified pocket_option:AEDCNY_otc development generation {expected_generation} candles 6 objects 3 bytes {}",
+            "verified pocket_option:AEDCNY_otc development generation {expected_generation} candles 12 objects 3 bytes {}",
             manifest
                 .objects
                 .iter()
@@ -481,7 +561,10 @@ fn audit_publishes_a_stream_generation_that_verifies_and_matches_a_direct_feed()
             .starts_with("verified pocket_option:AEDCNY_otc")
     );
     let again = audit(&config, &dataset_manifest).unwrap();
-    assert!(again.ends_with(" reused 3 (already published)"), "{again}");
+    assert!(
+        again.contains(" objects 3 reused 3 ") && again.ends_with("(already published)"),
+        "{again}"
+    );
     assert_eq!(fs::read(manifest_path).unwrap(), manifest.to_json());
 
     // Tampering with a published candle object is detected on verification.
@@ -536,7 +619,11 @@ fn audit_binds_only_a_configured_matching_instrument() {
             },
         ],
     );
-    let sources = format!("{}{}", scratch.tick_source(), scratch.bar_source());
+    let sources = format!(
+        "{}{}",
+        daily_tick_source(&scratch, &SYNTHETIC_TICKS),
+        scratch.bar_source().replace("evaluation", "development")
+    );
     let import_config = scratch.config("import.toml", &sources);
     import(&import_config).unwrap();
     let manifests = scratch.manifests("published");
@@ -621,8 +708,10 @@ fn audit_binds_only_a_configured_matching_instrument() {
 
     // A holdout generation is refused before any object is read: the same objects under a
     // manifest that records the holdout role, whose identity the role changes.
-    let mut holdout = GenerationManifest::from_json(&fs::read(&euro).unwrap()).unwrap();
+    let mut holdout = common::daily::pair(&scratch, true).v1;
     holdout.role = binary_alpha_engine::dataset::DatasetRole::Holdout;
+    holdout.layout = None;
+    holdout.day_inventory.clear();
     holdout.generation = binary_alpha_engine::dataset::generation_id(
         &binary_alpha_engine::market::InstrumentId {
             broker: holdout.broker.clone(),
@@ -646,16 +735,25 @@ fn audit_binds_only_a_configured_matching_instrument() {
     let tampered = store_sharing_objects(&scratch, "tampered");
     let mut miscounted = GenerationManifest::from_json(&fs::read(&euro).unwrap()).unwrap();
     miscounted.row_count += 1;
+    miscounted
+        .day_inventory
+        .iter_mut()
+        .find(|d| d.family == binary_alpha_engine::dataset::DayFamily::Observations)
+        .unwrap()
+        .rows += 1;
     let miscounted_path = tampered.join(miscounted.key());
     fs::create_dir_all(miscounted_path.parent().unwrap()).unwrap();
     fs::write(&miscounted_path, miscounted.to_json()).unwrap();
+    let before = ["published", "retained", "tampered"].map(|dir| snapshot_tree(&scratch.path(dir)));
     let error = audit(&mismatched, &miscounted_path).unwrap_err();
-    assert!(
-        error.contains("manifest records 5 rows") && error.contains("nothing was published"),
-        "{error}"
+    assert!(error.contains("day inventory mismatch"), "{error}");
+    assert_eq!(
+        before,
+        ["published", "retained", "tampered"].map(|dir| snapshot_tree(&scratch.path(dir))),
+        "refused audit must publish or retain no output"
     );
     let mut contradicted = StreamManifest::from_json(&fs::read(manifest_path).unwrap()).unwrap();
-    contradicted.source_kind = binary_alpha_engine::dataset::SourceKind::TickCsv;
+    contradicted.source_kind = binary_alpha_engine::dataset::SourceKind::BrokerHistory;
     assert!(
         verify(&tampered_manifest(&tampered, &contradicted))
             .unwrap_err()
@@ -1362,7 +1460,7 @@ fn governed_fixture_proof() {
             &dataset
                 .objects
                 .iter()
-                .find(|object| object.path == "normalized/ticks.parquet")
+                .find(|object| object.path == "observations/2026-03-22.parquet")
                 .unwrap()
                 .key,
         );
@@ -1569,3 +1667,266 @@ fn governed_fixture_proof() {
         "one non-currency instrument"
     );
 }
+
+#[test]
+fn descendant_audit_reuses_days_and_matches_full_weekend_recomputation() {
+    use binary_alpha_engine::dataset::{DayFamily, Layout, ObjectRole};
+    use common::daily::*;
+    let scratch = Scratch::new("incremental_candle_encoding");
+    let mut pair = pair(&scratch, false);
+    let root = scratch.path("published");
+    let empty_file = scratch.path("empty-observation-day.parquet");
+    binary_alpha_app::daily::write_ticks(
+        &empty_file,
+        "2026-09-16",
+        &binary_alpha_engine::market::InstrumentId {
+            broker: pair.v2.broker.clone(),
+            provider_symbol: pair.v2.provider_symbol.clone(),
+        },
+        scale(),
+        [Vec::<Tick>::new()],
+    )
+    .unwrap();
+    let empty_object = object(
+        &root,
+        "observations/2026-09-16.parquet",
+        ObjectRole::Normalized,
+        &empty_file,
+    );
+    let mut empty_day = pair
+        .v2
+        .day_inventory
+        .iter()
+        .find(|d| d.family == DayFamily::Observations && d.date == FIRST)
+        .unwrap()
+        .clone();
+    empty_day.date = "2026-09-16".into();
+    empty_day.object = Some(empty_object.key.clone());
+    empty_day.rows = 0;
+    empty_day.first_time = None;
+    empty_day.last_time = None;
+    pair.v2.objects.push(empty_object);
+    pair.v2.day_inventory.push(empty_day);
+    pair.v2
+        .day_inventory
+        .sort_by(|a, b| (a.family, &a.date).cmp(&(b.family, &b.date)));
+    write_coverage(&scratch, &mut pair.v2);
+    let config = scratch.config("audit.toml", &pair.instrument());
+    let mut parent = pair.v2.clone();
+    parent.day_inventory.retain(|d| d.date.as_str() < LAST);
+    parent
+        .objects
+        .retain(|o| !o.path.ends_with(&format!("{LAST}.parquet")));
+    parent.row_count = pair
+        .ticks
+        .iter()
+        .filter(|t| date(t.event_time_micros).as_str() < LAST)
+        .count() as u64;
+    parent.coverage.last_event_time = binary_alpha_engine::market::format_event_time_micros(
+        pair.ticks[parent.row_count as usize - 1].event_time_micros,
+    );
+    write_coverage(&scratch, &mut parent);
+    let parent_path = publish(&root, &mut parent);
+    let parent_line = audit(&config, &parent_path).unwrap();
+    let parent_stream = published_stream(
+        &root,
+        &root.join(binary_alpha_engine::dataset::manifest_key(&generation(
+            &parent_line,
+        ))),
+    );
+    // A lineage-only descendant changes no candle, including a stored empty day.
+    let mut unchanged = parent.clone();
+    let unchanged_lineage = scratch.path("unchanged-lineage.json");
+    fs::write(
+        &unchanged_lineage,
+        serde_json::json!({"schema_version":1,"parent_generation":parent.generation}).to_string(),
+    )
+    .unwrap();
+    unchanged.objects.push(object(
+        &root,
+        "provenance/lineage.json",
+        ObjectRole::Provenance,
+        &unchanged_lineage,
+    ));
+    let unchanged_path = publish(&root, &mut unchanged);
+    let unchanged_line = audit(&config, &unchanged_path).unwrap();
+    assert!(
+        unchanged_line.contains(&format!(
+            "candle days encoded 0 reused {}",
+            parent_stream.manifest.objects.len() - 1
+        )),
+        "{unchanged_line}"
+    );
+    let mut child = pair.v2.clone();
+    let lineage = scratch.path("child-lineage.json");
+    fs::write(
+        &lineage,
+        serde_json::json!({"schema_version":1,"parent_generation":parent.generation}).to_string(),
+    )
+    .unwrap();
+    child.objects.push(object(
+        &root,
+        "provenance/lineage.json",
+        ObjectRole::Provenance,
+        &lineage,
+    ));
+    let child_path = publish(&root, &mut child);
+    let incremental_line = audit(&config, &child_path).unwrap();
+    // The always-session grid also materializes weekend fills in both configured streams.
+    assert!(
+        incremental_line.contains("candle days encoded 8 reused 4"),
+        "{incremental_line}"
+    );
+    let stream_path = root.join(binary_alpha_engine::dataset::manifest_key(&generation(
+        &incremental_line,
+    )));
+    let incremental = published_stream(&root, &stream_path);
+    assert_eq!(incremental.manifest.layout, Some(Layout::DailyV2));
+    for spec in &incremental.manifest.streams {
+        let day = |stream: &StreamManifest, date: &str| {
+            stream
+                .day_inventory
+                .iter()
+                .find(|d| {
+                    d.family == DayFamily::Candles
+                        && d.duration == Some(spec.duration_seconds)
+                        && d.date == date
+                })
+                .unwrap()
+                .object
+                .clone()
+        };
+        assert_eq!(
+            day(&parent_stream.manifest, FIRST),
+            day(&incremental.manifest, FIRST)
+        );
+        assert_ne!(
+            day(&parent_stream.manifest, SECOND),
+            day(&incremental.manifest, SECOND)
+        );
+    }
+    common::verify(&stream_path).unwrap();
+    fs::remove_file(root.join(parent_stream.manifest.key())).unwrap();
+    fs::remove_file(scratch.path("retained").join(parent_stream.manifest.key())).unwrap();
+    let full_line = audit(&config, &child_path).unwrap();
+    // Full encoding includes the same twelve day objects as the continuous incremental grid.
+    assert!(
+        full_line.contains("candle days encoded 12 reused 0"),
+        "{full_line}"
+    );
+    let full = published_stream(&root, &stream_path);
+    assert_eq!(
+        incremental.manifest.day_inventory,
+        full.manifest.day_inventory
+    );
+    assert_eq!(incremental.candles, full.candles);
+    assert_eq!(incremental.profile, full.profile);
+}
+
+fn daily_tick_source(scratch: &Scratch, rows: &[&str]) -> String {
+    let values: Vec<_> = rows
+        .iter()
+        .map(|row| {
+            let fields: Vec<_> = row.split(',').collect();
+            (
+                parse_event_time_micros(fields[0]).unwrap() * 1_000,
+                fields[2].parse::<f64>().unwrap(),
+            )
+        })
+        .collect();
+    common::write_daily_directory(
+        &scratch.path("sources/daily/AEDCNY"),
+        "AEDCNY",
+        "AEDCNY_otc",
+        &[("2026-03-22", &values)],
+    );
+    "\n[[import.sources]]\nkind = \"tick_parquet_daily\"\npath = \"sources/daily\"\nbroker = \"pocket_option\"\nrole = \"development\"\nprice_scale = 6\ninstruments = [\"AEDCNY\"]\n".into()
+}
+
+#[test]
+fn descendant_bar_candles_preserve_signed_zero_bits_against_full_encoding() {
+    use binary_alpha_engine::dataset::{DayFamily, ObjectRole};
+    use common::daily::*;
+    let scratch = Scratch::new("signed_zero_candle_reuse");
+    let pair = pair(&scratch, true);
+    let root = scratch.path("published");
+    let config = scratch.config("audit.toml", &pair.instrument());
+    let write = |manifest: &mut GenerationManifest, volume: f64| {
+        let rows: Vec<_> = pair
+            .bars
+            .iter()
+            .filter(|b| date(b.start_unix_s * 1_000_000) == FIRST)
+            .cloned()
+            .map(|mut b| {
+                b.volume = volume;
+                b
+            })
+            .collect();
+        let path = scratch.path("signed-zero.parquet");
+        binary_alpha_app::daily::write_bars(&path, FIRST, [rows]).unwrap();
+        let replacement = object(
+            &root,
+            &format!("observations/{FIRST}.parquet"),
+            ObjectRole::Normalized,
+            &path,
+        );
+        *manifest
+            .objects
+            .iter_mut()
+            .find(|o| o.path == replacement.path)
+            .unwrap() = replacement.clone();
+        manifest
+            .day_inventory
+            .iter_mut()
+            .find(|d| d.family == DayFamily::Observations && d.date == FIRST)
+            .unwrap()
+            .object = Some(replacement.key);
+        publish(&root, manifest)
+    };
+    let mut parent = pair.v2.clone();
+    let parent_path = write(&mut parent, 0.0);
+    let parent_line = audit(&config, &parent_path).unwrap();
+    let parent_stream_key = binary_alpha_engine::dataset::manifest_key(&generation(&parent_line));
+    let parent_stream = published_stream(&root, &root.join(&parent_stream_key));
+    let mut child = parent.clone();
+    let lineage = scratch.path("zero-lineage.json");
+    fs::write(
+        &lineage,
+        serde_json::json!({"schema_version":1,"parent_generation":parent.generation}).to_string(),
+    )
+    .unwrap();
+    child.objects.push(object(
+        &root,
+        "provenance/lineage.json",
+        ObjectRole::Provenance,
+        &lineage,
+    ));
+    let child_path = write(&mut child, -0.0);
+    let child_line = audit(&config, &child_path).unwrap();
+    let child_stream_path = root.join(binary_alpha_engine::dataset::manifest_key(&generation(
+        &child_line,
+    )));
+    let child_stream = published_stream(&root, &child_stream_path);
+    let key = |stream: &StreamManifest| {
+        stream
+            .day_inventory
+            .iter()
+            .find(|d| d.date == FIRST && d.duration == Some(5))
+            .unwrap()
+            .object
+            .clone()
+    };
+    assert_ne!(key(&parent_stream.manifest), key(&child_stream.manifest));
+    assert_eq!(
+        child_stream.candles[0][0].volume.unwrap().to_bits(),
+        (-0.0f64).to_bits()
+    );
+    fs::remove_file(root.join(&parent_stream_key)).unwrap();
+    fs::remove_file(scratch.path("retained").join(&parent_stream_key)).unwrap();
+    // Publishing the same child again compares every freshly encoded byte identity.
+    audit(&config, &child_path).unwrap();
+    common::verify(&child_stream_path).unwrap();
+}
+
+#[path = "phase03_instrument_stream/sessions.rs"]
+mod sessions;

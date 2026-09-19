@@ -9,11 +9,12 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use binary_alpha_engine::config::{AccountClass, Broker, Config, RateBudgets, RateLimit};
 pub use binary_alpha_engine::config::{BrokerKind, Capabilities};
+use binary_alpha_engine::dataset::NativeGranularity;
 use binary_alpha_engine::execution::{
     BrokerLiability, CashFact, ContractSemantics, Decimal, Direction, EventSource, Settlement,
     TerminalFact,
 };
-use binary_alpha_engine::market::{BrokerId, Currency, InstrumentId, PriceScale, Tick};
+use binary_alpha_engine::market::{Bar, BrokerId, Currency, InstrumentId, PriceScale, Tick};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
@@ -67,12 +68,58 @@ pub enum LiveEvent {
     Break { generation: u64, reason: String },
 }
 
-/// One raw provider page and its directly normalized rows in provider order.
+/// The rows one history page decodes to, at the granularity the request named.
+#[derive(Debug, Clone, PartialEq)]
+pub enum HistoryRows {
+    Ticks(Vec<Tick>),
+    Bars(Vec<Bar>),
+}
+impl HistoryRows {
+    pub fn len(&self) -> usize {
+        match self {
+            Self::Ticks(rows) => rows.len(),
+            Self::Bars(rows) => rows.len(),
+        }
+    }
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+    /// The tick rows of a tick page.
+    pub fn ticks(&self) -> Option<&[Tick]> {
+        match self {
+            Self::Ticks(rows) => Some(rows),
+            Self::Bars(_) => None,
+        }
+    }
+    pub fn into_ticks(self) -> Option<Vec<Tick>> {
+        match self {
+            Self::Ticks(rows) => Some(rows),
+            Self::Bars(_) => None,
+        }
+    }
+    /// The provider event time of the first row: the tick time or the bar start.
+    pub fn first_time_micros(&self) -> Option<i64> {
+        match self {
+            Self::Ticks(rows) => rows.first().map(|row| row.event_time_micros),
+            Self::Bars(rows) => rows.first().map(|row| row.start_unix_s * 1_000_000),
+        }
+    }
+    pub fn last_time_micros(&self) -> Option<i64> {
+        match self {
+            Self::Ticks(rows) => rows.last().map(|row| row.event_time_micros),
+            Self::Bars(rows) => rows.last().map(|row| row.start_unix_s * 1_000_000),
+        }
+    }
+}
+
+/// One raw provider page whose envelope matched the request, with its local receipt; the
+/// caller retains the bytes before `decode_history` can reject their rows.
 #[derive(Debug, Clone)]
 pub struct HistoryPage {
     pub raw: Vec<u8>,
     pub anchor_token: Option<String>,
-    pub rows: Vec<Tick>,
+    /// Local receipt time of the response on the adapter's clock.
+    pub receipt_micros: i64,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Cancellation {
@@ -132,12 +179,25 @@ impl Continuity {
 
 pub trait MarketDataBroker: Send {
     fn discover(&mut self) -> Result<Vec<DiscoveredInstrument>, String>;
+    /// One bounded page of native history ending before `before_micros` (the latest page when
+    /// absent) at the requested granularity, returned once its envelope matches the request; an
+    /// adapter refuses a granularity it cannot serve before it sends anything.
     fn history_page(
         &mut self,
         instrument: &InstrumentId,
         scale: PriceScale,
         before_micros: Option<i64>,
+        granularity: NativeGranularity,
     ) -> Result<HistoryPage, String>;
+    /// Decodes and validates the rows of a page's bytes, returning the provider's numeric
+    /// instrument identifier when its rows carry one; pure, so retained pages replay exactly.
+    fn decode_history(
+        &self,
+        instrument: &InstrumentId,
+        raw: &[u8],
+        scale: PriceScale,
+        granularity: NativeGranularity,
+    ) -> Result<(Option<i32>, HistoryRows), String>;
     fn subscribe(&mut self, instrument: &InstrumentId, scale: PriceScale) -> Result<(), String>;
     fn next_live(&mut self, timeout_micros: i64) -> Result<Option<LiveEvent>, String>;
     fn unsubscribe(&mut self, instrument: &InstrumentId) -> Result<Cancellation, String>;
@@ -255,11 +315,11 @@ pub fn connect(config: &Config) -> Result<Adapter, String> {
         .iter()
         .find(|broker| broker.id() == &history.broker)
         .ok_or("history: broker is not declared")?;
-    let connector = Box::new(transport::WebSocketConnector::new()?);
-    let clock = Box::new(SystemClock);
     match settings {
         Broker::Deriv(settings) => Ok(Adapter::Deriv(deriv::DerivMarketData::connect(
-            settings, connector, clock,
+            settings,
+            Box::new(transport::WebSocketConnector::new()?),
+            Box::new(SystemClock),
         )?)),
         Broker::PocketOption(settings) => {
             let instruments = history
@@ -270,17 +330,75 @@ pub fn connect(config: &Config) -> Result<Adapter, String> {
                     provider_symbol: symbol.clone(),
                 })
                 .collect::<Vec<_>>();
-            Ok(Adapter::PocketOption(
+            let attempt = |credential: String| {
                 pocket_option::PocketMarketData::connect(
                     settings,
                     &instruments,
-                    connector,
-                    clock,
-                    resolve_secret(&settings.credential)?,
-                )?,
-            ))
+                    Box::new(transport::WebSocketConnector::new()?),
+                    Box::new(SystemClock),
+                    credential,
+                )
+            };
+            let credential = match resolve_secret(&settings.credential) {
+                Ok(credential) => credential,
+                Err(reason) => match &settings.credential_command {
+                    Some(command) => renew_credential(command, None)?,
+                    None => return Err(reason),
+                },
+            };
+            match attempt(credential.clone()) {
+                Ok(adapter) => Ok(Adapter::PocketOption(adapter)),
+                // A rejected or stale session is renewed once through the operator's command;
+                // any other failure of the fresh session is reported as is.
+                Err(reason) => match &settings.credential_command {
+                    Some(command) => attempt(renew_credential(command, Some(&credential))?)
+                        .map(Adapter::PocketOption)
+                        .map_err(|renewed| {
+                            format!("{renewed} (after credential renewal; first attempt: {reason})")
+                        }),
+                    None => Err(reason),
+                },
+            }
         }
     }
+}
+
+/// Runs the operator's credential command and returns the authentication object it printed,
+/// without letting the value into any diagnostic.
+pub fn renew_credential(command: &[String], stale: Option<&str>) -> Result<String, String> {
+    // Sibling jobs reuse the fresh session instead of rotating it out from under each other.
+    static RENEWAL: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+    let mut renewed = RENEWAL
+        .lock()
+        .map_err(|_| "credential_command: renewal lock poisoned")?;
+    if let Some(credential) = renewed
+        .as_ref()
+        .filter(|value| Some(value.as_str()) != stale)
+    {
+        return Ok(credential.clone());
+    }
+    let (program, arguments) = command
+        .split_first()
+        .ok_or("credential_command must name a program")?;
+    let output = std::process::Command::new(program)
+        .args(arguments)
+        .stdin(std::process::Stdio::null())
+        .output()
+        .map_err(|error| format!("credential_command {program}: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "credential_command {program}: exited with {}",
+            output.status
+        ));
+    }
+    let credential = String::from_utf8(output.stdout)
+        .map_err(|_| format!("credential_command {program}: output is not UTF-8"))?;
+    let credential = credential.trim().to_string();
+    if credential.is_empty() {
+        return Err(format!("credential_command {program}: printed nothing"));
+    }
+    *renewed = Some(credential.clone());
+    Ok(credential)
 }
 
 /// The configured account identity; provider login identifiers stay inside the adapter.

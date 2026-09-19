@@ -2,13 +2,14 @@
 //! and normalize each dataset from its retained bytes, publish it, and commit one ready manifest
 //! last.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
-use binary_alpha_engine::config::{PublicationUri, Source, relative_path};
+use binary_alpha_engine::config::{Config, PublicationUri, Source, relative_path};
 use binary_alpha_engine::dataset::{
     Capability, Coverage, DatasetRole, GenerationManifest, Input, IntervalContract,
     MANIFEST_SCHEMA_VERSION, NativeGranularity, ObjectRecord, ObjectRole, PriceRepresentation,
@@ -87,6 +88,18 @@ struct Dataset {
 pub fn run(config_path: &Path, out: &mut dyn Write) -> Result<(), String> {
     let config = crate::load_config(config_path)?;
     let base = config_path.parent().unwrap_or(Path::new("."));
+    let _locks = crate::data_pipeline::import_writer_locks(&config, base)?;
+    publish_all(&config, base, out).map(|_| ())
+}
+
+/// Plans, retains, validates, publishes, and commits every dataset `config` declares, with
+/// relative paths resolved against `base`; writes one report line per dataset and returns each
+/// publication in declared order.
+pub fn publish_all(
+    config: &Config,
+    base: &Path,
+    out: &mut dyn Write,
+) -> Result<Vec<Publication>, String> {
     let sources = config
         .import
         .as_ref()
@@ -121,13 +134,15 @@ pub fn run(config_path: &Path, out: &mut dyn Write) -> Result<(), String> {
     let local = Store::filesystem(&historical_dir);
     let destination = Store::open(&config.storage.publication_uri)?;
     let config_hash = config.content_hash();
+    let mut published = Vec::with_capacity(datasets.len());
     for dataset in &datasets {
-        let line = publish(dataset, &local, &destination, &config_hash)?;
+        let (line, publication) = publish(dataset, &local, &destination, &config_hash)?;
         writeln!(out, "{line}")
             .and_then(|()| out.flush())
             .map_err(|error| format!("cannot write the report: {error}"))?;
+        published.push(publication);
     }
-    Ok(())
+    Ok(published)
 }
 
 fn canonical(path: &Path) -> Result<PathBuf, String> {
@@ -219,6 +234,7 @@ fn plan(source: &Source, root: &Path, protected: &[PathBuf]) -> Result<Vec<Datas
             role,
             manifest,
             provenance,
+            instruments,
             ..
         } => plan_collection(
             root,
@@ -226,6 +242,7 @@ fn plan(source: &Source, root: &Path, protected: &[PathBuf]) -> Result<Vec<Datas
             *role,
             manifest,
             provenance.as_deref().unwrap_or(&[]),
+            instruments.as_deref(),
             protected,
         ),
         Source::TickParquetDaily {
@@ -272,6 +289,7 @@ fn plan_collection(
     role: DatasetRole,
     manifest: &Path,
     provenance: &[PathBuf],
+    instruments: Option<&[String]>,
     protected: &[PathBuf],
 ) -> Result<Vec<Dataset>, String> {
     let manifest_path = contained_file(root, manifest, protected)?;
@@ -284,6 +302,17 @@ fn plan_collection(
             manifest_path.display()
         )
     })?;
+    // A selection is checked against the listed names before any asset tree is opened.
+    if let Some(instruments) = instruments {
+        for name in instruments {
+            if !collection.assets.contains_key(name) {
+                return Err(format!(
+                    "{} lists no asset `{name}`",
+                    manifest_path.display()
+                ));
+            }
+        }
+    }
     let mut collection_files = Vec::new();
     for relative in std::iter::once(manifest).chain(provenance.iter().map(PathBuf::as_path)) {
         let absolute = contained_file(root, relative, protected)?;
@@ -294,7 +323,10 @@ fn plan_collection(
         });
     }
     let mut datasets = Vec::with_capacity(collection.assets.len());
-    for asset in collection.assets.values() {
+    for (name, asset) in &collection.assets {
+        if instruments.is_some_and(|instruments| !instruments.contains(name)) {
+            continue;
+        }
         let asset_root = contained_dir(root, &asset.asset_root, protected)?;
         let dataset_root = canonical(&root.join(&asset.dataset_root))?;
         let dataset_prefix = dataset_root.strip_prefix(&asset_root).map_err(|_| {
@@ -683,7 +715,7 @@ fn publish(
     local: &Store,
     destination: &Store,
     config_hash: &str,
-) -> Result<String, String> {
+) -> Result<(String, Publication), String> {
     let started = Instant::now();
     let mut identities: Vec<ObjectIdentity> =
         parallel::map(&dataset.files, |file| store::identify(&file.absolute))
@@ -726,6 +758,14 @@ fn publish(
     );
 
     let retaining = Instant::now();
+    let daily = dataset.role == DatasetRole::Development
+        && matches!(
+            source_kind,
+            SourceKind::TickParquetDaily | SourceKind::BarParquet
+        );
+    let staging = daily
+        .then(|| import_staging(local, &generation, &objects))
+        .transpose()?;
     for (file, identity) in dataset.files.iter().zip(&identities) {
         local.put_new(&object_key(&identity.sha256), &file.absolute, identity)?;
     }
@@ -751,20 +791,41 @@ fn publish(
                     TickRows::Daily { days } => {
                         let paths: Vec<PathBuf> =
                             objects[..days.len()].iter().map(retained_path).collect();
-                        archive::write_ticks(
-                            &temporary,
-                            &dataset.instrument,
-                            *scale,
-                            daily_tick_rows(days, &paths, *scale),
-                        )?
+                        if dataset.role != DatasetRole::Development {
+                            archive::write_ticks(
+                                &temporary,
+                                &dataset.instrument,
+                                *scale,
+                                daily_tick_rows(days, &paths, *scale),
+                            )?
+                        } else {
+                            let mut summary = DataSummary::default();
+                            let mut sequence = binary_alpha_engine::market::TickSequence::default();
+                            for row in daily_tick_rows(days, &paths, *scale) {
+                                let tick = row?;
+                                sequence
+                                    .accept(tick)
+                                    .map_err(|e| format!("{}: {e}", dataset.instrument))?;
+                                summary.rows += 1;
+                                summary
+                                    .first_event_micros
+                                    .get_or_insert(tick.event_time_micros);
+                                summary.last_event_micros = Some(tick.event_time_micros);
+                            }
+                            summary
+                        }
                     }
                 };
-                let identity = store::identify(&temporary)?;
-                local.put_new(&object_key(&identity.sha256), &temporary, &identity)?;
-                fs::remove_file(&temporary)
-                    .map_err(|error| format!("cannot remove {}: {error}", temporary.display()))?;
-                objects.push(record(ObjectRole::Normalized, TICK_OBJECT_PATH, &identity));
-                identities.push(identity);
+                if matches!(rows, TickRows::Csv { .. }) || dataset.role != DatasetRole::Development
+                {
+                    let identity = store::identify(&temporary)?;
+                    local.put_new(&object_key(&identity.sha256), &temporary, &identity)?;
+                    fs::remove_file(&temporary).map_err(|error| {
+                        format!("cannot remove {}: {error}", temporary.display())
+                    })?;
+                    objects.push(record(ObjectRole::Normalized, TICK_OBJECT_PATH, &identity));
+                    identities.push(identity);
+                }
                 (
                     summary,
                     NativeGranularity::Tick,
@@ -812,7 +873,9 @@ fn publish(
     let validated = validating.elapsed();
 
     let (first_event_time, last_event_time) = archive::coverage(&summary)?;
-    let manifest = GenerationManifest {
+    let mut manifest = GenerationManifest {
+        layout: None,
+        day_inventory: Vec::new(),
         schema_version: MANIFEST_SCHEMA_VERSION,
         generation: generation.clone(),
         broker: dataset.instrument.broker.clone(),
@@ -844,8 +907,59 @@ fn publish(
         interval,
         objects,
     };
+    if !daily {
+        return Err("data import: this source kind/role cannot publish daily-v2; only development tick_parquet_daily and bar_parquet_collection imports are supported; existing v1 data remains readable and must use data pipeline migrate".into());
+    }
+    if daily {
+        manifest = crate::lineage::import_root(local, manifest)?;
+        identities = manifest
+            .objects
+            .iter()
+            .map(|o| store::identify(&retained_path(o)))
+            .collect::<Result<_, _>>()?;
+    }
+    let generation = manifest.generation.clone();
     let publishing = Instant::now();
     let published = publish_generation(manifest, &identities, local, destination)?;
+    if let Some((journal, staging)) = staging {
+        // The durable journal owns staging across retries. Ready manifests still pin keys.
+        let mut referenced = BTreeSet::new();
+        for generation in local.list_manifests()? {
+            let mut bytes = Vec::new();
+            local.read_to(
+                &binary_alpha_engine::dataset::manifest_key(&generation),
+                None,
+                &mut bytes,
+            )?;
+            let value: serde_json::Value =
+                serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
+            if let Some(objects) = value["objects"].as_array() {
+                for o in objects {
+                    if let Some(key) = o["key"].as_str() {
+                        referenced.insert(key.to_string());
+                    }
+                }
+            }
+        }
+        for key in staging {
+            if !referenced.contains(&key) {
+                match fs::remove_file(local.local_path(&key).expect("local staging")) {
+                    Ok(()) => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(e) => return Err(e.to_string()),
+                }
+            }
+        }
+        // Persist deletions before forgetting ownership; a crash can safely replay the journal.
+        File::open(local.local_path("objects").expect("local staging"))
+            .and_then(|dir| dir.sync_all())
+            .map_err(|e| e.to_string())?;
+        fs::remove_file(&journal).map_err(|e| e.to_string())?;
+        File::open(journal.parent().ok_or("import staging parent absent")?)
+            .and_then(|dir| dir.sync_all())
+            .map_err(|e| e.to_string())?;
+    }
+
     let elapsed = publishing.elapsed();
     let report = format!(
         "published {} {} generation {generation} rows {} objects {} reused {}",
@@ -855,7 +969,7 @@ fn publish(
         published.manifest.objects.len(),
         published.reused
     );
-    Ok(if published.already_published {
+    let line = if published.already_published {
         format!("{report} (already published)")
     } else {
         format!(
@@ -865,11 +979,59 @@ fn publish(
             validated.as_secs_f64(),
             elapsed.as_secs_f64()
         )
-    })
+    };
+    Ok((line, published))
+}
+
+/// Record ownership before the first input copy, so a retry can reclaim `Put::Reused`
+/// inputs from its earlier attempt without adopting unrelated pre-existing objects.
+fn import_staging(
+    local: &Store,
+    generation: &str,
+    objects: &[ObjectRecord],
+) -> Result<(PathBuf, BTreeSet<String>), String> {
+    let key = format!("import_staging/{generation}.json");
+    let journal = local
+        .local_path(&key)
+        .ok_or("import staging requires local store")?;
+    let staging: BTreeSet<String> = if local.head(&key)?.is_some() {
+        serde_json::from_slice(&fs::read(&journal).map_err(|e| e.to_string())?)
+            .map_err(|e| e.to_string())?
+    } else {
+        let mut staging = BTreeSet::new();
+        for object in objects {
+            if local.head(&object.key)?.is_none() {
+                staging.insert(object.key.clone());
+            }
+        }
+        let temporary = temporary_path(local, "import-staging")?;
+        fs::write(
+            &temporary,
+            serde_json::to_vec(&staging).map_err(|e| e.to_string())?,
+        )
+        .map_err(|e| e.to_string())?;
+        local.put_new(&key, &temporary, &store::identify(&temporary)?)?;
+        fs::remove_file(temporary).map_err(|e| e.to_string())?;
+        staging
+    };
+    if staging
+        .iter()
+        .any(|key| !objects.iter().any(|o| &o.key == key))
+    {
+        return Err("import staging journal names an input outside this generation".into());
+    }
+    // The create-once store syncs file bytes; sync its directory entry before retaining inputs.
+    File::open(journal.parent().ok_or("import staging parent absent")?)
+        .and_then(|dir| dir.sync_all())
+        .map_err(|e| e.to_string())?;
+    File::open(local.local_path("").expect("local staging"))
+        .and_then(|dir| dir.sync_all())
+        .map_err(|e| e.to_string())?;
+    Ok((journal, staging))
 }
 
 /// The shared immutable publication tail, after source normalization and local retention.
-pub(crate) struct Publication {
+pub struct Publication {
     pub manifest: GenerationManifest,
     pub reused: usize,
     pub already_published: bool,
@@ -995,11 +1157,16 @@ pub(crate) fn record(role: ObjectRole, path: &str, identity: &ObjectIdentity) ->
     }
 }
 
-/// A process-specific scratch path inside the retained folder's object directory; a leftover
-/// from an interrupted run is ignored by every reader and overwritten by the same process id.
+/// A unique scratch path per call inside the retained folder's object directory; leftovers
+/// from interrupted runs are ignored by every reader.
 pub(crate) fn temporary_path(local: &Store, name: &str) -> Result<PathBuf, String> {
+    static SEQUENCE: AtomicU64 = AtomicU64::new(0);
+    let sequence = SEQUENCE.fetch_add(1, Ordering::Relaxed);
     let path = local
-        .local_path(&format!("objects/.tmp-{name}-{}", std::process::id()))
+        .local_path(&format!(
+            "objects/.tmp-{name}-{}-{sequence}",
+            std::process::id()
+        ))
         .expect("the retained folder is a filesystem store");
     let parent = path.parent().expect("objects directory");
     fs::create_dir_all(parent)
@@ -1120,12 +1287,46 @@ fn validate_bars(
 mod tests {
     use super::*;
     use binary_alpha_engine::dataset::Coverage;
-    use binary_alpha_engine::market::{BrokerId, ProviderSymbol};
+    use binary_alpha_engine::market::{Bar, BrokerId, ProviderSymbol};
+    use binary_alpha_engine::stream::Observation;
+
+    #[test]
+    fn concurrent_pages_retain_their_own_bytes() {
+        let dir = std::env::temp_dir().join(format!(
+            "binary-alpha-import-parallel-{}",
+            std::process::id()
+        ));
+        let barrier = std::sync::Barrier::new(8);
+        std::thread::scope(|scope| {
+            for job in 0..8 {
+                let dir = &dir;
+                let barrier = &barrier;
+                scope.spawn(move || {
+                    let local = Store::filesystem(dir.clone());
+                    // Keep all same-name scratch files present to make aliasing observable.
+                    let path = temporary_path(&local, "history-page").unwrap();
+                    let bytes = format!("page for job {job}");
+                    fs::write(&path, &bytes).unwrap();
+                    barrier.wait();
+                    assert_eq!(fs::read(&path).unwrap(), bytes.as_bytes());
+                    let identity = retain_bytes(&local, bytes.as_bytes(), "history-page").unwrap();
+                    let mut retained = Vec::new();
+                    local
+                        .read_to(&object_key(&identity.sha256), None, &mut retained)
+                        .unwrap();
+                    assert_eq!(retained, bytes.as_bytes());
+                });
+            }
+        });
+        fs::remove_dir_all(dir).unwrap();
+    }
 
     /// A tick manifest with one source object carrying the given destination metadata.
     fn manifest(crc32c: Option<u32>, generation: Option<i64>) -> GenerationManifest {
         let sha256 = "a".repeat(64);
         GenerationManifest {
+            layout: None,
+            day_inventory: Vec::new(),
             schema_version: MANIFEST_SCHEMA_VERSION,
             generation: "g".repeat(64),
             broker: BrokerId::try_from("b".to_string()).unwrap(),
@@ -1158,6 +1359,97 @@ mod tests {
                 generation,
             }],
         }
+    }
+
+    fn publish_broker_bars(local: &Store, destination: &Store, bars: &[Bar]) -> GenerationManifest {
+        let mut manifest = manifest(None, None);
+        let instrument = InstrumentId {
+            broker: manifest.broker.clone(),
+            provider_symbol: manifest.provider_symbol.clone(),
+        };
+        let path = temporary_path(local, "feed-bars").unwrap();
+        let summary =
+            archive::write_bars(&path, "s", 538, 7_200, bars.iter().copied().map(Ok)).unwrap();
+        let normalized = fs::read(&path).unwrap();
+        fs::remove_file(&path).unwrap();
+        manifest.objects.clear();
+        let mut identities = Vec::new();
+        for (role, path, bytes) in [
+            (ObjectRole::Source, "source/page.json", b"{}".as_slice()),
+            (
+                ObjectRole::Provenance,
+                "provenance/coverage.json",
+                b"{}".as_slice(),
+            ),
+            (
+                ObjectRole::Normalized,
+                archive::BAR_OBJECT_PATH,
+                normalized.as_slice(),
+            ),
+        ] {
+            let identity = retain_bytes(local, bytes, "feed-object").unwrap();
+            manifest.objects.push(record(role, path, &identity));
+            identities.push(identity);
+        }
+        manifest.source_kind = SourceKind::BrokerHistory;
+        manifest.native_granularity = NativeGranularity::Bar { period_seconds: 5 };
+        manifest.time_unit = TimeUnit::Second;
+        manifest.price_representation = PriceRepresentation::BinaryFloat64;
+        manifest.capabilities = vec![Capability::Bars];
+        manifest.interval = Some(IntervalContract::five_second("parquet_metadata"));
+        manifest.row_count = summary.rows;
+        (
+            manifest.coverage.first_event_time,
+            manifest.coverage.last_event_time,
+        ) = archive::coverage(&summary).unwrap();
+        manifest.generation = generation_id(
+            &instrument,
+            manifest.source_kind,
+            manifest.role,
+            None,
+            &manifest.objects,
+        );
+        publish_generation(manifest, &identities, local, destination)
+            .unwrap()
+            .manifest
+    }
+
+    #[test]
+    fn published_broker_bars_feed_normalized_observations_in_order() {
+        let dir = std::env::temp_dir().join(format!(
+            "binary-alpha-import-feed-bars-{}",
+            std::process::id()
+        ));
+        let local = Store::filesystem(dir.join("retained"));
+        let destination = Store::filesystem(dir.join("published"));
+        let bars = [0, 5, 15].map(|start_unix_s| Bar {
+            provider: (),
+            start_unix_s,
+            open: 1.25,
+            high: 1.5,
+            low: 1.0,
+            close: 1.375,
+            volume: start_unix_s as f64,
+            period_s: 5,
+        });
+        let published = publish_broker_bars(&local, &destination, &bars);
+        let mut bytes = Vec::new();
+        destination
+            .read_to(&published.key(), None, &mut bytes)
+            .unwrap();
+        let manifest = GenerationManifest::from_json(&bytes).unwrap();
+        let scale = PriceScale::try_from(3).unwrap();
+        let mut observations = Vec::new();
+        crate::audit::feed_generation(&destination, &manifest, scale, &mut |observation| {
+            observations.push(observation);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(
+            observations,
+            bars.map(|bar| Observation::from_bar(&bar, scale).unwrap())
+        );
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

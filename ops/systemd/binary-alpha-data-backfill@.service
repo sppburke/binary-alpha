@@ -1,0 +1,14 @@
+[Unit]
+Description=Binary Alpha weekly market-data backfill for %i
+Documentation=file:///usr/share/doc/binary-alpha/operations.md
+# Local storage must be mounted; network-online is not evidence of broker or Drive reachability.
+Requires=local-fs.target
+After=local-fs.target network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=%i
+UMask=0077
+EnvironmentFile=/etc/binary-alpha/data-pipeline/%i.env
+ExecStart=/usr/local/bin/binary-alpha data pipeline update --config /etc/binary-alpha/data-pipeline/%i.toml

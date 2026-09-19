@@ -12,9 +12,7 @@ use std::process::{Command, Stdio};
 use std::time::Duration;
 
 use binary_alpha_engine::config::StreamKey;
-use binary_alpha_engine::dataset::{
-    DatasetRole, GenerationManifest, PriceRepresentation, generation_id,
-};
+use binary_alpha_engine::dataset::{DatasetRole, GenerationManifest, PriceRepresentation};
 use binary_alpha_engine::execution::{Decimal, EventKind, FinancialEvent, Summary, Threshold};
 use binary_alpha_engine::features::{FeatureManifest, FeaturePlan, PLAN_OBJECT_PATH};
 use binary_alpha_engine::market::{InstrumentId, format_event_time_micros};
@@ -22,7 +20,8 @@ use binary_alpha_engine::portfolio::{
     Selection, SelectionManifest, State, selection_generation_id,
 };
 use binary_alpha_engine::search::Family;
-use common::{Scratch, command, generation, import, verify, write_ticks};
+use common::current::import;
+use common::{Scratch, command, generation, verify, write_ticks};
 use serde_json::Value;
 
 const BASE_MS: i64 = 1_767_571_200_000; // 2026-01-05T00:00:00Z, a Monday
@@ -32,7 +31,7 @@ const BASIS: i64 = 1_800_000;
 const ROWS: usize = 32;
 const INSTRUMENT: &str = "pocket_option:AEDCNY_otc";
 const STREAM: &str = "{ duration_seconds = 20, offset_seconds = 0 }";
-const TICK_INSTRUMENT: &str = "\n[[instruments]]\nbroker = \"pocket_option\"\nprovider_symbol = \"AEDCNY_otc\"\nbase_currency = \"AED\"\nquote_currency = \"CNY\"\nprice_scale = 6\nnative_granularity = { kind = \"tick\" }\ngap = { max_seconds = 2, reopen_seconds = 60 }\nfrozen = { min_observations = 10, min_seconds = 5 }\njump = { min_basis_points = 5 }\nspan = { min_percent = 75 }\nsessions = [{ name = \"week\", open_seconds = 0, close_seconds = 604800 }]\ncandles = [{ duration_seconds = 20, offset_seconds = 0, min_observations = 9, hard_min_observations = 5 }]\n";
+const TICK_INSTRUMENT: &str = "\n[[instruments]]\nbroker = \"pocket_option\"\nprovider_symbol = \"AEDCNY_otc\"\nbase_currency = \"AED\"\nquote_currency = \"CNY\"\nprice_scale = 6\nsession = { kind = \"always\" }\nnative_granularity = { kind = \"tick\" }\ngap = { max_seconds = 2, reopen_seconds = 60 }\nfrozen = { min_observations = 10, min_seconds = 5 }\njump = { min_basis_points = 5 }\nspan = { min_percent = 75 }\nsessions = [{ name = \"week\", open_seconds = 0, close_seconds = 604800 }]\ncandles = [{ duration_seconds = 20, offset_seconds = 0, min_observations = 9, hard_min_observations = 5 }]\n";
 /// The settlement rule of the search family's contract and of every alternative.
 const SETTLEMENT: &str = "settlement = { rule = \"price_at_due_v1\", max_settlement_delay_micros = 2000000, max_tick_gap_micros = 2000000 }";
 /// Five seconds of contract plus two seconds of permitted settlement delay.
@@ -2075,21 +2074,23 @@ fn later_role_evidence_and_ill_formed_inputs_are_refused_before_output() {
     assert_eq!(snapshot(&scratch), before);
 
     // A holdout-role input is refused on its manifest bytes before any output.
-    let mut holdout = GenerationManifest::from_json(&fs::read(&assessment).unwrap()).unwrap();
-    holdout.role = DatasetRole::Holdout;
-    let PriceRepresentation::IntegerUnits { scale } = holdout.price_representation else {
+    let assessment_manifest =
+        GenerationManifest::from_json(&fs::read(&assessment).unwrap()).unwrap();
+    let PriceRepresentation::IntegerUnits { scale } = assessment_manifest.price_representation
+    else {
         panic!("tick sources carry integer units");
     };
-    holdout.generation = generation_id(
+    let holdout = common::current::ticks(
+        &scratch.path("published"),
         &InstrumentId {
-            broker: holdout.broker.clone(),
-            provider_symbol: holdout.provider_symbol.clone(),
+            broker: assessment_manifest.broker.clone(),
+            provider_symbol: assessment_manifest.provider_symbol.clone(),
         },
-        holdout.source_kind,
         DatasetRole::Holdout,
-        Some(scale),
-        &holdout.objects,
-    );
+        scale,
+        &common::read_normalized_ticks(&scratch.path("published"), &assessment_manifest),
+    )
+    .unwrap();
     let holdout_path = scratch.path(&format!(
         "published/manifests/{}/ready.json",
         holdout.generation

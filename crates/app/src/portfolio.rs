@@ -530,6 +530,7 @@ pub fn optimize(config: &Config, local: &Store, destination: &Store) -> Result<S
     let access = Access {
         declaration: declaration.as_ref(),
         certification: None,
+        verified: None,
     };
     select(config, local, destination, access).map(|selected| selected.report)
 }

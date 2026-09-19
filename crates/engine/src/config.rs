@@ -196,6 +196,7 @@ impl Config {
                 Source::BarParquetCollection {
                     manifest,
                     provenance,
+                    instruments,
                     ..
                 } => {
                     relative_path(&manifest.to_string_lossy())
@@ -210,6 +211,24 @@ impl Config {
                                 field("provenance"),
                                 entry.display()
                             ));
+                        }
+                    }
+                    if let Some(instruments) = instruments {
+                        if instruments.is_empty() {
+                            return Err(format!(
+                                "{}: at least one asset name is required",
+                                field("instruments")
+                            ));
+                        }
+                        for (position, name) in instruments.iter().enumerate() {
+                            ProviderSymbol::try_from(name.clone())
+                                .map_err(|reason| format!("{}: {reason}", field("instruments")))?;
+                            if instruments[..position].contains(name) {
+                                return Err(format!(
+                                    "{}: {name} is listed twice",
+                                    field("instruments")
+                                ));
+                            }
                         }
                     }
                 }
@@ -321,10 +340,11 @@ impl Config {
                 if !self.instruments.iter().any(|instrument| {
                     instrument.broker == history.broker
                         && instrument.provider_symbol == *symbol
-                        && instrument.native_granularity == NativeGranularity::Tick
+                        && instrument.native_granularity == history.native_granularity
                 }) {
                     return Err(format!(
-                        "history: instruments[{index}] must name a declared tick instrument"
+                        "history: instruments[{index}] must name a declared {} instrument",
+                        history.native_granularity
                     ));
                 }
             }
@@ -389,7 +409,8 @@ pub enum Broker {
     PocketOption(PocketSettings),
 }
 
-fn credential_name(reference: &str) -> bool {
+/// Whether `reference` is an environment variable name a credential may be resolved from.
+pub fn credential_name(reference: &str) -> bool {
     !reference.is_empty()
         && reference
             .bytes()
@@ -422,8 +443,16 @@ pub struct PocketSettings {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub origin: Option<String>,
     pub credential: String,
+    /// A program and its arguments that print a fresh authentication object to standard
+    /// output; run when the referenced variable is unset and again, once, after the provider
+    /// rejects a session. The program is operator tooling outside this repository.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credential_command: Option<Vec<String>>,
     pub account_class: AccountClass,
     pub server_offset_minutes: i32,
+    /// Maximum unconsumed candle pages, including outstanding requests; defaults to eight.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub history_pages_in_flight: Option<u16>,
 }
 
 impl Broker {
@@ -498,6 +527,14 @@ impl Broker {
                 }
             }
             Self::PocketOption(settings) => {
+                if settings.history_pages_in_flight == Some(0) {
+                    return Err("history_pages_in_flight must be positive".into());
+                }
+                if let Some(command) = &settings.credential_command
+                    && command.first().is_none_or(String::is_empty)
+                {
+                    return Err("credential_command must name a program".into());
+                }
                 if settings.origin.as_ref().is_some_and(|origin| {
                     origin.is_empty() || origin.bytes().any(|b| b.is_ascii_control())
                 }) {
@@ -572,7 +609,8 @@ impl RateBudgets {
     }
 }
 
-/// Bounded tick acquisition, optionally repeated toward a new fixed end time each pass.
+/// Bounded native-history acquisition, optionally repeated toward a new fixed end time each
+/// pass, and optionally extended from explicitly bound imported seed generations.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct History {
@@ -583,7 +621,35 @@ pub struct History {
     pub end: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub refresh_interval_seconds: Option<u32>,
+    /// The native representation requested from the provider; an absent field is ticks.
+    #[serde(default, skip_serializing_if = "NativeGranularity::is_tick")]
+    pub native_granularity: NativeGranularity,
+    /// Imported generations an acquisition extends, each bound to its provider symbol, ready
+    /// manifest, and the source identity it was collected under.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub seeds: Vec<Seed>,
+    /// Seconds before the acquisition frontier that a new acquisition re-reads and compares.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub overlap_seconds: Option<u32>,
+    /// Pages one invocation may request before the acquisition stays pending.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_pages: Option<u32>,
+    /// Seconds one invocation may spend paging before the acquisition stays pending.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_elapsed_seconds: Option<u32>,
 }
+
+/// One imported generation an acquisition extends, bound to the source context it came from.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct Seed {
+    pub provider_symbol: ProviderSymbol,
+    pub manifest: ManifestUri,
+    /// The broker source identity the seed was collected under; acquisition refuses a
+    /// configured broker whose identity differs.
+    pub source_identity: String,
+}
+
 impl History {
     pub fn validate(&self) -> Result<(), String> {
         if self.role == DatasetRole::Holdout {
@@ -599,8 +665,44 @@ impl History {
         if start >= end {
             return Err("start must precede end".into());
         }
-        if self.refresh_interval_seconds == Some(0) {
-            return Err("refresh_interval_seconds must be positive".into());
+        for (name, value) in [
+            ("refresh_interval_seconds", self.refresh_interval_seconds),
+            ("overlap_seconds", self.overlap_seconds),
+            ("max_pages", self.max_pages),
+            ("max_elapsed_seconds", self.max_elapsed_seconds),
+        ] {
+            if value == Some(0) {
+                return Err(format!("{name} must be positive"));
+            }
+        }
+        if self.native_granularity == (NativeGranularity::Bar { period_seconds: 0 }) {
+            return Err("native_granularity.period_seconds: must be positive".into());
+        }
+        for (index, seed) in self.seeds.iter().enumerate() {
+            let field = |name: &str| format!("seeds[{index}].{name}");
+            if !self.instruments.contains(&seed.provider_symbol) {
+                return Err(format!(
+                    "{}: {} is not a history instrument",
+                    field("provider_symbol"),
+                    seed.provider_symbol
+                ));
+            }
+            if self.seeds[..index]
+                .iter()
+                .any(|earlier| earlier.provider_symbol == seed.provider_symbol)
+            {
+                return Err(format!(
+                    "{}: {} is listed twice",
+                    field("provider_symbol"),
+                    seed.provider_symbol
+                ));
+            }
+            if !crate::dataset::is_hex64(&seed.source_identity) {
+                return Err(format!(
+                    "{}: must be sixty-four lowercase hexadecimal digits",
+                    field("source_identity")
+                ));
+            }
         }
         Ok(())
     }
@@ -817,6 +919,10 @@ pub enum Source {
         manifest: PathBuf,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         provenance: Option<Vec<PathBuf>>,
+        /// The asset names to import; an absent list imports every asset the manifest lists,
+        /// and a present list opens no other asset tree.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        instruments: Option<Vec<String>>,
     },
     /// One archive root holding, per listed directory, daily Parquet tick files and their
     /// metadata.
@@ -2020,6 +2126,9 @@ pub struct Instrument {
     pub span: Option<SpanCheck>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sessions: Option<Vec<Session>>,
+    /// Trading calendar for the daily continuous candle product (not profile windows).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session: Option<crate::session::Session>,
     pub candles: Vec<CandleSpec>,
 }
 
@@ -2084,6 +2193,9 @@ pub const SECONDS_PER_WEEK: u32 = 7 * 86_400;
 impl Instrument {
     /// The rules a single field's deserializer cannot see; an error names the field.
     pub fn validate(&self) -> Result<(), String> {
+        if let Some(session) = &self.session {
+            session.calendar()?;
+        }
         if self.candles.is_empty() {
             return Err("candles: at least one candle stream is required".to_string());
         }
@@ -2248,12 +2360,218 @@ mod tests {
         let source = "schema_version = 1\nrun_mode = \"research\"\n\n[storage]\nhistorical_data_dir = \"/data/historical\"\npublication_uri = \"file:///data/published\"\n\n[[import.sources]]\nkind = \"tick_csv\"\npath = \"ticks.csv\"\nbroker = \"pocket_option\"\nrole = \"development\"\nprovider_symbol = \"AEDCNY_otc\"\nsource_symbol = \"AEDCNY\"\nprice_scale = 6\n\n[[import.sources]]\nkind = \"bar_parquet_collection\"\npath = \"/data/bars\"\nbroker = \"pocket_option\"\nrole = \"evaluation\"\nmanifest = \"collection.json\"\nprovenance = [\"batch.json\"]\n\n[[import.sources]]\nkind = \"tick_parquet_daily\"\npath = \"/data/deriv/ticks\"\nbroker = \"deriv\"\nrole = \"development\"\nprice_scale = 5\ninstruments = [\"AUDUSD\", \"USDJPY\"]\n".to_string();
         let config = Config::parse(&source).unwrap();
         assert_eq!(config.canonical_toml(), source);
+        assert!(matches!(
+            &config.import.as_ref().unwrap().sources[1],
+            Source::BarParquetCollection {
+                instruments: None,
+                ..
+            }
+        ));
+        assert_eq!(
+            config.content_hash(),
+            "v3:sha256:c0b29aea4a1cc52b5341e7c7dd887af171ed72aa7a424f95917a6c572d86326e"
+        );
         assert_eq!(
             Config::parse(&config.canonical_toml())
                 .unwrap()
                 .content_hash(),
             config.content_hash()
         );
+    }
+
+    #[test]
+    fn pocket_settings_history_prefetch_round_trip_and_validation() {
+        let source = "kind = \"pocket_option\"\nid = \"pocket_option\"\nendpoint = \"wss://example.invalid\"\norigin = \"https://example.invalid\"\ncredential = \"POCKET_AUTH\"\ncredential_command = [\"auth-helper\"]\naccount_class = \"demo\"\nserver_offset_minutes = 120\n";
+        let broker: Broker = toml::from_str(source).unwrap();
+        broker.validate(RunMode::Research).unwrap();
+        let Broker::PocketOption(settings) = &broker else {
+            panic!("expected Pocket settings")
+        };
+        assert_eq!(settings.history_pages_in_flight, None);
+        assert_eq!(toml::to_string(&broker).unwrap(), source);
+        for count in [1, 3, 8, u16::MAX] {
+            let explicit = format!("{source}history_pages_in_flight = {count}\n");
+            let broker: Broker = toml::from_str(&explicit).unwrap();
+            broker.validate(RunMode::Research).unwrap();
+            let Broker::PocketOption(settings) = &broker else {
+                panic!("expected Pocket settings")
+            };
+            assert_eq!(settings.history_pages_in_flight, Some(count));
+            assert_eq!(toml::to_string(&broker).unwrap(), explicit);
+        }
+        let broker: Broker =
+            toml::from_str(&format!("{source}history_pages_in_flight = 0\n")).unwrap();
+        assert_eq!(
+            broker.validate(RunMode::Research).unwrap_err(),
+            "history_pages_in_flight must be positive"
+        );
+    }
+
+    fn history_config() -> Config {
+        Config::parse(&format!(
+            "schema_version = 1\nrun_mode = \"research\"\n{STORAGE}
+[[instruments]]
+broker = \"b\"
+provider_symbol = \"S\"
+quote_currency = \"USD\"
+price_scale = 6
+native_granularity = {{ kind = \"tick\" }}
+candles = [{{ duration_seconds = 5, offset_seconds = 0 }}]
+
+[[brokers]]
+kind = \"deriv\"
+id = \"b\"
+public_endpoint = \"wss://example.invalid\"
+bootstrap_endpoint = \"https://example.invalid\"
+app_id = \"test\"
+
+[history]
+broker = \"b\"
+instruments = [\"S\"]
+role = \"development\"
+start = \"2025-05-19T11:15:00Z\"
+end = \"2025-05-19T11:15:10Z\"
+"
+        ))
+        .unwrap()
+    }
+
+    fn history_seed() -> Seed {
+        Seed {
+            provider_symbol: ProviderSymbol::try_from("S".to_string()).unwrap(),
+            manifest: format!("file:///seeds/manifests/{}/ready.json", "1".repeat(64))
+                .parse()
+                .unwrap(),
+            source_identity: "a".repeat(64),
+        }
+    }
+
+    #[test]
+    fn history_options_round_trip_and_defaults_are_omitted() {
+        let mut config = history_config();
+        let canonical = config.canonical_toml();
+        let defaults = canonical.split_once("\n[history]\n").unwrap().1;
+        assert_eq!(
+            defaults,
+            "broker = \"b\"\ninstruments = [\"S\"]\nrole = \"development\"\nstart = \"2025-05-19T11:15:00Z\"\nend = \"2025-05-19T11:15:10Z\"\n"
+        );
+        let explicit = canonical.replace(
+            "[history]\n",
+            "[history]\nnative_granularity = { kind = \"tick\" }\nseeds = []\n",
+        );
+        assert_eq!(
+            Config::parse(&explicit).unwrap().canonical_toml(),
+            canonical
+        );
+
+        let seed = history_seed();
+        let history = config.history.as_mut().unwrap();
+        history.native_granularity = NativeGranularity::Bar { period_seconds: 5 };
+        history.seeds = vec![seed.clone()];
+        history.overlap_seconds = Some(5);
+        history.max_pages = Some(2);
+        history.max_elapsed_seconds = Some(30);
+        config.instruments[0].native_granularity = NativeGranularity::Bar { period_seconds: 5 };
+        let canonical = config.canonical_toml();
+        assert_eq!(
+            canonical.split_once("\n[history]\n").unwrap().1,
+            format!(
+                "{defaults}overlap_seconds = 5\nmax_pages = 2\nmax_elapsed_seconds = 30\n\n[history.native_granularity]\nkind = \"bar\"\nperiod_seconds = 5\n\n[[history.seeds]]\nprovider_symbol = \"S\"\nmanifest = \"{}\"\nsource_identity = \"{}\"\n",
+                seed.manifest, seed.source_identity
+            )
+        );
+        assert_eq!(Config::parse(&canonical).unwrap(), config);
+    }
+
+    #[test]
+    fn history_limits_reject_zero_with_the_field_name() {
+        for field in ["max_pages", "max_elapsed_seconds", "overlap_seconds"] {
+            let config = history_config();
+            let source = config
+                .canonical_toml()
+                .replace("[history]\n", &format!("[history]\n{field} = 0\n"));
+            let config: Config = toml::from_str(&source).unwrap();
+            assert_eq!(
+                config.validate().unwrap_err(),
+                format!("history: {field} must be positive")
+            );
+        }
+    }
+
+    #[test]
+    fn history_seeds_reject_unknown_and_duplicate_instruments() {
+        let seed = history_seed();
+        let mut unknown = seed.clone();
+        unknown.provider_symbol = ProviderSymbol::try_from("other".to_string()).unwrap();
+        for (seeds, message) in [
+            (
+                vec![unknown],
+                "history: seeds[0].provider_symbol: other is not a history instrument",
+            ),
+            (
+                vec![seed.clone(), seed],
+                "history: seeds[1].provider_symbol: S is listed twice",
+            ),
+        ] {
+            let mut config = history_config();
+            config.history.as_mut().unwrap().seeds = seeds;
+            assert_eq!(config.validate().unwrap_err(), message);
+        }
+    }
+
+    #[test]
+    fn history_seed_source_identity_requires_lowercase_hex64() {
+        let mut config = history_config();
+        config.history.as_mut().unwrap().seeds = vec![history_seed()];
+        config.validate().unwrap();
+        for identity in [
+            "a".repeat(63),
+            "a".repeat(65),
+            "A".repeat(64),
+            "g".repeat(64),
+        ] {
+            config.history.as_mut().unwrap().seeds[0].source_identity = identity;
+            assert_eq!(
+                config.validate().unwrap_err(),
+                "history: seeds[0].source_identity: must be sixty-four lowercase hexadecimal digits"
+            );
+        }
+    }
+
+    #[test]
+    fn history_bars_require_a_matching_declared_granularity() {
+        let mut config = history_config();
+        config.history.as_mut().unwrap().native_granularity =
+            NativeGranularity::Bar { period_seconds: 5 };
+        assert_eq!(
+            config.validate().unwrap_err(),
+            "history: instruments[0] must name a declared 5-second bar instrument"
+        );
+        config.instruments[0].native_granularity = NativeGranularity::Bar { period_seconds: 5 };
+        config.validate().unwrap();
+    }
+
+    #[test]
+    fn bar_collection_instruments_reject_empty_duplicate_and_invalid_names() {
+        let source = format!(
+            "schema_version = 1\nrun_mode = \"research\"\n{STORAGE}\n[[import.sources]]\nkind = \"bar_parquet_collection\"\npath = \"/bars\"\nbroker = \"b\"\nrole = \"development\"\nmanifest = \"collection.json\"\n"
+        );
+        for (instruments, message) in [
+            ("[]", "at least one asset name is required"),
+            ("[\"S\", \"S\"]", "S is listed twice"),
+            ("[\"\"]", "ProviderSymbol must not be empty"),
+            (
+                "[\"S\\t\"]",
+                "ProviderSymbol `S\\t` contains a control character",
+            ),
+        ] {
+            let config: Config =
+                toml::from_str(&format!("{source}instruments = {instruments}\n")).unwrap();
+            assert_eq!(
+                config.validate().unwrap_err(),
+                format!("import.sources[0].instruments: {message}")
+            );
+        }
     }
 
     #[test]

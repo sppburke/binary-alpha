@@ -822,8 +822,18 @@ impl MarketDataBroker for MarketProbe {
         id: &InstrumentId,
         scale: PriceScale,
         before: Option<i64>,
+        granularity: binary_alpha_engine::dataset::NativeGranularity,
     ) -> Result<broker::HistoryPage, String> {
-        self.inner.history_page(id, scale, before)
+        self.inner.history_page(id, scale, before, granularity)
+    }
+    fn decode_history(
+        &self,
+        id: &InstrumentId,
+        raw: &[u8],
+        scale: PriceScale,
+        granularity: binary_alpha_engine::dataset::NativeGranularity,
+    ) -> Result<(Option<i32>, broker::HistoryRows), String> {
+        self.inner.decode_history(id, raw, scale, granularity)
     }
     fn subscribe(&mut self, id: &InstrumentId, scale: PriceScale) -> Result<(), String> {
         if let Some((started, release)) = self.subscribe_gate.take() {
@@ -1192,8 +1202,13 @@ fn successful_loss_reconciliation_keeps_failed_contract_subscription_veto() {
     let at = START + 5_000_000;
     let mut input = startup(at, json!([]), false, "9990");
     input.push(account(at,r#"{"msg_type":"proposal_open_contract","req_id":6,"error":{"code":"ContractUnavailable"}}"#));
+    // Finish the first proposal at startup time before advancing the renewal cadence.
+    // Otherwise the market worker can advance the clock before its tick reaches the owner,
+    // allowing reconciliation to queue first while this trace requires the proposal first.
+    input.push(tick(at));
+    input.push(refusal(at));
+    // This tick stays in the same 20s candle and advances only the reconciliation timer.
     input.push(tick(START + 7_000_000));
-    input.push(refusal(START + 7_000_000));
     input.push(portfolio(START + 7_000_000, json!([])));
     input.push(statement(START + 7_000_000));
     let recorded = RecordedConnector::from_jsonl(&log(&input)).unwrap();
