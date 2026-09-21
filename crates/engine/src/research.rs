@@ -89,6 +89,11 @@ fn lines_id(domain: &[u8], lines: &[&str]) -> String {
 }
 
 pub(crate) fn identifier(field: &str, text: &str) -> Result<(), String> {
+    if text == "." || text == ".." {
+        return Err(format!(
+            "{field}: `.` and `..` are path steps, not identifiers"
+        ));
+    }
     if text.is_empty()
         || text
             .bytes()

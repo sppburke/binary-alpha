@@ -38,7 +38,7 @@ pub fn run(config_path: &Path, out: &mut dyn Write) -> Result<(), String> {
         .map(|source| resolve(&source.root))
         .collect::<Result<Vec<_>, _>>()?;
     // The declaration lands beneath the namespace, so that location is checked as well.
-    let namespace_uri = match &destination_uri {
+    let namespace_uri = resolve(&match &destination_uri {
         PublicationUri::Filesystem(path) => PublicationUri::Filesystem(path.join(&split.namespace)),
         PublicationUri::GoogleCloudStorage { bucket, prefix } => {
             PublicationUri::GoogleCloudStorage {
@@ -50,7 +50,7 @@ pub fn run(config_path: &Path, out: &mut dyn Write) -> Result<(), String> {
                 },
             }
         }
-    };
+    })?;
     for target in [&retained, &destination_uri, &namespace_uri] {
         if let PublicationUri::Filesystem(path) = target
             && path.ancestors().any(data_pipeline::is_managed_store)
@@ -60,8 +60,11 @@ pub fn run(config_path: &Path, out: &mut dyn Write) -> Result<(), String> {
                     .into(),
             );
         }
-        if sources.iter().any(|source| within(target, source)) {
-            return Err("split: retained folder or destination lies in a source store".into());
+        if sources
+            .iter()
+            .any(|source| within(target, source) || within(source, target))
+        {
+            return Err("split: retained folder or destination overlaps a source store".into());
         }
     }
     let mut planned = Vec::new();

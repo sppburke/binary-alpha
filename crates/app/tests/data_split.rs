@@ -722,6 +722,32 @@ fn invalid_configuration_sources_windows_and_locations_write_nothing() {
         scratch.path("source-parent-alias"),
     )
     .unwrap();
+    // A namespace alias inside the destination, a source store nested inside an output folder,
+    // an alias that cycles through its own parent, and a long parent chain with no alias.
+    for (dir, target) in [
+        ("ns-source-dest", "published"),
+        ("ns-managed-dest", "managed/store"),
+    ] {
+        fs::create_dir_all(scratch.path(dir)).unwrap();
+        std::os::unix::fs::symlink(
+            scratch.path(target),
+            scratch.path(dir).join("split-fixture"),
+        )
+        .unwrap();
+    }
+    for root in ["nested-dest/manifests", "nested-retained/objects"] {
+        for (key, bytes) in snapshots(&scratch.path("published")) {
+            let path = scratch.path(root).join(key);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, bytes).unwrap();
+        }
+    }
+    std::os::unix::fs::symlink(
+        Path::new("recursive-cycle").join(".."),
+        scratch.path("recursive-cycle"),
+    )
+    .unwrap();
+    let long_chain = format!("{}managed/store", "x/../".repeat(45));
     let mut cases: Vec<(&str, Config, &str)> = Vec::new();
     for (name, from, to) in [
         ("evaluation-holdout", "evaluation", "holdout"),
@@ -891,6 +917,60 @@ fn invalid_configuration_sources_windows_and_locations_write_nothing() {
             .unwrap();
         cases.push((name, config, reason));
     }
+    for (name, destination, reason) in [
+        (
+            "namespace alias into source store",
+            "ns-source-dest",
+            "source store",
+        ),
+        (
+            "namespace alias into managed store",
+            "ns-managed-dest",
+            "managed pipeline store",
+        ),
+        (
+            "cyclic parent alias",
+            "recursive-cycle/nested",
+            "too many destination symlinks",
+        ),
+        (
+            "long parent chain",
+            long_chain.as_str(),
+            "managed pipeline store",
+        ),
+    ] {
+        let mut config = base.clone();
+        config.storage.publication_uri = format!("file://{}", scratch.path(destination).display())
+            .parse()
+            .unwrap();
+        cases.push((name, config, reason));
+    }
+    let generation = base.split.as_ref().unwrap().sources[0]
+        .generation()
+        .to_string();
+    for (name, root, retained) in [
+        ("source below destination", "nested-dest/manifests", false),
+        (
+            "source below retained folder",
+            "nested-retained/objects",
+            true,
+        ),
+    ] {
+        let mut config = base.clone();
+        config.split.as_mut().unwrap().sources = vec![uri(&scratch.path(root), &generation)];
+        let parent = scratch.path(root).parent().unwrap().to_path_buf();
+        if retained {
+            config.storage.historical_data_dir =
+                serde_json::from_value(serde_json::json!(parent)).unwrap();
+        } else {
+            config.storage.publication_uri =
+                format!("file://{}", parent.display()).parse().unwrap();
+        }
+        cases.push((name, config, "source store"));
+    }
+    let mut config = base.clone();
+    config.split.as_mut().unwrap().namespace = "..".into();
+    cases.push(("namespace parent step", config, "not identifiers"));
     for (index, (name, config, reason)) in cases.into_iter().enumerate() {
         let path = scratch.path(&format!("invalid-{index}.toml"));
         fs::write(&path, config.canonical_toml()).unwrap();

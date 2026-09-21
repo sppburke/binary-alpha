@@ -285,8 +285,14 @@ fn check_managed_store(store: &Path) -> Result<(), String> {
 
 /// Resolve one link at a time so an alias cannot hide a redirected managed store.
 /// The limit matches Linux's symlink traversal bound and also rejects cyclic aliases.
-pub(crate) fn import_destination(mut target: PathBuf) -> Result<PathBuf, String> {
-    for _ in 0..40 {
+pub(crate) fn import_destination(target: PathBuf) -> Result<PathBuf, String> {
+    resolve_destination(target, &mut 40)
+}
+
+/// `links` is the alias budget shared by every prefix resolution of one target; a parent step
+/// never spends it.
+fn resolve_destination(mut target: PathBuf, links: &mut u32) -> Result<PathBuf, String> {
+    loop {
         // A `..` steps up from what its prefix resolves to: an alias's target, or an uncreated
         // child's parent. Resolving the prefix first keeps a managed store behind either
         // visible, including one an alias target reaches through its own `..`.
@@ -294,7 +300,7 @@ pub(crate) fn import_destination(mut target: PathBuf) -> Result<PathBuf, String>
             .components()
             .position(|component| component == Component::ParentDir)
         {
-            let mut prefix = import_destination(target.components().take(index).collect())?;
+            let mut prefix = resolve_destination(target.components().take(index).collect(), links)?;
             prefix.pop();
             target = prefix.join(target.components().skip(index + 1).collect::<PathBuf>());
             continue;
@@ -308,6 +314,9 @@ pub(crate) fn import_destination(mut target: PathBuf) -> Result<PathBuf, String>
             }
             match fs::symlink_metadata(path) {
                 Ok(metadata) if metadata.file_type().is_symlink() => {
+                    *links = links
+                        .checked_sub(1)
+                        .ok_or("import: too many destination symlinks")?;
                     let link = fs::read_link(path).map_err(|e| e.to_string())?;
                     let resolved = if link.is_absolute() {
                         link
@@ -343,7 +352,6 @@ pub(crate) fn import_destination(mut target: PathBuf) -> Result<PathBuf, String>
             .map_err(|e| e.to_string())?
             .join(target.strip_prefix(ancestor).map_err(|e| e.to_string())?));
     }
-    Err("import: too many destination symlinks".into())
 }
 
 pub(crate) fn is_managed_store(path: &Path) -> bool {
