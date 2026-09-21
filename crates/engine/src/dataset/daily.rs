@@ -4,7 +4,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 
-use super::{ObjectRecord, ObjectRole};
+use super::{NativeGranularity, ObjectRecord, ObjectRole};
 use crate::market::parse_event_time_micros;
 
 pub const ACQUISITION_PREFIX: &str = "provenance/acquisitions/";
@@ -75,6 +75,22 @@ fn timestamp(text: &str) -> Result<i64, String> {
 }
 
 impl DayInventoryEntry {
+    /// Validated bars are aligned and strictly increasing, so these bounds and count occupy
+    /// every native slot of the UTC day.
+    pub fn full_bar_grid(&self, granularity: NativeGranularity) -> Result<bool, String> {
+        let NativeGranularity::Bar { period_seconds } = granularity else {
+            return Ok(false);
+        };
+        let period = i64::from(period_seconds) * 1_000_000;
+        if period == 0 || DAY_MICROS % period != 0 {
+            return Ok(false);
+        }
+        let (start, end) = day_bounds(&self.date)?;
+        Ok(self.rows == (DAY_MICROS / period) as u64
+            && self.first_time.as_deref().map(timestamp).transpose()? == Some(start)
+            && self.last_time.as_deref().map(timestamp).transpose()? == Some(end - period))
+    }
+
     pub fn logical_path(&self) -> Result<String, String> {
         day_bounds(&self.date)?;
         match (self.family, self.duration, self.offset) {
@@ -269,6 +285,27 @@ pub(crate) mod tests {
             start: "2026-09-17T12:00:00Z".into(),
             end: "2026-09-18T00:00:00Z".into(),
         }
+    }
+
+    #[test]
+    fn full_bar_grid_requires_every_native_slot() {
+        let mut day = entry(DayFamily::Observations);
+        day.rows = 17_280;
+        day.last_time = Some("2026-09-17T23:59:55Z".into());
+        for granularity in [
+            NativeGranularity::Tick,
+            NativeGranularity::Bar { period_seconds: 0 },
+            NativeGranularity::Bar { period_seconds: 7 },
+        ] {
+            assert!(!day.full_bar_grid(granularity).unwrap());
+        }
+        let granularity = NativeGranularity::Bar { period_seconds: 5 };
+        assert!(day.full_bar_grid(granularity).unwrap());
+        day.rows = 17_279;
+        assert!(!day.full_bar_grid(granularity).unwrap());
+        day.rows = 17_280;
+        day.first_time = Some("2026-09-17T00:00:05Z".into());
+        assert!(!day.full_bar_grid(granularity).unwrap());
     }
 
     #[test]
