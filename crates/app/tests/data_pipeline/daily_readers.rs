@@ -298,14 +298,14 @@ fn parity(pocket: bool) {
         normalize_profile(engines[0].profile(), "source"),
         normalize_profile(engines[1].profile(), "source")
     );
-    outcome_replay_parity(&scratch, &pair, &feature_paths, &features, pocket);
+    outcome_replay_parity(&scratch, &pair, &feature_paths, &features);
 }
 #[test]
 fn deriv_daily_readers_match_v1_through_every_consumer() {
     parity(false);
 }
 #[test]
-fn pocket_daily_readers_match_v1_and_keep_tick_only_rejections() {
+fn pocket_daily_readers_match_v1_through_every_consumer() {
     parity(true);
 }
 
@@ -322,7 +322,6 @@ fn outcome_replay_parity(
     pair: &Pair,
     feature_paths: &[PathBuf; 2],
     features: &[FeatureManifest],
-    pocket: bool,
 ) {
     use binary_alpha_engine::{
         execution::ReplayManifest,
@@ -346,28 +345,12 @@ fn outcome_replay_parity(
         .replace("pocket_option", pair.v1.broker.as_str())
         .replace("AEDCNY_otc", pair.v1.provider_symbol.as_str());
         let replay = run(scratch, "replay.toml", &suffix, &["replay"]);
-        if pocket {
-            let outcome = outcome.unwrap_err();
-            let replay = replay.unwrap_err();
-            assert!(
-                outcome.contains("ticks") || outcome.contains("tick"),
-                "{outcome}"
-            );
-            assert!(
-                replay.contains("ticks") || replay.contains("tick"),
-                "{replay}"
-            );
-            continue;
-        }
         let path = outcome.unwrap();
         common::verify(&path).unwrap();
         outcomes.push(OutcomeManifest::from_json(&fs::read(path).unwrap()).unwrap());
         let path = replay.unwrap();
         common::verify(&path).unwrap();
         replays.push(ReplayManifest::from_json(&fs::read(path).unwrap()).unwrap());
-    }
-    if pocket {
-        return;
     }
     for a in &outcomes[0].objects {
         assert_eq!(
@@ -377,6 +360,13 @@ fn outcome_replay_parity(
             a.path
         );
     }
+    let first_day_rows = pair
+        .v2
+        .day_inventory
+        .iter()
+        .find(|day| day.family == binary_alpha_engine::dataset::DayFamily::Observations)
+        .unwrap()
+        .rows;
     let mut global = false;
     let mut reasons = std::collections::BTreeSet::new();
     for stream in &outcomes[0].streams {
@@ -385,7 +375,9 @@ fn outcome_replay_parity(
             &object(&root, &outcomes[0].objects, &paths[1]),
             u32::from_le_bytes,
         );
-        global |= indices.iter().any(|&i| i != MISSING_INDEX && i > 240);
+        global |= indices
+            .iter()
+            .any(|&i| i != MISSING_INDEX && u64::from(i) >= first_day_rows);
         reasons.extend(fs::read(object(&root, &outcomes[0].objects, &paths[3])).unwrap());
     }
     assert!(global, "outcome indices remain global across all days");
@@ -1020,7 +1012,13 @@ fn lifecycle_output(
         &["outcomes", "build"],
     );
     let start = parse_event_time_micros(&dataset.coverage.first_event_time).unwrap();
-    let end = parse_event_time_micros(&dataset.coverage.last_event_time).unwrap() + 1;
+    let period = match dataset.native_granularity {
+        binary_alpha_engine::dataset::NativeGranularity::Tick => 0,
+        binary_alpha_engine::dataset::NativeGranularity::Bar { period_seconds } => {
+            i64::from(period_seconds) * 1_000_000
+        }
+    };
+    let end = parse_event_time_micros(&dataset.coverage.last_event_time).unwrap() + period + 1;
     let spec = &stream.streams[0];
     let spec_text = format!(
         "duration_seconds = {}, offset_seconds = {}",
@@ -1038,12 +1036,7 @@ fn lifecycle_output(
         .replace("duration_seconds = 15, offset_seconds = 5", &spec_text)
         .replace("duration_seconds = 5, offset_seconds = 0", &spec_text);
     let replay = run(scratch, "lifecycle-replay.toml", &suffix, &["replay"]);
-    let (outcomes, ledger, summary) = if dataset.capabilities.contains(&Capability::Bars) {
-        for error in [outcome.unwrap_err(), replay.unwrap_err()] {
-            assert!(error.contains("tick"), "{error}");
-        }
-        (BTreeMap::new(), String::new(), Vec::new())
-    } else {
+    let (outcomes, ledger, summary) = {
         let outcome = outcome.unwrap();
         common::verify(&outcome).unwrap();
         let outcome = OutcomeManifest::from_json(&fs::read(outcome).unwrap()).unwrap();

@@ -1,5 +1,5 @@
 //! `binary-alpha outcomes build`: label every decision row of one feature generation against the
-//! tick generation it was computed from, and publish the labels as one outcome generation.
+//! observation generation it was computed from, and publish the labels as one outcome generation.
 //!
 //! The engine owns the label rule, the reader, the identities, and the manifest; this module owns
 //! reading the bound generations, the little-endian object layout, publication through the same
@@ -12,8 +12,8 @@ use std::time::Instant;
 
 use binary_alpha_engine::config::{Config, ManifestUri, Outcomes, RunMode};
 use binary_alpha_engine::dataset::{
-    Capability, DatasetRole, GenerationManifest, ObjectRecord, ObjectRole, PriceRepresentation,
-    TimeUnit, manifest_key,
+    DatasetRole, GenerationManifest, ObjectRecord, ObjectRole, PriceRepresentation, TimeUnit,
+    manifest_key,
 };
 use binary_alpha_engine::features::{
     FeatureManifest, FeaturePlan, FeatureStreamSummary, StreamPlan, Value,
@@ -25,7 +25,7 @@ use binary_alpha_engine::outcomes::{
     TICK_TIME_OBJECT_PATH, outcome_generation_id, stream_object_paths,
 };
 use binary_alpha_engine::research::Access;
-use binary_alpha_engine::stream::Observation;
+use binary_alpha_engine::stream::{Observation, Source};
 
 use crate::archive::TableReader;
 use crate::audit::feed_generation;
@@ -144,6 +144,7 @@ pub(crate) fn bind_inputs(
     // instrument and streams, so a build may zip the streams, and it must carry the ticks'
     // price scale.
     let plan = features::fitted_plan(&field("feature_manifest"), &feature_store, &feature)?;
+    let scale = scale.unwrap_or(plan.price_scale);
     if plan.price_scale != scale {
         return Err(format!(
             "{}: the plan carries price scale {}, but the ticks carry {}",
@@ -183,8 +184,8 @@ fn bind(settings: &Outcomes, access: Access<'_>) -> Result<Bound, String> {
     Ok(bound)
 }
 
-/// Reads and checks one tick ready manifest for a build of `role` on its bytes alone: another
-/// kind, another generation, holdout data, another role, and a source without ticks are refused
+/// Reads and checks one observation ready manifest for a build of `role` on its bytes alone:
+/// another kind, another generation, unauthorized holdout data, and another role are refused
 /// before any object is read. `field` names the input in errors and `what` names the build.
 pub(crate) fn bind_tick(
     field: &str,
@@ -192,7 +193,7 @@ pub(crate) fn bind_tick(
     tick_manifest: &ManifestUri,
     what: &str,
     access: Access<'_>,
-) -> Result<(Store, GenerationManifest, PriceScale), String> {
+) -> Result<(Store, GenerationManifest, Option<PriceScale>), String> {
     let uri = tick_manifest.to_string();
     access
         .permit(Some(role), tick_manifest.generation())
@@ -224,15 +225,11 @@ pub(crate) fn bind_tick(
             tick.generation, tick.role
         ));
     }
-    tick.require(Capability::Ticks)
-        .map_err(|error| format!("{field}: {error}"))?;
-    let PriceRepresentation::IntegerUnits { scale } = tick.price_representation else {
-        unreachable!("a validated tick generation carries integer units at microsecond times")
-    };
+    let scale = Source::from_manifest(&tick).price_scale;
     Ok((tick_store, tick, scale))
 }
 
-/// Every tick of one generation, in order, through the Phase 02 readers.
+/// Every observation of one generation, priced when known, through the Phase 02 readers.
 pub(crate) fn load_ticks(
     store: &Store,
     manifest: &GenerationManifest,
@@ -246,9 +243,15 @@ pub(crate) fn load_ticks(
     })?;
     let (mut times, mut prices) = (Vec::with_capacity(count), Vec::with_capacity(count));
     feed_generation(store, manifest, scale, &mut |observation| {
-        if let Observation::Tick(tick) = observation {
-            times.push(tick.event_time_micros);
-            prices.push(tick.price_units);
+        match observation {
+            Observation::Tick(tick) => {
+                times.push(tick.event_time_micros);
+                prices.push(tick.price_units);
+            }
+            Observation::Bar(bar) => {
+                times.push(bar.start_micros + bar.period_micros);
+                prices.push(bar.close);
+            }
         }
         Ok(())
     })?;

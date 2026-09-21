@@ -44,8 +44,9 @@ are unavailable and are never fabricated. Live ingestion retains local receipt s
 
 `Tick` and `Bar` are distinct records. A source declares which of them it can provide. There is no
 universal market event with optional fields, and no implicit conversion from bars to ticks. A
-bar-only source cannot satisfy a request that needs a tick path, a tick count, an entry tick, or tick
-settlement. An instrument is a neutral typed identifier bound to a broker and a provider symbol,
+bar-only source cannot satisfy a request that needs a native tick path or tick count. Historical
+research accepts bars under the [outcome observation binding](#outcomes). An instrument is a
+neutral typed identifier bound to a broker and a provider symbol,
 rendered `BROKER:PROVIDER_SYMBOL`; both parts are non-empty and contain no ASCII control character.
 The owning phase declares its currency metadata and records its observed profile rather than
 assuming one.
@@ -815,7 +816,7 @@ hashes, both bindings, the calendars, and its preserved predecessor. Old daily p
 reconstructed separately from verification of the new session product.
 
 Named non-live gates (`cargo test -p binary-alpha-app --test data_pipeline` and the affected suites): one multi-day Deriv and one multi-day Pocket fixture through import, migration, history update, audit, feature/outcome/replay readers, archive, fresh-store restore, retirement, and a later update that uploads zero unchanged objects; covering midnight repeats, a cross-midnight page, an empty page, missing receipt metadata, a historical gap, a partial cutoff day, a weekend-delayed candle finalization, pending-acquisition diagnostics, repeated requests under one intent with unchanged observations (which changes only a page day), v1/v2 coexistence with equal coverage, encoding determinism across batch boundaries, interruption at each phase, and archive-registry rebuild. Assertions are on goal-bearing outputs, traversing every daily partition: identical feature rows and engine state, identical global outcome indices and reasons, identical replay ledger and results, identical recorded warm-up state, exact legacy candle/profile reconstruction and independently
-verified session candles, exact page reconstruction, and Pocket's existing rejection of tick-only outcome and replay paths.
+verified session candles, exact page reconstruction, and Pocket outcome and replay parity under the [outcome observation binding](#outcomes); live warm-up still requires ticks.
 
 ### Foundation representation and encoding choices
 
@@ -1590,8 +1591,8 @@ fitted encodings are frozen.
 
 The optional `outcomes` table declares, in this order: `role` (`development` or `evaluation`;
 `holdout` is rejected before anything is resolved); `tick_manifest`, the ready manifest of the
-Phase 02 tick generation; `feature_manifest`, the ready manifest of the Phase 04 feature
-generation computed from that tick generation; `expiry_seconds`, a non-empty sorted unique list
+Phase 02 observation generation; `feature_manifest`, the ready manifest of the Phase 04 feature
+generation computed from that observation generation; `expiry_seconds`, a non-empty sorted unique list
 of positive seconds (the reference's 30 through 300 seconds is a fixture choice, never a limit);
 the non-negative millisecond thresholds `max_entry_delay_ms`, `max_settlement_delay_ms`,
 `max_tick_gap_ms`, and `true_jump_max_gap_ms`; `true_jump_basis_points`, positive decimal text
@@ -1603,11 +1604,30 @@ existing configuration identity. The build requires `run_mode = "research"`.
 
 ### Binding
 
-The tick manifest must be a dataset ready manifest whose generation provides ticks in integer
-price units at microsecond event times and carries the declared role; a holdout generation and
-a bar generation are refused on the manifest bytes alone. The feature manifest must be a feature
-generation whose `input_generation` is the tick generation; its plan is read and checked as a
-frozen plan, and every stream's rows table must carry the plan's frozen `raw_identity` in its
+An observation generation is a tick generation, or a bar generation in which each bar is priced
+at its close at the bar's end, the first instant that close is known. The `tick_manifest` must
+name a dataset ready manifest carrying the declared role; unauthorized holdout is refused on
+manifest bytes alone. Integer-unit ticks retain their scale, which must equal the fitted plan's
+scale. Float bars convert exactly to integer units at the plan's instrument scale, rejecting a
+price that needs more fraction digits. The existing `tick_generation`, `tick_manifest`, and
+`tick_count` fields and tick array paths name this bound observation series; tick identities and
+the label algorithm are unchanged. In the label rule below, a tick names one member of this
+bound observation series.
+
+For bars, labels select the first bar end at or after the row's logical close, then the first bar
+end at or after that entry plus the expiry. Entry and settlement delay bounds measure those
+actual differences: zero when aligned, and more than one period only when a bar is missing.
+`max_tick_gap_ms` bounds adjacent bar-end spacing, whose native cadence is one period;
+`frozen_min_ticks` counts consecutive equal closes; `true_jump_max_gap_ms` limits the adjacent-end
+spacing over which the close-to-close jump test applies. Reason precedence, including no
+settlement at the tail, is unchanged. These observations describe sampled closes, never the path
+inside a bar. Tight thresholds remain valid; no period floor is imposed. Historical replay
+retains its own availability and acceptance clocks and execution-contract thresholds, separate
+from outcome thresholds: delayed simulated acceptance between bar ends uses the latest close.
+
+The feature manifest must be a feature generation whose `input_generation` is the observation
+generation; its plan is read and checked as a frozen plan, and every stream's rows table must
+carry the plan's frozen `raw_identity` in its
 footer. The `close_time_micros` column of each stream is read in physical order and must equal
 the feature manifest's row count and first and last decision times before anything is labeled;
 outcome row `i` of a stream is feature row `i` of the same `(duration_seconds, offset_seconds)`
@@ -1754,10 +1774,10 @@ include `rise_fall_strict_v1` and the settlement authority through that frozen e
 
 ### Binding
 
-Each input's tick manifest must be a dataset ready manifest providing ticks in integer price
-units at the declared role; its feature manifest must be a feature generation computed from that
-tick generation for the same instrument and role whose fitted plan carries the ticks' price scale
-and whose every stream's first and last decision times lie inside the decision window; an
+Each input's `tick_manifest` binds an observation generation under the [outcome binding](#outcomes)
+at the declared role; its feature manifest must be computed from that generation for the same
+instrument and role. Its fitted plan carries the price scale required by that binding, and every
+stream's first and last decision times lie inside the decision window; an
 optional outcome manifest must label exactly those two generations. A strategy binds through its
 plan identity to exactly one input; every condition names a compiled output or fitted encoding of
 a plan stream with a threshold of the output's kind (an encoding compares its label text). The
@@ -1831,9 +1851,11 @@ contracts; completed profit is the credit minus the paid basis.
 
 ### Settlement
 
-Under `price_at_due_v1` the configured simulation accepts an admitted command at the decision time
-with the current available quote as entry price, preserving the quote tick's provider time; the due
-time is the entry time plus the contract duration. The first observed tick at or after the due time
+Historical observations follow the [outcome binding](#outcomes); the thresholds below belong to
+the execution contract. Under `price_at_due_v1` the configured simulation accepts an admitted
+command at its simulated acceptance time with the current available quote as entry price,
+preserving the quote observation's provider time; the due time is the entry time plus the contract
+duration. The first observed tick at or after the due time
 settles when its delay is at most `max_settlement_delay_micros`; the outcome compares the
 settlement price with the entry price for the contract direction, an equal price is a tie. Ticks
 at or before the entry time are continuity evidence but not path or settlement evidence.
@@ -2167,9 +2189,9 @@ nonempty ordered list of `deployments`, one `member`, `repair` and `binding` ind
 `risk_policies` (existing fields, unique ids), nonempty `folds` (each a `cutoff`, a
 `decision_start` at least the embargo after the cutoff, a `decision_end` and nonempty `inputs`,
 each one development `fit` entry in the `features.instruments` form without a frozen plan and one
-`assessment_manifest` development tick generation), the `refit` (a `cutoff` and nonempty
-development `fits`) and the optional `evaluation` (a window at least the embargo after the refit
-cutoff, nonempty `inputs` evaluation tick manifests and optional `splits`). The declared count,
+`assessment_manifest` development observation generation under the [outcome binding](#outcomes)),
+the `refit` (a `cutoff` and nonempty development `fits`) and the optional `evaluation` (a window at least the embargo after the refit
+cutoff, nonempty `inputs` evaluation observation manifests and optional `splits`). The declared count,
 computed with checked arithmetic as the sum over subsets of the product of each deployment's
 alternative count, times the number of risk policies, must neither overflow nor exceed
 `max_policies`; the embargo must be at least every alternative's duration plus its permitted
@@ -2182,9 +2204,9 @@ identity.
 ### Stages and identities
 
 Every declared development input is read on its manifest bytes before any output exists: a fit
-resolves through the feature owner and its whole coverage must end before its cutoff; an
-assessment tick generation must carry the development role (holdout is refused) and the fit's
-instrument; every binding's instrument must have one input in every fold and in the refit. The
+resolves through the feature owner and its last observation must be known strictly before its
+cutoff under the [outcome binding](#outcomes); an assessment observation generation must carry the
+development role (holdout is refused) and the fit's instrument; every binding's instrument must have one input in every fold and in the refit. The
 optional evaluation inputs are not read at all until selection and refit succeed; only then are
 their manifests read for role and instrument and their objects opened. Each family is read through
 the typed development-only reader: every manifest input must be development before `family.json`
@@ -2289,14 +2311,14 @@ identifiers, `governance_manifest` as `file:///DIR/FILE.json` or `gs://BUCKET/KE
 declaration object, optional `predecessors` attempt identifiers other than the attempt itself,
 and the non-empty declared `changes`); the ordered `instruments` (each `instrument` as
 `BROKER:PROVIDER_SYMBOL` mapping one configured `[[instruments]]` entry, `source_manifest` (the
-development family-source tick generation), `features` (exactly the optional new-plan settings of
-a `[[features.instruments]]` entry), `outcomes` (exactly the `outcomes` table without its role
+development family-source observation generation under the [outcome binding](#outcomes)),
+`features` (exactly the optional new-plan settings of a `[[features.instruments]]` entry), `outcomes` (exactly the `outcomes` table without its role
 and manifests), and `search` (the `search` table's settings with its development
 `decision_start` and `decision_end` and without inputs or evaluation)); `folds` (each `cutoff`,
 `decision_start`, `decision_end`, and one `{ fit_manifest, assessment_manifest }` per instrument
-in instrument order); `refit` (`cutoff` and one development fit tick generation per instrument);
+in instrument order); `refit` (`cutoff` and one development fit observation generation per instrument);
 `evaluation` and `holdout` (each an evaluation window: `decision_start`, `decision_end`, one
-tick generation per instrument, optional `splits`; holdout references are validated for syntax
+observation generation per instrument, optional `splits`; holdout references are validated for syntax
 and declared role only and are never opened before certification); `portfolio` (exactly the
 `portfolio` table without families, folds, refit, and evaluation; a member's family index is its
 instrument index); optional `scenarios` (each a unique identifier `id` other than `baseline`, a

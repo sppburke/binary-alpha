@@ -94,17 +94,17 @@ without replacing anything. A generation whose identity no instrument maps is an
 instrument is ever defaulted, and a holdout generation is refused. Verify a stream generation
 with the same `data verify` command.
 
-Outcomes: declare the `[outcomes]` table (the role, the tick and feature ready manifests, the
+Outcomes: declare the `[outcomes]` table (the role, the observation and feature ready manifests, the
 expiries, and the label thresholds; see [docs/contracts.md](contracts.md), section "Outcomes"),
 then run `binary-alpha outcomes build --config PATH`. The command reads both generations from the
 stores their manifests name, verifies every object as it reads it, labels every decision row
-against the complete tick generation, retains the arrays and matrices in the historical-data
-folder, publishes them to `storage.publication_uri`, reconstructs the generation from the
-published objects, and publishes and mirrors the manifest last. It is resumable and idempotent
-the same way import is. A declared holdout role, a holdout or bar generation, and a feature
-generation computed from another tick generation are refused before any row is read. Verify an
+against the complete observation generation under the [outcome binding](contracts.md#outcomes),
+retains the arrays and matrices in the historical-data folder, publishes them to
+`storage.publication_uri`, reconstructs the generation from the published objects, and publishes and mirrors the manifest last. It is resumable and idempotent
+the same way import is. A declared holdout role, an unauthorized holdout generation, and a feature
+generation computed from another observation generation are refused before any row is read. Verify an
 outcome generation with the same `data verify` command, which recomputes every label from the
-published ticks and reference times.
+published observations and reference times.
 
 Replay: declare the `[replay]` table (the role and decision window, the tick, feature, and
 optional outcome ready manifests per instrument, the funded accounts, strategies, ordered

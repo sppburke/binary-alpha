@@ -775,6 +775,54 @@ fn outcomes_build_publishes_reconstructs_and_reuses() {
         let config = scratch.config(name, table);
         build(&config).unwrap_err()
     };
+    // A valid units input still binds its own scale even when a feature manifest names it.
+    let scaled_root = scratch.path("scaled");
+    let scaled_tick = common::current::ticks(
+        &scaled_root,
+        &binary_alpha_engine::market::InstrumentId {
+            broker: tick.broker.clone(),
+            provider_symbol: tick.provider_symbol.clone(),
+        },
+        tick.role,
+        3.try_into().unwrap(),
+        &[binary_alpha_engine::market::Tick {
+            event_time_micros: 1_767_571_200_000_000,
+            price_units: 1_800,
+        }],
+    )
+    .unwrap();
+    let mut scaled_feature = feature.clone();
+    scaled_feature.input_generation = scaled_tick.generation.clone();
+    scaled_feature.generation =
+        feature_generation_id(&feature.plan_identity, &scaled_tick.generation);
+    let scaled_feature_path = scaled_root.join(binary_alpha_engine::dataset::manifest_key(
+        &scaled_feature.generation,
+    ));
+    fs::create_dir_all(scaled_feature_path.parent().unwrap()).unwrap();
+    fs::write(&scaled_feature_path, scaled_feature.to_json()).unwrap();
+    let plan_object = feature
+        .objects
+        .iter()
+        .find(|object| object.path == "plan.json")
+        .unwrap();
+    fs::copy(
+        store.join(&plan_object.key),
+        scaled_root.join(&plan_object.key),
+    )
+    .unwrap();
+    let error = refusal(
+        "scale_mismatch.toml",
+        &outcomes_table(
+            "development",
+            &manifest_uri(&scaled_root.join(scaled_tick.key())),
+            &manifest_uri(&scaled_feature_path),
+        ),
+    );
+    assert_eq!(
+        error.trim_end(),
+        "outcomes: feature_manifest: the plan carries price scale 6, but the ticks carry 3"
+    );
+    println!("{error}");
     let cases = [
         (
             "role.toml",
@@ -1044,38 +1092,6 @@ fn outcomes_build_publishes_reconstructs_and_reuses() {
         error.contains("outcomes: feature_manifest: the plan does not describe the manifest's plan identity, instrument"),
         "{error}"
     );
-    // A bar generation has no ticks; the refusal is the machine-readable capability error.
-    let bar_root = scratch.path("sources/bars");
-    write_collection(
-        &bar_root,
-        &[AssetSpec {
-            asset: "AEDCNY_otc",
-            expected_symbol_id: Some(7),
-            symbol_id: Some(7),
-            files: vec![bars("AEDCNY_otc", 7, 1_767_571_200, 40)],
-            metadata: true,
-        }],
-    );
-    let bar_config = scratch.config("bars.toml", &scratch.bar_source());
-    let bar_manifest = {
-        let line = import(&bar_config).unwrap().remove(0);
-        scratch.path(&format!(
-            "published/manifests/{}/ready.json",
-            generation(&line)
-        ))
-    };
-    let error = refusal(
-        "bar_outcomes.toml",
-        &outcomes_table(
-            "evaluation",
-            &manifest_uri(&bar_manifest),
-            &manifest_uri(&feature_manifest),
-        ),
-    );
-    assert!(
-        error.contains("outcomes: tick_manifest: {\"required\":\"ticks\",\"provided\":[\"bars\"]"),
-        "{error}"
-    );
     // Configuration refusals happen before any store is opened.
     let holdout = scratch.config(
         "holdout.toml",
@@ -1107,8 +1123,8 @@ fn outcomes_build_publishes_reconstructs_and_reuses() {
     let manifests = scratch.manifests("published");
     assert_eq!(
         manifests.len() - manifests_before,
-        6,
-        "the bare feature and outcome, the other instrument's tick, stream, and feature, and the bar generations; no refusal published"
+        5,
+        "the bare feature and outcome and the other instrument's tick, stream, and feature; no refusal published"
     );
     assert_eq!(
         manifests

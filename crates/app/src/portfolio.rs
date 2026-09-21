@@ -19,10 +19,12 @@ use binary_alpha_engine::config::{
     Config, Evaluation, FeatureInstrument, Features, ManifestUri, Portfolio, Replay,
     ReplayScenario, RunMode,
 };
-use binary_alpha_engine::dataset::{DatasetRole, GenerationManifest, ObjectRole, manifest_key};
+use binary_alpha_engine::dataset::{
+    DatasetRole, GenerationManifest, NativeGranularity, ObjectRole, manifest_key,
+};
 use binary_alpha_engine::execution::{ReplayInput, Split};
 use binary_alpha_engine::features::{FeatureManifest, FeaturePlan};
-use binary_alpha_engine::market::parse_event_time_micros;
+use binary_alpha_engine::market::{format_event_time_micros, parse_event_time_micros};
 use binary_alpha_engine::portfolio::{
     self as engine, Choice, Failure, FamilyRecord, FeatureRef, FoldRecord, FoldResult, Form,
     LogicalMember, Outer, Policy, ReplayRef, SELECTION_MANIFEST_KIND, SELECTION_OBJECT_PATH,
@@ -74,8 +76,15 @@ fn bind_fit(
 ) -> Result<features::Resolved, String> {
     let resolved =
         features::resolve(entry, access).map_err(|reason| format!("{field}: {reason}"))?;
-    let coverage = &resolved.input().coverage.last_event_time;
-    if parse_event_time_micros(coverage)? >= cutoff {
+    let last_event = parse_event_time_micros(&resolved.input().coverage.last_event_time)?;
+    let known_at = match resolved.input().native_granularity {
+        NativeGranularity::Tick => last_event,
+        NativeGranularity::Bar { period_seconds } => last_event
+            .checked_add(i64::from(period_seconds) * 1_000_000)
+            .ok_or_else(|| format!("{field}.input_manifest: fitting bar end overflows"))?,
+    };
+    if known_at >= cutoff {
+        let coverage = format_event_time_micros(known_at);
         return Err(format!(
             "{field}.input_manifest: the fitting coverage of generation {} ends at {coverage}, not before the cutoff",
             resolved.input().generation

@@ -1,4 +1,4 @@
-//! Phase 11 through the ordinary CLI and the real Rust owners, using only invented ticks.
+//! Phase 11 through the ordinary CLI and the real Rust owners, using only invented ticks and bars.
 //! No test opens a broker, an external store, or a real protected population.
 mod common;
 #[path = "common/research.rs"]
@@ -86,7 +86,18 @@ impl Fixture {
     }
 
     fn at(scratch: Scratch, evaluation: [u8; 4], holdout: [u8; 4]) -> Self {
+        Self::with_bars(scratch, evaluation, holdout, false)
+    }
+
+    fn bars(name: &str) -> Self {
+        Self::with_bars(Scratch::new(name), PLANTED, PLANTED, true)
+    }
+
+    fn with_bars(scratch: Scratch, evaluation: [u8; 4], holdout: [u8; 4], bars: bool) -> Self {
         let mut config = fixture_config::configuration(&scratch.root);
+        if bars {
+            configure_bars(&mut config);
+        }
         let mut datasets = Vec::new();
         let mut populations = Vec::new();
         let mut refs = Vec::new();
@@ -97,14 +108,23 @@ impl Fixture {
             (3, "evaluation", DatasetRole::Evaluation, evaluation),
             (4, "holdout", DatasetRole::Holdout, holdout),
         ] {
-            let imported = import_pair(&scratch, name, role, BASE + hour * HOUR, &recipe(cells));
+            let imported = if bars {
+                import_bar_pair(&scratch, name, role, BASE + hour * HOUR, &recipe(cells))
+            } else {
+                import_pair(&scratch, name, role, BASE + hour * HOUR, &recipe(cells))
+            };
             for (i, manifest) in imported.into_iter().enumerate() {
                 refs.push(uri(&scratch.root, &manifest.generation));
                 populations.push(Population {
                     id: format!("{name}-{i}"),
                     role,
                     instrument: INSTRUMENTS[i].into(),
-                    source: "invented-quarter-second-ticks-v1".into(),
+                    source: if bars {
+                        "invented-five-second-bars-v1"
+                    } else {
+                        "invented-quarter-second-ticks-v1"
+                    }
+                    .into(),
                     coverage: manifest.coverage.clone(),
                     generations: vec![manifest.generation.clone()],
                     tokens: vec![format!("{name}-{i}-a"), format!("{name}-{i}-b")],
@@ -113,29 +133,31 @@ impl Fixture {
                 datasets.push(manifest);
             }
         }
-        // A second real synthetic generation of the same population is a declared alias.
-        // Its raw CSV differs only by an extra leading zero, preserving every observation.
-        let aliases = import_pair_text(
-            &scratch,
-            "holdout-alias",
-            DatasetRole::Holdout,
-            [
-                ticks(BASE + 4 * HOUR, &recipe(holdout), 0),
-                ticks(BASE + 4 * HOUR, &recipe(holdout), 1),
-            ]
-            .map(|lines| {
-                lines
-                    .into_iter()
-                    .map(|line| line.replace("SYNTHETIC,", "SYNTHETIC,0"))
-                    .collect()
-            }),
-        );
-        for (i, alias) in aliases.into_iter().enumerate() {
-            assert_ne!(alias.generation, populations[8 + i].generations[0]);
-            populations[8 + i]
-                .generations
-                .push(alias.generation.clone());
-            datasets.push(alias);
+        if !bars {
+            // A second real synthetic generation of the same population is a declared alias.
+            // Its raw CSV differs only by an extra leading zero, preserving every observation.
+            let aliases = import_pair_text(
+                &scratch,
+                "holdout-alias",
+                DatasetRole::Holdout,
+                [
+                    ticks(BASE + 4 * HOUR, &recipe(holdout), 0),
+                    ticks(BASE + 4 * HOUR, &recipe(holdout), 1),
+                ]
+                .map(|lines| {
+                    lines
+                        .into_iter()
+                        .map(|line| line.replace("SYNTHETIC,", "SYNTHETIC,0"))
+                        .collect()
+                }),
+            );
+            for (i, alias) in aliases.into_iter().enumerate() {
+                assert_ne!(alias.generation, populations[8 + i].generations[0]);
+                populations[8 + i]
+                    .generations
+                    .push(alias.generation.clone());
+                datasets.push(alias);
+            }
         }
         let research = config.research.as_mut().unwrap();
         for i in 0..2 {
@@ -381,6 +403,152 @@ fn import_pair_text(
     )
 }
 
+fn configure_bars(config: &mut Config) {
+    use binary_alpha_engine::dataset::NativeGranularity;
+    for instrument in &mut config.instruments {
+        instrument.native_granularity = NativeGranularity::Bar { period_seconds: 5 };
+        instrument.candles[0].min_observations = Some(4);
+        instrument.candles[0].hard_min_observations = Some(4);
+    }
+    let research = config.research.as_mut().unwrap();
+    let settlement = |contract: &mut binary_alpha_engine::execution::ContractTerms| {
+        contract.settlement.max_settlement_delay_micros = 5_000_000;
+        contract.settlement.max_tick_gap_micros = 5_000_000;
+    };
+    for instrument in &mut research.instruments {
+        instrument.outcomes.expiry_seconds = vec![5, 7, 20];
+        instrument.outcomes.max_entry_delay_ms = 5_000;
+        instrument.outcomes.max_settlement_delay_ms = 5_000;
+        instrument.outcomes.max_tick_gap_ms = 5_000;
+        instrument.outcomes.true_jump_max_gap_ms = 5_000;
+        instrument.search.embargo_micros = 10_000_000;
+        for contract in &mut instrument.search.contracts {
+            settlement(contract);
+        }
+    }
+    research.portfolio.embargo_micros = 10_000_000;
+    for binding in &mut research.portfolio.bindings {
+        for alternative in &mut binding.alternatives {
+            settlement(&mut alternative.contract);
+        }
+    }
+    for scenario in &mut research.scenarios {
+        for alternative in &mut scenario.alternatives {
+            settlement(&mut alternative.contract);
+        }
+    }
+}
+
+/// Four bars preserve each planted candle's direction and range. The next two closes pay
+/// its declared result for both aligned acceptance and the delayed acceptance scenario.
+fn bar_rows(base: i64, rows: &[Row], instrument: usize) -> Vec<common::BarRow> {
+    let mut bars = Vec::new();
+    let divisor = 10_i64.pow(u32::from(SCALES[instrument])) as f64;
+    for k in 0..=rows.len() {
+        let current = rows.get(k);
+        let previous = k.checked_sub(1).map(|i| rows[i]);
+        for step in 0..if current.is_some() { 4 } else { 2 } {
+            let movement = match (step, current) {
+                (0 | 1, _) => previous.map_or(2 + step, |row| {
+                    (if row.up { 1 } else { -1 }) + (if row.win { 1 } else { -1 }) * (2 + step)
+                }),
+                (3, Some(row)) => {
+                    if row.up {
+                        1
+                    } else {
+                        -1
+                    }
+                }
+                _ => 0,
+            };
+            let range = if current.is_some_and(|row| row.wide) {
+                12
+            } else {
+                4
+            };
+            let [open, high, low, close] = [
+                1_800_000,
+                1_800_000 + range,
+                1_800_000 - range,
+                1_800_000 + movement,
+            ]
+            .map(|price| price as f64 / divisor);
+            bars.push(common::bar(
+                SYMBOLS[instrument],
+                instrument as i32 + 7,
+                (base + k as i64 * CANDLE) / 1_000_000 + step * 5,
+                [open, high, low, close, 1.0],
+            ));
+        }
+    }
+    bars
+}
+
+fn import_bar_pair(
+    scratch: &Scratch,
+    name: &str,
+    role: DatasetRole,
+    base: i64,
+    rows: &[Row],
+) -> Vec<GenerationManifest> {
+    let source = format!("sources/{name}");
+    common::write_collection(
+        &scratch.path(&source),
+        &(0..2)
+            .map(|i| common::AssetSpec {
+                asset: SYMBOLS[i],
+                expected_symbol_id: Some(i as i32 + 7),
+                symbol_id: Some(i as i32 + 7),
+                files: vec![bar_rows(base, rows, i)],
+                metadata: true,
+            })
+            .collect::<Vec<_>>(),
+    );
+    let path = scratch.config(
+        &format!("import-{name}.toml"),
+        &scratch
+            .bar_source()
+            .replace("sources/bars", &source)
+            .replace(
+                "role = \"evaluation\"",
+                &format!(
+                    "role = \"{}\"",
+                    if role == DatasetRole::Holdout {
+                        DatasetRole::Evaluation
+                    } else {
+                        role
+                    }
+                ),
+            ),
+    );
+    let lines = if role == DatasetRole::Holdout {
+        let mut config = Config::parse(&fs::read_to_string(&path).unwrap()).unwrap();
+        let binary_alpha_engine::config::Source::BarParquetCollection { role, .. } =
+            &mut config.import.as_mut().unwrap().sources[0]
+        else {
+            unreachable!()
+        };
+        *role = DatasetRole::Holdout;
+        common::current::import_config(&config, &scratch.root).unwrap()
+    } else {
+        common::current::import(&path).unwrap()
+    };
+    lines
+        .iter()
+        .map(|line| {
+            GenerationManifest::from_json(
+                &fs::read(
+                    scratch
+                        .path("published")
+                        .join(manifest_key(&common::generation(line))),
+                )
+                .unwrap(),
+            )
+            .unwrap()
+        })
+        .collect()
+}
+
 /// Independent Phase 09 `joint` oracle: signal membership, ordered admission, exact native
 /// postings and per-posting converted drawdown. Every contract finishes before the next row.
 fn joint(
@@ -414,7 +582,307 @@ fn joint(
 
 #[test]
 fn research_run_freezes_awaits_and_certifies() {
-    let fixture = Fixture::new("phase11_complete");
+    assert_research_certifies(Fixture::new("phase11_complete"));
+}
+
+#[test]
+fn bar_research_run_freezes_awaits_and_certifies() {
+    assert_research_certifies(Fixture::bars("phase11_bars"));
+}
+
+#[test]
+fn research_fit_cutoff_requires_observations_known_strictly_before_it() {
+    use binary_alpha_engine::market::parse_event_time_micros;
+    for bars in [false, true] {
+        for refit in [false, true] {
+            for offset in [-1, 0, 1] {
+                let name = format!("phase11_cutoff_{bars}_{refit}_{offset}");
+                let mut fixture = if bars {
+                    Fixture::bars(&name)
+                } else {
+                    Fixture::new(&name)
+                };
+                let input = &fixture.datasets[if refit { 4 } else { 0 }];
+                let known_at = parse_event_time_micros(&input.coverage.last_event_time).unwrap()
+                    + if bars { 5_000_000 } else { 0 };
+                let generation = input.generation.clone();
+                let research = fixture.config.research.as_mut().unwrap();
+                if refit {
+                    research.refit.cutoff = time(known_at + offset);
+                } else {
+                    research.folds[0].cutoff = time(known_at + offset);
+                }
+                fixture.save();
+                if offset <= 0 {
+                    let error = fixture.run().unwrap_err();
+                    let field = if refit {
+                        "refit.fits[0]"
+                    } else {
+                        "folds[0].inputs[0].fit"
+                    };
+                    let expected = format!(
+                        "{field}.input_manifest: the fitting coverage of generation {generation} ends at {}, not before the cutoff",
+                        time(known_at)
+                    );
+                    assert_eq!(error.trim_end(), format!("research: {expected}"));
+                    println!("cutoff bars {bars} refit {refit} offset {offset}: {error}");
+                } else {
+                    let report = fixture.run().unwrap();
+                    assert_eq!(
+                        fixture.run_record().1.state,
+                        RunState::AwaitingHoldoutAuthorization,
+                        "{report}"
+                    );
+                    assert!(report.contains("state awaiting_holdout_authorization"));
+                    println!(
+                        "cutoff bars {bars} refit {refit} offset {offset}: state awaiting_holdout_authorization"
+                    );
+                }
+                no_access(&logged(&fixture.log()), &fixture.protected());
+            }
+        }
+    }
+}
+
+fn assert_bar_outcomes(fixture: &Fixture, run: &Run) {
+    use binary_alpha_engine::market::Bar;
+    use binary_alpha_engine::outcomes::{
+        MISSING_INDEX, OutcomeManifest, TICK_PRICE_OBJECT_PATH, TICK_TIME_OBJECT_PATH,
+        stream_object_paths,
+    };
+    use binary_alpha_engine::stream::Observation;
+    for (i, record) in run.instruments.iter().enumerate() {
+        let manifest: OutcomeManifest =
+            serde_json::from_value(fixture.manifest(&record.outcome)).unwrap();
+        let plan = FeaturePlan::from_json(&fixture.object(&record.feature, "plan.json")).unwrap();
+        assert_eq!(plan.price_scale.digits(), SCALES[i]);
+        assert_eq!(manifest.tick_generation, fixture.datasets[i].generation);
+        assert_eq!(manifest.tick_count, 130);
+        let read_i64 = |path: &str| {
+            fixture
+                .object(&record.outcome, path)
+                .as_chunks::<8>()
+                .0
+                .iter()
+                .copied()
+                .map(i64::from_le_bytes)
+                .collect::<Vec<_>>()
+        };
+        let read_u32 = |path: &str| {
+            fixture
+                .object(&record.outcome, path)
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .copied()
+                .map(u32::from_le_bytes)
+                .collect::<Vec<_>>()
+        };
+        let expected = bar_rows(BASE, &recipe(PLANTED), i)
+            .iter()
+            .map(|row| {
+                let [open, high, low, close, volume] = row.ohlcv;
+                let bar = Bar {
+                    start_unix_s: row.unix,
+                    period_s: 5,
+                    open,
+                    high,
+                    low,
+                    close,
+                    volume,
+                    provider: (),
+                };
+                let Observation::Bar(bar) = Observation::from_bar(&bar, plan.price_scale).unwrap()
+                else {
+                    unreachable!()
+                };
+                (bar.start_micros + bar.period_micros, bar.close)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            read_i64(TICK_TIME_OBJECT_PATH),
+            expected.iter().map(|row| row.0).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            read_i64(TICK_PRICE_OBJECT_PATH),
+            expected.iter().map(|row| row.1).collect::<Vec<_>>()
+        );
+        let paths = stream_object_paths(20, 0);
+        let references = read_i64(&paths[0]);
+        let entries = read_u32(&paths[1]);
+        let settlements = read_u32(&paths[2]);
+        let reasons = fixture.object(&record.outcome, &paths[3]);
+        assert_eq!(
+            references,
+            (1..=32).map(|k| BASE + k * CANDLE).collect::<Vec<_>>()
+        );
+        assert_eq!(entries, (0..32).map(|k| 4 * k + 3).collect::<Vec<_>>());
+        assert_eq!(&settlements[..3], &[4, 5, 7]);
+        assert_eq!(&reasons[..3], &[0, 0, 0]);
+        assert_eq!(&settlements[93..], &[128, 129, MISSING_INDEX]);
+        assert_eq!(&reasons[93..], &[0, 0, 3]);
+        println!(
+            "bar outcome {} observations 130 rows 32 entry 3 settlements [4, 5, 7] tail [128, 129, missing] reasons [0, 0, 3]",
+            INSTRUMENTS[i]
+        );
+    }
+}
+
+fn assert_bar_scenarios(fixture: &Fixture, run: &Run, certification: &CertificationRecord) {
+    use binary_alpha_engine::dataset::{Layout, NativeGranularity};
+    use binary_alpha_engine::execution::Outcome;
+    let selection = fixture.selection(run);
+    for (i, refit) in selection.refit.iter().enumerate() {
+        assert_eq!(
+            fixture.manifest(&refit.generation)["input_generation"],
+            fixture.datasets[4 + i].generation
+        );
+        assert_eq!(
+            fixture.manifest(&selection.folds[0].fits[i].generation)["input_generation"],
+            fixture.datasets[i].generation
+        );
+    }
+    for dataset in &fixture.datasets {
+        assert_eq!(
+            dataset.native_granularity,
+            NativeGranularity::Bar { period_seconds: 5 }
+        );
+        assert_eq!(
+            dataset.layout,
+            (dataset.role == DatasetRole::Development).then_some(Layout::DailyV2)
+        );
+    }
+    for (hour, results) in [(3, &run.outer), (4, &certification.scenarios)] {
+        for result in results {
+            for (i, feature) in result.outer.features.iter().enumerate() {
+                assert_eq!(
+                    fixture.manifest(&feature.generation)["input_generation"],
+                    fixture.datasets[hour * 2 + i].generation
+                );
+            }
+            let base = BASE + hour as i64 * HOUR;
+            let delayed = result.scenario == "delayed";
+            let delay = if delayed { 100_000 } else { 0 };
+            let events = fixture.events(&result.outer.replay.generation);
+            let signals = events
+                .iter()
+                .filter_map(|event| match &event.kind {
+                    EventKind::Signal {
+                        command: Some(command),
+                        instrument,
+                        close_time_micros,
+                        ..
+                    } => {
+                        let i = INSTRUMENTS.iter().position(|id| id == instrument).unwrap();
+                        let k = usize::try_from((close_time_micros - base) / CANDLE - 1).unwrap();
+                        Some((command.as_str(), (i, k, *close_time_micros)))
+                    }
+                    _ => None,
+                })
+                .collect::<BTreeMap<_, _>>();
+            assert_eq!(signals.len(), 16);
+            let mut accepted = 0;
+            let mut settled = 0;
+            for event in &events {
+                match &event.kind {
+                    EventKind::Accepted {
+                        command,
+                        source,
+                        entry_time_micros,
+                        entry_price_units,
+                        price_time_micros,
+                        due_time_micros,
+                        ..
+                    } => {
+                        let (i, _, close) = signals[command.as_str()];
+                        let price = if i == 0 { 1_800_001 } else { 1_799_999 };
+                        assert_eq!(
+                            (*entry_time_micros, *price_time_micros, *due_time_micros),
+                            (
+                                Some(close + delay),
+                                Some(close),
+                                Some(close + delay + 5_000_000)
+                            )
+                        );
+                        assert_eq!(*entry_price_units, Some(price));
+                        assert_eq!(
+                            (
+                                source.provider_time_micros,
+                                source.available_at_micros,
+                                source.simulated
+                            ),
+                            (close, close + delay, true)
+                        );
+                        assert_eq!(event.time_micros, close + delay);
+                        if accepted == 0 {
+                            println!(
+                                "bar acceptance hour {hour} {} price {} provider {} acceptance {} due {}",
+                                result.scenario,
+                                entry_price_units.unwrap(),
+                                price_time_micros.unwrap(),
+                                entry_time_micros.unwrap(),
+                                due_time_micros.unwrap()
+                            );
+                        }
+                        accepted += 1;
+                    }
+                    EventKind::Settled {
+                        command,
+                        source,
+                        settlement_time_micros,
+                        settlement_price_units,
+                        outcome,
+                        profit,
+                        ..
+                    } => {
+                        let (i, k, close) = signals[command.as_str()];
+                        let row = recipe(PLANTED)[k];
+                        let entry = if i == 0 { 1_800_001 } else { 1_799_999 };
+                        let price =
+                            entry + (if row.win { 1 } else { -1 }) * if delayed { 3 } else { 2 };
+                        let at = close + if delayed { 10_000_000 } else { 5_000_000 };
+                        assert_eq!(
+                            (*settlement_time_micros, *settlement_price_units),
+                            (at, Some(price))
+                        );
+                        assert_eq!((source.provider_time_micros, event.time_micros), (at, at));
+                        assert_eq!(*outcome, if row.win { Outcome::Win } else { Outcome::Loss });
+                        assert_eq!(
+                            *profit,
+                            cents(if row.win {
+                                if result.scenario == "worse_terms" {
+                                    145
+                                } else {
+                                    155
+                                }
+                            } else {
+                                -205
+                            })
+                        );
+                        if settled == 0 {
+                            println!(
+                                "bar settlement hour {hour} {} price {} at {} outcome {outcome:?} profit {profit}",
+                                result.scenario,
+                                settlement_price_units.unwrap(),
+                                settlement_time_micros
+                            );
+                        }
+                        settled += 1;
+                    }
+                    _ => {}
+                }
+            }
+            assert_eq!((accepted, settled), (16, 16));
+            assert_eq!(result.outer.projection.settled, 16);
+            println!(
+                "bar scenario hour {hour} {} accepted {accepted} settled {settled} prices and acceptance clocks verified",
+                result.scenario
+            );
+        }
+    }
+}
+
+fn assert_research_certifies(fixture: Fixture) {
     let lines = fixture.run().unwrap();
     let (manifest, run) = fixture.run_record();
     assert_eq!(run.state, RunState::AwaitingHoldoutAuthorization, "{lines}");
@@ -423,6 +891,12 @@ fn research_run_freezes_awaits_and_certifies() {
     no_access(&log, &fixture.protected());
     assert!(!log.iter().any(|l| l.contains("holdout-use")));
     assert_development(&fixture, &manifest, &run, &lines);
+    if fixture.datasets[0].native_granularity
+        != binary_alpha_engine::dataset::NativeGranularity::Tick
+    {
+        println!("{lines}");
+        assert_bar_outcomes(&fixture, &run);
+    }
     assert_claims(&fixture, &run, ClaimKind::AssessmentUse, None);
     let first_read = log
         .iter()
@@ -496,8 +970,24 @@ fn research_run_freezes_awaits_and_certifies() {
     let report = fixture.run().unwrap();
     let certification_log = logged(&fixture.log());
     let (certification, record) = fixture.certification(&grant);
+    if fixture.datasets[0].native_granularity
+        != binary_alpha_engine::dataset::NativeGranularity::Tick
+    {
+        println!("{grant_line}{report}");
+        assert_bar_scenarios(&fixture, &run, &record);
+        let expected = format!(
+            "verified research certification {} state certified scenarios 3 objects 1 bytes {}",
+            certification.generation,
+            fixture
+                .object(&certification.generation, "certification.json")
+                .len()
+        );
+        assert!(report.lines().any(|line| line == expected));
+    }
     assert_eq!(certification.state, "certified", "{report}");
     assert_eq!(record.verdict, Verdict::Pass);
+    assert_eq!(certification.grant, grant.hash);
+    assert_eq!(record.grant, grant.hash);
     assert_eq!(record.frozen, run.frozen.as_ref().unwrap().as_str());
     assert_eq!(record.holdout, grant.holdout);
     assert_eq!(record.bundle_sha256, manifest.bundle_sha256());
