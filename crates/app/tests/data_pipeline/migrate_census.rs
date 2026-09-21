@@ -244,12 +244,21 @@ fn updated(name: &str) -> Fixture {
         ),
     )
     .unwrap();
-    pipeline(
+    let update = pipeline(
         "update",
         &f.pipeline,
         &["--end", &time_text((DERIV_SEED_END + 200) * 1_000_000)],
     )
     .unwrap();
+    let (_, c) = typed(
+        &f.scratch.path("producer/store"),
+        field(job_line(&update, "deriv"), "dataset"),
+    );
+    assert!(
+        c.acquisitions
+            .iter()
+            .all(|a| !a.acquisition_id.starts_with("native-bar-grid:"))
+    );
     legacy_fixtures::freeze(&f);
     f
 }
@@ -498,6 +507,7 @@ fn older_verified_proof_is_superseded_without_rewriting_record() {
 // ----------------------------------------------------------------------------------------------
 
 use binary_alpha_app::retire::Plan;
+use binary_alpha_engine::continuous::{Fill, fill};
 use binary_alpha_engine::dataset::coverage::{CoverageRange, DailyCoverage, DayCoverage};
 use binary_alpha_engine::dataset::daily::{DayInventoryEntry, DayState};
 use binary_alpha_engine::dataset::manifest_key;
@@ -517,10 +527,8 @@ fn range(from: i64, to: i64) -> CoverageRange {
     CoverageRange::new(from * 1_000_000, to * 1_000_000)
 }
 
-/// Pocket sources whose imported seed holds two full UTC bar days and stops ten minutes before
-/// the fake broker's history begins, so the newest v1 baseline is `broker_history`, its verified
-/// acquisition range covers only the tail of the second day, and the first day has no claim.
-fn grid_fixture(name: &str, edit: impl FnOnce(&mut Vec<BarRow>)) -> (Fixture, Vec<String>) {
+/// The import holds day A and all but day B's last ten minutes; the fake broker completes B.
+fn grid_sources(name: &str, edit: impl FnOnce(&mut Vec<BarRow>)) -> (Fixture, String) {
     let mut f = fixture(name);
     f.pocket = serve_broker(Kind::Pocket {
         from: GRID_END - 3_600,
@@ -546,7 +554,8 @@ fn grid_fixture(name: &str, edit: impl FnOnce(&mut Vec<BarRow>)) -> (Fixture, Ve
             metadata: true,
         }],
     );
-    import(&f.scratch.path("pocket-import.toml")).unwrap();
+    let imported = import(&f.scratch.path("pocket-import.toml")).unwrap();
+    let root = imported_generation(&imported, "pocket_option:AEDCNY_otc").to_string();
     fs::write(
         &f.pipeline,
         pipeline_toml(
@@ -558,6 +567,12 @@ fn grid_fixture(name: &str, edit: impl FnOnce(&mut Vec<BarRow>)) -> (Fixture, Ve
         ),
     )
     .unwrap();
+    (f, root)
+}
+
+/// The newest v1 baseline is `broker_history`; its acquisition proves only B's tail, not A.
+fn grid_fixture(name: &str, edit: impl FnOnce(&mut Vec<BarRow>)) -> (Fixture, Vec<String>) {
+    let (f, _) = grid_sources(name, edit);
     pipeline(
         "update",
         &f.pipeline,
@@ -662,6 +677,162 @@ fn assert_cutoff_day(m: &GenerationManifest, c: &DailyCoverage, end: i64, reason
     let e = evidence(c, DAY_C);
     assert_eq!(e.verified, vec![range(GRID_END, end)]);
     assert_eq!(e.unresolved, vec![range(end, GRID_END + 86_400)]);
+}
+
+#[test]
+fn grid_claim_on_update() {
+    let (f, root) = grid_sources("grid_claim_update", |rows| {
+        let price = rows[1].ohlcv[3];
+        for row in &mut rows[2..4] {
+            row.ohlcv = [price, price, price, price, 0.0];
+        }
+    });
+    let store = f.scratch.path("producer/store");
+    let (imported, original) = typed(&store, &root);
+    assert_eq!(observation(&imported, DAY_A).state, DayState::Unknown);
+    assert_eq!(observation(&imported, DAY_B).rows, 17_160);
+    let audit = run(&[
+        "data",
+        "audit",
+        "--config",
+        f.scratch.path("pocket-import.toml").to_str().unwrap(),
+        "--manifest",
+        &format!("file://{}", store.join(imported.key()).display()),
+    ])
+    .unwrap();
+    let before = stream(&store, field(&audit, "generation"));
+    let day_a = before
+        .day_inventory
+        .iter()
+        .find(|d| d.date == DAY_A)
+        .unwrap();
+    let rows = binary_alpha_app::daily::read_candles(
+        &store.join(day_a.object.as_ref().unwrap()),
+        DAY_A,
+        &before.definition.id(),
+        before.definition.price_scale,
+        10,
+        0,
+    )
+    .unwrap();
+    assert_eq!(rows[1].open_time_micros, (GRID_START + 10) * 1_000_000);
+    assert_eq!(fill(&rows[1]), Fill::Source);
+    assert_eq!(rows[1].observations, 2);
+    assert!(rows.iter().all(|c| fill(c) != Fill::Engine));
+
+    let update = pipeline(
+        "update",
+        &f.pipeline,
+        &["--end", &time_text((GRID_END + 3_600) * 1_000_000)],
+    )
+    .unwrap();
+    let line = job_line(&update, "pocket");
+    assert_eq!(field(line, "status"), "archived");
+    let (m, c) = typed(&store, field(line, "dataset"));
+    let [grid] = c
+        .acquisitions
+        .iter()
+        .filter(|a| a.acquisition_id.starts_with("native-bar-grid:"))
+        .collect::<Vec<_>>()[..]
+    else {
+        panic!("one native-bar-grid claim: {:?}", c.acquisitions);
+    };
+    assert_eq!(grid.requested, vec![range(GRID_START, GRID_END)]);
+    assert_eq!(grid.verified, grid.requested);
+    assert!(grid.shortfalls.is_empty() && grid.unresolved.is_empty());
+    let fetch_id = grid
+        .acquisition_id
+        .strip_prefix("native-bar-grid:")
+        .unwrap();
+    let fetch = c
+        .acquisitions
+        .iter()
+        .find(|a| a.acquisition_id == fetch_id)
+        .unwrap();
+    assert_eq!(grid.source_identity, fetch.source_identity);
+    assert_eq!(c.acquisitions.len(), original.acquisitions.len() + 2);
+    for claim in &original.acquisitions {
+        assert_eq!(
+            c.acquisitions
+                .iter()
+                .find(|a| a.acquisition_id == claim.acquisition_id),
+            Some(claim)
+        );
+    }
+    for (date, from) in [(DAY_A, GRID_START), (DAY_B, GRID_START + 86_400)] {
+        assert_complete_grid(&m, &c, date, from, "cumulative verified acquisition ranges");
+        let mut ids = evidence(&original, date).acquisition_ids.clone();
+        ids.extend([fetch_id.to_string(), grid.acquisition_id.clone()]);
+        assert_eq!(evidence(&c, date).acquisition_ids, ids);
+    }
+    assert_cutoff_day(
+        &m,
+        &c,
+        GRID_END + 3_600,
+        "acquisition evidence does not cover the whole UTC day",
+    );
+    assert_eq!(
+        evidence(&c, DAY_C).acquisition_ids,
+        vec![fetch_id.to_string()]
+    );
+    let continuation = |m: &GenerationManifest| {
+        let object = m
+            .objects
+            .iter()
+            .find(|o| o.path == "provenance/lineage.json")
+            .unwrap();
+        read_json(&store.join(&object.key))["continuation"]["acquisition_id"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    };
+    assert_eq!(continuation(&m), fetch_id);
+    assert_eq!(
+        observation(&m, DAY_A).object,
+        observation(&imported, DAY_A).object
+    );
+    let after = stream(&store, field(line, "stream"));
+    let relabelled = after
+        .day_inventory
+        .iter()
+        .find(|d| d.date == DAY_A)
+        .unwrap();
+    assert_eq!(relabelled.object, day_a.object);
+    assert_eq!(
+        (relabelled.state, relabelled.rows),
+        (DayState::Complete, 8_640)
+    );
+
+    let update = pipeline(
+        "update",
+        &f.pipeline,
+        &["--end", &time_text((GRID_END + 5_400) * 1_000_000)],
+    )
+    .unwrap();
+    let line = job_line(&update, "pocket");
+    assert_eq!(field(line, "status"), "archived");
+    let (d, dc) = typed(&store, field(line, "dataset"));
+    assert_eq!(dc.acquisitions.len(), c.acquisitions.len() + 1);
+    for claim in &c.acquisitions {
+        assert_eq!(
+            dc.acquisitions
+                .iter()
+                .find(|a| a.acquisition_id == claim.acquisition_id),
+            Some(claim)
+        );
+    }
+    assert_eq!(
+        dc.acquisitions
+            .iter()
+            .filter(|a| a.acquisition_id.starts_with("native-bar-grid:"))
+            .collect::<Vec<_>>(),
+        vec![grid]
+    );
+    assert_eq!(
+        continuation(&d),
+        dc.acquisitions.last().unwrap().acquisition_id
+    );
+    assert_ne!(continuation(&d), fetch_id);
 }
 
 #[test]

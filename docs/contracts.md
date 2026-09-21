@@ -685,6 +685,17 @@ piece (a current fetch trims only the endpoints); the migration `provenance/line
 lists each such range under `legacy_shortfalls` (`generation`, `acquisition_id`, `field`,
 `reason`, `recorded`, `retained`, `basis`) so the retired record stays reconstructible.
 
+Daily updates may add one `native-bar-grid:<fetch acquisition id>` claim for observation days
+whose validated native bars occupy every slot of the UTC day and whose inherited day evidence
+plus fetched coverage does not already prove the whole day. Its `requested` and `verified`
+are those whole days merged into ranges, its `source_identity` is the fetch claim's, and its
+`shortfalls` and `unresolved` are empty. Selected days reference it after the fetch claim;
+existing acquisitions and the fetch continuation remain unchanged. Tick days never qualify.
+A later update omits the claim when no unproved full-grid day remains. A resumed acquisition
+uses its original baseline's day evidence, so its grid claim may overlap a sibling snapshot's
+claim. Relabelling an unchanged full grid preserves finalized candle rows, including delivered
+`source` fills.
+
 Each `(family, date)` has exactly one `DayCoverage` record: `acquisition_ids`, a nonempty
 `basis` identifying the retained evidence, `verified` spans, `unresolved` spans, and nullable
 `reason`. Only observations and pages belong here. Verified day spans lie within that UTC
@@ -700,8 +711,8 @@ incomplete acquisition, not proven absence. Unknown days record the whole day as
 Verification authenticates and decodes this object, binds its instrument, role and native
 granularity to the dataset, and checks the exact day set, every state, reason and unresolved
 interval against the inventory, including zero-row days. The evidence is a retained source
-claim or, for migrated native bars, a validated complete grid; it is not a new inference from
-sparse observations or authority to read external data.
+claim or, for migrated or updated native bars, a validated complete grid; it is not a new inference
+from sparse observations or authority to read external data.
 
 V2 stream manifests also record `source_manifest_uri`. Verification first resolves their
 `source_generation` in the stream store (supporting fresh-store restores), then uses that

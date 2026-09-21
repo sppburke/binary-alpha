@@ -2648,12 +2648,15 @@ fn descendant_days(
     acquisition: &str,
 ) -> Result<(), String> {
     let previous = std::mem::take(&mut coverage.days);
-    let acquired = &coverage
+    let claim = coverage
         .acquisitions
         .iter()
         .find(|a| a.acquisition_id == acquisition)
-        .ok_or("missing acquisition claim")?
-        .verified;
+        .ok_or("missing acquisition claim")?;
+    let (acquired, source_identity) = (&claim.verified, claim.source_identity.clone());
+    let granularity = manifest.native_granularity;
+    let grid_id = format!("native-bar-grid:{acquisition}");
+    let mut grid = Vec::new();
     for day in &mut manifest.day_inventory {
         let old = previous
             .iter()
@@ -2665,8 +2668,18 @@ fn descendant_days(
             verified.extend(clip(bounds, acquired)?);
         }
         ids.push(acquisition.into());
-        let verified = merge_ranges(verified)?;
-        let unresolved = complement(bounds, &verified)?;
+        let mut verified = merge_ranges(verified)?;
+        let mut unresolved = complement(bounds, &verified)?;
+        // A validated complete native-bar grid proves the day that acquisition ranges leave open.
+        if day.family == DayFamily::Observations
+            && !unresolved.is_empty()
+            && day.full_bar_grid(granularity)?
+        {
+            ids.push(grid_id.clone());
+            verified = vec![CoverageRange::new(bounds.0, bounds.1)];
+            unresolved.clear();
+            grid.extend(verified.clone());
+        }
         let evidence = DayCoverage {
             date:day.date.clone(), family:day.family, acquisition_ids:ids,
             basis: if day.family == DayFamily::Observations { "cumulative verified acquisition ranges and retained import evidence" } else { "retained response occurrences; market coverage does not prove occurrence completeness" }.into(),
@@ -2675,6 +2688,17 @@ fn descendant_days(
         };
         apply_day(day, &evidence)?;
         coverage.days.push(evidence);
+    }
+    if !grid.is_empty() {
+        let grid = merge_ranges(grid)?;
+        coverage.acquisitions.push(AcquisitionCoverage {
+            acquisition_id: grid_id,
+            source_identity,
+            requested: grid.clone(),
+            verified: grid,
+            shortfalls: vec![],
+            unresolved: vec![],
+        });
     }
     let empty: BTreeSet<_> = manifest
         .day_inventory
