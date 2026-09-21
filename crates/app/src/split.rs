@@ -2,7 +2,7 @@
 
 use std::collections::BTreeSet;
 use std::io::Write;
-use std::path::{Component, Path, PathBuf};
+use std::path::Path;
 
 use binary_alpha_engine::config::{ManifestUri, PublicationUri};
 use binary_alpha_engine::dataset::coverage::{CoverageRange, DailyCoverage};
@@ -228,24 +228,13 @@ pub fn run(config_path: &Path, out: &mut dyn Write) -> Result<(), String> {
 
 fn resolve(uri: &PublicationUri) -> Result<PublicationUri, String> {
     match uri {
-        PublicationUri::Filesystem(path) => {
-            let absolute = std::env::current_dir()
-                .map_err(|e| e.to_string())?
-                .join(path);
-            let mut resolved = PathBuf::new();
-            for component in absolute.components() {
-                if component == Component::ParentDir {
-                    // An uncreated child followed by .. must not hide the store publication reaches.
-                    resolved = data_pipeline::import_destination(resolved)?;
-                    resolved.pop();
-                } else {
-                    resolved.push(component);
-                }
-            }
-            Ok(PublicationUri::Filesystem(
-                data_pipeline::import_destination(resolved)?,
-            ))
-        }
+        PublicationUri::Filesystem(path) => Ok(PublicationUri::Filesystem(
+            data_pipeline::import_destination(
+                std::env::current_dir()
+                    .map_err(|e| e.to_string())?
+                    .join(path),
+            )?,
+        )),
         _ => Ok(uri.clone()),
     }
 }

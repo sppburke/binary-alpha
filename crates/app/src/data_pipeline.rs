@@ -8,7 +8,7 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs::{self, File};
 use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 
 use binary_alpha_engine::config::{
@@ -286,6 +286,17 @@ fn check_managed_store(store: &Path) -> Result<(), String> {
 /// Resolve one link at a time so an alias cannot hide a redirected managed store.
 /// The limit matches Linux's symlink traversal bound and also rejects cyclic aliases.
 pub(crate) fn import_destination(mut target: PathBuf) -> Result<PathBuf, String> {
+    // A `..` steps up from what its prefix resolves to: an alias's target, or an uncreated
+    // child's parent. Resolving the prefix first keeps a managed store behind either visible.
+    if let Some(index) = target
+        .components()
+        .position(|component| component == Component::ParentDir)
+    {
+        let mut prefix = import_destination(target.components().take(index).collect())?;
+        prefix.pop();
+        let rest: PathBuf = target.components().skip(index + 1).collect();
+        return import_destination(prefix.join(rest));
+    }
     for _ in 0..40 {
         // A trailing slash makes symlink_metadata follow a directory link on Unix.
         target = target.components().collect();
