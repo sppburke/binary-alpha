@@ -11,7 +11,7 @@ use binary_alpha_engine::dataset::daily::{
     day_bounds,
 };
 use binary_alpha_engine::dataset::{
-    ObjectRole, PriceRepresentation, generation_id_with_layout, object_key,
+    NativeGranularity, ObjectRole, PriceRepresentation, generation_id_with_layout, object_key,
 };
 use binary_alpha_engine::market::InstrumentId;
 use serde_json::{Value, json};
@@ -1197,6 +1197,18 @@ fn new_day(d: &str, family: DayFamily) -> DayInventoryEntry {
         unresolved: vec![],
     }
 }
+/// The whole-day lattice of one native bar period: the bar-start step in microseconds and the
+/// number of slots in a UTC day. Only a period that tiles the day forms a grid.
+fn bar_grid(granularity: NativeGranularity) -> Option<(i64, u64)> {
+    let NativeGranularity::Bar { period_seconds } = granularity else {
+        return None;
+    };
+    let period = i64::from(period_seconds).checked_mul(1_000_000)?;
+    if period == 0 || DAY_MICROS % period != 0 {
+        return None;
+    }
+    Some((period, u64::try_from(DAY_MICROS / period).ok()?))
+}
 fn set_data(day: &mut DayInventoryEntry, data: &archive::DataSummary, object: &ObjectRecord) {
     day.object = Some(object.key.clone());
     day.rows = data.rows;
@@ -1350,6 +1362,7 @@ fn observations(
     metas: &BTreeMap<String, Value>,
     coverage: Option<&Value>,
     reuse: &[GenerationManifest],
+    grid: Option<(i64, u64)>,
 ) -> Result<(Vec<ObjectRecord>, Vec<DayInventoryEntry>, u64), String> {
     let id = InstrumentId {
         broker: newest.broker.clone(),
@@ -1502,13 +1515,16 @@ fn observations(
                 }
             }
         }
-        if newest.source_kind == SourceKind::BarParquet
-            && day.rows == 17_280
+        if let Some((period, slots)) = grid
+            && day.rows == slots
             && day.first_time.as_deref().map(time).transpose()? == Some(start)
-            && day.last_time.as_deref().map(time).transpose()? == Some(end - 5_000_000)
+            && day.last_time.as_deref().map(time).transpose()? == Some(end - period)
         {
+            // Admitted bars lie on the period grid in strictly increasing order, so this count
+            // between these endpoints occupies every slot of the day.
             day.state = DayState::Complete;
             day.reason = None;
+            day.unresolved.clear();
         }
         if day.state == DayState::Unknown {
             day.unresolved = vec![UnresolvedInterval {
@@ -2276,6 +2292,27 @@ fn convert(
             records.push(record);
         }
     }
+    // A validated complete native-bar grid proves a day on a first-time migration however the
+    // bars arrived (#35). A superseding derivation must reproduce the predecessor's
+    // `migration-source` claim, which shares its identity, so it admits the grid exactly when the
+    // predecessor's observation basis recorded it: existing roots are never relabelled.
+    let predecessor_grid = match superseded.and_then(|s| s.record.as_deref()) {
+        None => true,
+        Some(record) => {
+            let previous: lineage::MigrationRecord =
+                get(&layout.state.join("records").join(record))?;
+            let root = continuations
+                .iter()
+                .find(|m| m.generation == previous.v2_root)
+                .ok_or("superseded root is absent from its continuation family")?;
+            lineage::read_coverage(&local, root)?
+                .days
+                .iter()
+                .any(|d| d.basis == lineage::GRID_BASIS)
+        }
+    };
+    let grid = bar_grid(newest.native_granularity)
+        .filter(|_| predecessor_grid || newest.source_kind == SourceKind::BarParquet);
     let (mut objects, mut days, mut peak_rows) = observations(
         &local,
         work,
@@ -2286,6 +2323,7 @@ fn convert(
             .find(|(g, _)| g == &newest.generation)
             .map(|(_, c)| c),
         &continuations,
+        grid,
     )?;
     let mut peak_bytes = 0;
     for dir in entries(&work.join("days"))? {
@@ -2391,7 +2429,8 @@ fn convert(
         &mut manifest,
         acquisition_ids.iter().map(String::as_str),
     )?;
-    let cov = lineage::migration_coverage(&mut manifest, history_claims, &identity)?;
+    let cov =
+        lineage::migration_coverage(&mut manifest, history_claims, &identity, grid.is_some())?;
     manifest
         .objects
         .push(retain_json(&local, work, fetch::COVERAGE_PATH, &cov)?);
@@ -3359,6 +3398,17 @@ fn census(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bar_grid_admits_only_periods_that_tile_the_day() {
+        assert_eq!(bar_grid(NativeGranularity::Tick), None);
+        assert_eq!(bar_grid(NativeGranularity::Bar { period_seconds: 0 }), None);
+        assert_eq!(bar_grid(NativeGranularity::Bar { period_seconds: 7 }), None);
+        assert_eq!(
+            bar_grid(NativeGranularity::Bar { period_seconds: 5 }),
+            Some((5_000_000, 17_280))
+        );
+    }
 
     fn converted_page() -> (fetch::PageCoverage, PageOccurrence) {
         let payload = br#"{"history":{"times":[1754956800,1754956802]}}"#.to_vec();

@@ -58,7 +58,9 @@ pub struct AcquisitionCoverage {
     pub unresolved: Vec<CoverageRange>,
 }
 
-/// Independent day evidence; never inferred from observation endpoints or row counts.
+/// Independent day evidence; never inferred from observation endpoints or row counts alone. A
+/// validated complete native-bar grid (every slot of the day occupied) is the one admitted
+/// count-based observation evidence, on a first-time migration.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DayCoverage {

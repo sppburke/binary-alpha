@@ -215,6 +215,11 @@ pipeline's supported command owners; no conversion, upload, or deletion scripts 
 
 1. Run `binary-alpha data pipeline migrate --config PIPELINE`. For a bounded subset add
    `--job ID`. This is offline and creates verified v2 continuation roots plus migration evidence.
+   On a first-time migration, a native-bar day holding a validated complete grid (17,280
+   five-second bars from the UTC day start) is `complete` whatever the legacy source kind; a
+   day without a complete grid keeps the state its retained claims support. An already
+   verified checkpoint is reused as `already_verified`, so existing roots keep their recorded
+   day states.
 2. Run `binary-alpha data pipeline archive --config PIPELINE` for every migrated job.
    Retain the printed catalog IDs and SHA-256 digests.
 3. Create a consumer document with the same archive root, a fresh, empty `local_root`, and
