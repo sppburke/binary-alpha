@@ -653,6 +653,18 @@ Each entry: `date`, `family` (and candle `duration`/`offset`), `object` key or n
 - `unknown`: source evidence exists without a completeness claim (reason recorded, for example a Deriv historical gap with `complete: false`);
 - `empty_known`: evidence covers the whole day with zero rows (for example Deriv `market_closed: true` without clipping); `object` is null.
 
+A first-time migration of native bars (period `N` seconds tiling the day) also derives
+`complete` for an observation day from a validated complete grid: exactly `86,400 / N` rows,
+the first bar start at the UTC day start, and the last bar start `N` seconds before the day
+end, whatever the legacy source kind. Every admitted bar lies on the period grid and follows
+the previous one strictly, so that count between those endpoints occupies every slot; the
+cutoff-day rule still applies afterwards. The observation `basis` of such a root names the
+grid. A superseding derivation must reproduce the predecessor's `migration-source` claim,
+which shares its identity, so it admits the grid exactly when the predecessor's basis names
+it and otherwise keeps the source-kind rule (`bar_parquet` only); verified checkpoints,
+existing roots, and completed retirement evidence are never relabelled. Ticks are never
+inferred from counts.
+
 #### Typed v2 acquisition coverage
 
 For `daily-v2`, `provenance/coverage.json` is the engine-owned
@@ -688,7 +700,8 @@ incomplete acquisition, not proven absence. Unknown days record the whole day as
 Verification authenticates and decodes this object, binds its instrument, role and native
 granularity to the dataset, and checks the exact day set, every state, reason and unresolved
 interval against the inventory, including zero-row days. The evidence is a retained source
-claim, not a new inference from sparse observations or authority to read external data.
+claim or, for migrated native bars, a validated complete grid; it is not a new inference from
+sparse observations or authority to read external data.
 
 V2 stream manifests also record `source_manifest_uri`. Verification first resolves their
 `source_generation` in the stream store (supporting fresh-store restores), then uses that

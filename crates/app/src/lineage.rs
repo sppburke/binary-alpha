@@ -2491,7 +2491,8 @@ fn import_coverage(
 }
 
 /// Translate retained v1 claims into the same typed coverage consumed by daily update and
-/// verification. Observation endpoints never create a completeness claim.
+/// verification. Observation endpoints or counts alone never create a completeness claim; a
+/// validated complete native-bar grid does on a first-time migration (`data_migrate`).
 /// Acquisition claims for every retained v1 history record, plus the lineage entries for
 /// shortfall ranges that an older executable recorded inside already verified coverage.
 /// Before the fetch clip (`fetch.rs`, "still-unverified part"), a budget shortfall began at the
@@ -2555,10 +2556,16 @@ pub(crate) fn history_claims(
     }
     Ok((claims, legacy))
 }
+/// The observation basis of a migration root that admitted the validated complete native-bar
+/// grid; a superseding derivation reads it to reproduce the predecessor's claims.
+pub(crate) const GRID_BASIS: &str = "retained v1 source metadata, acquisition coverage, or a validated complete native-bar grid, bound by migration lineage";
+
+/// `grid` names the validated complete native-bar grid as admitted observation evidence.
 pub(crate) fn migration_coverage(
     manifest: &mut GenerationManifest,
     histories: Vec<AcquisitionCoverage>,
     source_identity: &str,
+    grid: bool,
 ) -> Result<DailyCoverage, String> {
     let id = format!("migration-source:{}", manifest.generation);
     let mut evidence = DailyCoverage {
@@ -2598,10 +2605,12 @@ pub(crate) fn migration_coverage(
             date: day.date.clone(),
             family: day.family,
             acquisition_ids: vec![id.clone()],
-            basis: if day.family == DayFamily::Observations {
-                "retained v1 source metadata and acquisition coverage, bound by migration lineage"
-            } else {
-                "migration census of retained response occurrences; no whole-day occurrence claim"
+            basis: match day.family {
+                DayFamily::Observations if grid => GRID_BASIS,
+                DayFamily::Observations => {
+                    "retained v1 source metadata and acquisition coverage, bound by migration lineage"
+                }
+                _ => "migration census of retained response occurrences; no whole-day occurrence claim",
             }
             .into(),
             reason: (!missing.is_empty()).then(|| {
