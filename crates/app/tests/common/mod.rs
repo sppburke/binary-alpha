@@ -173,13 +173,15 @@ pub fn snapshot_tree(root: &Path) -> std::collections::BTreeMap<PathBuf, Vec<u8>
         }
         for entry in fs::read_dir(dir).unwrap() {
             let path = entry.unwrap().path();
+            let key = path.strip_prefix(root).unwrap().to_path_buf();
             if path.is_dir() {
                 visit(root, &path, files);
+            } else if path.exists() {
+                files.insert(key, fs::read(path).unwrap());
             } else {
-                files.insert(
-                    path.strip_prefix(root).unwrap().to_path_buf(),
-                    fs::read(path).unwrap(),
-                );
+                // A dangling link is inventoried by its target.
+                let target = fs::read_link(&path).unwrap();
+                files.insert(key, target.as_os_str().as_encoded_bytes().to_vec());
             }
         }
     }

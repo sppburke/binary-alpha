@@ -249,7 +249,13 @@ pub(crate) fn load_ticks(
                 prices.push(tick.price_units);
             }
             Observation::Bar(bar) => {
-                times.push(bar.start_micros + bar.period_micros);
+                let end = bar.start_micros.checked_add(bar.period_micros).ok_or_else(|| {
+                    format!(
+                        "tick_manifest: the bar at {} ends outside the representable time range",
+                        bar.start_micros
+                    )
+                })?;
+                times.push(end);
                 prices.push(bar.close);
             }
         }

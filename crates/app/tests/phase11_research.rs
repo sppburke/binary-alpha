@@ -658,26 +658,12 @@ fn assert_bar_outcomes(fixture: &Fixture, run: &Run) {
         assert_eq!(plan.price_scale.digits(), SCALES[i]);
         assert_eq!(manifest.tick_generation, fixture.datasets[i].generation);
         assert_eq!(manifest.tick_count, 130);
-        let read_i64 = |path: &str| {
-            fixture
-                .object(&record.outcome, path)
-                .as_chunks::<8>()
-                .0
-                .iter()
-                .copied()
-                .map(i64::from_le_bytes)
-                .collect::<Vec<_>>()
+        let object_path = |path: &str| {
+            let object = manifest.objects.iter().find(|o| o.path == path).unwrap();
+            fixture.scratch.path("published").join(&object.key)
         };
-        let read_u32 = |path: &str| {
-            fixture
-                .object(&record.outcome, path)
-                .as_chunks::<4>()
-                .0
-                .iter()
-                .copied()
-                .map(u32::from_le_bytes)
-                .collect::<Vec<_>>()
-        };
+        let read_i64 = |path: &str| common::read_le(&object_path(path), i64::from_le_bytes);
+        let read_u32 = |path: &str| common::read_le(&object_path(path), u32::from_le_bytes);
         let expected = bar_rows(BASE, &recipe(PLANTED), i)
             .iter()
             .map(|row| {

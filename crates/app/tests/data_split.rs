@@ -14,10 +14,10 @@ use binary_alpha_engine::research::{
     self, CertificationManifest, CertificationRecord, Claim, ClaimKind, Declaration, Grant, Run,
     RunManifest, RunState, Verdict,
 };
-use common::{Scratch, cli_as, command};
+use common::{Scratch, cli_as, command, snapshot_tree as snapshots};
 use fixture::{BASE, time};
 use serde_json::Value;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use std::{fs, path::Path};
 
 const OPERATOR: &str = "split-fixture-operator";
@@ -134,30 +134,6 @@ fn tick_root(scratch: &Scratch, instrument: usize) -> (GenerationManifest, Vec<T
     common::daily::publish(&root, &mut manifest);
     GenerationManifest::from_json(&manifest.to_json()).unwrap();
     (manifest, rows)
-}
-fn snapshots(root: &Path) -> BTreeMap<String, Vec<u8>> {
-    let mut result = BTreeMap::new();
-    fn visit(root: &Path, path: &Path, result: &mut BTreeMap<String, Vec<u8>>) {
-        if !path.exists() {
-            return;
-        }
-        for entry in fs::read_dir(path).unwrap() {
-            let path = entry.unwrap().path();
-            if path.is_dir() {
-                visit(root, &path, result);
-            } else {
-                result.insert(
-                    path.strip_prefix(root)
-                        .unwrap()
-                        .to_string_lossy()
-                        .into_owned(),
-                    fs::read(path).unwrap(),
-                );
-            }
-        }
-    }
-    visit(root, root, &mut result);
-    result
 }
 
 #[test]
@@ -735,6 +711,17 @@ fn invalid_configuration_sources_windows_and_locations_write_nothing() {
     std::os::unix::fs::symlink(scratch.path("managed/store"), scratch.path("managed-alias"))
         .unwrap();
     std::os::unix::fs::symlink(scratch.path("published"), scratch.path("published-alias")).unwrap();
+    // An alias whose own target steps through an uncreated child must resolve the same way.
+    std::os::unix::fs::symlink(
+        scratch.path("not-created/../managed/store"),
+        scratch.path("managed-parent-alias"),
+    )
+    .unwrap();
+    std::os::unix::fs::symlink(
+        scratch.path("not-created/../published"),
+        scratch.path("source-parent-alias"),
+    )
+    .unwrap();
     let mut cases: Vec<(&str, Config, &str)> = Vec::new();
     for (name, from, to) in [
         ("evaluation-holdout", "evaluation", "holdout"),
@@ -858,6 +845,16 @@ fn invalid_configuration_sources_windows_and_locations_write_nothing() {
             "not-created/../published",
             "source store",
         ),
+        (
+            "managed alias traversal",
+            "managed-parent-alias/nested",
+            "managed pipeline store",
+        ),
+        (
+            "source alias traversal",
+            "source-parent-alias",
+            "source store",
+        ),
     ] {
         for retained in [false, true] {
             let mut config = base.clone();
@@ -871,6 +868,28 @@ fn invalid_configuration_sources_windows_and_locations_write_nothing() {
             }
             cases.push((name, config, reason));
         }
+    }
+    // The declaration lands under the namespace, which must not name a protected store.
+    for (name, destination, namespace, reason) in [
+        (
+            "namespace into managed store",
+            "managed",
+            "store",
+            "managed pipeline store",
+        ),
+        (
+            "namespace into source store",
+            "",
+            "published",
+            "source store",
+        ),
+    ] {
+        let mut config = base.clone();
+        config.split.as_mut().unwrap().namespace = namespace.into();
+        config.storage.publication_uri = format!("file://{}", scratch.path(destination).display())
+            .parse()
+            .unwrap();
+        cases.push((name, config, reason));
     }
     for (index, (name, config, reason)) in cases.into_iter().enumerate() {
         let path = scratch.path(&format!("invalid-{index}.toml"));

@@ -37,7 +37,21 @@ pub fn run(config_path: &Path, out: &mut dyn Write) -> Result<(), String> {
         .iter()
         .map(|source| resolve(&source.root))
         .collect::<Result<Vec<_>, _>>()?;
-    for target in [&retained, &destination_uri] {
+    // The declaration lands beneath the namespace, so that location is checked as well.
+    let namespace_uri = match &destination_uri {
+        PublicationUri::Filesystem(path) => PublicationUri::Filesystem(path.join(&split.namespace)),
+        PublicationUri::GoogleCloudStorage { bucket, prefix } => {
+            PublicationUri::GoogleCloudStorage {
+                bucket: bucket.clone(),
+                prefix: if prefix.is_empty() {
+                    split.namespace.clone()
+                } else {
+                    format!("{prefix}/{}", split.namespace)
+                },
+            }
+        }
+    };
+    for target in [&retained, &destination_uri, &namespace_uri] {
         if let PublicationUri::Filesystem(path) = target
             && path.ancestors().any(data_pipeline::is_managed_store)
         {

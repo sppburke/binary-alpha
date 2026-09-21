@@ -2373,17 +2373,15 @@ impl DataSplit {
                 if start.rem_euclid(DAY_MICROS) != 0 || end.rem_euclid(DAY_MICROS) != 0 {
                     return Err(format!("{role}: window bounds must be UTC midnights"));
                 }
-                let range = CoverageRange::new(start, end);
+                // Development is listed first, so its windows overlap only one another.
                 for (earlier_role, earlier) in &windows {
                     let (a, b) = earlier.bounds()?;
-                    if start < b
-                        && a < end
-                        && (role != DatasetRole::Development || *earlier_role != role)
-                    {
+                    if start < b && a < end && role != DatasetRole::Development {
                         return Err(format!("{role}: window overlaps {earlier_role}"));
                     }
                 }
-                if !windows.contains(&(role, range.clone())) {
+                let range = CoverageRange::new(start, end);
+                if !windows.iter().any(|(r, w)| *r == role && *w == range) {
                     windows.push((role, range));
                 }
             }

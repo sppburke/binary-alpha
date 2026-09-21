@@ -286,27 +286,24 @@ fn check_managed_store(store: &Path) -> Result<(), String> {
 /// Resolve one link at a time so an alias cannot hide a redirected managed store.
 /// The limit matches Linux's symlink traversal bound and also rejects cyclic aliases.
 pub(crate) fn import_destination(mut target: PathBuf) -> Result<PathBuf, String> {
-    // A `..` steps up from what its prefix resolves to: an alias's target, or an uncreated
-    // child's parent. Resolving the prefix first keeps a managed store behind either visible.
-    if let Some(index) = target
-        .components()
-        .position(|component| component == Component::ParentDir)
-    {
-        let mut prefix = import_destination(target.components().take(index).collect())?;
-        prefix.pop();
-        let rest: PathBuf = target.components().skip(index + 1).collect();
-        return import_destination(prefix.join(rest));
-    }
     for _ in 0..40 {
+        // A `..` steps up from what its prefix resolves to: an alias's target, or an uncreated
+        // child's parent. Resolving the prefix first keeps a managed store behind either
+        // visible, including one an alias target reaches through its own `..`.
+        if let Some(index) = target
+            .components()
+            .position(|component| component == Component::ParentDir)
+        {
+            let mut prefix = import_destination(target.components().take(index).collect())?;
+            prefix.pop();
+            target = prefix.join(target.components().skip(index + 1).collect::<PathBuf>());
+            continue;
+        }
         // A trailing slash makes symlink_metadata follow a directory link on Unix.
         target = target.components().collect();
         let mut redirect = None;
         for path in target.ancestors().collect::<Vec<_>>().into_iter().rev() {
-            if path.file_name().is_some_and(|name| name == STORE_DIR)
-                && path
-                    .parent()
-                    .is_some_and(|parent| parent.join(STATE_DIR).is_dir())
-            {
+            if is_managed_store(path) {
                 check_managed_store(path)?;
             }
             match fs::symlink_metadata(path) {

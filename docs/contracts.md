@@ -534,8 +534,9 @@ whole-day window from the development roots in `split.sources`. Bounds are half-
 midnights. Development windows may overlap, and identical windows coalesce; evaluation and
 holdout windows are disjoint from each other and every development window. Each source names
 a distinct instrument. Every window contains observations. All sources, windows, and locations
-are checked before retention or publication starts. The retained folder and destination resolve
-outside every source store and cannot be at or below a managed pipeline store.
+are checked before retention or publication starts. The retained folder, the destination, and the
+destination's namespace location resolve outside every source store and cannot be at or below a
+managed pipeline store.
 
 Each slice preserves the selected observation day objects, including duplicate occurrences and
 empty inventory days, and carries reduced coverage evidence and split lineage naming the source
