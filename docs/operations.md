@@ -136,7 +136,25 @@ selection, and the rerun reuses every completed generation after its own verifie
 Verify a selection with the same `data verify` command, which restores every referenced replay.
 Selection performs no broker, live, paper, or production action and needs no operator task.
 
-Research: author the non-sensitive governance declaration from authorized records (operator,
+Cut research roles: declare `[split]` with a namespace, one development daily-root source per
+instrument, and whole-day development, evaluation, and holdout windows. Run
+`binary-alpha data split --config PATH` with a retained folder and destination outside the source
+stores and managed pipeline stores. Use the reviewed `storage.publication_uri` on Google Cloud
+Storage with existing credentials for real holdout authority; local publication is for fixtures.
+The command prints the bounded generations and their governance declaration location.
+
+Give the source one development window and make its search window equal to that range: historical
+replay refuses feature decisions outside the search window. For each fold, give the fit a window
+ending at its cutoff and the assessment a window equal to its decision window, with the start
+at least the embargo after the cutoff. Give the refit its own fit window; an identical source
+window reuses the same generation. Reserve one disjoint evaluation window and one disjoint
+holdout window per attempt, because each day's token is claimed once. Name these generations
+and the printed declaration in the research configuration. The unsliced root is never a research
+input. This command requires no production operator task or downtime; matching Sentry issues:
+none. It provisions no bucket and changes no broker, archive, or managed store.
+
+Research: use the declaration from `data split`, or author a non-sensitive governance declaration
+from authorized records (operator,
 authoritative root, namespace, and every population with its role, instrument, source, coverage,
 generation aliases, sorted stable conflict tokens, and exposure history; see
 [docs/contracts.md](contracts.md), section "Research") and publish it at the location

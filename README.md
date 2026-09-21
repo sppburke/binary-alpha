@@ -31,6 +31,7 @@ BINARY_ALPHA_NVCC=/home/sean/.local/cuda/13.4.1/bin/nvcc BINARY_ALPHA_HOST_COMPI
 cargo run --locked -p binary-alpha-app -- --help
 cargo run --locked -p binary-alpha-app -- config validate --config configs/example.toml
 cargo run --release --locked -p binary-alpha-app -- data import --config PATH
+cargo run --release --locked -p binary-alpha-app -- data split --config PATH
 cargo run --release --locked -p binary-alpha-app -- data fetch --config PATH
 cargo run --release --locked -p binary-alpha-app -- broker inspect --config PATH
 cargo run --release --locked -p binary-alpha-app -- data audit --config PATH --manifest URI

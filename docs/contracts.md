@@ -111,6 +111,7 @@ from a path.
 | `storage.historical_data_dir` | string | a non-empty path of the retained historical-data folder; a relative path resolves against the configuration file's directory |
 | `storage.publication_uri` | string | `gs://BUCKET` or `gs://BUCKET/PREFIX` in every run mode; `file:///ABSOLUTE/DIR` only with `run_mode = "research"`, for non-live tests and the research data pipeline |
 | `import.sources` | array of tables | optional; consumed only by `data import`, which requires at least one entry |
+| `split` | table | optional; consumed only by `data split`; declares `namespace`, development daily-root `sources`, and nonempty `development`, `evaluation`, and `holdout` arrays of whole-day `{ start, end }` windows |
 | `instruments` | array of tables | optional; maps audit generations and selected broker history/live instruments |
 | `features.instruments` | array of tables | optional; consumed only by `features build`, which requires at least one entry |
 | `outcomes` | table | optional; consumed only by `outcomes build`, which requires it |
@@ -527,6 +528,27 @@ the bytes retained. It writes one line per dataset to standard output:
 `[hash S retain S validate S publish S]` stage durations in seconds or by `(already published)`
 when the ready manifest already existed.
 
+`binary-alpha data split --config PATH` cuts one daily dataset generation per instrument and
+whole-day window from the development roots in `split.sources`. Bounds are half-open UTC
+midnights. Development windows may overlap, and identical windows coalesce; evaluation and
+holdout windows are disjoint from each other and every development window. Each source names
+a distinct instrument. Every window contains observations. All sources, windows, and locations
+are checked before retention or publication starts. The retained folder and destination resolve
+outside every source store and cannot be at or below a managed pipeline store.
+
+Each slice preserves the selected observation day objects, including duplicate occurrences and
+empty inventory days, and carries reduced coverage evidence and split lineage naming the source
+manifest and canonical window. Pages stay in the source root. Coverage uses the first and last
+nonempty day. The command validates and reads back each retained slice before immutable
+publication, then prints `published INSTRUMENT ROLE generation GENERATION rows N objects K reused R`.
+After all slices, it publishes `NAMESPACE/declaration-IDENTITY.json` and prints `declaration URI`.
+Each generation is one population, with stable `INSTRUMENT:YYYY-MM-DD` tokens for every day in
+its window. The unsliced root is absent from the declaration. Reruns reuse completed generations
+and identical declarations; an interrupted run retains completed evidence. Research inputs
+outside this declaration require an explicit addition by the operator. Evaluation slices support
+ordinary verification and frozen feature application; holdout stays protected, and audit accepts
+development only.
+
 `binary-alpha data verify --manifest URI` accepts a `file://` or `gs://` location ending in
 `manifests/GENERATION/ready.json`, resolves object keys against the prefix before `manifests/`, reads
 every object from that store alone, and asserts byte count, SHA-256, and any recorded CRC32C against
@@ -542,15 +564,16 @@ other kind is rejected. With `--config PATH`, the configuration's `research.stud
 permits the target before it is opened and refuses an undeclared dataset (see
 [Research](#research)).
 
-`data import`, `data audit`, and `data verify` exit with status 0 on success and, on any failure,
+`data import`, `data split`, `data audit`, and `data verify` exit with status 0 on success and, on any failure,
 write nothing further to standard output, write one diagnostic to standard error, and exit with
 status 1. None removes source files, retained objects, or published objects.
 
 ## Market data layout v2 (daily)
 
 The following is the normative owner-adopted layout standard, revision 3. It applies to
-ordinary `development` datasets (`tick_parquet_daily`, `bar_parquet`, `broker_history`) and
-their instrument streams. Derived research artifacts retain their own formats. The historical
+datasets of every role (`tick_parquet_daily`, `bar_parquet`, `broker_history`) and development
+instrument streams. The managed pipeline produces development roots; `data split` produces
+bounded research generations, including evaluation and holdout. Derived research artifacts retain their own formats. The historical
 dataset and instrument-stream layout documented elsewhere here is **legacy layout v1**, readable
 until verified retirement. An absent manifest `layout` means v1; `layout = "daily-v2"` selects
 this contract. Types, codecs, shared v1/v2 observation readers, v2 audit candle publication,

@@ -18,6 +18,7 @@ pub mod search;
 mod session_audit;
 mod session_candles;
 mod session_migration;
+pub mod split;
 pub mod store;
 pub mod verify;
 
@@ -34,6 +35,7 @@ use std::path::Path;
 pub fn skeleton(config: &Config) -> Config {
     Config {
         import: None,
+        split: None,
         instruments: Vec::new(),
         features: None,
         outcomes: None,

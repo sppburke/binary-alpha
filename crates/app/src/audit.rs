@@ -84,6 +84,9 @@ pub(crate) fn audit(
             "{uri} is a holdout generation; research never audits holdout data, and certification is a separate authorization"
         ));
     }
+    if manifest.role != DatasetRole::Development {
+        return Err("research audits development data only".into());
+    }
     if manifest.layout.is_none() {
         return Err(format!(
             "{uri}: v1 datasets are read-only; run data pipeline migrate before data audit"

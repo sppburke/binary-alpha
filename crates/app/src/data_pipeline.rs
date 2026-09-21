@@ -285,7 +285,7 @@ fn check_managed_store(store: &Path) -> Result<(), String> {
 
 /// Resolve one link at a time so an alias cannot hide a redirected managed store.
 /// The limit matches Linux's symlink traversal bound and also rejects cyclic aliases.
-fn import_destination(mut target: PathBuf) -> Result<PathBuf, String> {
+pub(crate) fn import_destination(mut target: PathBuf) -> Result<PathBuf, String> {
     for _ in 0..40 {
         // A trailing slash makes symlink_metadata follow a directory link on Unix.
         target = target.components().collect();
@@ -338,6 +338,13 @@ fn import_destination(mut target: PathBuf) -> Result<PathBuf, String> {
     Err("import: too many destination symlinks".into())
 }
 
+pub(crate) fn is_managed_store(path: &Path) -> bool {
+    path.file_name().is_some_and(|name| name == STORE_DIR)
+        && path
+            .parent()
+            .is_some_and(|parent| parent.join(STATE_DIR).is_dir())
+}
+
 /// Standalone imports may write either copy into a pipeline store. Resolve existing path
 /// aliases, lock each managed store once, and hold all locks until publication finishes.
 pub(crate) fn import_writer_locks(config: &Config, base: &Path) -> Result<Vec<File>, String> {
@@ -356,11 +363,8 @@ pub(crate) fn import_writer_locks(config: &Config, base: &Path) -> Result<Vec<Fi
         };
         let resolved = import_destination(target)?;
         for path in resolved.ancestors() {
-            if path.file_name().is_some_and(|name| name == STORE_DIR)
-                && let Some(parent) = path.parent()
-                && parent.join(STATE_DIR).is_dir()
-            {
-                states.insert(parent.join(STATE_DIR));
+            if is_managed_store(path) {
+                states.insert(path.parent().expect("managed store parent").join(STATE_DIR));
             }
         }
     }

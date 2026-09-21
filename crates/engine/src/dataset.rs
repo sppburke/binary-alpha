@@ -437,8 +437,10 @@ impl GenerationManifest {
         }
         validate_objects(&self.objects)?;
         if self.layout == Some(Layout::DailyV2) {
-            if self.role != DatasetRole::Development || self.source_kind == SourceKind::TickCsv {
-                return Err("daily-v2 requires development tick_parquet_daily, bar_parquet, or broker_history".into());
+            if self.source_kind == SourceKind::TickCsv {
+                return Err(
+                    "daily-v2 requires tick_parquet_daily, bar_parquet, or broker_history".into(),
+                );
             }
             daily::validate_inventory(
                 &self.day_inventory,
@@ -711,13 +713,24 @@ mod tests {
                 .unwrap_err()
                 .contains("requires layout")
         );
-        let mut bad = daily.clone();
-        bad.role = DatasetRole::Evaluation;
-        assert!(
-            GenerationManifest::from_json(&bad.to_json())
-                .unwrap_err()
-                .contains("requires development")
-        );
+        let mut generations = std::collections::BTreeSet::from([daily.generation.clone()]);
+        for role in [DatasetRole::Evaluation, DatasetRole::Holdout] {
+            let mut other = daily.clone();
+            other.role = role;
+            other.generation = generation_id_with_layout(
+                &instrument,
+                other.source_kind,
+                role,
+                None,
+                &other.objects,
+                other.layout,
+            );
+            assert_eq!(
+                GenerationManifest::from_json(&other.to_json()).unwrap(),
+                other
+            );
+            assert!(generations.insert(other.generation));
+        }
         let mut bad = serde_json::to_value(daily).unwrap();
         bad["layout"] = "future".into();
         assert!(GenerationManifest::from_json(&serde_json::to_vec(&bad).unwrap()).is_err());
