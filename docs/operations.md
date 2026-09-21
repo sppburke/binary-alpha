@@ -338,6 +338,22 @@ Run `data pipeline update --config PIPELINE` weekly. It follows the v2 lineage, 
 changed daily observation/page/candle partitions, reuses unchanged days by key, and archives
 new objects plus cumulative record closure through the archive-root registry. Partial-day
 and request-evidence changes can require new files even when older observations are unchanged.
+The weekly update also relabels retained complete native-bar grids whose days lack whole-day
+coverage, recording a separate `native-bar-grid` acquisition claim. It preserves retained
+observations and finalized candle rows, including delivered `source` fills. After the outstanding
+acquisition completes, observation days before each root's new cutoff day should be `complete`
+or `empty_known`, except these retained-evidence residuals (inventoried 2026-09-21):
+
+- Every Pocket root: 2025-05-19, with 9,180 retained bars from 11:15 UTC.
+- Every Deriv root: 2025-08-10, with zero ticks and recorded `complete=false`;
+  2025-12-24 and 2025-12-31, with instrument-specific counts of 78,922–79,196 ticks and
+  recorded `complete=false`; 2025-12-25 and 2026-01-01, with zero ticks and no completeness claim.
+
+These days need separately authorized historical re-acquisition. An inventoried cutoff day
+remains `partial` with some verified coverage or `unknown` with none; candle days follow the
+existing session, finalizer, and pending-candle audit rules. Verify the newest ready manifest
+per instrument and an `archived` update report for all 17 jobs after the outstanding run.
+
 A pending update retains its pinned cutoff and exact seed binding, including an initially empty
 seed list. Repeat the command to resume; do not move the cutoff or delete progress files.
 Page/time budgets may be increased through their declared configuration fields. After a
