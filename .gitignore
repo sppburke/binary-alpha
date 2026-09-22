@@ -22,3 +22,4 @@ target
 
 # Retained historical-data folder of the repository-local example configuration
 /historical_data/
+__pycache__

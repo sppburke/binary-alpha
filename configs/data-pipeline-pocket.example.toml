@@ -27,7 +27,7 @@ origin = "https://pocketoption.com"
 credential = "BINARY_ALPHA_POCKET_AUTH"
 # Direct executable and argv; prints one fresh auth JSON object to stdout.
 # Credential values never enter the configuration, logs, or repository.
-credential_command = ["/absolute/path/to/pocket-auth"]
+credential_command = ["/absolute/path/to/python", "/absolute/path/to/tools/pocket_auth.py"]
 account_class = "demo" # must match authorized source; never relabel existing data
 server_offset_minutes = 120 # replace with the proved provider clock mapping
 history_pages_in_flight = 8

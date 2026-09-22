@@ -28,4 +28,4 @@ retry_seconds = 900
 # max_elapsed_seconds = 3600, overlap_seconds = 60. Pocket has 8 pages in flight.
 # These bound one invocation; rerun pending work at the same cutoff for a larger gap.
 # Pocket requires origin = "https://pocketoption.com"; credential_command is a program
-# and argv array, e.g. ["/absolute/path/to/pocket-auth"], never an inline credential.
+# and argv array, e.g. ["/absolute/path/to/python", "tools/pocket_auth.py"], never an inline credential.
