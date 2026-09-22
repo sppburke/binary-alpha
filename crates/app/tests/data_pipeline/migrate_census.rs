@@ -680,6 +680,51 @@ fn assert_cutoff_day(m: &GenerationManifest, c: &DailyCoverage, end: i64, reason
 }
 
 #[test]
+fn empty_first_candle_page_is_an_unresolved_shortfall_not_a_failure() {
+    // The fake serves candles before GRID_END + 7,200; a cutoff one page later answers the
+    // first request with `data: []`, as the real endpoint did on 2026-09-22. The documented
+    // outcome is an archived catalog with a primary shortfall, `archived_with_gaps`.
+    let (f, root) = grid_sources("grid_empty_page", |_| ());
+    let store = f.scratch.path("producer/store");
+    let (imported, original) = typed(&store, &root);
+    let end = GRID_END + 7_200 + 400;
+    let report = pipeline(
+        "update",
+        &f.pipeline,
+        &["--end", &time_text(end * 1_000_000)],
+    )
+    .unwrap_err();
+    let line = job_line(&report, "pocket");
+    assert_eq!(field(line, "status"), "archived_with_gaps");
+    assert_eq!(field(line, "shortfall"), "empty_page");
+    let (m, c) = typed(&store, field(line, "dataset"));
+    assert_eq!(m.row_count, imported.row_count);
+    let [fetch] = c
+        .acquisitions
+        .iter()
+        .filter(|a| !a.acquisition_id.starts_with("native-bar-grid:"))
+        .filter(|a| {
+            original
+                .acquisitions
+                .iter()
+                .all(|o| o.acquisition_id != a.acquisition_id)
+        })
+        .collect::<Vec<_>>()[..]
+    else {
+        panic!("one fetch claim: {:?}", c.acquisitions);
+    };
+    assert_eq!(fetch.verified, vec![]);
+    assert_eq!(fetch.unresolved, fetch.requested);
+    assert_eq!(
+        observations(&m).iter().map(|d| &d.date).collect::<Vec<_>>(),
+        observations(&imported)
+            .iter()
+            .map(|d| &d.date)
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
 fn grid_claim_on_update() {
     let (f, root) = grid_sources("grid_claim_update", |rows| {
         let price = rows[1].ohlcv[3];
