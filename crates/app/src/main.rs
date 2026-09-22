@@ -320,15 +320,21 @@ enum PipelineCommand {
         #[arg(long, requires = "job")]
         whole_job: bool,
     },
-    /// Extend every job's imported generation from its frontier to one pinned cutoff within
-    /// its budget, then audit, verify, and archive the result.
+    /// Acquire from each selected job's frontier or an explicit start to one pinned cutoff
+    /// within its budget, then audit, verify, and archive the result.
     Update {
         /// Path of the TOML pipeline document.
         #[arg(long)]
         config: PathBuf,
+        /// Acquire an explicit window; one ending inside a daily root keeps its continuation.
+        #[arg(long, requires = "end")]
+        start: Option<String>,
         /// The pinned cutoff as `YYYY-MM-DDTHH:MM:SS[.ffffff]Z`; absent means now.
         #[arg(long)]
         end: Option<String>,
+        /// Run only this job; repeat to select more jobs. Absent means all jobs.
+        #[arg(long)]
+        job: Vec<String>,
     },
     /// Select the newest archived catalog of one instrument and restore it unless it is already
     /// in this document's managed store; print the local ready-manifest locations.
@@ -466,9 +472,18 @@ fn main() -> ExitCode {
                 whole_job,
                 &mut std::io::stdout().lock(),
             ),
-            PipelineCommand::Update { config, end } => {
-                data_pipeline::update(&config, end.as_deref(), &mut std::io::stdout().lock())
-            }
+            PipelineCommand::Update {
+                config,
+                start,
+                end,
+                job,
+            } => data_pipeline::update(
+                &config,
+                start.as_deref(),
+                end.as_deref(),
+                &job,
+                &mut std::io::stdout().lock(),
+            ),
             PipelineCommand::Pull {
                 config,
                 broker,

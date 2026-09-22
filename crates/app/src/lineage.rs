@@ -1224,6 +1224,7 @@ pub(crate) fn descendant(
     local: &Store,
     destination: &Store,
     baseline: &GenerationManifest,
+    supplement: bool,
     mut manifest: GenerationManifest,
     rows: Vec<Observation>,
     coverage: &HistoryCoverage,
@@ -1412,7 +1413,22 @@ pub(crate) fn descendant(
     {
         lineage["root_generation"] = json!(baseline.generation);
     }
-    lineage["continuation"] = json!({"acquisition_id": acquisition.acquisition_id, "intent": acquisition.intent, "seed": coverage.seed});
+    // A supplement keeps the continuation's acquisition; every descendant takes the fetch's
+    // normalized seed so the next advance still selects it.
+    let current =
+        json!({"acquisition_id": acquisition.acquisition_id, "intent": acquisition.intent});
+    let fields = lineage.as_object_mut().expect("lineage object");
+    fields.remove("supplement");
+    fields.insert(
+        (if supplement {
+            "supplement"
+        } else {
+            "continuation"
+        })
+        .into(),
+        current,
+    );
+    lineage["continuation"]["seed"] = json!(coverage.seed);
     manifest
         .objects
         .push(metadata(local, LINEAGE_PATH, &lineage)?);
@@ -3328,6 +3344,10 @@ fn superseded_snapshots(
             .pointer("/continuation/intent")
             .and_then(Value::as_str)
             != Some(intent)
+            && lineage
+                .pointer("/supplement/intent")
+                .and_then(Value::as_str)
+                != Some(intent)
         {
             continue;
         }

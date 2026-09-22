@@ -2581,6 +2581,8 @@ fn pipeline_flushes_each_job_to_a_non_send_writer() {
     let error = data_pipeline::update_with(
         &f.pipeline,
         None,
+        None,
+        &[],
         &FakeClock::at(DERIV_SEED_END * 1_000_000),
         &mut Reports(std::rc::Rc::clone(&reports), Some(report_flushed)),
     )
@@ -4777,7 +4779,7 @@ fn pipeline_schedule() {
     )
     .unwrap();
     let mut out = Vec::new();
-    data_pipeline::update_with(&pocket_only, None, &clock, &mut out).unwrap_err();
+    data_pipeline::update_with(&pocket_only, None, None, &[], &clock, &mut out).unwrap_err();
     let first = String::from_utf8(out).unwrap();
     assert_eq!(
         field(job_line(&first, "pocket"), "status"),
@@ -4798,7 +4800,7 @@ fn pipeline_schedule() {
     );
     binary_alpha_app::broker::Clock::sleep(&mut clock, 600 * 1_000_000);
     let mut out = Vec::new();
-    data_pipeline::update_with(&pocket_only, None, &clock, &mut out).unwrap_err();
+    data_pipeline::update_with(&pocket_only, None, None, &[], &clock, &mut out).unwrap_err();
     let resumed = String::from_utf8(out).unwrap();
     assert_eq!(
         field(job_line(&resumed, "pocket"), "cutoff"),
@@ -4815,7 +4817,9 @@ fn pipeline_schedule() {
     let mut out = Vec::new();
     data_pipeline::update_with(
         &pocket_only,
+        None,
         Some(&time_text((cutoff + 5) * 1_000_000)),
+        &[],
         &clock,
         &mut out,
     )
@@ -4824,7 +4828,7 @@ fn pipeline_schedule() {
     assert!(conflict.contains("conflicts"), "{conflict}");
     // The third page reaches cutoff-587, past the required seed overlap.
     let mut out = Vec::new();
-    data_pipeline::update_with(&pocket_only, None, &clock, &mut out).unwrap();
+    data_pipeline::update_with(&pocket_only, None, None, &[], &clock, &mut out).unwrap();
     let completed = String::from_utf8(out).unwrap();
     assert_eq!(field(job_line(&completed, "pocket"), "status"), "archived");
     assert!(!pending_path.exists());
@@ -4844,7 +4848,7 @@ fn pipeline_schedule() {
     )
     .unwrap();
     let mut out = Vec::new();
-    let result = data_pipeline::update_with(&pocket_only, None, &clock, &mut out);
+    let result = data_pipeline::update_with(&pocket_only, None, None, &[], &clock, &mut out);
     let advanced = String::from_utf8(out).unwrap();
     result.unwrap_or_else(|error| panic!("{error}\n{advanced}"));
     assert_eq!(
@@ -4863,7 +4867,8 @@ fn pipeline_schedule() {
     binary_alpha_app::broker::Clock::sleep(&mut clock, 600 * 1_000_000);
     drop(f.deriv);
     let mut out = Vec::new();
-    let partial = data_pipeline::update_with(&f.pipeline, None, &clock, &mut out).unwrap_err();
+    let partial =
+        data_pipeline::update_with(&f.pipeline, None, None, &[], &clock, &mut out).unwrap_err();
     assert!(partial.contains("1 job(s) failed: deriv"), "{partial}");
     let report = String::from_utf8(out).unwrap();
     assert!(report.contains("pipeline job deriv failed"), "{report}");
@@ -4872,7 +4877,8 @@ fn pipeline_schedule() {
     // Local writer-lock contention: a second producer is refused while the lock is held.
     let lock = File::create(producer.join("pipeline_state/writer.lock")).unwrap();
     lock.try_lock().unwrap();
-    let held = data_pipeline::update_with(&pocket_only, None, &clock, &mut Vec::new()).unwrap_err();
+    let held = data_pipeline::update_with(&pocket_only, None, None, &[], &clock, &mut Vec::new())
+        .unwrap_err();
     assert!(held.contains("another producer holds"), "{held}");
     drop(lock);
 

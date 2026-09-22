@@ -370,15 +370,31 @@ observations and finalized candle rows, including delivered `source` fills. Afte
 acquisition completes, observation days before each root's new cutoff day should be `complete`
 or `empty_known`, except these retained-evidence residuals (inventoried 2026-09-21):
 
-- Every Pocket root: 2025-05-19, with 9,180 retained bars from 11:15 UTC.
-- Every Deriv root: 2025-08-10, with zero ticks and recorded `complete=false`;
-  2025-12-24 and 2025-12-31, with instrument-specific counts of 78,922–79,196 ticks and
-  recorded `complete=false`; 2025-12-25 and 2026-01-01, with zero ticks and no completeness claim.
+- Every Pocket root: 2025-05-19, with 9,180 retained bars from 11:15 UTC, where the broker's
+  own five-second history begins (probed on all ten roots, 2026-09-22): unrecoverable.
+- Every Deriv root: 2025-08-10, with zero ticks and recorded `complete=false`, beyond the
+  broker's one-year tick retention (2026-09-22): unrecoverable. 2025-12-24, 2025-12-25,
+  2025-12-31 and 2026-01-01 are recoverable with supplements over `[2025-12-24, 2025-12-26)`
+  and `[2025-12-31, 2026-01-02)` until retention passes them (from 2026-12-25).
 
-These days need separately authorized historical re-acquisition. An inventoried cutoff day
+An inventoried cutoff day
 remains `partial` with some verified coverage or `unknown` with none; candle days follow the
 existing session, finalizer, and pending-candle audit rules. Verify the newest ready manifest
 per instrument and an `archived` update report for all 17 jobs after the outstanding run.
+
+To re-prove a bounded past window of an existing daily root, run a supplement:
+
+```text
+binary-alpha data pipeline update --config PIPELINE --start START --end END [--job ID]...
+```
+
+The window `[START, END)` must start at or after the job's configured `history.start` and end
+no later than its retained frontier; `--job` may repeat and absent means every job. The new
+acquisition claim records what the broker verified inside the window, so whole days it proves
+become `complete` or `empty_known`; retained rows must match re-received rows exactly. The
+lineage `continuation` keeps its acquisition, so the next ordinary update advances as before.
+A pending supplement resumes with the same command; a pending window and a pending advance
+refuse each other.
 
 A pending update retains its pinned cutoff and exact seed binding, including an initially empty
 seed list. Repeat the command to resume; do not move the cutoff or delete progress files.
