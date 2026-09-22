@@ -1074,6 +1074,7 @@ pub(crate) fn publish_generation(
         }
         None => manifest.to_json(),
     };
+    let manifest = GenerationManifest::from_json(&committed)?;
     let temporary = temporary_path(local, &format!("manifest-{}", manifest.generation))?;
     fs::write(&temporary, &committed)
         .map_err(|error| format!("cannot write {}: {error}", temporary.display()))?;
@@ -1083,7 +1084,7 @@ pub(crate) fn publish_generation(
     fs::remove_file(&temporary)
         .map_err(|error| format!("cannot remove {}: {error}", temporary.display()))?;
     Ok(Publication {
-        manifest: GenerationManifest::from_json(&committed)?,
+        manifest,
         reused,
         already_published: matches!(put, Put::Reused(_)),
     })
@@ -1449,6 +1450,30 @@ mod tests {
             observations,
             bars.map(|bar| Observation::from_bar(&bar, scale).unwrap())
         );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn invalid_manifest_is_not_published_to_either_store() {
+        let dir = std::env::temp_dir().join(format!(
+            "binary-alpha-import-invalid-manifest-{}",
+            std::process::id()
+        ));
+        let local = Store::filesystem(dir.join("retained"));
+        let destination = Store::filesystem(dir.join("published"));
+        let identity = retain_bytes(&local, b"x", "invalid-manifest").unwrap();
+        let mut manifest = manifest(None, None);
+        manifest.objects[0] = record(ObjectRole::Source, "ticks.csv", &identity);
+        let key = manifest.key();
+        let error = GenerationManifest::from_json(&manifest.to_json()).unwrap_err();
+        assert_eq!(
+            publish_generation(manifest, &[identity], &local, &destination)
+                .err()
+                .unwrap(),
+            error
+        );
+        assert!(destination.head(&key).unwrap().is_none());
+        assert!(local.head(&key).unwrap().is_none());
         fs::remove_dir_all(dir).unwrap();
     }
 

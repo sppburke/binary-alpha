@@ -10,7 +10,8 @@ never a live, locked-holdout, or production system.
 
 Broker access uses only authorized application programming interfaces and WebSockets. No browser,
 Document Object Model, Chrome DevTools Protocol, browser profile, cookie, or click-execution path
-exists or will be added.
+exists or will be added to the application. The one exception is the operator-run credential
+renewal program under `tools/`, which the application never contains and only executes.
 
 ## Secrets
 
@@ -24,9 +25,14 @@ Pocket Option resolves the complete opaque JSON authentication object. Keep valu
 configuration, logs and evidence. Credential renewal is an operator action, performed either by
 hand or by the operator's own renewal program named in the broker's `credential_command`; the
 application runs that program when the variable is unset and once more after a rejected session,
-and never contains a browser or login path itself. A Pocket Option renewal program that logs in
-with an account login and password from the environment and prints the session object is the
-operator's, kept outside this repository together with those values.
+and never contains a browser or login path itself. The checked-in renewal program is
+`tools/pocket_auth.py --account-class real|demo` (`pip install -r tools/requirements.txt`, then
+`playwright install chromium`, or pass `--chrome PATH`): it captures the session object from a
+remembered browser profile headlessly and, when that profile has expired, opens one visible window
+on the login page (prefilled from `POCKET_LOGIN` and `POCKET_PASSWORD` when set) so the operator
+can solve the broker's captcha (observed 2026-09-21: a headless login stops at it). Interactive
+login requires a display; without one the program exits 3. Parallel jobs share the profile
+through a lock. `tools/drive_consent.py` performs the one-time Google Drive consent below.
 
 For Google Drive, `drive.credential` names a process environment variable holding user OAuth
 (Open Authorization) refresh credentials as a JavaScript Object Notation (JSON) object with string
@@ -207,8 +213,9 @@ On a recorded session's status query or a chunk PUT, either rate-limit 403 inste
 
 ### Consent and credentials
 
-Initial user OAuth (Open Authorization) consent is an operator task using supported Google
-tooling. Obtain refresh credentials with `https://www.googleapis.com/auth/drive.file` scope for
+Initial user OAuth (Open Authorization) consent is an operator task: `tools/drive_consent.py
+CLIENT_SECRET.json [--env FILE]` runs the loopback consent flow once and writes the credential and
+root variables into the private environment file (created with mode 0600 when absent). Obtain refresh credentials with `https://www.googleapis.com/auth/drive.file` scope for
 an app-created or explicitly granted archive root; a folder identifier alone grants nothing.
 Keep the archive private and check the actual grant before unattended operation. See
 [Google Drive scopes](https://developers.google.com/workspace/drive/api/guides/api-specific-auth).
@@ -346,8 +353,9 @@ The checked-in example uses `parallel_jobs = 4`, `parallel_transfers = 8`,
 `retry_seconds = 900`. The broker templates use `overlap_seconds = 60`,
 `max_elapsed_seconds = 3600`, and 6,000 Deriv / 20,000 Pocket pages per invocation.
 Pocket uses `history_pages_in_flight = 8`, `origin = "https://pocketoption.com"` and
-`credential_command = ["/absolute/path/to/pocket-auth"]` (an executable/argv array, not a
-shell string). The operator supplies that executable; it prints auth JSON to stdout.
+`credential_command = ["/absolute/path/to/python", "/absolute/path/to/tools/pocket_auth.py",
+"--account-class", "demo"]` (an executable/argv array matching `account_class`, not a shell
+string); it prints auth JSON to stdout.
 These are portable starting settings, not a promise of coverage within an hour:
 20,000 Pocket pages span about 45 days at 195 seconds/page, but provider and elapsed limits
 may stop sooner; Deriv's tick density determines its span.

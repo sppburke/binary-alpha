@@ -1,7 +1,7 @@
 //! One non-live sequence crosses every daily owner, including recovery and reachability.
 use super::*;
 use binary_alpha_app::retire::Plan;
-use binary_alpha_engine::dataset::Layout;
+use binary_alpha_engine::dataset::{DayFamily, DayState, Layout};
 use std::collections::{BTreeMap, BTreeSet};
 
 fn uploaded_once(drive: &FakeDrive) {
@@ -41,6 +41,82 @@ fn verify_closure(store: &Path, dataset: &str, stream: &str) {
             ),
         ])
         .unwrap();
+    }
+}
+
+#[test]
+fn update_keeps_unknown_day_object_when_shared_empty_day_becomes_known() {
+    let mut f = fixture("daily_shared_empty_day");
+    write_daily_directory(
+        &f.scratch.path("sources/deriv/EURUSD"),
+        "EURUSD",
+        "frxEURUSD",
+        &[("2025-08-10", &[]), ("2025-08-13", &[])],
+    );
+    let day14 = DAY2 + 2 * 86_400;
+    let mut ticks = deriv_ticks(DAY2, DERIV_SEED_END);
+    ticks.extend(deriv_ticks(day14 + 60, day14 + 300));
+    f.deriv = serve_broker(Kind::Deriv(Arc::new(ticks)));
+    let core = deriv_core(&f.deriv.url, 60, 50, 60);
+    fs::write(f.scratch.path("deriv.toml"), &core).unwrap();
+    write_evidence(&f.scratch, "deriv", &core);
+    let report = import(&import_config(&f.scratch, "deriv", &core)).unwrap();
+    let store = f.scratch.path("producer/store");
+    let root = dataset(&store, imported_generation(&report, "deriv:frxEURUSD"));
+    let empty: Vec<_> = root
+        .day_inventory
+        .iter()
+        .filter(|d| d.family == DayFamily::Observations && d.rows == 0)
+        .collect();
+    assert_eq!(
+        empty.iter().map(|d| d.date.as_str()).collect::<Vec<_>>(),
+        ["2025-08-10", "2025-08-13"]
+    );
+    assert!(empty.iter().all(|d| d.state == DayState::Unknown));
+    let key = empty[0].object.as_ref().unwrap();
+    assert_eq!(empty[1].object.as_ref(), Some(key));
+    fs::write(
+        &f.pipeline,
+        pipeline_toml(
+            &f.scratch.path("producer"),
+            &f.drive.base,
+            &[("deriv", "deriv.toml")],
+            None,
+            3,
+        ),
+    )
+    .unwrap();
+    for end in [day14 + 120, day14 + 180] {
+        let report = pipeline(
+            "update",
+            &f.pipeline,
+            &["--end", &time_text(end * 1_000_000)],
+        )
+        .unwrap();
+        let line = job_line(&report, "deriv");
+        assert_eq!(field(line, "status"), "archived");
+        let manifest = dataset(&store, field(line, "dataset"));
+        for (date, state, object) in [
+            ("2025-08-10", DayState::Unknown, Some(key)),
+            ("2025-08-13", DayState::EmptyKnown, None),
+        ] {
+            let day = manifest
+                .day_inventory
+                .iter()
+                .find(|d| d.family == DayFamily::Observations && d.date == date)
+                .unwrap();
+            assert_eq!(day.state, state);
+            assert_eq!(day.rows, 0);
+            assert_eq!(day.object.as_ref(), object);
+            assert_eq!(
+                manifest
+                    .objects
+                    .iter()
+                    .find(|o| o.path == day.logical_path().unwrap())
+                    .map(|o| &o.key),
+                object
+            );
+        }
     }
 }
 

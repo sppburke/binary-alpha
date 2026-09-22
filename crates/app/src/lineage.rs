@@ -2704,9 +2704,9 @@ fn descendant_days(
         .day_inventory
         .iter_mut()
         .filter(|d| d.state == DayState::EmptyKnown)
-        .filter_map(|d| d.object.take())
-        .collect();
-    manifest.objects.retain(|o| !empty.contains(&o.key));
+        .filter_map(|d| d.object.take().map(|_| d.logical_path()))
+        .collect::<Result<_, _>>()?;
+    manifest.objects.retain(|o| !empty.contains(&o.path));
     coverage.validate()
 }
 
