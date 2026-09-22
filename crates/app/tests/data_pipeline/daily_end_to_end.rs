@@ -155,15 +155,13 @@ fn update_inventories_a_closed_day_between_acquired_days() {
         (day.rows, day.state, &day.object),
         (0, DayState::EmptyKnown, &None)
     );
-    let stream = read_json(&store.join(format!("manifests/{}/ready.json", field(line, "stream"))));
-    let candles = stream["day_inventory"].as_array().unwrap();
-    let state = |date: &str| {
-        candles
-            .iter()
-            .find(|d| d["family"] == "candles" && d["date"] == date)
-            .map(|d| d["state"].clone())
-    };
-    assert_eq!(state("2025-08-12"), Some(json!("complete")));
+    let stream = stream(&store, field(line, "stream"));
+    let candles = stream
+        .day_inventory
+        .iter()
+        .find(|d| d.family == DayFamily::Candles && d.date == "2025-08-12")
+        .unwrap();
+    assert_eq!(candles.state, DayState::Complete);
 }
 
 fn supplement_fixture(name: &str, max_pages: u32) -> (Fixture, GenerationManifest) {
