@@ -17,8 +17,8 @@ kind = "weekly"
 timezone = "UTC"
 open = { day = "monday", time = "00:00:00" }
 close = { day = "friday", time = "20:55:00" }
-closed_dates = ["2025-12-25", "2026-01-01"]
-early_closes = [{ date = "2025-12-24", time = "22:00:00" }, { date = "2025-12-31", time = "22:00:00" }]
+closed_dates = ["12-25", "01-01"]
+early_closes = [{ date = "12-24", time = "22:00:00" }, { date = "12-31", time = "22:00:00" }]
 [[brokers]]
 id = "deriv"
 kind = "deriv"

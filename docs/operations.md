@@ -310,7 +310,8 @@ An explicit singular `[instruments.session]` is mandatory; alternatively `--sess
 reads a TOML file containing the table's fields. `kind = "always"` is an explicit 24/7 policy.
 The exact weekly shape is `kind = "weekly"`, `timezone = "UTC"` or `"America/New_York"`,
 `open = { day = "sunday", time = "17:00:00" }`, `close` in the same shape, and optional
-`closed_dates = ["2026-12-25"]` / `early_closes = [{date="2026-11-27",time="13:00:00"}]`.
+`closed_dates = ["2026-12-25"]` / `early_closes = [{date="2026-11-27",time="13:00:00"}]`; a
+`MM-DD` date applies every year (for example `closed_dates = ["12-25", "01-01"]`).
 Weekdays are full lowercase English names. Never substitute the old plural profile windows
 `[[instruments.sessions]]`. The engine validates both `always` and weekly calendars through
 `Config::parse` and `Session::calendar()`. Registration and acquisition preserve the session
