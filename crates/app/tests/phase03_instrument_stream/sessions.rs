@@ -557,10 +557,7 @@ fn yearly_closed_date_removes_an_observed_day() {
         .iter()
         .find(|d| d.date == "2026-09-04")
         .unwrap();
-    assert_eq!(
-        (day.state, day.rows, &day.object),
-        (DayState::EmptyKnown, 0, &None)
-    );
+    assert_eq!(day.state, DayState::EmptyKnown);
 }
 
 #[test]

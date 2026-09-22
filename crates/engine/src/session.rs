@@ -452,9 +452,11 @@ mod tests {
         } = &mut s
         {
             closed_dates.extend(["12-25".into(), "02-29".into()]);
+            // Yearly rule for the 24th, plus a dated 2026 override proving dated precedence.
+            early_closes[0].date = "12-24".into();
             early_closes.push(EarlyClose {
-                date: "12-24".into(),
-                time: "22:00:00".into(),
+                date: "2026-12-24".into(),
+                time: "18:00:00".into(),
             });
         }
         let c = s.calendar().unwrap();
@@ -462,34 +464,24 @@ mod tests {
             let start = t(at).unwrap();
             c.contains(start, start + 5_000_000).unwrap()
         };
-        for year in [2025, 2026] {
+        for year in [2025, 2030] {
             assert!(!open(&format!("{year}-12-25T12:00:00Z")));
             assert!(open(&format!("{year}-12-24T22:00:00Z")));
             assert!(!open(&format!("{year}-12-24T22:00:05Z")));
             assert!(open(&format!("{year}-12-23T22:00:05Z")));
         }
+        assert!(open("2026-12-24T18:00:00Z") && !open("2026-12-24T18:00:05Z"));
         assert!(!open("2028-02-29T12:00:00Z"));
         assert!(open("2028-02-28T12:00:00Z") && open("2028-03-01T12:00:00Z"));
-        let refused = |closed: &[&str], early: &[(&str, &str)]| {
-            let mut s = deriv();
-            if let Session::Weekly {
-                closed_dates,
-                early_closes,
-                ..
-            } = &mut s
-            {
-                closed_dates.extend(closed.iter().map(|d| d.to_string()));
-                early_closes.extend(early.iter().map(|(date, time)| EarlyClose {
-                    date: date.to_string(),
-                    time: time.to_string(),
-                }));
+        assert!(open("2027-03-01T12:00:00Z"));
+        // Malformed, duplicate, and closed-day early closes are refused.
+        for closed in ["13-01", "12-32", "12-25", "12-24"] {
+            let mut refused = s.clone();
+            if let Session::Weekly { closed_dates, .. } = &mut refused {
+                closed_dates.push(closed.into());
             }
-            s.calendar().is_err()
-        };
-        assert!(refused(&["13-01"], &[]));
-        assert!(refused(&["12-32"], &[]));
-        assert!(refused(&["12-25", "12-25"], &[]));
-        assert!(refused(&["12-25"], &[("12-25", "20:00:00")]));
+            assert!(refused.calendar().is_err(), "{closed}");
+        }
     }
     fn deriv() -> Session {
         Session::Weekly {

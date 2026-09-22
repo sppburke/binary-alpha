@@ -608,10 +608,8 @@ open = { day = "sunday", time = "17:00:00" }, close = { day = "friday", time = "
 closed_dates = [], early_closes = [] }`. Weekdays are lowercase English names; clock values
 are `HH:MM:SS`. Dates and early-close clocks are local to that zone. An early close is
 `{ date = "YYYY-MM-DD", time = "HH:MM:SS" }`; a closed date removes its entire local day. A
-date written `MM-DD` applies every year (`02-29` in leap years only); a closed date of either form
-removes the day, and a dated early close takes precedence over a yearly one. A yearly New York
-early close is converted per occurrence, so a DST-skipped or ambiguous local time is refused
-when that day is evaluated.
+date written `MM-DD` applies every year (`02-29` in leap years only); a dated early close takes
+precedence over a yearly one.
 Only `UTC` (offset zero) and `America/New_York` are supported; other zones are refused
 when configuration is parsed. New York uses UTC−5 standard time and UTC−4 daylight time,
 from the second Sunday in March at 02:00 local to the first Sunday in November at 02:00 local.
