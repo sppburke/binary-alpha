@@ -225,7 +225,7 @@ pub struct Outcome {
 
 pub fn run(config_path: &Path, out: &mut dyn Write) -> Result<(), String> {
     let config = crate::load_config(config_path)?;
-    config
+    let history = config
         .history
         .as_ref()
         .ok_or("fetch: the configuration declares no history table")?;
@@ -233,7 +233,15 @@ pub fn run(config_path: &Path, out: &mut dyn Write) -> Result<(), String> {
     let local = Store::filesystem(root.join(config.storage.historical_data_dir.as_path()));
     let destination = Store::open(&config.storage.publication_uri)?;
     // Every seed binding and source context is checked before any credential is resolved.
-    prepare(&config, &local, None)?;
+    prepare(
+        &config,
+        &local,
+        Requested::Explicit {
+            start: time(&history.start)?,
+            end: time(&history.end)?,
+        },
+        None,
+    )?;
     let mut adapter = broker::connect(&config)?;
     passes(
         &config,
@@ -451,6 +459,7 @@ struct Plan<'a> {
     definition: &'a binary_alpha_engine::config::Instrument,
     baseline: Option<Baseline>,
     requested: (i64, i64),
+    supplement: bool,
 }
 
 /// The prior broker-history generation of this instrument, role, granularity, source, and seed
@@ -841,9 +850,21 @@ fn plan<'a>(
                 (history_start.max(frontier.saturating_sub(overlap)), cutoff)
             }
         };
+        // A supplement re-proves a retained window of a lineage that already has a continuation;
+        // it neither extends nor narrows that lineage.
+        let supplement = matches!(requested, Requested::Explicit { .. })
+            && match &baseline {
+                Some(baseline) if baseline.coverage.is_some() => {
+                    end <= frontier(history.native_granularity, baseline.last_time()?)
+                }
+                _ => false,
+            };
         // A seeded lineage is extended, never narrowed: the declared start covers every retained
         // row and the end lies beyond the retained frontier.
-        if let Some(baseline) = baseline.as_ref().filter(|baseline| baseline.seed.is_some()) {
+        if let Some(baseline) = baseline
+            .as_ref()
+            .filter(|baseline| !supplement && baseline.seed.is_some())
+        {
             let frontier = frontier(history.native_granularity, baseline.last_time()?);
             if history_start > baseline.first_time()? || end < frontier {
                 return Err(format!(
@@ -863,6 +884,7 @@ fn plan<'a>(
             definition,
             baseline,
             requested: (start, end),
+            supplement,
         });
     }
     Ok((plans, history, settings, source_identity))
@@ -884,23 +906,10 @@ fn frontier(granularity: NativeGranularity, last_time: i64) -> i64 {
 pub fn prepare(
     config: &Config,
     local: &Store,
+    requested: Requested,
     declaration: Option<&Declaration>,
 ) -> Result<(), String> {
-    let history = config
-        .history
-        .as_ref()
-        .ok_or("fetch: the configuration declares no history table")?;
-    plan(
-        config,
-        local,
-        Requested::Explicit {
-            start: time(&history.start)?,
-            end: time(&history.end)?,
-        },
-        None,
-        declaration,
-    )
-    .map(|_| ())
+    plan(config, local, requested, None, declaration).map(|_| ())
 }
 
 /// Re-received rows must equal the retained rows wherever both are verified: from `floor`,
@@ -1121,9 +1130,13 @@ fn acquire_one<R: Row>(
             .filter(|(start, _)| *start <= requested.0)
             .map(|(_, end)| end),
     };
-    let fetch_start = baseline_end.map_or(requested.0, |end| {
-        requested.0.max(end.saturating_sub(overlap))
-    });
+    let fetch_start = if plan.supplement {
+        requested.0
+    } else {
+        baseline_end.map_or(requested.0, |end| {
+            requested.0.max(end.saturating_sub(overlap))
+        })
+    };
     let coverage_of = |baseline: &Baseline| baseline.coverage.clone().expect("descendant coverage");
     if fetch_start >= requested.1 {
         let prior = baseline
@@ -1211,7 +1224,11 @@ fn acquire_one<R: Row>(
         })
         .collect();
     let mut earliest = None;
-    let floor = previous_verified.map_or(fetch_start, |(start, _)| start);
+    let floor = if plan.supplement {
+        fetch_start
+    } else {
+        previous_verified.map_or(fetch_start, |(start, _)| start)
+    };
     let mut anchor = Some(requested.1);
     let mut received_end = None;
     let mut requests: u32 = 0;
@@ -1465,14 +1482,18 @@ fn acquire_one<R: Row>(
             received_end.expect("received rows"),
         )
     });
-    let verified_bounds = match (previous_verified, newly_verified) {
-        (Some((old_start, old_end)), Some((start, end)))
-            if start <= old_end && old_start <= end =>
-        {
-            Some((old_start.min(start), old_end.max(end)))
+    let verified_bounds = if plan.supplement {
+        newly_verified
+    } else {
+        match (previous_verified, newly_verified) {
+            (Some((old_start, old_end)), Some((start, end)))
+                if start <= old_end && old_start <= end =>
+            {
+                Some((old_start.min(start), old_end.max(end)))
+            }
+            (Some(prior), _) => Some(prior),
+            (None, new) => new,
         }
-        (Some(prior), _) => Some(prior),
-        (None, new) => new,
     };
     let verified = verified_bounds.map(|(start, end)| Range::new(start, end));
     let tail = verified_bounds
@@ -1560,6 +1581,7 @@ fn acquire_one<R: Row>(
             local,
             destination,
             baseline,
+            plan.supplement,
             manifest,
             daily_rows,
             &coverage,

@@ -518,6 +518,7 @@ fn binding_hash(config: &Config) -> String {
 fn effective(
     bound: &Bound,
     layout: &Layout,
+    start: Option<i64>,
     cutoff: i64,
     seeds: Vec<Seed>,
 ) -> Result<Config, String> {
@@ -529,6 +530,9 @@ fn effective(
         .history
         .as_mut()
         .expect("bound configuration has history");
+    if let Some(start) = start {
+        history.start = time_text(start);
+    }
     history.end = time_text(cutoff);
     history.seeds = seeds;
     // The effective document is parsed again so every cross-field rule applies to it.
@@ -1428,24 +1432,41 @@ pub fn archive(config_path: &Path, job: Option<&str>, out: &mut dyn Write) -> Re
     })
 }
 
-/// `data pipeline update`: extend every job's imported generation from its frontier to one
-/// pinned cutoff within its budget, then audit, verify, and archive the result.
-pub fn update(config_path: &Path, end: Option<&str>, out: &mut dyn Write) -> Result<(), String> {
-    update_with(config_path, end, &SystemClock, out)
+/// `data pipeline update`: acquire selected jobs from their frontier or an explicit start to
+/// one pinned cutoff within their budgets, then audit, verify, and archive the result.
+pub fn update(
+    config_path: &Path,
+    start: Option<&str>,
+    end: Option<&str>,
+    jobs: &[String],
+    out: &mut dyn Write,
+) -> Result<(), String> {
+    update_with(config_path, start, end, jobs, &SystemClock, out)
 }
 
 /// `update` under an explicit clock: the cutoff and the invocation deadline come from it.
 pub fn update_with(
     config_path: &Path,
+    start: Option<&str>,
     end: Option<&str>,
+    jobs: &[String],
     clock: &dyn Clock,
     out: &mut dyn Write,
 ) -> Result<(), String> {
-    let (config, layout, hash) = load(config_path)?;
+    let (mut config, layout, hash) = load(config_path)?;
+    for id in jobs {
+        if !config.jobs.iter().any(|job| &job.id == id) {
+            return Err(format!("pipeline: unknown job {id}"));
+        }
+    }
+    if !jobs.is_empty() {
+        config.jobs.retain(|job| jobs.contains(&job.id));
+    }
+    let start = start.map(time).transpose()?;
     let end = end.map(time).transpose()?;
     run_jobs(&config, &layout, out, &|job, bound, drive, access, out| {
         update_job(
-            &config, job, bound, &layout, &hash, drive, access, end, clock, out,
+            &config, job, bound, &layout, &hash, drive, access, start, end, clock, out,
         )
     })
 }
@@ -1620,6 +1641,7 @@ fn update_job(
     pipeline_hash: &str,
     drive: &mut Drive,
     access: Access<'_>,
+    start: Option<i64>,
     end: Option<i64>,
     clock: &dyn Clock,
     out: &mut dyn Write,
@@ -1716,8 +1738,12 @@ fn update_job(
             .into_iter()
             .collect()
     };
-    let config = effective(&bound, layout, cutoff, seeds.clone())?;
-    let binding = binding_hash(&config);
+    let config = effective(&bound, layout, start, cutoff, seeds.clone())?;
+    let mut binding = binding_hash(&config);
+    if start.is_some() {
+        // A window and an advance over the same configured range never resume each other.
+        binding = sha256_hex(format!("{binding}\nsupplement").as_bytes());
+    }
     let records = layout.records();
     if let Some(pending) = &pending {
         if pending.effective_config_hash != binding {
@@ -1738,7 +1764,23 @@ fn update_job(
         }
     }
     // Seed binding and source context are checked before any credential is resolved.
-    fetch::prepare(&config, &local, access.declaration)?;
+    if let Some(start) = start
+        && start < time(&history.start)?
+    {
+        return Err(format!(
+            "fetch {}:{}: the requested range {} to {} narrows the declared history starting {}; retained rows are never clipped",
+            history.broker,
+            bound.symbol,
+            time_text(start),
+            time_text(cutoff),
+            history.start
+        ));
+    }
+    let requested = match start {
+        Some(start) => Requested::Explicit { start, end: cutoff },
+        None => Requested::Advance { cutoff },
+    };
+    fetch::prepare(&config, &local, requested, access.declaration)?;
     let intent = match &pending {
         Some(pending) => pending.intent.clone(),
         None => publish(
@@ -1848,7 +1890,7 @@ fn update_job(
             adapter.market(),
             &local,
             &local,
-            Requested::Advance { cutoff },
+            requested,
             &mut bounds,
             out,
         )?

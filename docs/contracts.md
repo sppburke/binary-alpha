@@ -499,8 +499,13 @@ A pending acquisition instead keeps its pinned baseline, start, cutoff, and reta
 For legacy v1, the seed's original manifest is retained as `seed/ready.json`, with its raw/provenance objects
 beneath `seed/`; lineage uses generation and source identity without a producer-location
 dependency. Seeds must match instrument, role, native representation, and source identity.
-A seeded lineage is never narrowed: a later `history.start` than its first retained row or a
-cutoff before its retained frontier fails before broker connection. Retained rows are not clipped.
+A seeded advance or extending whole-window fetch is never narrowed: a later `history.start`
+than its first retained row or a cutoff before its retained frontier fails before broker
+connection. An explicit window on a daily baseline with a continuation, ending no later than
+its retained frontier, is a supplement. It is exempt from seeded narrowing (`data pipeline update`
+refuses a start before the job's configured `history.start`) and acquires from its explicit start
+with overlap equality checked from that start. Its new claim records only what the broker verified inside the window;
+it does not merge the continuation's verified range. Retained rows are not clipped.
 An older inherited gap remains in the retained data and provenance; frontier advancement does
 not establish continuous coverage or repair history outside the overlap.
 
@@ -768,11 +773,17 @@ Rules: one row per response occurrence, never deduplicated by payload hash; the 
 
 The daily coverage object is the only authority for requested and verified acquisition ranges,
 shortfalls, unresolved intervals, and day-state evidence. Descendant lineage records contain
-`continuation = {acquisition_id, intent, seed}` to select the typed acquisition used for the next fetch;
-they do not duplicate a legacy coverage object or page index. They preserve `root_generation`,
+`continuation = {acquisition_id, intent, seed}` to select the typed acquisition used for the next fetch.
+A supplement keeps the continuation's `acquisition_id` and `intent` and records
+`supplement = {acquisition_id, intent}`; an ordinary advance replaces them and drops the
+supplement object. Every descendant writes `seed` from its fetch, which normalizes a
+broker-history seed. Inherited acquisition claims remain unchanged. Lineage records
+do not duplicate a legacy coverage object or page index. They preserve `root_generation`,
 `parent_generation`, and the historical `ancestors` identities. Resumed snapshots name prior
-snapshots of the same intent as ancestors only after proving their response occurrences remain
-in the replacement closure. Observation day evidence combines
+snapshots of the same intent, matched through either `continuation.intent` or `supplement.intent`,
+as ancestors only after proving their response occurrences remain in the replacement closure.
+A supplement's pending binding adds a discriminator to the effective configuration's, so a
+pending window and a pending advance never resume each other. Observation day evidence combines
 retained verified spans with new acquisition evidence; unresolved ranges are their exact UTC-day
 complement. Clipping without a proved covered boundary remains `unknown`. Page completeness
 requires occurrence evidence independently of market coverage.

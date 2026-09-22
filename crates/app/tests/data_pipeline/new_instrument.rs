@@ -643,3 +643,48 @@ fn native_session_contract() {
         doc["instruments"][0]["session"]
     );
 }
+
+#[test]
+fn supplement_before_the_first_advance_takes_the_normalized_seed() {
+    use super::daily_end_to_end::lineage_value;
+    use super::migrate_census::typed;
+    let f = new_jobs("new_instrument_supplement", 100, None);
+    let store = f.scratch.path("producer/store");
+    let job = f.jobs[0].id.as_str();
+    let update = |args: &[&str]| {
+        let report = pipeline("update", &f.config, &[args, &["--job", job]].concat()).unwrap();
+        let line = job_line(&report, job);
+        assert_eq!(field(line, "status"), "archived");
+        dataset(&store, field(line, "dataset"))
+    };
+    let root = update(&["--end", &time_text((DAY2 + 100) * 1_000_000)]);
+    let root_lineage = lineage_value(&store, &root);
+    assert!(root_lineage["continuation"]["seed"].is_null());
+    let supplement = update(&[
+        "--start",
+        &time_text((DAY2 - 600) * 1_000_000),
+        "--end",
+        &time_text(DAY2 * 1_000_000),
+    ]);
+    let lineage = lineage_value(&store, &supplement);
+    assert_eq!(
+        lineage["continuation"]["acquisition_id"],
+        root_lineage["continuation"]["acquisition_id"]
+    );
+    assert_eq!(
+        lineage["continuation"]["seed"]["generation"],
+        root.generation
+    );
+    let advanced = update(&["--end", &time_text((DAY2 + 600) * 1_000_000)]);
+    assert_eq!(
+        lineage_value(&store, &advanced)["parent_generation"],
+        supplement.generation
+    );
+    let (_, coverage) = typed(&store, &advanced.generation);
+    assert!(
+        coverage
+            .acquisitions
+            .iter()
+            .any(|a| a.acquisition_id == lineage["supplement"]["acquisition_id"])
+    );
+}

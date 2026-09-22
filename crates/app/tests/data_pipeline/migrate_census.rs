@@ -523,7 +523,7 @@ const GRID_BASIS: &str = "validated complete native-bar grid";
 const CUTOFF_REASON: &str =
     "verified acquisition covers only part of this day; cutoff day may receive later input";
 
-fn range(from: i64, to: i64) -> CoverageRange {
+pub(super) fn range(from: i64, to: i64) -> CoverageRange {
     CoverageRange::new(from * 1_000_000, to * 1_000_000)
 }
 
@@ -583,7 +583,7 @@ fn grid_fixture(name: &str, edit: impl FnOnce(&mut Vec<BarRow>)) -> (Fixture, Ve
     (f, legacy)
 }
 
-fn typed(store: &Path, generation: &str) -> (GenerationManifest, DailyCoverage) {
+pub(super) fn typed(store: &Path, generation: &str) -> (GenerationManifest, DailyCoverage) {
     let m = dataset(store, generation);
     let object = m
         .objects
@@ -595,14 +595,14 @@ fn typed(store: &Path, generation: &str) -> (GenerationManifest, DailyCoverage) 
     (m, coverage)
 }
 
-fn observation<'a>(m: &'a GenerationManifest, date: &str) -> &'a DayInventoryEntry {
+pub(super) fn observation<'a>(m: &'a GenerationManifest, date: &str) -> &'a DayInventoryEntry {
     m.day_inventory
         .iter()
         .find(|d| d.family == DayFamily::Observations && d.date == date)
         .unwrap()
 }
 
-fn evidence<'a>(c: &'a DailyCoverage, date: &str) -> &'a DayCoverage {
+pub(super) fn evidence<'a>(c: &'a DailyCoverage, date: &str) -> &'a DayCoverage {
     c.days
         .iter()
         .find(|d| d.family == DayFamily::Observations && d.date == date)

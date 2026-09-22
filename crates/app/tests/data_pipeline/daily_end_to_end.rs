@@ -1,4 +1,5 @@
 //! One non-live sequence crosses every daily owner, including recovery and reachability.
+use super::migrate_census::{evidence, observation, range, typed};
 use super::*;
 use binary_alpha_app::retire::Plan;
 use binary_alpha_engine::dataset::{DayFamily, DayState, Layout};
@@ -118,6 +119,346 @@ fn update_keeps_unknown_day_object_when_shared_empty_day_becomes_known() {
             );
         }
     }
+}
+
+fn supplement_fixture(name: &str, max_pages: u32) -> (Fixture, GenerationManifest) {
+    let mut f = fixture(name);
+    write_daily_directory(
+        &f.scratch.path("sources/deriv/EURUSD"),
+        "EURUSD",
+        "frxEURUSD",
+        &[("2025-08-10", &[]), ("2025-08-13", &[])],
+    );
+    let start = DAY1 - 129_600;
+    let mut ticks = deriv_ticks(start, start + 300);
+    ticks.extend(deriv_ticks(DAY1, DAY1 + 302));
+    ticks.extend(deriv_ticks(DAY2, DERIV_SERIES_END));
+    f.deriv = serve_broker(Kind::Deriv(Arc::new(ticks)));
+    let core = deriv_core(&f.deriv.url, 60, 50, 60)
+        .replace("2025-08-11T00:00:00Z", "2025-08-09T12:00:00Z");
+    fs::write(f.scratch.path("deriv.toml"), &core).unwrap();
+    write_evidence(&f.scratch, "deriv", &core);
+    let report = import(&import_config(&f.scratch, "deriv", &core)).unwrap();
+    let store = f.scratch.path("producer/store");
+    let root = dataset(&store, imported_generation(&report, "deriv:frxEURUSD"));
+    for date in ["2025-08-10", "2025-08-13"] {
+        let day = observation(&root, date);
+        assert_eq!((day.rows, day.state), (0, DayState::Unknown));
+    }
+    fs::write(
+        &f.pipeline,
+        pipeline_toml(
+            &f.scratch.path("producer"),
+            &f.drive.base,
+            &[("deriv", "deriv.toml"), ("pocket", "pocket.toml")],
+            None,
+            3,
+        ),
+    )
+    .unwrap();
+    let report = pipeline(
+        "update",
+        &f.pipeline,
+        &[
+            "--end",
+            &time_text((DERIV_SEED_END + 300) * 1_000_000),
+            "--job",
+            "deriv",
+        ],
+    )
+    .unwrap();
+    let line = job_line(&report, "deriv");
+    assert_eq!(field(line, "status"), "archived");
+    assert!(!report.contains("pipeline update pocket "), "{report}");
+    assert!(f.pocket.requests().is_empty());
+    let baseline = dataset(&store, field(line, "dataset"));
+    fs::write(
+        f.scratch.path("deriv.toml"),
+        core.replace("max_pages = 50", &format!("max_pages = {max_pages}")),
+    )
+    .unwrap();
+    (f, baseline)
+}
+
+pub(super) fn lineage_value(store: &Path, manifest: &GenerationManifest) -> Value {
+    let object = manifest
+        .objects
+        .iter()
+        .find(|o| o.path == "provenance/lineage.json")
+        .unwrap();
+    read_json(&store.join(&object.key))
+}
+
+#[test]
+fn update_supplement_preserves_continuation_claims_and_retained_rows() {
+    let (f, baseline) = supplement_fixture("daily_supplement", 50);
+    let store = f.scratch.path("producer/store");
+    let (_, prior) = typed(&store, &baseline.generation);
+    let retained = ticks(&store, &baseline);
+    let lineage = lineage_value(&store, &baseline);
+    // Unknown selections fail before attempting even an already-held writer lock.
+    let lock = fs::File::open(f.scratch.path("producer/pipeline_state/writer.lock")).unwrap();
+    lock.try_lock().unwrap();
+    let requests = f.deriv.requests();
+    let error = pipeline(
+        "update",
+        &f.pipeline,
+        &["--job", "deriv", "--job", "missing"],
+    )
+    .unwrap_err();
+    assert!(error.contains("unknown job missing"), "{error}");
+    assert_eq!(f.deriv.requests(), requests);
+    assert!(f.pocket.requests().is_empty());
+    drop(lock);
+
+    let report = pipeline(
+        "update",
+        &f.pipeline,
+        &[
+            "--start",
+            "2025-08-09T12:00:00Z",
+            "--end",
+            "2025-08-11T00:05:00Z",
+            "--job",
+            "deriv",
+        ],
+    )
+    .unwrap();
+    let line = job_line(&report, "deriv");
+    assert_eq!(field(line, "status"), "archived");
+    assert!(!report.contains("pipeline update pocket "), "{report}");
+    assert!(f.pocket.requests().is_empty());
+    let (supplement, acquired) = typed(&store, field(line, "dataset"));
+    assert_eq!(acquired.acquisitions.len(), prior.acquisitions.len() + 1);
+    assert_eq!(
+        &acquired.acquisitions[..prior.acquisitions.len()],
+        prior.acquisitions
+    );
+    let claim = acquired.acquisitions.last().unwrap();
+    let window = range(DAY1 - 129_600, DAY1 + 300);
+    assert_eq!(claim.requested, vec![window.clone()]);
+    assert_eq!(claim.verified, vec![window]);
+    assert!(claim.unresolved.is_empty() && claim.shortfalls.is_empty());
+    let after = lineage_value(&store, &supplement);
+    assert_eq!(after["continuation"], lineage["continuation"]);
+    assert_eq!(after["supplement"]["acquisition_id"], claim.acquisition_id);
+    let records = f.scratch.path("producer/pipeline_state/records");
+    let intent = after["supplement"]["intent"].as_str().unwrap();
+    assert_eq!(read_json(&records.join(intent))["command"], "update");
+    assert_eq!(
+        read_json(&records.join(&claim.acquisition_id))["intent"],
+        intent
+    );
+    let day = observation(&supplement, "2025-08-10");
+    assert_eq!(
+        (day.rows, day.state, &day.object),
+        (0, DayState::EmptyKnown, &None)
+    );
+    assert_eq!(
+        evidence(&acquired, "2025-08-10").verified,
+        vec![range(DAY1 - 86_400, DAY1)]
+    );
+    assert!(evidence(&acquired, "2025-08-10").unresolved.is_empty());
+    assert_eq!(
+        observation(&supplement, "2025-08-13"),
+        observation(&baseline, "2025-08-13")
+    );
+    assert_eq!(
+        observation(&supplement, "2025-08-13").state,
+        DayState::Unknown
+    );
+    let rows = ticks(&store, &supplement);
+    let prefix = deriv_ticks(DAY1 - 129_600, DAY1 - 129_600 + 300);
+    assert_eq!(
+        supplement.row_count,
+        baseline.row_count + prefix.len() as u64
+    );
+    assert_eq!(rows[prefix.len()..], retained);
+    assert_eq!(
+        rows[..prefix.len()]
+            .iter()
+            .map(|t| (t.event_time_micros, t.price_units))
+            .collect::<Vec<_>>(),
+        prefix
+            .iter()
+            .map(|(t, p)| (t * 1_000_000, units5(p)))
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        observation(&supplement, "2025-08-11").object,
+        observation(&baseline, "2025-08-11").object
+    );
+    verify_closure(&store, &supplement.generation, field(line, "stream"));
+
+    let report = pipeline(
+        "update",
+        &f.pipeline,
+        &[
+            "--end",
+            &time_text((DERIV_SEED_END + 600) * 1_000_000),
+            "--job",
+            "deriv",
+        ],
+    )
+    .unwrap();
+    let line = job_line(&report, "deriv");
+    assert_eq!(field(line, "status"), "archived");
+    let (advanced, coverage) = typed(&store, field(line, "dataset"));
+    assert_eq!(
+        &coverage.acquisitions[..acquired.acquisitions.len()],
+        acquired.acquisitions
+    );
+    let new = coverage.acquisitions.last().unwrap();
+    let continuation = lineage_value(&store, &advanced);
+    assert_eq!(
+        continuation["continuation"]["acquisition_id"],
+        new.acquisition_id
+    );
+    assert_eq!(
+        read_json(&records.join(&new.acquisition_id))["intent"],
+        continuation["continuation"]["intent"]
+    );
+    assert!(continuation.get("supplement").is_none());
+    let previous = prior
+        .acquisitions
+        .iter()
+        .find(|a| a.acquisition_id == lineage["continuation"]["acquisition_id"])
+        .unwrap();
+    assert_eq!(
+        new.verified,
+        vec![binary_alpha_engine::dataset::coverage::CoverageRange {
+            start: previous.verified[0].start.clone(),
+            end: time_text((DERIV_SEED_END + 600) * 1_000_000),
+        }]
+    );
+    assert_eq!(&ticks(&store, &advanced)[..rows.len()], rows);
+    verify_closure(&store, &advanced.generation, field(line, "stream"));
+}
+
+#[test]
+fn update_supplement_resumes_snapshots_and_refuses_pending_kind_changes() {
+    let (f, baseline) = supplement_fixture("daily_supplement_resume", 2);
+    let store = f.scratch.path("producer/store");
+    let window = [
+        "--start",
+        "2025-08-09T12:00:00Z",
+        "--end",
+        "2025-08-11T00:05:00Z",
+        "--job",
+        "deriv",
+    ];
+    let report = pipeline("update", &f.pipeline, &window).unwrap_err();
+    let line = job_line(&report, "deriv");
+    assert_eq!(field(line, "status"), "pending");
+    let progress = f
+        .scratch
+        .path("producer/pipeline_state/deriv/progress.json");
+    let pending = read_progress(&progress);
+    let intent = pending["intent"].as_str().unwrap();
+    let (snapshot, partial) = typed(&store, field(line, "dataset"));
+    assert_eq!(
+        lineage_value(&store, &snapshot)["continuation"],
+        lineage_value(&store, &baseline)["continuation"]
+    );
+    let requests = f.deriv.requests();
+    let error = pipeline(
+        "update",
+        &f.pipeline,
+        &["--end", "2025-08-11T00:05:00Z", "--job", "deriv"],
+    )
+    .unwrap_err();
+    assert!(
+        error.contains(intent) && error.contains("pending") && error.contains("conflicts"),
+        "{error}"
+    );
+    assert_eq!(f.deriv.requests(), requests);
+
+    let report = pipeline("update", &f.pipeline, &window).unwrap();
+    let line = job_line(&report, "deriv");
+    assert_eq!(field(line, "status"), "archived");
+    let (completed, coverage) = typed(&store, field(line, "dataset"));
+    assert_eq!(
+        &coverage.acquisitions[..partial.acquisitions.len()],
+        partial.acquisitions
+    );
+    assert_eq!(coverage.acquisitions.len(), partial.acquisitions.len() + 1);
+    let claim = coverage.acquisitions.last().unwrap();
+    assert_eq!(claim.requested, vec![range(DAY1 - 129_600, DAY1 + 300)]);
+    assert_eq!(claim.verified, claim.requested);
+    let lineage = lineage_value(&store, &completed);
+    assert_eq!(
+        lineage["continuation"],
+        lineage_value(&store, &baseline)["continuation"]
+    );
+    assert_eq!(
+        lineage["supplement"]["acquisition_id"],
+        claim.acquisition_id
+    );
+    assert_eq!(lineage["supplement"]["intent"], intent);
+    assert!(
+        lineage["ancestors"]
+            .as_array()
+            .unwrap()
+            .contains(&json!(snapshot.generation))
+    );
+    assert!(
+        !f.scratch
+            .path("producer/pipeline_state/deriv/progress.json")
+            .exists()
+    );
+    verify_closure(&store, &completed.generation, field(line, "stream"));
+    // Selection must find one terminal descendant after the two sibling snapshots merge.
+    let report = pipeline(
+        "update",
+        &f.pipeline,
+        &[
+            "--end",
+            &time_text((DERIV_SEED_END + 600) * 1_000_000),
+            "--job",
+            "deriv",
+        ],
+    )
+    .unwrap();
+    let line = job_line(&report, "deriv");
+    assert_eq!(field(line, "status"), "archived");
+    let (advanced, advanced_coverage) = typed(&store, field(line, "dataset"));
+    assert_eq!(
+        lineage_value(&store, &advanced)["parent_generation"],
+        completed.generation
+    );
+    assert_eq!(
+        &advanced_coverage.acquisitions[..coverage.acquisitions.len()],
+        coverage.acquisitions
+    );
+
+    let cutoff = time_text((DERIV_SEED_END + 1_200) * 1_000_000);
+    let report =
+        pipeline("update", &f.pipeline, &["--end", &cutoff, "--job", "deriv"]).unwrap_err();
+    let line = job_line(&report, "deriv");
+    assert_eq!(field(line, "status"), "pending");
+    let requests = f.deriv.requests();
+    let error = pipeline(
+        "update",
+        &f.pipeline,
+        &[
+            "--start",
+            "2025-08-09T12:00:00Z",
+            "--end",
+            &cutoff,
+            "--job",
+            "deriv",
+        ],
+    )
+    .unwrap_err();
+    let pending = read_progress(&progress);
+    assert!(
+        error.contains(pending["intent"].as_str().unwrap())
+            && error.contains("pending")
+            && error.contains("conflicts"),
+        "{error}"
+    );
+    assert_eq!(f.deriv.requests(), requests);
+    assert!(f.pocket.requests().is_empty());
 }
 
 #[test]
