@@ -1414,8 +1414,14 @@ fn assert_scenarios(
 }
 
 fn manifest_snapshot(root: &Path) -> BTreeMap<PathBuf, (Vec<u8>, SystemTime)> {
-    fs::read_dir(root.join("manifests"))
-        .unwrap()
+    // The publisher writes the destination manifest before the retained copy, so a process
+    // killed at the first boundary can leave no retained manifests directory yet.
+    let entries = match fs::read_dir(root.join("manifests")) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return BTreeMap::new(),
+        Err(error) => panic!("{}: {error}", root.display()),
+    };
+    entries
         .map(|e| e.unwrap().path().join("ready.json"))
         .filter(|p| p.is_file())
         .map(|path| {
