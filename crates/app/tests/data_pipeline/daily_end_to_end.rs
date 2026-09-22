@@ -121,6 +121,49 @@ fn update_keeps_unknown_day_object_when_shared_empty_day_becomes_known() {
     }
 }
 
+#[test]
+fn update_inventories_a_closed_day_between_acquired_days() {
+    let mut f = fixture("daily_closed_day");
+    let day14 = DAY2 + 2 * 86_400;
+    let mut ticks = deriv_ticks(DAY2, DERIV_SEED_END);
+    ticks.extend(deriv_ticks(day14 + 60, day14 + 300));
+    f.deriv = serve_broker(Kind::Deriv(Arc::new(ticks)));
+    let core = deriv_core(&f.deriv.url, 60, 50, 60);
+    fs::write(f.scratch.path("deriv.toml"), &core).unwrap();
+    write_evidence(&f.scratch, "deriv", &core);
+    let report = import(&import_config(&f.scratch, "deriv", &core)).unwrap();
+    let store = f.scratch.path("producer/store");
+    let root = dataset(&store, imported_generation(&report, "deriv:frxEURUSD"));
+    assert_eq!(observation(&root, "2025-08-12").state, DayState::Complete);
+    assert!(!root.day_inventory.iter().any(|d| d.date == "2025-08-13"));
+    let report = pipeline(
+        "update",
+        &f.pipeline,
+        &[
+            "--end",
+            &time_text((day14 + 120) * 1_000_000),
+            "--job",
+            "deriv",
+        ],
+    )
+    .unwrap();
+    let line = job_line(&report, "deriv");
+    assert_eq!(field(line, "status"), "archived");
+    let manifest = dataset(&store, field(line, "dataset"));
+    let day = observation(&manifest, "2025-08-13");
+    assert_eq!(
+        (day.rows, day.state, &day.object),
+        (0, DayState::EmptyKnown, &None)
+    );
+    let stream = stream(&store, field(line, "stream"));
+    let candles = stream
+        .day_inventory
+        .iter()
+        .find(|d| d.family == DayFamily::Candles && d.date == "2025-08-12")
+        .unwrap();
+    assert_eq!(candles.state, DayState::Complete);
+}
+
 fn supplement_fixture(name: &str, max_pages: u32) -> (Fixture, GenerationManifest) {
     let mut f = fixture(name);
     write_daily_directory(

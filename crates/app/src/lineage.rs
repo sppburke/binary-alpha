@@ -1035,7 +1035,24 @@ fn observations(
     for row in rows {
         grouped.entry(date(row.time()?)).or_default().push(row);
     }
+    // A date without rows between inventoried days is still inventoried, so acquisition
+    // evidence can prove a closed market day instead of leaving it out.
     if let Some(old) = baseline {
+        let known: BTreeSet<String> = old
+            .day_inventory
+            .iter()
+            .filter(|d| d.family == DayFamily::Observations)
+            .map(|d| d.date.clone())
+            .chain(grouped.keys().cloned())
+            .collect();
+        if let (Some(mut day), Some(last)) = (known.first().cloned(), known.last()) {
+            while &day < last {
+                if !known.contains(&day) {
+                    grouped.insert(day.clone(), vec![]);
+                }
+                day = date(day_bounds(&day)?.1);
+            }
+        }
         for d in old
             .day_inventory
             .iter()
@@ -1055,12 +1072,15 @@ fn observations(
                 .iter()
                 .find(|d| d.family == DayFamily::Observations && d.date == date)
         });
-        let first = rows.first().expect("nonempty day").time()?;
-        let last = rows.last().expect("nonempty day").time()?;
+        let bounds = match (rows.first(), rows.last()) {
+            (Some(first), Some(last)) => Some((text(first.time()?), text(last.time()?))),
+            _ => None,
+        };
         if let Some(d) = previous.filter(|d| {
             d.rows == rows.len() as u64
-                && d.first_time.as_deref() == Some(text(first).as_str())
-                && d.last_time.as_deref() == Some(text(last).as_str())
+                && bounds.as_ref().is_some_and(|(first, last)| {
+                    d.first_time.as_ref() == Some(first) && d.last_time.as_ref() == Some(last)
+                })
         }) {
             // Acquisition has already proved overlap equality including repeated-tick order.
             manifest

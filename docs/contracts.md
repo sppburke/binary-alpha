@@ -683,6 +683,9 @@ Each entry: `date`, `family` (and candle `duration`/`offset`), `object` key or n
 - `unknown`: source evidence exists without a completeness claim (reason recorded, for example a Deriv historical gap with `complete: false`);
 - `empty_known`: evidence covers the whole day with zero rows (for example Deriv `market_closed: true` without clipping); `object` is null.
 
+A descendant inventories every UTC date between its first and last observation day; a date
+without rows gets an empty partition and takes its state from acquisition evidence.
+
 A first-time migration of native bars (period `N` seconds tiling the day) also derives
 `complete` for an observation day from a validated complete grid: exactly `86,400 / N` rows,
 the first bar start at the UTC day start, and the last bar start `N` seconds before the day
