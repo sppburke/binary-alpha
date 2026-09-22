@@ -527,14 +527,48 @@ fn closed_friday_offset_bucket_needs_no_saturday_coverage() {
 }
 
 #[test]
+fn yearly_closed_date_removes_an_observed_day() {
+    let scratch = Scratch::new("session_yearly_closed");
+    let (source, definition, _) = fixture(&scratch, "deriv", false);
+    assert!(
+        source
+            .day_inventory
+            .iter()
+            .any(|d| d.date == "2026-09-04" && d.rows > 0)
+    );
+    let definition = definition.replace("closed_dates=[]", "closed_dates=[\"09-04\"]");
+    let config = scratch.config("audit.toml", &definition);
+    let report = common::command(&[
+        "data",
+        "audit",
+        "--config",
+        config.to_str().unwrap(),
+        "--manifest",
+        &uri(&scratch.path("published").join(source.key())),
+    ])
+    .unwrap();
+    let path = scratch
+        .path("published")
+        .join(manifest_key(&common::generation(&report[0])));
+    common::verify(&path).unwrap();
+    let manifest = StreamManifest::from_json(&fs::read(&path).unwrap()).unwrap();
+    let day = manifest
+        .day_inventory
+        .iter()
+        .find(|d| d.date == "2026-09-04")
+        .unwrap();
+    assert_eq!(day.state, DayState::EmptyKnown);
+}
+
+#[test]
 fn closing_quotes_survive_audit_and_verifier_requires_the_close_bucket() {
     for (kind, close_text, duration, early) in [
-        ("deriv", "2026-09-04T20:55:00Z", 5, false),
-        ("deriv", "2026-09-04T20:55:00Z", 60, false),
-        ("deriv", "2025-12-24T22:00:00Z", 5, true),
-        ("deriv", "2025-12-24T22:00:00Z", 60, true),
-        ("pocket", "2026-09-04T21:00:00Z", 5, false),
-        ("pocket", "2026-11-06T22:00:00Z", 5, false),
+        ("deriv", "2026-09-04T20:55:00Z", 5, None),
+        ("deriv", "2026-09-04T20:55:00Z", 60, None),
+        ("deriv", "2025-12-24T22:00:00Z", 5, Some("2025-12-24")),
+        ("deriv", "2025-12-24T22:00:00Z", 60, Some("12-24")),
+        ("pocket", "2026-09-04T21:00:00Z", 5, None),
+        ("pocket", "2026-11-06T22:00:00Z", 5, None),
     ] {
         let scratch = Scratch::new(&format!("inclusive_close_{kind}_{duration}_{close_text}"));
         let (mut source, mut definition, _) = fixture(&scratch, kind, false);
@@ -621,10 +655,10 @@ fn closing_quotes_survive_audit_and_verifier_requires_the_close_bucket() {
             "duration_seconds=5",
             &format!("duration_seconds={duration}"),
         );
-        if early {
+        if let Some(early) = early {
             definition = definition.replace(
                 "early_closes=[]",
-                "early_closes=[{date=\"2025-12-24\",time=\"22:00:00\"}]",
+                &format!("early_closes=[{{date=\"{early}\",time=\"22:00:00\"}}]"),
             );
         }
         let config = scratch.config("audit.toml", &definition);

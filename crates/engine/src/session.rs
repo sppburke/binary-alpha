@@ -8,6 +8,7 @@ use crate::market::{civil_from_days, days_from_civil};
 const DAY: i64 = 86_400;
 const SECOND_MICROS: i64 = 1_000_000;
 type Date = i64; // Gregorian days since 1970-01-01, using the shared market arithmetic.
+type MonthDay = (i64, i64);
 
 #[derive(Debug, Clone, Copy)]
 enum Zone {
@@ -145,6 +146,8 @@ pub struct Calendar {
     weekly: Option<(i64, i64)>,
     closed: BTreeSet<Date>,
     early: BTreeMap<Date, i64>,
+    yearly_closed: BTreeSet<MonthDay>,
+    yearly_early: BTreeMap<MonthDay, i64>,
 }
 
 fn err(error: impl std::fmt::Display) -> String {
@@ -154,6 +157,18 @@ fn date(text: &str) -> Result<Date, String> {
     // Enforce the repository's exact Gregorian date grammar first.
     let (start, _) = crate::dataset::daily::day_bounds(text).map_err(err)?;
     Ok(start / (DAY * SECOND_MICROS))
+}
+/// A yearly `MM-DD` entry applies in every year; it is checked in a leap year, so `02-29`
+/// applies in leap years only.
+fn yearly(text: &str) -> Result<Option<MonthDay>, String> {
+    if text.len() != 5 {
+        return Ok(None);
+    }
+    Ok(Some(month_day(date(&format!("2000-{text}"))?)))
+}
+fn month_day(day: Date) -> MonthDay {
+    let (_, month, day) = civil_from_days(day);
+    (month, day)
 }
 fn clock(text: &str) -> Result<i64, String> {
     if text.len() != 8 || !text.is_ascii() || &text[2..3] != ":" || &text[5..6] != ":" {
@@ -194,6 +209,8 @@ impl Session {
             weekly: None,
             closed: BTreeSet::new(),
             early: BTreeMap::new(),
+            yearly_closed: BTreeSet::new(),
+            yearly_early: BTreeMap::new(),
         };
         if let Self::Weekly {
             timezone,
@@ -220,20 +237,34 @@ impl Session {
             }
             calendar.weekly = Some((open, close));
             for text in closed_dates {
-                let day = date(text)?;
-                calendar.zone.check_date(day)?;
-                if !calendar.closed.insert(day) {
+                let inserted = match yearly(text)? {
+                    Some(month_day) => calendar.yearly_closed.insert(month_day),
+                    None => {
+                        let day = date(text)?;
+                        calendar.zone.check_date(day)?;
+                        calendar.closed.insert(day)
+                    }
+                };
+                if !inserted {
                     return Err(err("duplicate closed date"));
                 }
             }
             for early in early_closes {
-                let day = date(&early.date)?;
-                calendar.zone.check_date(day)?;
-                // Dated overrides can be checked at config parse time, including DST folds.
-                calendar.zone.instant(day, clock(&early.time)?)?;
-                if calendar.closed.contains(&day)
-                    || calendar.early.insert(day, clock(&early.time)?).is_some()
-                {
+                let time = clock(&early.time)?;
+                let conflict = match yearly(&early.date)? {
+                    Some(month_day) => {
+                        calendar.yearly_closed.contains(&month_day)
+                            || calendar.yearly_early.insert(month_day, time).is_some()
+                    }
+                    None => {
+                        let day = date(&early.date)?;
+                        calendar.zone.check_date(day)?;
+                        // Dated overrides can be checked at config parse time, including DST folds.
+                        calendar.zone.instant(day, time)?;
+                        calendar.closed.contains(&day) || calendar.early.insert(day, time).is_some()
+                    }
+                };
+                if conflict {
                     return Err(err("duplicate or closed early-close date"));
                 }
             }
@@ -249,9 +280,14 @@ impl Calendar {
         self.zone.instant(day, seconds)
     }
     fn intervals(&self, day: Date) -> Result<Vec<(i64, i64)>, String> {
-        if self.closed.contains(&day) {
+        let yearly = month_day(day);
+        if self.closed.contains(&day) || self.yearly_closed.contains(&yearly) {
             return Ok(Vec::new());
         }
+        let early = self
+            .early
+            .get(&day)
+            .or_else(|| self.yearly_early.get(&yearly));
         let d = weekday(day) * 86400;
         let spans = match self.weekly {
             None => vec![(0, 604800)],
@@ -261,7 +297,7 @@ impl Calendar {
         let mut result = Vec::new();
         for (a, b) in spans {
             let from = (a - d).max(0);
-            let to = (b - d).min(*self.early.get(&day).unwrap_or(&86400));
+            let to = (b - d).min(*early.unwrap_or(&86400));
             // A close at local midnight contributes that instant even though this day's
             // intersection has zero length. Closed dates above still remove the whole day.
             if from <= to {
@@ -405,6 +441,47 @@ mod tests {
         // Open-instant membership includes straddling buckets and the early close itself.
         assert!(c.contains(start, start + 15_000_000).unwrap());
         assert!(c.contains(start + 5_000_000, start + 20_000_000).unwrap());
+    }
+    #[test]
+    fn yearly_closures_apply_every_year() {
+        let mut s = deriv();
+        if let Session::Weekly {
+            closed_dates,
+            early_closes,
+            ..
+        } = &mut s
+        {
+            closed_dates.extend(["12-25".into(), "02-29".into()]);
+            // Yearly rule for the 24th, plus a dated 2026 override proving dated precedence.
+            early_closes[0].date = "12-24".into();
+            early_closes.push(EarlyClose {
+                date: "2026-12-24".into(),
+                time: "18:00:00".into(),
+            });
+        }
+        let c = s.calendar().unwrap();
+        let open = |at: &str| {
+            let start = t(at).unwrap();
+            c.contains(start, start + 5_000_000).unwrap()
+        };
+        for year in [2025, 2030] {
+            assert!(!open(&format!("{year}-12-25T12:00:00Z")));
+            assert!(open(&format!("{year}-12-24T22:00:00Z")));
+            assert!(!open(&format!("{year}-12-24T22:00:05Z")));
+            assert!(open(&format!("{year}-12-23T22:00:05Z")));
+        }
+        assert!(open("2026-12-24T18:00:00Z") && !open("2026-12-24T18:00:05Z"));
+        assert!(!open("2028-02-29T12:00:00Z"));
+        assert!(open("2028-02-28T12:00:00Z") && open("2028-03-01T12:00:00Z"));
+        assert!(open("2027-03-01T12:00:00Z"));
+        // Malformed, duplicate, and closed-day early closes are refused.
+        for closed in ["13-01", "12-32", "12-25", "12-24"] {
+            let mut refused = s.clone();
+            if let Session::Weekly { closed_dates, .. } = &mut refused {
+                closed_dates.push(closed.into());
+            }
+            assert!(refused.calendar().is_err(), "{closed}");
+        }
     }
     fn deriv() -> Session {
         Session::Weekly {

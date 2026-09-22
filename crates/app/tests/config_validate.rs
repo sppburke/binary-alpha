@@ -90,11 +90,11 @@ fn pipeline_examples_validate_the_reviewed_session_tables() {
     for (name, expected) in [
         (
             "deriv",
-            "kind='weekly'\ntimezone='UTC'\nopen={day='monday',time='00:00:00'}\nclose={day='friday',time='20:55:00'}\nclosed_dates=['2025-12-25','2026-01-01']\nearly_closes=[{date='2025-12-24',time='22:00:00'},{date='2025-12-31',time='22:00:00'}]",
+            "kind='weekly'\ntimezone='UTC'\nopen={day='monday',time='00:00:00'}\nclose={day='friday',time='20:55:00'}\nclosed_dates=['12-25','01-01']\nearly_closes=[{date='12-24',time='22:00:00'},{date='12-31',time='22:00:00'}]",
         ),
         (
             "pocket",
-            "kind='weekly'\ntimezone='America/New_York'\nopen={day='sunday',time='17:00:00'}\nclose={day='friday',time='17:00:00'}\nclosed_dates=[]\nearly_closes=[]",
+            "kind='weekly'\ntimezone='America/New_York'\nopen={day='sunday',time='17:00:00'}\nclose={day='friday',time='17:00:00'}\nclosed_dates=['01-01']\nearly_closes=[{date='12-31',time='17:00:00'}]",
         ),
     ] {
         let path = format!(

@@ -343,7 +343,7 @@ mod tests {
             ("timezone = \"UTC\"", "timezone = \"America/New_York\""),
             ("monday", "sunday"),
             ("20:55:00", "20:50:00"),
-            ("2025-12-25", "2025-12-26"),
+            ("12-25", "12-26"),
             ("22:00:00", "21:00:00"),
         ] {
             let changed = Config::parse(&text.replace(from, to)).unwrap();

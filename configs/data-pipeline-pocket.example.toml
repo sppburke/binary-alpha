@@ -17,8 +17,8 @@ kind = "weekly"
 timezone = "America/New_York"
 open = { day = "sunday", time = "17:00:00" }
 close = { day = "friday", time = "17:00:00" }
-closed_dates = []
-early_closes = []
+closed_dates = ["01-01"]
+early_closes = [{ date = "12-31", time = "17:00:00" }]
 [[brokers]]
 id = "pocket_option"
 kind = "pocket_option"
