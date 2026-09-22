@@ -13,8 +13,8 @@ on:
 # skipped, so a new test file or module runs there by default. Filters are libtest substrings:
 # `retire::` also selects `review_retire::`, `config_validate` runs whole because one of its
 # tests carries the `pipeline_` prefix, the three long `whole_day_bar_completeness` tests of
-# `migrate_census::` are spread one per pipeline shard by name, its `grid_claim_on_update` runs
-# in the lightest pipeline shard, and the live-runtime module
+# `migrate_census::` are spread one per pipeline shard by name, its `grid_claim_on_update` and
+# `empty_first_candle_page` run in the lightest pipeline shard, and the live-runtime module
 # names (`control::`, `economics::`, `faults::`, `leases::`, `resilience::`, `runtime::`) must
 # stay unique across test binaries so the skip filters remove only that binary's tests.
 jobs:
@@ -38,13 +38,13 @@ jobs:
             run: >-
               cargo test -p binary-alpha-app --locked --test data_pipeline --
               daily_end_to_end:: new_instrument:: daily_review_fixes:: whole_day_bar_completeness_boundaries
-              grid_claim_on_update
+              grid_claim_on_update empty_first_candle_page
           - shard: pipeline-migration
             run: >-
               cargo test -p binary-alpha-app --locked --test data_pipeline --
               review_final:: migrate_census:: lineage:: daily_readers:: registry_archive:: archive_records:: pipeline_
               --skip whole_day_bar_completeness_boundaries --skip whole_day_bar_completeness_lifecycle
-              --skip grid_claim_on_update
+              --skip grid_claim_on_update --skip empty_first_candle_page
           - shard: pipeline-retirement
             run: >-
               cargo test -p binary-alpha-app --locked --test data_pipeline --

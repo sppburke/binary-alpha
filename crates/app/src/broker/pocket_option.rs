@@ -704,8 +704,8 @@ impl PocketMarketData {
     /// seconds, every row must carry one constant provider
     /// identifier, whole-second grid-aligned starts and finite consistent prices, and every
     /// price must convert exactly to units at `scale` both as decimal text and as the archive's
-    /// binary floating point. A page without rows is the provider's end of history and carries
-    /// no identifier.
+    /// binary floating point. A page without rows carries no identifier; the fetch records it as
+    /// an `empty_page` shortfall.
     fn decode_candles(
         &self,
         instrument: &InstrumentId,
