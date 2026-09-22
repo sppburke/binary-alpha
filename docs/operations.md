@@ -376,7 +376,8 @@ or `empty_known`, except these retained-evidence residuals (inventoried 2026-09-
   broker's one-year tick retention (2026-09-22): unrecoverable. 2025-12-24, 2025-12-25,
   2025-12-31 and 2026-01-01 are recoverable with supplements over `[2025-12-24, 2025-12-26)`
   and `[2025-12-31, 2026-01-02)` until retention passes them (from 2026-12-25).
- An inventoried cutoff day
+
+An inventoried cutoff day
 remains `partial` with some verified coverage or `unknown` with none; candle days follow the
 existing session, finalizer, and pending-candle audit rules. Verify the newest ready manifest
 per instrument and an `archived` update report for all 17 jobs after the outstanding run.

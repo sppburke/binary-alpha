@@ -326,7 +326,7 @@ enum PipelineCommand {
         /// Path of the TOML pipeline document.
         #[arg(long)]
         config: PathBuf,
-        /// Acquire an explicit window, including retained days, without moving its continuation.
+        /// Acquire an explicit window; one ending inside a daily root keeps its continuation.
         #[arg(long, requires = "end")]
         start: Option<String>,
         /// The pinned cutoff as `YYYY-MM-DDTHH:MM:SS[.ffffff]Z`; absent means now.

@@ -602,7 +602,7 @@ pub(super) fn observation<'a>(m: &'a GenerationManifest, date: &str) -> &'a DayI
         .unwrap()
 }
 
-pub(super) fn evidence<'a>(c: &'a DailyCoverage, date: &str) -> &'a DayCoverage {
+fn evidence<'a>(c: &'a DailyCoverage, date: &str) -> &'a DayCoverage {
     c.days
         .iter()
         .find(|d| d.family == DayFamily::Observations && d.date == date)

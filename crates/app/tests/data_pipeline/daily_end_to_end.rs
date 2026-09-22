@@ -1,5 +1,5 @@
 //! One non-live sequence crosses every daily owner, including recovery and reachability.
-use super::migrate_census::{evidence, observation, range, typed};
+use super::migrate_census::{observation, range, typed};
 use super::*;
 use binary_alpha_app::retire::Plan;
 use binary_alpha_engine::dataset::{DayFamily, DayState, Layout};
@@ -145,17 +145,6 @@ fn supplement_fixture(name: &str, max_pages: u32) -> (Fixture, GenerationManifes
         let day = observation(&root, date);
         assert_eq!((day.rows, day.state), (0, DayState::Unknown));
     }
-    fs::write(
-        &f.pipeline,
-        pipeline_toml(
-            &f.scratch.path("producer"),
-            &f.drive.base,
-            &[("deriv", "deriv.toml"), ("pocket", "pocket.toml")],
-            None,
-            3,
-        ),
-    )
-    .unwrap();
     let report = pipeline(
         "update",
         &f.pipeline,
@@ -210,6 +199,25 @@ fn update_supplement_preserves_continuation_claims_and_retained_rows() {
     assert_eq!(f.deriv.requests(), requests);
     assert!(f.pocket.requests().is_empty());
     drop(lock);
+    // A window before the job's configured start is refused before any record or request.
+    let records = f.scratch.path("producer/pipeline_state/records");
+    let recorded = fs::read_dir(&records).unwrap().count();
+    let error = pipeline(
+        "update",
+        &f.pipeline,
+        &[
+            "--start",
+            "2025-08-09T11:59:58Z",
+            "--end",
+            "2025-08-11T00:05:00Z",
+            "--job",
+            "deriv",
+        ],
+    )
+    .unwrap_err();
+    assert!(error.contains("narrows the declared history"), "{error}");
+    assert_eq!(f.deriv.requests(), requests);
+    assert_eq!(fs::read_dir(&records).unwrap().count(), recorded);
 
     let report = pipeline(
         "update",
@@ -242,7 +250,6 @@ fn update_supplement_preserves_continuation_claims_and_retained_rows() {
     let after = lineage_value(&store, &supplement);
     assert_eq!(after["continuation"], lineage["continuation"]);
     assert_eq!(after["supplement"]["acquisition_id"], claim.acquisition_id);
-    let records = f.scratch.path("producer/pipeline_state/records");
     let intent = after["supplement"]["intent"].as_str().unwrap();
     assert_eq!(read_json(&records.join(intent))["command"], "update");
     assert_eq!(
@@ -254,11 +261,6 @@ fn update_supplement_preserves_continuation_claims_and_retained_rows() {
         (day.rows, day.state, &day.object),
         (0, DayState::EmptyKnown, &None)
     );
-    assert_eq!(
-        evidence(&acquired, "2025-08-10").verified,
-        vec![range(DAY1 - 86_400, DAY1)]
-    );
-    assert!(evidence(&acquired, "2025-08-10").unresolved.is_empty());
     assert_eq!(
         observation(&supplement, "2025-08-13"),
         observation(&baseline, "2025-08-13")
