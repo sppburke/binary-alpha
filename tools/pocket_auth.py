@@ -20,8 +20,8 @@ class Failure(Exception):
 
 
 class Socket:
-    def __init__(self):
-        self.auth, self.success, self.pending = None, False, []
+    def __init__(self, demo):
+        self.demo, self.auth, self.success, self.pending = demo, None, False, []
 
     def sent(self, payload):
         if not isinstance(payload, str) or not payload.startswith('42["auth"'):
@@ -32,7 +32,7 @@ class Socket:
         except (IndexError, KeyError, TypeError, ValueError, OverflowError):
             return
         if isinstance(token, str) and token and isinstance(uid, int) and not isinstance(uid, bool) and uid > 0:
-            self.auth, self.success = auth if mode == 0 else None, False
+            self.auth, self.success = auth if mode == self.demo else None, False
 
     def received(self, payload):
         if isinstance(payload, str):
@@ -47,7 +47,7 @@ class Socket:
 
 def browser(playwright, args, headless):
     return playwright.chromium.launch_persistent_context(
-        str(args.profile), executable_path=str(args.chrome), headless=headless,
+        str(args.profile), executable_path=args.chrome, headless=headless,
         viewport={"width": 1440, "height": 1000}, locale="en-US", accept_downloads=False,
     )
 
@@ -70,7 +70,7 @@ def capture(playwright, args):
         def opened(websocket):
             url = urlsplit(websocket.url)
             if url.scheme == "wss" and (url.hostname or "").endswith(".po.market") and url.path == "/socket.io/":
-                socket = Socket()
+                socket = Socket(args.account_class == "demo")
                 sockets.append(socket)
                 websocket.on("framesent", socket.sent)
                 websocket.on("framereceived", socket.received)
@@ -124,17 +124,19 @@ def main():
     config = Path(os.environ.get("XDG_CONFIG_HOME") or "~/.config").expanduser()
     parser.add_argument("--profile", type=Path, default=config / "binary-alpha/pocket-profile")
     parser.add_argument("--login-timeout", type=float, default=600, metavar="SECONDS")
-    parser.add_argument("--chrome", type=Path, default=Path("/usr/bin/google-chrome-stable"), metavar="PATH")
+    parser.add_argument("--account-class", choices=["real", "demo"], default="real")
+    parser.add_argument("--chrome", metavar="PATH", help="browser executable; default: Playwright's Chromium")
     args = parser.parse_args()
     try:
         os.umask(0o077)
         args.profile = args.profile.expanduser().resolve()
-        args.chrome = args.chrome.expanduser().resolve()
         args.profile.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         with open(str(args.profile) + ".lock", "a") as lock:
             fcntl.flock(lock, fcntl.LOCK_EX)
             args.profile.mkdir(exist_ok=True, mode=0o700)
             args.profile.chmod(0o700)
+            for name in ("DEBUG", "DEBUGP", "DEBUG_FILE", "PWDEBUG"):
+                os.environ.pop(name, None)  # Playwright's debug logging would echo the form values.
             from playwright.sync_api import sync_playwright
             with sync_playwright() as playwright:
                 auth = capture(playwright, args)

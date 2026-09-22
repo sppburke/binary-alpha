@@ -6,7 +6,9 @@ the code for a refresh token, creates the private archive root folder with that 
 BINARY_ALPHA_DRIVE_CREDENTIAL and BINARY_ALPHA_DRIVE_ROOT into the private env file. No secret
 is printed. Standard library only.
 
-Usage: drive_consent.py /path/to/client_secret_....json [--folder-name binary-alpha-archive]
+Usage: drive_consent.py /path/to/client_secret_....json [--folder-name binary-alpha-archive] [--env FILE]
+
+Run it once: it refuses an env file that already names BINARY_ALPHA_DRIVE_ROOT.
 """
 import http.server
 import json
@@ -25,10 +27,15 @@ SCOPE = "https://www.googleapis.com/auth/drive.file"
 def main() -> int:
     if len(sys.argv) < 2:
         raise SystemExit(__doc__)
-    client = json.load(open(sys.argv[1], encoding="utf-8"))
-    client = client.get("installed") or client.get("web") or client
+    client = json.load(open(sys.argv[1], encoding="utf-8"))["installed"]
     client_id, client_secret = client["client_id"], client["client_secret"]
-    folder_name = sys.argv[sys.argv.index("--folder-name") + 1] if "--folder-name" in sys.argv else "binary-alpha-archive"
+    option = lambda name, default: sys.argv[sys.argv.index(name) + 1] if name in sys.argv else default
+    folder_name = option("--folder-name", "binary-alpha-archive")
+    env = option("--env", ENV)
+    os.makedirs(os.path.dirname(env), mode=0o700, exist_ok=True)
+    lines = open(env, encoding="utf-8").read().splitlines() if os.path.exists(env) else []
+    if any(line.startswith("BINARY_ALPHA_DRIVE_ROOT=") for line in lines):
+        raise SystemExit(f"{env} already names BINARY_ALPHA_DRIVE_ROOT; remove it to consent again")
 
     state = secrets.token_urlsafe(16)
     code_holder = {}
@@ -90,7 +97,6 @@ def main() -> int:
     )))
 
     credential = json.dumps({"client_id": client_id, "client_secret": client_secret, "refresh_token": refresh}, separators=(",", ":"))
-    lines = open(ENV, encoding="utf-8").read().splitlines()
     updated = []
     seen = set()
     for line in lines:
@@ -106,11 +112,10 @@ def main() -> int:
         updated.append("BINARY_ALPHA_DRIVE_CREDENTIAL='" + credential + "'")
     if "BINARY_ALPHA_DRIVE_ROOT" not in seen:
         updated.append("BINARY_ALPHA_DRIVE_ROOT='" + folder["id"] + "'")
-    tmp = ENV + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as handle:
+    tmp = env + ".tmp"
+    with os.fdopen(os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), "w", encoding="utf-8") as handle:
         handle.write("\n".join(updated) + "\n")
-    os.chmod(tmp, 0o600)
-    os.replace(tmp, ENV)
+    os.replace(tmp, env)
     print(f"Drive consent stored; archive root folder '{folder['name']}' created (id written to the env file).", file=sys.stderr)
     return 0
 
