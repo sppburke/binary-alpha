@@ -1114,6 +1114,28 @@ fn assert_candle_rows(
 }
 
 #[test]
+fn pocket_candle_page_without_rows_decodes_as_the_end_of_history() {
+    // Observed 2026-09-22 on the real endpoint: `{"asset":"EURUSD_otc","index":…,"data":[],"period":5}`.
+    let clock = FakeClock::at(1_789_348_000_000_000);
+    let mut frames = handshake();
+    frames.extend(attachment(
+        "loadHistoryPeriodFast",
+        pocket_candle_page(0, &[]),
+    ));
+    let (mut adapter, _) = candle_adapter(vec![frames], &clock, Some(3));
+    let instrument = &pocket_ids()[0];
+    let granularity = NativeGranularity::Bar { period_seconds: 5 };
+    let page = adapter
+        .history_page(instrument, scale(5), Some(2_000_000_000), granularity)
+        .unwrap();
+    assert_eq!(
+        adapter
+            .decode_history(instrument, &page.raw, scale(5), granularity)
+            .unwrap(),
+        (None, HistoryRows::Bars(vec![]))
+    );
+}
+#[test]
 fn pocket_candle_prefetch_walk_batches_requests_and_preserves_each_page() {
     let clock = FakeClock::at(1_789_348_000_000_000);
     let index = 0;

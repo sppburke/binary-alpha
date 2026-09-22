@@ -704,13 +704,14 @@ impl PocketMarketData {
     /// seconds, every row must carry one constant provider
     /// identifier, whole-second grid-aligned starts and finite consistent prices, and every
     /// price must convert exactly to units at `scale` both as decimal text and as the archive's
-    /// binary floating point.
+    /// binary floating point. A page without rows is the provider's end of history and carries
+    /// no identifier.
     fn decode_candles(
         &self,
         instrument: &InstrumentId,
         raw: &[u8],
         scale: PriceScale,
-    ) -> Result<(i32, Vec<Bar>), String> {
+    ) -> Result<(Option<i32>, Vec<Bar>), String> {
         let response: CandleHistory = serde_json::from_slice(raw)
             .map_err(|_| "pocket_option: malformed candle history or row shape")?;
         if response.asset != instrument.provider_symbol.as_str() {
@@ -776,7 +777,6 @@ impl PocketMarketData {
                 .map_err(|reason| format!("pocket_option: {reason}"))?;
             bars.push(bar);
         }
-        let symbol_id = symbol_id.ok_or("pocket_option: candle history page holds no rows")?;
         Ok((symbol_id, bars))
     }
 }
@@ -874,7 +874,7 @@ impl MarketDataBroker for PocketMarketData {
     ) -> Result<(Option<i32>, HistoryRows), String> {
         if granularity != NativeGranularity::Tick {
             let (symbol_id, rows) = self.decode_candles(instrument, raw, scale)?;
-            return Ok((Some(symbol_id), HistoryRows::Bars(rows)));
+            return Ok((symbol_id, HistoryRows::Bars(rows)));
         }
         // A retained tick page is the older shape when it carries `data`, else the initial one.
         let rows = match serde_json::from_slice::<OlderHistory>(raw) {
