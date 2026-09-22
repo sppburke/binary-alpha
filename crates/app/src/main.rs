@@ -5,7 +5,7 @@
 
 use binary_alpha_app::{
     audit, data_pipeline, features, fetch, import, inspect, live, load_config, outcomes, portfolio,
-    replay, research, search, verify,
+    replay, research, search, split, verify,
 };
 
 use std::path::{Path, PathBuf};
@@ -220,6 +220,11 @@ enum BrokerCommand {
 
 #[derive(Subcommand)]
 enum DataCommand {
+    /// Cut whole-day research populations and publish their governance declaration.
+    Split {
+        #[arg(long)]
+        config: PathBuf,
+    },
     /// Fetch and publish bounded broker tick history.
     Fetch {
         #[arg(long)]
@@ -404,6 +409,9 @@ fn main() -> ExitCode {
         Command::Config {
             command: ConfigCommand::Validate { config },
         } => validate(&config).map(|report| print!("{report}")),
+        Command::Data {
+            command: DataCommand::Split { config },
+        } => split::run(&config, &mut std::io::stdout().lock()),
         Command::Data {
             command: DataCommand::Import { config },
         } => import::run(&config, &mut std::io::stdout().lock()),

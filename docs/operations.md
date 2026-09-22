@@ -94,17 +94,17 @@ without replacing anything. A generation whose identity no instrument maps is an
 instrument is ever defaulted, and a holdout generation is refused. Verify a stream generation
 with the same `data verify` command.
 
-Outcomes: declare the `[outcomes]` table (the role, the tick and feature ready manifests, the
+Outcomes: declare the `[outcomes]` table (the role, the observation and feature ready manifests, the
 expiries, and the label thresholds; see [docs/contracts.md](contracts.md), section "Outcomes"),
 then run `binary-alpha outcomes build --config PATH`. The command reads both generations from the
 stores their manifests name, verifies every object as it reads it, labels every decision row
-against the complete tick generation, retains the arrays and matrices in the historical-data
-folder, publishes them to `storage.publication_uri`, reconstructs the generation from the
-published objects, and publishes and mirrors the manifest last. It is resumable and idempotent
-the same way import is. A declared holdout role, a holdout or bar generation, and a feature
-generation computed from another tick generation are refused before any row is read. Verify an
+against the complete observation generation under the [outcome binding](contracts.md#outcomes),
+retains the arrays and matrices in the historical-data folder, publishes them to
+`storage.publication_uri`, reconstructs the generation from the published objects, and publishes and mirrors the manifest last. It is resumable and idempotent
+the same way import is. A declared holdout role, an unauthorized holdout generation, and a feature
+generation computed from another observation generation are refused before any row is read. Verify an
 outcome generation with the same `data verify` command, which recomputes every label from the
-published ticks and reference times.
+published observations and reference times.
 
 Replay: declare the `[replay]` table (the role and decision window, the tick, feature, and
 optional outcome ready manifests per instrument, the funded accounts, strategies, ordered
@@ -136,7 +136,25 @@ selection, and the rerun reuses every completed generation after its own verifie
 Verify a selection with the same `data verify` command, which restores every referenced replay.
 Selection performs no broker, live, paper, or production action and needs no operator task.
 
-Research: author the non-sensitive governance declaration from authorized records (operator,
+Cut research roles: declare `[split]` with a namespace, one development daily-root source per
+instrument, and whole-day development, evaluation, and holdout windows. Run
+`binary-alpha data split --config PATH` with a retained folder and destination outside the source
+stores and managed pipeline stores. Use the reviewed `storage.publication_uri` on Google Cloud
+Storage with existing credentials for real holdout authority; local publication is for fixtures.
+The command prints the bounded generations and their governance declaration location.
+
+Give the source one development window and make its search window equal to that range: historical
+replay refuses feature decisions outside the search window. For each fold, give the fit a window
+ending at its cutoff and the assessment a window equal to its decision window, with the start
+at least the embargo after the cutoff. Give the refit its own fit window; an identical source
+window reuses the same generation. Reserve one disjoint evaluation window and one disjoint
+holdout window per attempt, because each day's token is claimed once. Name these generations
+and the printed declaration in the research configuration. The unsliced root is never a research
+input. This command requires no production operator task or downtime; matching Sentry issues:
+none. It provisions no bucket and changes no broker, archive, or managed store.
+
+Research: use the declaration from `data split`, or author a non-sensitive governance declaration
+from authorized records (operator,
 authoritative root, namespace, and every population with its role, instrument, source, coverage,
 generation aliases, sorted stable conflict tokens, and exposure history; see
 [docs/contracts.md](contracts.md), section "Research") and publish it at the location

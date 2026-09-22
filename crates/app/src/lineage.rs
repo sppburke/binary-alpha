@@ -981,7 +981,7 @@ fn retain_file(
     fs::remove_file(path).map_err(err)?;
     Ok(import::record(role, logical, &id))
 }
-fn metadata(
+pub(crate) fn metadata(
     local: &Store,
     logical: &str,
     value: &impl serde::Serialize,

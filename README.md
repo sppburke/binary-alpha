@@ -31,6 +31,7 @@ BINARY_ALPHA_NVCC=/home/sean/.local/cuda/13.4.1/bin/nvcc BINARY_ALPHA_HOST_COMPI
 cargo run --locked -p binary-alpha-app -- --help
 cargo run --locked -p binary-alpha-app -- config validate --config configs/example.toml
 cargo run --release --locked -p binary-alpha-app -- data import --config PATH
+cargo run --release --locked -p binary-alpha-app -- data split --config PATH
 cargo run --release --locked -p binary-alpha-app -- data fetch --config PATH
 cargo run --release --locked -p binary-alpha-app -- broker inspect --config PATH
 cargo run --release --locked -p binary-alpha-app -- data audit --config PATH --manifest URI
@@ -60,9 +61,9 @@ publishes its profile, one candle object per configured stream, and a stream man
 `binary-alpha features build --config PATH` resolves or applies one feature plan per
 `[[features.instruments]]` entry over a published stream generation and publishes the plan, rows,
 events, and encoded rows as a feature generation; `binary-alpha outcomes build --config PATH`
-labels every decision row of the `[outcomes]` feature generation against its tick generation and
-publishes the future-only outcome generation; `binary-alpha replay --config PATH` feeds the
-`[replay]` inputs through the engine with the configured simulation and publishes the ledger and
+labels every decision row of the `[outcomes]` feature generation against its observation generation
+under the [outcome binding](docs/contracts.md#outcomes) and publishes the future-only outcome generation;
+`binary-alpha replay --config PATH` feeds the `[replay]` inputs through the engine with the configured simulation and publishes the ledger and
 summary as a replay generation; `binary-alpha search --config PATH` enumerates, scores, replays,
 evaluates, and resamples one candidate family and publishes it; `binary-alpha portfolio optimize
 --config PATH` enumerates every declared complete joint policy over development-only families,

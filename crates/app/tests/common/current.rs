@@ -170,10 +170,19 @@ pub fn import(path: &Path) -> Result<Vec<String>, String> {
     }) {
         return super::import(path);
     }
+    import_config(&config, path.parent().unwrap())
+}
+
+/// Publishes invented consumer inputs from typed settings, including synthetic holdout bars.
+pub fn import_config(config: &Config, base: &Path) -> Result<Vec<String>, String> {
+    let sources = &config
+        .import
+        .as_ref()
+        .ok_or("fixture has no import sources")?
+        .sources;
     let PublicationUri::Filesystem(root) = &config.storage.publication_uri else {
         return Err("consumer fixtures require a local publication directory".into());
     };
-    let base = path.parent().unwrap();
     let retained = base.join(config.storage.historical_data_dir.as_path());
     fs::create_dir_all(root).map_err(|e| e.to_string())?;
     let mut manifests = Vec::new();

@@ -9,7 +9,7 @@ use serde::de::Error as _;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use sha2::{Digest, Sha256};
 
-use crate::dataset::{DatasetRole, NativeGranularity};
+use crate::dataset::{DatasetRole, NativeGranularity, coverage::CoverageRange, daily::DAY_MICROS};
 use crate::execution::{
     AccountSpec, Comparator, Condition, ContractTerms, Decimal, DeploymentBinding, Envelope,
     RateEvent, ReplayInput, RiskPolicy, Split, StrategySpec, Threshold,
@@ -32,6 +32,8 @@ pub struct Config {
     pub storage: Storage,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub import: Option<Import>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub split: Option<DataSplit>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub instruments: Vec<Instrument>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -85,6 +87,11 @@ impl Config {
                 "storage.publication_uri: a `file://` destination is the non-live test boundary and requires run_mode `research`, not `{}`",
                 self.run_mode.as_str()
             ));
+        }
+        if let Some(split) = &self.split {
+            split
+                .validate()
+                .map_err(|reason| format!("split.{reason}"))?;
         }
         for (index, instrument) in self.instruments.iter().enumerate() {
             instrument
@@ -2322,6 +2329,64 @@ impl Instrument {
     /// generation's identity hashes.
     pub fn canonical_toml(&self) -> String {
         toml::to_string(self).expect("a validated instrument serializes")
+    }
+}
+
+/// Whole-day research populations cut from development daily roots.
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct DataSplit {
+    pub namespace: String,
+    pub sources: Vec<ManifestUri>,
+    pub development: Vec<CoverageRange>,
+    pub evaluation: Vec<CoverageRange>,
+    pub holdout: Vec<CoverageRange>,
+}
+
+impl DataSplit {
+    fn validate(&self) -> Result<(), String> {
+        crate::research::identifier("namespace", &self.namespace)?;
+        if self.sources.is_empty() {
+            return Err("sources: at least one source is required".into());
+        }
+        for (index, source) in self.sources.iter().enumerate() {
+            if self.sources[..index].contains(source) {
+                return Err("sources: a source is declared twice".into());
+            }
+        }
+        self.windows().map(|_| ())
+    }
+
+    /// Validated, canonically spelled windows, coalescing identical development uses.
+    pub fn windows(&self) -> Result<Vec<(DatasetRole, CoverageRange)>, String> {
+        let mut windows: Vec<(DatasetRole, CoverageRange)> = Vec::new();
+        for (role, ranges) in [
+            (DatasetRole::Development, &self.development),
+            (DatasetRole::Evaluation, &self.evaluation),
+            (DatasetRole::Holdout, &self.holdout),
+        ] {
+            if ranges.is_empty() {
+                return Err(format!("{role}: at least one window is required"));
+            }
+            for range in ranges {
+                let (start, end) = range.bounds().map_err(|e| format!("{role}: {e}"))?;
+                if start.rem_euclid(DAY_MICROS) != 0 || end.rem_euclid(DAY_MICROS) != 0 {
+                    return Err(format!("{role}: window bounds must be UTC midnights"));
+                }
+                // Development is listed first, so its windows overlap only one another.
+                for (earlier_role, earlier) in &windows {
+                    let (a, b) = earlier.bounds()?;
+                    if start < b && a < end && role != DatasetRole::Development {
+                        return Err(format!("{role}: window overlaps {earlier_role}"));
+                    }
+                }
+                let range = CoverageRange::new(start, end);
+                if !windows.iter().any(|(r, w)| *r == role && *w == range) {
+                    windows.push((role, range));
+                }
+            }
+        }
+        Ok(windows)
     }
 }
 

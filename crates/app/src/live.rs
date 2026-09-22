@@ -529,6 +529,7 @@ impl Runtime {
                 "live warmup",
                 Access::ORDINARY,
             )?;
+            let scale = scale.ok_or("live: warmup requires tick generations")?;
             if manifest.instrument != definition.definition.instruments[index].instrument
                 || scale != definition.plans[index].price_scale
             {
