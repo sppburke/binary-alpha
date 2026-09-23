@@ -111,10 +111,12 @@ Verification runs `cargo fmt --all --check`,
 `cargo test --workspace --locked`, and `cargo build --workspace --locked`; the
 ordinary workflow in `.github/workflows/ci.yml` runs the default feature set and validates
 `configs/example.toml`. The separate `.github/workflows/cuda.yml` runs the CUDA-enabled locked
-build, static analysis, device tests, and governed parity on the registered NVIDIA runner.
+build, static analysis, device tests, governed parity, and governed candidate evaluation on the
+registered NVIDIA runner.
 
 The repository-only runner `binary-alpha-cuda-quantum` uses actions/runner `2.337.0` on `quantum`
-with labels `self-hosted`, `linux`, `x64`, and `binary-alpha-cuda-quantum`. The workflow supplies
+with labels `self-hosted`, `linux`, `x64`, and `binary-alpha-cuda-quantum`; that runner version
+supports the workflow's background and parallel steps. The workflow supplies
 `BINARY_ALPHA_NVCC=/home/sean/.local/cuda/13.4.1/bin/nvcc`,
 `BINARY_ALPHA_HOST_COMPILER=/usr/bin/gcc`,
 `BINARY_ALPHA_TEST_CONFIG=/mnt/data/issue-7-scratch/phase06_test_config.json`, and

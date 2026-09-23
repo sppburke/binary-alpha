@@ -5,6 +5,13 @@ on:
     branches: [main]
   pull_request:
 
+# The device checks run on one self-hosted runner, so the job overlaps its own work. The governed
+# checks need their own release build and then run mostly on one processor core, so after the
+# compiler checks they run in the background, in order, beside the debug build, lint, and tests;
+# Cargo locks each profile's build directory separately. Cargo releases its lock before running
+# tests, so the debug tests run as a parallel group balanced by measured runtime: the two longest
+# integration tests alone, and every other target Cargo tests by default, including any new one,
+# together.
 jobs:
   device:
     runs-on: [self-hosted, linux, x64, binary-alpha-cuda-quantum]
@@ -19,15 +26,28 @@ jobs:
         run: |
           "$BINARY_ALPHA_NVCC" --version | grep -F "V13.4.59"
           "$BINARY_ALPHA_HOST_COMPILER" --version | grep -F " 13.3.0"
-      - run: cargo build --workspace --locked --features binary-alpha-app/cuda
-      - run: cargo clippy --workspace --all-targets --locked --features binary-alpha-app/cuda -- -D warnings
-      - run: cargo test --workspace --locked --features binary-alpha-app/cuda
-      - name: Governed device parity
-        run: cargo test --release --locked -p binary-alpha-app --features cuda --test phase07_cuda_parity governed_parity -- --exact --ignored --nocapture
+      - name: Governed device parity and candidate evaluation
+        id: governed
+        background: true
+        run: |
+          cargo test --release --locked -p binary-alpha-app --features cuda --test phase07_cuda_parity governed_parity -- --exact --ignored --nocapture
+          cargo test --release --locked -p binary-alpha-app --features cuda --test phase08_candidate_evaluation governed_candidate_evaluation -- --exact --ignored --nocapture
         env:
           BINARY_ALPHA_TEST_CONFIG: /mnt/data/issue-7-scratch/phase06_test_config.json
           BINARY_ALPHA_CUDA_REFERENCE: /mnt/data/binary-alpha-phase07-reference/attempt5/reference.json
-      - name: Governed candidate evaluation
-        run: cargo test --release --locked -p binary-alpha-app --features cuda --test phase08_candidate_evaluation governed_candidate_evaluation -- --exact --ignored --nocapture
-        env:
-          BINARY_ALPHA_TEST_CONFIG: /mnt/data/issue-7-scratch/phase06_test_config.json
+      - run: cargo build --workspace --locked --features binary-alpha-app/cuda
+      - run: cargo clippy --workspace --all-targets --locked --features binary-alpha-app/cuda -- -D warnings
+      - run: cargo test --workspace --locked --features binary-alpha-app/cuda --no-run
+      - parallel:
+          - name: Test data_pipeline
+            run: cargo test --workspace --locked --features binary-alpha-app/cuda --test data_pipeline
+          - name: Test phase12_live_runtime
+            run: cargo test --workspace --locked --features binary-alpha-app/cuda --test phase12_live_runtime
+          - name: Test every other target
+            shell: bash
+            run: |
+              # Every target `cargo test` runs by default, as Cargo's own `test` flag marks it.
+              others=$(cargo metadata --no-deps --format-version 1 --locked | jq -r '[.packages[].targets[] | select(.test and (.kind != ["test"] or (.name != "data_pipeline" and .name != "phase12_live_runtime"))) | if .kind == ["test"] or .kind == ["bin"] or .kind == ["example"] or .kind == ["bench"] then "--\(.kind[0])=\(.name)" else "--lib" end] | unique | .[]')
+              cargo test --workspace --locked --features binary-alpha-app/cuda $others
+              cargo test --workspace --locked --features binary-alpha-app/cuda --doc
+      - wait: governed
