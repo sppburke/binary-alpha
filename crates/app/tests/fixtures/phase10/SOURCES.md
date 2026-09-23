@@ -1,6 +1,6 @@
 # Phase 10 fixture sources
 
-Retained evidence root: `/mnt/data/binary-alpha-evidence/phase10-public-20260914T000736Z-gtovasc1`.
+Evidence root at capture: `/mnt/data/binary-alpha-evidence/phase10-public-20260914T000736Z-gtovasc1`, deleted on 2026-09-23 after the work completed. The origin paths below are relative to it; the fixtures in this directory and their SHA-256 values are now the only copy.
 
 Provider numeric token spelling is preserved. Deriv original raw frame strings are copied with only subscription identities replaced by synthetic labels. Pocket Option payloads reconstruct the selected retained provider fields; logger fields are omitted and `response_period` is restored to `period`. Handshake frames, account bootstrap frames, second-scale fixtures, and all faults created by tests are synthetic.
 
