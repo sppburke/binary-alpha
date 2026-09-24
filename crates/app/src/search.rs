@@ -212,10 +212,10 @@ fn tuple_batches(
     offsets: &[i32],
     count: usize,
     settings: &Search,
+    batch_size: usize,
     driver_visits: &mut usize,
     mut consume: impl FnMut(&[SparseBatch]) -> Result<(), String>,
 ) -> Result<(), String> {
-    const BATCH: usize = 1024;
     const GROUP: usize = 16;
     let mut group = Vec::new();
     let mut batch = SparseBatch {
@@ -247,7 +247,7 @@ fn tuple_batches(
         *driver_visits += (offsets[driver as usize + 1] - offsets[driver as usize]) as usize;
         batch.drivers.push(driver);
         batch.offsets.push(batch.features.len() as i32);
-        if batch.globals.len() == BATCH {
+        if batch.globals.len() == batch_size {
             group.push(std::mem::replace(
                 &mut batch,
                 SparseBatch {
@@ -271,6 +271,98 @@ fn tuple_batches(
     Ok(())
 }
 
+/// Test instrumentation for subprocess gates: `BINARY_ALPHA_TEST_SCREEN_BATCH` and
+/// `BINARY_ALPHA_TEST_COLUMN_BUDGET` bound scoring, while
+/// `BINARY_ALPHA_TEST_SCREEN_DIGEST` writes the final scoring population's digests.
+/// Ordinary searches use the fixed production limits and do not write a digest.
+fn test_screen_limit(name: &str) -> Result<Option<usize>, String> {
+    std::env::var(name)
+        .ok()
+        .map(|value| {
+            value
+                .parse::<usize>()
+                .ok()
+                .filter(|&limit| limit > 0)
+                .ok_or_else(|| format!("{name}: expected a positive integer"))
+        })
+        .transpose()
+}
+
+/// Test-only digest of the complete screening population; the published schema-2 object keeps
+/// only survivors. Separate raw, BH-order, and survivor digests make CUDA/CPU parity explicit
+/// without allocating a large JSON snapshot in the release scale gate.
+fn test_screen_digest(compact: &[search::CompactMember], survivors: &[u64]) -> Result<(), String> {
+    let Ok(path) = std::env::var("BINARY_ALPHA_TEST_SCREEN_DIGEST") else {
+        return Ok(());
+    };
+    let mut raw = Sha256::new();
+    for member in compact {
+        for count in [
+            member.raw.total,
+            member.raw.wins,
+            member.raw.losses,
+            member.raw.ties,
+            member.raw.invalid,
+        ] {
+            raw.update(count.to_le_bytes());
+        }
+        raw.update(
+            member
+                .score
+                .map(f64::to_bits)
+                .unwrap_or(u64::MAX)
+                .to_le_bytes(),
+        );
+        raw.update(
+            member
+                .adjusted
+                .map(f64::to_bits)
+                .unwrap_or(u64::MAX)
+                .to_le_bytes(),
+        );
+    }
+    let mut order: Vec<usize> = (0..compact.len())
+        .filter(|&index| compact[index].score.is_some())
+        .collect();
+    order.sort_by(|&left, &right| {
+        compact[left]
+            .score
+            .unwrap()
+            .partial_cmp(&compact[right].score.unwrap())
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then(left.cmp(&right))
+    });
+    let mut bh = Sha256::new();
+    for index in order {
+        bh.update((index as u64).to_le_bytes());
+    }
+    let mut retained = Sha256::new();
+    for &index in survivors {
+        retained.update(index.to_le_bytes());
+    }
+    let digest = serde_json::json!({
+        "members": compact.len(),
+        "raw_and_adjusted": binary_alpha_engine::hex(&raw.finalize()),
+        "bh_order": binary_alpha_engine::hex(&bh.finalize()),
+        "survivors": binary_alpha_engine::hex(&retained.finalize()),
+        "survivor_count": survivors.len(),
+    });
+    fs::write(
+        &path,
+        serde_json::to_vec(&digest).expect("test digest serializes"),
+    )
+    .map_err(|error| format!("cannot write test screen digest {path}: {error}"))
+}
+
+fn screen_compact(
+    compact: &mut [search::CompactMember],
+    settings: &Search,
+) -> Result<(u64, Vec<u64>), String> {
+    let result = search::screen_compact(compact, &settings.contracts, settings.screen.as_ref());
+    test_screen_digest(compact, &result.1)?;
+    Ok(result)
+}
+
 /// Wall-clock stages of one run, outside every identity.
 #[derive(Default)]
 struct Clock {
@@ -281,6 +373,7 @@ struct Clock {
     stability: Duration,
     publish: Duration,
     columns: usize,
+    blocks: usize,
     tuples: usize,
     list_entries: usize,
     construction_visits: usize,
@@ -433,8 +526,7 @@ pub fn family(
                 .map(|section| section.devices.as_slice()),
             &mut clock,
         )?;
-        let (applicable, survivors) =
-            search::screen_compact(&mut compact, &settings.contracts, settings.screen.as_ref());
+        let (applicable, survivors) = screen_compact(&mut compact, settings)?;
         for global in survivors {
             let mut member =
                 streamed_member(global, settings, &development.plan_identity, conditions)?;
@@ -646,7 +738,7 @@ pub fn family(
     let line = match put {
         Put::Reused(_) => format!("{report} (already published)"),
         Put::Created(_) => format!(
-            "{report} [load {:.3}s lowering {:.3}s device upload {:.3}s execute {:.3}s download {:.3}s bytes {} replay {:.3}s stability {:.3}s publish {:.3}s] columns {} tuples {} list_entries {} construction_visits {} validation_visits {} driver_visits {} transfer_bytes {} peak_rss_kb {}",
+            "{report} [load {:.3}s lowering {:.3}s device upload {:.3}s execute {:.3}s download {:.3}s bytes {} replay {:.3}s stability {:.3}s publish {:.3}s] columns {} blocks {} tuples {} list_entries {} construction_visits {} validation_visits {} driver_visits {} transfer_bytes {} peak_rss_kb {}",
             clock.load.as_secs_f64(),
             clock.lowering.as_secs_f64(),
             clock.device.upload.as_secs_f64(),
@@ -657,6 +749,7 @@ pub fn family(
             clock.stability.as_secs_f64(),
             clock.publish.as_secs_f64(),
             clock.columns,
+            clock.blocks,
             clock.tuples,
             clock.list_entries,
             clock.construction_visits,
@@ -1603,7 +1696,7 @@ fn score_streamed(
     #[cfg(feature = "cuda")]
     let mut budget = usize::MAX;
     #[cfg(not(feature = "cuda"))]
-    let budget = usize::MAX;
+    let mut budget = usize::MAX;
     #[cfg(feature = "cuda")]
     for (position, backend) in backends.iter().enumerate() {
         if let Backend::Cuda(device) = backend {
@@ -1617,15 +1710,19 @@ fn score_streamed(
     }
     #[cfg(not(feature = "cuda"))]
     let _ = (backends, device_ordinals);
+    budget =
+        budget.min(test_screen_limit("BINARY_ALPHA_TEST_COLUMN_BUDGET")?.unwrap_or(usize::MAX));
+    let batch_size = test_screen_limit("BINARY_ALPHA_TEST_SCREEN_BATCH")?.unwrap_or(1024);
     let plan = kernels::plan_column_blocks(
         &lengths,
         rows,
         condition_slots(settings.max_conditions, conditions.len()),
-        1024,
+        batch_size,
         1,
         1,
         budget,
     )?;
+    clock.blocks = plan.blocks.len();
     let mut suffix_capacity = vec![0; plan.blocks.len() + 1];
     for block in (0..plan.blocks.len()).rev() {
         suffix_capacity[block] = suffix_capacity[block + 1] + plan.blocks[block].columns.len();
@@ -1674,7 +1771,7 @@ fn score_streamed(
                 }
                 clock.construction_visits += buckets.len() * ordered.len();
                 clock.list_entries += sparse_rows.len();
-                clock.validation_visits += offsets.len() + sparse_rows.len();
+                clock.validation_visits += (offsets.len() + sparse_rows.len()) * backends.len();
                 let keys = kernels::SparseKeys {
                     key_chrono_offsets: &offsets,
                     key_chrono_rows: &sparse_rows,
@@ -1809,6 +1906,7 @@ fn score_streamed(
                             &offsets,
                             conditions.len(),
                             settings,
+                            batch_size,
                             &mut clock.driver_visits,
                             |group| {
                                 let batches: Vec<_> = group
@@ -1836,6 +1934,7 @@ fn score_streamed(
                                 &offsets,
                                 conditions.len(),
                                 settings,
+                                batch_size,
                                 &mut clock.driver_visits,
                                 |group| {
                                     let mut scored = Vec::new();
@@ -2517,8 +2616,7 @@ fn verify_read_family_streamed(
         }
         scored
     };
-    let (applicable, survivors) =
-        search::screen_compact(&mut compact, &settings.contracts, settings.screen.as_ref());
+    let (applicable, survivors) = screen_compact(&mut compact, settings)?;
     if applicable != family.applicable
         || survivors
             != family

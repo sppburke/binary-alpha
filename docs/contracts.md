@@ -2186,6 +2186,10 @@ blocks, including row buffers, sparse lists and candidate/output allocations. Ca
 by nondecreasing block tuple in bounded batches; global combinatorial ranks place their counts
 in the compact whole-family array. CUDA batches follow a deterministic round robin over every
 configured `[accelerator] devices` entry; CPU uses the same sparse scorer.
+The created search report lists `columns C blocks K tuples T` before the visit counters.
+`validation_visits` counts sparse tuple-index entries once per constructed workspace: once
+for CPU, or once per configured CUDA device entry, including repeated device ordinals.
+Candidate-driver row visits are reported separately.
 
 The statistic of a member applies when `W = winning_net() >= 0`,
 `L = purchase() + loss.terminal_fee - loss.gross_return > 0`, and the tie nets exactly zero,

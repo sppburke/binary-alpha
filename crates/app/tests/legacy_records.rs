@@ -134,12 +134,15 @@ fn schema1_records_remain_verifiable() {
     let scratch = Scratch::new("legacy_schema1");
     copy_tree(&fixture, &scratch.root);
 
-    verify(&scratch, RUN);
-    for (generation, _) in FAMILIES {
-        verify(&scratch, generation);
-    }
-    verify(&scratch, SELECTION);
-    for (generation, _) in FEATURES {
+    let mut generations: Vec<_> = fs::read_dir(scratch.path("published/manifests"))
+        .unwrap()
+        .map(|entry| entry.unwrap())
+        .filter(|entry| entry.path().join("ready.json").is_file())
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .collect();
+    generations.sort();
+    assert_eq!(generations.len(), 45);
+    for generation in &generations {
         verify(&scratch, generation);
     }
 

@@ -1,0 +1,79 @@
+# Synthetic release gate for issue 54 Phase 2. This file is SHA-256 pinned by the ignored test.
+# All windows are whole UTC days, with five-second bars and end-exclusive role cuts.
+[gate]
+max_elapsed_seconds = 14400
+max_swap_growth_kb = 0
+base_bar_seconds = 5
+streams_seconds = [5, 15, 30, 60, 300, 900, 3600]
+expiries_seconds = [30, 45, 60, 90, 120, 180, 240, 300]
+
+[search]
+rolling_windows = [4, 8, 16, 32]
+moving_average_periods = [8, 21, 50]
+max_labels = 32
+max_candidates = 40000000
+max_conditions = 2
+screen_top = 8
+chunk_size = 8
+stability_simulations = 16
+portfolio_top = 8
+generated_output = "*"
+
+[minimum]
+resolved_conditions = 1119
+members = 10000000
+screened_survivors = 1
+folds = 1
+scenarios = 3
+candidate_driver_row_visits = 1000000000
+projected_columns = 1119
+block_tuples = 1
+sparse_list_entries = 1
+construction_visits = 4969434240
+validation_visits = 1
+transfer_bytes = 1
+
+[roles.development]
+days = 257
+minimum_rows = 4440960
+complete_feature_builds = 1
+complete_replays = 1
+
+[roles.fold_fit]
+days = 128
+minimum_rows = 2211840
+complete_feature_builds = 1
+complete_replays = 0
+
+[roles.fold_assessment]
+days = 64
+minimum_rows = 1105920
+complete_feature_builds = 1
+complete_replays = 1
+
+[roles.refit]
+days = 257
+minimum_rows = 4440960
+complete_feature_builds = 1
+complete_replays = 0
+
+[roles.evaluation]
+days = 185
+minimum_rows = 3196800
+complete_feature_builds = 1
+complete_replays = 3
+
+[roles.certification]
+days = 49
+minimum_rows = 846720
+complete_feature_builds = 1
+complete_replays = 3
+
+[stability]
+# Conservative full base-row bounds: simulations * rows * 8 bytes, per role.
+development_bytes = 568442880
+fold_fit_bytes = 283115520
+fold_assessment_bytes = 141557760
+refit_bytes = 568442880
+evaluation_bytes = 409190400
+certification_bytes = 108380160

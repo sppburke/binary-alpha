@@ -1178,7 +1178,6 @@ fn generated_schema_two_search_projects_lowers_and_publishes_empty_family() {
             "tuples",
             "list_entries",
             "construction_visits",
-            "validation_visits",
             "driver_visits",
         ] {
             assert_eq!(
@@ -1187,6 +1186,10 @@ fn generated_schema_two_search_projects_lowers_and_publishes_empty_family() {
                 "{name}"
             );
         }
+        assert_eq!(
+            search_counter(&duplicate_lines[0], "validation_visits"),
+            2 * search_counter(&cpu_lines[0], "validation_visits")
+        );
         assert!(
             search_counter(&duplicate_lines[0], "transfer_bytes")
                 > search_counter(&cuda_lines[0], "transfer_bytes")

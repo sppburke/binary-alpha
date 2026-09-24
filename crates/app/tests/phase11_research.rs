@@ -20,7 +20,7 @@ use binary_alpha_engine::dataset::{DatasetRole, GenerationManifest, Layout, mani
 use binary_alpha_engine::execution::{
     Comparator, Decimal, EventKind, FinancialEvent, Summary, Threshold,
 };
-use binary_alpha_engine::features::{FeatureManifest, FeaturePlan};
+use binary_alpha_engine::features::{FeatureManifest, FeaturePlan, ProjectionKind};
 use binary_alpha_engine::portfolio::{
     Selection, SelectionManifest, State, selection_generation_id,
 };
@@ -275,7 +275,7 @@ impl Fixture {
             instrument.features.min_history = Some(2);
             instrument.features.price_epsilon = Some("0".into());
             instrument.features.structure = Some(serde_json::from_value(serde_json::json!({
-                "swing_left":2,"swing_right":2,"rolling_windows":[2,3],"direction_window":2,
+                "swing_left":2,"swing_right":2,"rolling_windows":[2,3,4],"direction_window":2,
                 "trend_efficiency_threshold":0.35,"trend_min_abs_momentum_bps":3.0,
                 "range_efficiency_threshold":0.25,"compression_ratio_threshold":0.7,
                 "expanded_ratio_threshold":1.3,"extreme_ratio_threshold":1.8,
@@ -850,6 +850,107 @@ fn five_stream_generated_search_publishes_and_verifies_in_research() {
     }
 }
 
+fn reference_for_generation(published: &Path, generation: &str) -> String {
+    format!(
+        "file://{}",
+        published.join(manifest_key(generation)).display()
+    )
+}
+
+impl Fixture {
+    /// Build the development evidence and a standalone search from the wide research settings.
+    /// The caller may add a frozen evaluation input before running that search.
+    fn wide_standalone_setup(
+        &self,
+        mut standalone: Config,
+        path: &Path,
+        published: &Path,
+        development: &str,
+    ) -> (Config, Value, String, String, String) {
+        let uri = |generation: &str| {
+            format!(
+                "file://{}",
+                published.join(manifest_key(generation)).display()
+            )
+        };
+        write(path, standalone.canonical_toml());
+        let audit = cli(
+            &self.log(),
+            &[
+                "data",
+                "audit",
+                "--config",
+                path.to_str().unwrap(),
+                "--manifest",
+                development,
+            ],
+        )
+        .unwrap();
+        let profile = common::generation(audit.lines().next().unwrap());
+        cli(
+            &self.log(),
+            &["data", "verify", "--manifest", &uri(&profile)],
+        )
+        .unwrap();
+        let mut feature =
+            serde_json::to_value(&self.config.research.as_ref().unwrap().instruments[0].features)
+                .unwrap();
+        feature["role"] = "development".into();
+        feature["input_manifest"] = development.into();
+        feature["profile_manifest"] = uri(&profile).into();
+        standalone.features =
+            Some(serde_json::from_value(serde_json::json!({"instruments":[feature]})).unwrap());
+        write(path, standalone.canonical_toml());
+        let built = cli(
+            &self.log(),
+            &["features", "build", "--config", path.to_str().unwrap()],
+        )
+        .unwrap();
+        let fit = common::generation(built.lines().next().unwrap());
+        cli(&self.log(), &["data", "verify", "--manifest", &uri(&fit)]).unwrap();
+        standalone.features = None;
+        let mut outcomes =
+            serde_json::to_value(&self.config.research.as_ref().unwrap().instruments[0].outcomes)
+                .unwrap();
+        outcomes["role"] = "development".into();
+        outcomes["tick_manifest"] = development.into();
+        outcomes["feature_manifest"] = uri(&fit).into();
+        standalone.outcomes = Some(serde_json::from_value(outcomes).unwrap());
+        write(path, standalone.canonical_toml());
+        let built = cli(
+            &self.log(),
+            &["outcomes", "build", "--config", path.to_str().unwrap()],
+        )
+        .unwrap();
+        let outcome = common::generation(built.lines().next().unwrap());
+        cli(
+            &self.log(),
+            &["data", "verify", "--manifest", &uri(&outcome)],
+        )
+        .unwrap();
+        standalone.outcomes = None;
+        let mut search =
+            serde_json::to_value(&self.config.research.as_ref().unwrap().instruments[0].search)
+                .unwrap();
+        let start = search
+            .as_object_mut()
+            .unwrap()
+            .remove("decision_start")
+            .unwrap();
+        let end = search
+            .as_object_mut()
+            .unwrap()
+            .remove("decision_end")
+            .unwrap();
+        search["development"] = serde_json::json!({
+            "decision_start":start,"decision_end":end,
+            "inputs":[{"tick_manifest":development,"feature_manifest":uri(&fit),"outcome_manifest":uri(&outcome)}]
+        });
+        standalone.search = Some(serde_json::from_value(search.clone()).unwrap());
+        (standalone, search, profile, fit, outcome)
+    }
+}
+
 #[test]
 fn wide_research_daily_split_certifies_without_early_holdout_access() {
     let fixture = Fixture::wide_split("phase11_wide_daily_split");
@@ -867,90 +968,14 @@ fn wide_research_daily_split_certifies_without_early_holdout_access() {
             fixture.verify(&dataset.generation).unwrap();
         }
     }
-    let development = &fixture.config.research.as_ref().unwrap().instruments[0].source_manifest;
+    let development = fixture.config.research.as_ref().unwrap().instruments[0]
+        .source_manifest
+        .to_string();
     let mut standalone = binary_alpha_app::skeleton(&fixture.config);
     standalone.instruments = fixture.config.instruments.clone();
     let path = fixture.scratch.path("wide-standalone.toml");
-    write(&path, standalone.canonical_toml());
-    let audit = cli(
-        &fixture.log(),
-        &[
-            "data",
-            "audit",
-            "--config",
-            path.to_str().unwrap(),
-            "--manifest",
-            &development.to_string(),
-        ],
-    )
-    .unwrap();
-    let profile_generation = common::generation(audit.lines().next().unwrap());
-    let profile = format!(
-        "file://{}",
-        fixture
-            .published()
-            .join(manifest_key(&profile_generation))
-            .display()
-    );
-    fixture.verify(&profile_generation).unwrap();
-    let feature_settings = &fixture.config.research.as_ref().unwrap().instruments[0].features;
-    let mut feature = serde_json::to_value(feature_settings).unwrap();
-    feature["role"] = "development".into();
-    feature["input_manifest"] = development.to_string().into();
-    feature["profile_manifest"] = profile.clone().into();
-    standalone.features =
-        Some(serde_json::from_value(serde_json::json!({"instruments":[feature]})).unwrap());
-    write(&path, standalone.canonical_toml());
-    let built = cli(
-        &fixture.log(),
-        &["features", "build", "--config", path.to_str().unwrap()],
-    )
-    .unwrap();
-    let feature_generation = common::generation(built.lines().next().unwrap());
-    fixture.verify(&feature_generation).unwrap();
-    standalone.features = None;
-    let mut outcomes =
-        serde_json::to_value(&fixture.config.research.as_ref().unwrap().instruments[0].outcomes)
-            .unwrap();
-    outcomes["role"] = "development".into();
-    outcomes["tick_manifest"] = development.to_string().into();
-    outcomes["feature_manifest"] = format!(
-        "file://{}",
-        fixture
-            .published()
-            .join(manifest_key(&feature_generation))
-            .display()
-    )
-    .into();
-    standalone.outcomes = Some(serde_json::from_value(outcomes).unwrap());
-    write(&path, standalone.canonical_toml());
-    let built = cli(
-        &fixture.log(),
-        &["outcomes", "build", "--config", path.to_str().unwrap()],
-    )
-    .unwrap();
-    let outcome_generation = common::generation(built.lines().next().unwrap());
-    fixture.verify(&outcome_generation).unwrap();
-    standalone.outcomes = None;
-    let mut search =
-        serde_json::to_value(&fixture.config.research.as_ref().unwrap().instruments[0].search)
-            .unwrap();
-    let start = search
-        .as_object_mut()
-        .unwrap()
-        .remove("decision_start")
-        .unwrap();
-    let end = search
-        .as_object_mut()
-        .unwrap()
-        .remove("decision_end")
-        .unwrap();
-    search["development"] = serde_json::json!({
-        "decision_start":start,"decision_end":end,
-        "inputs":[{"tick_manifest":development,"feature_manifest":format!("file://{}", fixture.published().join(manifest_key(&feature_generation)).display()),
-            "outcome_manifest":format!("file://{}", fixture.published().join(manifest_key(&outcome_generation)).display())}]
-    });
-    standalone.search = Some(serde_json::from_value(search.clone()).unwrap());
+    let (mut standalone, mut search, _, _, _) =
+        fixture.wide_standalone_setup(standalone, &path, &fixture.published(), &development);
     write(&path, standalone.canonical_toml());
     let searched = cli(
         &fixture.log(),
@@ -1049,17 +1074,42 @@ fn wide_research_daily_split_certifies_without_early_holdout_access() {
                 .unwrap();
             assert!(summary.rows >= 5, "unfilled {duration}s@{offset}s stream");
             assert_eq!(fit.rows, summary.rows);
-            assert!(
-                stream
-                    .outputs
+            // §2a starts three rolling kinds at w=2, three at w=3, and three at w=4.
+            // All eleven are predictive, so all_supported gives each an automatic encoding.
+            for name in [
+                "return_std_2_bps",
+                "up_move_ratio_2",
+                "range_position_2",
+                "return_skew_3",
+                "trend_r2_3",
+                "trend_residual_3_bps",
+                "return_kurtosis_4",
+                "return_autocorr_4",
+                "sign_reversal_rate_4",
+                "range_overlap",
+                "candle_pattern",
+            ] {
+                assert!(
+                    stream.outputs.iter().any(|output| output.name == name),
+                    "{duration}s@{offset}s missing {name}"
+                );
+                let encodings: Vec<_> = stream
+                    .encodings
                     .iter()
-                    .any(|output| output.name == "return_std_2_bps")
-            );
-            assert!(stream.encodings.iter().any(|encoding| {
-                encoding.input == "return_std_2_bps"
-                    && encoding.output == "return_std_2_bps_auto_encoded"
-                    && encoding.automatic
-            }));
+                    .filter(|encoding| encoding.input == name)
+                    .collect();
+                assert_eq!(encodings.len(), 1, "{duration}s@{offset}s {name}");
+                assert_eq!(encodings[0].output, format!("{name}_auto_encoded"));
+                assert!(encodings[0].automatic);
+                assert_eq!(
+                    encodings[0].encoding,
+                    if name == "candle_pattern" {
+                        ProjectionKind::Category
+                    } else {
+                        ProjectionKind::DevelopmentFifths
+                    }
+                );
+            }
         }
         let family = Family::from_json(&fixture.object(&instrument.family, "family.json")).unwrap();
         assert_eq!(family.schema_version, 2);
@@ -1141,6 +1191,7 @@ fn wide_research_daily_split_certifies_without_early_holdout_access() {
             .min_win_rate,
         Some(decimal("0.1"))
     );
+    assert_eq!(run.outer.len(), 3);
     assert!(run.outer.iter().all(|result| {
         let projection = &result.outer.projection;
         let decisive = projection.wins.unwrap() + projection.losses.unwrap();
@@ -1184,6 +1235,284 @@ fn wide_research_daily_split_certifies_without_early_holdout_access() {
         assert_eq!(scenario.verdict, Verdict::Pass);
     }
     fixture.verify(&certification.generation).unwrap();
+}
+
+#[cfg(feature = "cuda")]
+fn wide_search_ready(fixture: &Fixture) -> Config {
+    let development = &fixture.config.research.as_ref().unwrap().instruments[0].source_manifest;
+    let mut standalone = binary_alpha_app::skeleton(&fixture.config);
+    standalone.instruments = fixture.config.instruments.clone();
+    let path = fixture.scratch.path("device-search-setup.toml");
+    write(&path, standalone.canonical_toml());
+    let audit = cli(
+        &fixture.log(),
+        &[
+            "data",
+            "audit",
+            "--config",
+            path.to_str().unwrap(),
+            "--manifest",
+            &development.to_string(),
+        ],
+    )
+    .unwrap();
+    let profile_generation = common::generation(audit.lines().next().unwrap());
+    let profile = format!(
+        "file://{}",
+        fixture
+            .published()
+            .join(manifest_key(&profile_generation))
+            .display()
+    );
+    let mut feature =
+        serde_json::to_value(&fixture.config.research.as_ref().unwrap().instruments[0].features)
+            .unwrap();
+    feature["role"] = "development".into();
+    feature["input_manifest"] = development.to_string().into();
+    feature["profile_manifest"] = profile.into();
+    standalone.features =
+        Some(serde_json::from_value(serde_json::json!({"instruments":[feature]})).unwrap());
+    write(&path, standalone.canonical_toml());
+    let built = cli(
+        &fixture.log(),
+        &["features", "build", "--config", path.to_str().unwrap()],
+    )
+    .unwrap();
+    let feature_generation = common::generation(built.lines().next().unwrap());
+    standalone.features = None;
+    let mut outcomes =
+        serde_json::to_value(&fixture.config.research.as_ref().unwrap().instruments[0].outcomes)
+            .unwrap();
+    outcomes["role"] = "development".into();
+    outcomes["tick_manifest"] = development.to_string().into();
+    outcomes["feature_manifest"] = format!(
+        "file://{}",
+        fixture
+            .published()
+            .join(manifest_key(&feature_generation))
+            .display()
+    )
+    .into();
+    standalone.outcomes = Some(serde_json::from_value(outcomes).unwrap());
+    write(&path, standalone.canonical_toml());
+    let built = cli(
+        &fixture.log(),
+        &["outcomes", "build", "--config", path.to_str().unwrap()],
+    )
+    .unwrap();
+    let outcome_generation = common::generation(built.lines().next().unwrap());
+    standalone.outcomes = None;
+    let mut search =
+        serde_json::to_value(&fixture.config.research.as_ref().unwrap().instruments[0].search)
+            .unwrap();
+    let start = search
+        .as_object_mut()
+        .unwrap()
+        .remove("decision_start")
+        .unwrap();
+    let end = search
+        .as_object_mut()
+        .unwrap()
+        .remove("decision_end")
+        .unwrap();
+    search["development"] = serde_json::json!({
+        "decision_start": start, "decision_end": end,
+        "inputs":[{"tick_manifest": development,
+            "feature_manifest": format!("file://{}", fixture.published().join(manifest_key(&feature_generation)).display()),
+            "outcome_manifest": format!("file://{}", fixture.published().join(manifest_key(&outcome_generation)).display())}]
+    });
+    standalone.search = Some(serde_json::from_value(search).unwrap());
+    standalone
+}
+
+/// The device job runs this on quantum for each change. Only process-local test knobs vary.
+#[cfg(feature = "cuda")]
+#[test]
+fn wide_search_batches_blocks_and_devices_have_exact_parity() {
+    let fixture = Fixture::wide_split("phase11_quantum_device_parity");
+    let base = wide_search_ready(&fixture);
+    let mut expected: Option<(Vec<u8>, Value, [u64; 6], u64)> = None;
+    for (device, devices) in [
+        ("cpu", vec![]),
+        ("cuda", vec![0]),
+        ("duplicate", vec![0, 0]),
+    ] {
+        for batch in [8, 16] {
+            let mut config = base.clone();
+            if !devices.is_empty() {
+                config.accelerator = Some(
+                    serde_json::from_value(serde_json::json!({
+                        "backend":"cuda", "devices":devices
+                    }))
+                    .unwrap(),
+                );
+            }
+            let label = format!("{device}-{batch}");
+            let config_path = fixture.scratch.path(&format!("{label}.toml"));
+            let digest_path = fixture.scratch.path(&format!("{label}-screen.json"));
+            write(&config_path, config.canonical_toml());
+            let result = Command::new(env!("CARGO_BIN_EXE_binary-alpha"))
+                .args(["search", "--config", config_path.to_str().unwrap()])
+                .env("BINARY_ALPHA_TEST_SCREEN_BATCH", batch.to_string())
+                .env("BINARY_ALPHA_TEST_COLUMN_BUDGET", "45000")
+                .env("BINARY_ALPHA_TEST_SCREEN_DIGEST", &digest_path)
+                .output()
+                .unwrap();
+            assert!(
+                result.status.success(),
+                "{label}: {}",
+                String::from_utf8_lossy(&result.stderr)
+            );
+            let report = String::from_utf8(result.stdout).unwrap();
+            let generation = common::generation(report.lines().next().unwrap());
+            let family_bytes = fixture.object(&generation, "family.json");
+            let digest: Value = serde_json::from_slice(&fs::read(digest_path).unwrap()).unwrap();
+            let first = report.lines().next().unwrap();
+            let counter = |name: &str| -> u64 {
+                let words: Vec<_> = first.split_whitespace().collect();
+                words.windows(2).find(|pair| pair[0] == name).unwrap()[1]
+                    .parse()
+                    .unwrap()
+            };
+            assert!(digest["members"].as_u64().unwrap() > batch);
+            let counters = (batch == 8).then(|| {
+                assert!(counter("blocks") >= 3, "{label}: {report}");
+                (
+                    [
+                        "columns",
+                        "blocks",
+                        "tuples",
+                        "list_entries",
+                        "construction_visits",
+                        "driver_visits",
+                    ]
+                    .map(counter),
+                    counter("validation_visits"),
+                )
+            });
+            if let Some((bytes, reference, reference_counters, cpu_validation)) = &expected {
+                assert_eq!(&family_bytes, bytes, "family.json {label}");
+                assert_eq!(&digest, reference, "whole-family raw/BH/survivor {label}");
+                if let Some((counters, validation)) = counters {
+                    assert_eq!(
+                        &counters, reference_counters,
+                        "non-transfer counters {label}"
+                    );
+                    assert_eq!(
+                        validation,
+                        if device == "duplicate" {
+                            2 * cpu_validation
+                        } else {
+                            *cpu_validation
+                        },
+                        "workspace validations {label}"
+                    );
+                }
+            } else {
+                let (counters, validation) = counters.expect("first search is created");
+                assert!(validation > 0, "CPU workspace validations");
+                expected = Some((family_bytes, digest, counters, validation));
+            }
+            println!("{label}: {report}");
+        }
+    }
+}
+
+/// Manual release gate: the object contains only retained records while the manifest binds
+/// the entire ten-million-member search population.
+#[cfg(feature = "cuda")]
+#[test]
+#[ignore]
+fn quantum_ten_million_member_schema_two_family() {
+    use binary_alpha_engine::execution::Direction;
+    let fixture = Fixture::wide_split("phase11_quantum_ten_million");
+    let mut config = wide_search_ready(&fixture);
+    let search = config.search.as_mut().unwrap();
+    let stream = search.base_stream;
+    search.min_conditions = 2;
+    search.max_conditions = 2;
+    search.max_candidates = 10_100_000;
+    search.screen.as_mut().unwrap().top = Some(8);
+    search.conditions = vec![SearchCondition::Named(
+        binary_alpha_engine::config::NamedSearchCondition {
+            stream,
+            output: "range_bps".into(),
+            comparator: Comparator::Gt,
+            thresholds: (0..1119)
+                .map(|index| Threshold::Number(1_000_000.0 + index as f64))
+                .collect(),
+        },
+    )];
+    let template = search.contracts[0].clone();
+    search.contracts = (0..16)
+        .map(|index| {
+            let mut contract = template.clone();
+            contract.id = format!("synthetic-{index}");
+            contract.direction = if index % 2 == 0 {
+                Direction::Buy
+            } else {
+                Direction::Sell
+            };
+            contract.win.gross_return = decimal(&format!("1.{:02}", 80 + index));
+            contract
+        })
+        .collect();
+    config.accelerator =
+        Some(serde_json::from_value(serde_json::json!({"backend":"cuda","devices":[0]})).unwrap());
+    let path = fixture.scratch.path("ten-million.toml");
+    write(&path, config.canonical_toml());
+    let started = Instant::now();
+    let result = Command::new(env!("CARGO_BIN_EXE_binary-alpha"))
+        .args(["search", "--config", path.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let report = String::from_utf8(result.stdout).unwrap();
+    assert!(
+        report.lines().next().unwrap().contains(" blocks 1 "),
+        "{report}"
+    );
+    let generation = common::generation(report.lines().next().unwrap());
+    let manifest: binary_alpha_engine::search::FamilyManifest = serde_json::from_slice(
+        &fs::read(fixture.published().join(manifest_key(&generation))).unwrap(),
+    )
+    .unwrap();
+    assert!(manifest.members >= 10_000_000, "{report}");
+    let bytes = fixture.object(&generation, "family.json");
+    let family = Family::from_json(&bytes).unwrap();
+    assert_eq!(family.schema_version, 2);
+    assert!(
+        bytes.len() < 10_000_000,
+        "schema-2 object {} bytes",
+        bytes.len()
+    );
+    let verified = command(&[
+        "data",
+        "verify",
+        "--config",
+        path.to_str().unwrap(),
+        "--manifest",
+        &format!(
+            "file://{}",
+            fixture
+                .published()
+                .join(manifest_key(&generation))
+                .display()
+        ),
+    ])
+    .unwrap();
+    assert!(verified[0].starts_with("verified search generation "));
+    println!(
+        "ten-million report: {report} elapsed {:.3}s members {} family_bytes {} survivors {}",
+        started.elapsed().as_secs_f64(),
+        manifest.members,
+        bytes.len(),
+        family.members.len()
+    );
 }
 
 #[test]
@@ -1263,65 +1592,11 @@ fn wide_research_without_holdout_evaluates_a_frozen_search_family() {
     let mut standalone = binary_alpha_app::skeleton(&fixture.config);
     standalone.storage = split.storage;
     standalone.instruments = fixture.config.instruments.clone();
-    write(&path, standalone.canonical_toml());
-    let audit = cli(
-        &fixture.log(),
-        &[
-            "data",
-            "audit",
-            "--config",
-            path.to_str().unwrap(),
-            "--manifest",
-            &development,
-        ],
-    )
-    .unwrap();
-    let generated_uri = |report: &str| {
-        format!(
-            "file://{}",
-            published
-                .join(manifest_key(&common::generation(
-                    report.lines().next().unwrap()
-                )))
-                .display()
-        )
-    };
-    let profile = generated_uri(&audit);
+    let (mut standalone, mut search, profile_generation, fit_generation, _) =
+        fixture.wide_standalone_setup(standalone, &path, &published, &development);
+    let profile = reference_for_generation(&published, &profile_generation);
+    let fit = reference_for_generation(&published, &fit_generation);
     let verify = |uri: &str| command(&["data", "verify", "--manifest", uri]).unwrap();
-    verify(&profile);
-    let mut feature =
-        serde_json::to_value(&fixture.config.research.as_ref().unwrap().instruments[0].features)
-            .unwrap();
-    feature["role"] = "development".into();
-    feature["input_manifest"] = development.clone().into();
-    feature["profile_manifest"] = profile.clone().into();
-    standalone.features =
-        Some(serde_json::from_value(serde_json::json!({"instruments":[feature]})).unwrap());
-    write(&path, standalone.canonical_toml());
-    let fit = cli(
-        &fixture.log(),
-        &["features", "build", "--config", path.to_str().unwrap()],
-    )
-    .unwrap();
-    let fit = generated_uri(&fit);
-    verify(&fit);
-    standalone.features = None;
-    let mut outcome =
-        serde_json::to_value(&fixture.config.research.as_ref().unwrap().instruments[0].outcomes)
-            .unwrap();
-    outcome["role"] = "development".into();
-    outcome["tick_manifest"] = development.clone().into();
-    outcome["feature_manifest"] = fit.clone().into();
-    standalone.outcomes = Some(serde_json::from_value(outcome).unwrap());
-    write(&path, standalone.canonical_toml());
-    let outcomes = cli(
-        &fixture.log(),
-        &["outcomes", "build", "--config", path.to_str().unwrap()],
-    )
-    .unwrap();
-    let outcomes = generated_uri(&outcomes);
-    verify(&outcomes);
-    standalone.outcomes = None;
     standalone.features = Some(serde_json::from_value(serde_json::json!({"instruments":[{
         "role":"evaluation","input_manifest":evaluation,"profile_manifest":profile,"frozen_plan":fit
     }]})).unwrap());
@@ -1331,24 +1606,12 @@ fn wide_research_without_holdout_evaluates_a_frozen_search_family() {
         &["features", "build", "--config", path.to_str().unwrap()],
     )
     .unwrap();
-    let applied = generated_uri(&applied);
+    let applied = reference_for_generation(
+        &published,
+        &common::generation(applied.lines().next().unwrap()),
+    );
     verify(&applied);
     standalone.features = None;
-    let mut search =
-        serde_json::to_value(&fixture.config.research.as_ref().unwrap().instruments[0].search)
-            .unwrap();
-    let start = search
-        .as_object_mut()
-        .unwrap()
-        .remove("decision_start")
-        .unwrap();
-    let end = search
-        .as_object_mut()
-        .unwrap()
-        .remove("decision_end")
-        .unwrap();
-    search["development"] = serde_json::json!({"decision_start":start,"decision_end":end,
-        "inputs":[{"tick_manifest":development,"feature_manifest":fit,"outcome_manifest":outcomes}]});
     search["evaluation"] = serde_json::json!({"decision_start":time(BASE + 3*DAY_MICROS),
         "decision_end":time(BASE + 3*DAY_MICROS + 81*CANDLE + 1_000_000),
         "inputs":[{"tick_manifest":evaluation,"feature_manifest":applied}]});
@@ -1359,7 +1622,10 @@ fn wide_research_without_holdout_evaluates_a_frozen_search_family() {
         &["search", "--config", path.to_str().unwrap()],
     )
     .unwrap();
-    let family_uri = generated_uri(&searched);
+    let family_uri = reference_for_generation(
+        &published,
+        &common::generation(searched.lines().next().unwrap()),
+    );
     verify(&family_uri);
     let manifest = serde_json::from_slice::<Value>(
         &fs::read(family_uri.strip_prefix("file://").unwrap()).unwrap(),
@@ -1473,11 +1739,12 @@ fn decisive_research_gates_classify_synthetic_evaluation_and_holdout() {
         fixture.save();
         fixture.run().unwrap();
         let (verdict, scenarios) = if role == DatasetRole::Evaluation {
-            let (_, run) = fixture.run_record();
+            let (manifest, run) = fixture.run_record();
             let RunState::OuterRejected { verdict } = run.state else {
                 panic!("expected outer rejection")
             };
             no_access(&logged(&fixture.log()), &fixture.protected());
+            fixture.verify(&manifest.generation).unwrap();
             (verdict, run.outer)
         } else {
             let (_, run) = fixture.run_record();
