@@ -188,10 +188,10 @@ result is terminal for that frozen run: it never tunes, reranks, retries, or ope
 No live service quiescence or downtime is involved.
 
 Rollout to Google Cloud Storage: discover and reuse existing projects, buckets, identities, and
-regions first; create nothing in a region whose name begins `us-west`; provision the bucket and a
-least-privilege identity that can read and create objects but not create or delete buckets, outside
-the application; then run the import above. Rollback reverts the application and configuration
-change; source files, the retained copy, and published generations stay intact.
+regions first; provision the bucket and a least-privilege identity that can read and create objects
+but not create or delete buckets, outside the application; then run the import above. Rollback
+reverts the application and configuration change; source files, the retained copy, and published
+generations stay intact.
 
 ## Data pipeline
 
@@ -568,8 +568,7 @@ This procedure records the separately authorized rollout required by issue
 ### Rollout and handoff
 
 1. Discover and reuse an existing Supabase project and approved Google resources. If a resource
-   must be created, create nothing in a region whose name begins `us-west`; choose the existing
-   compute region or a measured permitted region.
+   must be created, choose the existing compute region or a measured region.
 2. Apply the `live_leases` and `live_dispatch_claims` migration idempotently. Record its schema
    version and result so another agent can resume. Grant the runtime only the row operations
    needed for its account lease and dispatch claims. The implemented `Postgres::migrate` uses
@@ -737,11 +736,6 @@ Runner rollback stops and unregisters only `binary-alpha-cuda-quantum`; keep the
 and unrelated machine setup. Accelerator rollback selects the explicit central-processor backend
 and reverts the accelerator change while preserving completed evidence. Production operator tasks:
 none. Linked matching Sentry issues: none.
-
-## Regions
-
-Create nothing in a region whose name begins `us-west`. This applies to every bucket, database,
-service, runner, and secret.
 
 ## Rollback
 
