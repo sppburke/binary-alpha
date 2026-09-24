@@ -74,18 +74,9 @@ fn column_blocks_split_before_sparse_key_count_exceeds_i32() {
 #[test]
 fn column_block_coverage_detects_skipped_column() {
     let skipped = [
-        ColumnBlock {
-            columns: 0..1,
-            row_list_len: 0,
-        },
-        ColumnBlock {
-            columns: 2..3,
-            row_list_len: 0,
-        },
-        ColumnBlock {
-            columns: 3..6,
-            row_list_len: 0,
-        },
+        ColumnBlock { columns: 0..1 },
+        ColumnBlock { columns: 2..3 },
+        ColumnBlock { columns: 3..6 },
     ];
     assert_eq!(skipped.first().unwrap().columns.start, 0);
     assert_eq!(skipped.last().unwrap().columns.end, 6);

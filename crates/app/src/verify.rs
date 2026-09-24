@@ -71,7 +71,7 @@ pub fn run_with(uri: &str, access: Access<'_>) -> Result<String, String> {
 
 /// Runs `verify` once per URI and authorization context: a hit in `access.verified` returns
 /// the recorded summary, a miss records only a successful result, and no memo means no reuse.
-fn memo(
+pub(crate) fn memo(
     access: Access<'_>,
     uri: &str,
     verify: impl FnOnce() -> Result<String, String>,

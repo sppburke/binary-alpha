@@ -7,9 +7,10 @@ mod common;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use binary_alpha_engine::dataset::{DatasetRole, GenerationManifest, manifest_key};
 use binary_alpha_engine::execution::{Decimal, Summary};
 use binary_alpha_engine::market::format_event_time_micros;
-use binary_alpha_engine::research::{Access, Verified};
+use binary_alpha_engine::research::{Access, Declaration, Population, Verified};
 use binary_alpha_engine::search::{Family, FamilyManifest, StabilityOutcome, family_generation_id};
 use common::current::import;
 use common::{Scratch, cli, command, generation, read_table, verify, write_ticks};
@@ -327,6 +328,12 @@ fn run_search(scratch: &Scratch, name: &str, table: &str) -> (Vec<String>, PathB
     (lines, manifest.clone(), family(scratch, &manifest))
 }
 
+fn search_counter(report: &str, name: &str) -> usize {
+    let words: Vec<_> = report.split_whitespace().collect();
+    let index = words.iter().position(|&word| word == name).unwrap();
+    words[index + 1].parse().unwrap()
+}
+
 fn family(scratch: &Scratch, manifest: &Path) -> Family {
     let manifest = FamilyManifest::from_json(&fs::read(manifest).unwrap()).unwrap();
     Family::from_json(&fs::read(scratch.path("published").join(&manifest.objects[0].key)).unwrap())
@@ -417,6 +424,7 @@ fn candidate_search_publishes_verifies_and_resumes() {
     };
     let (lines, manifest, family) =
         run_search(&scratch, "search_balanced.toml", &search_table(&spec));
+    println!("{}", lines[0]);
     assert!(
         lines[0].contains(
             " members 20 applicable 20 screened 0 replayed 20 passed 0 evaluated 0 objects 1 ["
@@ -424,6 +432,19 @@ fn candidate_search_publishes_verifies_and_resumes() {
         "{}",
         lines[0]
     );
+    // 64 rows x 4 resolved columns for planning; two tuples each scan four columns.
+    // Four 32-row lists are built per tuple; ten conjunctions visit 32 driver rows each.
+    for (name, expected) in [
+        ("columns", 4),
+        ("tuples", 2),
+        ("list_entries", 256),
+        ("construction_visits", 768),
+        ("validation_visits", 266),
+        ("driver_visits", 320),
+        ("transfer_bytes", 0),
+    ] {
+        assert_eq!(search_counter(&lines[0], name), expected, "{name}");
+    }
     assert_eq!(family.members.len(), 20);
     assert_eq!(
         family.chunks.len(),
@@ -1005,12 +1026,50 @@ fn generated_schema_two_search_projects_lowers_and_publishes_empty_family() {
         policy_extra: "",
         chunk_size: 8,
     };
-    let (_, manifest, projected) = run_search(
+    let (cpu_lines, manifest, projected) = run_search(
         &scratch,
         "generated_projected.toml",
         &generated_table(&spec, false),
     );
+    assert_eq!(search_counter(&cpu_lines[0], "transfer_bytes"), 0);
     assert_eq!(projected.schema_version, 2);
+    let declared_path = scratch.config(
+        "generated_declared.toml",
+        &generated_table(&spec, false).replace("seed = 7", "seed = 8"),
+    );
+    let declared_config = binary_alpha_app::load_config(&declared_path).unwrap();
+    let local = binary_alpha_app::store::Store::filesystem(scratch.path("retained"));
+    let destination =
+        binary_alpha_app::store::Store::open(&declared_config.storage.publication_uri).unwrap();
+    let tick = GenerationManifest::from_json(&fs::read(&role.tick).unwrap()).unwrap();
+    let declaration = Declaration {
+        schema_version: 1,
+        operator: "fixture".into(),
+        root: declared_config.storage.publication_uri.clone(),
+        namespace: "fixture".into(),
+        populations: vec![Population {
+            id: tick.generation.clone(),
+            role: DatasetRole::Development,
+            instrument: tick.instrument.clone(),
+            source: "fixture".into(),
+            coverage: tick.coverage.clone(),
+            generations: vec![tick.generation],
+            tokens: vec!["fixture".into()],
+            exposure: Vec::new(),
+        }],
+    };
+    let cached_publication = Verified::default();
+    let declared_access = Access {
+        declaration: Some(&declaration),
+        certification: None,
+        verified: Some(&cached_publication),
+    };
+    let published =
+        binary_alpha_app::search::family(&declared_config, &local, &destination, declared_access)
+            .unwrap();
+    let declared_uri = destination.uri(&manifest_key(&published.generation));
+    binary_alpha_app::verify::run_with(&declared_uri, declared_access).unwrap();
+    assert_eq!(cached_publication.family_rescores(), 1);
     assert!(projected.lowering.is_none());
     assert!(
         projected
@@ -1082,9 +1141,24 @@ fn generated_schema_two_search_projects_lowers_and_publishes_empty_family() {
             "{}\n[accelerator]\nbackend = \"cuda\"\ndevices = [0]\n",
             generated_table(&spec, false)
         );
-        let (_, cuda_manifest, cuda_family) =
+        let (cuda_lines, cuda_manifest, cuda_family) =
             run_search(&scratch, "generated_cuda.toml", &cuda_table);
         assert_eq!(cuda_family.to_json(), projected.to_json());
+        for name in [
+            "columns",
+            "tuples",
+            "list_entries",
+            "construction_visits",
+            "validation_visits",
+            "driver_visits",
+        ] {
+            assert_eq!(
+                search_counter(&cuda_lines[0], name),
+                search_counter(&cpu_lines[0], name),
+                "{name}"
+            );
+        }
+        assert!(search_counter(&cuda_lines[0], "transfer_bytes") > 0);
         let verified = command(&[
             "data",
             "verify",
@@ -1096,9 +1170,27 @@ fn generated_schema_two_search_projects_lowers_and_publishes_empty_family() {
         .unwrap();
         assert!(verified[0].starts_with("verified search generation "));
         let duplicate_table = cuda_table.replace("devices = [0]", "devices = [0, 0]");
-        let (_, duplicate_manifest, duplicate_family) =
+        let (duplicate_lines, duplicate_manifest, duplicate_family) =
             run_search(&scratch, "generated_duplicate_cuda.toml", &duplicate_table);
         assert_eq!(duplicate_family.to_json(), projected.to_json());
+        for name in [
+            "columns",
+            "tuples",
+            "list_entries",
+            "construction_visits",
+            "validation_visits",
+            "driver_visits",
+        ] {
+            assert_eq!(
+                search_counter(&duplicate_lines[0], name),
+                search_counter(&cpu_lines[0], name),
+                "{name}"
+            );
+        }
+        assert!(
+            search_counter(&duplicate_lines[0], "transfer_bytes")
+                > search_counter(&cuda_lines[0], "transfer_bytes")
+        );
         assert!(
             command(&[
                 "data",
@@ -1238,6 +1330,14 @@ fn generated_schema_two_search_projects_lowers_and_publishes_empty_family() {
         2
     );
     assert!(verify(&one_manifest).is_ok());
+    let (empty_columns_lines, _, empty_columns) = run_search(
+        &scratch,
+        "generated_one_below_min.toml",
+        &generated_table(&short_spec, true).replace("min_conditions = 1", "min_conditions = 2"),
+    );
+    assert_eq!(empty_columns.resolved_conditions.as_ref().unwrap().len(), 1);
+    assert_eq!(search_counter(&empty_columns_lines[0], "columns"), 1);
+    assert_eq!(search_counter(&empty_columns_lines[0], "tuples"), 0);
 
     let replace_rules = |mut table: String, output: &str| {
         let from = table.find("[[search.conditions]]").unwrap();

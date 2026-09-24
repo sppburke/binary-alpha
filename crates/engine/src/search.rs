@@ -660,71 +660,6 @@ pub fn member_unrank(
     None
 }
 
-/// Streams bounded members without allocating the family or its candidate conjunctions.
-pub fn stream_members(
-    count: usize,
-    min: usize,
-    max: usize,
-    contracts: usize,
-) -> Option<MemberStream> {
-    let total = family_size(count, min, max, contracts)?;
-    let size = min.max(1);
-    Some(MemberStream {
-        count,
-        max: max.min(count),
-        contracts,
-        total,
-        global: 0,
-        contract: 0,
-        indices: if total == 0 {
-            Vec::new()
-        } else {
-            (0..size).collect()
-        },
-    })
-}
-
-/// Current conjunction and contract are the only retained enumeration state.
-pub struct MemberStream {
-    count: usize,
-    max: usize,
-    contracts: usize,
-    total: u64,
-    global: u64,
-    contract: usize,
-    indices: Vec<usize>,
-}
-
-impl Iterator for MemberStream {
-    type Item = (u64, Vec<usize>, usize);
-
-    fn next(&mut self) -> Option<Self::Item> {
-        if self.global == self.total {
-            return None;
-        }
-        let item = (self.global, self.indices.clone(), self.contract);
-        self.global += 1;
-        self.contract += 1;
-        if self.contract == self.contracts {
-            self.contract = 0;
-            let size = self.indices.len();
-            let mut position = size;
-            while position > 0 && self.indices[position - 1] == self.count - size + position - 1 {
-                position -= 1;
-            }
-            if position > 0 {
-                self.indices[position - 1] += 1;
-                for later in position..size {
-                    self.indices[later] = self.indices[later - 1] + 1;
-                }
-            } else if size < self.max {
-                self.indices = (0..size + 1).collect();
-            }
-        }
-        Some(item)
-    }
-}
-
 /// Every combination of `min..=max` distinct indices below `count`, in lexicographic order.
 pub fn combinations(count: usize, min: usize, max: usize) -> Vec<Vec<usize>> {
     let mut all = Vec::new();
@@ -1820,20 +1755,14 @@ mod tests {
     }
 
     #[test]
-    fn streamed_ranks_match_exhaustive_order_and_large_edge() {
+    fn member_ranks_match_exhaustive_order() {
         for count in 1..=8 {
             for min in 1..=count + 1 {
                 for max in min..=count + 1 {
                     let expected = combinations(count, min, max);
-                    let streamed: Vec<_> = stream_members(count, min, max, 3).unwrap().collect();
-                    assert_eq!(streamed.len(), expected.len() * 3);
                     for (ordinal, indices) in expected.iter().enumerate() {
                         for contract in 0..3 {
                             let global = (ordinal * 3 + contract) as u64;
-                            assert_eq!(
-                                streamed[global as usize],
-                                (global, indices.clone(), contract)
-                            );
                             assert_eq!(
                                 member_rank(count, min, max, 3, indices, contract),
                                 Some(global)
@@ -1846,14 +1775,6 @@ mod tests {
                     }
                 }
             }
-        }
-        let max_candidates = 100;
-        assert_eq!(family_size(100, 99, 99, 1), Some(max_candidates));
-        let expected = combinations(100, 99, 99);
-        for (global, indices, contract) in stream_members(100, 99, 99, 1).unwrap() {
-            assert_eq!(indices, expected[global as usize]);
-            assert_eq!(contract, 0);
-            assert_eq!(member_rank(100, 99, 99, 1, &indices, 0), Some(global));
         }
     }
 

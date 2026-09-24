@@ -3012,7 +3012,7 @@ fn candle_pattern(previous: StatisticalCandle, current: StatisticalCandle) -> &'
 }
 
 impl Statistics {
-    fn new(windows: Vec<u32>, _unit: f64) -> Self {
+    fn new(windows: Vec<u32>) -> Self {
         let capacity = windows.last().copied().unwrap_or(1) as usize + 1;
         Self {
             candles: History::new(capacity),
@@ -5044,7 +5044,6 @@ impl FeatureEngine {
                         .structure
                         .as_ref()
                         .map_or(Vec::new(), |s| s.rolling_windows.clone()),
-                    definition.price_scale.unit() as f64,
                 )
             });
             states.push(StreamState {
@@ -5949,7 +5948,7 @@ mod tests {
 
     #[test]
     fn rolling_statistics_pin_windows_formulas_and_degenerate_cases() {
-        let mut statistics = Statistics::new(vec![2, 3, 4], 1.0);
+        let mut statistics = Statistics::new(vec![2, 3, 4]);
         let first = statistics.update_test(&statistical_candle(100, 100), false, true);
         assert_eq!(first.pattern, None);
         assert_eq!(first.overlap, None);
@@ -5975,7 +5974,7 @@ mod tests {
         assert_eq!(w4.position, Some(0.857143));
         assert_eq!(last.overlap, Some(0.857143));
         let flat = statistical_candle(100, 100);
-        let mut zero = Statistics::new(vec![2, 3, 4], 1.0);
+        let mut zero = Statistics::new(vec![2, 3, 4]);
         for _ in 0..5 {
             zero.update_test(&flat, true, true);
         }
@@ -5992,7 +5991,7 @@ mod tests {
         degenerate.high_units = 100;
         degenerate.low_units = 100;
         assert_eq!(zero.update_test(&degenerate, true, true).overlap, None);
-        let mut zero_range = Statistics::new(vec![2], 1.0);
+        let mut zero_range = Statistics::new(vec![2]);
         zero_range.update_test(&degenerate, false, true);
         assert_eq!(
             zero_range.update_test(&degenerate, true, true).windows[0]
@@ -6002,7 +6001,7 @@ mod tests {
         );
         let mut zero_close = statistical_candle(100, 0);
         zero_close.close_units = 0;
-        let mut zero = Statistics::new(vec![3], 1.0);
+        let mut zero = Statistics::new(vec![3]);
         for _ in 0..2 {
             zero.update_test(&flat, true, true);
         }
@@ -6012,7 +6011,7 @@ mod tests {
                 .residual,
             None
         );
-        let mut missing_return = Statistics::new(vec![2], 1.0);
+        let mut missing_return = Statistics::new(vec![2]);
         missing_return.update_test(&statistical_candle(0, 0), false, true);
         missing_return.update_test(&statistical_candle(0, 1), true, false);
         assert_eq!(
@@ -6023,7 +6022,7 @@ mod tests {
                 .std,
             None
         );
-        let mut one_pair = Statistics::new(vec![4], 1.0);
+        let mut one_pair = Statistics::new(vec![4]);
         for close in [100, 110, 120, 120, 110] {
             let row = one_pair.update_test(&statistical_candle(close, close), true, true);
             if close == 110 && one_pair.candles.len() == 5 {
@@ -6035,7 +6034,7 @@ mod tests {
     #[test]
     fn statistics_keep_unit_differences_above_f64_integer_precision() {
         let base = 1_i64 << 53;
-        let mut position = Statistics::new(vec![2], 1.0);
+        let mut position = Statistics::new(vec![2]);
         for close in [base, base + 1] {
             let mut candle = statistical_candle(close, close);
             candle.low_units = base;
@@ -6046,7 +6045,7 @@ mod tests {
             }
         }
 
-        let mut trend = Statistics::new(vec![3], 1.0);
+        let mut trend = Statistics::new(vec![3]);
         for close in [base, base + 1, base + 2] {
             let row = trend.update_test(&statistical_candle(close, close), true, false);
             if close == base + 2 {
@@ -6059,7 +6058,7 @@ mod tests {
 
     #[test]
     fn disjoint_adjacent_ranges_have_zero_overlap() {
-        let mut statistics = Statistics::new(vec![], 1.0);
+        let mut statistics = Statistics::new(vec![]);
         let mut prior = statistical_candle(0, 1);
         prior.low_units = 0;
         prior.high_units = 1;
@@ -6115,7 +6114,7 @@ mod tests {
         prior.low_units = base - 5_000_000;
         let current = statistical_candle(base, base + 1_000_004);
         let mut shape = Shape::new(None, &[]);
-        let mut statistics = Statistics::new(vec![], 1.0);
+        let mut statistics = Statistics::new(vec![]);
         for (ordinal, candle) in [(1, &prior), (2, &current)] {
             let anatomy = Anatomy::new(candle, 1.0);
             let row = shape.update(

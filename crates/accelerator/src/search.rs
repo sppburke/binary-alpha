@@ -22,16 +22,12 @@ use std::ops::Range;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ColumnBlock {
     pub columns: Range<usize>,
-    pub row_list_len: usize,
 }
 
 /// Conservative peak device allocation for a tuple and its concurrent batches.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ColumnBlockPlan {
     pub blocks: Vec<ColumnBlock>,
-    pub resident_row_bytes: u128,
-    pub concurrent_batch_bytes: u128,
-    pub budget_bytes: u128,
 }
 
 /// Greedily packs columns under a device's reported free-byte budget. `row_list_lengths` gives
@@ -103,7 +99,6 @@ pub fn plan_column_blocks(
         }
         blocks.push(ColumnBlock {
             columns: start..index,
-            row_list_len: list_len,
         });
         start = index;
         list_len = length;
@@ -111,15 +106,9 @@ pub fn plan_column_blocks(
     if start < row_list_lengths.len() {
         blocks.push(ColumnBlock {
             columns: start..row_list_lengths.len(),
-            row_list_len: list_len,
         });
     }
-    Ok(ColumnBlockPlan {
-        blocks,
-        resident_row_bytes,
-        concurrent_batch_bytes,
-        budget_bytes: budget,
-    })
+    Ok(ColumnBlockPlan { blocks })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

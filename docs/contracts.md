@@ -2254,7 +2254,7 @@ their full-member, full-lowering and close-time CPU verification path and remain
 
 The command writes
 `search SCOPE generation GENERATION members M applicable A screened S replayed R passed P evaluated E objects 1`
-followed by the stage timings and peak resident memory or `(already published)`, then the
+followed by stage timings, resolved columns, block tuples, sparse-list entries, sparse-list construction visits, tuple-index validation visits, candidate-driver row visits, host-to-device transfer bytes, and peak resident memory or `(already published)`, then the
 verification line. `data verify` on a family generation validates the manifest and object,
 re-enumerates the family, restores every referenced replay through its verifier and checks its
 definition against the table synthesized for its recorded members, compares every group and split group with the verified summaries

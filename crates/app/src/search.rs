@@ -74,20 +74,10 @@ pub fn score_cpu_batches(
             .iter()
             .enumerate()
             .map(|(position, &global)| {
-                let counts = |values: &[i64]| {
-                    let start = position * 21;
-                    RawCounts {
-                        total: values[start],
-                        wins: values[start + 1],
-                        losses: values[start + 2],
-                        ties: values[start + 3],
-                        invalid: values[start + 4],
-                    }
-                };
                 (
                     global,
-                    counts(&output.buy_output),
-                    counts(&output.sell_output),
+                    raw_at(&output.buy_output, position),
+                    raw_at(&output.sell_output, position),
                 )
             })
             .collect::<Vec<_>>())
@@ -222,6 +212,7 @@ fn tuple_batches(
     offsets: &[i32],
     count: usize,
     settings: &Search,
+    driver_visits: &mut usize,
     mut consume: impl FnMut(&[SparseBatch]) -> Result<(), String>,
 ) -> Result<(), String> {
     const BATCH: usize = 1024;
@@ -252,7 +243,9 @@ fn tuple_batches(
                 driver = Some((local as i32, frequency));
             }
         }
-        batch.drivers.push(driver.expect("nonempty member").0);
+        let driver = driver.expect("nonempty member").0;
+        *driver_visits += (offsets[driver as usize + 1] - offsets[driver as usize]) as usize;
+        batch.drivers.push(driver);
         batch.offsets.push(batch.features.len() as i32);
         if batch.globals.len() == BATCH {
             group.push(std::mem::replace(
@@ -287,6 +280,13 @@ struct Clock {
     replay: Duration,
     stability: Duration,
     publish: Duration,
+    columns: usize,
+    tuples: usize,
+    list_entries: usize,
+    construction_visits: usize,
+    validation_visits: usize,
+    driver_visits: usize,
+    transfer_bytes: usize,
 }
 
 fn add(total: &mut Timings, measured: Timings) {
@@ -296,9 +296,36 @@ fn add(total: &mut Timings, measured: Timings) {
     total.allocated_bytes = total.allocated_bytes.max(measured.allocated_bytes);
 }
 
+fn lowered_conditions(
+    plan: &binary_alpha_engine::features::FeaturePlan,
+    conditions: &[binary_alpha_engine::execution::Condition],
+) -> (
+    Vec<binary_alpha_engine::execution::Condition>,
+    BTreeMap<usize, String>,
+) {
+    let indices: Vec<usize> = conditions
+        .iter()
+        .enumerate()
+        .filter_map(|(index, condition)| {
+            projected_bucket(plan, condition).is_none().then_some(index)
+        })
+        .collect();
+    (
+        indices
+            .iter()
+            .map(|&index| conditions[index].clone())
+            .collect(),
+        indices
+            .iter()
+            .enumerate()
+            .map(|(local, &global)| (global, format!("c{local}")))
+            .collect(),
+    )
+}
+
 /// One published family generation and the report and verification lines of the command.
-pub(crate) struct Searched {
-    pub(crate) generation: String,
+pub struct Searched {
+    pub generation: String,
     pub(crate) report: String,
 }
 
@@ -321,7 +348,7 @@ pub fn search(config: &Config, local: &Store, destination: &Store) -> Result<Str
 }
 
 /// `search` with its typed result, under the caller's read permit.
-pub(crate) fn family(
+pub fn family(
     config: &Config,
     local: &Store,
     destination: &Store,
@@ -347,28 +374,13 @@ pub(crate) fn family(
     let development = bind_development(settings, access)?;
     let resolved = search::resolve_conditions(settings, &development.bound.plan)?;
     let conditions = &resolved.conditions;
+    clock.columns = conditions.len();
     let total = resolved.members;
     clock.load = started.elapsed();
 
     let lowering_started = Instant::now();
-    let lowered_indices: Vec<usize> = conditions
-        .iter()
-        .enumerate()
-        .filter_map(|(index, condition)| {
-            projected_bucket(&development.bound.plan, condition)
-                .is_none()
-                .then_some(index)
-        })
-        .collect();
-    let lowered_conditions: Vec<_> = lowered_indices
-        .iter()
-        .map(|&index| conditions[index].clone())
-        .collect();
-    let lowered_bindings: BTreeMap<usize, String> = lowered_indices
-        .iter()
-        .enumerate()
-        .map(|(local, &global)| (global, format!("c{local}")))
-        .collect();
+    let (lowered_conditions, lowered_bindings) =
+        lowered_conditions(&development.bound.plan, conditions);
     let (lowering_ref, lowering_events) = if total > 0 && !lowered_conditions.is_empty() {
         let lowering = search::lowering_replay_for(
             settings,
@@ -605,19 +617,15 @@ pub(crate) fn family(
         None => manifest.to_json(),
     };
     let uri = destination.uri(&key);
-    let verified = verify_family(&uri, destination, &key, &committed, access)?;
+    let verified = verify::memo(access, &uri, || {
+        verify_family(&uri, destination, &key, &committed, access)
+    })?;
     let temporary = import::temporary_path(local, &format!("manifest-{generation}"))?;
     fs::write(&temporary, &committed)
         .map_err(|error| format!("cannot write {}: {error}", temporary.display()))?;
     let identity = store::identify(&temporary)?;
     let put = destination.put_new(&key, &temporary, &identity)?;
     local.put_new(&key, &temporary, &identity)?;
-    if let Some(cache) = access.verified {
-        cache
-            .lock()
-            .map_err(|_| "verify: memo poisoned")?
-            .insert(uri.clone(), verified.clone());
-    }
     fs::remove_file(&temporary)
         .map_err(|error| format!("cannot remove {}: {error}", temporary.display()))?;
     clock.publish = publishing.elapsed();
@@ -638,7 +646,7 @@ pub(crate) fn family(
     let line = match put {
         Put::Reused(_) => format!("{report} (already published)"),
         Put::Created(_) => format!(
-            "{report} [load {:.3}s lowering {:.3}s device upload {:.3}s execute {:.3}s download {:.3}s bytes {} replay {:.3}s stability {:.3}s publish {:.3}s] peak_rss_kb {}",
+            "{report} [load {:.3}s lowering {:.3}s device upload {:.3}s execute {:.3}s download {:.3}s bytes {} replay {:.3}s stability {:.3}s publish {:.3}s] columns {} tuples {} list_entries {} construction_visits {} validation_visits {} driver_visits {} transfer_bytes {} peak_rss_kb {}",
             clock.load.as_secs_f64(),
             clock.lowering.as_secs_f64(),
             clock.device.upload.as_secs_f64(),
@@ -648,6 +656,13 @@ pub(crate) fn family(
             clock.replay.as_secs_f64(),
             clock.stability.as_secs_f64(),
             clock.publish.as_secs_f64(),
+            clock.columns,
+            clock.tuples,
+            clock.list_entries,
+            clock.construction_visits,
+            clock.validation_visits,
+            clock.driver_visits,
+            clock.transfer_bytes,
             peak_rss_kb()
         ),
     };
@@ -1478,7 +1493,6 @@ fn score_members(
         .collect())
 }
 
-#[cfg(feature = "cuda")]
 fn raw_at(values: &[i64], position: usize) -> RawCounts {
     let at = position * 21;
     RawCounts {
@@ -1583,6 +1597,7 @@ fn score_streamed(
             signals,
             lowered_bindings,
         )?;
+        clock.construction_visits += codes.len();
         lengths.push(codes.iter().filter(|&&code| code == buckets[0]).count());
     }
     #[cfg(feature = "cuda")]
@@ -1601,7 +1616,7 @@ fn score_streamed(
         }
     }
     #[cfg(not(feature = "cuda"))]
-    let _ = (backends, device_ordinals, clock);
+    let _ = (backends, device_ordinals);
     let plan = kernels::plan_column_blocks(
         &lengths,
         rows,
@@ -1628,6 +1643,7 @@ fn score_streamed(
             0,
             &mut Vec::new(),
             &mut |tuple| {
+                clock.tuples += 1;
                 let mut requested = Vec::new();
                 for &block in tuple {
                     requested.extend(plan.blocks[block].columns.clone());
@@ -1656,6 +1672,9 @@ fn score_streamed(
                             .map_err(|_| "sparse row list exceeds i32")?,
                     );
                 }
+                clock.construction_visits += buckets.len() * ordered.len();
+                clock.list_entries += sparse_rows.len();
+                clock.validation_visits += offsets.len() + sparse_rows.len();
                 let keys = kernels::SparseKeys {
                     key_chrono_offsets: &offsets,
                     key_chrono_rows: &sparse_rows,
@@ -1703,6 +1722,27 @@ fn score_streamed(
                     for workspace in &workspaces {
                         add(&mut clock.device, workspace.timings);
                     }
+                    let buffers = tuple_buffers(
+                        &codes,
+                        requested.len() as i32,
+                        rows as i32,
+                        &ordered,
+                        entry_times,
+                        first,
+                    );
+                    let workspace_bytes = std::mem::size_of_val(buffers.feature_codes)
+                        + std::mem::size_of_val(buffers.ordered_rows)
+                        + std::mem::size_of_val(buffers.decision_time_ms)
+                        + std::mem::size_of_val(buffers.release_time_ms)
+                        + std::mem::size_of_val(buffers.settlement_time_ms)
+                        + std::mem::size_of_val(buffers.valid)
+                        + std::mem::size_of_val(buffers.buy_win)
+                        + std::mem::size_of_val(buffers.sell_win)
+                        + std::mem::size_of_val(buffers.tie)
+                        + std::mem::size_of_val(split_mask.as_slice())
+                        + std::mem::size_of_val(keys.key_chrono_offsets)
+                        + std::mem::size_of_val(keys.key_chrono_rows);
+                    clock.transfer_bytes += workspace_bytes * workspaces.len();
                     workspaces
                 };
                 for (&expiry, outcome) in &outcome_rows {
@@ -1726,6 +1766,17 @@ fn score_streamed(
                                 &mut clock.device,
                                 workspace.set_outcome(buffers, &split_mask)?,
                             );
+                        }
+                        #[cfg(feature = "cuda")]
+                        {
+                            clock.transfer_bytes += workspaces.len()
+                                * (std::mem::size_of_val(buffers.release_time_ms)
+                                    + std::mem::size_of_val(buffers.settlement_time_ms)
+                                    + std::mem::size_of_val(buffers.valid)
+                                    + std::mem::size_of_val(buffers.buy_win)
+                                    + std::mem::size_of_val(buffers.sell_win)
+                                    + std::mem::size_of_val(buffers.tie)
+                                    + std::mem::size_of_val(split_mask.as_slice()));
                         }
                     }
                     let apply =
@@ -1758,6 +1809,7 @@ fn score_streamed(
                             &offsets,
                             conditions.len(),
                             settings,
+                            &mut clock.driver_visits,
                             |group| {
                                 let batches: Vec<_> = group
                                     .iter()
@@ -1784,6 +1836,7 @@ fn score_streamed(
                                 &offsets,
                                 conditions.len(),
                                 settings,
+                                &mut clock.driver_visits,
                                 |group| {
                                     let mut scored = Vec::new();
                                     let schedule = kernels::schedule_batches_from(
@@ -1796,6 +1849,11 @@ fn score_streamed(
                                         let device = assignment.device;
                                         let uploaded = workspaces[device]
                                             .upload_batch(batch.candidates(), &batch.drivers)?;
+                                        clock.transfer_bytes +=
+                                            std::mem::size_of_val(batch.features.as_slice())
+                                                + std::mem::size_of_val(batch.buckets.as_slice())
+                                                + std::mem::size_of_val(batch.offsets.as_slice())
+                                                + std::mem::size_of_val(batch.drivers.as_slice());
                                         add(&mut clock.device, uploaded.timings);
                                         let output = uploaded.score_sparse_dual(0, duration, 0)?;
                                         add(&mut clock.device, output.timings);
@@ -2395,24 +2453,8 @@ fn verify_read_family_streamed(
         ));
     }
     let conditions = &resolved.conditions;
-    let lowered_indices: Vec<usize> = conditions
-        .iter()
-        .enumerate()
-        .filter_map(|(index, condition)| {
-            projected_bucket(&development.bound.plan, condition)
-                .is_none()
-                .then_some(index)
-        })
-        .collect();
-    let lowered_conditions: Vec<_> = lowered_indices
-        .iter()
-        .map(|&index| conditions[index].clone())
-        .collect();
-    let lowered_bindings: BTreeMap<usize, String> = lowered_indices
-        .iter()
-        .enumerate()
-        .map(|(local, &global)| (global, format!("c{local}")))
-        .collect();
+    let (lowered_conditions, lowered_bindings) =
+        lowered_conditions(&development.bound.plan, conditions);
     let lowering_events = match (
         &family.lowering,
         lowered_conditions.is_empty() || resolved.members == 0,
@@ -2717,11 +2759,11 @@ mod projection_tests {
         let blocks: Vec<_> = (0..100)
             .map(|column| kernels::ColumnBlock {
                 columns: column..column + 1,
-                row_list_len: 0,
             })
             .collect();
         let suffix_capacity: Vec<_> = (0..=100).map(|block| 100 - block).collect();
         let mut visited = 0;
+        let mut ranks = Vec::new();
         visit_block_tuples(
             &blocks,
             &suffix_capacity,
@@ -2732,11 +2774,18 @@ mod projection_tests {
                 assert_eq!(tuple.len(), 99);
                 assert!(tuple.windows(2).all(|pair| pair[0] < pair[1]));
                 visited += 1;
+                visit_tuple_conditions(&blocks, tuple, 0, 0, &mut Vec::new(), &mut |chosen| {
+                    ranks.push(search::member_rank(100, 99, 99, 1, chosen, 0).unwrap());
+                    Ok(())
+                })?;
                 Ok(())
             },
         )
         .unwrap();
         assert_eq!(visited, 100);
+        assert_eq!(search::family_size(100, 99, 99, 1), Some(100));
+        ranks.sort_unstable();
+        assert_eq!(ranks, (0..100).collect::<Vec<_>>());
     }
 
     fn legacy_plan() -> binary_alpha_engine::features::FeaturePlan {
