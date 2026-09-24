@@ -67,6 +67,9 @@ pub fn plan_column_blocks(
     let budget = budget_bytes as u128;
     let fits = |columns: usize, list_len: usize| -> bool {
         if columns > i32::MAX as usize
+            || columns
+                .checked_mul(max_conditions)
+                .is_none_or(|n| n > i32::MAX as usize)
             || list_len > i32::MAX as usize
             || list_len
                 .checked_mul(max_conditions)
@@ -409,6 +412,9 @@ impl Request<'_> {
             }
         }
         if let Some(sparse) = self.sparse {
+            if !resident && b.ordered_rows.len() > rows {
+                return Err(format!("{k}: ordered_rows length exceeds row_count"));
+            }
             length(
                 k,
                 "candidate_driver_key",

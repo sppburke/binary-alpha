@@ -12,12 +12,22 @@ fn bits(value: f64) -> i64 {
     value.to_bits() as i64
 }
 
+fn blocks_cover_columns(blocks: &[ColumnBlock], columns: usize) -> bool {
+    blocks.first().is_some_and(|block| block.columns.start == 0)
+        && blocks
+            .last()
+            .is_some_and(|block| block.columns.end == columns)
+        && blocks.iter().all(|block| !block.columns.is_empty())
+        && blocks
+            .windows(2)
+            .all(|pair| pair[0].columns.end == pair[1].columns.start)
+}
+
 #[test]
 fn column_blocks_bound_memory_sparse_indices_and_schedule() {
     let plan = plan_column_blocks(&[4; 6], 4, 2, 1, 1, 1, 600).unwrap();
     assert!(plan.blocks.len() >= 3, "forced small budget: {plan:?}");
-    assert_eq!(plan.blocks.first().unwrap().columns.start, 0);
-    assert_eq!(plan.blocks.last().unwrap().columns.end, 6);
+    assert!(blocks_cover_columns(&plan.blocks, 6));
     assert!(
         plan_column_blocks(&[4], 4, 2, 1, 1, 1, 1)
             .unwrap_err()
@@ -50,11 +60,85 @@ fn column_blocks_bound_memory_sparse_indices_and_schedule() {
 }
 
 #[test]
+fn column_blocks_split_before_sparse_key_count_exceeds_i32() {
+    let plan = plan_column_blocks(&[0; 32_768], 1, 65_536, 1, 1, 1, 14_000_000_000).unwrap();
+    assert!(plan.blocks.len() > 1);
+    assert!(blocks_cover_columns(&plan.blocks, 32_768));
+    assert!(
+        plan.blocks
+            .iter()
+            .all(|block| block.columns.len() * 65_536 <= i32::MAX as usize)
+    );
+}
+
+#[test]
+fn column_block_coverage_detects_skipped_column() {
+    let skipped = [
+        ColumnBlock {
+            columns: 0..1,
+            row_list_len: 0,
+        },
+        ColumnBlock {
+            columns: 2..3,
+            row_list_len: 0,
+        },
+        ColumnBlock {
+            columns: 3..6,
+            row_list_len: 0,
+        },
+    ];
+    assert_eq!(skipped.first().unwrap().columns.start, 0);
+    assert_eq!(skipped.last().unwrap().columns.end, 6);
+    assert_eq!(skipped.len(), 3);
+    assert!(!blocks_cover_columns(&skipped, 6));
+}
+
+#[test]
+fn sparse_tuple_rejects_ordered_rows_beyond_planned_residency() {
+    let plan = plan_column_blocks(&[1], 1, 1, 1, 1, 1, 405).unwrap();
+    assert_eq!(plan.blocks[0].columns, 0..1);
+    let ordered_rows = [0; 1_000];
+    let request = crate::search::Request {
+        kind: 6,
+        buffers: SearchBuffers {
+            feature_codes: &[0],
+            feature_count: 1,
+            row_count: 1,
+            ordered_rows: &ordered_rows,
+            decision_time_ms: &[1],
+            release_time_ms: &[2],
+            settlement_time_ms: &[2],
+            valid: &[1],
+            buy_win: &[1],
+            sell_win: &[0],
+            tie: &[0],
+        },
+        split_mask: &[1],
+        candidates: CandidateConditions {
+            condition_feature: &[0],
+            condition_bucket: &[0],
+            candidate_offsets: &[0, 1],
+            candidate_count: 1,
+        },
+        sparse: Some(SparseIndex {
+            candidate_driver_key: &[0],
+            key_chrono_offsets: &[0, 1],
+            key_chrono_rows: &[0],
+        }),
+        expiry_ms: 1,
+        direction_code: 1,
+        payout_basis: 92,
+    };
+    assert!(request.validate().unwrap_err().contains("ordered_rows"));
+}
+
+#[test]
 fn cpu_resident_sparse_batches_match_one_shot_across_forced_blocks_and_expiries() {
     let case = &search_cases()[0];
     let rows = case.entry.len();
     let plan = plan_column_blocks(&[rows; 6], rows, 2, 1, 1, 1, 600).unwrap();
     assert!(plan.blocks.len() >= 3);
+    assert!(blocks_cover_columns(&plan.blocks, 6));
     let ordered: Vec<i64> = (0..rows as i64).collect();
     let sparse_rows: Vec<i32> = (0..rows as i32).collect();
     let offsets = [0, rows as i32];
