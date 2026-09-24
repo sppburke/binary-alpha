@@ -1766,14 +1766,30 @@ pub struct SearchWindow {
     pub splits: Option<Vec<Split>>,
 }
 
-/// One menu entry: one output and comparator with its ordered thresholds.
+/// A named menu entry or a plan-bound rule. The rule has no threshold field, so it cannot
+/// accidentally be treated as a named condition before the development plan is bound.
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(untagged)]
+pub enum SearchCondition {
+    Named(NamedSearchCondition),
+    Generate(GeneratedSearchCondition),
+}
+
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-pub struct SearchCondition {
+pub struct NamedSearchCondition {
     pub stream: StreamKey,
     pub output: String,
     pub comparator: Comparator,
     pub thresholds: Vec<Threshold>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct GeneratedSearchCondition {
+    pub stream: StreamKey,
+    pub output: String,
+    pub comparator: Comparator,
 }
 
 /// The account every member is funded from, one account per member.
@@ -3694,6 +3710,49 @@ mod search_tests {
             };
             let error = Config::parse(&edited).unwrap_err().to_string();
             assert!(error.contains(expected), "{edit}: {error}");
+        }
+    }
+
+    #[test]
+    fn generation_rule_is_typed_and_checked_before_plan_binding() {
+        let source = table(|text| {
+            text.replace(
+            "output = \"candle_direction\"\ncomparator = \"eq\"\nthresholds = [\"up\", \"down\"]",
+            "output = \"*\"\ncomparator = \"eq\"",
+        )
+        });
+        let config = Config::parse(&source).unwrap();
+        assert!(matches!(
+            config.search.as_ref().unwrap().conditions[0],
+            SearchCondition::Generate(_)
+        ));
+        assert_eq!(Config::parse(&config.canonical_toml()).unwrap(), config);
+        for (edited, expected) in [
+            (
+                source.replace("output = \"*\"", "output = \"candle_direction\""),
+                "generation rule requires output `*`",
+            ),
+            (
+                source.replace(
+                    "output = \"*\"\ncomparator = \"eq\"",
+                    "output = \"*\"\ncomparator = \"ne\"",
+                ),
+                "generation rule requires output `*` and comparator `eq`",
+            ),
+            (
+                source.replace(
+                    "output = \"*\"\ncomparator = \"eq\"",
+                    "output = \"*\"\ncomparator = \"eq\"\nthresholds = [\"up\"]",
+                ),
+                "`*` requires a generation rule",
+            ),
+        ] {
+            assert!(
+                Config::parse(&edited)
+                    .unwrap_err()
+                    .to_string()
+                    .contains(expected)
+            );
         }
     }
 }

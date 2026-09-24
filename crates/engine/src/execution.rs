@@ -2690,6 +2690,78 @@ pub fn value_ready(
         && readiness.into_iter().all(|ready| ready)
 }
 
+/// The one interpretation of a condition's raw value, declared readiness, and fitted label.
+/// Both engine decisions and the search projection use this path.
+struct ReadyConditionValue<'a> {
+    value: &'a Value,
+    label: Option<Cow<'a, str>>,
+}
+
+fn ready_condition_value<'a>(
+    value: Option<&'a Value>,
+    spec: &'a ColumnSpec,
+    readiness: impl IntoIterator<Item = bool>,
+) -> Option<ReadyConditionValue<'a>> {
+    if !value_ready(value, &spec.unready, readiness) {
+        return None;
+    }
+    let value = value.expect("ready value");
+    Some(ReadyConditionValue {
+        value,
+        label: spec
+            .encoding
+            .as_ref()
+            .and_then(|encoding| encoding.label(Some(value))),
+    })
+}
+
+impl ReadyConditionValue<'_> {
+    fn compare(&self, threshold: &Threshold) -> Option<Ordering> {
+        match (threshold, self.label.as_deref(), self.value) {
+            (Threshold::Text(threshold), Some(label), _) => Some(label.cmp(threshold.as_str())),
+            (Threshold::Text(threshold), None, Value::Text(text)) => {
+                Some(text.as_ref().cmp(threshold.as_str()))
+            }
+            (Threshold::Bool(threshold), None, Value::Bool(value)) => Some(value.cmp(threshold)),
+            (Threshold::Number(threshold), None, Value::Int(v) | Value::Time(v)) => {
+                (*v as f64).partial_cmp(threshold)
+            }
+            (Threshold::Number(threshold), None, Value::Float(v)) => v.partial_cmp(threshold),
+            _ => None,
+        }
+    }
+}
+
+/// Project one latest installed row to its retained fitted-label code. A missing row, a row
+/// closing after the base close, an unready value, or an unretained label is `-1`. The caller
+/// selects the latest row by installation time; this function never searches earlier rows.
+pub fn project_fitted_label(
+    base_close: i64,
+    latest: Option<(i64, Option<&Value>)>,
+    spec: &ColumnSpec,
+    readiness: impl IntoIterator<Item = bool>,
+) -> i16 {
+    let Some((close, value)) = latest else {
+        return -1;
+    };
+    if close > base_close {
+        return -1;
+    }
+    let Some(ready) = ready_condition_value(value, spec, readiness) else {
+        return -1;
+    };
+    let Some(encoding) = spec.encoding.as_ref() else {
+        return -1;
+    };
+    let Some(label) = ready.label else { return -1 };
+    encoding
+        .labels
+        .iter()
+        .position(|retained| retained == label.as_ref())
+        .and_then(|index| i16::try_from(index).ok())
+        .unwrap_or(-1)
+}
+
 impl Engine {
     /// Compiles the definition against its own column lists and starts from the accounts'
     /// initial cash with no obligations. The definition record is the first ledger record.
@@ -4969,34 +5041,17 @@ impl Engine {
         let spec = &self.definition.instruments[instrument].streams[condition.stream].columns
             [condition.column];
         let value = row.values[condition.column].as_ref();
-        if !value_ready(
+        let Some(ready) = ready_condition_value(
             value,
-            &spec.unready,
+            spec,
             condition
                 .readiness
                 .iter()
                 .map(|flag| row.values[*flag] == Some(Value::Bool(true))),
-        ) {
+        ) else {
             return false;
-        }
-        let value = value.expect("ready value");
-        let label: Option<Cow<'_, str>> = spec
-            .encoding
-            .as_ref()
-            .and_then(|encoding| encoding.label(Some(value)));
-        let ordering = match (&condition.threshold, label.as_deref(), value) {
-            (Threshold::Text(threshold), Some(label), _) => Some(label.cmp(threshold.as_str())),
-            (Threshold::Text(threshold), None, Value::Text(text)) => {
-                Some(text.as_ref().cmp(threshold.as_str()))
-            }
-            (Threshold::Bool(threshold), None, Value::Bool(value)) => Some(value.cmp(threshold)),
-            (Threshold::Number(threshold), None, Value::Int(v) | Value::Time(v)) => {
-                (*v as f64).partial_cmp(threshold)
-            }
-            (Threshold::Number(threshold), None, Value::Float(v)) => v.partial_cmp(threshold),
-            _ => None,
         };
-        let Some(ordering) = ordering else {
+        let Some(ordering) = ready.compare(&condition.threshold) else {
             return false;
         };
         match condition.comparator {

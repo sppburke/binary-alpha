@@ -269,7 +269,7 @@ pub(crate) fn stream_columns(
 
 /// The column a condition name reads: the compiled output itself, or the fitted encoding's input
 /// with the encoding that labels it.
-fn column_spec(stream: &StreamPlan, name: &str) -> Option<ColumnSpec> {
+pub(crate) fn column_spec(stream: &StreamPlan, name: &str) -> Option<ColumnSpec> {
     if let Some(output) = stream.outputs.iter().find(|output| output.name == name) {
         return Some(ColumnSpec {
             name: name.to_string(),
@@ -300,7 +300,7 @@ fn column_spec(stream: &StreamPlan, name: &str) -> Option<ColumnSpec> {
 
 /// The rows of one stream's published table, one row group at a time, with only the clocks and
 /// the bound columns held in memory.
-struct RowCursor {
+pub(crate) struct RowCursor {
     reader: TableReader,
     _local: verify::LocalObject,
     location: String,
@@ -315,29 +315,27 @@ struct RowCursor {
 }
 
 impl RowCursor {
-    fn open(bound: &BoundInstrument, stream: &StreamColumns) -> Result<Self, String> {
+    pub(crate) fn open(bound: &Bound, stream: &StreamColumns) -> Result<Self, String> {
         let plan_stream = bound
-            .inputs
             .plan
             .stream(stream.stream)
             .expect("bound streams are plan streams");
         let path = &plan_stream.object_paths()[0];
         let object = bound
-            .inputs
             .feature
             .objects
             .iter()
             .find(|object| object.path == *path)
             .expect("a validated feature manifest lists every stream's rows");
-        let (_, local) = verify::fetch(&bound.inputs.feature_store, object, true)?;
+        let (_, local) = verify::fetch(&bound.feature_store, object, true)?;
         let local = local.expect("decoded objects have a local path");
-        let location = bound.inputs.feature_store.uri(&object.key);
+        let location = bound.feature_store.uri(&object.key);
         let reader = TableReader::open(&local.path, ROWS_MESSAGE)
             .map_err(|reason| format!("{location}: {reason}"))?;
         let expected: Vec<(String, String)> = features::table_metadata(
-            &bound.inputs.plan,
+            &bound.plan,
             plan_stream,
-            ("raw_identity", &bound.inputs.plan.raw_identity),
+            ("raw_identity", &bound.plan.raw_identity),
         )
         .into_iter()
         .map(|(key, value)| (key.to_string(), value))
@@ -401,13 +399,13 @@ impl RowCursor {
     }
 
     /// The availability of the next row, if any.
-    fn peek(&mut self) -> Result<Option<i64>, String> {
+    pub(crate) fn peek(&mut self) -> Result<Option<i64>, String> {
         self.fill()?;
         Ok(self.clocks.get(self.offset).map(|&(_, known)| known))
     }
 
     /// The next row: its clocks and its bound column values.
-    fn next(&mut self) -> Result<(i64, i64, Vec<Option<Value>>), String> {
+    pub(crate) fn next(&mut self) -> Result<(i64, i64, Vec<Option<Value>>), String> {
         self.fill()?;
         let (close, known) = self.clocks[self.offset];
         let values = self
@@ -683,7 +681,7 @@ pub(crate) fn publish(
             .binding
             .streams
             .iter()
-            .map(|stream| RowCursor::open(instrument, stream))
+            .map(|stream| RowCursor::open(&instrument.inputs, stream))
             .collect::<Result<Vec<_>, _>>()?;
         inputs.push(Inputs {
             times,

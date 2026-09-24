@@ -1669,12 +1669,39 @@ pub fn certification_generation_id(research: &str, grant_hash: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::{GeneratedSearchCondition, SearchCondition};
     use crate::dataset::ObjectRole;
     use crate::execution::Decimal;
     use crate::portfolio::ReplayRef;
 
     fn decimal(text: &str) -> Decimal {
         Decimal::parse(text).unwrap()
+    }
+
+    #[test]
+    fn research_validates_generation_rule_syntax_before_binding_a_plan() {
+        let config = Config::parse(include_str!(
+            "../../app/tests/fixtures/legacy_schema1/research.toml"
+        ))
+        .unwrap();
+        let mut research = config.research.unwrap();
+        let stream = research.instruments[0].search.base_stream;
+        research.instruments[0].search.conditions =
+            vec![SearchCondition::Generate(GeneratedSearchCondition {
+                stream,
+                output: "*".into(),
+                comparator: crate::execution::Comparator::Eq,
+            })];
+        research.validate().unwrap();
+        if let SearchCondition::Generate(rule) = &mut research.instruments[0].search.conditions[0] {
+            rule.output = "candle_direction".into();
+        }
+        assert!(
+            research
+                .validate()
+                .unwrap_err()
+                .contains("generation rule requires output `*`")
+        );
     }
 
     fn generation(byte: u8) -> String {

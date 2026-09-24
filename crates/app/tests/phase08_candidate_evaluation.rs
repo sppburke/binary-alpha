@@ -1068,21 +1068,24 @@ fn governed_candidate_evaluation() {
         );
         let condition = &strategy.conditions[0];
         match menu.iter_mut().find(|entry| {
-            entry.stream == condition.stream
-                && entry.output == condition.output
-                && entry.comparator == condition.comparator
+            matches!(entry, SearchCondition::Named(named) if named.stream == condition.stream
+                && named.output == condition.output
+                && named.comparator == condition.comparator)
         }) {
-            Some(entry) => {
+            Some(SearchCondition::Named(entry)) => {
                 if !entry.thresholds.contains(&condition.threshold) {
                     entry.thresholds.push(condition.threshold.clone());
                 }
             }
-            None => menu.push(SearchCondition {
-                stream: condition.stream,
-                output: condition.output.clone(),
-                comparator: condition.comparator,
-                thresholds: vec![condition.threshold.clone()],
-            }),
+            Some(SearchCondition::Generate(_)) => unreachable!("matched named entry"),
+            None => menu.push(SearchCondition::Named(
+                binary_alpha_engine::config::NamedSearchCondition {
+                    stream: condition.stream,
+                    output: condition.output.clone(),
+                    comparator: condition.comparator,
+                    thresholds: vec![condition.threshold.clone()],
+                },
+            )),
         }
     }
     let mut policy = replay.risk_policies[0].clone();

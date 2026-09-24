@@ -5287,6 +5287,11 @@ impl StreamState {
 /// missing values.
 const UNCODED_LABELS: [&str; 6] = ["", "missing", "none", "<NA>", "nan", "NaT"];
 
+/// Whether a label can receive a fitted code and therefore a generated condition.
+pub fn coded_label(label: &str) -> bool {
+    !UNCODED_LABELS.contains(&label)
+}
+
 /// The reference's general number format: six significant digits, trailing zeros removed, and
 /// an exponent below `1e-4` or at `1e6` and above.
 pub fn format_general(value: f64) -> String {
@@ -5480,7 +5485,7 @@ impl FittedEncoding {
         }
         let mut ranked: Vec<(u64, String)> = counts
             .into_iter()
-            .filter(|(label, count)| *count > 0 && !UNCODED_LABELS.contains(&label.as_str()))
+            .filter(|(label, count)| *count > 0 && coded_label(label))
             .map(|(label, count)| (count, label))
             .collect();
         ranked.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
@@ -5787,6 +5792,86 @@ mod tests {
             tick_path_streams: Some(keys),
             encodings: None,
         }
+    }
+
+    #[test]
+    fn all_supported_fitted_numeric_and_boolean_labels_generate_conditions() {
+        use crate::config::{EncodingSpec, Encodings, GeneratedSearchCondition, SearchCondition};
+        let mut request = entry(&[(5, 0)], Outputs::AllSupported);
+        request.encodings = Some(Encodings {
+            max_labels: 8,
+            outputs: vec![EncodingSpec {
+                output: "all_supported".into(),
+                bins: None,
+            }],
+        });
+        let mut plan = FeaturePlan::resolve(
+            &request,
+            profile(NativeGranularity::Tick, true, &[(5, 0)]),
+            "input",
+        )
+        .unwrap();
+        let stream = plan.streams[0].key();
+        let numeric = plan.streams[0]
+            .encodings
+            .iter_mut()
+            .find(|encoding| encoding.input == "range_bps")
+            .unwrap();
+        assert!(numeric.automatic && numeric.output != numeric.input);
+        numeric
+            .fit(&numbers(&(0..100).map(f64::from).collect::<Vec<_>>()), 8)
+            .unwrap();
+        let numeric_output = numeric.output.clone();
+        let boolean_input = plan.streams[0]
+            .outputs
+            .iter()
+            .find(|output| output.predictive && output.kind == Kind::Bool)
+            .unwrap()
+            .name
+            .clone();
+        let boolean = plan.streams[0]
+            .encodings
+            .iter_mut()
+            .find(|encoding| encoding.input == boolean_input)
+            .unwrap();
+        assert!(boolean.automatic && boolean.output != boolean.input);
+        boolean
+            .fit(&[Some(Value::Bool(true)), Some(Value::Bool(false))], 8)
+            .unwrap();
+        let boolean_output = boolean.output.clone();
+        let family: crate::search::Family = serde_json::from_slice(include_bytes!("../../app/tests/fixtures/legacy_schema1/published/objects/736abc73d301789d7e19aa2ac927cc1e1010dd12cce189c2087b4255ee254717")).unwrap();
+        let mut search = family.search;
+        search.base_stream = stream;
+        search.conditions = vec![SearchCondition::Generate(GeneratedSearchCondition {
+            stream,
+            output: "*".into(),
+            comparator: crate::execution::Comparator::Eq,
+        })];
+        search.max_conditions = 2;
+        search.max_candidates = 1000;
+        let resolved = crate::search::resolve_conditions(&search, &plan).unwrap();
+        assert_eq!(resolved.conditions.len(), 7);
+        assert_eq!(
+            resolved
+                .conditions
+                .iter()
+                .filter(|condition| condition.output == numeric_output)
+                .count(),
+            5
+        );
+        let boolean_labels: Vec<_> = resolved
+            .conditions
+            .iter()
+            .filter(|condition| condition.output == boolean_output)
+            .map(|condition| &condition.threshold)
+            .collect();
+        assert_eq!(
+            boolean_labels,
+            [
+                &crate::execution::Threshold::Text("false".into()),
+                &crate::execution::Threshold::Text("true".into())
+            ]
+        );
     }
 
     fn category(values: &[&str]) -> Vec<Option<Value>> {

@@ -19,6 +19,7 @@ use crate::execution::{
     AccountSpec, Condition, ContractTerms, Decimal, DeploymentBinding, Disposition, EventKind,
     FinancialEvent, Group, Resolution, SettlementRule, StrategySpec, signal_logic_identity,
 };
+use crate::features::{FeaturePlan, Kind};
 use crate::market::parse_event_time_micros;
 
 /// The manifest kind of a published search family.
@@ -62,10 +63,25 @@ pub fn validate(search: &Search) -> Result<(), String> {
         return Err("conditions: at least one menu entry is required".to_string());
     }
     for (index, entry) in search.conditions.iter().enumerate() {
-        if entry.thresholds.is_empty() {
-            return Err(format!(
-                "conditions[{index}].thresholds: at least one threshold is required"
-            ));
+        match entry {
+            SearchCondition::Named(entry) if entry.thresholds.is_empty() => {
+                return Err(format!(
+                    "conditions[{index}].thresholds: at least one threshold is required"
+                ));
+            }
+            SearchCondition::Named(entry) if entry.output == "*" => {
+                return Err(format!(
+                    "conditions[{index}].output: `*` requires a generation rule without thresholds"
+                ));
+            }
+            SearchCondition::Generate(entry)
+                if entry.output != "*" || entry.comparator != crate::execution::Comparator::Eq =>
+            {
+                return Err(format!(
+                    "conditions[{index}]: a generation rule requires output `*` and comparator `eq`"
+                ));
+            }
+            _ => {}
         }
     }
     if search.contracts.is_empty() {
@@ -140,26 +156,12 @@ pub fn validate(search: &Search) -> Result<(), String> {
             return Err(format!("stability.{name}: must be positive"));
         }
     }
-    let conditions = conditions(&search.conditions);
-    if search.max_conditions as usize > conditions.len() {
-        return Err(format!(
-            "max_conditions: {} exceeds the {} distinct conditions of the menu",
-            search.max_conditions,
-            conditions.len()
-        ));
-    }
-    let size = family_size(
-        conditions.len(),
-        search.min_conditions as usize,
-        search.max_conditions as usize,
-        search.contracts.len(),
-    )
-    .ok_or("conditions: the family size overflows")?;
-    if size > search.max_candidates {
-        return Err(format!(
-            "max_candidates: the menu enumerates {size} members, above the maximum {}",
-            search.max_candidates
-        ));
+    let generated = search
+        .conditions
+        .iter()
+        .any(|entry| matches!(entry, SearchCondition::Generate(_)));
+    if !generated {
+        validate_size(search, conditions(&search.conditions).len(), false)?;
     }
     if search.embargo_micros < 0 {
         return Err("embargo_micros: must not be negative".to_string());
@@ -185,7 +187,18 @@ pub fn validate(search: &Search) -> Result<(), String> {
         return Err("evaluation.splits: `none` names the undeclared split".to_string());
     }
     let placeholder_instrument = format!("{}:validation", search.account.broker);
-    let lowering = lowering_replay(search, "validation", &placeholder_instrument);
+    let placeholder = [Condition {
+        stream: search.base_stream,
+        output: "validation_only".into(),
+        comparator: crate::execution::Comparator::Eq,
+        threshold: crate::execution::Threshold::Bool(true),
+    }];
+    let named = conditions(&search.conditions);
+    let lowering = if generated && named.is_empty() {
+        lowering_replay_for(search, "validation", &placeholder_instrument, &placeholder)
+    } else {
+        lowering_replay_for(search, "validation", &placeholder_instrument, &named)
+    };
     crate::execution::validate(&lowering)?;
     if let Some(evaluation) = &search.evaluation {
         let development_end = parse_event_time_micros(&search.development.decision_end)?;
@@ -214,6 +227,193 @@ pub fn validate(search: &Search) -> Result<(), String> {
     Ok(())
 }
 
+fn validate_size(search: &Search, count: usize, allow_short: bool) -> Result<u64, String> {
+    if !allow_short && search.max_conditions as usize > count {
+        return Err(format!(
+            "max_conditions: {} exceeds the {} distinct conditions of the menu",
+            search.max_conditions, count
+        ));
+    }
+    let size = family_size(
+        count,
+        search.min_conditions as usize,
+        search.max_conditions as usize,
+        search.contracts.len(),
+    )
+    .ok_or("conditions: the family size overflows")?;
+    if size > search.max_candidates {
+        return Err(format!(
+            "max_candidates: the menu enumerates {size} members, above the maximum {}",
+            search.max_candidates
+        ));
+    }
+    Ok(size)
+}
+
+/// The ordered concrete table and its canonical identity, available to search and verification.
+#[derive(Debug)]
+pub struct ResolvedConditions {
+    pub conditions: Vec<Condition>,
+    pub hash: String,
+    pub members: u64,
+}
+
+/// Resolve all generation rules against the frozen development plan, then validate the complete
+/// lowering table and bound family size before any candidate allocation.
+pub fn resolve_conditions(
+    search: &Search,
+    plan: &FeaturePlan,
+) -> Result<ResolvedConditions, String> {
+    validate(search)?;
+    let mut resolved = Vec::new();
+    for (index, entry) in search.conditions.iter().enumerate() {
+        match entry {
+            SearchCondition::Named(entry) => {
+                for threshold in &entry.thresholds {
+                    let condition = Condition {
+                        stream: entry.stream,
+                        output: entry.output.clone(),
+                        comparator: entry.comparator,
+                        threshold: threshold.clone(),
+                    };
+                    if !resolved.contains(&condition) {
+                        resolved.push(condition);
+                    }
+                }
+            }
+            SearchCondition::Generate(rule) => {
+                let stream = plan.stream(rule.stream).ok_or_else(|| {
+                    format!(
+                        "conditions[{index}].stream: {} is not in the development plan",
+                        rule.stream
+                    )
+                })?;
+                for encoding in &stream.encodings {
+                    if encoding.labels.len() <= 1
+                        || stream
+                            .outputs
+                            .iter()
+                            .any(|output| output.name == encoding.output)
+                    {
+                        continue;
+                    }
+                    let unready = &plan.readiness_of(&encoding.input).unready;
+                    for label in &encoding.labels {
+                        if !crate::features::coded_label(label) || unready.contains(label) {
+                            continue;
+                        }
+                        let condition = Condition {
+                            stream: rule.stream,
+                            output: encoding.output.clone(),
+                            comparator: crate::execution::Comparator::Eq,
+                            threshold: crate::execution::Threshold::Text(label.clone()),
+                        };
+                        if !resolved.contains(&condition) {
+                            resolved.push(condition);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    for (index, condition) in resolved.iter().enumerate() {
+        let stream = plan.stream(condition.stream).ok_or_else(|| {
+            format!(
+                "resolved conditions[{index}].stream: {} is not in the development plan",
+                condition.stream
+            )
+        })?;
+        let (kind, source) = if let Some(output) = stream
+            .outputs
+            .iter()
+            .find(|output| output.name == condition.output)
+        {
+            (output.kind, output.name.as_str())
+        } else if let Some(encoding) = stream
+            .encodings
+            .iter()
+            .find(|encoding| encoding.output == condition.output)
+        {
+            if !stream
+                .outputs
+                .iter()
+                .any(|output| output.name == encoding.input)
+            {
+                return Err(format!(
+                    "resolved conditions[{index}].output: encoding `{}` has no compiled input `{}`",
+                    encoding.output, encoding.input
+                ));
+            }
+            (Kind::Text, encoding.input.as_str())
+        } else {
+            return Err(format!(
+                "resolved conditions[{index}].output: `{}` is not a compiled output or fitted encoding of stream {}",
+                condition.output, condition.stream
+            ));
+        };
+        if !matches!(
+            (&condition.threshold, kind),
+            (crate::execution::Threshold::Text(_), Kind::Text)
+                | (crate::execution::Threshold::Bool(_), Kind::Bool)
+                | (
+                    crate::execution::Threshold::Number(_),
+                    Kind::Int | Kind::Float | Kind::Time
+                )
+        ) {
+            return Err(format!(
+                "resolved conditions[{index}]: `{}` is a {kind} output; the threshold type does not match",
+                condition.output
+            ));
+        }
+        for flag in plan.readiness_of(source).flags {
+            if !stream.outputs.iter().any(|output| output.name == flag)
+                && !stream
+                    .encodings
+                    .iter()
+                    .any(|encoding| encoding.output == flag)
+            {
+                return Err(format!(
+                    "resolved conditions[{index}].output: readiness flag `{flag}` of `{}` is absent from stream {}",
+                    condition.output, condition.stream
+                ));
+            }
+        }
+    }
+    let members = validate_size(search, resolved.len(), true)?;
+    let placeholder = format!("{}:validation", search.account.broker);
+    let lowering = lowering_replay_for(search, "validation", &placeholder, &resolved);
+    // An empty resolved table has no replay strategies; the next stage publishes an empty family.
+    if !resolved.is_empty() {
+        crate::execution::validate(&lowering)?;
+    }
+    if let Some(evaluation) = &search.evaluation {
+        let members: Vec<_> = lowering
+            .strategies
+            .into_iter()
+            .map(|strategy| (strategy.id.clone(), strategy, 0))
+            .collect();
+        if !members.is_empty() {
+            crate::execution::validate(&replay_table(
+                search,
+                DatasetRole::Evaluation,
+                evaluation,
+                &placeholder,
+                &members,
+                search.account.initial_cash,
+            ))
+            .map_err(|reason| format!("evaluation.{reason}"))?;
+        }
+    }
+    let mut hasher = Sha256::new();
+    hasher.update(b"binary-alpha resolved search conditions v1\n");
+    hasher.update(serde_json::to_vec(&resolved).expect("conditions serialize"));
+    Ok(ResolvedConditions {
+        conditions: resolved,
+        hash: crate::hex(&hasher.finalize()),
+        members,
+    })
+}
+
 /// The contract with every amount normalized, so equal money written at different scales
 /// compares equal.
 fn normalized_terms(contract: &ContractTerms) -> ContractTerms {
@@ -236,19 +436,27 @@ fn normalized_terms(contract: &ContractTerms) -> ContractTerms {
 /// account and one single-condition strategy per condition, so every base row where a
 /// condition holds is a `signal` record and nothing is ever funded.
 pub fn lowering_replay(search: &Search, plan_identity: &str, instrument: &str) -> Replay {
-    let conditions = conditions(&search.conditions);
+    lowering_replay_for(
+        search,
+        plan_identity,
+        instrument,
+        &conditions(&search.conditions),
+    )
+}
+
+/// Lower an already resolved table; unlike menu lowering, this includes generated conditions.
+pub fn lowering_replay_for(
+    search: &Search,
+    plan_identity: &str,
+    instrument: &str,
+    conditions: &[Condition],
+) -> Replay {
     let members: Vec<(String, StrategySpec, usize)> = (0..conditions.len())
         .map(|index| {
             let id = format!("c{index}");
             (
                 id.clone(),
-                strategy(
-                    &id,
-                    plan_identity,
-                    search.base_stream,
-                    &conditions,
-                    &[index],
-                ),
+                strategy(&id, plan_identity, search.base_stream, conditions, &[index]),
                 0,
             )
         })
@@ -323,6 +531,9 @@ pub fn replay_table(
 pub fn conditions(menu: &[SearchCondition]) -> Vec<Condition> {
     let mut conditions: Vec<Condition> = Vec::new();
     for entry in menu {
+        let SearchCondition::Named(entry) = entry else {
+            continue;
+        };
         for threshold in &entry.thresholds {
             let condition = Condition {
                 stream: entry.stream,
@@ -1236,18 +1447,18 @@ mod tests {
             offset_seconds: 0,
         };
         let menu = vec![
-            SearchCondition {
+            SearchCondition::Named(crate::config::NamedSearchCondition {
                 stream,
                 output: "candle_direction".into(),
                 comparator: Comparator::Eq,
                 thresholds: vec![Threshold::Text("up".into()), Threshold::Text("up".into())],
-            },
-            SearchCondition {
+            }),
+            SearchCondition::Named(crate::config::NamedSearchCondition {
                 stream,
                 output: "range_bps".into(),
                 comparator: Comparator::Gt,
                 thresholds: vec![Threshold::Number(0.08)],
-            },
+            }),
         ];
         let conditions = conditions(&menu);
         assert_eq!(conditions.len(), 2);
@@ -1258,6 +1469,187 @@ mod tests {
             candidates[2].logic_identity,
             signal_logic_identity(&strategy("x", "plan", stream, &conditions, &[1, 0]))
         );
+    }
+
+    #[test]
+    fn generated_rules_resolve_fitted_labels_only_after_binding() {
+        use crate::config::{GeneratedSearchCondition, NamedSearchCondition};
+        use crate::features::{FittedEncoding, OutputSpec, ProjectionKind, Value};
+        let family: Family = serde_json::from_slice(include_bytes!("../../app/tests/fixtures/legacy_schema1/published/objects/736abc73d301789d7e19aa2ac927cc1e1010dd12cce189c2087b4255ee254717")).unwrap();
+        let mut search = family.search;
+        let mut plan = FeaturePlan::from_json(include_bytes!("../../app/tests/fixtures/legacy_schema1/published/objects/681b83854e41cf26ce7bd74254460523b82de3b8df0d09cd238c87d5ce4f3c92")).unwrap();
+        let stream = plan.streams[0].key();
+        let mut boolean: OutputSpec = plan.streams[0]
+            .outputs
+            .iter()
+            .find(|output| output.name == "candle_direction")
+            .unwrap()
+            .clone();
+        boolean.name = "is_bullish".into();
+        boolean.kind = Kind::Bool;
+        plan.streams[0].outputs.push(boolean);
+        let mut sequence = plan.streams[0]
+            .outputs
+            .iter()
+            .find(|output| output.name == "candle_direction")
+            .unwrap()
+            .clone();
+        sequence.name = "market_structure_sequence".into();
+        plan.streams[0].outputs.push(sequence);
+        let mut numeric = FittedEncoding {
+            output: "range_bps__dev_fifths".into(),
+            input: "range_bps".into(),
+            automatic: true,
+            encoding: ProjectionKind::DevelopmentFifths,
+            edges: None,
+            input_divisor: 1.0,
+            labels: vec![],
+        };
+        numeric
+            .fit(
+                &(0..100)
+                    .map(|x| Some(Value::Float(x as f64)))
+                    .collect::<Vec<_>>(),
+                5,
+            )
+            .unwrap();
+        assert_eq!(numeric.labels.len(), 5);
+        plan.streams[0].encodings = vec![
+            numeric.clone(),
+            FittedEncoding {
+                output: "is_bullish__category".into(),
+                input: "is_bullish".into(),
+                automatic: true,
+                encoding: ProjectionKind::Category,
+                edges: None,
+                input_divisor: 1.0,
+                labels: vec!["true".into(), "false".into()],
+            },
+            FittedEncoding {
+                output: "constant".into(),
+                input: "candle_direction".into(),
+                automatic: true,
+                encoding: ProjectionKind::Category,
+                edges: None,
+                input_divisor: 1.0,
+                labels: vec!["up".into()],
+            },
+            FittedEncoding {
+                output: "collided".into(),
+                input: "range_bps".into(),
+                automatic: true,
+                encoding: ProjectionKind::DevelopmentFifths,
+                edges: None,
+                input_divisor: 1.0,
+                labels: vec![],
+            },
+            FittedEncoding {
+                output: "range_bps".into(),
+                input: "range_bps".into(),
+                automatic: false,
+                encoding: ProjectionKind::Category,
+                edges: None,
+                input_divisor: 1.0,
+                labels: vec!["a".into(), "b".into()],
+            },
+            FittedEncoding {
+                output: "uncoded".into(),
+                input: "candle_direction".into(),
+                automatic: true,
+                encoding: ProjectionKind::Category,
+                edges: None,
+                input_divisor: 1.0,
+                labels: vec!["missing".into(), "none".into()],
+            },
+            FittedEncoding {
+                output: "unready_dominant".into(),
+                input: "market_structure_sequence".into(),
+                automatic: true,
+                encoding: ProjectionKind::Category,
+                edges: None,
+                input_divisor: 1.0,
+                labels: vec!["unknown".into(), "warming_up".into()],
+            },
+        ];
+        search.conditions = vec![
+            SearchCondition::Named(NamedSearchCondition {
+                stream,
+                output: numeric.output.clone(),
+                comparator: Comparator::Eq,
+                thresholds: vec![Threshold::Text(numeric.labels[0].clone())],
+            }),
+            SearchCondition::Generate(GeneratedSearchCondition {
+                stream,
+                output: "*".into(),
+                comparator: Comparator::Eq,
+            }),
+        ];
+        search.min_conditions = 1;
+        search.max_conditions = 2;
+        search.max_candidates = 1000;
+        validate(&search).unwrap(); // Syntax requires no plan or resolved family count.
+        let resolved = resolve_conditions(&search, &plan).unwrap();
+        assert_eq!(resolved.conditions.len(), 7);
+        assert_eq!(
+            resolved.conditions[0].threshold,
+            Threshold::Text(numeric.labels[0].clone())
+        );
+        assert_eq!(
+            resolved.conditions[1].threshold,
+            Threshold::Text(numeric.labels[1].clone())
+        );
+        assert_eq!(
+            resolved.conditions[5].threshold,
+            Threshold::Text("true".into())
+        );
+        assert_eq!(
+            resolved.conditions[6].threshold,
+            Threshold::Text("false".into())
+        );
+        assert_eq!(
+            resolved.members,
+            family_size(7, 1, 2, search.contracts.len()).unwrap()
+        );
+        assert_eq!(
+            resolve_conditions(&search, &plan).unwrap().hash,
+            resolved.hash
+        );
+        plan.streams[0].encodings[0].input = "absent".into();
+        assert!(
+            resolve_conditions(&search, &plan)
+                .unwrap_err()
+                .contains("has no compiled input")
+        );
+        plan.streams[0].encodings[0].input = "range_bps".into();
+        search.max_candidates = 1;
+        assert!(validate(&search).is_ok());
+        assert!(
+            resolve_conditions(&search, &plan)
+                .unwrap_err()
+                .contains("max_candidates")
+        );
+        search.max_candidates = 1000;
+        search.conditions.remove(0);
+        plan.streams[0].encodings.truncate(1);
+        plan.streams[0].encodings[0].labels.truncate(1);
+        search.min_conditions = 2;
+        let short = resolve_conditions(&search, &plan).unwrap();
+        assert!(short.conditions.is_empty());
+        assert_eq!(short.members, 0);
+        search.conditions.insert(
+            0,
+            SearchCondition::Named(NamedSearchCondition {
+                stream,
+                output: "candle_direction".into(),
+                comparator: Comparator::Eq,
+                thresholds: vec![Threshold::Text("up".into())],
+            }),
+        );
+        search.min_conditions = 1;
+        search.max_conditions = 3;
+        let one = resolve_conditions(&search, &plan).unwrap();
+        assert_eq!(one.conditions.len(), 1);
+        assert_eq!(one.members, search.contracts.len() as u64);
     }
 
     #[test]
