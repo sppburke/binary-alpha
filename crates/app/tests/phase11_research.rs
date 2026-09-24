@@ -11,10 +11,12 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant, SystemTime};
 
 use binary_alpha_engine::config::{
-    Config, EncodingSpec, Encodings, GeneratedSearchCondition, ManifestUri, PortfolioGenerate,
-    ReplayScenario, SearchCondition, StreamKey,
+    Config, DataSplit, EncodingSpec, Encodings, GeneratedSearchCondition, ManifestUri,
+    PortfolioGenerate, ReplayScenario, Scope, Screen, SearchCondition, StreamKey,
 };
-use binary_alpha_engine::dataset::{DatasetRole, GenerationManifest, manifest_key};
+use binary_alpha_engine::dataset::coverage::CoverageRange;
+use binary_alpha_engine::dataset::daily::DAY_MICROS;
+use binary_alpha_engine::dataset::{DatasetRole, GenerationManifest, Layout, manifest_key};
 use binary_alpha_engine::execution::{
     Comparator, Decimal, EventKind, FinancialEvent, Summary, Threshold,
 };
@@ -38,7 +40,7 @@ const PROTECTED: &str =
 /// The distinct operator account the grant command runs under.
 const OPERATOR: &str = "synthetic-operator";
 
-use fixture_config::{Row, recipe};
+use fixture_config::{Row, bar_rows, recipe};
 fn ticks(base: i64, rows: &[Row], instrument: usize) -> Vec<String> {
     fixture_config::ticks_at_scale(base, rows, SCALES[instrument])
 }
@@ -98,6 +100,236 @@ impl Fixture {
 
     fn bars(name: &str) -> Self {
         Self::with_bars(Scratch::new(name), PLANTED, PLANTED, true)
+    }
+
+    fn wide_split(name: &str) -> Self {
+        use binary_alpha_engine::config::{NamedSearchCondition, Outputs};
+        let scratch = Scratch::new(name);
+        let mut config = fixture_config::configuration(&scratch.root);
+        configure_bars(&mut config);
+        let streams: Vec<_> = [(5, 0), (15, 5), (30, 15), (60, 30), (300, 150)]
+            .map(|(duration_seconds, offset_seconds)| StreamKey {
+                duration_seconds,
+                offset_seconds,
+            })
+            .into();
+        let recipe = recipe(PLANTED);
+        let rows = (0..80)
+            .map(|index| recipe[index % recipe.len()])
+            .collect::<Vec<_>>();
+        let source = scratch.path("sources/wide-bars");
+        common::write_collection(
+            &source,
+            &(0..2)
+                .map(|instrument| {
+                    let divisor = 10_i64.pow(u32::from(SCALES[instrument])) as f64;
+                    let bars = (0..5)
+                        .flat_map(|day| {
+                            let mut bars = bar_rows(BASE + day * DAY_MICROS, &rows, instrument);
+                            for (index, bar) in bars.iter_mut().enumerate() {
+                                let variation = (index / 60 + index % 3) as i64;
+                                bar.ohlcv[1] = ((bar.ohlcv[1] * divisor).round() as i64 + variation)
+                                    as f64
+                                    / divisor;
+                                bar.ohlcv[2] = ((bar.ohlcv[2] * divisor).round() as i64 - variation)
+                                    as f64
+                                    / divisor;
+                            }
+                            bars
+                        })
+                        .collect();
+                    common::AssetSpec {
+                        asset: SYMBOLS[instrument],
+                        expected_symbol_id: Some(instrument as i32 + 7),
+                        symbol_id: Some(instrument as i32 + 7),
+                        files: vec![bars],
+                        metadata: true,
+                    }
+                })
+                .collect::<Vec<_>>(),
+        );
+        let import_path = scratch.config(
+            "wide-import.toml",
+            &scratch
+                .bar_source()
+                .replace("sources/bars", "sources/wide-bars")
+                .replace("role = \"evaluation\"", "role = \"development\""),
+        );
+        let imports = common::current::import(&import_path).unwrap();
+        let root_datasets: Vec<_> = imports
+            .iter()
+            .map(|line| {
+                let generation = common::generation(line);
+                GenerationManifest::from_json(
+                    &fs::read(scratch.path("published").join(manifest_key(&generation))).unwrap(),
+                )
+                .unwrap()
+            })
+            .collect();
+        assert_eq!(root_datasets.len(), 2);
+        assert!(
+            root_datasets
+                .iter()
+                .all(|root| root.layout == Some(Layout::DailyV2))
+        );
+        let split_root = scratch.path("split-published");
+        let day =
+            |first, end| CoverageRange::new(BASE + first * DAY_MICROS, BASE + end * DAY_MICROS);
+        let mut split = binary_alpha_app::skeleton(&config);
+        split.storage.historical_data_dir =
+            serde_json::from_value(serde_json::json!(scratch.path("split-retained"))).unwrap();
+        split.storage.publication_uri = format!("file://{}", split_root.display()).parse().unwrap();
+        split.split = Some(DataSplit {
+            namespace: "phase11-wide".into(),
+            sources: root_datasets
+                .iter()
+                .map(|root| uri(&scratch.root, &root.generation))
+                .collect(),
+            development: vec![day(0, 1), day(1, 2), day(2, 3)],
+            evaluation: vec![day(3, 4)],
+            holdout: vec![day(4, 5)],
+        });
+        let split_path = scratch.path("wide-split.toml");
+        write(&split_path, split.canonical_toml());
+        let report = cli_as(
+            &scratch.path("wide-split.log"),
+            OPERATOR,
+            &["data", "split", "--config", split_path.to_str().unwrap()],
+        )
+        .unwrap();
+        let declaration_uri = report
+            .lines()
+            .last()
+            .unwrap()
+            .strip_prefix("declaration ")
+            .unwrap();
+        let declaration = Declaration::from_json(
+            &fs::read(declaration_uri.strip_prefix("file://").unwrap()).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(declaration.populations.len(), 10);
+        let mut datasets = root_datasets;
+        datasets.extend(declaration.populations.iter().map(|population| {
+            GenerationManifest::from_json(
+                &fs::read(split_root.join(manifest_key(&population.id))).unwrap(),
+            )
+            .unwrap()
+        }));
+        config.storage = split.storage;
+        config.research.as_mut().unwrap().study.governance_manifest =
+            declaration_uri.parse().unwrap();
+        for instrument in &mut config.instruments {
+            instrument.candles = streams
+                .iter()
+                .map(|stream| binary_alpha_engine::config::CandleSpec {
+                    duration_seconds: stream.duration_seconds,
+                    offset_seconds: stream.offset_seconds,
+                    min_observations: Some(1),
+                    hard_min_observations: Some(1),
+                })
+                .collect();
+        }
+        let research = config.research.as_mut().unwrap();
+        research.portfolio.generate = Some(PortfolioGenerate { top: 8 });
+        research.portfolio.members.clear();
+        research.portfolio.subsets.clear();
+        research.portfolio.max_policies = 64;
+        research.portfolio.max_rate_age_micros = 8 * DAY_MICROS;
+        research.portfolio.gates.min_decisive = Some(1);
+        research.portfolio.gates.min_win_rate = Some(decimal("0.1"));
+        research.portfolio.gates.max_unresolved = 100;
+        research.portfolio.gates.min_profit = decimal("-1000");
+        research.qualification.gates = research.portfolio.gates.clone();
+        for binding in &mut research.portfolio.bindings {
+            binding.alternatives.truncate(1);
+        }
+        let end =
+            |day| time(BASE + day * DAY_MICROS + (rows.len() as i64 + 1) * CANDLE + 1_000_000);
+        research.folds[0].cutoff = end(1);
+        research.folds[0].decision_start = time(BASE + 2 * DAY_MICROS);
+        research.folds[0].decision_end = end(2);
+        research.refit.cutoff = end(2);
+        research.evaluation.decision_start = time(BASE + 3 * DAY_MICROS);
+        research.evaluation.decision_end = end(3);
+        research.evaluation.splits = None;
+        research.holdout.decision_start = time(BASE + 4 * DAY_MICROS);
+        research.holdout.decision_end = end(4);
+        research.holdout.splits = None;
+        for index in 0..2 {
+            let reference = |slot: usize| {
+                format!(
+                    "file://{}",
+                    split_root
+                        .join(manifest_key(&declaration.populations[index * 5 + slot].id))
+                        .display()
+                )
+                .parse()
+                .unwrap()
+            };
+            let instrument = &mut research.instruments[index];
+            instrument.source_manifest = reference(0);
+            instrument.features.streams = Some(streams.clone());
+            instrument.features.outputs = Some(Outputs::AllSupported);
+            instrument.features.moving_average_periods = Some(vec![2, 3]);
+            instrument.features.rolling_window = Some(4);
+            instrument.features.min_history = Some(2);
+            instrument.features.price_epsilon = Some("0".into());
+            instrument.features.structure = Some(serde_json::from_value(serde_json::json!({
+                "swing_left":2,"swing_right":2,"rolling_windows":[2,3],"direction_window":2,
+                "trend_efficiency_threshold":0.35,"trend_min_abs_momentum_bps":3.0,
+                "range_efficiency_threshold":0.25,"compression_ratio_threshold":0.7,
+                "expanded_ratio_threshold":1.3,"extreme_ratio_threshold":1.8,
+                "pullback_min_trend_age":2,"trend_reset_sideways_bars":2,"failed_breakout_max_bars":2
+            })).unwrap());
+            instrument.features.encodings = Some(Encodings {
+                max_labels: 2,
+                outputs: vec![EncodingSpec {
+                    output: "all_supported".into(),
+                    bins: None,
+                }],
+            });
+            instrument.search.decision_start = time(BASE);
+            instrument.search.decision_end = end(0);
+            instrument.search.scope = Scope::Heuristic;
+            instrument.search.base_stream = streams[0];
+            instrument.search.max_candidates = 100_000;
+            instrument.search.max_conditions = 2;
+            instrument.search.conditions = vec![
+                SearchCondition::Generate(GeneratedSearchCondition {
+                    stream: streams[4],
+                    output: "*".into(),
+                    comparator: Comparator::Eq,
+                }),
+                SearchCondition::Named(NamedSearchCondition {
+                    stream: streams[4],
+                    output: "candle_direction".into(),
+                    comparator: Comparator::Eq,
+                    thresholds: vec![Threshold::Text("up".into())],
+                }),
+            ];
+            instrument.search.screen = Some(Screen {
+                max_adjusted_score: 1.0,
+                top: Some(64),
+            });
+            instrument.search.gates.min_settled = 0;
+            instrument.search.gates.min_net_profit = decimal("-1000");
+            instrument.search.gates.max_unresolved = 100;
+            research.folds[0].inputs[index].fit_manifest = reference(1);
+            research.folds[0].inputs[index].assessment_manifest = reference(2);
+            research.refit.fits[index] = reference(2);
+            research.evaluation.inputs[index] = reference(3);
+            research.holdout.inputs[index] = reference(4);
+        }
+        let path = scratch.path("research.toml");
+        let fixture = Self {
+            scratch,
+            config,
+            path,
+            declaration,
+            datasets,
+        };
+        fixture.save();
+        fixture
     }
 
     fn with_bars(scratch: Scratch, evaluation: [u8; 4], holdout: [u8; 4], bars: bool) -> Self {
@@ -217,6 +449,16 @@ impl Fixture {
     fn log(&self) -> PathBuf {
         self.scratch.path("access.log")
     }
+    fn published(&self) -> PathBuf {
+        PathBuf::from(
+            self.config
+                .storage
+                .publication_uri
+                .to_string()
+                .strip_prefix("file://")
+                .unwrap(),
+        )
+    }
     fn run(&self) -> Result<String, String> {
         cli(
             &self.log(),
@@ -231,15 +473,8 @@ impl Fixture {
         )
     }
     fn manifest(&self, generation: &str) -> Value {
-        serde_json::from_slice(
-            &fs::read(
-                self.scratch
-                    .path("published")
-                    .join(manifest_key(generation)),
-            )
-            .unwrap(),
-        )
-        .unwrap()
+        serde_json::from_slice(&fs::read(self.published().join(manifest_key(generation))).unwrap())
+            .unwrap()
     }
     fn object(&self, generation: &str, path: &str) -> Vec<u8> {
         let manifest = self.manifest(generation);
@@ -249,23 +484,13 @@ impl Fixture {
             .iter()
             .find(|o| o["path"] == path)
             .unwrap();
-        fs::read(
-            self.scratch
-                .path("published")
-                .join(object["key"].as_str().unwrap()),
-        )
-        .unwrap()
+        fs::read(self.published().join(object["key"].as_str().unwrap())).unwrap()
     }
     fn run_record(&self) -> (RunManifest, Run) {
         let generation = self.generation();
         (
             RunManifest::from_json(
-                &fs::read(
-                    self.scratch
-                        .path("published")
-                        .join(manifest_key(&generation)),
-                )
-                .unwrap(),
+                &fs::read(self.published().join(manifest_key(&generation))).unwrap(),
             )
             .unwrap(),
             Run::from_json(&self.object(&generation, "research.json")).unwrap(),
@@ -285,8 +510,9 @@ impl Fixture {
         Summary::from_json(&self.object(generation, "summary.json")).unwrap()
     }
     fn grant_path(&self) -> PathBuf {
-        self.scratch.path("governance").join(
-            self.declaration
+        self.governance_path(
+            &self
+                .declaration
                 .key(&research::grant_key(&self.generation())),
         )
     }
@@ -302,7 +528,12 @@ impl Fixture {
                 "--config",
                 self.path.to_str().unwrap(),
                 "--bundle-manifest",
-                &uri(&self.scratch.root, &self.generation()).to_string(),
+                &format!(
+                    "file://{}",
+                    self.published()
+                        .join(manifest_key(&self.generation()))
+                        .display()
+                ),
                 "--holdout-manifest",
                 &holdout[0].to_string(),
                 "--holdout-manifest",
@@ -321,12 +552,7 @@ impl Fixture {
         let generation = research::certification_generation_id(&self.generation(), &grant.hash);
         (
             CertificationManifest::from_json(
-                &fs::read(
-                    self.scratch
-                        .path("published")
-                        .join(manifest_key(&generation)),
-                )
-                .unwrap(),
+                &fs::read(self.published().join(manifest_key(&generation))).unwrap(),
             )
             .unwrap(),
             CertificationRecord::from_json(&self.object(&generation, "certification.json"))
@@ -361,7 +587,14 @@ impl Fixture {
             .collect()
     }
     fn governance_path(&self, key: &str) -> PathBuf {
-        self.scratch.path("governance").join(key)
+        PathBuf::from(
+            self.declaration
+                .root
+                .to_string()
+                .strip_prefix("file://")
+                .unwrap(),
+        )
+        .join(key)
     }
     fn verify(&self, generation: &str) -> Result<String, String> {
         cli(
@@ -370,7 +603,10 @@ impl Fixture {
                 "data",
                 "verify",
                 "--manifest",
-                &uri(&self.scratch.root, generation).to_string(),
+                &format!(
+                    "file://{}",
+                    self.published().join(manifest_key(generation)).display()
+                ),
                 "--config",
                 self.path.to_str().unwrap(),
             ],
@@ -444,51 +680,6 @@ fn configure_bars(config: &mut Config) {
             settlement(&mut alternative.contract);
         }
     }
-}
-
-/// Four bars preserve each planted candle's direction and range. The next two closes pay
-/// its declared result for both aligned acceptance and the delayed acceptance scenario.
-fn bar_rows(base: i64, rows: &[Row], instrument: usize) -> Vec<common::BarRow> {
-    let mut bars = Vec::new();
-    let divisor = 10_i64.pow(u32::from(SCALES[instrument])) as f64;
-    for k in 0..=rows.len() {
-        let current = rows.get(k);
-        let previous = k.checked_sub(1).map(|i| rows[i]);
-        for step in 0..if current.is_some() { 4 } else { 2 } {
-            let movement = match (step, current) {
-                (0 | 1, _) => previous.map_or(2 + step, |row| {
-                    (if row.up { 1 } else { -1 }) + (if row.win { 1 } else { -1 }) * (2 + step)
-                }),
-                (3, Some(row)) => {
-                    if row.up {
-                        1
-                    } else {
-                        -1
-                    }
-                }
-                _ => 0,
-            };
-            let range = if current.is_some_and(|row| row.wide) {
-                12
-            } else {
-                4
-            };
-            let [open, high, low, close] = [
-                1_800_000,
-                1_800_000 + range,
-                1_800_000 - range,
-                1_800_000 + movement,
-            ]
-            .map(|price| price as f64 / divisor);
-            bars.push(common::bar(
-                SYMBOLS[instrument],
-                instrument as i32 + 7,
-                (base + k as i64 * CANDLE) / 1_000_000 + step * 5,
-                [open, high, low, close, 1.0],
-            ));
-        }
-    }
-    bars
 }
 
 fn import_bar_pair(
@@ -656,6 +847,680 @@ fn five_stream_generated_search_publishes_and_verifies_in_research() {
                 .unwrap()
                 .contains("verified search generation")
         );
+    }
+}
+
+#[test]
+fn daily_split_wide_generated_research_certifies_without_early_holdout_access() {
+    let fixture = Fixture::wide_split("phase11_wide_daily_split");
+    for dataset in fixture.datasets.iter().take(2) {
+        command(&[
+            "data",
+            "verify",
+            "--manifest",
+            &uri(&fixture.scratch.root, &dataset.generation).to_string(),
+        ])
+        .unwrap();
+    }
+    for dataset in fixture.datasets.iter().skip(2) {
+        if dataset.role != DatasetRole::Holdout {
+            fixture.verify(&dataset.generation).unwrap();
+        }
+    }
+    let development = &fixture.config.research.as_ref().unwrap().instruments[0].source_manifest;
+    let mut standalone = binary_alpha_app::skeleton(&fixture.config);
+    standalone.instruments = fixture.config.instruments.clone();
+    let path = fixture.scratch.path("wide-standalone.toml");
+    write(&path, standalone.canonical_toml());
+    let audit = cli(
+        &fixture.log(),
+        &[
+            "data",
+            "audit",
+            "--config",
+            path.to_str().unwrap(),
+            "--manifest",
+            &development.to_string(),
+        ],
+    )
+    .unwrap();
+    let profile_generation = common::generation(audit.lines().next().unwrap());
+    let profile = format!(
+        "file://{}",
+        fixture
+            .published()
+            .join(manifest_key(&profile_generation))
+            .display()
+    );
+    fixture.verify(&profile_generation).unwrap();
+    let feature_settings = &fixture.config.research.as_ref().unwrap().instruments[0].features;
+    let mut feature = serde_json::to_value(feature_settings).unwrap();
+    feature["role"] = "development".into();
+    feature["input_manifest"] = development.to_string().into();
+    feature["profile_manifest"] = profile.clone().into();
+    standalone.features =
+        Some(serde_json::from_value(serde_json::json!({"instruments":[feature]})).unwrap());
+    write(&path, standalone.canonical_toml());
+    let built = cli(
+        &fixture.log(),
+        &["features", "build", "--config", path.to_str().unwrap()],
+    )
+    .unwrap();
+    let feature_generation = common::generation(built.lines().next().unwrap());
+    fixture.verify(&feature_generation).unwrap();
+    standalone.features = None;
+    let mut outcomes =
+        serde_json::to_value(&fixture.config.research.as_ref().unwrap().instruments[0].outcomes)
+            .unwrap();
+    outcomes["role"] = "development".into();
+    outcomes["tick_manifest"] = development.to_string().into();
+    outcomes["feature_manifest"] = format!(
+        "file://{}",
+        fixture
+            .published()
+            .join(manifest_key(&feature_generation))
+            .display()
+    )
+    .into();
+    standalone.outcomes = Some(serde_json::from_value(outcomes).unwrap());
+    write(&path, standalone.canonical_toml());
+    let built = cli(
+        &fixture.log(),
+        &["outcomes", "build", "--config", path.to_str().unwrap()],
+    )
+    .unwrap();
+    let outcome_generation = common::generation(built.lines().next().unwrap());
+    fixture.verify(&outcome_generation).unwrap();
+    standalone.outcomes = None;
+    let mut search =
+        serde_json::to_value(&fixture.config.research.as_ref().unwrap().instruments[0].search)
+            .unwrap();
+    let start = search
+        .as_object_mut()
+        .unwrap()
+        .remove("decision_start")
+        .unwrap();
+    let end = search
+        .as_object_mut()
+        .unwrap()
+        .remove("decision_end")
+        .unwrap();
+    search["development"] = serde_json::json!({
+        "decision_start":start,"decision_end":end,
+        "inputs":[{"tick_manifest":development,"feature_manifest":format!("file://{}", fixture.published().join(manifest_key(&feature_generation)).display()),
+            "outcome_manifest":format!("file://{}", fixture.published().join(manifest_key(&outcome_generation)).display())}]
+    });
+    standalone.search = Some(serde_json::from_value(search.clone()).unwrap());
+    write(&path, standalone.canonical_toml());
+    let searched = cli(
+        &fixture.log(),
+        &["search", "--config", path.to_str().unwrap()],
+    )
+    .unwrap();
+    let searched_generation = common::generation(searched.lines().next().unwrap());
+    fixture.verify(&searched_generation).unwrap();
+    let standalone_family =
+        Family::from_json(&fixture.object(&searched_generation, "family.json")).unwrap();
+    assert_eq!(standalone_family.schema_version, 2);
+    assert!(standalone_family.lowering.is_some());
+    let stream = fixture.config.research.as_ref().unwrap().instruments[0]
+        .search
+        .conditions[0]
+        .clone();
+    let SearchCondition::Generate(rule) = stream else {
+        unreachable!()
+    };
+    search["conditions"] = serde_json::json!([
+        {"stream":rule.stream,"output":"candle_direction_auto_encoded","comparator":"eq","thresholds":["up"]},
+        {"stream":rule.stream,"output":"candle_direction","comparator":"eq","thresholds":["up"]}
+    ]);
+    search["max_conditions"] = 1.into();
+    search["scope"] = "exhaustive".into();
+    search.as_object_mut().unwrap().remove("screen");
+    standalone.search = Some(serde_json::from_value(search).unwrap());
+    write(&path, standalone.canonical_toml());
+    let parity = cli(
+        &fixture.log(),
+        &["search", "--config", path.to_str().unwrap()],
+    )
+    .unwrap();
+    let parity_generation = common::generation(parity.lines().next().unwrap());
+    fixture.verify(&parity_generation).unwrap();
+    let parity_family =
+        Family::from_json(&fixture.object(&parity_generation, "family.json")).unwrap();
+    let projected = parity_family
+        .members
+        .iter()
+        .find(|member| member.conditions[0].output == "candle_direction_auto_encoded")
+        .unwrap();
+    let lowered = parity_family
+        .members
+        .iter()
+        .find(|member| member.conditions[0].output == "candle_direction")
+        .unwrap();
+    assert_eq!(projected.raw, lowered.raw);
+    assert_eq!(projected.development, lowered.development);
+    let report = fixture.run().unwrap();
+    let (manifest, run) = fixture.run_record();
+    assert_eq!(
+        run.state,
+        RunState::AwaitingHoldoutAuthorization,
+        "{report}"
+    );
+    assert_eq!(manifest.state, "awaiting_holdout_authorization");
+    no_access(&logged(&fixture.log()), &fixture.protected());
+    for (index, instrument) in run.instruments.iter().enumerate() {
+        for generation in [
+            &instrument.profile,
+            &instrument.feature,
+            &instrument.outcome,
+            &instrument.family,
+        ] {
+            fixture.verify(generation).unwrap();
+        }
+        let plan =
+            FeaturePlan::from_json(&fixture.object(&instrument.feature, "plan.json")).unwrap();
+        let feature = FeatureManifest::from_json(
+            &fs::read(fixture.published().join(manifest_key(&instrument.feature))).unwrap(),
+        )
+        .unwrap();
+        let expected_streams = [(5, 0), (15, 5), (30, 15), (60, 30), (300, 150)];
+        assert_eq!(plan.streams.len(), expected_streams.len());
+        assert_eq!(feature.streams.len(), expected_streams.len());
+        for (duration, offset) in expected_streams {
+            let stream = plan
+                .streams
+                .iter()
+                .find(|stream| {
+                    stream.duration_seconds == duration && stream.offset_seconds == offset
+                })
+                .unwrap();
+            let summary = feature
+                .streams
+                .iter()
+                .find(|summary| {
+                    summary.duration_seconds == duration && summary.offset_seconds == offset
+                })
+                .unwrap();
+            let fit = plan
+                .fit_windows
+                .iter()
+                .find(|fit| fit.duration_seconds == duration && fit.offset_seconds == offset)
+                .unwrap();
+            assert!(summary.rows >= 5, "unfilled {duration}s@{offset}s stream");
+            assert_eq!(fit.rows, summary.rows);
+            assert!(
+                stream
+                    .outputs
+                    .iter()
+                    .any(|output| output.name == "return_std_2_bps")
+            );
+            assert!(stream.encodings.iter().any(|encoding| {
+                encoding.input == "return_std_2_bps"
+                    && encoding.output == "return_std_2_bps_auto_encoded"
+                    && encoding.automatic
+            }));
+        }
+        let family = Family::from_json(&fixture.object(&instrument.family, "family.json")).unwrap();
+        assert_eq!(family.schema_version, 2);
+        assert!(
+            family
+                .resolved_conditions
+                .as_ref()
+                .unwrap()
+                .iter()
+                .any(|condition| condition.output.ends_with("_auto_encoded"))
+        );
+        assert!(family.lowering.is_some());
+        assert!(family.members.iter().any(|member| member.rank.is_some()));
+        assert!(family.members.iter().any(|member| {
+            member.rank.is_some()
+                && member
+                    .conditions
+                    .iter()
+                    .any(|condition| condition.output == "candle_direction_auto_encoded")
+                && member
+                    .development
+                    .as_ref()
+                    .and_then(|group| group.profit.get(CURRENCIES[index]).copied().flatten())
+                    .is_some_and(|profit| profit.compare(decimal("0")).unwrap().is_gt())
+        }));
+    }
+    let selection = fixture.selection(&run);
+    let settings = selection.config.portfolio.as_ref().unwrap();
+    assert_eq!(settings.generate, Some(PortfolioGenerate { top: 8 }));
+    assert!(
+        settings
+            .members
+            .iter()
+            .any(|member| !member.ordinals.is_empty())
+    );
+    for member in &settings.members {
+        let record = &run.instruments[member.family];
+        let plan = FeaturePlan::from_json(&fixture.object(&record.feature, "plan.json")).unwrap();
+        let family = Family::from_json(&fixture.object(&record.family, "family.json")).unwrap();
+        let source = family
+            .members
+            .iter()
+            .find(|source| source.global_index == Some(member.member as u64))
+            .unwrap();
+        for ordinal in &member.ordinals {
+            let condition = &source.conditions[ordinal.condition];
+            let encoding = plan
+                .stream(condition.stream)
+                .unwrap()
+                .encodings
+                .iter()
+                .find(|encoding| encoding.output == condition.output)
+                .unwrap();
+            assert_eq!(
+                condition.threshold,
+                Threshold::Text(encoding.interval_label(ordinal.ordinal).unwrap())
+            );
+        }
+    }
+    assert_eq!(
+        fixture
+            .config
+            .research
+            .as_ref()
+            .unwrap()
+            .qualification
+            .gates
+            .min_decisive,
+        Some(1)
+    );
+    assert_eq!(
+        fixture
+            .config
+            .research
+            .as_ref()
+            .unwrap()
+            .qualification
+            .gates
+            .min_win_rate,
+        Some(decimal("0.1"))
+    );
+    assert!(run.outer.iter().all(|result| {
+        let projection = &result.outer.projection;
+        let decisive = projection.wins.unwrap() + projection.losses.unwrap();
+        projection.ties.is_some() && decisive >= 1 && projection.wins.unwrap() * 10 >= decisive
+    }));
+    fixture.verify(&run.selection).unwrap();
+    fixture.verify(&manifest.generation).unwrap();
+    let (_, grant) = fixture.grant();
+    no_access(&logged(&fixture.log()), &fixture.protected());
+    let certified = fixture.run().unwrap();
+    assert!(certified.contains("verified research certification"));
+    assert!(!certified.contains("envelope only"));
+    let (certification, record) = fixture.certification(&grant);
+    assert_eq!(certification.state, "certified");
+    assert_eq!(record.verdict, Verdict::Pass);
+    assert_eq!(record.holdout.len(), 2);
+    assert_eq!(record.scenarios.len(), 3);
+    for (scenario, expected) in
+        record
+            .scenarios
+            .iter()
+            .zip([(52, 30, 22, 0, 1), (51, 24, 27, 0, 2), (52, 30, 22, 0, 1)])
+    {
+        let projection = &scenario.outer.projection;
+        assert_eq!(
+            (
+                projection.settled,
+                projection.wins,
+                projection.losses,
+                projection.ties,
+                projection.unresolved
+            ),
+            (
+                expected.0,
+                Some(expected.1),
+                Some(expected.2),
+                Some(expected.3),
+                expected.4
+            )
+        );
+        assert_eq!(scenario.verdict, Verdict::Pass);
+    }
+    fixture.verify(&certification.generation).unwrap();
+}
+
+#[test]
+fn daily_wide_root_without_holdout_evaluates_a_frozen_search_family() {
+    let fixture = Fixture::wide_split("phase11_wide_without_holdout");
+    let root = fixture.datasets.iter().take(2).collect::<Vec<_>>();
+    let mut split = binary_alpha_app::skeleton(&fixture.config);
+    split.storage.historical_data_dir =
+        serde_json::from_value(serde_json::json!(fixture.scratch.path("free-retained"))).unwrap();
+    split.storage.publication_uri = format!(
+        "file://{}",
+        fixture.scratch.path("free-published").display()
+    )
+    .parse()
+    .unwrap();
+    split.split = Some(DataSplit {
+        namespace: "phase11-wide-without-holdout".into(),
+        sources: root
+            .iter()
+            .map(|root| uri(&fixture.scratch.root, &root.generation))
+            .collect(),
+        development: vec![CoverageRange::new(BASE, BASE + DAY_MICROS)],
+        evaluation: vec![CoverageRange::new(
+            BASE + 3 * DAY_MICROS,
+            BASE + 4 * DAY_MICROS,
+        )],
+        holdout: vec![],
+    });
+    let path = fixture.scratch.path("wide-free.toml");
+    write(&path, split.canonical_toml());
+    let report = cli_as(
+        &fixture.log(),
+        OPERATOR,
+        &["data", "split", "--config", path.to_str().unwrap()],
+    )
+    .unwrap();
+    let declaration_uri = report
+        .lines()
+        .last()
+        .unwrap()
+        .strip_prefix("declaration ")
+        .unwrap();
+    let declaration = Declaration::from_json(
+        &fs::read(declaration_uri.strip_prefix("file://").unwrap()).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(declaration.populations.len(), 4);
+    assert!(
+        declaration
+            .populations
+            .iter()
+            .all(|population| population.role != DatasetRole::Holdout)
+    );
+    let published = fixture.scratch.path("free-published");
+    for population in &declaration.populations {
+        command(&[
+            "data",
+            "verify",
+            "--manifest",
+            &format!(
+                "file://{}",
+                published.join(manifest_key(&population.id)).display()
+            ),
+        ])
+        .unwrap();
+    }
+    let reference = |index: usize| {
+        format!(
+            "file://{}",
+            published
+                .join(manifest_key(&declaration.populations[index].id))
+                .display()
+        )
+    };
+    let development = reference(0);
+    let evaluation = reference(1);
+    let mut standalone = binary_alpha_app::skeleton(&fixture.config);
+    standalone.storage = split.storage;
+    standalone.instruments = fixture.config.instruments.clone();
+    write(&path, standalone.canonical_toml());
+    let audit = cli(
+        &fixture.log(),
+        &[
+            "data",
+            "audit",
+            "--config",
+            path.to_str().unwrap(),
+            "--manifest",
+            &development,
+        ],
+    )
+    .unwrap();
+    let generated_uri = |report: &str| {
+        format!(
+            "file://{}",
+            published
+                .join(manifest_key(&common::generation(
+                    report.lines().next().unwrap()
+                )))
+                .display()
+        )
+    };
+    let profile = generated_uri(&audit);
+    let verify = |uri: &str| command(&["data", "verify", "--manifest", uri]).unwrap();
+    verify(&profile);
+    let mut feature =
+        serde_json::to_value(&fixture.config.research.as_ref().unwrap().instruments[0].features)
+            .unwrap();
+    feature["role"] = "development".into();
+    feature["input_manifest"] = development.clone().into();
+    feature["profile_manifest"] = profile.clone().into();
+    standalone.features =
+        Some(serde_json::from_value(serde_json::json!({"instruments":[feature]})).unwrap());
+    write(&path, standalone.canonical_toml());
+    let fit = cli(
+        &fixture.log(),
+        &["features", "build", "--config", path.to_str().unwrap()],
+    )
+    .unwrap();
+    let fit = generated_uri(&fit);
+    verify(&fit);
+    standalone.features = None;
+    let mut outcome =
+        serde_json::to_value(&fixture.config.research.as_ref().unwrap().instruments[0].outcomes)
+            .unwrap();
+    outcome["role"] = "development".into();
+    outcome["tick_manifest"] = development.clone().into();
+    outcome["feature_manifest"] = fit.clone().into();
+    standalone.outcomes = Some(serde_json::from_value(outcome).unwrap());
+    write(&path, standalone.canonical_toml());
+    let outcomes = cli(
+        &fixture.log(),
+        &["outcomes", "build", "--config", path.to_str().unwrap()],
+    )
+    .unwrap();
+    let outcomes = generated_uri(&outcomes);
+    verify(&outcomes);
+    standalone.outcomes = None;
+    standalone.features = Some(serde_json::from_value(serde_json::json!({"instruments":[{
+        "role":"evaluation","input_manifest":evaluation,"profile_manifest":profile,"frozen_plan":fit
+    }]})).unwrap());
+    write(&path, standalone.canonical_toml());
+    let applied = cli(
+        &fixture.log(),
+        &["features", "build", "--config", path.to_str().unwrap()],
+    )
+    .unwrap();
+    let applied = generated_uri(&applied);
+    verify(&applied);
+    standalone.features = None;
+    let mut search =
+        serde_json::to_value(&fixture.config.research.as_ref().unwrap().instruments[0].search)
+            .unwrap();
+    let start = search
+        .as_object_mut()
+        .unwrap()
+        .remove("decision_start")
+        .unwrap();
+    let end = search
+        .as_object_mut()
+        .unwrap()
+        .remove("decision_end")
+        .unwrap();
+    search["development"] = serde_json::json!({"decision_start":start,"decision_end":end,
+        "inputs":[{"tick_manifest":development,"feature_manifest":fit,"outcome_manifest":outcomes}]});
+    search["evaluation"] = serde_json::json!({"decision_start":time(BASE + 3*DAY_MICROS),
+        "decision_end":time(BASE + 3*DAY_MICROS + 81*CANDLE + 1_000_000),
+        "inputs":[{"tick_manifest":evaluation,"feature_manifest":applied}]});
+    standalone.search = Some(serde_json::from_value(search).unwrap());
+    write(&path, standalone.canonical_toml());
+    let searched = cli(
+        &fixture.log(),
+        &["search", "--config", path.to_str().unwrap()],
+    )
+    .unwrap();
+    let family_uri = generated_uri(&searched);
+    verify(&family_uri);
+    let manifest = serde_json::from_slice::<Value>(
+        &fs::read(family_uri.strip_prefix("file://").unwrap()).unwrap(),
+    )
+    .unwrap();
+    let family_object = manifest["objects"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|object| object["path"] == "family.json")
+        .unwrap();
+    let family = Family::from_json(
+        &fs::read(published.join(family_object["key"].as_str().unwrap())).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(family.schema_version, 2);
+    assert!(family.search.evaluation.is_some());
+    assert!(
+        family
+            .members
+            .iter()
+            .any(|member| member.rank.is_some() && member.evaluation.is_some())
+    );
+    assert!(
+        family
+            .members
+            .iter()
+            .filter(|member| member.rank.is_some())
+            .all(|member| member.evaluation.is_some())
+    );
+}
+
+fn tied_ticks(base: i64, rows: &[Row], instrument: usize) -> Vec<String> {
+    let mut lines = ticks(base, rows, instrument);
+    for candle in lines.chunks_mut(80) {
+        let price = candle[0].rsplit_once(',').unwrap().1.to_string();
+        for step in [20, 21] {
+            let (time_and_symbol, _) = candle[step].rsplit_once(',').unwrap();
+            candle[step] = format!("{time_and_symbol},{price}");
+        }
+    }
+    lines
+}
+
+#[test]
+fn decisive_research_gates_classify_synthetic_evaluation_and_holdout() {
+    for (role, ties) in [
+        (DatasetRole::Evaluation, true),
+        (DatasetRole::Evaluation, false),
+        (DatasetRole::Holdout, true),
+        (DatasetRole::Holdout, false),
+    ] {
+        let name = format!("phase11_decisive_{role}_{ties}");
+        let mut fixture = Fixture::at(
+            Scratch::new(&name),
+            if role == DatasetRole::Evaluation && !ties {
+                LOSING
+            } else {
+                PLANTED
+            },
+            if role == DatasetRole::Holdout && !ties {
+                LOSING
+            } else {
+                PLANTED
+            },
+        );
+        if ties {
+            let hour = if role == DatasetRole::Evaluation {
+                3
+            } else {
+                4
+            };
+            let changed = import_pair_text(
+                &fixture.scratch,
+                "ties",
+                role,
+                [0, 1]
+                    .map(|instrument| tied_ticks(BASE + hour * HOUR, &recipe(PLANTED), instrument)),
+            );
+            let offset = if role == DatasetRole::Evaluation {
+                6
+            } else {
+                8
+            };
+            for (instrument, dataset) in changed.into_iter().enumerate() {
+                let research = fixture.config.research.as_mut().unwrap();
+                if role == DatasetRole::Evaluation {
+                    research.evaluation.inputs[instrument] =
+                        uri(&fixture.scratch.root, &dataset.generation);
+                } else {
+                    research.holdout.inputs[instrument] =
+                        uri(&fixture.scratch.root, &dataset.generation);
+                }
+                fixture.declaration.populations[offset + instrument].generations =
+                    vec![dataset.generation.clone()];
+                fixture.datasets.push(dataset);
+            }
+        }
+        let gates = &mut fixture
+            .config
+            .research
+            .as_mut()
+            .unwrap()
+            .qualification
+            .gates;
+        gates.min_settled = 16;
+        gates.min_decisive = Some(1);
+        gates.min_win_rate = Some(decimal("0.6"));
+        gates.min_profit = decimal("-1000");
+        gates.max_drawdown = decimal("1000");
+        fixture.save();
+        fixture.run().unwrap();
+        let (verdict, scenarios) = if role == DatasetRole::Evaluation {
+            let (_, run) = fixture.run_record();
+            let RunState::OuterRejected { verdict } = run.state else {
+                panic!("expected outer rejection")
+            };
+            no_access(&logged(&fixture.log()), &fixture.protected());
+            (verdict, run.outer)
+        } else {
+            let (_, run) = fixture.run_record();
+            assert_eq!(run.state, RunState::AwaitingHoldoutAuthorization);
+            no_access(&logged(&fixture.log()), &fixture.protected());
+            let (_, grant) = fixture.grant();
+            fixture.run().unwrap();
+            let (manifest, record) = fixture.certification(&grant);
+            assert_eq!(manifest.state, "rejected");
+            fixture.verify(&manifest.generation).unwrap();
+            (record.verdict, record.scenarios)
+        };
+        assert_eq!(
+            verdict.reason(),
+            Some(if ties {
+                "insufficient_evidence"
+            } else {
+                "economic_failure"
+            })
+        );
+        let projection = &scenarios[0].outer.projection;
+        assert!(projection.settled >= 16);
+        if ties {
+            assert_eq!(projection.wins.unwrap() + projection.losses.unwrap(), 0);
+            assert!(projection.ties.unwrap() >= 16);
+            assert!(
+                matches!(
+                    verdict,
+                    Verdict::InsufficientEvidence { ref reason }
+                        if reason.contains("decisive trades 0")
+                ),
+                "{verdict:?}"
+            );
+        } else {
+            assert!(projection.wins.unwrap() + projection.losses.unwrap() >= 1);
+            assert!(
+                projection
+                    .failure
+                    .as_ref()
+                    .unwrap()
+                    .contains("decisive win rate")
+            );
+        }
     }
 }
 

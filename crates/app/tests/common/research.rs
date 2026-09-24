@@ -177,6 +177,51 @@ pub fn recipe(cells: [u8; 4]) -> Vec<Row> {
         .collect()
 }
 
+/// Four five-second bars preserve each planted candle's direction and range.
+/// The next two closes pay its declared result when that next candle is present.
+pub fn bar_rows(base: i64, rows: &[Row], instrument: usize) -> Vec<crate::common::BarRow> {
+    let mut bars = Vec::new();
+    let divisor = 10_i64.pow(u32::from(SCALES[instrument])) as f64;
+    for k in 0..=rows.len() {
+        let current = rows.get(k);
+        let previous = k.checked_sub(1).map(|i| rows[i]);
+        for step in 0..if current.is_some() { 4 } else { 2 } {
+            let movement = match (step, current) {
+                (0 | 1, _) => previous.map_or(2 + step, |row| {
+                    (if row.up { 1 } else { -1 }) + (if row.win { 1 } else { -1 }) * (2 + step)
+                }),
+                (3, Some(row)) => {
+                    if row.up {
+                        1
+                    } else {
+                        -1
+                    }
+                }
+                _ => 0,
+            };
+            let range = if current.is_some_and(|row| row.wide) {
+                12
+            } else {
+                4
+            };
+            let [open, high, low, close] = [
+                1_800_000,
+                1_800_000 + range,
+                1_800_000 - range,
+                1_800_000 + movement,
+            ]
+            .map(|price| price as f64 / divisor);
+            bars.push(crate::common::bar(
+                SYMBOLS[instrument],
+                instrument as i32 + 7,
+                (base + k as i64 * CANDLE) / 1_000_000 + step * 5,
+                [open, high, low, close, 1.0],
+            ));
+        }
+    }
+    bars
+}
+
 /// Phase 09's planted candle recipe; the five-second outcome persists for one extra tick
 /// so the required 100 ms acceptance delay has the same known outcomes. Both scales have
 /// the same relative movement: B's numeric price is 1000 times A's, not a rounded A price.
