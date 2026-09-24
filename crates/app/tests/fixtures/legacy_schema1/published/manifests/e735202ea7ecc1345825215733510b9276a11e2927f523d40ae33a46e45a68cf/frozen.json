@@ -1,0 +1,236 @@
+{
+  "research": "e735202ea7ecc1345825215733510b9276a11e2927f523d40ae33a46e45a68cf",
+  "intent": "phase11/attempts/synthetic/first/intent.json",
+  "declaration": "7c3e0e70ac2c572f8c1264e4c9dc0db747a0070b064c90e40129046a4b217baa",
+  "instruments": [
+    {
+      "instrument": "pocket_option:AEDCNY_otc",
+      "source": "f2f1b9cd5e4ca1db4e4afcfec207f63eb81320019fbf379056e7fdee2d1a7d33",
+      "profile": "6b5c0ed2c2ce8cd491227dc08c0c70689f2c5d8cc65271beab3cafeec3e377d0",
+      "feature": "bc01ba9344f078a18659c982b05c74801d43ae44e2eaff729e8e7defa60bf05c",
+      "outcome": "a377abdc0fdc92a8c71d2e98163cad588803d64c256d145cfbf2bfe8b2fc993f",
+      "family": "d7924115f6ec1c2219d5239081221020315db2bf998d950c10cb60d194c53f67"
+    },
+    {
+      "instrument": "pocket_option:SECOND_otc",
+      "source": "61cb801d1ce5f355e507d1cdcdba54fbb9d52a794bb294f80b1a275e711d1fd3",
+      "profile": "5d253a8808829f5f95557669ed760942069ecf467f00a9c9d24d789613d8d916",
+      "feature": "24409612301a6ee325fcdac35b37641c65cca1475a72f93b244f7df2efe79cc1",
+      "outcome": "1236c0faf0ce00179c0cb64eaae4392f2438b132461f38e7037e665b48eeb2e9",
+      "family": "73486072a7f59ab1df2e6f2f2b704454759ec5c23ff977b874b58c0f3fd180d7"
+    }
+  ],
+  "selection": "f41b61b63bbfde46c43b2bcebcb039f463f26562521852358279a0cb31e25aa7",
+  "scenarios": [
+    {
+      "id": "delayed",
+      "acceptance_delay_micros": 100000,
+      "alternatives": [
+        {
+          "binding": "b0",
+          "contract": {
+            "id": "0-large",
+            "direction": "buy",
+            "duration_micros": 5000000,
+            "currency": "unit",
+            "stake": "2",
+            "quoted_cost": "2",
+            "entry_fee": "0.05",
+            "win": {
+              "gross_return": "3.60",
+              "terminal_fee": "0"
+            },
+            "loss": {
+              "gross_return": "0",
+              "terminal_fee": "0"
+            },
+            "tie": {
+              "gross_return": "2.05",
+              "terminal_fee": "0"
+            },
+            "settlement": {
+              "rule": "price_at_due_v1",
+              "max_settlement_delay_micros": 5000000,
+              "max_tick_gap_micros": 5000000
+            }
+          },
+          "envelope": {
+            "max_purchase_cost": "2",
+            "max_entry_fee": "0.05",
+            "max_win_terminal_fee": "0",
+            "max_loss_terminal_fee": "0",
+            "max_tie_terminal_fee": "0",
+            "min_winning_net_return": "1.55",
+            "settlement_rule": "price_at_due_v1"
+          }
+        },
+        {
+          "binding": "b1",
+          "contract": {
+            "id": "1-large",
+            "direction": "buy",
+            "duration_micros": 5000000,
+            "currency": "eur",
+            "stake": "2",
+            "quoted_cost": "2",
+            "entry_fee": "0.05",
+            "win": {
+              "gross_return": "3.60",
+              "terminal_fee": "0"
+            },
+            "loss": {
+              "gross_return": "0",
+              "terminal_fee": "0"
+            },
+            "tie": {
+              "gross_return": "2.05",
+              "terminal_fee": "0"
+            },
+            "settlement": {
+              "rule": "price_at_due_v1",
+              "max_settlement_delay_micros": 5000000,
+              "max_tick_gap_micros": 5000000
+            }
+          },
+          "envelope": {
+            "max_purchase_cost": "2",
+            "max_entry_fee": "0.05",
+            "max_win_terminal_fee": "0",
+            "max_loss_terminal_fee": "0",
+            "max_tie_terminal_fee": "0",
+            "min_winning_net_return": "1.55",
+            "settlement_rule": "price_at_due_v1"
+          }
+        }
+      ]
+    },
+    {
+      "id": "worse_terms",
+      "acceptance_delay_micros": 0,
+      "alternatives": [
+        {
+          "binding": "b0",
+          "contract": {
+            "id": "0-large",
+            "direction": "buy",
+            "duration_micros": 5000000,
+            "currency": "unit",
+            "stake": "2",
+            "quoted_cost": "2",
+            "entry_fee": "0.05",
+            "win": {
+              "gross_return": "3.50",
+              "terminal_fee": "0"
+            },
+            "loss": {
+              "gross_return": "0",
+              "terminal_fee": "0"
+            },
+            "tie": {
+              "gross_return": "2.05",
+              "terminal_fee": "0"
+            },
+            "settlement": {
+              "rule": "price_at_due_v1",
+              "max_settlement_delay_micros": 5000000,
+              "max_tick_gap_micros": 5000000
+            }
+          },
+          "envelope": {
+            "max_purchase_cost": "2",
+            "max_entry_fee": "0.05",
+            "max_win_terminal_fee": "0",
+            "max_loss_terminal_fee": "0",
+            "max_tie_terminal_fee": "0",
+            "min_winning_net_return": "1.45",
+            "settlement_rule": "price_at_due_v1"
+          }
+        },
+        {
+          "binding": "b1",
+          "contract": {
+            "id": "1-large",
+            "direction": "buy",
+            "duration_micros": 5000000,
+            "currency": "eur",
+            "stake": "2",
+            "quoted_cost": "2",
+            "entry_fee": "0.05",
+            "win": {
+              "gross_return": "3.50",
+              "terminal_fee": "0"
+            },
+            "loss": {
+              "gross_return": "0",
+              "terminal_fee": "0"
+            },
+            "tie": {
+              "gross_return": "2.05",
+              "terminal_fee": "0"
+            },
+            "settlement": {
+              "rule": "price_at_due_v1",
+              "max_settlement_delay_micros": 5000000,
+              "max_tick_gap_micros": 5000000
+            }
+          },
+          "envelope": {
+            "max_purchase_cost": "2",
+            "max_entry_fee": "0.05",
+            "max_win_terminal_fee": "0",
+            "max_loss_terminal_fee": "0",
+            "max_tie_terminal_fee": "0",
+            "min_winning_net_return": "1.45",
+            "settlement_rule": "price_at_due_v1"
+          }
+        }
+      ]
+    }
+  ],
+  "descriptor": {
+    "claim": "empirical_policy_qualification_v1",
+    "look": "fixed_horizon_once",
+    "benchmark": "analytic_zero_profit",
+    "objective": "profit_then_drawdown",
+    "gates": {
+      "min_settled": 1,
+      "max_unresolved": 0,
+      "min_profit": "0",
+      "max_drawdown": "1000"
+    },
+    "reporting_currency": "unit",
+    "reporting_scale": 2,
+    "accounts": [
+      {
+        "id": "a0",
+        "broker": "pocket_option",
+        "currency": "unit",
+        "scale": 2,
+        "initial_cash": "10000"
+      },
+      {
+        "id": "a1",
+        "broker": "pocket_option",
+        "currency": "eur",
+        "scale": 2,
+        "initial_cash": "10000"
+      }
+    ],
+    "evaluation": {
+      "decision_start": "2026-01-05T03:00:20.000000Z",
+      "decision_end": "2026-01-05T03:01:40.000000Z"
+    },
+    "holdout": {
+      "decision_start": "2026-01-05T04:00:20.000000Z",
+      "decision_end": "2026-01-05T04:01:40.000000Z"
+    },
+    "horizon": "last_input_tick_per_instrument",
+    "scenarios": [
+      "baseline",
+      "delayed",
+      "worse_terms"
+    ],
+    "market_inference": "unavailable",
+    "inference_justification": "no observation model or uncertainty justification is established; support counts, adjusted scores, and synthetic resampling are not market inference"
+  }
+}

@@ -3047,8 +3047,8 @@ impl Statistics {
             .filter(|_| adjacent)
             .map(|prior| candle_pattern(prior, current));
         let ret = previous.and_then(|prior| {
-            bps_change(
-                current.close as f64 / self.unit,
+            bps_size(
+                (i128::from(current.close) - i128::from(prior.close)) as f64 / self.unit,
                 prior.close as f64 / self.unit,
             )
         });
@@ -3064,12 +3064,16 @@ impl Statistics {
                 let max_high = candles.iter().map(|c| c.high).max().unwrap();
                 if max_high > min_low {
                     row.position = finite_six(
-                        (current.close as f64 - min_low as f64)
-                            / (max_high as f64 - min_low as f64),
+                        (i128::from(current.close) - i128::from(min_low)) as f64
+                            / (i128::from(max_high) - i128::from(min_low)) as f64,
                     );
                 }
                 if n >= 3 {
-                    let closes: Vec<f64> = candles.iter().map(|c| c.close as f64).collect();
+                    let reference = i128::from(candles[0].close);
+                    let closes: Vec<f64> = candles
+                        .iter()
+                        .map(|c| (i128::from(c.close) - reference) as f64)
+                        .collect();
                     let mean_x = (n - 1) as f64 / 2.0;
                     let mean_y = sum(closes.iter().copied()) / n as f64;
                     let sxx = sum((0..n).map(|i| (i as f64 - mean_x).powi(2)));
@@ -3089,7 +3093,7 @@ impl Statistics {
                     }
                     if current.close != 0 {
                         row.residual = finite_six(
-                            10_000.0 * (current.close as f64 - fitted_last) / current.close as f64,
+                            10_000.0 * (closes[n - 1] - fitted_last) / current.close as f64,
                         );
                     }
                 }
@@ -5839,7 +5843,7 @@ mod tests {
             .fit(&[Some(Value::Bool(true)), Some(Value::Bool(false))], 8)
             .unwrap();
         let boolean_output = boolean.output.clone();
-        let family: crate::search::Family = serde_json::from_slice(include_bytes!("../../app/tests/fixtures/legacy_schema1/published/objects/736abc73d301789d7e19aa2ac927cc1e1010dd12cce189c2087b4255ee254717")).unwrap();
+        let family: crate::search::Family = serde_json::from_slice(include_bytes!("../../app/tests/fixtures/legacy_schema1/published/objects/24e476f4f6bb8abbd2211c19ba7b0659762b682b299cb240ec6d40a694d51327")).unwrap();
         let mut search = family.search;
         search.base_stream = stream;
         search.conditions = vec![SearchCondition::Generate(GeneratedSearchCondition {
@@ -6008,6 +6012,44 @@ mod tests {
                 assert_eq!(row.windows[0].1.reversal, Some(0.0));
             }
         }
+    }
+
+    #[test]
+    fn statistics_keep_unit_differences_above_f64_integer_precision() {
+        let base = 1_i64 << 53;
+        let mut position = Statistics::new(vec![2], 1.0);
+        for close in [base, base + 1] {
+            let mut candle = statistical_candle(close, close);
+            candle.low_units = base;
+            candle.high_units = base + 2;
+            let row = position.update(&candle, true, false);
+            if close == base + 1 {
+                assert_eq!(row.windows[0].1.position, Some(0.5));
+            }
+        }
+
+        let mut trend = Statistics::new(vec![3], 1.0);
+        for close in [base, base + 1, base + 2] {
+            let row = trend.update(&statistical_candle(close, close), true, false);
+            if close == base + 2 {
+                assert_eq!(row.windows[0].1.r2, Some(1.0));
+                assert_eq!(row.windows[0].1.residual, Some(0.0));
+            }
+        }
+        assert!(trend.returns.last().flatten().unwrap() > 0.0);
+    }
+
+    #[test]
+    fn disjoint_adjacent_ranges_have_zero_overlap() {
+        let mut statistics = Statistics::new(vec![], 1.0);
+        let mut prior = statistical_candle(0, 1);
+        prior.low_units = 0;
+        prior.high_units = 1;
+        statistics.update(&prior, false, false);
+        let mut current = statistical_candle(2, 3);
+        current.low_units = 2;
+        current.high_units = 3;
+        assert_eq!(statistics.update(&current, true, false).overlap, Some(0.0));
     }
 
     #[test]

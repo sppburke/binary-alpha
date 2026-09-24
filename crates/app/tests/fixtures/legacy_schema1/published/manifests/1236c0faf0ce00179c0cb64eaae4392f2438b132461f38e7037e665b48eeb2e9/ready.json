@@ -1,0 +1,103 @@
+{
+  "kind": "outcome_generation",
+  "schema_version": 1,
+  "generation": "1236c0faf0ce00179c0cb64eaae4392f2438b132461f38e7037e665b48eeb2e9",
+  "broker": "pocket_option",
+  "provider_symbol": "SECOND_otc",
+  "instrument": "pocket_option:SECOND_otc",
+  "role": "development",
+  "tick_generation": "61cb801d1ce5f355e507d1cdcdba54fbb9d52a794bb294f80b1a275e711d1fd3",
+  "tick_manifest": "file:///proc/self/cwd/published/manifests/61cb801d1ce5f355e507d1cdcdba54fbb9d52a794bb294f80b1a275e711d1fd3/ready.json",
+  "feature_generation": "24409612301a6ee325fcdac35b37641c65cca1475a72f93b244f7df2efe79cc1",
+  "feature_manifest": "file:///proc/self/cwd/published/manifests/24409612301a6ee325fcdac35b37641c65cca1475a72f93b244f7df2efe79cc1/ready.json",
+  "raw_identity": "c4e4a2830662aaf9098934d6612b6da2d873c21ee06169be7053115b8cbcf82c",
+  "config_hash": "v3:sha256:06b220c6fb06d2b89a4acbe5c83f9ff6112b418263728e3e60c84983561d5789",
+  "code_revision": "fe93017a2fdec8d209d036ed8d7da9c370e185f9",
+  "rule": {
+    "expiry_seconds": [
+      5,
+      7,
+      20
+    ],
+    "max_entry_delay_micros": 5000000,
+    "max_settlement_delay_micros": 5000000,
+    "max_tick_gap_micros": 5000000,
+    "true_jump_max_gap_micros": 5000000,
+    "true_jump_basis_points": "5",
+    "frozen_min_ticks": 10,
+    "frozen_min_micros": 5000000
+  },
+  "reference_clock": "feature_row_close_time",
+  "time_unit": "microsecond",
+  "price_representation": {
+    "kind": "integer_units",
+    "scale": 3
+  },
+  "missing_index": 4294967295,
+  "tick_count": 18,
+  "streams": [
+    {
+      "duration_seconds": 20,
+      "offset_seconds": 0,
+      "rows": 4,
+      "first_reference_time": "2026-01-05T00:00:20.000000Z",
+      "last_reference_time": "2026-01-05T00:01:20.000000Z"
+    }
+  ],
+  "objects": [
+    {
+      "role": "normalized",
+      "path": "ticks/event_time_micros.bin",
+      "key": "objects/96bda1186d460fe2671b641979b1053b3aba18ffaadb887a2653a44c604ec877",
+      "bytes": 144,
+      "sha256": "96bda1186d460fe2671b641979b1053b3aba18ffaadb887a2653a44c604ec877",
+      "crc32c": null,
+      "generation": null
+    },
+    {
+      "role": "normalized",
+      "path": "ticks/price_units.bin",
+      "key": "objects/3e28797aeaeed481cb323f0666d347a5a0d5f039ada1f2fd95b9eaf840a72a94",
+      "bytes": 144,
+      "sha256": "3e28797aeaeed481cb323f0666d347a5a0d5f039ada1f2fd95b9eaf840a72a94",
+      "crc32c": null,
+      "generation": null
+    },
+    {
+      "role": "normalized",
+      "path": "reference/20s_0s.bin",
+      "key": "objects/8b5a7eb946ce10b102a8c431daa3bc9f868030b8c911cc758f3bcbfb62022f64",
+      "bytes": 32,
+      "sha256": "8b5a7eb946ce10b102a8c431daa3bc9f868030b8c911cc758f3bcbfb62022f64",
+      "crc32c": null,
+      "generation": null
+    },
+    {
+      "role": "normalized",
+      "path": "entry/20s_0s.bin",
+      "key": "objects/b3a85f34a2bd5e57b87fd04ad1b2234a49ed83f5c484e1cf4a0e4b54ccfcf112",
+      "bytes": 16,
+      "sha256": "b3a85f34a2bd5e57b87fd04ad1b2234a49ed83f5c484e1cf4a0e4b54ccfcf112",
+      "crc32c": null,
+      "generation": null
+    },
+    {
+      "role": "normalized",
+      "path": "settlement/20s_0s.bin",
+      "key": "objects/ba40384bfc6121c35dc6dc4d4ebb55e6fe73cac182c4dac4519cee0c7003c906",
+      "bytes": 48,
+      "sha256": "ba40384bfc6121c35dc6dc4d4ebb55e6fe73cac182c4dac4519cee0c7003c906",
+      "crc32c": null,
+      "generation": null
+    },
+    {
+      "role": "normalized",
+      "path": "reason/20s_0s.bin",
+      "key": "objects/83db8de998f01dda92e2a4ea1c256e16cb5dfe643701c5484c59990534d03360",
+      "bytes": 12,
+      "sha256": "83db8de998f01dda92e2a4ea1c256e16cb5dfe643701c5484c59990534d03360",
+      "crc32c": null,
+      "generation": null
+    }
+  ]
+}

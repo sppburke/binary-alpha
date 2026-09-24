@@ -61,47 +61,47 @@
   "code_revision": "fe93017a2fdec8d209d036ed8d7da9c370e185f9",
   "inputs": [
     {
-      "path": "/tmp/claude-1000/-mnt-data-binary-alpha/0542aee6-2795-4c53-a425-6af541d9ea7e/scratchpad/s0/generated_clean/sources/assessment/SECOND_otc/dataset/parquet/year=2025/month=05/part-00000.parquet",
+      "path": "/tmp/claude-1000/-mnt-data-binary-alpha/0542aee6-2795-4c53-a425-6af541d9ea7e/scratchpad/s2c/generated_clean/sources/assessment/SECOND_otc/dataset/parquet/year=2025/month=05/part-00000.parquet",
       "bytes": 3193,
       "sha256": "8684dda048e992d082b7428713d2f9ddd052d2bb8b3ef7c4a62c8bb9aa36a6df"
     },
     {
-      "path": "/tmp/claude-1000/-mnt-data-binary-alpha/0542aee6-2795-4c53-a425-6af541d9ea7e/scratchpad/s0/generated_clean/sources/assessment/SECOND_otc/checkpoint.ndjson",
+      "path": "/tmp/claude-1000/-mnt-data-binary-alpha/0542aee6-2795-4c53-a425-6af541d9ea7e/scratchpad/s2c/generated_clean/sources/assessment/SECOND_otc/checkpoint.ndjson",
       "bytes": 115,
       "sha256": "b8df44b693d6a64f750ff33fa79c938205cc93de56feecb6368f397465ccee89"
     },
     {
-      "path": "/tmp/claude-1000/-mnt-data-binary-alpha/0542aee6-2795-4c53-a425-6af541d9ea7e/scratchpad/s0/generated_clean/sources/assessment/SECOND_otc/dataset/_SUCCESS",
+      "path": "/tmp/claude-1000/-mnt-data-binary-alpha/0542aee6-2795-4c53-a425-6af541d9ea7e/scratchpad/s2c/generated_clean/sources/assessment/SECOND_otc/dataset/_SUCCESS",
       "bytes": 0,
       "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
     },
     {
-      "path": "/tmp/claude-1000/-mnt-data-binary-alpha/0542aee6-2795-4c53-a425-6af541d9ea7e/scratchpad/s0/generated_clean/sources/assessment/SECOND_otc/dataset/hashes.sha256",
+      "path": "/tmp/claude-1000/-mnt-data-binary-alpha/0542aee6-2795-4c53-a425-6af541d9ea7e/scratchpad/s2c/generated_clean/sources/assessment/SECOND_otc/dataset/hashes.sha256",
       "bytes": 112,
       "sha256": "1d6518a672d2c10260c5f4ba14b670af90976dc8d8a2e7bc8ef494878b856c50"
     },
     {
-      "path": "/tmp/claude-1000/-mnt-data-binary-alpha/0542aee6-2795-4c53-a425-6af541d9ea7e/scratchpad/s0/generated_clean/sources/assessment/SECOND_otc/dataset/manifest.json",
+      "path": "/tmp/claude-1000/-mnt-data-binary-alpha/0542aee6-2795-4c53-a425-6af541d9ea7e/scratchpad/s2c/generated_clean/sources/assessment/SECOND_otc/dataset/manifest.json",
       "bytes": 46,
       "sha256": "2f36a977694b22ad87057dd452f4ae0f9cae8b08c853eea80c1aafb9a380626e"
     },
     {
-      "path": "/tmp/claude-1000/-mnt-data-binary-alpha/0542aee6-2795-4c53-a425-6af541d9ea7e/scratchpad/s0/generated_clean/sources/assessment/SECOND_otc/dataset/reports/quality.json",
+      "path": "/tmp/claude-1000/-mnt-data-binary-alpha/0542aee6-2795-4c53-a425-6af541d9ea7e/scratchpad/s2c/generated_clean/sources/assessment/SECOND_otc/dataset/reports/quality.json",
       "bytes": 3,
       "sha256": "ca3d163bab055381827226140568f3bef7eaac187cebd76878e0b63e9e442356"
     },
     {
-      "path": "/tmp/claude-1000/-mnt-data-binary-alpha/0542aee6-2795-4c53-a425-6af541d9ea7e/scratchpad/s0/generated_clean/sources/assessment/SECOND_otc/download_manifest.json",
+      "path": "/tmp/claude-1000/-mnt-data-binary-alpha/0542aee6-2795-4c53-a425-6af541d9ea7e/scratchpad/s2c/generated_clean/sources/assessment/SECOND_otc/download_manifest.json",
       "bytes": 24,
       "sha256": "31ccad44a5007965f26cbed47171e3db2989a1c9deb69bd57f5e85ae082149b3"
     },
     {
-      "path": "/tmp/claude-1000/-mnt-data-binary-alpha/0542aee6-2795-4c53-a425-6af541d9ea7e/scratchpad/s0/generated_clean/sources/assessment/SECOND_otc/raw_pages.ndjson",
+      "path": "/tmp/claude-1000/-mnt-data-binary-alpha/0542aee6-2795-4c53-a425-6af541d9ea7e/scratchpad/s2c/generated_clean/sources/assessment/SECOND_otc/raw_pages.ndjson",
       "bytes": 36,
       "sha256": "6828934bc1f5da61e264a565587bda26c11cdf4d64d310ab4a2896d31feb9153"
     },
     {
-      "path": "/tmp/claude-1000/-mnt-data-binary-alpha/0542aee6-2795-4c53-a425-6af541d9ea7e/scratchpad/s0/generated_clean/sources/assessment/collection.json",
+      "path": "/tmp/claude-1000/-mnt-data-binary-alpha/0542aee6-2795-4c53-a425-6af541d9ea7e/scratchpad/s2c/generated_clean/sources/assessment/collection.json",
       "bytes": 1847,
       "sha256": "0cb66093ce6b3c6aaf0e05020c4536dc779a84242d2c978c47503cd58fff240f"
     }

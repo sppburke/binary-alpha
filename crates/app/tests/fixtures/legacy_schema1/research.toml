@@ -62,7 +62,7 @@ instrument = "pocket_option:AEDCNY_otc"
 source_manifest = "file:///proc/self/cwd/published/manifests/f2f1b9cd5e4ca1db4e4afcfec207f63eb81320019fbf379056e7fdee2d1a7d33/ready.json"
 
 [research.instruments.features]
-outputs = ["candle_direction", "range_bps"]
+outputs = "all_supported"
 
 [[research.instruments.features.streams]]
 duration_seconds = 20
@@ -166,7 +166,7 @@ instrument = "pocket_option:SECOND_otc"
 source_manifest = "file:///proc/self/cwd/published/manifests/61cb801d1ce5f355e507d1cdcdba54fbb9d52a794bb294f80b1a275e711d1fd3/ready.json"
 
 [research.instruments.features]
-outputs = ["candle_direction", "range_bps"]
+outputs = "all_supported"
 
 [[research.instruments.features.streams]]
 duration_seconds = 20

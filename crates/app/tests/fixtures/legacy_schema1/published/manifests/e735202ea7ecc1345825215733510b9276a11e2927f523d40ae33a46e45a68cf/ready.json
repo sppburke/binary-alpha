@@ -1,0 +1,21 @@
+{
+  "kind": "research_run",
+  "schema_version": 1,
+  "generation": "e735202ea7ecc1345825215733510b9276a11e2927f523d40ae33a46e45a68cf",
+  "config_hash": "v3:sha256:ed808ef40f2fec9ccdf28c4facdca2a890d722dc9d1bf1714de08906ee7f9ccd",
+  "code_revision": "fe93017a2fdec8d209d036ed8d7da9c370e185f9",
+  "declaration": "7c3e0e70ac2c572f8c1264e4c9dc0db747a0070b064c90e40129046a4b217baa",
+  "selection": "f41b61b63bbfde46c43b2bcebcb039f463f26562521852358279a0cb31e25aa7",
+  "state": "awaiting_holdout_authorization",
+  "objects": [
+    {
+      "role": "normalized",
+      "path": "research.json",
+      "key": "objects/7c463430d1787602e0b8a1d09f3af17af3cae7a9be6eb727d79924dfe64281d2",
+      "bytes": 35046,
+      "sha256": "7c463430d1787602e0b8a1d09f3af17af3cae7a9be6eb727d79924dfe64281d2",
+      "crc32c": null,
+      "generation": null
+    }
+  ]
+}

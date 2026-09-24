@@ -12,13 +12,17 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use binary_alpha_engine::config::Config;
-use binary_alpha_engine::dataset::GenerationManifest;
+use binary_alpha_engine::dataset::{
+    Capability, DatasetRole, GenerationManifest, NativeGranularity, SourceKind,
+};
 use binary_alpha_engine::features::{
-    Exclusion, FeatureEngine, FeatureManifest, FeatureOutput, FeaturePlan, SequenceEvent,
-    StructureEvent, Value, development_fifths, feature_generation_id, raw_identity,
+    Exclusion, FeatureEngine, FeatureManifest, FeatureOutput, FeaturePlan, ProfileReference,
+    SequenceEvent, StructureEvent, Value, development_fifths, feature_generation_id, raw_identity,
 };
 use binary_alpha_engine::market::{Tick, format_event_time_micros};
-use binary_alpha_engine::stream::{Observation, Source, StreamManifest};
+use binary_alpha_engine::stream::{
+    BarUnits, InstrumentStream, Observation, Source, StreamManifest,
+};
 use common::current::import;
 use common::*;
 
@@ -359,6 +363,128 @@ fn sequence_row(event: &SequenceEvent) -> Vec<Option<Value>> {
 
 fn value_of<'a>(row: &'a [Option<Value>], names: &[String], name: &str) -> Option<&'a Value> {
     row[names.iter().position(|n| n == name).unwrap()].as_ref()
+}
+
+#[test]
+fn entirely_missing_interval_rejects_next_candle_and_breaks_statistical_adjacency() {
+    let micros = 1_000_000;
+    for native in [
+        NativeGranularity::Bar { period_seconds: 5 },
+        NativeGranularity::Tick,
+    ] {
+        let scratch = Scratch::new(if native == NativeGranularity::Tick {
+            "phase04_missing_interval_ticks"
+        } else {
+            "phase04_missing_interval_bars"
+        });
+        let (granularity, candle, source_kind, capability) = if native == NativeGranularity::Tick {
+            (
+                "{ kind = \"tick\" }",
+                "{ duration_seconds = 5, offset_seconds = 0, min_observations = 2, hard_min_observations = 1 }",
+                SourceKind::TickCsv,
+                Capability::Ticks,
+            )
+        } else {
+            (
+                "{ kind = \"bar\", period_seconds = 5 }",
+                "{ duration_seconds = 5, offset_seconds = 0 }",
+                SourceKind::BarParquet,
+                Capability::Bars,
+            )
+        };
+        let config = scratch.config(
+            "missing.toml",
+            &format!(
+                "\n[[instruments]]\nbroker = \"pocket_option\"\nprovider_symbol = \"GAP\"\nquote_currency = \"USD\"\nprice_scale = 3\nsession = {{ kind = \"always\" }}\nnative_granularity = {granularity}\ngap = {{ max_seconds = 2, reopen_seconds = 60 }}\nfrozen = {{ min_observations = 10, min_seconds = 60 }}\njump = {{ min_basis_points = 1000 }}\nspan = {{ min_percent = 50 }}\ncandles = [{candle}]\n\n[[features.instruments]]\nrole = \"development\"\ninput_manifest = \"file:///fixture/manifests/1111111111111111111111111111111111111111111111111111111111111111/ready.json\"\nprofile_manifest = \"file:///fixture/manifests/2222222222222222222222222222222222222222222222222222222222222222/ready.json\"\nstreams = [{{ duration_seconds = 5, offset_seconds = 0 }}]\noutputs = [\"range_overlap\", \"candle_pattern\"]\n"
+            ),
+        );
+        let parsed = Config::parse(&fs::read_to_string(config).unwrap()).unwrap();
+        let instrument = parsed.instruments[0].clone();
+        let source = Source {
+            generation: "input".into(),
+            source_kind,
+            role: DatasetRole::Development,
+            native_granularity: native,
+            price_scale: (native == NativeGranularity::Tick).then_some(instrument.price_scale),
+            capabilities: vec![capability],
+        };
+        let profile = ProfileReference {
+            stream_generation: "profile".into(),
+            profile_sha256: "0".repeat(64),
+            source_generation: "input".into(),
+            role: DatasetRole::Development,
+            definition: instrument.clone(),
+            ticks: native == NativeGranularity::Tick,
+        };
+        let plan = FeaturePlan::resolve(&parsed.features.unwrap().instruments[0], profile, "input")
+            .unwrap();
+        let observations: Vec<Observation> = if native == NativeGranularity::Tick {
+            [0, 1, 2, 3, 4, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20]
+                .into_iter()
+                .map(|second| {
+                    Observation::Tick(Tick {
+                        event_time_micros: second * micros,
+                        price_units: 100_000 + second,
+                    })
+                })
+                .collect()
+        } else {
+            [0, 10, 15]
+                .into_iter()
+                .map(|second| {
+                    Observation::Bar(BarUnits {
+                        start_micros: second * micros,
+                        period_micros: 5 * micros,
+                        open: 100_000 + second,
+                        high: 100_004 + second,
+                        low: 99_999 + second,
+                        close: 100_003 + second,
+                        volume: 1.0,
+                    })
+                })
+                .collect()
+        };
+        let mut stream = InstrumentStream::new(&instrument, source.clone()).unwrap();
+        let mut candles = Vec::new();
+        let mut engine = FeatureEngine::new(&plan, source).unwrap();
+        let mut output = FeatureOutput::default();
+        for observation in observations {
+            stream.push(observation, &mut candles).unwrap();
+            engine.push(observation, &mut output).unwrap();
+        }
+        assert_eq!(candles.len(), 3, "{native:?}");
+        assert_eq!(
+            candles
+                .iter()
+                .map(|(_, candle)| candle.open_time_micros)
+                .collect::<Vec<_>>(),
+            [0, 10 * micros, 15 * micros],
+            "{native:?}"
+        );
+        assert!(candles[1].1.flags.missing_before, "{native:?}");
+        assert!(!candles[1].1.flags.clean(), "{native:?}");
+        assert!(candles[0].1.flags.clean(), "{native:?}");
+        assert!(candles[2].1.flags.clean(), "{native:?}");
+        assert_eq!(output.rows.len(), 2, "{native:?}");
+        assert_eq!(output.rows[0].1.close_time_micros, 5 * micros);
+        assert_eq!(output.rows[1].1.close_time_micros, 20 * micros);
+        let names: Vec<_> = plan.streams[0]
+            .outputs
+            .iter()
+            .map(|output| output.name.clone())
+            .collect();
+        assert_eq!(
+            value_of(&output.rows[1].1.values, &names, "candle_ordinal"),
+            Some(&Value::Int(3))
+        );
+        for name in ["range_overlap", "candle_pattern"] {
+            assert_eq!(
+                value_of(&output.rows[1].1.values, &names, name),
+                None,
+                "{native:?}: {name}"
+            );
+        }
+    }
 }
 
 #[test]

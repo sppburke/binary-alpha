@@ -2341,27 +2341,97 @@ pub(crate) fn reclaim(
                 }
             }
         }
-        for key in plan.candidates.clone() {
-            if plan.reclaimed.contains(&key) {
-                continue;
-            }
-            if protected.contains(&key) {
-                plan.protected.insert(key);
-            } else {
-                let target = local
-                    .local_path(&key)
-                    .ok_or("reclamation requires local store")?;
-                match fs::remove_file(target) {
-                    Ok(()) => {}
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                    Err(e) => return Err(err(e)),
-                }
-                plan.reclaimed.insert(key);
-            }
-            atomic(&path, &plan)?;
-        }
+        remove_reclamation_candidates(local, &path, &mut plan, &protected)?;
     }
     Ok(())
+}
+
+fn remove_reclamation_candidates(
+    local: &Store,
+    path: &Path,
+    plan: &mut Reclamation,
+    protected: &BTreeSet<String>,
+) -> Result<(), String> {
+    for key in &plan.candidates {
+        if plan.reclaimed.contains(key) {
+            continue;
+        }
+        if protected.contains(key) {
+            plan.protected.insert(key.clone());
+        } else {
+            let target = local
+                .local_path(key)
+                .ok_or("reclamation requires local store")?;
+            match fs::remove_file(target) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(err(e)),
+            }
+            plan.reclaimed.insert(key.clone());
+        }
+    }
+    atomic(path, plan)
+}
+
+#[cfg(test)]
+mod reclamation_tests {
+    use super::*;
+
+    #[test]
+    fn large_reclamation_resumes_after_unrecorded_partial_removal() {
+        let root = std::env::temp_dir().join(format!("reclaim-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("store/objects")).unwrap();
+        fs::create_dir_all(root.join("state")).unwrap();
+        let local = Store::filesystem(root.join("store"));
+        let path = root.join("state/reclaim-fixture.json");
+        let candidates: BTreeSet<_> = (0..20_000)
+            .map(|index| format!("objects/{index:064x}"))
+            .collect();
+        let mut plan = Reclamation {
+            intent: "fixture".into(),
+            receipt: "fixture.json".into(),
+            generation: "fixture".into(),
+            pending_header_sha256: None,
+            acquisitions: BTreeSet::new(),
+            candidates: candidates.clone(),
+            reclaimed: BTreeSet::new(),
+            protected: BTreeSet::new(),
+        };
+        let blocker = local
+            .local_path("objects/0000000000000000000000000000000000000000000000000000000000002710")
+            .unwrap();
+        for key in &candidates {
+            let target = local.local_path(key).unwrap();
+            if target == blocker {
+                fs::create_dir(&target).unwrap();
+            } else {
+                fs::write(target, b"fixture").unwrap();
+            }
+        }
+        atomic(&path, &plan).unwrap();
+        assert!(remove_reclamation_candidates(&local, &path, &mut plan, &BTreeSet::new()).is_err());
+        let recorded: Reclamation = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert!(recorded.reclaimed.is_empty());
+        assert!(
+            !local
+                .local_path(&format!("objects/{:064x}", 0))
+                .unwrap()
+                .exists()
+        );
+        fs::remove_dir(&blocker).unwrap();
+        fs::write(&blocker, b"fixture").unwrap();
+        let mut resumed = recorded;
+        remove_reclamation_candidates(&local, &path, &mut resumed, &BTreeSet::new()).unwrap();
+        let recorded: Reclamation = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(recorded.candidates, candidates);
+        assert_eq!(recorded.reclaimed, candidates);
+        assert!(recorded.protected.is_empty());
+        for key in &recorded.candidates {
+            assert!(!local.local_path(key).unwrap().exists(), "{key}");
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
 }
 
 pub(crate) fn reclamation_roots(path: &Path) -> Result<BTreeSet<String>, String> {

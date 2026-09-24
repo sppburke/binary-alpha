@@ -1,0 +1,65 @@
+{
+  "kind": "feature_generation",
+  "schema_version": 1,
+  "generation": "c767abdbea7095058a78be04182f27da1b69a645171ae80f9ea0e7972f9fd152",
+  "broker": "pocket_option",
+  "provider_symbol": "SECOND_otc",
+  "instrument": "pocket_option:SECOND_otc",
+  "role": "evaluation",
+  "input_generation": "dfa3b2e968c8b9f477bd95bdae9d1ae52b0cafd7b82f0fbdae59201c1fa538a2",
+  "plan_identity": "d232fc2882aa19ba8dbf495110d16e5922c38535fb19abd1932e435fa288c0c4",
+  "frozen_from": "e61ee3c55fd134576dbdc7d8a0811d409630b2f21a639c5c7521494449095d35",
+  "profile_generation": "7a1ee053dc20a85cb9fd6ec30175aa4e720c641ca568fbd0c521f88296bac480",
+  "config_hash": "v3:sha256:a13abdf2614a0087a89c3c9963028b09a566c5ad6de9e466de95992d63d3a7d4",
+  "code_revision": "fe93017a2fdec8d209d036ed8d7da9c370e185f9",
+  "observations": 18,
+  "streams": [
+    {
+      "duration_seconds": 20,
+      "offset_seconds": 0,
+      "rows": 4,
+      "structure_events": 0,
+      "sequence_events": 0,
+      "first_decision_time": "2026-01-05T03:00:20.000000Z",
+      "last_decision_time": "2026-01-05T03:01:20.000000Z"
+    }
+  ],
+  "objects": [
+    {
+      "role": "normalized",
+      "path": "plan.json",
+      "key": "objects/15d6fb6a7afb3e5fa746e6ba794a875d992e5da6cd2c7e324c7386e41e04d5bc",
+      "bytes": 28704,
+      "sha256": "15d6fb6a7afb3e5fa746e6ba794a875d992e5da6cd2c7e324c7386e41e04d5bc",
+      "crc32c": null,
+      "generation": null
+    },
+    {
+      "role": "normalized",
+      "path": "rows/20s_0s.parquet",
+      "key": "objects/b8441373922cdd87ac23e72a8affdd1f499fabcc4ac0694361c8778fa2d3f814",
+      "bytes": 12792,
+      "sha256": "b8441373922cdd87ac23e72a8affdd1f499fabcc4ac0694361c8778fa2d3f814",
+      "crc32c": null,
+      "generation": null
+    },
+    {
+      "role": "normalized",
+      "path": "events/structure_20s_0s.parquet",
+      "key": "objects/8ae254c439cf9b2f41aacf06754c62bb58bb3e12a82987f77b8d15e60a98c956",
+      "bytes": 701,
+      "sha256": "8ae254c439cf9b2f41aacf06754c62bb58bb3e12a82987f77b8d15e60a98c956",
+      "crc32c": null,
+      "generation": null
+    },
+    {
+      "role": "normalized",
+      "path": "events/sequence_20s_0s.parquet",
+      "key": "objects/3af1d30db996d76e82115ed47701c310669b88ee025565584440252044342bc8",
+      "bytes": 788,
+      "sha256": "3af1d30db996d76e82115ed47701c310669b88ee025565584440252044342bc8",
+      "crc32c": null,
+      "generation": null
+    }
+  ]
+}

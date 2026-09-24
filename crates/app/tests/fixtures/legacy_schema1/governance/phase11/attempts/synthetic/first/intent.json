@@ -2,7 +2,7 @@
   "schema_version": 1,
   "study": "synthetic",
   "attempt": "first",
-  "config_hash": "v3:sha256:0489e89204cfb61e9984e61cc4d57635286a8bcaacc54c47f2ac29b06022e83c",
+  "config_hash": "v3:sha256:ed808ef40f2fec9ccdf28c4facdca2a890d722dc9d1bf1714de08906ee7f9ccd",
   "code_revision": "fe93017a2fdec8d209d036ed8d7da9c370e185f9",
   "declaration": "7c3e0e70ac2c572f8c1264e4c9dc0db747a0070b064c90e40129046a4b217baa",
   "root": "file:///proc/self/cwd/governance",

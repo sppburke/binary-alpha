@@ -1,0 +1,77 @@
+{
+  "kind": "engine_replay",
+  "schema_version": 1,
+  "generation": "8f7f0897d0c24647e700c2dbb147a6e76fadb106ade90fa5bae803c5510c7063",
+  "role": "development",
+  "config_hash": "v3:sha256:436617f36f60f6ac6fe1252961b55fc6c0fe0db376bae9f7277a0c0e17e25f94",
+  "code_revision": "fe93017a2fdec8d209d036ed8d7da9c370e185f9",
+  "availability": "provider_order_simulation",
+  "decision_start": "2026-01-05T01:00:20.000000Z",
+  "decision_end": "2026-01-05T01:01:40.000000Z",
+  "instruments": [
+    {
+      "instrument": "pocket_option:AEDCNY_otc",
+      "broker": "pocket_option",
+      "provider_symbol": "AEDCNY_otc",
+      "price_scale": 6,
+      "tick_generation": "99af8c0991265c02366977a4b568dcfc15d1a3f5811697d35425bd5f4f43baf4",
+      "feature_generation": "66cf1bc75d8b7ca622496619345560d56a5c73fe9e6bf02853bcc44387aa3fc9",
+      "plan_identity": "c2c579fbc3504ab7dfc4a632633a7be73334fadd322fe6f5048633735bec5b74",
+      "raw_identity": "3ffc1c03227af22125297b3711bd75a18028897b3b1a4f0d965f9c203bc88d61",
+      "streams": [
+        {
+          "stream": {
+            "duration_seconds": 20,
+            "offset_seconds": 0
+          },
+          "columns": [
+            {
+              "name": "candle_direction",
+              "source": "candle_direction",
+              "kind": "text"
+            },
+            {
+              "name": "range_bps",
+              "source": "range_bps",
+              "kind": "float"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "instrument": "pocket_option:SECOND_otc",
+      "broker": "pocket_option",
+      "provider_symbol": "SECOND_otc",
+      "price_scale": 3,
+      "tick_generation": "93146e695247f59dc42e127bd5e33c271288d8d93e02cc52f293f61e2b02f901",
+      "feature_generation": "40263899da5e4e58aa331cbc978d044356b7f60ffd6f32db2463056cd029a90e",
+      "plan_identity": "09c0ab2fc423f0024f66af3b2d4ab46f2593356fd0322f4cf7f797cab123850d",
+      "raw_identity": "c4e4a2830662aaf9098934d6612b6da2d873c21ee06169be7053115b8cbcf82c",
+      "streams": []
+    }
+  ],
+  "events": 6,
+  "final_state_identity": "8c95e16d2f9929510d8f31c3b600a59bc6a6325e7505222955f0e54f9280a19c",
+  "summary_identity": "9648f9c105f820a74d237066607fe3f7c5e0d684505398cef257aa770ca37687",
+  "objects": [
+    {
+      "role": "normalized",
+      "path": "ledger/events.jsonl",
+      "key": "objects/08038e280e38c2c2ca707e78d7e6abdf9ee62d978e841af1c09974623280b9d2",
+      "bytes": 6272,
+      "sha256": "08038e280e38c2c2ca707e78d7e6abdf9ee62d978e841af1c09974623280b9d2",
+      "crc32c": null,
+      "generation": null
+    },
+    {
+      "role": "normalized",
+      "path": "summary.json",
+      "key": "objects/491d0d11b1df7011bf718356d711f85cd03b527466f2a2f93dac4bf69fca8a3f",
+      "bytes": 2406,
+      "sha256": "491d0d11b1df7011bf718356d711f85cd03b527466f2a2f93dac4bf69fca8a3f",
+      "crc32c": null,
+      "generation": null
+    }
+  ]
+}

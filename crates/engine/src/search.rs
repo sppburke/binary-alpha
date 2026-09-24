@@ -1475,9 +1475,9 @@ mod tests {
     fn generated_rules_resolve_fitted_labels_only_after_binding() {
         use crate::config::{GeneratedSearchCondition, NamedSearchCondition};
         use crate::features::{FittedEncoding, OutputSpec, ProjectionKind, Value};
-        let family: Family = serde_json::from_slice(include_bytes!("../../app/tests/fixtures/legacy_schema1/published/objects/736abc73d301789d7e19aa2ac927cc1e1010dd12cce189c2087b4255ee254717")).unwrap();
+        let family: Family = serde_json::from_slice(include_bytes!("../../app/tests/fixtures/legacy_schema1/published/objects/24e476f4f6bb8abbd2211c19ba7b0659762b682b299cb240ec6d40a694d51327")).unwrap();
         let mut search = family.search;
-        let mut plan = FeaturePlan::from_json(include_bytes!("../../app/tests/fixtures/legacy_schema1/published/objects/681b83854e41cf26ce7bd74254460523b82de3b8df0d09cd238c87d5ce4f3c92")).unwrap();
+        let mut plan = FeaturePlan::from_json(include_bytes!("../../app/tests/fixtures/legacy_schema1/published/objects/25fc908bd6027d9d562ad39cf1d04c8dc013081ae69b6df40edfa54bba820308")).unwrap();
         let stream = plan.streams[0].key();
         let mut boolean: OutputSpec = plan.streams[0]
             .outputs

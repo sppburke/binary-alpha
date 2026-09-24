@@ -6,55 +6,56 @@ use std::fs;
 use std::path::Path;
 use std::process::Command;
 
+use binary_alpha_engine::config::Outputs;
 use binary_alpha_engine::features::FeaturePlan;
 use common::Scratch;
 use serde_json::{Value, json};
 
 const WRITER: &str = "fe93017a2fdec8d209d036ed8d7da9c370e185f9";
-const RUN: &str = "1ff6bcd7bd7cc941ba6ab93685edc42985457d3b455f62f96c1d9e3e7d880740";
-const SELECTION: &str = "2ee96a1b86f8aa23ac9351bcaf5f502f2a1ffdf5afb25c59ae1199d1bd594d2d";
+const RUN: &str = "e735202ea7ecc1345825215733510b9276a11e2927f523d40ae33a46e45a68cf";
+const SELECTION: &str = "f41b61b63bbfde46c43b2bcebcb039f463f26562521852358279a0cb31e25aa7";
 const FAMILIES: [(&str, &str); 2] = [
     (
-        "409663ae0efeeb5f7a8cc0b4014f80827e11e3f7bbada6dfe4746211a8d493e9",
-        "bdb7400d739469757be2196113cb51d382c65c92bbfd2d760e5d9153ca22c118",
+        "d7924115f6ec1c2219d5239081221020315db2bf998d950c10cb60d194c53f67",
+        "c2c579fbc3504ab7dfc4a632633a7be73334fadd322fe6f5048633735bec5b74",
     ),
     (
-        "4421d5db7f772c227901e75804145cda10079a6afdf1cd9cce0c77fab73b90cf",
-        "1e849138f50b67ecbe767c117ea324b0d05ef6d2c7ba41bbeee3e46e5b6e551f",
+        "73486072a7f59ab1df2e6f2f2b704454759ec5c23ff977b874b58c0f3fd180d7",
+        "09c0ab2fc423f0024f66af3b2d4ab46f2593356fd0322f4cf7f797cab123850d",
     ),
 ];
 const FEATURES: [(&str, &str); 8] = [
     (
-        "057aae44fd62c232dc1aea9bbb25df1b732efd0f041a1f714aae3dea12ba79ac",
-        "976c576c1087085825d10d7a13d53a793ab8bb84ef9a921a7d31c38a070ca932",
+        "24409612301a6ee325fcdac35b37641c65cca1475a72f93b244f7df2efe79cc1",
+        "09c0ab2fc423f0024f66af3b2d4ab46f2593356fd0322f4cf7f797cab123850d",
     ),
     (
-        "096abefd050eeb42e68e17ed4d8a52e7bd0298f48a51794a78615cdb9dcdba8f",
-        "bdb7400d739469757be2196113cb51d382c65c92bbfd2d760e5d9153ca22c118",
+        "40263899da5e4e58aa331cbc978d044356b7f60ffd6f32db2463056cd029a90e",
+        "09c0ab2fc423f0024f66af3b2d4ab46f2593356fd0322f4cf7f797cab123850d",
     ),
     (
-        "212696cf966a83bbb1cb21941a2e83e644f29d3a065c8a59410b5e3593cd1b31",
-        "fd08eeb5231757853942e275a03d88e39edd1de2fef9ccf9a424fb413fbcb956",
+        "66cf1bc75d8b7ca622496619345560d56a5c73fe9e6bf02853bcc44387aa3fc9",
+        "c2c579fbc3504ab7dfc4a632633a7be73334fadd322fe6f5048633735bec5b74",
     ),
     (
-        "49988f58f2b54839ab1f1fddaa13f9294c277e7d86a87a6786d7771cb3a92109",
-        "fd08eeb5231757853942e275a03d88e39edd1de2fef9ccf9a424fb413fbcb956",
+        "97683c23ab072d6763cbe4aff952189ae477b990b1b370b5828a56fd86a19654",
+        "f3b004aa565f36508bbd255e43c761bde255bfededb9f8d7090a5bf49c3c3c62",
     ),
     (
-        "815f7ff188ace34ada25c914d6b806d6b3376b008c0d1d2c55c646bb2f00d19f",
-        "1e849138f50b67ecbe767c117ea324b0d05ef6d2c7ba41bbeee3e46e5b6e551f",
+        "a7ccab4e17b84ad665de5b29c9ccbca10df2b926d7dfe7a3c4987267092f8f29",
+        "f3b004aa565f36508bbd255e43c761bde255bfededb9f8d7090a5bf49c3c3c62",
     ),
     (
-        "95dbb99ab1490049f7d2f199e84750d739a9801665bec176b6c58c32e31f77f7",
-        "976c576c1087085825d10d7a13d53a793ab8bb84ef9a921a7d31c38a070ca932",
+        "bc01ba9344f078a18659c982b05c74801d43ae44e2eaff729e8e7defa60bf05c",
+        "c2c579fbc3504ab7dfc4a632633a7be73334fadd322fe6f5048633735bec5b74",
     ),
     (
-        "a17b7a09bd13b53be037fbfb740a8971daf1479ff06e7d80508bdfa413e153e9",
-        "bdb7400d739469757be2196113cb51d382c65c92bbfd2d760e5d9153ca22c118",
+        "c767abdbea7095058a78be04182f27da1b69a645171ae80f9ea0e7972f9fd152",
+        "d232fc2882aa19ba8dbf495110d16e5922c38535fb19abd1932e435fa288c0c4",
     ),
     (
-        "e0f530bc8d06c0434b980b5a27981336fc10469781cd825270e3290e8a2d1f69",
-        "1e849138f50b67ecbe767c117ea324b0d05ef6d2c7ba41bbeee3e46e5b6e551f",
+        "e61ee3c55fd134576dbdc7d8a0811d409630b2f21a639c5c7521494449095d35",
+        "d232fc2882aa19ba8dbf495110d16e5922c38535fb19abd1932e435fa288c0c4",
     ),
 ];
 
@@ -227,15 +228,17 @@ fn schema1_records_remain_verifiable() {
     );
     assert_eq!(
         selection["frozen"]["strategies"][0]["plan_identity"],
-        "976c576c1087085825d10d7a13d53a793ab8bb84ef9a921a7d31c38a070ca932"
+        "d232fc2882aa19ba8dbf495110d16e5922c38535fb19abd1932e435fa288c0c4"
     );
 
     for (generation, identity) in FEATURES {
         let ready = manifest(&scratch.root, generation);
         assert_eq!(ready["schema_version"], 1);
         assert_eq!(ready["plan_identity"], identity);
+        assert_eq!(ready["streams"][0]["rows"], 4);
         let plan = FeaturePlan::from_json(&object(&scratch.root, &ready, "plan.json")).unwrap();
         assert_eq!(plan.identity(), identity);
+        assert_eq!(plan.settings.outputs, Outputs::AllSupported);
     }
 
     let declaration: Value =

@@ -1740,7 +1740,7 @@ mod projection_tests {
 
     #[test]
     fn retained_fitted_label_projects_and_dropped_label_uses_lowering() {
-        let mut plan = binary_alpha_engine::features::FeaturePlan::from_json(include_bytes!("../tests/fixtures/legacy_schema1/published/objects/681b83854e41cf26ce7bd74254460523b82de3b8df0d09cd238c87d5ce4f3c92")).unwrap();
+        let mut plan = binary_alpha_engine::features::FeaturePlan::from_json(include_bytes!("../tests/fixtures/legacy_schema1/published/objects/25fc908bd6027d9d562ad39cf1d04c8dc013081ae69b6df40edfa54bba820308")).unwrap();
         let stream = plan.streams[0].key();
         plan.streams[0].encodings.push(FittedEncoding {
             output: "direction_encoded".into(),
@@ -1783,15 +1783,15 @@ mod projection_tests {
         )
         .unwrap();
         let feature: binary_alpha_engine::features::FeatureManifest = serde_json::from_slice(
-            &manifest("096abefd050eeb42e68e17ed4d8a52e7bd0298f48a51794a78615cdb9dcdba8f"),
+            &manifest("bc01ba9344f078a18659c982b05c74801d43ae44e2eaff729e8e7defa60bf05c"),
         )
         .unwrap();
         let outcome: OutcomeManifest = serde_json::from_slice(&manifest(
-            "b0ca2b465d4fd02cd272d5bf2ce15ece2de0915d037ce8fab43b569231f13756",
+            "a377abdc0fdc92a8c71d2e98163cad588803d64c256d145cfbf2bfe8b2fc993f",
         ))
         .unwrap();
         let family_manifest: FamilyManifest = serde_json::from_slice(&manifest(
-            "409663ae0efeeb5f7a8cc0b4014f80827e11e3f7bbada6dfe4746211a8d493e9",
+            "d7924115f6ec1c2219d5239081221020315db2bf998d950c10cb60d194c53f67",
         ))
         .unwrap();
         let plan_object = feature
@@ -1831,7 +1831,7 @@ mod projection_tests {
         };
         let index = projection_index(&development).unwrap();
         let event_bytes = fs::read(
-            root.join("objects/2948dc355a12085d7b1f1851e9f98a702683a365248a7f2fadd20d9812b1bef9"),
+            root.join("objects/100919c6323ae3b3a009aafe0b98a64a749762a5c4f25b3a8652cfb2741d170e"),
         )
         .unwrap();
         let signals: Vec<FinancialEvent> = event_bytes
