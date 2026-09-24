@@ -386,14 +386,52 @@ impl Certification {
 pub struct Access<'a> {
     pub declaration: Option<&'a Declaration>,
     pub certification: Option<&'a Certification>,
-    /// Manifests this phase has already verified, by URI, with each verifier summary. A phase
+    /// Manifests this phase has already verified, by URI and authorization context, with each
+    /// verifier summary. A phase
     /// that holds the store's writer lock verifies a manifest once however many closures
     /// share it; a phase that must observe fresh state starts an empty memo.
     pub verified: Option<&'a Verified>,
 }
 
-/// The memo behind [`Access::verified`].
-pub type Verified = std::sync::Mutex<std::collections::BTreeMap<String, String>>;
+/// The command-owned memo behind [`Access::verified`]. Device ordinals affect only the
+/// computation used to verify schema-2 families, never their recorded identity.
+#[derive(Debug, Default)]
+pub struct Verified {
+    summaries: std::sync::Mutex<std::collections::BTreeMap<String, String>>,
+    devices: Option<Vec<usize>>,
+    family_rescores: std::sync::atomic::AtomicUsize,
+}
+
+impl Verified {
+    pub fn with_devices(devices: Option<Vec<usize>>) -> Self {
+        Self {
+            summaries: std::sync::Mutex::default(),
+            devices,
+            family_rescores: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+
+    pub fn devices(&self) -> Option<&[usize]> {
+        self.devices.as_deref()
+    }
+
+    pub fn family_rescores(&self) -> usize {
+        self.family_rescores
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub fn note_family_rescore(&self) {
+        self.family_rescores
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub fn lock(
+        &self,
+    ) -> std::sync::LockResult<std::sync::MutexGuard<'_, std::collections::BTreeMap<String, String>>>
+    {
+        self.summaries.lock()
+    }
+}
 
 impl Access<'_> {
     /// An ordinary reader: development and evaluation only, checked on the manifest after it
@@ -1796,6 +1834,7 @@ mod tests {
             "contracts":[contract,second],"risk_policies":[risk]
         })).unwrap();
         let selection = Selection {
+            schema_version: 1,
             config: config.clone(),
             families: Vec::new(),
             members: Vec::new(),

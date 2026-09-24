@@ -30,7 +30,14 @@ use crate::store::{Hasher, Store, Tee};
 
 /// Verifies the generation whose ready manifest is at `uri` and returns its report line.
 pub fn run(uri: &str) -> Result<String, String> {
-    run_with(uri, Access::ORDINARY)
+    let verified = crate::verification_cache(None);
+    run_with(
+        uri,
+        Access {
+            verified: Some(&verified),
+            ..Access::ORDINARY
+        },
+    )
 }
 
 /// `run` with the declaration of the configuration at `config`, when one is given: a declared
@@ -42,12 +49,13 @@ pub fn run_configured(config: Option<&std::path::Path>, uri: &str) -> Result<Str
         .map(crate::research::declaration)
         .transpose()?
         .flatten();
+    let verified = crate::verification_cache(config.as_ref());
     run_with(
         uri,
         Access {
             declaration: declaration.as_ref(),
             certification: None,
-            verified: None,
+            verified: Some(&verified),
         },
     )
 }
@@ -56,11 +64,13 @@ pub fn run_configured(config: Option<&std::path::Path>, uri: &str) -> Result<Str
 /// derived generations keep their own role checks; protected research evidence is verified
 /// only within the matching certification context.
 pub fn run_with(uri: &str, access: Access<'_>) -> Result<String, String> {
+    let target: ManifestUri = uri.parse()?;
+    access.lookup(target.generation())?;
     memo(access, uri, || run_once(uri, access))
 }
 
-/// Runs `verify` for `uri` once per phase: a hit in `access.verified` returns the recorded
-/// summary, a miss records the summary it produces, and no memo means no reuse.
+/// Runs `verify` once per URI and authorization context: a hit in `access.verified` returns
+/// the recorded summary, a miss records only a successful result, and no memo means no reuse.
 fn memo(
     access: Access<'_>,
     uri: &str,
@@ -69,10 +79,19 @@ fn memo(
     let Some(verified) = access.verified else {
         return verify();
     };
+    // A certification result may have followed protected children. Keep it separate from
+    // ordinary verification of the same derived URI within this command.
+    let key = access.certification.map_or_else(
+        || uri.to_string(),
+        |certification| {
+            let receipt = certification.receipt();
+            format!("certification:{}:{receipt}:{uri}", receipt.len())
+        },
+    );
     if let Some(summary) = verified
         .lock()
         .map_err(|_| "verify: memo poisoned")?
-        .get(uri)
+        .get(&key)
     {
         return Ok(summary.clone());
     }
@@ -80,7 +99,7 @@ fn memo(
     verified
         .lock()
         .map_err(|_| "verify: memo poisoned")?
-        .insert(uri.to_string(), summary.clone());
+        .insert(key, summary.clone());
     Ok(summary)
 }
 

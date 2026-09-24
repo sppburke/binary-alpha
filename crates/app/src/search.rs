@@ -1,6 +1,6 @@
-//! `binary-alpha search`: enumerate one typed candidate family, lower every distinct condition
-//! through the engine's own signal records, score the complete family with the retained
-//! capacity-one kernel, replay the survivors through the engine in chunks, evaluate the frozen
+//! `binary-alpha search`: resolve one typed candidate family, project fitted labels and lower
+//! fallback conditions, stream sparse screening over the complete family, replay retained
+//! survivors through the engine in chunks, evaluate the frozen
 //! development ranking, resample settlement paths through the retained bootstrap primitive, and
 //! publish the family as one immutable generation that `data verify` re-derives.
 //!
@@ -19,6 +19,7 @@ use binary_alpha_engine::dataset::{DatasetRole, ObjectRecord, ObjectRole, manife
 use binary_alpha_engine::execution::{
     ColumnSpec, EVENTS_OBJECT_PATH, EventKind, FinancialEvent, ReplayManifest, Resolution,
     SUMMARY_OBJECT_PATH, StrategySpec, StreamColumns, Summary, project_fitted_label,
+    signal_logic_identity,
 };
 use binary_alpha_engine::features::Value;
 use binary_alpha_engine::outcomes::{
@@ -148,6 +149,135 @@ struct DeviceRows {
     tie: Vec<u8>,
 }
 
+#[derive(Default)]
+struct SparseBatch {
+    globals: Vec<u64>,
+    features: Vec<i32>,
+    buckets: Vec<i16>,
+    offsets: Vec<i32>,
+    drivers: Vec<i32>,
+}
+
+impl SparseBatch {
+    fn candidates(&self) -> kernels::CandidateConditions<'_> {
+        kernels::CandidateConditions {
+            condition_feature: &self.features,
+            condition_bucket: &self.buckets,
+            candidate_offsets: &self.offsets,
+            candidate_count: self.globals.len() as i32,
+        }
+    }
+}
+
+fn visit_block_tuples(
+    blocks: &[kernels::ColumnBlock],
+    suffix_capacity: &[usize],
+    remaining: usize,
+    first: usize,
+    tuple: &mut Vec<usize>,
+    visit: &mut impl FnMut(&[usize]) -> Result<(), String>,
+) -> Result<(), String> {
+    if remaining == 0 {
+        return visit(tuple);
+    }
+    for block in first..blocks.len() {
+        let used = tuple.iter().filter(|&&current| current == block).count();
+        if used == blocks[block].columns.len() || suffix_capacity[block] - used < remaining {
+            continue;
+        }
+        tuple.push(block);
+        visit_block_tuples(blocks, suffix_capacity, remaining - 1, block, tuple, visit)?;
+        tuple.pop();
+    }
+    Ok(())
+}
+
+fn visit_tuple_conditions(
+    blocks: &[kernels::ColumnBlock],
+    tuple: &[usize],
+    position: usize,
+    first: usize,
+    chosen: &mut Vec<usize>,
+    visit: &mut impl FnMut(&[usize]) -> Result<(), String>,
+) -> Result<(), String> {
+    if position == tuple.len() {
+        return visit(chosen);
+    }
+    for condition in blocks[tuple[position]].columns.clone() {
+        if condition >= first {
+            chosen.push(condition);
+            visit_tuple_conditions(blocks, tuple, position + 1, condition + 1, chosen, visit)?;
+            chosen.pop();
+        }
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn tuple_batches(
+    blocks: &[kernels::ColumnBlock],
+    tuple: &[usize],
+    requested: &[usize],
+    buckets: &[i16],
+    offsets: &[i32],
+    count: usize,
+    settings: &Search,
+    mut consume: impl FnMut(&[SparseBatch]) -> Result<(), String>,
+) -> Result<(), String> {
+    const BATCH: usize = 1024;
+    const GROUP: usize = 16;
+    let mut group = Vec::new();
+    let mut batch = SparseBatch {
+        offsets: vec![0],
+        ..SparseBatch::default()
+    };
+    visit_tuple_conditions(blocks, tuple, 0, 0, &mut Vec::new(), &mut |chosen| {
+        let global = search::member_rank(
+            count,
+            settings.min_conditions as usize,
+            settings.max_conditions as usize,
+            settings.contracts.len(),
+            chosen,
+            0,
+        )
+        .ok_or("cannot rank streamed member")?;
+        batch.globals.push(global);
+        let mut driver = None;
+        for &condition in chosen {
+            let local = requested.binary_search(&condition).expect("tuple column");
+            batch.features.push(local as i32);
+            batch.buckets.push(buckets[local]);
+            let frequency = offsets[local + 1] - offsets[local];
+            if driver.is_none_or(|(_, shortest)| frequency < shortest) {
+                driver = Some((local as i32, frequency));
+            }
+        }
+        batch.drivers.push(driver.expect("nonempty member").0);
+        batch.offsets.push(batch.features.len() as i32);
+        if batch.globals.len() == BATCH {
+            group.push(std::mem::replace(
+                &mut batch,
+                SparseBatch {
+                    offsets: vec![0],
+                    ..SparseBatch::default()
+                },
+            ));
+            if group.len() == GROUP {
+                consume(&group)?;
+                group.clear();
+            }
+        }
+        Ok(())
+    })?;
+    if !batch.globals.is_empty() {
+        group.push(batch);
+    }
+    if !group.is_empty() {
+        consume(&group)?;
+    }
+    Ok(())
+}
+
 /// Wall-clock stages of one run, outside every identity.
 #[derive(Default)]
 struct Clock {
@@ -176,6 +306,7 @@ pub(crate) struct Searched {
 /// and verify one family generation of the configuration's `search` table.
 pub fn search(config: &Config, local: &Store, destination: &Store) -> Result<String, String> {
     let declaration = crate::research::declaration(config)?;
+    let verified = crate::verification_cache(Some(config));
     family(
         config,
         local,
@@ -183,7 +314,7 @@ pub fn search(config: &Config, local: &Store, destination: &Store) -> Result<Str
         Access {
             declaration: declaration.as_ref(),
             certification: None,
-            verified: None,
+            verified: Some(&verified),
         },
     )
     .map(|searched| searched.report)
@@ -200,104 +331,112 @@ pub(crate) fn family(
         .search
         .as_ref()
         .ok_or("search: the table is required")?;
-    let backend = match config.accelerator.as_ref() {
-        Some(section) if section.backend == Selected::Cuda => Backend::cuda(section.devices[0])?,
-        _ => Backend::Cpu,
+    let backends: Vec<Backend> = match config.accelerator.as_ref() {
+        Some(section) if section.backend == Selected::Cuda => section
+            .devices
+            .iter()
+            .map(|&device| Backend::cuda(device))
+            .collect::<Result<_, _>>()?,
+        _ => vec![Backend::Cpu],
     };
+    let backend = &backends[0];
     let mut clock = Clock::default();
     let started = Instant::now();
 
-    // 1. Bind the development input and enumerate the family before any allocation.
+    // Resolve against the bound fitted plan before allocating a family-sized buffer.
     let development = bind_development(settings, access)?;
-    let conditions = search::conditions(&settings.conditions);
-    let candidates = search::candidates(
-        &development.plan_identity,
-        settings.base_stream,
-        &conditions,
-        settings.min_conditions as usize,
-        settings.max_conditions as usize,
-    );
-    let expiries = expiry_columns(settings, &development)?;
-    let mut members: Vec<Member> = candidates
-        .iter()
-        .flat_map(|candidate| {
-            settings.contracts.iter().map(|contract| Member {
-                global_index: None,
-                logic_identity: candidate.logic_identity.clone(),
-                conditions: candidate
-                    .conditions
-                    .iter()
-                    .map(|&index| conditions[index].clone())
-                    .collect(),
-                contract: contract.id.clone(),
-                raw: RawCounts::default(),
-                null: None,
-                inapplicable: None,
-                score: None,
-                adjusted: None,
-                screened: None,
-                development: None,
-                rejected: None,
-                rank: None,
-                evaluation: None,
-                evaluation_splits: BTreeMap::new(),
-                stability: BTreeMap::new(),
-            })
-        })
-        .collect();
+    let resolved = search::resolve_conditions(settings, &development.bound.plan)?;
+    let conditions = &resolved.conditions;
+    let total = resolved.members;
     clock.load = started.elapsed();
 
-    // 2. Lower every distinct condition through the engine's own signal records.
     let lowering_started = Instant::now();
-    let lowering = search::lowering_replay(
-        settings,
-        &development.plan_identity,
-        &development.instrument,
-    );
-    let lowering_bindings: Vec<String> = lowering.strategies.iter().map(|s| s.id.clone()).collect();
-    let lowered = replay::publish(
-        &chunk_config(config, lowering),
-        local,
-        destination,
-        true,
-        access,
-    )?;
-    let references = read_references(&development)?;
-    let codes = lowering_codes(
-        &chunk_events(destination, &lowered.manifest)?,
-        &references,
-        conditions.len(),
-    )?;
-    let lowering_ref = ChunkRef {
-        role: DatasetRole::Development.to_string(),
-        generation: lowered.manifest.generation.clone(),
-        summary_identity: lowered.manifest.summary_identity.clone(),
-        bindings: lowering_bindings,
+    let lowered_indices: Vec<usize> = conditions
+        .iter()
+        .enumerate()
+        .filter_map(|(index, condition)| {
+            projected_bucket(&development.bound.plan, condition)
+                .is_none()
+                .then_some(index)
+        })
+        .collect();
+    let lowered_conditions: Vec<_> = lowered_indices
+        .iter()
+        .map(|&index| conditions[index].clone())
+        .collect();
+    let lowered_bindings: BTreeMap<usize, String> = lowered_indices
+        .iter()
+        .enumerate()
+        .map(|(local, &global)| (global, format!("c{local}")))
+        .collect();
+    let (lowering_ref, lowering_events) = if total > 0 && !lowered_conditions.is_empty() {
+        let lowering = search::lowering_replay_for(
+            settings,
+            &development.plan_identity,
+            &development.instrument,
+            &lowered_conditions,
+        );
+        let bindings = lowering
+            .strategies
+            .iter()
+            .map(|strategy| strategy.id.clone())
+            .collect();
+        let published = replay::publish(
+            &chunk_config(config, lowering),
+            local,
+            destination,
+            true,
+            access,
+        )?;
+        let events = chunk_events(destination, &published.manifest)?;
+        (
+            Some(ChunkRef {
+                role: DatasetRole::Development.to_string(),
+                generation: published.manifest.generation.clone(),
+                summary_identity: published.manifest.summary_identity.clone(),
+                bindings,
+            }),
+            events,
+        )
+    } else {
+        (None, Vec::new())
     };
     clock.lowering = lowering_started.elapsed();
 
-    // 3. Score the complete family once per contract duration, adjust, and screen.
-    let raw = score_members(
-        &backend,
-        settings,
-        &development,
-        &candidates,
-        &expiries,
-        &codes,
-        &references,
-        &mut clock,
-    )?;
-    for (member, raw) in members.iter_mut().zip(raw) {
-        member.raw = raw;
-    }
-    let applicable = search::score(&mut members, &settings.contracts, settings.screen.as_ref());
+    let mut members = Vec::new();
+    let applicable = if total == 0 {
+        0
+    } else {
+        let mut compact = score_streamed(
+            settings,
+            &development,
+            conditions,
+            &lowering_events,
+            &lowered_bindings,
+            &backends,
+            config
+                .accelerator
+                .as_ref()
+                .filter(|section| section.backend == Selected::Cuda)
+                .map(|section| section.devices.as_slice()),
+            &mut clock,
+        )?;
+        let (applicable, survivors) =
+            search::screen_compact(&mut compact, &settings.contracts, settings.screen.as_ref());
+        for global in survivors {
+            let mut member =
+                streamed_member(global, settings, &development.plan_identity, conditions)?;
+            let contract = &settings.contracts[global as usize % settings.contracts.len()];
+            compact[global as usize].apply(&mut member, contract, settings.screen.as_ref());
+            members.push(member);
+        }
+        applicable
+    };
 
     // 5. Replay survivors through the engine in canonical chunks; gate and rank.
     let currency = settings.account.currency.to_string();
     let replay_started = Instant::now();
-    let survivors: Vec<usize> = (0..members.len())
-        .filter(|&index| members[index].screened.is_none())
-        .collect();
+    let survivors: Vec<usize> = (0..members.len()).collect();
     let mut chunks = Vec::new();
     let mut profits: BTreeMap<(String, String), Vec<f64>> = BTreeMap::new();
     let run_chunks = |role: DatasetRole,
@@ -308,14 +447,12 @@ pub(crate) fn family(
                       profits: &mut BTreeMap<(String, String), Vec<f64>>|
      -> Result<(), String> {
         for chunk in selected.chunks(settings.chunk_size as usize) {
-            let ids: Vec<String> = chunk.iter().map(|index| format!("m{index}")).collect();
-            let chunk_members = chunk_members(
-                &ids,
-                settings,
-                &development.plan_identity,
-                &conditions,
-                &candidates,
-            )?;
+            let ids: Vec<String> = chunk
+                .iter()
+                .map(|&index| format!("m{}", members[index].global_index.expect("schema-2 member")))
+                .collect();
+            let chunk_members =
+                chunk_members_streamed(&ids, settings, &development.plan_identity, conditions)?;
             let table = search::replay_table(
                 settings,
                 role,
@@ -339,7 +476,12 @@ pub(crate) fn family(
                 BTreeMap::new()
             };
             for (id, _, _) in &chunk_members {
-                let index: usize = id[1..].parse().expect("member id");
+                let global: u64 = id[1..].parse().expect("member id");
+                let index = members
+                    .binary_search_by_key(&global, |member| {
+                        member.global_index.expect("schema-2 member")
+                    })
+                    .expect("retained member binding");
                 let group = summary.strategies.get(id).cloned().unwrap_or_default();
                 profits.insert(
                     (id.clone(), role.to_string()),
@@ -372,7 +514,7 @@ pub(crate) fn family(
     let passed = search::rank(&mut members, &settings.gates, &currency);
     // The development result is complete here; only now may evaluation objects be read.
     let mut inputs = vec![development.input.clone()];
-    if let Some(window) = &settings.evaluation {
+    if let Some(window) = settings.evaluation.as_ref().filter(|_| total > 0) {
         inputs.push(bind_evaluation(settings, &development, access)?);
         let mut ordered = passed.clone();
         ordered.sort_unstable();
@@ -391,17 +533,13 @@ pub(crate) fn family(
     let stability_started = Instant::now();
     for &index in &passed {
         for role in [DatasetRole::Development, DatasetRole::Evaluation] {
-            let Some(series) = profits.get(&(format!("m{index}"), role.to_string())) else {
+            let Some(series) = profits.get(&(
+                format!("m{}", members[index].global_index.expect("schema-2 member")),
+                role.to_string(),
+            )) else {
                 continue;
             };
-            let outcome = resample(
-                &backend,
-                settings,
-                &members[index],
-                role,
-                series,
-                &mut clock,
-            )?;
+            let outcome = resample(backend, settings, &members[index], role, series, &mut clock)?;
             members[index].stability.insert(role.to_string(), outcome);
         }
     }
@@ -410,17 +548,17 @@ pub(crate) fn family(
     // 7. Publish the family, then its manifest, and verify before it becomes ready.
     let publishing = Instant::now();
     let family = Family {
-        schema_version: search::FAMILY_SCHEMA_VERSION,
+        schema_version: search::STREAMED_FAMILY_SCHEMA_VERSION,
         search: settings.clone(),
-        resolved_conditions: None,
-        resolved_hash: None,
+        resolved_conditions: Some(conditions.clone()),
+        resolved_hash: Some(resolved.hash),
         plan_identity: development.plan_identity.clone(),
         base_stream: settings.base_stream,
         kernel_module: kernel_identity(),
         sampler: SAMPLER_VERSION.to_string(),
         applicable,
         members,
-        lowering: Some(lowering_ref),
+        lowering: lowering_ref,
         chunks,
     };
     let generation = family_generation_id(&config.content_hash(), CODE_REVISION, &inputs);
@@ -438,12 +576,12 @@ pub(crate) fn family(
         .map_err(|error| format!("cannot remove {}: {error}", temporary.display()))?;
     let manifest = FamilyManifest {
         kind: search::FAMILY_MANIFEST_KIND.to_string(),
-        schema_version: search::FAMILY_SCHEMA_VERSION,
+        schema_version: search::STREAMED_FAMILY_SCHEMA_VERSION,
         generation: generation.clone(),
         config_hash: config.content_hash(),
         code_revision: CODE_REVISION.to_string(),
         inputs,
-        members: family.members.len() as u64,
+        members: total,
         objects: vec![object],
     };
     let committed = match destination.head(&key)? {
@@ -474,18 +612,20 @@ pub(crate) fn family(
     let identity = store::identify(&temporary)?;
     let put = destination.put_new(&key, &temporary, &identity)?;
     local.put_new(&key, &temporary, &identity)?;
+    if let Some(cache) = access.verified {
+        cache
+            .lock()
+            .map_err(|_| "verify: memo poisoned")?
+            .insert(uri.clone(), verified.clone());
+    }
     fs::remove_file(&temporary)
         .map_err(|error| format!("cannot remove {}: {error}", temporary.display()))?;
     clock.publish = publishing.elapsed();
-    let screened = family
-        .members
-        .iter()
-        .filter(|member| member.screened.is_some())
-        .count();
+    let screened = total - family.members.len() as u64;
     let report = format!(
         "search {} generation {generation} members {} applicable {} screened {screened} replayed {} passed {} evaluated {} objects 1",
         settings.scope,
-        family.members.len(),
+        total,
         family.applicable,
         survivors.len(),
         passed.len(),
@@ -869,16 +1009,100 @@ fn projected_bucket(
         .and_then(|code| i16::try_from(code).ok())
 }
 
-/// Build only the requested condition columns. Fitted equalities carry retained label codes;
-/// all other columns carry 0/1 from the engine's own lowering Signal records.
-#[allow(dead_code)]
-fn projection_block(
+fn projected_code_at(
+    index: &ProjectionIndex,
+    base_row: usize,
+    stream: usize,
+    codes: &[i16],
+) -> i16 {
+    let base = &index.base[base_row];
+    index
+        .latest(base_row, stream)
+        .filter(|&row| index.closes[stream][row] <= base.close)
+        .map_or(-1, |row| codes[row])
+}
+
+fn projected_row_codes(
+    development: &Development,
+    condition: &binary_alpha_engine::execution::Condition,
+) -> Result<Vec<i16>, String> {
+    let plan_stream = development
+        .bound
+        .plan
+        .stream(condition.stream)
+        .ok_or("projected stream is absent from the plan")?;
+    let mut spec = replay::column_spec(plan_stream, &condition.output)
+        .ok_or("projected encoding is absent from the plan")?;
+    let readiness = development.bound.plan.readiness_of(&spec.source);
+    spec.readiness = readiness.flags;
+    spec.unready = readiness.unready;
+    let mut columns: Vec<ColumnSpec> = spec
+        .readiness
+        .iter()
+        .map(|flag| {
+            replay::column_spec(plan_stream, flag)
+                .ok_or_else(|| format!("readiness flag `{flag}` is absent"))
+        })
+        .collect::<Result<_, _>>()?;
+    let value_index = columns.len();
+    columns.push(spec.clone());
+    let mut cursor = replay::RowCursor::open(
+        &development.bound,
+        &StreamColumns {
+            stream: condition.stream,
+            columns,
+        },
+    )?;
+    let mut row_codes = Vec::new();
+    while cursor.peek()?.is_some() {
+        let (close, _, values) = cursor.next()?;
+        let ready = spec
+            .readiness
+            .iter()
+            .enumerate()
+            .map(|(flag, _)| values[flag] == Some(Value::Bool(true)));
+        row_codes.push(project_fitted_label(
+            i64::MAX,
+            Some((close, values[value_index].as_ref())),
+            &spec,
+            ready,
+        ));
+    }
+    Ok(row_codes)
+}
+
+fn projection_block_from_development(
     development: &Development,
     index: &ProjectionIndex,
     conditions: &[binary_alpha_engine::execution::Condition],
     requested: &[usize],
     signals: &[FinancialEvent],
     lowered_bindings: &BTreeMap<usize, String>,
+) -> Result<(Vec<i16>, Vec<i16>), String> {
+    projection_block(
+        &development.bound.plan,
+        index,
+        conditions,
+        requested,
+        signals,
+        lowered_bindings,
+        |condition| projected_row_codes(development, condition),
+    )
+}
+
+/// Build only the requested condition columns. Fitted equalities carry retained label codes;
+/// all other columns carry 0/1 from the engine's own lowering Signal records.
+#[allow(dead_code)]
+fn projection_block(
+    plan: &binary_alpha_engine::features::FeaturePlan,
+    index: &ProjectionIndex,
+    conditions: &[binary_alpha_engine::execution::Condition],
+    requested: &[usize],
+    signals: &[FinancialEvent],
+    lowered_bindings: &BTreeMap<usize, String>,
+    mut projected_rows: impl FnMut(
+        &binary_alpha_engine::execution::Condition,
+    ) -> Result<Vec<i16>, String>,
 ) -> Result<(Vec<i16>, Vec<i16>), String> {
     let mut codes = Vec::with_capacity(requested.len() * index.base.len());
     let mut buckets = Vec::with_capacity(requested.len());
@@ -892,64 +1116,18 @@ fn projection_block(
         let condition = conditions
             .get(condition_index)
             .ok_or("condition block index is out of bounds")?;
-        if let Some(bucket) = projected_bucket(&development.bound.plan, condition) {
+        if let Some(bucket) = projected_bucket(plan, condition) {
             let stream_index = index
                 .streams
                 .iter()
                 .position(|&stream| stream == condition.stream)
                 .ok_or("condition stream is absent from plan")?;
-            let plan_stream = development
-                .bound
-                .plan
-                .stream(condition.stream)
-                .expect("indexed stream");
-            let mut spec = replay::column_spec(plan_stream, &condition.output)
-                .ok_or("projected encoding is absent from the plan")?;
-            let readiness = development.bound.plan.readiness_of(&spec.source);
-            spec.readiness = readiness.flags;
-            spec.unready = readiness.unready;
-            let mut columns: Vec<ColumnSpec> = spec
-                .readiness
-                .iter()
-                .map(|flag| {
-                    replay::column_spec(plan_stream, flag)
-                        .ok_or_else(|| format!("readiness flag `{flag}` is absent"))
-                })
-                .collect::<Result<_, _>>()?;
-            let value_index = columns.len();
-            columns.push(spec.clone());
-            let mut cursor = replay::RowCursor::open(
-                &development.bound,
-                &StreamColumns {
-                    stream: condition.stream,
-                    columns,
-                },
-            )?;
-            let mut row_codes = Vec::new();
-            while cursor.peek()?.is_some() {
-                let (close, _, values) = cursor.next()?;
-                let ready = spec
-                    .readiness
-                    .iter()
-                    .enumerate()
-                    .map(|(flag, _)| values[flag] == Some(Value::Bool(true)));
-                row_codes.push(project_fitted_label(
-                    i64::MAX,
-                    Some((close, values[value_index].as_ref())),
-                    &spec,
-                    ready,
-                ));
-            }
+            let row_codes = projected_rows(condition)?;
             if row_codes.len() != index.closes[stream_index].len() {
                 return Err("projection row count changed after clock indexing".into());
             }
-            for (base_row, base) in index.base.iter().enumerate() {
-                let latest = index.latest(base_row, stream_index);
-                codes.push(
-                    latest
-                        .filter(|&row| index.closes[stream_index][row] <= base.close)
-                        .map_or(-1, |row| row_codes[row]),
-                );
+            for base_row in 0..index.base.len() {
+                codes.push(projected_code_at(index, base_row, stream_index, &row_codes));
             }
             buckets.push(bucket);
         } else {
@@ -1300,6 +1478,278 @@ fn score_members(
         .collect())
 }
 
+#[cfg(feature = "cuda")]
+fn raw_at(values: &[i64], position: usize) -> RawCounts {
+    let at = position * 21;
+    RawCounts {
+        total: values[at],
+        wins: values[at + 1],
+        losses: values[at + 2],
+        ties: values[at + 3],
+        invalid: values[at + 4],
+    }
+}
+
+/// Stream block tuples, keeping only compact whole-family counts. Each tuple's sparse index is
+/// scoped to its columns and built once; batches carry only conjunctions and driver IDs.
+#[allow(clippy::too_many_arguments)]
+fn score_streamed(
+    settings: &Search,
+    development: &Development,
+    conditions: &[binary_alpha_engine::execution::Condition],
+    signals: &[FinancialEvent],
+    lowered_bindings: &BTreeMap<usize, String>,
+    backends: &[Backend],
+    device_ordinals: Option<&[usize]>,
+    clock: &mut Clock,
+) -> Result<Vec<search::CompactMember>, String> {
+    let total = search::family_size(
+        conditions.len(),
+        settings.min_conditions as usize,
+        settings.max_conditions as usize,
+        settings.contracts.len(),
+    )
+    .ok_or("resolved family size overflows")?;
+    let total = usize::try_from(total).map_err(|_| "family is too large for this host")?;
+    let index = projection_index(development)?;
+    let rows = index.base.len();
+    let expiries = expiry_columns(settings, development)?;
+    let builder = outcome_builder(development)?;
+    let references = read_references(development)?;
+    let mut outcome_rows = BTreeMap::new();
+    for &expiry in &expiries {
+        if let std::collections::btree_map::Entry::Vacant(entry) = outcome_rows.entry(expiry) {
+            entry.insert(device_rows(development, &builder, &references, expiry)?);
+        }
+    }
+    let start =
+        binary_alpha_engine::market::parse_event_time_micros(&settings.development.decision_start)?;
+    let end =
+        binary_alpha_engine::market::parse_event_time_micros(&settings.development.decision_end)?;
+    let mask = index.slot_mask(start, end);
+    let mut lengths = Vec::with_capacity(conditions.len());
+    for column in 0..conditions.len() {
+        let (codes, buckets) = projection_block_from_development(
+            development,
+            &index,
+            conditions,
+            &[column],
+            signals,
+            lowered_bindings,
+        )?;
+        lengths.push(codes.iter().filter(|&&code| code == buckets[0]).count());
+    }
+    #[cfg(feature = "cuda")]
+    let mut budget = usize::MAX;
+    #[cfg(not(feature = "cuda"))]
+    let budget = usize::MAX;
+    #[cfg(feature = "cuda")]
+    for (position, backend) in backends.iter().enumerate() {
+        if let Backend::Cuda(device) = backend {
+            let ordinals = device_ordinals.ok_or("CUDA screening has no device ordinals")?;
+            let duplicate_workers = ordinals
+                .iter()
+                .filter(|&&ordinal| ordinal == ordinals[position])
+                .count();
+            budget = budget.min(device.memory_info()?.0 / duplicate_workers);
+        }
+    }
+    #[cfg(not(feature = "cuda"))]
+    let _ = (backends, device_ordinals, clock);
+    let plan = kernels::plan_column_blocks(
+        &lengths,
+        rows,
+        settings.max_conditions as usize,
+        1024,
+        1,
+        1,
+        budget,
+    )?;
+    let mut suffix_capacity = vec![0; plan.blocks.len() + 1];
+    for block in (0..plan.blocks.len()).rev() {
+        suffix_capacity[block] = suffix_capacity[block + 1] + plan.blocks[block].columns.len();
+    }
+    let mut records = vec![search::CompactMember::new(RawCounts::default()); total];
+    #[cfg(feature = "cuda")]
+    let mut next_device = 0_usize;
+    for size in settings.min_conditions as usize
+        ..=settings.max_conditions.min(conditions.len() as u32) as usize
+    {
+        visit_block_tuples(
+            &plan.blocks,
+            &suffix_capacity,
+            size,
+            0,
+            &mut Vec::new(),
+            &mut |tuple| {
+                let mut requested = Vec::new();
+                for &block in tuple {
+                    requested.extend(plan.blocks[block].columns.clone());
+                }
+                requested.sort_unstable();
+                requested.dedup();
+                let (codes, buckets) = projection_block_from_development(
+                    development,
+                    &index,
+                    conditions,
+                    &requested,
+                    signals,
+                    lowered_bindings,
+                )?;
+                for (&expiry, outcome) in &outcome_rows {
+                    let duration =
+                        i64::from(development.outcome.rule.expiry_seconds[expiry]) * 1_000_000;
+                    let mut split_mask = mask.clone();
+                    for (flag, &entry) in split_mask.iter_mut().zip(&outcome.decision_ms) {
+                        if entry == i64::MIN {
+                            *flag = 0;
+                        }
+                    }
+                    let mut ordered: Vec<i64> = (0..rows as i64).collect();
+                    ordered.sort_by_key(|&row| (outcome.decision_ms[row as usize], row));
+                    let mut offsets = vec![0_i32];
+                    let mut sparse_rows = Vec::new();
+                    for (column, &bucket) in buckets.iter().enumerate() {
+                        for &row in &ordered {
+                            if codes[column * rows + row as usize] == bucket {
+                                sparse_rows.push(
+                                    i32::try_from(row).map_err(|_| "sparse row exceeds i32")?,
+                                );
+                            }
+                        }
+                        offsets.push(
+                            i32::try_from(sparse_rows.len())
+                                .map_err(|_| "sparse row list exceeds i32")?,
+                        );
+                    }
+                    let buffers = kernels::SearchBuffers {
+                        feature_codes: &codes,
+                        feature_count: i32::try_from(requested.len())
+                            .map_err(|_| "requested column count exceeds i32")?,
+                        row_count: rows as i32,
+                        ordered_rows: &ordered,
+                        decision_time_ms: &outcome.decision_ms,
+                        release_time_ms: &outcome.release_ms,
+                        settlement_time_ms: &outcome.release_ms,
+                        valid: &outcome.valid,
+                        buy_win: &outcome.buy_win,
+                        sell_win: &outcome.sell_win,
+                        tie: &outcome.tie,
+                    };
+                    let keys = kernels::SparseKeys {
+                        key_chrono_offsets: &offsets,
+                        key_chrono_rows: &sparse_rows,
+                    };
+                    let apply =
+                        |scored: Vec<(u64, RawCounts, RawCounts)>,
+                         records: &mut [search::CompactMember]| {
+                            for (global, buy, sell) in scored {
+                                for (contract, &column) in expiries.iter().enumerate() {
+                                    if column == expiry {
+                                        let at = usize::try_from(global).expect("bounded rank")
+                                            + contract;
+                                        records[at].raw =
+                                            match settings.contracts[contract].direction {
+                                                binary_alpha_engine::execution::Direction::Buy => {
+                                                    buy.clone()
+                                                }
+                                                binary_alpha_engine::execution::Direction::Sell => {
+                                                    sell.clone()
+                                                }
+                                            };
+                                    }
+                                }
+                            }
+                        };
+                    if backends.len() == 1 && matches!(backends[0], Backend::Cpu) {
+                        let workspace =
+                            kernels::CpuSparseTuple::new(buffers, &[&split_mask], keys)?;
+                        tuple_batches(
+                            &plan.blocks,
+                            tuple,
+                            &requested,
+                            &buckets,
+                            &offsets,
+                            conditions.len(),
+                            settings,
+                            |group| {
+                                let batches: Vec<_> = group
+                                    .iter()
+                                    .map(|batch| CpuBatch {
+                                        global_indices: &batch.globals,
+                                        candidates: batch.candidates(),
+                                        driver_keys: &batch.drivers,
+                                    })
+                                    .collect();
+                                let scored =
+                                    score_cpu_batches(&workspace, &batches, 0, duration, 0)?;
+                                apply(scored, &mut records);
+                                Ok(())
+                            },
+                        )?;
+                    } else {
+                        #[cfg(feature = "cuda")]
+                        {
+                            let workspaces: Vec<_> = backends
+                                .iter()
+                                .map(|backend| match backend {
+                                    Backend::Cuda(device) => {
+                                        device.search_tuple_workspace(buffers, &[&split_mask], keys)
+                                    }
+                                    Backend::Cpu => Err("mixed CPU and CUDA search devices".into()),
+                                })
+                                .collect::<Result<_, String>>()?;
+                            for workspace in &workspaces {
+                                add(&mut clock.device, workspace.timings);
+                            }
+                            tuple_batches(
+                                &plan.blocks,
+                                tuple,
+                                &requested,
+                                &buckets,
+                                &offsets,
+                                conditions.len(),
+                                settings,
+                                |group| {
+                                    let mut scored = Vec::new();
+                                    let schedule = kernels::schedule_batches_from(
+                                        &[group.len()],
+                                        workspaces.len(),
+                                        next_device,
+                                    )?;
+                                    next_device += group.len();
+                                    for (batch, assignment) in group.iter().zip(schedule) {
+                                        let device = assignment.device;
+                                        let uploaded = workspaces[device]
+                                            .upload_batch(batch.candidates(), &batch.drivers)?;
+                                        add(&mut clock.device, uploaded.timings);
+                                        let output = uploaded.score_sparse_dual(0, duration, 0)?;
+                                        add(&mut clock.device, output.timings);
+                                        for (position, &global) in batch.globals.iter().enumerate()
+                                        {
+                                            scored.push((
+                                                global,
+                                                raw_at(&output.output.buy_output, position),
+                                                raw_at(&output.output.sell_output, position),
+                                            ));
+                                        }
+                                    }
+                                    apply(scored, &mut records);
+                                    Ok(())
+                                },
+                            )?;
+                        }
+                        #[cfg(not(feature = "cuda"))]
+                        return Err("CUDA screening requires the cuda feature".into());
+                    }
+                }
+                Ok(())
+            },
+        )?;
+    }
+    Ok(records)
+}
+
 /// The expiry column of every configured contract in the bound outcome generation.
 fn expiry_columns(settings: &Search, development: &Development) -> Result<Vec<usize>, String> {
     settings
@@ -1362,6 +1812,83 @@ fn chunk_members(
         .collect()
 }
 
+fn streamed_member(
+    global: u64,
+    settings: &Search,
+    plan_identity: &str,
+    conditions: &[binary_alpha_engine::execution::Condition],
+) -> Result<Member, String> {
+    let (selected, contract) = search::member_unrank(
+        conditions.len(),
+        settings.min_conditions as usize,
+        settings.max_conditions as usize,
+        settings.contracts.len(),
+        global,
+    )
+    .ok_or_else(|| format!("global member {global} is outside the resolved family"))?;
+    let strategy = search::strategy(
+        "",
+        plan_identity,
+        settings.base_stream,
+        conditions,
+        &selected,
+    );
+    Ok(Member {
+        global_index: Some(global),
+        logic_identity: signal_logic_identity(&strategy),
+        conditions: strategy.conditions,
+        contract: settings.contracts[contract].id.clone(),
+        raw: RawCounts::default(),
+        null: None,
+        inapplicable: None,
+        score: None,
+        adjusted: None,
+        screened: None,
+        development: None,
+        rejected: None,
+        rank: None,
+        evaluation: None,
+        evaluation_splits: BTreeMap::new(),
+        stability: BTreeMap::new(),
+    })
+}
+
+fn chunk_members_streamed(
+    bindings: &[String],
+    settings: &Search,
+    plan_identity: &str,
+    conditions: &[binary_alpha_engine::execution::Condition],
+) -> Result<Vec<ChunkMember>, String> {
+    bindings
+        .iter()
+        .map(|id| {
+            let global: u64 = id
+                .strip_prefix('m')
+                .and_then(|index| index.parse().ok())
+                .ok_or_else(|| format!("chunk binding `{id}` is not a member"))?;
+            let (selected, contract) = search::member_unrank(
+                conditions.len(),
+                settings.min_conditions as usize,
+                settings.max_conditions as usize,
+                settings.contracts.len(),
+                global,
+            )
+            .ok_or_else(|| format!("chunk binding `{id}` is outside the resolved family"))?;
+            Ok((
+                id.clone(),
+                search::strategy(
+                    id,
+                    plan_identity,
+                    settings.base_stream,
+                    conditions,
+                    &selected,
+                ),
+                contract,
+            ))
+        })
+        .collect()
+}
+
 /// The run definition a published replay generation restored from: its first ledger record.
 fn restored_definition(
     events: &[FinancialEvent],
@@ -1393,7 +1920,7 @@ pub fn verify_family(
     Ok(format!(
         "verified search generation {} members {} applicable {} replayed {replayed} passed {} objects 1 bytes {family_bytes}",
         manifest.generation,
-        family.members.len(),
+        manifest.members,
         family.applicable,
         family
             .members
@@ -1464,7 +1991,7 @@ pub(crate) fn development_family(
             "{uri}: the family carries {what}; a portfolio universe reads development-only families"
         ));
     }
-    verify_read_family(uri, &store, &manifest, &family, access)?;
+    verify::run_with(uri, access)?;
     Ok((manifest, family))
 }
 
@@ -1490,7 +2017,12 @@ fn read_family(
     let family_bytes = read_object(store, &manifest.objects, FAMILY_OBJECT_PATH)?;
     let family = Family::from_json(&family_bytes)
         .map_err(|error| format!("{uri}: {FAMILY_OBJECT_PATH}: {error}"))?;
-    if family.members.len() as u64 != manifest.members {
+    if family.schema_version != manifest.schema_version {
+        return Err(format!("{uri}: family and manifest schema versions differ"));
+    }
+    if manifest.schema_version == search::FAMILY_SCHEMA_VERSION
+        && family.members.len() as u64 != manifest.members
+    {
         return Err(format!(
             "{uri}: the manifest records {} members but the family holds {}",
             manifest.members,
@@ -1505,6 +2037,28 @@ fn read_family(
     Ok((family, family_bytes.len()))
 }
 
+fn read_verified_chunk(
+    uri: &str,
+    store: &Store,
+    chunk: &ChunkRef,
+    access: Access<'_>,
+) -> Result<(ReplayManifest, Vec<FinancialEvent>), String> {
+    let chunk_key = manifest_key(&chunk.generation);
+    let mut bytes = Vec::new();
+    store.read_to(&chunk_key, None, &mut bytes)?;
+    let chunk_uri = store.uri(&chunk_key);
+    let chunk_manifest =
+        ReplayManifest::from_json(&bytes).map_err(|error| format!("{chunk_uri}: {error}"))?;
+    if chunk_manifest.summary_identity != chunk.summary_identity
+        || chunk_manifest.role.to_string() != chunk.role
+    {
+        return Err(format!("{uri}: {chunk_uri} is not the recorded chunk"));
+    }
+    replay::verify_replay(&chunk_uri, store, &chunk_key, &bytes, access)?;
+    let events = chunk_events(store, &chunk_manifest)?;
+    Ok((chunk_manifest, events))
+}
+
 /// Verifies a read family against its bound generations and every referenced replay, returning
 /// the number of members replayed on development data.
 fn verify_read_family(
@@ -1514,6 +2068,9 @@ fn verify_read_family(
     family: &Family,
     access: Access<'_>,
 ) -> Result<usize, String> {
+    if manifest.schema_version == search::STREAMED_FAMILY_SCHEMA_VERSION {
+        return verify_read_family_streamed(uri, store, manifest, family, access);
+    }
     let settings = &family.search;
     settings
         .validate()
@@ -1570,27 +2127,7 @@ fn verify_read_family(
     }
     // Every referenced replay restores through its verifier.
     let mut clock = Clock::default();
-    let read_chunk = |chunk: &ChunkRef| -> Result<(ReplayManifest, Vec<FinancialEvent>), String> {
-        let chunk_key = manifest_key(&chunk.generation);
-        let mut bytes = Vec::new();
-        store.read_to(&chunk_key, None, &mut bytes)?;
-        let chunk_uri = store.uri(&chunk_key);
-        let chunk_manifest =
-            ReplayManifest::from_json(&bytes).map_err(|error| format!("{chunk_uri}: {error}"))?;
-        // The manifest's own role and summary must be the recorded ones before any object of
-        // the chunk is opened. Reuse without simulation (the search's resume path) requires the
-        // recorded revision; a re-simulation under another revision that reproduces the
-        // identical generation is reused by the store, so verification restores every chunk and
-        // checks its definition regardless of the revision that first published it.
-        if chunk_manifest.summary_identity != chunk.summary_identity
-            || chunk_manifest.role.to_string() != chunk.role
-        {
-            return Err(format!("{uri}: {chunk_uri} is not the recorded chunk"));
-        }
-        replay::verify_replay(&chunk_uri, store, &chunk_key, &bytes, access)?;
-        let events = chunk_events(store, &chunk_manifest)?;
-        Ok((chunk_manifest, events))
-    };
+    let read_chunk = |chunk: &ChunkRef| read_verified_chunk(uri, store, chunk, access);
     let lowering = family
         .lowering
         .as_ref()
@@ -1755,12 +2292,319 @@ fn verify_read_family(
     Ok(replayed)
 }
 
+fn verify_read_family_streamed(
+    uri: &str,
+    store: &Store,
+    manifest: &FamilyManifest,
+    family: &Family,
+    access: Access<'_>,
+) -> Result<usize, String> {
+    let settings = &family.search;
+    settings
+        .validate()
+        .map_err(|reason| format!("{uri}: search.{reason}"))?;
+    let development = bind_development(settings, access)?;
+    if family.plan_identity != development.plan_identity
+        || family.base_stream != settings.base_stream
+    {
+        return Err(format!(
+            "{uri}: bound development plan differs from the family"
+        ));
+    }
+    let resolved = search::resolve_conditions(settings, &development.bound.plan)?;
+    if family.resolved_conditions.as_ref() != Some(&resolved.conditions)
+        || family.resolved_hash.as_ref() != Some(&resolved.hash)
+        || manifest.members != resolved.members
+    {
+        return Err(format!(
+            "{uri}: resolved rules, hash, or enumerated count differs from the fitted development plan"
+        ));
+    }
+    let mut inputs = vec![development.input.clone()];
+    if resolved.members > 0 && settings.evaluation.is_some() {
+        inputs.push(bind_evaluation(settings, &development, access)?);
+    }
+    if manifest.inputs != inputs {
+        return Err(format!(
+            "{uri}: manifest inputs are not the bound generations"
+        ));
+    }
+    let conditions = &resolved.conditions;
+    let lowered_indices: Vec<usize> = conditions
+        .iter()
+        .enumerate()
+        .filter_map(|(index, condition)| {
+            projected_bucket(&development.bound.plan, condition)
+                .is_none()
+                .then_some(index)
+        })
+        .collect();
+    let lowered_conditions: Vec<_> = lowered_indices
+        .iter()
+        .map(|&index| conditions[index].clone())
+        .collect();
+    let lowered_bindings: BTreeMap<usize, String> = lowered_indices
+        .iter()
+        .enumerate()
+        .map(|(local, &global)| (global, format!("c{local}")))
+        .collect();
+    let lowering_events = match (
+        &family.lowering,
+        lowered_conditions.is_empty() || resolved.members == 0,
+    ) {
+        (None, true) => Vec::new(),
+        (Some(_), true) | (None, false) => {
+            return Err(format!(
+                "{uri}: lowering reference does not match the lowered conditions"
+            ));
+        }
+        (Some(lowering), false) => {
+            let (_, events) = read_verified_chunk(uri, store, lowering, access)?;
+            let table = search::lowering_replay_for(
+                settings,
+                &family.plan_identity,
+                &development.instrument,
+                &lowered_conditions,
+            );
+            if restored_definition(&events)?.replay != table
+                || lowering.bindings
+                    != table
+                        .strategies
+                        .iter()
+                        .map(|strategy| strategy.id.clone())
+                        .collect::<Vec<_>>()
+            {
+                return Err(format!(
+                    "{uri}: lowering replay is not the table for its fallback conditions"
+                ));
+            }
+            events
+        }
+    };
+    let backends: Vec<Backend> = match access.verified.and_then(|cache| cache.devices()) {
+        Some(devices) => devices
+            .iter()
+            .map(|&ordinal| Backend::cuda(ordinal))
+            .collect::<Result<_, _>>()?,
+        None => vec![Backend::Cpu],
+    };
+    let mut clock = Clock::default();
+    let mut compact = if resolved.members == 0 {
+        Vec::new()
+    } else {
+        let scored = score_streamed(
+            settings,
+            &development,
+            conditions,
+            &lowering_events,
+            &lowered_bindings,
+            &backends,
+            access.verified.and_then(|cache| cache.devices()),
+            &mut clock,
+        )?;
+        if let Some(cache) = access.verified {
+            cache.note_family_rescore();
+        }
+        scored
+    };
+    let (applicable, survivors) =
+        search::screen_compact(&mut compact, &settings.contracts, settings.screen.as_ref());
+    if applicable != family.applicable
+        || survivors
+            != family
+                .members
+                .iter()
+                .map(|member| member.global_index.expect("schema-2 parsed member"))
+                .collect::<Vec<_>>()
+    {
+        return Err(format!(
+            "{uri}: applicable count or indexed survivors differ from full-family screening"
+        ));
+    }
+    let mut expected = family.members.clone();
+    for (member, &global) in expected.iter_mut().zip(&survivors) {
+        let identity = streamed_member(global, settings, &family.plan_identity, conditions)?;
+        if member.global_index != identity.global_index
+            || member.logic_identity != identity.logic_identity
+            || member.conditions != identity.conditions
+            || member.contract != identity.contract
+        {
+            return Err(format!(
+                "{uri}: member {global} is not the enumerated member"
+            ));
+        }
+        compact[global as usize].apply(
+            member,
+            &settings.contracts[global as usize % settings.contracts.len()],
+            settings.screen.as_ref(),
+        );
+    }
+    let currency = settings.account.currency.to_string();
+    search::rank(&mut expected, &settings.gates, &currency);
+    for (member, expected) in family.members.iter().zip(&expected) {
+        if member != expected {
+            return Err(format!(
+                "{uri}: member {} records counts, scores, screen, gate, or rank the family does not produce",
+                member.global_index.expect("schema-2 parsed member")
+            ));
+        }
+    }
+    let mut seen: BTreeMap<(String, String), ()> = BTreeMap::new();
+    let mut replayed = 0;
+    for chunk in &family.chunks {
+        let (chunk_manifest, events) = read_verified_chunk(uri, store, chunk, access)?;
+        let members =
+            chunk_members_streamed(&chunk.bindings, settings, &family.plan_identity, conditions)?;
+        let (role, window) = match chunk.role.as_str() {
+            "development" => (DatasetRole::Development, &settings.development),
+            "evaluation" => (
+                DatasetRole::Evaluation,
+                settings
+                    .evaluation
+                    .as_ref()
+                    .ok_or_else(|| format!("{uri}: evaluation chunk without window"))?,
+            ),
+            other => return Err(format!("{uri}: chunk role `{other}`")),
+        };
+        let table = search::replay_table(
+            settings,
+            role,
+            window,
+            &development.instrument,
+            &members,
+            settings.account.initial_cash,
+        );
+        if restored_definition(&events)?.replay != table {
+            return Err(format!(
+                "{uri}: chunk {} is not the table synthesized for its recorded members",
+                chunk.generation
+            ));
+        }
+        let summary = Summary::from_json(&read_object(
+            store,
+            &chunk_manifest.objects,
+            SUMMARY_OBJECT_PATH,
+        )?)
+        .map_err(|error| format!("{uri}: {}: {error}", chunk.generation))?;
+        let splits = if role == DatasetRole::Evaluation {
+            search::project_splits(events.iter().cloned(), &currency)
+        } else {
+            BTreeMap::new()
+        };
+        for (id, _, _) in &members {
+            let global: u64 = id[1..].parse().expect("checked");
+            let position = survivors
+                .binary_search(&global)
+                .map_err(|_| format!("{uri}: chunk replays screened member {global}"))?;
+            if seen.insert((id.clone(), chunk.role.clone()), ()).is_some() {
+                return Err(format!(
+                    "{uri}: member {global} is replayed twice for {}",
+                    chunk.role
+                ));
+            }
+            let member = &family.members[position];
+            let group = summary.strategies.get(id).cloned().unwrap_or_default();
+            let matches = if role == DatasetRole::Development {
+                replayed += 1;
+                member.development.as_ref() == Some(&group)
+            } else {
+                member.evaluation.as_ref() == Some(&group)
+                    && member.evaluation_splits == splits.get(id).cloned().unwrap_or_default()
+            };
+            if !matches {
+                return Err(format!(
+                    "{uri}: member {global} records groups its replay does not hold"
+                ));
+            }
+            if member.rank.is_some() {
+                let series = settled_profits(&events, id, settings.account.scale);
+                let stability =
+                    resample(&Backend::Cpu, settings, member, role, &series, &mut clock)?;
+                if member.stability.get(&chunk.role) != Some(&stability) {
+                    return Err(format!(
+                        "{uri}: member {global} records stability its settlements do not produce"
+                    ));
+                }
+            }
+        }
+    }
+    for member in &family.members {
+        let global = member.global_index.expect("schema-2 parsed member");
+        let id = format!("m{global}");
+        let development_seen = seen.contains_key(&(id.clone(), "development".into()));
+        let evaluation_seen = seen.contains_key(&(id, "evaluation".into()));
+        let evaluation_expected = member.rank.is_some() && settings.evaluation.is_some();
+        let roles: Vec<&str> = member.stability.keys().map(String::as_str).collect();
+        let expected_roles: &[&str] = match (member.rank.is_some(), evaluation_expected) {
+            (true, true) => &["development", "evaluation"],
+            (true, false) => &["development"],
+            _ => &[],
+        };
+        if !development_seen
+            || member.development.is_none()
+            || evaluation_seen != evaluation_expected
+            || member.evaluation.is_some() != evaluation_expected
+            || (!member.evaluation_splits.is_empty() && !evaluation_expected)
+            || roles != expected_roles
+        {
+            return Err(format!(
+                "{uri}: member {global} is not replayed and resampled exactly as its status requires"
+            ));
+        }
+    }
+    Ok(replayed)
+}
+
 #[cfg(test)]
 mod projection_tests {
     use super::*;
     use binary_alpha_engine::config::StreamKey;
     use binary_alpha_engine::execution::{Comparator, Condition, Threshold};
     use binary_alpha_engine::features::{FittedEncoding, ProjectionKind};
+
+    #[test]
+    fn wide_block_tuples_visit_only_feasible_combinations() {
+        let blocks: Vec<_> = (0..100)
+            .map(|column| kernels::ColumnBlock {
+                columns: column..column + 1,
+                row_list_len: 0,
+            })
+            .collect();
+        let suffix_capacity: Vec<_> = (0..=100).map(|block| 100 - block).collect();
+        let mut visited = 0;
+        visit_block_tuples(
+            &blocks,
+            &suffix_capacity,
+            99,
+            0,
+            &mut Vec::new(),
+            &mut |tuple| {
+                assert_eq!(tuple.len(), 99);
+                assert!(tuple.windows(2).all(|pair| pair[0] < pair[1]));
+                visited += 1;
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(visited, 100);
+    }
+
+    fn legacy_plan() -> binary_alpha_engine::features::FeaturePlan {
+        let root =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/legacy_schema1/published");
+        let manifest: binary_alpha_engine::features::FeatureManifest = serde_json::from_slice(
+            &fs::read(root.join("manifests/a7ccab4e17b84ad665de5b29c9ccbca10df2b926d7dfe7a3c4987267092f8f29/ready.json")).unwrap(),
+        ).unwrap();
+        let object = manifest
+            .objects
+            .iter()
+            .find(|object| object.path == "plan.json")
+            .unwrap();
+        binary_alpha_engine::features::FeaturePlan::from_json(
+            &fs::read(root.join(&object.key)).unwrap(),
+        )
+        .unwrap()
+    }
 
     #[test]
     fn cpu_batches_merge_by_global_member_index() {
@@ -1881,8 +2725,57 @@ mod projection_tests {
     }
 
     #[test]
+    fn projection_block_uses_latest_same_time_condition_row() {
+        let base = stream(5, 0);
+        let condition = stream(15, 5);
+        let mut plan = legacy_plan();
+        let mut condition_plan = plan.streams[0].clone();
+        condition_plan.duration_seconds = condition.duration_seconds;
+        condition_plan.offset_seconds = condition.offset_seconds;
+        condition_plan.encodings.push(FittedEncoding {
+            output: "direction_encoded".into(),
+            input: "candle_direction".into(),
+            automatic: true,
+            encoding: ProjectionKind::Category,
+            edges: None,
+            input_divisor: 1.0,
+            labels: vec!["up".into(), "down".into()],
+        });
+        plan.streams.push(condition_plan);
+        let index = ProjectionIndex::from_clocks(
+            vec![base, condition],
+            vec![vec![(15, 20)], vec![(5, 5), (20, 20)]],
+            base,
+            vec![20],
+        )
+        .unwrap();
+        // Both condition rows carry the retained label. The paired engine parity case
+        // `later close replaces earlier` proves replay rejects this same condition and clock.
+        let condition = Condition {
+            stream: condition,
+            output: "direction_encoded".into(),
+            comparator: Comparator::Eq,
+            threshold: Threshold::Text("up".into()),
+        };
+        let (codes, buckets) = projection_block(
+            &plan,
+            &index,
+            &[condition],
+            &[0],
+            &[],
+            &BTreeMap::new(),
+            |_| Ok(vec![0, 0]),
+        )
+        .unwrap();
+        assert_eq!(index.latest(0, 1), Some(1));
+        assert_eq!(codes, [-1]);
+        assert_eq!(buckets, [0]);
+        assert_eq!(index.slot_mask(20, 21), [1]);
+    }
+
+    #[test]
     fn retained_fitted_label_projects_and_dropped_label_uses_lowering() {
-        let mut plan = binary_alpha_engine::features::FeaturePlan::from_json(include_bytes!("../tests/fixtures/legacy_schema1/published/objects/25fc908bd6027d9d562ad39cf1d04c8dc013081ae69b6df40edfa54bba820308")).unwrap();
+        let mut plan = legacy_plan();
         let stream = plan.streams[0].key();
         plan.streams[0].encodings.push(FittedEncoding {
             output: "direction_encoded".into(),
@@ -1972,10 +2865,18 @@ mod projection_tests {
             },
         };
         let index = projection_index(&development).unwrap();
-        let event_bytes = fs::read(
-            root.join("objects/100919c6323ae3b3a009aafe0b98a64a749762a5c4f25b3a8652cfb2741d170e"),
-        )
-        .unwrap();
+        let family =
+            Family::from_json(&fs::read(root.join(&family_manifest.objects[0].key)).unwrap())
+                .unwrap();
+        let lowering = family.lowering.as_ref().unwrap();
+        let lowering_manifest: ReplayManifest =
+            serde_json::from_slice(&manifest(&lowering.generation)).unwrap();
+        let events_object = lowering_manifest
+            .objects
+            .iter()
+            .find(|object| object.path == EVENTS_OBJECT_PATH)
+            .unwrap();
+        let event_bytes = fs::read(root.join(&events_object.key)).unwrap();
         let signals: Vec<FinancialEvent> = event_bytes
             .split(|&byte| byte == b'\n')
             .filter(|line| !line.is_empty())
@@ -1997,7 +2898,7 @@ mod projection_tests {
         ];
         let mut bindings = BTreeMap::new();
         bindings.insert(1, "c1".into());
-        let (codes, buckets) = projection_block(
+        let (codes, buckets) = projection_block_from_development(
             &development,
             &index,
             &conditions,

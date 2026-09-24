@@ -219,6 +219,7 @@ struct Study<'a> {
     identity: String,
     governance: Store,
     generation: String,
+    verified: binary_alpha_engine::research::Verified,
 }
 
 impl Study<'_> {
@@ -226,7 +227,7 @@ impl Study<'_> {
         Access {
             declaration: Some(&self.declaration),
             certification: None,
-            verified: None,
+            verified: Some(&self.verified),
         }
     }
 
@@ -548,6 +549,7 @@ fn bind(config: &Config) -> Result<Study<'_>, String> {
         identity,
         governance,
         generation,
+        verified: crate::verification_cache(Some(config)),
     })
 }
 
@@ -1228,7 +1230,7 @@ fn certify(
     let access = Access {
         declaration: Some(&study.declaration),
         certification: Some(&certification),
-        verified: None,
+        verified: Some(&study.verified),
     };
 
     // A completed result under this grant is terminal: verify it in context and return.

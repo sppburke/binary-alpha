@@ -131,11 +131,20 @@ pub fn schedule_batches(
     tuple_batch_counts: &[usize],
     devices: usize,
 ) -> Result<Vec<BatchAssignment>, String> {
+    schedule_batches_from(tuple_batch_counts, devices, 0)
+}
+
+/// Continue a deterministic round robin across bounded groups of streamed batches.
+pub fn schedule_batches_from(
+    tuple_batch_counts: &[usize],
+    devices: usize,
+    first_device: usize,
+) -> Result<Vec<BatchAssignment>, String> {
     if devices == 0 {
         return Err("batch schedule: no devices".into());
     }
     let mut assignments = Vec::new();
-    let mut next_device = 0;
+    let mut next_device = first_device % devices;
     for (tuple, &count) in tuple_batch_counts.iter().enumerate() {
         for batch in 0..count {
             assignments.push(BatchAssignment {

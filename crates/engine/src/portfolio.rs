@@ -26,6 +26,7 @@ use crate::search::Family;
 /// The manifest kind of a published selection.
 pub const SELECTION_MANIFEST_KIND: &str = "portfolio_selection";
 pub const SELECTION_SCHEMA_VERSION: u32 = 1;
+pub const STREAMED_SELECTION_SCHEMA_VERSION: u32 = 2;
 /// The one object of a selection generation.
 pub const SELECTION_OBJECT_PATH: &str = "selection.json";
 /// The plan identity prefix of a strategy's logical form, before a fold resolves it: the
@@ -435,7 +436,18 @@ pub fn logical_members(
         .enumerate()
         .map(|(index, base)| {
             let family = &families[base.family];
-            let member = family.members.get(base.member).ok_or_else(|| {
+            let member = (if family.schema_version == 2 {
+                family
+                    .members
+                    .binary_search_by_key(&(base.member as u64), |member| {
+                        member.global_index.expect("checked schema-2 family")
+                    })
+                    .ok()
+                    .and_then(|position| family.members.get(position))
+            } else {
+                family.members.get(base.member)
+            })
+            .ok_or_else(|| {
                 format!(
                     "members[{index}].member: {} is not a member of family {}, which holds {}",
                     base.member,
@@ -1090,6 +1102,9 @@ pub fn rank(
 /// is excluded from the universe by configuration, never by a search rank, score, or screen.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub struct SourceMember {
+    /// The declared source's global family index in schema 2; absent in schema 1.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub global_index: Option<u64>,
     pub logic_identity: String,
     pub contract: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -1162,6 +1177,11 @@ impl State {
 /// hash the manifest binds, then everything the procedure computed.
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 pub struct Selection {
+    #[serde(
+        default = "selection_schema_one",
+        skip_serializing_if = "selection_is_schema_one"
+    )]
+    pub schema_version: u32,
     pub config: Config,
     pub families: Vec<FamilyRecord>,
     pub members: Vec<LogicalMember>,
@@ -1191,8 +1211,22 @@ impl Selection {
     }
 
     pub fn from_json(bytes: &[u8]) -> Result<Self, String> {
-        serde_json::from_slice(bytes).map_err(|error| error.to_string())
+        let selection: Self = serde_json::from_slice(bytes).map_err(|error| error.to_string())?;
+        if !matches!(selection.schema_version, 1 | 2) {
+            return Err(format!(
+                "unsupported selection schema_version {}",
+                selection.schema_version
+            ));
+        }
+        Ok(selection)
     }
+}
+
+fn selection_schema_one() -> u32 {
+    1
+}
+fn selection_is_schema_one(version: &u32) -> bool {
+    *version == 1
 }
 
 /// The ready manifest of a selection generation.
@@ -1223,9 +1257,12 @@ impl SelectionManifest {
                 manifest.kind
             ));
         }
-        if manifest.schema_version != SELECTION_SCHEMA_VERSION {
+        if !matches!(
+            manifest.schema_version,
+            SELECTION_SCHEMA_VERSION | STREAMED_SELECTION_SCHEMA_VERSION
+        ) {
             return Err(format!(
-                "unsupported schema_version {}, expected {SELECTION_SCHEMA_VERSION}",
+                "unsupported schema_version {}, expected 1 or 2",
                 manifest.schema_version
             ));
         }

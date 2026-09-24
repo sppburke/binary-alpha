@@ -10,9 +10,14 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant, SystemTime};
 
-use binary_alpha_engine::config::{Config, ManifestUri, ReplayScenario};
+use binary_alpha_engine::config::{
+    Config, EncodingSpec, Encodings, GeneratedSearchCondition, ManifestUri, ReplayScenario,
+    SearchCondition, StreamKey,
+};
 use binary_alpha_engine::dataset::{DatasetRole, GenerationManifest, manifest_key};
-use binary_alpha_engine::execution::{Decimal, EventKind, FinancialEvent, Summary, Threshold};
+use binary_alpha_engine::execution::{
+    Comparator, Decimal, EventKind, FinancialEvent, Summary, Threshold,
+};
 use binary_alpha_engine::features::{FeatureManifest, FeaturePlan};
 use binary_alpha_engine::portfolio::{Selection, State};
 use binary_alpha_engine::research::{
@@ -583,6 +588,73 @@ fn joint(
 #[test]
 fn research_run_freezes_awaits_and_certifies() {
     assert_research_certifies(Fixture::new("phase11_complete"));
+}
+
+#[test]
+fn five_stream_generated_search_publishes_and_verifies_in_research() {
+    let mut fixture = Fixture::new("phase11_generated_five_streams");
+    let streams: Vec<_> = [20, 40, 60, 80, 100]
+        .into_iter()
+        .map(|duration_seconds| StreamKey {
+            duration_seconds,
+            offset_seconds: 0,
+        })
+        .collect();
+    for instrument in &mut fixture.config.instruments {
+        let candle = instrument.candles[0].clone();
+        instrument.candles = streams
+            .iter()
+            .map(|stream| binary_alpha_engine::config::CandleSpec {
+                duration_seconds: stream.duration_seconds,
+                offset_seconds: stream.offset_seconds,
+                ..candle.clone()
+            })
+            .collect();
+    }
+    for instrument in &mut fixture.config.research.as_mut().unwrap().instruments {
+        instrument.features.streams = Some(streams.clone());
+        instrument.features.encodings = Some(Encodings {
+            max_labels: 8,
+            outputs: vec![EncodingSpec {
+                output: "all_supported".into(),
+                bins: None,
+            }],
+        });
+        instrument.search.conditions = streams
+            .iter()
+            .map(|&stream| {
+                SearchCondition::Generate(GeneratedSearchCondition {
+                    stream,
+                    output: "*".into(),
+                    comparator: Comparator::Eq,
+                })
+            })
+            .collect();
+    }
+    fixture.save();
+    let report = fixture.run().unwrap();
+    let (_, run) = fixture.run_record();
+    assert_eq!(run.instruments.len(), 2, "{report}");
+    for instrument in &run.instruments {
+        let family = Family::from_json(&fixture.object(&instrument.family, "family.json")).unwrap();
+        assert_eq!(family.schema_version, 2);
+        assert_eq!(family.search.conditions.len(), 5);
+        assert_eq!(family.resolved_conditions.as_ref().unwrap().len(), 8);
+        assert!(family.lowering.is_none());
+        assert_eq!(family.members.len(), 8);
+        assert!(
+            family
+                .members
+                .iter()
+                .all(|member| member.global_index.is_some())
+        );
+        assert!(
+            fixture
+                .verify(&instrument.family)
+                .unwrap()
+                .contains("verified search generation")
+        );
+    }
 }
 
 #[test]

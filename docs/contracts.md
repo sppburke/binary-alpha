@@ -2129,13 +2129,14 @@ expected return.
 The optional `search` table declares, in canonical order: `scope` (`exhaustive` replays every
 member; `heuristic` requires `screen` and replays only members it keeps), `seed`, positive
 `chunk_size` and `max_candidates`, `min_conditions` and `max_conditions` with
-`1 <= min <= max <= distinct conditions`, non-negative `embargo_micros` at least every
+`1 <= min <= max`, non-negative `embargo_micros` at least every
 contract's `duration_micros + settlement.max_settlement_delay_micros`, `base_stream`,
 `development` and optional `evaluation` (each a `decision_start`, `decision_end`, exactly one
 `inputs` entry as in `replay`, and optional `splits`, no evaluation split named `none`; the development input
 must name its `outcome_manifest`; `evaluation.decision_start - development.decision_end` must be
-at least the embargo), a nonempty `conditions` menu (each entry a `stream`, `output`,
-`comparator` and nonempty ordered `thresholds`), the `contracts` (existing contract terms with
+at least the embargo), a nonempty `conditions` menu (a named entry has a `stream`, `output`,
+`comparator` and nonempty ordered `thresholds`; a generation rule has a `stream`,
+`output = "*"`, `comparator = "eq"` and no `thresholds`), the `contracts` (existing contract terms with
 unique ids, no two agreeing in every field but their id, and every duration a whole number of
 seconds among the bound outcome generation's expiries), the `account` template (`broker`,
 `currency`, `scale`, `initial_cash`), one `risk_policy` (existing fields; `max_open_per_duration`,
@@ -2148,15 +2149,25 @@ existing configuration identity; the `accelerator` table selects the backend, `c
 
 ### Stages and identities
 
-The menu expands to distinct conditions in menu order. Candidates are every combination of
-`min_conditions..=max_conditions` conditions in increasing count then lexicographic index order,
-deduplicated by signal-logic identity (the first combination keeps it). A member is one candidate
-paired with one contract in configured order; members keep their zero-based global index
-`m{index}` everywhere. The family size is computed with checked arithmetic before any allocation.
+After binding the fitted development plan, each generation rule expands in plan order to every
+retained, coded label of each encoding on its stream with at least two labels. It skips unready
+labels and encodings whose output name collides with a raw output. Named thresholds and generated
+conditions deduplicate in menu order. The ordered resolved table and its hash are stored beside
+the declared rules. Sizing uses the resolved condition count, checked binomial arithmetic and
+`max_candidates` before family allocation. If fewer than `min_conditions` remain, the schema-2
+family has zero enumerated and applicable members, no retained members, lowering or replay chunks;
+it does not open an optional evaluation input.
+Otherwise members enumerate by condition count, lexicographic condition indices and configured
+contracts fastest. Each member's zero-based global index binds its `m{index}` replay ID.
 
-Lowering runs one development replay whose strategies are one single-condition strategy per
-distinct condition (`c{index}`), each on its own unfunded account with the first contract, the
-configured policy and envelope; each `signal` record marks a base row where that condition held.
+A fitted-label equality projects directly when it names a distinct-name encoding and its label
+is retained in the fitted plan. The projection uses the latest causally installed row per stream
+after all rows installed at the same time; a latest row closing after the base close yields no
+match, even if an older row matched. Readiness and the fitted code use the engine projection
+shared with `holds`. All other conditions, including equalities for dropped labels, use one
+development lowering replay with one unfunded single-condition strategy per fallback condition;
+each `signal` marks a base row where that condition held. Lowering is absent when all conditions
+project. The code matrix consists of requested projected encoding columns and lowered 0/1 columns.
 Every synthesized replay carries only the schema version, run mode, storage and its role's replay
 table (contracts in configured order, `max_rate_age_micros = 0`, no rates), so its generation is
 independent of backend and of the other role. The base rows are the base stream's reference rows
@@ -2164,10 +2175,17 @@ of the bound outcome generation; for each contract duration the device rows are 
 outcome reader's cell: a row without an entry tick is masked out, the decision clock is the entry
 tick time, `valid` is set only for `valid` cells, the outcome flags follow the cell, and the
 release clock is the settlement tick time when valid and the nominal due time otherwise. The
-basic dual kernel compares its clock arguments only, so they carry microsecond times unchanged
-under their retained `_ms` names; rows are ordered by decision time then index, the mask is one
-inside the development window, the equality bucket is one, `payout_basis` is zero, and columns
-zero to four (total, wins, losses, ties, invalid) are read.
+dual kernel compares its clock arguments only, so they carry microsecond times unchanged under
+their retained `_ms` names. Schema-2 slots use the base row's installation time inside the
+development window and require a stored entry tick at or after installation; rows without an
+entry are masked. The sparse scorer orders rows by stored entry time then row index, constructs
+chronological lists for each requested `(column, code)`, and drives each candidate by its least
+frequent condition while checking its whole conjunction. `payout_basis` is zero; columns zero to
+four give total, wins, losses, ties and invalid. A device free-memory budget determines column
+blocks, including row buffers, sparse lists and candidate/output allocations. Candidates stream
+by nondecreasing block tuple in bounded batches; global combinatorial ranks place their counts
+in the compact whole-family array. CUDA batches follow a deterministic round robin over every
+configured `[accelerator] devices` entry; CPU uses the same sparse scorer.
 
 The statistic of a member applies when `W = winning_net() >= 0`,
 `L = purchase() + loss.terminal_fee - loss.gross_return > 0`, and the tie nets exactly zero,
@@ -2179,7 +2197,9 @@ over the applicable members. Heuristic scope screens members whose adjusted valu
 `max_adjusted_score`, beyond the first `top` by adjusted value then order, and every inapplicable
 member; screened members are never replayed.
 
-Survivors are replayed in canonical chunks of `chunk_size`, one account, strategy and binding per
+Only retained survivors become schema-2 `Member` records, ordered by `global_index`; logic
+identities are computed for those members. Survivors are replayed in canonical chunks of
+`chunk_size`, one account, strategy and binding per
 member. A completed chunk generation is reused only after its own verifier restores it and its
 manifest records the same instruments, configuration hash and code revision. The development
 group of a member is its binding's summary group (a zero group when it never signalled); profit
@@ -2205,26 +2225,39 @@ two settlements or a horizon beyond them is `unavailable` with its reason.
 
 ### Family generations
 
-The family generation publishes one object, `family.json`: the resolved `search` table, the plan
+The family generation publishes one object, `family.json`: the declared `search` table, the plan
 identity and base stream, the SHA-256 identity of the retained kernel sources, the sampler
-version, the applicable count, every member (conditions, contract, logic identity, raw counts,
-null, applicability, score, adjusted value, screen reason, development group, gate reason, rank,
+version, the applicable count, the schema-2 resolved condition table and hash, and retained
+members (global index, conditions, contract, logic identity, raw counts, null, applicability,
+score, adjusted value, development group, gate reason, rank,
 evaluation group, evaluation split groups, stability outcomes), and the lowering and chunk
 generation references with their summary identities; pretty-printed JSON in declared field order
 with one trailing newline, and identical on every backend. The ready manifest records `kind`
-(`search_family`), `schema_version` (`1`), `generation`, `config_hash`, `code_revision`, the
+(`search_family`), `schema_version` (`2` for new families, `1` for legacy readers),
+`generation`, `config_hash`, `code_revision`, the
 ordered `inputs` (role, instrument, tick, feature, plan and outcome identities), `members`, and
 `objects`. The generation is SHA-256 over `binary-alpha search family v1\n`, the configuration
 hash and the code revision each followed by a newline, then one line per input
 (`role instrument tick feature plan outcome`, a dash for an absent outcome) followed by a newline.
+The schema-2 manifest's `members` and the report's `members` count the complete enumerated
+family, including screened and inapplicable members; `Family.members.len()` counts retained
+survivors. Verification re-expands the recorded rules against the recorded fitted development
+plan, requires exact ordered equality with the resolved table, checks optional lowering against
+only fallback conditions, rebuilds projections, and re-scores every global member through the
+same sparse scorer. It recomputes applicability, exact BH adjustments, the survivor index set,
+gates and ranks, then verifies each retained member's replay chunks. A configured `data verify
+--config` uses its accelerator devices only for schema-2 re-scoring; without one it uses CPU
+batches fanned across cores. Within a command, successful full verification is cached by URI
+after the development-only role guard. Certified and ordinary contexts have separate cache keys;
+a separate command re-scores. Schema-1 families retain
+their full-member, full-lowering and close-time CPU verification path and remain readable.
+
 The command writes
 `search SCOPE generation GENERATION members M applicable A screened S replayed R passed P evaluated E objects 1`
 followed by the stage timings and peak resident memory or `(already published)`, then the
 verification line. `data verify` on a family generation validates the manifest and object,
-re-enumerates the members from the recorded table, restores every referenced replay through its
-verifier and checks its definition against the table synthesized for its recorded members,
-recomputes the raw counts through the central-processor kernel from the verified lowering records
-and the bound outcome objects, compares every group and split group with the verified summaries
+re-enumerates the family, restores every referenced replay through its verifier and checks its
+definition against the table synthesized for its recorded members, compares every group and split group with the verified summaries
 and the ledger projection, recomputes stability, applicability, scores, adjustments, screen
 decisions, gates and ranks, and writes
 `verified search generation GENERATION members M applicable A replayed R passed P objects 1 bytes B`.
@@ -2270,7 +2303,9 @@ alternative count, times the number of risk policies, must neither overflow nor 
 settlement delay; one contract identity names one contract, so identical terms may repeat under
 their identity while conflicting terms may not. Accounts, every alternative, every risk policy,
 the rates, the reporting contract and the first fold's window are validated by the execution rules
-before any choice is enumerated. Omitting the table preserves every existing configuration
+before any choice is enumerated. For schema-2 families, `member` names a retained global family
+index; an absent or screened index fails before folds. Schema-1 families use their all-member
+vector position. Omitting the table preserves every existing configuration
 identity.
 
 ### Stages and identities
@@ -2340,8 +2375,8 @@ passing choice the result is `no_feasible_policy` with no refit and no outer rea
 ### Selection generations
 
 The selection generation publishes one object, `selection.json`: the resolved configuration,
-whose content hash the manifest binds, every family (generation, plan identity, base stream and every source member with its logic
-identity, contract and the bases that declare it), the logical members, the declared, rejected,
+whose content hash the manifest binds, every family (generation, plan identity, base stream and
+source members with their logic identity, contract and declaring bases), the logical members, the declared, rejected,
 valid and passing counts, every fold's fit and assessment generations, every choice (subset,
 alternatives, risk policy, identity, structural rejection, fold results with their replay
 generation and summary identity, projection and inapplicability, aggregate profit and drawdown,
@@ -2349,7 +2384,8 @@ failure and rank), the selected index, the refit generations, the frozen policy,
 (feature generations, replay reference, projection and split groups) and the terminal `state`
 (`selected`, `no_feasible_policy`, `refit_inapplicable` with its reason, `outer_rejected` with its
 reason); only `selected` carries a deployable candidate, never a certification. The ready manifest
-records `kind` (`portfolio_selection`), `schema_version` (`1`), `generation`, `config_hash`,
+records `kind` (`portfolio_selection`), `schema_version` (`2` when any source family is schema 2,
+otherwise `1`), `generation`, `config_hash`,
 `code_revision`, the `families` generations, `state` and `objects`; the generation is SHA-256 over
 `binary-alpha portfolio selection v1\n`, the configuration hash, the code revision and every
 family generation, each followed by a newline, so extending a grid changes the identity even when
@@ -2357,9 +2393,12 @@ the winner is unchanged. The command writes
 `portfolio generation GENERATION declared D rejected R valid V passing P state S objects 1`
 followed by `[bind S folds S refit S publish S]` or `(already published)`, then the verification
 line. An interruption preserves every completed replay and feature generation and publishes no
-selection; the rerun reuses them and recomputes the rest. `data verify` on a selection checks
-the recorded configuration's hash against the manifest, re-reads the families through the
-development-only reader, re-enumerates the choices, identities and structural rejections,
+selection; the rerun reuses them and recomputes the rest. A schema-2 selection stores only
+declared source members, each keyed by its retained `global_index`; schema-1 selections retain
+their all-member source records and remain readable. `data verify` on a selection checks
+the recorded configuration's hash and schema against the manifest, re-reads the families through
+the development-only reader, checks every declared global source index, and re-enumerates the
+choices, identities and structural rejections,
 verifies every recorded fit, assessment, refit and outer feature generation through the feature
 verifier and re-resolves every configured fit through the feature owner against the recorded plan
 before its fit and against its cutoff, restores every recorded replay through its verifier and checks its definition against the table

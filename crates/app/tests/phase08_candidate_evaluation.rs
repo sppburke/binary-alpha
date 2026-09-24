@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 
 use binary_alpha_engine::execution::{Decimal, Summary};
 use binary_alpha_engine::market::format_event_time_micros;
+use binary_alpha_engine::research::{Access, Verified};
 use binary_alpha_engine::search::{Family, FamilyManifest, StabilityOutcome, family_generation_id};
 use common::current::import;
 use common::{Scratch, command, generation, read_table, verify, write_ticks};
@@ -29,6 +30,7 @@ struct Row {
     up: bool,
     wide: bool,
     outcome_up: bool,
+    range_units: Option<i64>,
 }
 
 /// Sixteen rows per feature-bit pair, interleaved by pair. The balanced control gives every
@@ -50,6 +52,7 @@ fn recipe(planted: bool) -> Vec<Row> {
                 up,
                 wide,
                 outcome_up: position < ups,
+                range_units: None,
             }
         })
         .collect()
@@ -89,8 +92,8 @@ fn ticks(base_ms: i64, rows: &[Row]) -> Vec<String> {
                             -2
                         }
                 }
-                (32, Some(row)) => BASIS + if row.wide { 12 } else { 4 },
-                (48, Some(row)) => BASIS - if row.wide { 12 } else { 4 },
+                (32, Some(row)) => BASIS + row.range_units.unwrap_or(if row.wide { 12 } else { 4 }),
+                (48, Some(row)) => BASIS - row.range_units.unwrap_or(if row.wide { 12 } else { 4 }),
                 (79, Some(row)) => BASIS + if row.up { 1 } else { -1 },
                 _ => BASIS + if step % 2 == 0 { 1 } else { -1 },
             };
@@ -131,10 +134,12 @@ fn publish_role(
         rows,
         frozen,
         "[\"candle_direction\", \"range_bps\"]",
+        "",
     )
 }
 
 /// `publish_role` with an explicit compiled-output list for a new development plan.
+#[allow(clippy::too_many_arguments)]
 fn publish_role_with(
     scratch: &Scratch,
     name: &str,
@@ -143,6 +148,7 @@ fn publish_role_with(
     rows: &[Row],
     frozen: Option<(&Path, &Path)>,
     outputs: &str,
+    encodings: &str,
 ) -> Role {
     let lines = ticks(base_ms, rows);
     write_ticks(
@@ -191,7 +197,7 @@ fn publish_role_with(
     };
     let settings = if frozen.is_none() {
         format!(
-            "streams = [{{ duration_seconds = 20, offset_seconds = 0 }}]\noutputs = {outputs}\n"
+            "streams = [{{ duration_seconds = 20, offset_seconds = 0 }}]\noutputs = {outputs}\n{encodings}"
         )
     } else {
         String::new()
@@ -289,6 +295,18 @@ fn search_table(spec: &SearchSpec<'_>) -> String {
         spec.screen,
         spec.horizon
     )
+}
+
+fn generated_table(spec: &SearchSpec<'_>, fallback: bool) -> String {
+    let mut table = search_table(spec);
+    let from = table.find("[[search.conditions]]").unwrap();
+    let to = table.find("[[search.contracts]]").unwrap();
+    let mut rules = "[[search.conditions]]\nstream = { duration_seconds = 20, offset_seconds = 0 }\noutput = \"*\"\ncomparator = \"eq\"\n".to_string();
+    if fallback {
+        rules.push_str("\n[[search.conditions]]\nstream = { duration_seconds = 20, offset_seconds = 0 }\noutput = \"candle_direction\"\ncomparator = \"eq\"\nthresholds = [\"up\"]\n");
+    }
+    table.replace_range(from..to, &rules);
+    table
 }
 
 /// Runs `search` and returns its report lines, the manifest path, and the published family.
@@ -494,6 +512,7 @@ fn candidate_search_publishes_verifies_and_resumes() {
         &recipe(true),
         None,
         "[\"candle_direction\"]",
+        "",
     );
     let fitted = publish_role(
         &scratch,
@@ -714,7 +733,7 @@ fn candidate_search_publishes_verifies_and_resumes() {
         "{error}"
     );
 
-    // Heuristic scope keeps the eliminated members, replays only survivors, and reports
+    // Heuristic scope publishes only survivors and reports
     // unavailable stability when the horizon exceeds the settlements.
     let (lines, heuristic_manifest, heuristic) = run_search(
         &scratch,
@@ -733,26 +752,11 @@ fn candidate_search_publishes_verifies_and_resumes() {
         "{}",
         lines[0]
     );
-    let screened: Vec<&binary_alpha_engine::search::Member> = heuristic
+    assert_eq!(heuristic.members.len(), 4);
+    let survivors: Vec<usize> = heuristic
         .members
         .iter()
-        .filter(|m| m.screened.is_some())
-        .collect();
-    assert_eq!(screened.len(), 36);
-    assert!(
-        screened
-            .iter()
-            .all(|m| m.development.is_none() && m.rank.is_none() && m.stability.is_empty())
-    );
-    assert!(
-        heuristic
-            .members
-            .iter()
-            .filter(|m| m.inapplicable.is_some())
-            .all(|m| m.screened.as_deref().unwrap().starts_with("inapplicable: "))
-    );
-    let survivors: Vec<usize> = (0..heuristic.members.len())
-        .filter(|&i| heuristic.members[i].screened.is_none())
+        .map(|member| member.global_index.unwrap() as usize)
         .collect();
     assert_eq!(
         survivors,
@@ -766,8 +770,7 @@ fn candidate_search_publishes_verifies_and_resumes() {
             .into_iter()
             .collect::<Vec<_>>()
     );
-    for &index in &survivors {
-        let member = &heuristic.members[index];
+    for member in &heuristic.members {
         assert!(
             (0.69..=0.70).contains(&member.adjusted.unwrap()),
             "{:?}",
@@ -856,8 +859,7 @@ fn candidate_search_publishes_verifies_and_resumes() {
     let again = command(&["search", "--config", config.to_str().unwrap()]).unwrap();
     assert!(again[0].ends_with("(already published)"), "{}", again[0]);
 
-    // Verification rejects a manifest whose family disagrees with its replay, and a member count
-    // that disagrees with the family.
+    // Verification rejects changed replay evidence and an enumerated family count.
     let manifest_path = heuristic_manifest.clone();
     let mut forged: Value = serde_json::from_slice(&family_bytes).unwrap();
     let index = forged["members"]
@@ -881,7 +883,7 @@ fn candidate_search_publishes_verifies_and_resumes() {
     .unwrap();
     let error = verify(&manifest_path).unwrap_err();
     assert!(
-        error.contains("records development groups its replay"),
+        error.contains("records groups its replay does not hold"),
         "{error}"
     );
     let mut short: Value = serde_json::from_slice(&manifest_before).unwrap();
@@ -889,7 +891,7 @@ fn candidate_search_publishes_verifies_and_resumes() {
     fs::write(&manifest_path, serde_json::to_vec_pretty(&short).unwrap()).unwrap();
     let error = verify(&manifest_path).unwrap_err();
     assert!(
-        error.contains("records 39 members but the family holds 40"),
+        error.contains("resolved rules, hash, or enumerated count"),
         "{error}"
     );
     // Forged provenance: an input identity that is not the bound generation, republished at the
@@ -909,16 +911,9 @@ fn candidate_search_publishes_verifies_and_resumes() {
     fs::write(&forged_path, forged_manifest.to_json()).unwrap();
     let error = verify(&forged_path).unwrap_err();
     assert!(error.contains("not the bound generations"), "{error}");
-    // A screened member with a fabricated development group is not verified evidence.
+    // Omitting a retained survivor is detected against the full-family screen.
     let mut fabricated: Value = serde_json::from_slice(&family_bytes).unwrap();
-    let screened = fabricated["members"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .position(|m| m["screened"].is_string())
-        .unwrap();
-    fabricated["members"][screened]["development"] =
-        fabricated["members"][index]["development"].clone();
+    fabricated["members"].as_array_mut().unwrap().remove(0);
     let fabricated = serde_json::to_vec_pretty(&fabricated).unwrap();
     let sha = sha256_hex(&fabricated);
     fs::write(
@@ -936,10 +931,7 @@ fn candidate_search_publishes_verifies_and_resumes() {
     )
     .unwrap();
     let error = verify(&manifest_path).unwrap_err();
-    assert!(
-        error.contains("is not replayed and resampled exactly as its status requires"),
-        "{error}"
-    );
+    assert!(error.contains("indexed survivors differ"), "{error}");
     // A family whose chunks vanished cannot verify even though every recorded field is intact.
     let mut missing: Value = serde_json::from_slice(&family_bytes).unwrap();
     missing["chunks"] = Value::Array(Vec::new());
@@ -960,8 +952,280 @@ fn candidate_search_publishes_verifies_and_resumes() {
         error.contains("is not replayed and resampled exactly as its status requires"),
         "{error}"
     );
+    let tamper = |family: Value| {
+        let bytes = serde_json::to_vec_pretty(&family).unwrap();
+        let sha = sha256_hex(&bytes);
+        fs::write(scratch.path(&format!("published/objects/{sha}")), &bytes).unwrap();
+        let mut manifest: Value = serde_json::from_slice(&manifest_before).unwrap();
+        manifest["objects"][0]["key"] = Value::from(format!("objects/{sha}"));
+        manifest["objects"][0]["sha256"] = Value::from(sha);
+        manifest["objects"][0]["bytes"] = Value::from(bytes.len());
+        fs::write(
+            &manifest_path,
+            serde_json::to_vec_pretty(&manifest).unwrap(),
+        )
+        .unwrap();
+        verify(&manifest_path).unwrap_err()
+    };
+    let mut omitted: Value = serde_json::from_slice(&family_bytes).unwrap();
+    omitted["resolved_conditions"].as_array_mut().unwrap().pop();
+    assert!(tamper(omitted).contains("resolved rules, hash, or enumerated count"));
+    let mut substituted: Value = serde_json::from_slice(&family_bytes).unwrap();
+    substituted["members"][0]["global_index"] = Value::from(0);
+    assert!(tamper(substituted).contains("indexed survivors differ"));
     fs::write(&manifest_path, &manifest_before).unwrap();
     assert!(verify(&manifest_path).is_ok());
+}
+
+#[test]
+fn generated_schema_two_search_projects_lowers_and_publishes_empty_family() {
+    let scratch = Scratch::new("phase08_generated");
+    let encodings = "encodings = { max_labels = 8, outputs = \"all_supported\" }\n";
+    let mut varied = recipe(true);
+    for (index, row) in varied.iter_mut().enumerate() {
+        row.range_units = Some(4 + (index % 5) as i64 * 2);
+    }
+    let role = publish_role_with(
+        &scratch,
+        "encoded",
+        "development",
+        BASE_DEV_MS,
+        &varied,
+        None,
+        "[\"candle_direction\", \"range_bps\"]",
+        encodings,
+    );
+    let spec = SearchSpec {
+        development: &role,
+        evaluation: None,
+        scope: "exhaustive",
+        screen: "",
+        horizon: 4,
+        extra_contracts: "",
+        policy_extra: "",
+        chunk_size: 8,
+    };
+    let (_, manifest, projected) = run_search(
+        &scratch,
+        "generated_projected.toml",
+        &generated_table(&spec, false),
+    );
+    assert_eq!(projected.schema_version, 2);
+    assert!(projected.lowering.is_none());
+    assert!(
+        projected
+            .resolved_conditions
+            .as_ref()
+            .unwrap()
+            .iter()
+            .any(|condition| { condition.output == "range_bps_auto_encoded" })
+    );
+    assert_eq!(
+        FamilyManifest::from_json(&fs::read(&manifest).unwrap())
+            .unwrap()
+            .members,
+        projected.members.len() as u64
+    );
+    assert!(verify(&manifest).is_ok());
+    #[cfg(feature = "cuda")]
+    {
+        let cuda_table = format!(
+            "{}\n[accelerator]\nbackend = \"cuda\"\ndevices = [0]\n",
+            generated_table(&spec, false)
+        );
+        let (_, cuda_manifest, cuda_family) =
+            run_search(&scratch, "generated_cuda.toml", &cuda_table);
+        assert_eq!(cuda_family.to_json(), projected.to_json());
+        let verified = command(&[
+            "data",
+            "verify",
+            "--config",
+            scratch.path("generated_cuda.toml").to_str().unwrap(),
+            "--manifest",
+            &manifest_uri(&cuda_manifest),
+        ])
+        .unwrap();
+        assert!(verified[0].starts_with("verified search generation "));
+        let duplicate_table = cuda_table.replace("devices = [0]", "devices = [0, 0]");
+        let (_, duplicate_manifest, duplicate_family) =
+            run_search(&scratch, "generated_duplicate_cuda.toml", &duplicate_table);
+        assert_eq!(duplicate_family.to_json(), projected.to_json());
+        assert!(
+            command(&[
+                "data",
+                "verify",
+                "--config",
+                scratch
+                    .path("generated_duplicate_cuda.toml")
+                    .to_str()
+                    .unwrap(),
+                "--manifest",
+                &manifest_uri(&duplicate_manifest),
+            ])
+            .is_ok()
+        );
+    }
+    let cached = Verified::default();
+    let uri = manifest_uri(&manifest);
+    let access = Access {
+        verified: Some(&cached),
+        ..Access::ORDINARY
+    };
+    binary_alpha_app::verify::run_with(&uri, access).unwrap();
+    binary_alpha_app::verify::run_with(&uri, access).unwrap();
+    assert_eq!(cached.family_rescores(), 1);
+    let independent = Verified::default();
+    binary_alpha_app::verify::run_with(
+        &uri,
+        Access {
+            verified: Some(&independent),
+            ..Access::ORDINARY
+        },
+    )
+    .unwrap();
+    assert_eq!(independent.family_rescores(), 1);
+    let verified = command(&[
+        "data",
+        "verify",
+        "--config",
+        scratch.path("generated_projected.toml").to_str().unwrap(),
+        "--manifest",
+        &uri,
+    ])
+    .unwrap();
+    assert!(verified[0].starts_with("verified search generation "));
+
+    let (_, lowered_manifest, mixed) = run_search(
+        &scratch,
+        "generated_mixed.toml",
+        &generated_table(&spec, true),
+    );
+    assert!(mixed.lowering.is_some());
+    assert!(verify(&lowered_manifest).is_ok());
+    let projected_up = projected
+        .members
+        .iter()
+        .find(|member| {
+            member.contract == "buy"
+                && member.conditions.len() == 1
+                && member.conditions[0].output == "candle_direction_auto_encoded"
+                && member.conditions[0].threshold
+                    == binary_alpha_engine::execution::Threshold::Text("up".into())
+        })
+        .unwrap();
+    let lowered_up = mixed
+        .members
+        .iter()
+        .find(|member| {
+            member.contract == "buy"
+                && member.conditions.len() == 1
+                && member.conditions[0].output == "candle_direction"
+        })
+        .unwrap();
+    assert_eq!(projected_up.raw, lowered_up.raw);
+    assert_eq!(projected_up.development, lowered_up.development);
+
+    let short = publish_role_with(
+        &scratch,
+        "short",
+        "development",
+        BASE_DEV_MS,
+        &recipe(true),
+        None,
+        "[\"candle_direction\", \"range_bps\"]",
+        "encodings = { max_labels = 1, outputs = \"all_supported\" }\n",
+    );
+    let short_spec = SearchSpec {
+        development: &short,
+        ..spec
+    };
+    let (_, empty_manifest, empty) = run_search(
+        &scratch,
+        "generated_empty.toml",
+        &generated_table(&short_spec, false),
+    );
+    assert!(empty.resolved_conditions.as_ref().unwrap().is_empty());
+    assert!(empty.members.is_empty() && empty.lowering.is_none() && empty.chunks.is_empty());
+    assert_eq!(
+        FamilyManifest::from_json(&fs::read(&empty_manifest).unwrap())
+            .unwrap()
+            .members,
+        0
+    );
+    assert!(verify(&empty_manifest).is_ok());
+    let unavailable_evaluation = Role {
+        tick: scratch.path(&format!("missing/manifests/{}/ready.json", "a".repeat(64))),
+        feature: scratch.path(&format!("missing/manifests/{}/ready.json", "b".repeat(64))),
+        outcome: None,
+    };
+    let empty_with_evaluation = SearchSpec {
+        evaluation: Some(&unavailable_evaluation),
+        ..short_spec
+    };
+    let (_, empty_evaluation_manifest, empty_evaluation) = run_search(
+        &scratch,
+        "generated_empty_with_evaluation.toml",
+        &generated_table(&empty_with_evaluation, false),
+    );
+    assert!(empty_evaluation.members.is_empty());
+    assert_eq!(
+        FamilyManifest::from_json(&fs::read(&empty_evaluation_manifest).unwrap())
+            .unwrap()
+            .inputs
+            .len(),
+        1
+    );
+    assert!(verify(&empty_evaluation_manifest).is_ok());
+    let (_, one_manifest, one) = run_search(
+        &scratch,
+        "generated_one.toml",
+        &generated_table(&short_spec, true),
+    );
+    assert_eq!(one.resolved_conditions.as_ref().unwrap().len(), 1);
+    assert_eq!(
+        FamilyManifest::from_json(&fs::read(&one_manifest).unwrap())
+            .unwrap()
+            .members,
+        2
+    );
+    assert!(verify(&one_manifest).is_ok());
+
+    let replace_rules = |mut table: String, output: &str| {
+        let from = table.find("[[search.conditions]]").unwrap();
+        let to = table.find("[[search.contracts]]").unwrap();
+        table.replace_range(from..to, &format!(
+            "[[search.conditions]]\nstream = {{ duration_seconds = 20, offset_seconds = 0 }}\noutput = \"{output}\"\ncomparator = \"eq\"\nthresholds = [\"down\", \"up\"]\n"
+        ));
+        table
+    };
+    let (_, dropped_manifest, dropped) = run_search(
+        &scratch,
+        "dropped_label.toml",
+        &replace_rules(search_table(&short_spec), "candle_direction_auto_encoded"),
+    );
+    let (_, raw_manifest, raw) = run_search(
+        &scratch,
+        "raw_labels.toml",
+        &replace_rules(search_table(&short_spec), "candle_direction"),
+    );
+    assert!(verify(&dropped_manifest).is_ok() && verify(&raw_manifest).is_ok());
+    assert!(dropped.lowering.is_some());
+    for label in ["down", "up"] {
+        let find = |family: &Family| {
+            let member = family
+                .members
+                .iter()
+                .find(|member| {
+                    member.contract == "buy"
+                        && member.conditions.len() == 1
+                        && member.conditions[0].threshold
+                            == binary_alpha_engine::execution::Threshold::Text(label.into())
+                })
+                .unwrap();
+            (member.raw.clone(), member.development.clone())
+        };
+        assert_eq!(find(&dropped), find(&raw), "{label}");
+    }
 }
 
 fn feature_rows_key(manifest: &Path) -> String {

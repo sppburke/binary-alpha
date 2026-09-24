@@ -25,7 +25,7 @@ use crate::market::parse_event_time_micros;
 /// The manifest kind of a published search family.
 pub const FAMILY_MANIFEST_KIND: &str = "search_family";
 pub const FAMILY_SCHEMA_VERSION: u32 = 1;
-/// Survivor-only family format; schema 1 remains the writer until search is switched over.
+/// Survivor-only family format written by search; schema 1 remains readable.
 pub const STREAMED_FAMILY_SCHEMA_VERSION: u32 = 2;
 /// The one object of a family generation.
 pub const FAMILY_OBJECT_PATH: &str = "family.json";
@@ -1470,7 +1470,7 @@ pub struct RawCounts {
     pub invalid: i64,
 }
 
-/// One member of the complete family and everything computed for it.
+/// One published member and everything computed for it.
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 pub struct Member {
     /// Schema-2 global family index; absent from schema-1 bytes.
@@ -1515,8 +1515,8 @@ pub struct ChunkRef {
     pub bindings: Vec<String>,
 }
 
-/// The complete family as published in `family.json`: the resolved search table, the bound
-/// plan, and every member with everything computed for it. Backend and timings stay outside.
+/// A published family: declared rules, the bound plan, and its member records. Schema 2 stores
+/// only retained members; backend and timings stay outside.
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 pub struct Family {
     /// Schema-2 marker; omitted from schema-1 JSON.
@@ -1709,6 +1709,35 @@ mod tests {
     use crate::execution::{
         Cashflow, Comparator, Direction, Settlement, SettlementRule, Threshold,
     };
+
+    fn legacy_manifest(generation: &str) -> Vec<u8> {
+        std::fs::read(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../app/tests/fixtures/legacy_schema1/published/manifests")
+                .join(generation)
+                .join("ready.json"),
+        )
+        .unwrap()
+    }
+
+    fn legacy_object(generation: &str, path: &str) -> Vec<u8> {
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&legacy_manifest(generation)).unwrap();
+        let key = manifest["objects"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|object| object["path"] == path)
+            .unwrap()["key"]
+            .as_str()
+            .unwrap();
+        std::fs::read(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../app/tests/fixtures/legacy_schema1/published")
+                .join(key),
+        )
+        .unwrap()
+    }
 
     fn decimal(text: &str) -> Decimal {
         Decimal::parse(text).unwrap()
@@ -1940,10 +1969,11 @@ mod tests {
 
     #[test]
     fn schema_two_empty_family_round_trips_without_changing_schema_one_bytes() {
-        let bytes = include_bytes!(
-            "../../app/tests/fixtures/legacy_schema1/published/objects/24e476f4f6bb8abbd2211c19ba7b0659762b682b299cb240ec6d40a694d51327"
+        let bytes = legacy_object(
+            "d7924115f6ec1c2219d5239081221020315db2bf998d950c10cb60d194c53f67",
+            "family.json",
         );
-        let original = Family::from_json(bytes).unwrap();
+        let original = Family::from_json(&bytes).unwrap();
         assert_eq!(original.schema_version, 1);
         assert_eq!(original.to_json(), bytes);
         let mut empty = original;
@@ -1966,10 +1996,9 @@ mod tests {
                 .unwrap_err()
                 .contains("empty family")
         );
-        let manifest_bytes = include_bytes!(
-            "../../app/tests/fixtures/legacy_schema1/published/manifests/73486072a7f59ab1df2e6f2f2b704454759ec5c23ff977b874b58c0f3fd180d7/ready.json"
-        );
-        let mut manifest = FamilyManifest::from_json(manifest_bytes).unwrap();
+        let manifest_bytes =
+            legacy_manifest("73486072a7f59ab1df2e6f2f2b704454759ec5c23ff977b874b58c0f3fd180d7");
+        let mut manifest = FamilyManifest::from_json(&manifest_bytes).unwrap();
         assert_eq!(manifest.to_json(), manifest_bytes);
         manifest.schema_version = STREAMED_FAMILY_SCHEMA_VERSION;
         manifest.members = 0;
@@ -1983,9 +2012,17 @@ mod tests {
     fn generated_rules_resolve_fitted_labels_only_after_binding() {
         use crate::config::{GeneratedSearchCondition, NamedSearchCondition};
         use crate::features::{FittedEncoding, OutputSpec, ProjectionKind, Value};
-        let family: Family = serde_json::from_slice(include_bytes!("../../app/tests/fixtures/legacy_schema1/published/objects/24e476f4f6bb8abbd2211c19ba7b0659762b682b299cb240ec6d40a694d51327")).unwrap();
+        let family: Family = serde_json::from_slice(&legacy_object(
+            "d7924115f6ec1c2219d5239081221020315db2bf998d950c10cb60d194c53f67",
+            "family.json",
+        ))
+        .unwrap();
         let mut search = family.search;
-        let mut plan = FeaturePlan::from_json(include_bytes!("../../app/tests/fixtures/legacy_schema1/published/objects/25fc908bd6027d9d562ad39cf1d04c8dc013081ae69b6df40edfa54bba820308")).unwrap();
+        let mut plan = FeaturePlan::from_json(&legacy_object(
+            "a7ccab4e17b84ad665de5b29c9ccbca10df2b926d7dfe7a3c4987267092f8f29",
+            "plan.json",
+        ))
+        .unwrap();
         let stream = plan.streams[0].key();
         let mut boolean: OutputSpec = plan.streams[0]
             .outputs

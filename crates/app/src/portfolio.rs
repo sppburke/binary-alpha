@@ -28,8 +28,8 @@ use binary_alpha_engine::market::{format_event_time_micros, parse_event_time_mic
 use binary_alpha_engine::portfolio::{
     self as engine, Choice, Failure, FamilyRecord, FeatureRef, FoldRecord, FoldResult, Form,
     LogicalMember, Outer, Policy, ReplayRef, SELECTION_MANIFEST_KIND, SELECTION_OBJECT_PATH,
-    SELECTION_SCHEMA_VERSION, Selection, SelectionManifest, SourceMember, State,
-    selection_generation_id,
+    SELECTION_SCHEMA_VERSION, STREAMED_SELECTION_SCHEMA_VERSION, Selection, SelectionManifest,
+    SourceMember, State, selection_generation_id,
 };
 use binary_alpha_engine::research::Access;
 use binary_alpha_engine::search::Family;
@@ -457,16 +457,21 @@ fn families(
                 .members
                 .iter()
                 .enumerate()
-                .map(|(member, source)| SourceMember {
-                    logic_identity: source.logic_identity.clone(),
-                    contract: source.contract.clone(),
-                    bases: settings
+                .filter_map(|(position, source)| {
+                    let member = source.global_index.map_or(position, |index| index as usize);
+                    let bases: Vec<usize> = settings
                         .members
                         .iter()
                         .enumerate()
                         .filter(|(_, base)| base.family == index && base.member == member)
                         .map(|(base, _)| base)
-                        .collect(),
+                        .collect();
+                    (family.schema_version == 1 || !bases.is_empty()).then_some(SourceMember {
+                        global_index: source.global_index,
+                        logic_identity: source.logic_identity.clone(),
+                        contract: source.contract.clone(),
+                        bases,
+                    })
                 })
                 .collect(),
         });
@@ -536,10 +541,11 @@ pub(crate) struct Selected {
 /// table, returning its report and verification lines.
 pub fn optimize(config: &Config, local: &Store, destination: &Store) -> Result<String, String> {
     let declaration = crate::research::declaration(config)?;
+    let verified = crate::verification_cache(Some(config));
     let access = Access {
         declaration: declaration.as_ref(),
         certification: None,
-        verified: None,
+        verified: Some(&verified),
     };
     select(config, local, destination, access).map(|selected| selected.report)
 }
@@ -558,11 +564,11 @@ pub(crate) fn select(
     let mut clock = Clock::default();
     let started = Instant::now();
 
-    // 1. Every declared input on its manifest bytes, then the verified development-only
-    //    families, the frozen logical universe, and every declared choice.
-    let bound = bind(settings, access)?;
+    // 1. Verify the development-only families and declared member indices before opening any
+    //    fold input, then bind the folds and enumerate choices.
     let (families, family_records) = families(settings, access)?;
     let members = engine::logical_members(settings, &families)?;
+    let bound = bind(settings, access)?;
     let mut choices = choices(settings, &members)?;
     let declared = engine::declared_count(settings)?;
     let rejected = choices
@@ -731,7 +737,13 @@ pub(crate) fn select(
 
     // 4. Publish the selection, then its manifest, and verify before it becomes ready.
     let publishing = Instant::now();
+    let selection_schema = if families.iter().any(|family| family.schema_version == 2) {
+        STREAMED_SELECTION_SCHEMA_VERSION
+    } else {
+        SELECTION_SCHEMA_VERSION
+    };
     let selection = Selection {
+        schema_version: selection_schema,
         config: config.clone(),
         families: family_records,
         members,
@@ -768,7 +780,7 @@ pub(crate) fn select(
         .map_err(|error| format!("cannot remove {}: {error}", temporary.display()))?;
     let manifest = SelectionManifest {
         kind: SELECTION_MANIFEST_KIND.to_string(),
-        schema_version: SELECTION_SCHEMA_VERSION,
+        schema_version: selection_schema,
         generation: generation.clone(),
         config_hash: config.content_hash(),
         code_revision: CODE_REVISION.to_string(),
@@ -987,6 +999,11 @@ pub(crate) fn verified_selection(
     let selection_bytes = search::read_object(store, &manifest.objects, SELECTION_OBJECT_PATH)?;
     let selection = Selection::from_json(&selection_bytes)
         .map_err(|error| format!("{uri}: {SELECTION_OBJECT_PATH}: {error}"))?;
+    if selection.schema_version != manifest.schema_version {
+        return Err(format!(
+            "{uri}: selection and manifest schema versions differ"
+        ));
+    }
     if selection.config.content_hash() != manifest.config_hash {
         return Err(format!(
             "{uri}: the recorded configuration does not hash to the manifest's configuration hash"

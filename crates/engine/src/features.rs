@@ -2924,6 +2924,7 @@ struct Rolling {
 /// The rolling outputs of one accepted candle.
 #[derive(Debug, Clone)]
 struct RollingRow {
+    return_1_unrounded: Option<f64>,
     return_1_bps: Option<f64>,
     windows: Vec<(u32, WindowRow)>,
     range_to_avg20: Option<f64>,
@@ -2967,7 +2968,6 @@ struct Statistics {
     candles: History<StatisticalCandle>,
     returns: History<Option<f64>>,
     windows: Vec<u32>,
-    unit: f64,
 }
 
 fn finite_six(value: f64) -> Option<f64> {
@@ -3012,17 +3012,22 @@ fn candle_pattern(previous: StatisticalCandle, current: StatisticalCandle) -> &'
 }
 
 impl Statistics {
-    fn new(windows: Vec<u32>, unit: f64) -> Self {
+    fn new(windows: Vec<u32>, _unit: f64) -> Self {
         let capacity = windows.last().copied().unwrap_or(1) as usize + 1;
         Self {
             candles: History::new(capacity),
             returns: History::new(capacity),
             windows,
-            unit,
         }
     }
 
-    fn update(&mut self, candle: &Candle, adjacent: bool, doji: bool) -> StatisticalRow {
+    fn update(
+        &mut self,
+        candle: &Candle,
+        adjacent: bool,
+        doji: bool,
+        return_1: Option<f64>,
+    ) -> StatisticalRow {
         let current = StatisticalCandle {
             open: candle.open_units,
             high: candle.high_units,
@@ -3046,14 +3051,8 @@ impl Statistics {
         let pattern = previous
             .filter(|_| adjacent)
             .map(|prior| candle_pattern(prior, current));
-        let ret = previous.and_then(|prior| {
-            bps_size(
-                (i128::from(current.close) - i128::from(prior.close)) as f64 / self.unit,
-                prior.close as f64 / self.unit,
-            )
-        });
         self.candles.push(current);
-        self.returns.push(ret);
+        self.returns.push(return_1);
         let mut windows = Vec::with_capacity(self.windows.len());
         for &w in &self.windows {
             let n = w as usize;
@@ -3149,6 +3148,18 @@ impl Statistics {
             overlap,
             pattern,
         }
+    }
+
+    #[cfg(test)]
+    fn update_test(&mut self, candle: &Candle, adjacent: bool, doji: bool) -> StatisticalRow {
+        let previous = self.candles.last();
+        let return_1 = previous.and_then(|prior| {
+            bps_size(
+                (i128::from(candle.close_units) - i128::from(prior.close)) as f64,
+                prior.close as f64,
+            )
+        });
+        self.update(candle, adjacent, doji, return_1)
     }
 }
 
@@ -3274,6 +3285,7 @@ impl Rolling {
         }
         self.closes.push(close);
         RollingRow {
+            return_1_unrounded: return_1,
             return_1_bps: return_1.map(six),
             windows,
             range_to_avg20: range_to_avg20.map(six),
@@ -5233,10 +5245,14 @@ impl StreamState {
             _ => None,
         };
         let shape = self.shape.update(swing_candle, &anatomy, tick_volume);
-        let statistics = self
-            .statistics
-            .as_mut()
-            .map(|statistics| statistics.update(candle, shape.adjacent, shape.doji));
+        let statistics = self.statistics.as_mut().map(|statistics| {
+            statistics.update(
+                candle,
+                shape.adjacent,
+                shape.doji,
+                rolling.as_ref().and_then(|row| row.return_1_unrounded),
+            )
+        });
         let regime = regime(
             rolling.as_ref(),
             structure.as_ref(),
@@ -5934,7 +5950,7 @@ mod tests {
     #[test]
     fn rolling_statistics_pin_windows_formulas_and_degenerate_cases() {
         let mut statistics = Statistics::new(vec![2, 3, 4], 1.0);
-        let first = statistics.update(&statistical_candle(100, 100), false, true);
+        let first = statistics.update_test(&statistical_candle(100, 100), false, true);
         assert_eq!(first.pattern, None);
         assert_eq!(first.overlap, None);
         assert!(
@@ -5944,9 +5960,9 @@ mod tests {
                 .all(|(_, row)| row.std.is_none() && row.position.is_none())
         );
         for (open, close) in [(100, 110), (110, 90), (90, 120), (120, 80)] {
-            statistics.update(&statistical_candle(open, close), true, false);
+            statistics.update_test(&statistical_candle(open, close), true, false);
         }
-        let last = statistics.update(&statistical_candle(80, 130), true, false);
+        let last = statistics.update_test(&statistical_candle(80, 130), true, false);
         let w4 = last.windows.iter().find(|(w, _)| *w == 4).unwrap().1;
         assert_eq!(w4.std, Some(3862.649811));
         assert_eq!(w4.skew, Some(0.148881));
@@ -5961,9 +5977,9 @@ mod tests {
         let flat = statistical_candle(100, 100);
         let mut zero = Statistics::new(vec![2, 3, 4], 1.0);
         for _ in 0..5 {
-            zero.update(&flat, true, true);
+            zero.update_test(&flat, true, true);
         }
-        let row = zero.update(&flat, true, true).windows[2].1;
+        let row = zero.update_test(&flat, true, true).windows[2].1;
         assert_eq!(row.std, Some(0.0));
         assert_eq!(row.skew, None);
         assert_eq!(row.kurtosis, None);
@@ -5975,11 +5991,11 @@ mod tests {
         let mut degenerate = statistical_candle(100, 100);
         degenerate.high_units = 100;
         degenerate.low_units = 100;
-        assert_eq!(zero.update(&degenerate, true, true).overlap, None);
+        assert_eq!(zero.update_test(&degenerate, true, true).overlap, None);
         let mut zero_range = Statistics::new(vec![2], 1.0);
-        zero_range.update(&degenerate, false, true);
+        zero_range.update_test(&degenerate, false, true);
         assert_eq!(
-            zero_range.update(&degenerate, true, true).windows[0]
+            zero_range.update_test(&degenerate, true, true).windows[0]
                 .1
                 .position,
             None
@@ -5988,18 +6004,20 @@ mod tests {
         zero_close.close_units = 0;
         let mut zero = Statistics::new(vec![3], 1.0);
         for _ in 0..2 {
-            zero.update(&flat, true, true);
+            zero.update_test(&flat, true, true);
         }
         assert_eq!(
-            zero.update(&zero_close, true, false).windows[0].1.residual,
+            zero.update_test(&zero_close, true, false).windows[0]
+                .1
+                .residual,
             None
         );
         let mut missing_return = Statistics::new(vec![2], 1.0);
-        missing_return.update(&statistical_candle(0, 0), false, true);
-        missing_return.update(&statistical_candle(0, 1), true, false);
+        missing_return.update_test(&statistical_candle(0, 0), false, true);
+        missing_return.update_test(&statistical_candle(0, 1), true, false);
         assert_eq!(
             missing_return
-                .update(&statistical_candle(1, 2), true, false)
+                .update_test(&statistical_candle(1, 2), true, false)
                 .windows[0]
                 .1
                 .std,
@@ -6007,7 +6025,7 @@ mod tests {
         );
         let mut one_pair = Statistics::new(vec![4], 1.0);
         for close in [100, 110, 120, 120, 110] {
-            let row = one_pair.update(&statistical_candle(close, close), true, true);
+            let row = one_pair.update_test(&statistical_candle(close, close), true, true);
             if close == 110 && one_pair.candles.len() == 5 {
                 assert_eq!(row.windows[0].1.reversal, Some(0.0));
             }
@@ -6022,7 +6040,7 @@ mod tests {
             let mut candle = statistical_candle(close, close);
             candle.low_units = base;
             candle.high_units = base + 2;
-            let row = position.update(&candle, true, false);
+            let row = position.update_test(&candle, true, false);
             if close == base + 1 {
                 assert_eq!(row.windows[0].1.position, Some(0.5));
             }
@@ -6030,7 +6048,7 @@ mod tests {
 
         let mut trend = Statistics::new(vec![3], 1.0);
         for close in [base, base + 1, base + 2] {
-            let row = trend.update(&statistical_candle(close, close), true, false);
+            let row = trend.update_test(&statistical_candle(close, close), true, false);
             if close == base + 2 {
                 assert_eq!(row.windows[0].1.r2, Some(1.0));
                 assert_eq!(row.windows[0].1.residual, Some(0.0));
@@ -6045,11 +6063,14 @@ mod tests {
         let mut prior = statistical_candle(0, 1);
         prior.low_units = 0;
         prior.high_units = 1;
-        statistics.update(&prior, false, false);
+        statistics.update_test(&prior, false, false);
         let mut current = statistical_candle(2, 3);
         current.low_units = 2;
         current.high_units = 3;
-        assert_eq!(statistics.update(&current, true, false).overlap, Some(0.0));
+        assert_eq!(
+            statistics.update_test(&current, true, false).overlap,
+            Some(0.0)
+        );
     }
 
     #[test]
@@ -6116,12 +6137,14 @@ mod tests {
                 assert!(row.adjacent);
                 assert!(!row.doji);
                 assert_eq!(
-                    statistics.update(candle, row.adjacent, row.doji).pattern,
+                    statistics
+                        .update_test(candle, row.adjacent, row.doji)
+                        .pattern,
                     Some("none")
                 );
                 break;
             }
-            statistics.update(candle, row.adjacent, row.doji);
+            statistics.update_test(candle, row.adjacent, row.doji);
         }
     }
 

@@ -331,8 +331,13 @@ fn family(
     evaluation: &str,
 ) -> (PathBuf, Family) {
     let (start, end) = window(base_ms);
+    let scope = if evaluation.contains("[search.screen]") {
+        "heuristic"
+    } else {
+        "exhaustive"
+    };
     let table = format!(
-        "\n[search]\nscope = \"exhaustive\"\nseed = 7\nchunk_size = 8\nmax_candidates = 1000\nmin_conditions = 1\nmax_conditions = 1\nembargo_micros = {EMBARGO_MICROS}\nbase_stream = {STREAM}\n\n[search.development]\ndecision_start = \"{start}\"\ndecision_end = \"{end}\"\ninputs = [{{ tick_manifest = \"{}\", feature_manifest = \"{}\", outcome_manifest = \"{}\" }}]\n{evaluation}{menu}\n[[search.contracts]]\nid = \"A\"\ndirection = \"buy\"\nduration_micros = 5000000\ncurrency = \"unit\"\nstake = \"1\"\nquoted_cost = \"1\"\nentry_fee = \"0\"\nwin = {{ gross_return = \"1.80\", terminal_fee = \"0\" }}\nloss = {{ gross_return = \"0\", terminal_fee = \"0\" }}\ntie = {{ gross_return = \"1\", terminal_fee = \"0\" }}\n{SETTLEMENT}\n\n[search.account]\nbroker = \"pocket_option\"\ncurrency = \"unit\"\nscale = 2\ninitial_cash = \"1000\"\n\n[search.risk_policy]\nid = \"one\"\nmax_open_per_strategy = 1\nsame_entry = \"all\"\ndeduplicate_signal_logic = false\nmax_feature_age_micros = 60000000\nmax_quote_age_micros = 0\n\n[search.envelope]\nmax_purchase_cost = \"1\"\nmax_entry_fee = \"0.10\"\nmax_win_terminal_fee = \"0\"\nmax_loss_terminal_fee = \"0\"\nmax_tie_terminal_fee = \"0\"\nmin_winning_net_return = \"0.70\"\nsettlement_rule = \"price_at_due_v1\"\n\n[search.gates]\nmin_settled = 1\nmax_unresolved = 0\nmin_net_profit = \"0\"\n\n[search.stability]\nblock_length = 4\nsimulations = 16\nrolling_horizon = 4\n",
+        "\n[search]\nscope = \"{scope}\"\nseed = 7\nchunk_size = 8\nmax_candidates = 1000\nmin_conditions = 1\nmax_conditions = 1\nembargo_micros = {EMBARGO_MICROS}\nbase_stream = {STREAM}\n\n[search.development]\ndecision_start = \"{start}\"\ndecision_end = \"{end}\"\ninputs = [{{ tick_manifest = \"{}\", feature_manifest = \"{}\", outcome_manifest = \"{}\" }}]\n{evaluation}{menu}\n[[search.contracts]]\nid = \"A\"\ndirection = \"buy\"\nduration_micros = 5000000\ncurrency = \"unit\"\nstake = \"1\"\nquoted_cost = \"1\"\nentry_fee = \"0\"\nwin = {{ gross_return = \"1.80\", terminal_fee = \"0\" }}\nloss = {{ gross_return = \"0\", terminal_fee = \"0\" }}\ntie = {{ gross_return = \"1\", terminal_fee = \"0\" }}\n{SETTLEMENT}\n\n[search.account]\nbroker = \"pocket_option\"\ncurrency = \"unit\"\nscale = 2\ninitial_cash = \"1000\"\n\n[search.risk_policy]\nid = \"one\"\nmax_open_per_strategy = 1\nsame_entry = \"all\"\ndeduplicate_signal_logic = false\nmax_feature_age_micros = 60000000\nmax_quote_age_micros = 0\n\n[search.envelope]\nmax_purchase_cost = \"1\"\nmax_entry_fee = \"0.10\"\nmax_win_terminal_fee = \"0\"\nmax_loss_terminal_fee = \"0\"\nmax_tie_terminal_fee = \"0\"\nmin_winning_net_return = \"0.70\"\nsettlement_rule = \"price_at_due_v1\"\n\n[search.gates]\nmin_settled = 1\nmax_unresolved = 0\nmin_net_profit = \"0\"\n\n[search.stability]\nblock_length = 4\nsimulations = 16\nrolling_horizon = 4\n",
         manifest_uri(&development.tick),
         manifest_uri(&development.feature),
         manifest_uri(&development.outcome)
@@ -1338,6 +1343,65 @@ fn counting_grid_selects_verifies_and_resumes() {
     );
     fs::write(&manifest, &bytes).unwrap();
     assert!(verify(&manifest).is_ok());
+}
+
+#[test]
+fn schema_two_explicit_selection_uses_retained_global_index() {
+    let scratch = Scratch::new("phase09_sparse_source");
+    let fixture = counting_fixture(&scratch, PLANTED);
+    let mut strong = recipe(PLANTED);
+    for row in &mut strong {
+        row.win = !row.up;
+    }
+    let development = development(&scratch, "strong", BASE_MS, &strong, false);
+    let reversed = "\n[[search.conditions]]\nstream = { duration_seconds = 20, offset_seconds = 0 }\noutput = \"candle_direction\"\ncomparator = \"eq\"\nthresholds = [\"flat\", \"up\", \"down\"]\n";
+    let (screened_manifest, screened) = family(
+        &scratch,
+        "screened",
+        &development,
+        BASE_MS,
+        reversed,
+        "\n[search.screen]\nmax_adjusted_score = 1.0\ntop = 1\n",
+    );
+    assert_eq!(screened.members.len(), 1);
+    let global = screened.members[0].global_index.unwrap() as usize;
+    assert!(global > 0, "the retained source must be sparse");
+    let base = fixture.table(
+        GATES,
+        "{ id = \"none\" }",
+        &subset(&[deployment(0, 0, 0)]),
+        &risk_policy("cap1", 1),
+        10,
+    );
+    let table = base
+        .replace(
+            &manifest_uri(&fixture.family),
+            &manifest_uri(&screened_manifest),
+        )
+        .replace(
+            &format!("members = [{}]", fixture.members),
+            &format!("members = [{{ family = 0, member = {global} }}]"),
+        );
+    let config = scratch.config("sparse_portfolio.toml", &table);
+    let (_, selection_manifest, selection) = optimize(&scratch, &config).unwrap();
+    assert_eq!(selection.schema_version, 2);
+    assert_eq!(selection.families[0].members.len(), 1);
+    assert_eq!(
+        selection.families[0].members[0].global_index,
+        Some(global as u64)
+    );
+    assert!(verify(&selection_manifest).is_ok());
+    let screened_table = table.replace(&format!("member = {global}"), "member = 0");
+    let rejected = scratch.config("screened_portfolio.toml", &screened_table);
+    let error = optimize(&scratch, &rejected).unwrap_err();
+    assert!(error.contains("is not a member of family"), "{error}");
+    let missing_fit = screened_table.replace(
+        &manifest_uri(&fixture.fits[0].tick),
+        &manifest_uri(&scratch.path(&format!("missing/manifests/{}/ready.json", "c".repeat(64)))),
+    );
+    let rejected = scratch.config("screened_before_fold.toml", &missing_fit);
+    let error = optimize(&scratch, &rejected).unwrap_err();
+    assert!(error.contains("is not a member of family"), "{error}");
 }
 
 // ----------------------------------------------------------------------------------------------
