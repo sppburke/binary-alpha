@@ -15,7 +15,7 @@ use binary_alpha_engine::config::Config;
 use binary_alpha_engine::dataset::GenerationManifest;
 use binary_alpha_engine::features::{
     Exclusion, FeatureEngine, FeatureManifest, FeatureOutput, FeaturePlan, SequenceEvent,
-    StructureEvent, Value, feature_generation_id, raw_identity,
+    StructureEvent, Value, development_fifths, feature_generation_id, raw_identity,
 };
 use binary_alpha_engine::market::{Tick, format_event_time_micros};
 use binary_alpha_engine::stream::{Observation, Source, StreamManifest};
@@ -469,7 +469,12 @@ fn features_build_fits_publishes_reconstructs_freezes_and_isolates() {
     assert_eq!(plan.development_generation, development);
     assert_eq!(
         plan.raw_identity,
-        raw_identity(&plan.profile, &development, &plan.settings)
+        raw_identity(
+            &plan.profile,
+            &development,
+            &plan.settings,
+            &plan.definitions
+        )
     );
     assert!(plan.is_fitted());
     assert_eq!(plan.streams.len(), 2);
@@ -484,6 +489,24 @@ fn features_build_fits_publishes_reconstructs_freezes_and_isolates() {
             "every configured tick stream carries a path, including sixty seconds"
         );
         assert_eq!(stream_plan.encodings.len(), 7);
+        for name in [
+            "return_std_5_bps",
+            "return_skew_5",
+            "return_kurtosis_5",
+            "return_autocorr_5",
+            "sign_reversal_rate_5",
+            "up_move_ratio_5",
+            "trend_r2_5",
+            "trend_residual_5_bps",
+            "range_position_5",
+            "range_overlap",
+            "candle_pattern",
+        ] {
+            assert!(
+                stream_plan.outputs.iter().any(|output| output.name == name),
+                "tick stream missing {name}"
+            );
+        }
         assert_eq!(
             (stream_plan.duration_seconds, stream_plan.offset_seconds),
             (summary.duration_seconds, summary.offset_seconds)
@@ -1046,10 +1069,101 @@ fn bars_exclude_tick_outputs_with_their_reason_and_named_tick_requests_fail() {
         "missing_buckets_since_prev_candle",
         "active_span_micros",
         "swing_high_type",
+        "return_std_5_bps",
+        "return_skew_5",
+        "return_kurtosis_5",
+        "return_autocorr_5",
+        "sign_reversal_rate_5",
+        "up_move_ratio_5",
+        "trend_r2_5",
+        "trend_residual_5_bps",
+        "range_position_5",
+        "range_overlap",
+        "candle_pattern",
     ] {
         assert!(selected.contains(&name), "{name} is bar-compatible");
     }
     assert!(!selected.contains(&"ema20_minus_ema50_bps"));
+    for (name, fragments) in [
+        (
+            "return_std_5_bps",
+            &["window", "unrounded returns", "prior candle", "non-finite"][..],
+        ),
+        (
+            "return_skew_5",
+            &[
+                "window",
+                "unrounded returns",
+                "prior candle",
+                "zero return variance",
+            ],
+        ),
+        (
+            "return_kurtosis_5",
+            &[
+                "window",
+                "unrounded returns",
+                "prior candle",
+                "zero return variance",
+            ],
+        ),
+        (
+            "return_autocorr_5",
+            &[
+                "window",
+                "unrounded returns",
+                "prior candle",
+                "zero variance",
+            ],
+        ),
+        (
+            "sign_reversal_rate_5",
+            &[
+                "window",
+                "unrounded return pairs",
+                "prior candle",
+                "zero pairs with both returns nonzero",
+            ],
+        ),
+        (
+            "up_move_ratio_5",
+            &[
+                "window",
+                "unrounded returns",
+                "prior candle",
+                "zero absolute-return sum",
+            ],
+        ),
+        ("trend_r2_5", &["window", "zero close variance"]),
+        ("trend_residual_5_bps", &["window", "zero last close"]),
+        ("range_position_5", &["window", "zero high-low span"]),
+        (
+            "range_overlap",
+            &[
+                "prior accepted candle is adjacent",
+                "skipped or rejected",
+                "zero",
+            ],
+        ),
+        (
+            "candle_pattern",
+            &[
+                "prior accepted candle is adjacent",
+                "skipped or rejected",
+                "doji",
+            ],
+        ),
+    ] {
+        let description = &stream
+            .outputs
+            .iter()
+            .find(|output| output.name == name)
+            .unwrap()
+            .readiness;
+        for fragment in fragments {
+            assert!(description.contains(fragment), "{name}: {description}");
+        }
+    }
     assert!(
         excluded
             .get("ema20_minus_ema50_bps")
@@ -1076,6 +1190,8 @@ fn bars_exclude_tick_outputs_with_their_reason_and_named_tick_requests_fail() {
     );
     assert!(!names.contains(&"tick_volume".to_string()));
     let first = &rows[0];
+    assert_eq!(value_of(first, names, "range_overlap"), None);
+    assert_eq!(value_of(first, names, "candle_pattern"), None);
     assert_eq!(
         value_of(first, names, "is_ema8_ready"),
         Some(&Value::Bool(false))
@@ -1189,7 +1305,250 @@ fn bars_exclude_tick_outputs_with_their_reason_and_named_tick_requests_fail() {
     other.rolling_window = Some(31);
     assert_ne!(
         plan.raw_identity,
-        raw_identity(&plan.profile, &dataset, &other)
+        raw_identity(&plan.profile, &dataset, &other, &plan.definitions)
+    );
+}
+
+#[test]
+fn automatic_encodings_fit_only_ready_rows_and_keep_distinct_names() {
+    let scratch = Scratch::new("phase04_automatic_encodings");
+    let start = 1_747_653_300;
+    let rows: Vec<_> = (0..156_i64)
+        .map(|index| {
+            let rounded = |value: f64| (value * 1000.0).round() / 1000.0;
+            let open = rounded(100.0 + index as f64 * 0.01);
+            let close = rounded(open + if index % 3 == 0 { 0.004 } else { -0.003 });
+            bar(
+                "AAPL_otc",
+                7,
+                start + index * 5,
+                [
+                    open,
+                    rounded(open.max(close) + 0.006),
+                    rounded(open.min(close) - 0.006),
+                    close,
+                    3.0,
+                ],
+            )
+        })
+        .collect();
+    write_collection(
+        &scratch.path("sources/bars"),
+        &[AssetSpec {
+            asset: "AAPL_otc",
+            expected_symbol_id: Some(7),
+            symbol_id: Some(7),
+            files: vec![rows],
+            metadata: true,
+        }],
+    );
+    let import_config = scratch.config(
+        "import.toml",
+        &scratch
+            .bar_source()
+            .replace("\"evaluation\"", "\"development\""),
+    );
+    let dataset = generation(&import(&import_config).unwrap()[0]);
+    let dataset_manifest = scratch.path(&format!("published/manifests/{dataset}/ready.json"));
+    let audit_config = scratch.config("audit.toml", &bar_instrument("AAPL_otc"));
+    let stream_manifest = scratch.path(&format!(
+        "published/manifests/{}/ready.json",
+        generation(&audit(&audit_config, &dataset_manifest))
+    ));
+    let settings = format!(
+        "{}encodings = {{ max_labels = 1, outputs = \"all_supported\" }}\n",
+        BAR_SETTINGS.split("encodings =").next().unwrap()
+    );
+    let config = scratch.config(
+        "features.toml",
+        &feature_entry(
+            "development",
+            &dataset_manifest,
+            &stream_manifest,
+            &settings,
+        ),
+    );
+    let lines = build(&config).unwrap();
+    let manifest_path = scratch.path(&format!(
+        "published/manifests/{}/ready.json",
+        generation(&lines[0])
+    ));
+    let published = published_features(&scratch.path("published"), &manifest_path);
+    let stream = &published.plan.streams[0];
+    let encodings = &stream.encodings;
+    assert_eq!(
+        encodings.len(),
+        stream
+            .outputs
+            .iter()
+            .filter(|output| output.predictive
+                && output.kind != binary_alpha_engine::features::Kind::Time)
+            .count()
+    );
+    let mut names = std::collections::BTreeSet::new();
+    for encoding in encodings {
+        assert!(encoding.automatic);
+        assert!(
+            stream
+                .outputs
+                .iter()
+                .all(|output| output.name != encoding.output)
+        );
+        assert!(names.insert(&encoding.output));
+    }
+    let slope = encodings
+        .iter()
+        .find(|encoding| encoding.input == "ema8_slope_state")
+        .unwrap();
+    assert_eq!(slope.labels.len(), 1);
+    assert_ne!(slope.labels[0], "not_ready");
+    let (columns, rows) = &published.tables[0][0];
+    let slope_column = columns
+        .iter()
+        .position(|name| name == "ema8_slope_state")
+        .unwrap();
+    let unready = rows
+        .iter()
+        .filter(|row| row[slope_column] == Some(Value::Text("not_ready".into())))
+        .count();
+    assert!(
+        unready > rows.len() - unready,
+        "the test needs an unready-dominant category"
+    );
+    let flag = columns
+        .iter()
+        .position(|name| name == "is_ema8_ready")
+        .unwrap();
+    let ema = columns.iter().position(|name| name == "ema8").unwrap();
+    let preview: Vec<_> = rows
+        .iter()
+        .filter(|row| row[flag] == Some(Value::Bool(false)))
+        .filter_map(|row| row[ema].as_ref().and_then(Value::as_f64))
+        .collect();
+    assert!(preview.windows(2).any(|pair| pair[0] != pair[1]));
+    let mut ready: Vec<_> = rows
+        .iter()
+        .filter(|row| row[flag] == Some(Value::Bool(true)))
+        .filter_map(|row| row[ema].as_ref().and_then(Value::as_f64))
+        .collect();
+    let expected = development_fifths(&mut ready);
+    let mut all_values: Vec<_> = rows
+        .iter()
+        .filter_map(|row| row[ema].as_ref().and_then(Value::as_f64))
+        .collect();
+    assert_ne!(development_fifths(&mut all_values), expected);
+    let fitted = encodings
+        .iter()
+        .find(|encoding| encoding.input == "ema8")
+        .unwrap();
+    assert_eq!(fitted.edges, expected);
+    let no_ready = encodings
+        .iter()
+        .find(|encoding| encoding.input == "ema21")
+        .unwrap();
+    assert_eq!(no_ready.edges, None);
+    assert!(no_ready.labels.is_empty());
+    assert_eq!(
+        binary_alpha(&[
+            "data",
+            "verify",
+            "--manifest",
+            &manifest_uri(&manifest_path)
+        ])
+        .status
+        .code(),
+        Some(0)
+    );
+
+    let collision = Scratch::new("phase04_automatic_collision");
+    let rows: Vec<_> = (0..180_i64)
+        .map(|index| {
+            let open = 100_000.0 + index as f64 / 1000.0;
+            let close = open + 0.001;
+            let rounded = |value: f64| (value * 1000.0).round() / 1000.0;
+            bar(
+                "AAPL_otc",
+                7,
+                start + index * 5,
+                [
+                    rounded(open),
+                    rounded(close),
+                    rounded(open - 0.001),
+                    rounded(close),
+                    3.0,
+                ],
+            )
+        })
+        .collect();
+    write_collection(
+        &collision.path("sources/bars"),
+        &[AssetSpec {
+            asset: "AAPL_otc",
+            expected_symbol_id: Some(7),
+            symbol_id: Some(7),
+            files: vec![rows],
+            metadata: true,
+        }],
+    );
+    let import_config = collision.config(
+        "import.toml",
+        &collision
+            .bar_source()
+            .replace("\"evaluation\"", "\"development\""),
+    );
+    let dataset = generation(&import(&import_config).unwrap()[0]);
+    let dataset_manifest = collision.path(&format!("published/manifests/{dataset}/ready.json"));
+    let audit_config = collision.config("audit.toml", &bar_instrument("AAPL_otc"));
+    let stream_manifest = collision.path(&format!(
+        "published/manifests/{}/ready.json",
+        generation(&audit(&audit_config, &dataset_manifest))
+    ));
+    let config = collision.config(
+        "features.toml",
+        &feature_entry(
+            "development",
+            &dataset_manifest,
+            &stream_manifest,
+            &settings,
+        ),
+    );
+    let lines = build(&config).unwrap();
+    let manifest_path = collision.path(&format!(
+        "published/manifests/{}/ready.json",
+        generation(&lines[0])
+    ));
+    let published = published_features(&collision.path("published"), &manifest_path);
+    let (columns, rows) = &published.tables[0][0];
+    let flag = columns
+        .iter()
+        .position(|name| name == "is_ema8_ready")
+        .unwrap();
+    let ema = columns.iter().position(|name| name == "ema8").unwrap();
+    let mut ready: Vec<_> = rows
+        .iter()
+        .filter(|row| row[flag] == Some(Value::Bool(true)))
+        .filter_map(|row| row[ema].as_ref().and_then(Value::as_f64))
+        .collect();
+    ready.sort_by(f64::total_cmp);
+    ready.dedup();
+    assert!(ready.len() >= 4);
+    let encoding = published.plan.streams[0]
+        .encodings
+        .iter()
+        .find(|encoding| encoding.input == "ema8")
+        .unwrap();
+    assert_eq!(encoding.edges, None);
+    assert!(encoding.labels.is_empty());
+    assert_eq!(
+        binary_alpha(&[
+            "data",
+            "verify",
+            "--manifest",
+            &manifest_uri(&manifest_path)
+        ])
+        .status
+        .code(),
+        Some(0)
     );
 }
 

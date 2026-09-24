@@ -1493,6 +1493,45 @@ substitute volume, counts, zero diagnostics, or `clean`; bar-compatible geometry
 prior ratios, moving averages, returns, momentum, efficiency, structure, sequences, and the
 trend, volatility, structure, transition, and bias regime components remain available.
 
+`rolling_statistics_v1` is present only when the plan's recorded `definitions.statistics`
+names it. New plans record that definition; plans without it retain their original
+`all_supported` membership and raw identity. For each configured structure window `w`, the
+following use the last `w` accepted candles, oldest to newest. Return statistics use the
+unrounded `bps_change` values used by `Rolling::update`, before `return_1_bps` is rounded
+for publication; a return that rounds to zero remains nonzero in these calculations.
+Thus `w` returns require a preceding candle. `return_std_{w}_bps` is the population
+standard deviation; `return_skew_{w}` is the population third central
+moment divided by variance to the power 3/2; `return_kurtosis_{w}` is the population fourth
+central moment divided by squared variance, minus 3. `return_autocorr_{w}` is Pearson
+correlation of returns 0..w-2 and 1..w-1. `sign_reversal_rate_{w}` is the opposite-sign
+share of adjacent pairs for which both returns are nonzero, requiring at least two
+adjacent pair positions and at least one eligible pair. `up_move_ratio_{w}` is
+positive-return sum divided by absolute-return sum.
+`trend_r2_{w}` is `1 - SSE/SST` from ordinary least squares of close units on indices
+0..w-1; `trend_residual_{w}_bps` is 10000 times (last close minus fitted last close)
+divided by last close. `range_position_{w}` is (last close minus minimum low) divided by
+(maximum high minus minimum low). The standard deviation, up ratio, and range position
+start at `w = 2`; skew, R², and residual at `w = 3`; kurtosis, autocorrelation, and
+reversal rate at `w = 4`. A missing preceding candle, unfilled window, zero return
+variance for skew/kurtosis, zero series variance for autocorrelation, zero absolute-return
+sum for up ratio, zero close variance for R², zero last close for residual, and zero
+high-low span for range position yield unavailable values. All non-finite computations
+are unavailable. Each finite emitted statistic is rounded with `six` once. A flat return
+window has standard deviation zero when filled.
+
+Per candle, `range_overlap` is the positive overlap of current and prior high-low ranges
+divided by the current high-low range; it is unavailable without an immediately preceding
+accepted candle with no skipped or rejected stream interval, or with zero current range.
+`candle_pattern` uses the same prior requirement and is unavailable when it is unmet.
+It compares opposite non-doji bodies in exact price units, using `is_doji` as computed
+from six-rounded `body_to_range <= 0.10`. It is `bullish_engulfing` or `bearish_engulfing`
+when current body endpoints enclose the prior body, otherwise `bullish_harami` or
+`bearish_harami` when the current
+body is inside it; equality counts, engulfing takes priority, and every other case with
+an adjacent prior, including a doji, is `none`. Every statistics output records these
+warmup and degenerate rules in its own `readiness` text. Both bar and tick-built candles
+use this one causal computation.
+
 ### Computation
 
 One ordered chain per stream consumes the Phase 03 stream's records: the tick path and the
@@ -1547,7 +1586,18 @@ six-significant-digit general format, and duplicate labels are an error rather t
 intervals. Labels rank by development count descending then text ascending, are limited to
 `max_labels`, and take zero-based signed 16-bit codes; a missing, unseen, out-of-range, or
 uncoded (`""`, `missing`, `none`, `<NA>`, `nan`, `NaT`) label encodes as `-1`, and raw values
-stay beside their codes. The fitted plan records the fit windows (rows and first and last
+stay beside their codes.
+
+With `encodings.outputs = "all_supported"`, the plan attempts development fifths for
+every selected predictive numeric output and category fitting for every selected predictive
+text or boolean output. Each encoding's output is a deterministic distinct name; `input`
+names the raw column. Only development rows passing that input's plan-declared readiness
+flags and `value_ready` contribute to automatic fitting. No ready values produce no edges
+or labels. Fewer than four distinct ready numeric values or duplicate six-significant-digit
+interval labels leave automatic numeric edges absent and labels empty. Explicit encoding
+lists retain fitting on all development rows and their duplicate-label error.
+
+The fitted plan records the fit windows (rows and first and last
 decision time per stream), every label list and edge list, and its identity is SHA-256 over
 `binary-alpha feature plan v1` and the plan's JSON bytes. Applying a frozen plan recomputes
 rows under its settings and encodes under its labels without refitting; no artifact records

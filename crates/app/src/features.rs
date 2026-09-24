@@ -613,13 +613,52 @@ pub(crate) fn build(
             })
             .collect();
         let max_labels = plan.max_labels;
-        for (stream, temporary) in plan.streams.iter_mut().zip(temporaries.chunks(3)) {
+        let readiness: Vec<_> = plan
+            .streams
+            .iter()
+            .map(|stream| {
+                stream
+                    .encodings
+                    .iter()
+                    .map(|encoding| plan.readiness_of(&encoding.input))
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        for ((stream, temporary), readiness) in plan
+            .streams
+            .iter_mut()
+            .zip(temporaries.chunks(3))
+            .zip(readiness)
+        {
             let reader = TableReader::open(&temporary[0], ROWS_MESSAGE)?;
-            for encoding in &mut stream.encodings {
+            for (encoding, readiness) in stream.encodings.iter_mut().zip(readiness) {
                 let index = reader.column_index(&encoding.input).ok_or_else(|| {
                     format!("encoding input `{}` is not a row column", encoding.input)
                 })?;
-                let column = reader.whole_column(index)?;
+                let mut column = reader.whole_column(index)?;
+                if encoding.automatic {
+                    let flags: Vec<_> = readiness
+                        .flags
+                        .iter()
+                        .map(|flag| {
+                            let index = reader.column_index(flag).ok_or_else(|| {
+                                format!("readiness flag `{flag}` is not a row column")
+                            })?;
+                            reader.whole_column(index)
+                        })
+                        .collect::<Result<_, String>>()?;
+                    for row in 0..column.len() {
+                        if !binary_alpha_engine::execution::value_ready(
+                            column[row].as_ref(),
+                            &readiness.unready,
+                            flags.iter().map(|flag: &Vec<Option<Value>>| {
+                                flag[row] == Some(Value::Bool(true))
+                            }),
+                        ) {
+                            column[row] = None;
+                        }
+                    }
+                }
                 encoding.fit(&column, max_labels)?;
             }
         }

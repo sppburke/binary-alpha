@@ -25,6 +25,7 @@ use binary_alpha_engine::config::{
 };
 use binary_alpha_engine::dataset::{DatasetRole, ObjectRecord, ObjectRole, manifest_key};
 use binary_alpha_engine::execution::ReplayInput;
+use binary_alpha_engine::features::FeaturePlan;
 use binary_alpha_engine::market::format_event_time_micros;
 use binary_alpha_engine::outcomes::{
     OUTCOME_MANIFEST_KIND, OutcomeManifest, OutcomeRule, outcome_generation_id,
@@ -1675,7 +1676,14 @@ fn verified_children(
         }
         let plan = features::fitted_plan(uri, &feature_store, &feature)?;
         let fit = engine::fit_entry(instrument, source, profile);
-        if *features::resolve(&fit, access)?.plan() != plan.unfitted() {
+        let resolved = features::resolve(&fit, access)?;
+        let recorded = FeaturePlan::resolve_with_definitions(
+            &fit,
+            resolved.plan().profile.clone(),
+            &resolved.plan().development_generation,
+            plan.definitions.clone(),
+        )?;
+        if recorded != plan.unfitted() {
             return Err(format!(
                 "{uri}: feature generation {} is not the configured fit of {}",
                 record.feature, record.instrument

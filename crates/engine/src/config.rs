@@ -1153,7 +1153,73 @@ pub struct StructureSettings {
 pub struct Encodings {
     /// `1` to `32768`.
     pub max_labels: u32,
+    #[serde(with = "encoding_outputs")]
     pub outputs: Vec<EncodingSpec>,
+}
+
+mod encoding_outputs {
+    use super::EncodingSpec;
+    use serde::{
+        Deserializer, Serialize, Serializer,
+        de::{Error, SeqAccess, Visitor},
+    };
+    use std::fmt;
+
+    pub fn serialize<S: Serializer>(
+        outputs: &[EncodingSpec],
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        if outputs.len() == 1 && outputs[0].output == "all_supported" && outputs[0].bins.is_none() {
+            serializer.serialize_str("all_supported")
+        } else {
+            outputs.serialize(serializer)
+        }
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<Vec<EncodingSpec>, D::Error> {
+        struct OutputsVisitor;
+        impl<'de> Visitor<'de> for OutputsVisitor {
+            type Value = Vec<EncodingSpec>;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+                formatter.write_str("`all_supported` or an encoding list")
+            }
+
+            fn visit_str<E: Error>(self, text: &str) -> Result<Self::Value, E> {
+                if text == "all_supported" {
+                    Ok(vec![EncodingSpec {
+                        output: text.to_string(),
+                        bins: None,
+                    }])
+                } else {
+                    Err(E::custom(format!("unknown encodings outputs `{text}`")))
+                }
+            }
+
+            fn visit_string<E: Error>(self, text: String) -> Result<Self::Value, E> {
+                self.visit_str(&text)
+            }
+
+            fn visit_seq<A: SeqAccess<'de>>(
+                self,
+                mut sequence: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut outputs = Vec::new();
+                while let Some(output) = sequence.next_element::<EncodingSpec>()? {
+                    if output.output == "all_supported" {
+                        return Err(A::Error::custom(
+                            "`all_supported` is a string mode, not an encoding output",
+                        ));
+                    }
+                    outputs.push(output);
+                }
+                Ok(outputs)
+            }
+        }
+        deserializer.deserialize_any(OutputsVisitor)
+    }
 }
 
 /// One encoded output: a category output or a compiled projection needs no bins; a numeric

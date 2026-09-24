@@ -927,7 +927,13 @@ fn configured_fit(
 ) -> Result<(), String> {
     let resolved =
         bind_fit(field, entry, cutoff, access).map_err(|reason| format!("{uri}: {reason}"))?;
-    if *resolved.plan() != plan.unfitted() {
+    let recorded = FeaturePlan::resolve_with_definitions(
+        entry,
+        resolved.plan().profile.clone(),
+        &resolved.plan().development_generation,
+        plan.definitions.clone(),
+    )?;
+    if recorded != plan.unfitted() {
         return Err(format!(
             "{uri}: {field} does not resolve to the recorded plan before its fit"
         ));

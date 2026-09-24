@@ -2444,6 +2444,28 @@ mod tests {
     }
 
     #[test]
+    fn tie_only_projection_keeps_its_verdict_without_decisive_gates() {
+        let mut gates = gates();
+        gates.min_profit = decimal("0");
+        let mut ties = projection(3, Some("0"), Some("0"), 0, None);
+        assert_eq!(verdict(&ties, &gates), Verdict::Pass);
+        ties.wins = Some(0);
+        ties.losses = Some(0);
+        ties.ties = Some(3);
+        gates.min_decisive = Some(1);
+        assert!(matches!(
+            verdict(&ties, &gates),
+            Verdict::InsufficientEvidence { reason } if reason.contains("decisive trades 0")
+        ));
+        gates.min_decisive = None;
+        gates.min_win_rate = Some(decimal("0.5"));
+        assert!(matches!(
+            verdict(&ties, &gates),
+            Verdict::InsufficientEvidence { reason } if reason.contains("zero is insufficient")
+        ));
+    }
+
+    #[test]
     fn decisive_verdicts_follow_existing_support_gates() {
         let mut gates = gates();
         gates.min_decisive = Some(2);
