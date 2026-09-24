@@ -12,7 +12,7 @@ use binary_alpha_engine::market::format_event_time_micros;
 use binary_alpha_engine::research::{Access, Verified};
 use binary_alpha_engine::search::{Family, FamilyManifest, StabilityOutcome, family_generation_id};
 use common::current::import;
-use common::{Scratch, command, generation, read_table, verify, write_ticks};
+use common::{Scratch, cli, command, generation, read_table, verify, write_ticks};
 use serde_json::Value;
 
 const BASE_DEV_MS: i64 = 1_767_571_200_000; // 2026-01-05T00:00:00Z, a Monday
@@ -949,7 +949,7 @@ fn candidate_search_publishes_verifies_and_resumes() {
     .unwrap();
     let error = verify(&manifest_path).unwrap_err();
     assert!(
-        error.contains("is not replayed and resampled exactly as its status requires"),
+        error.contains("chunk bindings are not canonical survivor partitions"),
         "{error}"
     );
     let tamper = |family: Value| {
@@ -1027,6 +1027,55 @@ fn generated_schema_two_search_projects_lowers_and_publishes_empty_family() {
         projected.members.len() as u64
     );
     assert!(verify(&manifest).is_ok());
+    let multi_outcomes = scratch.config(
+        "outcomes_multi.toml",
+        &format!(
+            "\n[outcomes]\nrole = \"development\"\ntick_manifest = \"{}\"\nfeature_manifest = \"{}\"\nexpiry_seconds = [5, 10]\nmax_entry_delay_ms = 2000\nmax_settlement_delay_ms = 2000\nmax_tick_gap_ms = 2000\ntrue_jump_max_gap_ms = 2000\ntrue_jump_basis_points = \"5\"\nfrozen_min_ticks = 10\nfrozen_min_ms = 5000\n",
+            manifest_uri(&role.tick),
+            manifest_uri(&role.feature)
+        ),
+    );
+    let multi_outcome = scratch.path(&format!(
+        "published/manifests/{}/ready.json",
+        generation(
+            &command(&[
+                "outcomes",
+                "build",
+                "--config",
+                multi_outcomes.to_str().unwrap()
+            ])
+            .unwrap()[0]
+        )
+    ));
+    let multi_role = Role {
+        tick: role.tick.clone(),
+        feature: role.feature.clone(),
+        outcome: Some(multi_outcome),
+    };
+    let long_contract = contract("long_buy", "buy", "0", "1")
+        .replace("duration_micros = 5000000", "duration_micros = 10000000");
+    let (_, _, multi) = run_search(
+        &scratch,
+        "generated_multi_expiry.toml",
+        &generated_table(
+            &SearchSpec {
+                development: &multi_role,
+                extra_contracts: &long_contract,
+                ..spec
+            },
+            false,
+        ),
+    );
+    for member in &projected.members {
+        let matched = multi
+            .members
+            .iter()
+            .find(|other| {
+                other.logic_identity == member.logic_identity && other.contract == member.contract
+            })
+            .unwrap();
+        assert_eq!(matched.raw, member.raw);
+    }
     #[cfg(feature = "cuda")]
     {
         let cuda_table = format!(
@@ -1226,6 +1275,108 @@ fn generated_schema_two_search_projects_lowers_and_publishes_empty_family() {
         };
         assert_eq!(find(&dropped), find(&raw), "{label}");
     }
+}
+
+#[test]
+fn schema_two_verification_proves_development_before_evaluation_and_requires_chunk_order() {
+    let scratch = Scratch::new("phase08_streamed_verification_order");
+    let rows = recipe(true);
+    let development = publish_role_with(
+        &scratch,
+        "development",
+        "development",
+        BASE_DEV_MS,
+        &rows,
+        None,
+        "[\"candle_direction\", \"range_bps\"]",
+        "encodings = { max_labels = 8, outputs = \"all_supported\" }\n",
+    );
+    let profile = scratch.path(&format!(
+        "published/manifests/{}/ready.json",
+        profile_generation(&scratch, &development)
+    ));
+    let evaluation = publish_role_with(
+        &scratch,
+        "evaluation",
+        "evaluation",
+        BASE_EVAL_MS,
+        &rows,
+        Some((&profile, &development.feature)),
+        "[\"candle_direction\", \"range_bps\"]",
+        "encodings = { max_labels = 8, outputs = \"all_supported\" }\n",
+    );
+    let spec = SearchSpec {
+        development: &development,
+        evaluation: Some(&evaluation),
+        scope: "exhaustive",
+        screen: "",
+        horizon: 4,
+        extra_contracts: "",
+        policy_extra: "",
+        chunk_size: 2,
+    };
+    let (_, path, family) = run_search(
+        &scratch,
+        "streamed_verification_order.toml",
+        &generated_table(&spec, false)
+            .replace("min_net_profit = \"0\"", "min_net_profit = \"-1000\""),
+    );
+    assert_eq!(family.schema_version, 2);
+    assert!(
+        family
+            .chunks
+            .iter()
+            .filter(|chunk| chunk.role == "development")
+            .count()
+            >= 2
+    );
+    assert!(family.chunks.iter().any(|chunk| chunk.role == "evaluation"));
+    let original_manifest: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    let original_family: Value = serde_json::to_value(&family).unwrap();
+    let tamper = |changed: Value| {
+        let bytes = serde_json::to_vec_pretty(&changed).unwrap();
+        let sha = sha256_hex(&bytes);
+        fs::write(scratch.path(&format!("published/objects/{sha}")), &bytes).unwrap();
+        let mut manifest = original_manifest.clone();
+        manifest["objects"][0]["key"] = Value::from(format!("objects/{sha}"));
+        manifest["objects"][0]["sha256"] = Value::from(sha);
+        manifest["objects"][0]["bytes"] = Value::from(bytes.len());
+        fs::write(&path, serde_json::to_vec_pretty(&manifest).unwrap()).unwrap();
+        let log = scratch.path("verify_access.log");
+        let error = cli(
+            &log,
+            &["data", "verify", "--manifest", &manifest_uri(&path)],
+        )
+        .unwrap_err();
+        (error, fs::read_to_string(log).unwrap())
+    };
+    let mut bad_count = original_family.clone();
+    bad_count["members"][0]["raw"]["total"] = Value::from(999);
+    let (error, log) = tamper(bad_count);
+    assert!(
+        error.contains("records counts, scores, screen, gate, or rank"),
+        "{error}"
+    );
+    for source in [&evaluation.tick, &evaluation.feature] {
+        let generation = source
+            .parent()
+            .unwrap()
+            .file_name()
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert!(
+            !log.contains(&format!("manifests/{generation}/ready.json")),
+            "{log}"
+        );
+    }
+    let mut swapped = original_family;
+    swapped["chunks"].as_array_mut().unwrap().swap(0, 1);
+    let (error, _) = tamper(swapped);
+    assert!(
+        error.contains("chunk bindings are not canonical survivor partitions"),
+        "{error}"
+    );
 }
 
 fn feature_rows_key(manifest: &Path) -> String {

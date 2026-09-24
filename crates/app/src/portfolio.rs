@@ -1102,6 +1102,16 @@ pub(crate) fn verified_selection(
     }
     // The universe: verified families, their records, the logical members, and every choice.
     let (families, family_records) = families(settings, access)?;
+    let required_schema = if families.iter().any(|family| family.schema_version == 2) {
+        STREAMED_SELECTION_SCHEMA_VERSION
+    } else {
+        SELECTION_SCHEMA_VERSION
+    };
+    if selection.schema_version != required_schema {
+        return Err(format!(
+            "{uri}: selection schema version differs from its source families"
+        ));
+    }
     check_generated(settings, &families, access).map_err(|reason| format!("{uri}: {reason}"))?;
     if family_records != selection.families
         || manifest.families

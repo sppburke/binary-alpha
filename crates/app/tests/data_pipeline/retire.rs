@@ -2347,7 +2347,7 @@ fn metadata_reads_only_download<'a>(log: &[String], files: impl IntoIterator<Ite
 /// A phase memo lets shared manifests verify once; a fresh access observes the store again.
 #[test]
 fn verification_memo_is_per_phase() {
-    use binary_alpha_engine::research::{Access, Verified};
+    use binary_alpha_engine::research::{Access, Declaration, Population, Verified};
     let f = fixture();
     let store = f.root.join("store");
     let uri = format!("file://{}", store.join(f.new_dataset.key()).display());
@@ -2358,6 +2358,37 @@ fn verification_memo_is_per_phase() {
     };
     let summary = binary_alpha_app::verify::run_with(&uri, phase).unwrap();
     assert_eq!(memo.lock().unwrap().get(&uri), Some(&summary));
+    let declaration = Declaration {
+        schema_version: 1,
+        operator: "synthetic-operator".into(),
+        root: format!("file://{}/governance", f.scratch.root.display())
+            .parse()
+            .unwrap(),
+        namespace: "memo-role".into(),
+        populations: vec![Population {
+            id: "relabeled".into(),
+            role: binary_alpha_engine::dataset::DatasetRole::Evaluation,
+            instrument: f.new_dataset.instrument.clone(),
+            source: "synthetic-pages".into(),
+            coverage: f.new_dataset.coverage.clone(),
+            generations: vec![f.new_dataset.generation.clone()],
+            tokens: vec!["history-observations".into()],
+            exposure: vec![],
+        }],
+    };
+    let error = binary_alpha_app::verify::run_with(
+        &uri,
+        Access {
+            declaration: Some(&declaration),
+            verified: Some(&memo),
+            ..Access::ORDINARY
+        },
+    )
+    .unwrap_err();
+    assert!(
+        error.contains("declared `evaluation`, not `development`"),
+        "{error}"
+    );
     let object = store.join(&f.new_dataset.objects[0].key);
     let original = fs::read(&object).unwrap();
     fs::write(&object, b"changed after the phase verified it").unwrap();

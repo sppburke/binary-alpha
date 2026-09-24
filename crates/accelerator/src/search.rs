@@ -219,12 +219,48 @@ pub struct SparseKeys<'a> {
     pub key_chrono_rows: &'a [i32],
 }
 
+pub(crate) fn validate_tuple_outcome(
+    original: SearchBuffers<'_>,
+    replacement: SearchBuffers<'_>,
+    split_mask: &[u8],
+) -> Result<(), String> {
+    if original.row_count != replacement.row_count
+        || original.feature_count != replacement.feature_count
+        || !std::ptr::eq(original.feature_codes, replacement.feature_codes)
+        || !std::ptr::eq(original.ordered_rows, replacement.ordered_rows)
+        || !std::ptr::eq(original.decision_time_ms, replacement.decision_time_ms)
+    {
+        return Err(
+            "resident tuple: feature matrix or entry order changed between expiries".into(),
+        );
+    }
+    let rows = original.row_count as usize;
+    for (name, len) in [
+        ("split_mask", split_mask.len()),
+        ("decision_time_ms", replacement.decision_time_ms.len()),
+        ("release_time_ms", replacement.release_time_ms.len()),
+        ("settlement_time_ms", replacement.settlement_time_ms.len()),
+        ("valid", replacement.valid.len()),
+        ("buy_win", replacement.buy_win.len()),
+        ("sell_win", replacement.sell_win.len()),
+        ("tie", replacement.tie.len()),
+    ] {
+        length("resident tuple", name, len, rows)?;
+    }
+    Ok(())
+}
+
 /// CPU reference for the resident tuple contract. Shared arrays and sparse rows are checked
 /// once; each batch still checks its own conditions, offsets, driver IDs, and output bounds.
 pub struct CpuSparseTuple<'a> {
     buffers: SearchBuffers<'a>,
     split_masks: Vec<&'a [u8]>,
     keys: SparseKeys<'a>,
+}
+
+#[cfg(test)]
+thread_local! {
+    static CPU_TUPLE_CONSTRUCTIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 impl<'a> CpuSparseTuple<'a> {
@@ -264,11 +300,18 @@ impl<'a> CpuSparseTuple<'a> {
                 buffers.row_count as usize,
             )?;
         }
+        #[cfg(test)]
+        CPU_TUPLE_CONSTRUCTIONS.with(|count| count.set(count.get() + 1));
         Ok(Self {
             buffers,
             split_masks: split_masks.to_vec(),
             keys,
         })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn construction_count() -> usize {
+        CPU_TUPLE_CONSTRUCTIONS.with(std::cell::Cell::get)
     }
 
     pub fn score_batch(
@@ -299,6 +342,18 @@ impl<'a> CpuSparseTuple<'a> {
         };
         input.validate_resident_batch()?;
         Ok(crate::cpu(|| input.reference()))
+    }
+
+    /// Keep the validated feature matrix and sparse index while changing expiry outcomes.
+    pub fn set_outcome(
+        &mut self,
+        buffers: SearchBuffers<'a>,
+        split_mask: &'a [u8],
+    ) -> Result<(), String> {
+        validate_tuple_outcome(self.buffers, buffers, split_mask)?;
+        self.buffers = buffers;
+        self.split_masks[0] = split_mask;
+        Ok(())
     }
 }
 

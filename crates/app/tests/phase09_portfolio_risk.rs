@@ -1391,6 +1391,27 @@ fn schema_two_explicit_selection_uses_retained_global_index() {
         Some(global as u64)
     );
     assert!(verify(&selection_manifest).is_ok());
+    let mut relabeled_selection: Value = serde_json::to_value(&selection).unwrap();
+    relabeled_selection["schema_version"] = Value::from(1);
+    let bytes = serde_json::to_vec_pretty(&relabeled_selection).unwrap();
+    let sha = sha256_hex(&bytes);
+    fs::write(scratch.path(&format!("published/objects/{sha}")), &bytes).unwrap();
+    let mut relabeled_manifest: Value =
+        serde_json::from_slice(&fs::read(&selection_manifest).unwrap()).unwrap();
+    relabeled_manifest["schema_version"] = Value::from(1);
+    relabeled_manifest["objects"][0]["key"] = Value::from(format!("objects/{sha}"));
+    relabeled_manifest["objects"][0]["sha256"] = Value::from(sha);
+    relabeled_manifest["objects"][0]["bytes"] = Value::from(bytes.len());
+    fs::write(
+        &selection_manifest,
+        serde_json::to_vec_pretty(&relabeled_manifest).unwrap(),
+    )
+    .unwrap();
+    let error = verify(&selection_manifest).unwrap_err();
+    assert!(
+        error.contains("selection schema version differs from its source families"),
+        "{error}"
+    );
     let screened_table = table.replace(&format!("member = {global}"), "member = 0");
     let rejected = scratch.config("screened_portfolio.toml", &screened_table);
     let error = optimize(&scratch, &rejected).unwrap_err();

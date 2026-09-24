@@ -88,6 +88,16 @@ fn memo(
             format!("certification:{}:{receipt}:{uri}", receipt.len())
         },
     );
+    let key = if let Some(declaration) = access.declaration {
+        let bytes = serde_json::to_vec(declaration)
+            .map_err(|error| format!("verify: declaration identity: {error}"))?;
+        format!(
+            "declaration:{}:{key}",
+            binary_alpha_engine::hex(&Sha256::digest(bytes))
+        )
+    } else {
+        key
+    };
     if let Some(summary) = verified
         .lock()
         .map_err(|_| "verify: memo poisoned")?

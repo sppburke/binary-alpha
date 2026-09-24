@@ -611,6 +611,7 @@ impl Device {
         split_masks: &[&'a [u8]],
         keys: SparseKeys<'a>,
     ) -> Result<ResidentTuple<'a>, String> {
+        let validation_started = Instant::now();
         if split_masks.is_empty() {
             return Err("resident tuple: no split masks".into());
         }
@@ -639,6 +640,7 @@ impl Device {
                 return Err("resident tuple: split_mask length differs from row_count".into());
             }
         }
+        let validation = validation_started.elapsed();
         let shared = self.shared(buffers, split_masks, "search tuple")?;
         let workspace = ResidentSearch {
             device: self,
@@ -657,7 +659,7 @@ impl Device {
         let rows = self.upload("search tuple", "key_chrono_rows", keys.key_chrono_rows)?;
         self.sync("search tuple", "upload")?;
         let timings = Timings {
-            upload: workspace.timings.upload + started.elapsed(),
+            upload: validation + workspace.timings.upload + started.elapsed(),
             allocated_bytes: workspace.timings.allocated_bytes
                 + offsets.num_bytes()
                 + rows.num_bytes(),
@@ -674,6 +676,55 @@ impl Device {
 }
 
 impl<'data> ResidentTuple<'data> {
+    /// Replace only expiry-dependent arrays; the feature matrix and sparse keys stay resident.
+    pub fn set_outcome(
+        &mut self,
+        buffers: SearchBuffers<'data>,
+        split_mask: &'data [u8],
+    ) -> Result<Timings, String> {
+        let started = Instant::now();
+        crate::search::validate_tuple_outcome(self.workspace.buffers, buffers, split_mask)?;
+        let device = self.workspace.device;
+        device.sync("search tuple outcome", "before upload")?;
+        let shared = &mut self.workspace.shared;
+        device
+            .stream
+            .memcpy_htod(buffers.release_time_ms, &mut shared.release_time_ms)
+            .map_err(|source| error("search tuple outcome", "release_time_ms", source))?;
+        device
+            .stream
+            .memcpy_htod(buffers.settlement_time_ms, &mut shared.settlement_time_ms)
+            .map_err(|source| error("search tuple outcome", "settlement_time_ms", source))?;
+        device
+            .stream
+            .memcpy_htod(buffers.valid, &mut shared.valid)
+            .map_err(|source| error("search tuple outcome", "valid", source))?;
+        device
+            .stream
+            .memcpy_htod(buffers.buy_win, &mut shared.buy_win)
+            .map_err(|source| error("search tuple outcome", "buy_win", source))?;
+        device
+            .stream
+            .memcpy_htod(buffers.sell_win, &mut shared.sell_win)
+            .map_err(|source| error("search tuple outcome", "sell_win", source))?;
+        device
+            .stream
+            .memcpy_htod(buffers.tie, &mut shared.tie)
+            .map_err(|source| error("search tuple outcome", "tie", source))?;
+        device
+            .stream
+            .memcpy_htod(split_mask, &mut shared.split_masks[0])
+            .map_err(|source| error("search tuple outcome", "split_mask", source))?;
+        device.sync("search tuple outcome", "upload")?;
+        self.workspace.buffers = buffers;
+        self.workspace.split_masks[0] = split_mask;
+        Ok(Timings {
+            upload: started.elapsed(),
+            allocated_bytes: self.timings.allocated_bytes,
+            ..Timings::default()
+        })
+    }
+
     pub fn upload_batch<'stage>(
         &'stage self,
         candidates: CandidateConditions<'stage>,

@@ -143,25 +143,32 @@ fn cpu_resident_sparse_batches_match_one_shot_across_forced_blocks_and_expiries(
     let sparse_rows: Vec<i32> = (0..rows as i32).collect();
     let offsets = [0, rows as i32];
     let split_masks = [&case.split[..]];
+    let before = CpuSparseTuple::construction_count();
     for block in &plan.blocks {
         let codes: Vec<i16> = (0..block.columns.len())
             .flat_map(|column| (0..rows).map(move |row| ((column + row) % 2) as i16))
             .collect();
-        let buffers = SearchBuffers {
+        let buy_variants = [case.buy.clone(), vec![0; rows], vec![1; rows]];
+        let release_variants = [
+            case.release.clone(),
+            case.release.iter().map(|time| time + 200).collect(),
+            case.release.iter().map(|time| time + 400).collect(),
+        ];
+        let buffers = |variant: usize| SearchBuffers {
             feature_codes: &codes,
             feature_count: block.columns.len() as i32,
             row_count: rows as i32,
             ordered_rows: &ordered,
             decision_time_ms: &case.entry,
-            release_time_ms: &case.release,
+            release_time_ms: &release_variants[variant],
             settlement_time_ms: &case.settlement,
             valid: &case.valid,
-            buy_win: &case.buy,
+            buy_win: &buy_variants[variant],
             sell_win: &case.sell,
             tie: &case.tie,
         };
-        let tuple = CpuSparseTuple::new(
-            buffers,
+        let mut tuple = CpuSparseTuple::new(
+            buffers(0),
             &split_masks,
             SparseKeys {
                 key_chrono_offsets: &offsets,
@@ -180,7 +187,8 @@ fn cpu_resident_sparse_batches_match_one_shot_across_forced_blocks_and_expiries(
                 candidate_offsets: &candidate_offsets,
                 candidate_count: 1,
             };
-            for expiry in [1, case.expiry_ms, 120_000] {
+            for (variant, expiry) in [1, case.expiry_ms, 120_000].into_iter().enumerate() {
+                tuple.set_outcome(buffers(variant), &case.split).unwrap();
                 let resident = tuple
                     .score_batch(0, candidates, &drivers, expiry, case.payout)
                     .unwrap();
@@ -195,10 +203,10 @@ fn cpu_resident_sparse_batches_match_one_shot_across_forced_blocks_and_expiries(
                     &sparse_rows,
                     &case.split,
                     &case.entry,
-                    &case.release,
+                    &release_variants[variant],
                     &case.settlement,
                     &case.valid,
-                    &case.buy,
+                    &buy_variants[variant],
                     &case.sell,
                     &case.tie,
                     1,
@@ -211,6 +219,10 @@ fn cpu_resident_sparse_batches_match_one_shot_across_forced_blocks_and_expiries(
             }
         }
     }
+    assert_eq!(
+        CpuSparseTuple::construction_count() - before,
+        plan.blocks.len()
+    );
 }
 
 #[cfg(feature = "cuda")]
@@ -232,6 +244,8 @@ fn cuda_resident_tuple_matches_cpu_reference() {
     let ordered: Vec<i64> = (0..rows as i64).collect();
     let sparse_rows: Vec<i32> = (0..rows as i32).collect();
     let offsets = [0, rows as i32];
+    let alternate_release: Vec<i64> = case.release.iter().map(|time| time + 200).collect();
+    let alternate_buy = vec![0_u8; rows];
     let buffers = SearchBuffers {
         feature_codes: &codes,
         feature_count: 1,
@@ -245,7 +259,7 @@ fn cuda_resident_tuple_matches_cpu_reference() {
         sell_win: &case.sell,
         tie: &case.tie,
     };
-    let tuple = device
+    let mut tuple = device
         .search_tuple_workspace(
             buffers,
             &[&case.split],
@@ -297,6 +311,53 @@ fn cuda_resident_tuple_matches_cpu_reference() {
         .unwrap();
         assert_eq!(actual.output, expected.output);
     }
+    drop(batch);
+    let alternate = SearchBuffers {
+        release_time_ms: &alternate_release,
+        buy_win: &alternate_buy,
+        ..buffers
+    };
+    let transfer = tuple.set_outcome(alternate, &case.split).unwrap();
+    assert!(transfer.upload > std::time::Duration::ZERO);
+    assert_eq!(transfer.allocated_bytes, tuple.timings.allocated_bytes);
+    let batch = tuple
+        .upload_batch(
+            CandidateConditions {
+                condition_feature: &features,
+                condition_bucket: &buckets,
+                candidate_offsets: &candidate_offsets,
+                candidate_count: 1,
+            },
+            &drivers,
+        )
+        .unwrap();
+    let actual = batch
+        .score_sparse_dual(0, case.expiry_ms, case.payout)
+        .unwrap();
+    let expected = score_bucket_plans_cap1_sparse_dual(
+        &Backend::Cpu,
+        &codes,
+        &features,
+        &buckets,
+        &candidate_offsets,
+        &drivers,
+        &offsets,
+        &sparse_rows,
+        &case.split,
+        &case.entry,
+        &alternate_release,
+        &case.settlement,
+        &case.valid,
+        &alternate_buy,
+        &case.sell,
+        &case.tie,
+        1,
+        rows as i32,
+        case.expiry_ms,
+        case.payout,
+    )
+    .unwrap();
+    assert_eq!(actual.output, expected.output);
 }
 
 struct SearchCase {

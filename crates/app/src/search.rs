@@ -1492,6 +1492,33 @@ fn raw_at(values: &[i64], position: usize) -> RawCounts {
 
 /// Stream block tuples, keeping only compact whole-family counts. Each tuple's sparse index is
 /// scoped to its columns and built once; batches carry only conjunctions and driver IDs.
+fn condition_slots(max_conditions: u32, resolved: usize) -> usize {
+    (max_conditions as usize).min(resolved)
+}
+
+fn tuple_buffers<'a>(
+    codes: &'a [i16],
+    feature_count: i32,
+    rows: i32,
+    ordered: &'a [i64],
+    entry_times: &'a [i64],
+    outcome: &'a DeviceRows,
+) -> kernels::SearchBuffers<'a> {
+    kernels::SearchBuffers {
+        feature_codes: codes,
+        feature_count,
+        row_count: rows,
+        ordered_rows: ordered,
+        decision_time_ms: entry_times,
+        release_time_ms: &outcome.release_ms,
+        settlement_time_ms: &outcome.release_ms,
+        valid: &outcome.valid,
+        buy_win: &outcome.buy_win,
+        sell_win: &outcome.sell_win,
+        tie: &outcome.tie,
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn score_streamed(
     settings: &Search,
@@ -1522,11 +1549,30 @@ fn score_streamed(
             entry.insert(device_rows(development, &builder, &references, expiry)?);
         }
     }
+    let entry_times = &outcome_rows
+        .first_key_value()
+        .ok_or("search has no expiry outcomes")?
+        .1
+        .decision_ms;
+    if outcome_rows
+        .values()
+        .any(|outcome| outcome.decision_ms != *entry_times)
+    {
+        return Err("expiry outcomes disagree on entry times".into());
+    }
     let start =
         binary_alpha_engine::market::parse_event_time_micros(&settings.development.decision_start)?;
     let end =
         binary_alpha_engine::market::parse_event_time_micros(&settings.development.decision_end)?;
     let mask = index.slot_mask(start, end);
+    let mut split_mask = mask.clone();
+    for (flag, &entry) in split_mask.iter_mut().zip(entry_times) {
+        if entry == i64::MIN {
+            *flag = 0;
+        }
+    }
+    let mut ordered: Vec<i64> = (0..rows as i64).collect();
+    ordered.sort_by_key(|&row| (entry_times[row as usize], row));
     let mut lengths = Vec::with_capacity(conditions.len());
     for column in 0..conditions.len() {
         let (codes, buckets) = projection_block_from_development(
@@ -1559,7 +1605,7 @@ fn score_streamed(
     let plan = kernels::plan_column_blocks(
         &lengths,
         rows,
-        settings.max_conditions as usize,
+        condition_slots(settings.max_conditions, conditions.len()),
         1024,
         1,
         1,
@@ -1596,50 +1642,92 @@ fn score_streamed(
                     signals,
                     lowered_bindings,
                 )?;
+                let mut offsets = vec![0_i32];
+                let mut sparse_rows = Vec::new();
+                for (column, &bucket) in buckets.iter().enumerate() {
+                    for &row in &ordered {
+                        if codes[column * rows + row as usize] == bucket {
+                            sparse_rows
+                                .push(i32::try_from(row).map_err(|_| "sparse row exceeds i32")?);
+                        }
+                    }
+                    offsets.push(
+                        i32::try_from(sparse_rows.len())
+                            .map_err(|_| "sparse row list exceeds i32")?,
+                    );
+                }
+                let keys = kernels::SparseKeys {
+                    key_chrono_offsets: &offsets,
+                    key_chrono_rows: &sparse_rows,
+                };
+                let first = outcome_rows.first_key_value().expect("nonempty outcomes").1;
+                let cpu = backends.len() == 1 && matches!(backends[0], Backend::Cpu);
+                let mut cpu_workspace = if cpu {
+                    Some(kernels::CpuSparseTuple::new(
+                        tuple_buffers(
+                            &codes,
+                            requested.len() as i32,
+                            rows as i32,
+                            &ordered,
+                            entry_times,
+                            first,
+                        ),
+                        &[&split_mask],
+                        keys,
+                    )?)
+                } else {
+                    None
+                };
+                #[cfg(feature = "cuda")]
+                let mut workspaces = if cpu {
+                    Vec::new()
+                } else {
+                    let workspaces: Vec<_> = backends
+                        .iter()
+                        .map(|backend| match backend {
+                            Backend::Cuda(device) => device.search_tuple_workspace(
+                                tuple_buffers(
+                                    &codes,
+                                    requested.len() as i32,
+                                    rows as i32,
+                                    &ordered,
+                                    entry_times,
+                                    first,
+                                ),
+                                &[&split_mask],
+                                keys,
+                            ),
+                            Backend::Cpu => Err("mixed CPU and CUDA search devices".into()),
+                        })
+                        .collect::<Result<_, String>>()?;
+                    for workspace in &workspaces {
+                        add(&mut clock.device, workspace.timings);
+                    }
+                    workspaces
+                };
                 for (&expiry, outcome) in &outcome_rows {
                     let duration =
                         i64::from(development.outcome.rule.expiry_seconds[expiry]) * 1_000_000;
-                    let mut split_mask = mask.clone();
-                    for (flag, &entry) in split_mask.iter_mut().zip(&outcome.decision_ms) {
-                        if entry == i64::MIN {
-                            *flag = 0;
+                    let buffers = tuple_buffers(
+                        &codes,
+                        requested.len() as i32,
+                        rows as i32,
+                        &ordered,
+                        entry_times,
+                        outcome,
+                    );
+                    if !std::ptr::eq(outcome, first) {
+                        if let Some(workspace) = &mut cpu_workspace {
+                            workspace.set_outcome(buffers, &split_mask)?;
+                        }
+                        #[cfg(feature = "cuda")]
+                        for workspace in &mut workspaces {
+                            add(
+                                &mut clock.device,
+                                workspace.set_outcome(buffers, &split_mask)?,
+                            );
                         }
                     }
-                    let mut ordered: Vec<i64> = (0..rows as i64).collect();
-                    ordered.sort_by_key(|&row| (outcome.decision_ms[row as usize], row));
-                    let mut offsets = vec![0_i32];
-                    let mut sparse_rows = Vec::new();
-                    for (column, &bucket) in buckets.iter().enumerate() {
-                        for &row in &ordered {
-                            if codes[column * rows + row as usize] == bucket {
-                                sparse_rows.push(
-                                    i32::try_from(row).map_err(|_| "sparse row exceeds i32")?,
-                                );
-                            }
-                        }
-                        offsets.push(
-                            i32::try_from(sparse_rows.len())
-                                .map_err(|_| "sparse row list exceeds i32")?,
-                        );
-                    }
-                    let buffers = kernels::SearchBuffers {
-                        feature_codes: &codes,
-                        feature_count: i32::try_from(requested.len())
-                            .map_err(|_| "requested column count exceeds i32")?,
-                        row_count: rows as i32,
-                        ordered_rows: &ordered,
-                        decision_time_ms: &outcome.decision_ms,
-                        release_time_ms: &outcome.release_ms,
-                        settlement_time_ms: &outcome.release_ms,
-                        valid: &outcome.valid,
-                        buy_win: &outcome.buy_win,
-                        sell_win: &outcome.sell_win,
-                        tie: &outcome.tie,
-                    };
-                    let keys = kernels::SparseKeys {
-                        key_chrono_offsets: &offsets,
-                        key_chrono_rows: &sparse_rows,
-                    };
                     let apply =
                         |scored: Vec<(u64, RawCounts, RawCounts)>,
                          records: &mut [search::CompactMember]| {
@@ -1661,9 +1749,7 @@ fn score_streamed(
                                 }
                             }
                         };
-                    if backends.len() == 1 && matches!(backends[0], Backend::Cpu) {
-                        let workspace =
-                            kernels::CpuSparseTuple::new(buffers, &[&split_mask], keys)?;
+                    if let Some(workspace) = &cpu_workspace {
                         tuple_batches(
                             &plan.blocks,
                             tuple,
@@ -1682,7 +1768,7 @@ fn score_streamed(
                                     })
                                     .collect();
                                 let scored =
-                                    score_cpu_batches(&workspace, &batches, 0, duration, 0)?;
+                                    score_cpu_batches(workspace, &batches, 0, duration, 0)?;
                                 apply(scored, &mut records);
                                 Ok(())
                             },
@@ -1690,18 +1776,6 @@ fn score_streamed(
                     } else {
                         #[cfg(feature = "cuda")]
                         {
-                            let workspaces: Vec<_> = backends
-                                .iter()
-                                .map(|backend| match backend {
-                                    Backend::Cuda(device) => {
-                                        device.search_tuple_workspace(buffers, &[&split_mask], keys)
-                                    }
-                                    Backend::Cpu => Err("mixed CPU and CUDA search devices".into()),
-                                })
-                                .collect::<Result<_, String>>()?;
-                            for workspace in &workspaces {
-                                add(&mut clock.device, workspace.timings);
-                            }
                             tuple_batches(
                                 &plan.blocks,
                                 tuple,
@@ -2320,15 +2394,6 @@ fn verify_read_family_streamed(
             "{uri}: resolved rules, hash, or enumerated count differs from the fitted development plan"
         ));
     }
-    let mut inputs = vec![development.input.clone()];
-    if resolved.members > 0 && settings.evaluation.is_some() {
-        inputs.push(bind_evaluation(settings, &development, access)?);
-    }
-    if manifest.inputs != inputs {
-        return Err(format!(
-            "{uri}: manifest inputs are not the bound generations"
-        ));
-    }
     let conditions = &resolved.conditions;
     let lowered_indices: Vec<usize> = conditions
         .iter()
@@ -2359,6 +2424,9 @@ fn verify_read_family_streamed(
             ));
         }
         (Some(lowering), false) => {
+            if lowering.role != "development" {
+                return Err(format!("{uri}: lowering replay must have development role"));
+            }
             let (_, events) = read_verified_chunk(uri, store, lowering, access)?;
             let table = search::lowering_replay_for(
                 settings,
@@ -2449,81 +2517,151 @@ fn verify_read_family_streamed(
             ));
         }
     }
+    let expected_chunks: Vec<(String, Vec<String>)> = [
+        ("development", family.members.iter().collect::<Vec<_>>()),
+        (
+            "evaluation",
+            if settings.evaluation.is_some() {
+                family
+                    .members
+                    .iter()
+                    .filter(|member| member.rank.is_some())
+                    .collect()
+            } else {
+                Vec::new()
+            },
+        ),
+    ]
+    .into_iter()
+    .flat_map(|(role, members)| {
+        members
+            .chunks(settings.chunk_size as usize)
+            .map(move |chunk| {
+                (
+                    role.to_string(),
+                    chunk
+                        .iter()
+                        .map(|member| format!("m{}", member.global_index.expect("schema-2 member")))
+                        .collect(),
+                )
+            })
+            .collect::<Vec<_>>()
+    })
+    .collect();
+    if family
+        .chunks
+        .iter()
+        .map(|chunk| (chunk.role.clone(), chunk.bindings.clone()))
+        .collect::<Vec<_>>()
+        != expected_chunks
+    {
+        return Err(format!(
+            "{uri}: chunk bindings are not canonical survivor partitions"
+        ));
+    }
     let mut seen: BTreeMap<(String, String), ()> = BTreeMap::new();
     let mut replayed = 0;
-    for chunk in &family.chunks {
-        let (chunk_manifest, events) = read_verified_chunk(uri, store, chunk, access)?;
-        let members =
-            chunk_members_streamed(&chunk.bindings, settings, &family.plan_identity, conditions)?;
-        let (role, window) = match chunk.role.as_str() {
-            "development" => (DatasetRole::Development, &settings.development),
-            "evaluation" => (
-                DatasetRole::Evaluation,
-                settings
-                    .evaluation
-                    .as_ref()
-                    .ok_or_else(|| format!("{uri}: evaluation chunk without window"))?,
-            ),
-            other => return Err(format!("{uri}: chunk role `{other}`")),
-        };
-        let table = search::replay_table(
-            settings,
-            role,
-            window,
-            &development.instrument,
-            &members,
-            settings.account.initial_cash,
-        );
-        if restored_definition(&events)?.replay != table {
-            return Err(format!(
-                "{uri}: chunk {} is not the table synthesized for its recorded members",
-                chunk.generation
-            ));
-        }
-        let summary = Summary::from_json(&read_object(
-            store,
-            &chunk_manifest.objects,
-            SUMMARY_OBJECT_PATH,
-        )?)
-        .map_err(|error| format!("{uri}: {}: {error}", chunk.generation))?;
-        let splits = if role == DatasetRole::Evaluation {
-            search::project_splits(events.iter().cloned(), &currency)
-        } else {
-            BTreeMap::new()
-        };
-        for (id, _, _) in &members {
-            let global: u64 = id[1..].parse().expect("checked");
-            let position = survivors
-                .binary_search(&global)
-                .map_err(|_| format!("{uri}: chunk replays screened member {global}"))?;
-            if seen.insert((id.clone(), chunk.role.clone()), ()).is_some() {
-                return Err(format!(
-                    "{uri}: member {global} is replayed twice for {}",
-                    chunk.role
-                ));
-            }
-            let member = &family.members[position];
-            let group = summary.strategies.get(id).cloned().unwrap_or_default();
-            let matches = if role == DatasetRole::Development {
-                replayed += 1;
-                member.development.as_ref() == Some(&group)
-            } else {
-                member.evaluation.as_ref() == Some(&group)
-                    && member.evaluation_splits == splits.get(id).cloned().unwrap_or_default()
-            };
-            if !matches {
-                return Err(format!(
-                    "{uri}: member {global} records groups its replay does not hold"
-                ));
-            }
-            if member.rank.is_some() {
-                let series = settled_profits(&events, id, settings.account.scale);
-                let stability =
-                    resample(&Backend::Cpu, settings, member, role, &series, &mut clock)?;
-                if member.stability.get(&chunk.role) != Some(&stability) {
+    for phase in ["development", "evaluation"] {
+        if phase == "evaluation" {
+            for member in &family.members {
+                let global = member.global_index.expect("schema-2 parsed member");
+                if !seen.contains_key(&(format!("m{global}"), "development".into()))
+                    || member.development.is_none()
+                    || member.stability.contains_key("development") != member.rank.is_some()
+                {
                     return Err(format!(
-                        "{uri}: member {global} records stability its settlements do not produce"
+                        "{uri}: member {global} is not replayed and resampled exactly as its status requires"
                     ));
+                }
+            }
+            let mut inputs = vec![development.input.clone()];
+            if resolved.members > 0 && settings.evaluation.is_some() {
+                inputs.push(bind_evaluation(settings, &development, access)?);
+            }
+            if manifest.inputs != inputs {
+                return Err(format!(
+                    "{uri}: manifest inputs are not the bound generations"
+                ));
+            }
+        }
+        for chunk in family.chunks.iter().filter(|chunk| chunk.role == phase) {
+            let (chunk_manifest, events) = read_verified_chunk(uri, store, chunk, access)?;
+            let members = chunk_members_streamed(
+                &chunk.bindings,
+                settings,
+                &family.plan_identity,
+                conditions,
+            )?;
+            let (role, window) = match chunk.role.as_str() {
+                "development" => (DatasetRole::Development, &settings.development),
+                "evaluation" => (
+                    DatasetRole::Evaluation,
+                    settings
+                        .evaluation
+                        .as_ref()
+                        .ok_or_else(|| format!("{uri}: evaluation chunk without window"))?,
+                ),
+                other => return Err(format!("{uri}: chunk role `{other}`")),
+            };
+            let table = search::replay_table(
+                settings,
+                role,
+                window,
+                &development.instrument,
+                &members,
+                settings.account.initial_cash,
+            );
+            if restored_definition(&events)?.replay != table {
+                return Err(format!(
+                    "{uri}: chunk {} is not the table synthesized for its recorded members",
+                    chunk.generation
+                ));
+            }
+            let summary = Summary::from_json(&read_object(
+                store,
+                &chunk_manifest.objects,
+                SUMMARY_OBJECT_PATH,
+            )?)
+            .map_err(|error| format!("{uri}: {}: {error}", chunk.generation))?;
+            let splits = if role == DatasetRole::Evaluation {
+                search::project_splits(events.iter().cloned(), &currency)
+            } else {
+                BTreeMap::new()
+            };
+            for (id, _, _) in &members {
+                let global: u64 = id[1..].parse().expect("checked");
+                let position = survivors
+                    .binary_search(&global)
+                    .map_err(|_| format!("{uri}: chunk replays screened member {global}"))?;
+                if seen.insert((id.clone(), chunk.role.clone()), ()).is_some() {
+                    return Err(format!(
+                        "{uri}: member {global} is replayed twice for {}",
+                        chunk.role
+                    ));
+                }
+                let member = &family.members[position];
+                let group = summary.strategies.get(id).cloned().unwrap_or_default();
+                let matches = if role == DatasetRole::Development {
+                    replayed += 1;
+                    member.development.as_ref() == Some(&group)
+                } else {
+                    member.evaluation.as_ref() == Some(&group)
+                        && member.evaluation_splits == splits.get(id).cloned().unwrap_or_default()
+                };
+                if !matches {
+                    return Err(format!(
+                        "{uri}: member {global} records groups its replay does not hold"
+                    ));
+                }
+                if member.rank.is_some() {
+                    let series = settled_profits(&events, id, settings.account.scale);
+                    let stability =
+                        resample(&Backend::Cpu, settings, member, role, &series, &mut clock)?;
+                    if member.stability.get(&chunk.role) != Some(&stability) {
+                        return Err(format!(
+                            "{uri}: member {global} records stability its settlements do not produce"
+                        ));
+                    }
                 }
             }
         }
@@ -2561,6 +2699,18 @@ mod projection_tests {
     use binary_alpha_engine::config::StreamKey;
     use binary_alpha_engine::execution::{Comparator, Condition, Threshold};
     use binary_alpha_engine::features::{FittedEncoding, ProjectionKind};
+
+    #[test]
+    fn wide_search_budget_uses_resolved_condition_slots() {
+        let rows = 4_440_960;
+        let slots = condition_slots(1_000, 1);
+        assert_eq!(slots, 1);
+        let plan =
+            kernels::plan_column_blocks(&[rows], rows, slots, 1_024, 1, 1, 8_151 * 1024 * 1024)
+                .unwrap();
+        assert_eq!(plan.blocks.len(), 1);
+        assert_eq!(plan.blocks[0].columns, 0..1);
+    }
 
     #[test]
     fn wide_block_tuples_visit_only_feasible_combinations() {
