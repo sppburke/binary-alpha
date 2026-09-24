@@ -471,12 +471,7 @@ pub fn generated_members(
             let mut ordinals = Vec::new();
             let mut eligible = true;
             for (condition_index, condition) in member.conditions.iter().enumerate() {
-                let encoding = plan.stream(condition.stream).and_then(|stream| {
-                    stream
-                        .encodings
-                        .iter()
-                        .find(|encoding| encoding.output == condition.output)
-                });
+                let encoding = encoding_of(plan, condition);
                 if let Some(encoding) = encoding
                     .filter(|encoding| encoding.encoding == ProjectionKind::DevelopmentFifths)
                 {
@@ -747,7 +742,11 @@ pub enum Failure {
 
 /// The fitted encoding a condition reads, when its output is one.
 fn encoding_of<'a>(plan: &'a FeaturePlan, condition: &Condition) -> Option<&'a FittedEncoding> {
-    plan.stream(condition.stream)?
+    let stream = plan.stream(condition.stream)?;
+    if stream.output_index(&condition.output).is_some() {
+        return None;
+    }
+    stream
         .encodings
         .iter()
         .find(|encoding| encoding.output == condition.output)

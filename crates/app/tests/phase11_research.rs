@@ -800,6 +800,39 @@ fn generated_portfolio_empty_selection_and_run_skip_outer_inputs() {
 }
 
 #[test]
+fn no_feasible_run_rejects_fabricated_outer_claim() {
+    let mut fixture = generated_fixture("phase11_empty_run_claim", 1);
+    for instrument in &mut fixture.config.research.as_mut().unwrap().instruments {
+        instrument.search.gates.min_settled = 1_000_000;
+    }
+    fixture.save();
+    fixture.run().unwrap();
+    let (mut manifest, mut run) = fixture.run_record();
+    assert_eq!(run.state, RunState::NoFeasiblePolicy);
+    run.claims.push("fabricated-assessment-claim".into());
+    let bytes = run.to_json();
+    let object = &mut manifest.objects[0];
+    object.sha256 = research::digest(b"", &bytes);
+    object.key = binary_alpha_engine::dataset::object_key(&object.sha256);
+    object.bytes = bytes.len() as u64;
+    object.crc32c = None;
+    object.generation = None;
+    write(&fixture.scratch.path("published").join(&object.key), bytes);
+    let store =
+        binary_alpha_app::store::Store::open(&fixture.config.storage.publication_uri).unwrap();
+    let key = manifest.key();
+    let error = binary_alpha_app::research::verify_run(
+        &store.uri(&key),
+        &store,
+        &key,
+        &manifest.to_json(),
+        research::Access::ORDINARY,
+    )
+    .unwrap_err();
+    assert!(error.contains("outer claims and results"), "{error}");
+}
+
+#[test]
 fn generated_portfolio_rejects_wrong_instrument_and_multiple_alternatives() {
     for wrong in ["instrument", "alternative"] {
         let mut fixture = generated_fixture(&format!("phase11_generated_bad_{wrong}"), 1);
@@ -821,6 +854,41 @@ fn generated_portfolio_rejects_wrong_instrument_and_multiple_alternatives() {
             "{wrong}: {error}"
         );
         no_access(&logged(&fixture.log()), &fixture.protected());
+    }
+}
+
+#[test]
+fn generated_missing_binding_fails_before_fold_and_refit_profiles_publish() {
+    let mut fixture = generated_fixture("phase11_missing_binding_profiles", 1);
+    let research = fixture.config.research.as_mut().unwrap();
+    for (input, fit) in research.folds[0]
+        .inputs
+        .iter_mut()
+        .zip(&research.refit.fits)
+    {
+        input.fit_manifest = fit.clone();
+    }
+    let fit_generations: BTreeSet<_> = research
+        .refit
+        .fits
+        .iter()
+        .map(|fit| fit.generation().to_string())
+        .collect();
+    research.portfolio.bindings[0].instrument = INSTRUMENTS[1].into();
+    fixture.save();
+    let error = fixture.run().unwrap_err();
+    assert!(error.contains("requires exactly one binding"), "{error}");
+    for entry in fs::read_dir(fixture.scratch.path("published/manifests")).unwrap() {
+        let path = entry.unwrap().path().join("ready.json");
+        if !path.exists() {
+            continue;
+        }
+        let manifest: Value = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
+        assert!(
+            manifest["kind"] != "instrument_stream"
+                || !fit_generations.contains(manifest["source_generation"].as_str().unwrap()),
+            "a fold-fit or refit profile was published before generated binding validation"
+        );
     }
 }
 
@@ -1000,6 +1068,49 @@ fn generated_ordinals_follow_fitted_edges_not_label_code_order() {
         fallback[0].member,
         second_rank.global_index.unwrap() as usize
     );
+}
+
+#[test]
+fn generated_raw_output_precedes_same_named_fifths_through_folds() {
+    use binary_alpha_engine::config::{Bins, NamedSearchCondition, Outputs};
+
+    let mut fixture = generated_fixture("phase11_generated_raw_fifths_collision", 1);
+    for instrument in &mut fixture.config.research.as_mut().unwrap().instruments {
+        instrument.features.outputs = Some(Outputs::Named(vec!["body_bps".into()]));
+        instrument.features.encodings = Some(Encodings {
+            max_labels: 8,
+            outputs: vec![EncodingSpec {
+                output: "body_bps".into(),
+                bins: Some(Bins::DevelopmentFifths),
+            }],
+        });
+        instrument.search.conditions = vec![SearchCondition::Named(NamedSearchCondition {
+            stream: instrument.search.base_stream,
+            output: "body_bps".into(),
+            comparator: Comparator::Ge,
+            thresholds: vec![Threshold::Number(0.0)],
+        })];
+    }
+    fixture.save();
+    let report = fixture.run().unwrap();
+    let (_, run) = fixture.run_record();
+    let selection = fixture.selection(&run);
+    let settings = selection.config.portfolio.as_ref().unwrap();
+    assert!(!settings.members.is_empty(), "{report}");
+    assert!(
+        settings
+            .members
+            .iter()
+            .all(|member| member.ordinals.is_empty())
+    );
+    assert!(selection.choices.iter().any(|choice| {
+        choice
+            .folds
+            .iter()
+            .any(|fold| fold.replay.is_some() && fold.inapplicable.is_none())
+    }));
+    fixture.verify(&run.selection).unwrap();
+    fixture.verify(&fixture.generation()).unwrap();
 }
 
 #[test]

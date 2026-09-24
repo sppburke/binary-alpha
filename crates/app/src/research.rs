@@ -855,6 +855,23 @@ fn develop(
             family: searched.generation,
         });
     }
+    if research.portfolio.generate.is_some() {
+        // Portfolio lowering needs profile URIs for fold and refit fits, but generation and
+        // static validation do not read those profiles. Bind their declared URIs provisionally
+        // so a bad generated portfolio fails before any of their audits publish.
+        let mut provisional = profiles.clone();
+        for fit in research
+            .folds
+            .iter()
+            .flat_map(|fold| fold.inputs.iter().map(|input| &input.fit_manifest))
+            .chain(research.refit.fits.iter())
+        {
+            provisional
+                .entry(fit.generation().to_string())
+                .or_insert_with(|| fit.clone());
+        }
+        selection_table(research, families.clone(), &provisional, access)?;
+    }
     for fit in research
         .folds
         .iter()
@@ -1549,6 +1566,15 @@ pub fn verify_run(
     };
     let selection =
         verified_children(uri, store, config, &run.instruments, &run.selection, access)?;
+    if matches!(
+        selection.state,
+        State::NoFeasiblePolicy | State::RefitInapplicable { .. }
+    ) && (!run.claims.is_empty() || !run.outer.is_empty())
+    {
+        return Err(format!(
+            "{uri}: a non-selected run cannot carry outer claims and results"
+        ));
+    }
     // The state and, for a selected policy, the outer claims and every scenario.
     let expected_state = match &selection.state {
         State::NoFeasiblePolicy => RunState::NoFeasiblePolicy,
