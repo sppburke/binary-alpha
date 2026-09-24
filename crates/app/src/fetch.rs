@@ -22,6 +22,7 @@ use binary_alpha_engine::market::{
 };
 use binary_alpha_engine::research::{Access, Declaration};
 use serde::{Deserialize, Serialize};
+use std::collections::VecDeque;
 use std::fs;
 use std::io::Write;
 use std::path::Path;
@@ -56,7 +57,7 @@ pub struct Actual {
     pub first: String,
     pub last: String,
 }
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct OccurrenceIdentity {
     pub acquisition_id: String,
     pub intent: Option<String>,
@@ -912,46 +913,102 @@ pub fn prepare(
     plan(config, local, requested, None, declaration).map(|_| ())
 }
 
-/// Re-received rows must equal the retained rows wherever both are verified: from `floor`,
-/// the start of the baseline's verified coverage or the seed's requested overlap, so a seed's
-/// own unknown gaps are never mistaken for provider conflicts.
-fn check_verified_overlap<R: Row>(
-    instrument: &InstrumentId,
-    previous: &[R],
-    received: &[R],
-    floor: i64,
-) -> Result<(), String> {
-    if let (Some(first), Some(last), Some(old_first), Some(old_last)) = (
-        received.first(),
-        received.last(),
-        previous.first(),
-        previous.last(),
-    ) {
+/// Every received row, older pages first, assembled across page boundaries, and how far its
+/// overlap with the retained rows is proven. While the rows stay time-ordered, as provider pages chain,
+/// `checked` is the start of the proven interval, so each check compares only the interval its
+/// page completes; `None` means a page left them out of order and every check compares the
+/// whole window.
+struct Received<R> {
+    rows: VecDeque<R>,
+    checked: Option<i64>,
+}
+
+impl<R: Row> Received<R> {
+    fn new() -> Self {
+        Self {
+            rows: VecDeque::new(),
+            checked: Some(i64::MAX),
+        }
+    }
+
+    fn prepend(&mut self, page: Vec<R>) {
+        let added = prepend(page, &mut self.rows);
+        if added > 0
+            && added < self.rows.len()
+            && self.rows[added - 1].time() > self.rows[added].time()
+        {
+            self.checked = None;
+        }
+    }
+
+    /// Re-received rows must equal the retained rows wherever both are verified: from `floor`,
+    /// the start of the baseline's verified coverage or the seed's requested overlap, so a
+    /// seed's own unknown gaps are never mistaken for provider conflicts.
+    fn check_verified_overlap(
+        &mut self,
+        instrument: &InstrumentId,
+        previous: &[R],
+        floor: i64,
+    ) -> Result<(), String> {
+        let (Some(first), Some(last), Some(old_first), Some(old_last)) = (
+            self.rows.front(),
+            self.rows.back(),
+            previous.first(),
+            previous.last(),
+        ) else {
+            return Ok(());
+        };
         let start = first.time().max(old_first.time()).max(floor);
         let end = last.time().min(old_last.time());
-        let overlap = |row: &&R| row.time() >= start && row.time() <= end;
-        if !received
-            .iter()
-            .filter(overlap)
-            .eq(previous.iter().filter(overlap))
-        {
+        let same = match self.checked {
+            Some(checked) => {
+                // Both sides are time-ordered, so the unproven part of the window is one span
+                // of each; the spans newer than `checked` already matched.
+                let upper = checked.min(end.saturating_add(1)).max(start);
+                let received = self.rows.partition_point(|row| row.time() < start)
+                    ..self.rows.partition_point(|row| row.time() < upper);
+                let retained = previous.partition_point(|row| row.time() < start)
+                    ..previous.partition_point(|row| row.time() < upper);
+                self.checked = Some(checked.min(start));
+                self.rows.range(received).eq(&previous[retained])
+            }
+            None => {
+                let overlap = |row: &&R| row.time() >= start && row.time() <= end;
+                self.rows
+                    .iter()
+                    .filter(overlap)
+                    .eq(previous.iter().filter(overlap))
+            }
+        };
+        if !same {
             return Err(format!(
                 "fetch {instrument}: conflicting or inconsistent reread of verified observations"
             ));
         }
+        Ok(())
     }
-    Ok(())
 }
 
 /// Removes only a proven page-boundary overlap; within-page repeated observations stay intact.
-pub fn prepend_page<R: PartialEq>(mut older: Vec<R>, newer: Vec<R>) -> Vec<R> {
+pub fn prepend_page<R: PartialEq>(older: Vec<R>, newer: Vec<R>) -> Vec<R> {
+    let mut rows = VecDeque::from(newer);
+    prepend(older, &mut rows);
+    rows.into()
+}
+
+/// Prepends `older` in place, without its longest suffix equal to the front of `newer`, and
+/// returns how many rows it added.
+fn prepend<R: PartialEq>(mut older: Vec<R>, newer: &mut VecDeque<R>) -> usize {
     let overlap = (1..=older.len().min(newer.len()))
         .rev()
-        .find(|count| older[older.len() - count..] == newer[..*count])
+        .find(|&count| newer.range(..count).eq(&older[older.len() - count..]))
         .unwrap_or(0);
     older.truncate(older.len() - overlap);
-    older.extend(newer);
-    older
+    let added = older.len();
+    for row in older.into_iter().rev() {
+        newer.push_front(row);
+    }
+    added
 }
 
 fn publish_retained(
@@ -1164,7 +1221,7 @@ fn acquire_one<R: Row>(
         });
     }
     let started = Instant::now();
-    let mut rows: Vec<R> = Vec::new();
+    let mut rows = VecDeque::new();
     let mut objects = Vec::new();
     let pages = Vec::new();
     let mut previous_rows: Vec<R> = Vec::new();
@@ -1234,7 +1291,7 @@ fn acquire_one<R: Row>(
     let mut requests: u32 = 0;
     // Every received row, assembled across page boundaries before the resume filter, so a
     // repeated observation split between two pages still matches the verified multiplicity.
-    let mut received_all: Vec<R> = Vec::new();
+    let mut received = Received::new();
     let shortfall = loop {
         // A retained page of the pending intent replays from its bytes; then live requests
         // continue from the durable cursor within this invocation's budget.
@@ -1348,14 +1405,15 @@ fn acquire_one<R: Row>(
             }
             native.symbol_id = Some(symbol_id);
         }
-        received_all = prepend_page(page_rows.clone(), received_all);
+        received.prepend(page_rows.clone());
         // A page contradicting the retained rows is never checkpointed. The oldest received
         // time is excluded until the next page can complete its multiplicity.
-        let boundary = received_all
-            .first()
+        let boundary = received
+            .rows
+            .front()
             .map_or(floor, |row| row.time().saturating_add(1).max(floor));
         validated(
-            check_verified_overlap(instrument, &previous_rows, &received_all, boundary),
+            received.check_verified_overlap(instrument, &previous_rows, boundary),
             bounds,
         )?;
         let first = page_rows.first().map(Row::time);
@@ -1408,7 +1466,7 @@ fn acquire_one<R: Row>(
                 row.time() >= fetch_start && row.time() < requested.1 && row.end() <= requested.1
             })
             .collect();
-        rows = prepend_page(kept, rows);
+        prepend(kept, &mut rows);
         if first <= fetch_start {
             break None;
         }
@@ -1421,10 +1479,11 @@ fn acquire_one<R: Row>(
     // before new requests on resume, when the following page can finish multiplicity proof.
     if !pending {
         validated(
-            check_verified_overlap(instrument, &previous_rows, &received_all, floor),
+            received.check_verified_overlap(instrument, &previous_rows, floor),
             bounds,
         )?;
     }
+    let mut rows = Vec::from(rows);
     let new_count = rows.len();
     if pending && progress.pages.is_empty() {
         // The budget expired before the first page: nothing was acquired, so nothing is
@@ -2422,5 +2481,187 @@ mod daily_baseline_tests {
             assert_eq!(results[0], results[1]);
         }
         fs::remove_dir_all(dir).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod overlap_tests {
+    use super::*;
+
+    /// Today's whole-history accumulation, kept as the oracle.
+    fn prepend_oracle(mut older: Vec<Tick>, newer: Vec<Tick>) -> Vec<Tick> {
+        let overlap = (1..=older.len().min(newer.len()))
+            .rev()
+            .find(|count| older[older.len() - count..] == newer[..*count])
+            .unwrap_or(0);
+        older.truncate(older.len() - overlap);
+        older.extend(newer);
+        older
+    }
+
+    /// Today's whole-window comparison, kept as the oracle.
+    fn overlap_oracle(previous: &[Tick], received: &[Tick], floor: i64) -> bool {
+        let (Some(first), Some(last), Some(old_first), Some(old_last)) = (
+            received.first(),
+            received.last(),
+            previous.first(),
+            previous.last(),
+        ) else {
+            return true;
+        };
+        let start = first.time().max(old_first.time()).max(floor);
+        let end = last.time().min(old_last.time());
+        let overlap = |row: &&Tick| row.time() >= start && row.time() <= end;
+        received
+            .iter()
+            .filter(overlap)
+            .eq(previous.iter().filter(overlap))
+    }
+
+    fn tick(time: i64, price: i64) -> Tick {
+        Tick {
+            event_time_micros: time,
+            price_units: price,
+        }
+    }
+
+    fn instrument() -> InstrumentId {
+        InstrumentId {
+            broker: "fixture".to_string().try_into().unwrap(),
+            provider_symbol: "S".to_string().try_into().unwrap(),
+        }
+    }
+
+    /// Each page's rows and every overlap decision, as `acquire_one` makes them, equal today's
+    /// whole-history results for time-ordered, repeated, stale, and changed pages against
+    /// consistent and perturbed baselines.
+    #[test]
+    fn incremental_overlap_matches_the_whole_window_oracle() {
+        let instrument = instrument();
+        let mut state = 0x9e37_79b9_7f4a_7c15_u64;
+        let mut random = |below: usize| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state % below as u64) as usize
+        };
+        let (mut accepted, mut rejected, mut unordered) = (0, 0, 0);
+        for _ in 0..20_000 {
+            let mut time = 0;
+            let truth: Vec<Tick> = (0..1 + random(30))
+                .map(|_| {
+                    time += random(3) as i64;
+                    tick(time, time % 5)
+                })
+                .collect();
+            let mut pages: Vec<Vec<Tick>> = Vec::new();
+            let mut high = truth.len();
+            loop {
+                let low = high - 1 - random(high.min(6));
+                let mut page = truth[low..high].to_vec();
+                let at = random(page.len());
+                match random(12) {
+                    0 => page = pages.last().cloned().unwrap_or(page),
+                    1 => {
+                        page.remove(at);
+                    }
+                    2 => page[at].price_units += 1,
+                    _ => {}
+                }
+                pages.push(page);
+                if low == 0 {
+                    break;
+                }
+                high = (low + random(3)).min(high - 1);
+            }
+            let start = random(truth.len() + 1);
+            let mut previous = truth[start..start + random(truth.len() - start + 1)].to_vec();
+            if !previous.is_empty() {
+                let at = random(previous.len());
+                match random(6) {
+                    0 => {
+                        previous.remove(at);
+                    }
+                    1 => previous.insert(at, previous[at]),
+                    2 => previous[at].price_units += 1,
+                    _ => {}
+                }
+            }
+            let floor = random(time as usize + 3) as i64 - 1;
+
+            let mut expected = Vec::new();
+            let mut received = Received::new();
+            let mut ok = true;
+            for page in &pages {
+                let newer = expected.clone();
+                expected = prepend_oracle(page.clone(), expected);
+                assert_eq!(prepend_page(page.clone(), newer), expected);
+                received.prepend(page.clone());
+                assert_eq!(received.rows, expected);
+                let boundary = expected
+                    .first()
+                    .map_or(floor, |row| row.time().saturating_add(1).max(floor));
+                ok = overlap_oracle(&previous, &expected, boundary);
+                assert_eq!(
+                    received
+                        .check_verified_overlap(&instrument, &previous, boundary)
+                        .is_ok(),
+                    ok,
+                    "{pages:?} {previous:?} {floor}"
+                );
+                if !ok {
+                    break;
+                }
+            }
+            if ok {
+                ok = overlap_oracle(&previous, &expected, floor);
+                assert_eq!(
+                    received
+                        .check_verified_overlap(&instrument, &previous, floor)
+                        .is_ok(),
+                    ok,
+                    "{pages:?} {previous:?} {floor}"
+                );
+            }
+            accepted += usize::from(ok);
+            rejected += usize::from(!ok);
+            unordered += usize::from(received.checked.is_none());
+        }
+        assert!(
+            accepted > 1_000 && rejected > 1_000 && unordered > 1_000,
+            "{accepted} accepted, {rejected} rejected, {unordered} out of order"
+        );
+    }
+
+    /// Two hundred thousand 40-row pages overlapping by one row, checked page by page against
+    /// a baseline of two million of their rows, return exactly the rows they were cut from.
+    /// Accumulating by copying the whole history per page would copy about 7.8e11 rows.
+    #[test]
+    fn two_hundred_thousand_pages_accumulate_and_verify_once() {
+        let instrument = instrument();
+        let truth: Vec<Tick> = (0..200_000 * 39 + 1)
+            .map(|time| tick(time, time % 97))
+            .collect();
+        let previous = &truth[1_000_000..3_000_000];
+        let started = Instant::now();
+        let mut received = Received::new();
+        let mut high = truth.len();
+        while high > 1 {
+            let low = high - 40;
+            received.prepend(truth[low..high].to_vec());
+            let boundary = received.rows.front().map_or(0, |row| row.time() + 1);
+            received
+                .check_verified_overlap(&instrument, previous, boundary)
+                .unwrap();
+            high = low + 1;
+        }
+        received
+            .check_verified_overlap(&instrument, previous, 0)
+            .unwrap();
+        eprintln!(
+            "200,000 pages accumulated and verified in {:?}",
+            started.elapsed()
+        );
+        assert_eq!(received.rows, truth);
     }
 }

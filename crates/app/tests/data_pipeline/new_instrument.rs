@@ -184,6 +184,33 @@ fn daily_only(store: &Path) -> BTreeSet<String> {
     keys
 }
 
+/// A job's published observation days by path and digest, and its decoded rows.
+type Observations = (BTreeSet<(String, String)>, Vec<Tick>, Vec<Bar>);
+
+/// Every job's observations after every manifest in the store verifies.
+fn observations(f: &NewJobs, report: &str) -> Vec<Observations> {
+    let store = f.scratch.path("producer/store");
+    daily_only(&store);
+    f.jobs
+        .iter()
+        .map(|job| {
+            let manifest = dataset(&store, field(job_line(report, &job.id), "dataset"));
+            let days: BTreeSet<_> = manifest
+                .objects
+                .iter()
+                .filter(|object| object.path.starts_with("observations/"))
+                .map(|object| (object.path.clone(), object.sha256.clone()))
+                .collect();
+            assert!(!days.is_empty());
+            if manifest.broker.as_str() == "deriv" {
+                (days, ticks(&store, &manifest), Vec::new())
+            } else {
+                (days, Vec::new(), bars(&store, &manifest))
+            }
+        })
+        .collect()
+}
+
 fn uploaded_hashes(drive: &FakeDrive) -> BTreeSet<String> {
     let state = drive.state.lock().unwrap();
     let mut hashes = BTreeSet::new();
@@ -478,7 +505,14 @@ fn interrupted_empty_store_keeps_original_seed_binding() {
     );
     let report = completed.expect("bounded first acquisition eventually completes");
     let store = f.scratch.path("producer/store");
-    daily_only(&store);
+    // The resumed acquisition publishes one uninterrupted acquisition's observation days,
+    // byte for byte, and every manifest of both verifies.
+    let whole = new_jobs("new_instrument_uninterrupted", 100, None);
+    let whole_report = pipeline("update", &whole.config, &["--end", &cutoff]).unwrap();
+    assert_eq!(
+        observations(&f, &report),
+        observations(&whole, &whole_report)
+    );
     for job in &f.jobs {
         let manifest = dataset(&store, field(job_line(&report, &job.id), "dataset"));
         assert_eq!(
