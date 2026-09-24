@@ -851,7 +851,7 @@ fn five_stream_generated_search_publishes_and_verifies_in_research() {
 }
 
 #[test]
-fn daily_split_wide_generated_research_certifies_without_early_holdout_access() {
+fn wide_research_daily_split_certifies_without_early_holdout_access() {
     let fixture = Fixture::wide_split("phase11_wide_daily_split");
     for dataset in fixture.datasets.iter().take(2) {
         command(&[
@@ -1187,7 +1187,7 @@ fn daily_split_wide_generated_research_certifies_without_early_holdout_access() 
 }
 
 #[test]
-fn daily_wide_root_without_holdout_evaluates_a_frozen_search_family() {
+fn wide_research_without_holdout_evaluates_a_frozen_search_family() {
     let fixture = Fixture::wide_split("phase11_wide_without_holdout");
     let root = fixture.datasets.iter().take(2).collect::<Vec<_>>();
     let mut split = binary_alpha_app::skeleton(&fixture.config);

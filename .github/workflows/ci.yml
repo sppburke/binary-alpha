@@ -5,10 +5,11 @@ on:
     branches: [main]
   pull_request:
 
-# Wall-clock is bounded by the slowest job, so lint and five test shards run at once, balanced
+# Wall-clock is bounded by the slowest job, so lint and six test shards run at once, balanced
 # by measured runtime. Every test runs in exactly one shard: the three `data_pipeline` shards
 # name their modules (`pipeline_` selects that binary's root-level tests), `live-runtime` runs
-# the `phase12_live_runtime` binary, and `everything-else` runs the other crates, the
+# the `phase12_live_runtime` binary, `research-wide` runs the `wide_research_` tests of
+# `phase11_research`, and `everything-else` runs the other crates, the
 # application's unit tests, and every other integration test with exactly those filters
 # skipped, so a new test file or module runs there by default. Filters are libtest substrings:
 # `retire::` also selects `review_retire::`, `config_validate` runs whole because one of its
@@ -51,11 +52,13 @@ jobs:
               retire:: review_archive:: whole_day_bar_completeness_lifecycle
           - shard: live-runtime
             run: cargo test -p binary-alpha-app --locked --test phase12_live_runtime
+          - shard: research-wide
+            run: cargo test -p binary-alpha-app --locked --test phase11_research -- wide_research_
           - shard: everything-else
             run: |
               cargo test --workspace --locked --exclude binary-alpha-app
               cargo test -p binary-alpha-app --locked --lib --bins --test config_validate
-              cargo test -p binary-alpha-app --locked --test '*' -- --skip daily_end_to_end:: --skip new_instrument:: --skip daily_review_fixes:: --skip review_final:: --skip migrate_census:: --skip lineage:: --skip daily_readers:: --skip registry_archive:: --skip archive_records:: --skip pipeline_ --skip retire:: --skip review_archive:: --skip control:: --skip economics:: --skip faults:: --skip leases:: --skip resilience:: --skip runtime::
+              cargo test -p binary-alpha-app --locked --test '*' -- --skip daily_end_to_end:: --skip new_instrument:: --skip daily_review_fixes:: --skip review_final:: --skip migrate_census:: --skip lineage:: --skip daily_readers:: --skip registry_archive:: --skip archive_records:: --skip pipeline_ --skip retire:: --skip review_archive:: --skip control:: --skip economics:: --skip faults:: --skip leases:: --skip resilience:: --skip runtime:: --skip wide_research_
               cargo run --locked -p binary-alpha-app -- config validate --config configs/example.toml
     steps:
       - uses: actions/checkout@v7
