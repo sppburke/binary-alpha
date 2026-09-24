@@ -1,0 +1,62 @@
+{
+  "kind": "engine_replay",
+  "schema_version": 1,
+  "generation": "54899997050a3b9b3eba75d29f5176fa60666127317b032a523dfae7d0b1b185",
+  "role": "development",
+  "config_hash": "v3:sha256:46fe54ed21baa4f98d0bb1e920d7637f334abb8eef854c8319eb05f40ed3ea60",
+  "code_revision": "fe93017a2fdec8d209d036ed8d7da9c370e185f9",
+  "availability": "provider_order_simulation",
+  "decision_start": "2026-01-05T00:00:20.000000Z",
+  "decision_end": "2026-01-05T00:01:40.000000Z",
+  "instruments": [
+    {
+      "instrument": "pocket_option:SECOND_otc",
+      "broker": "pocket_option",
+      "provider_symbol": "SECOND_otc",
+      "price_scale": 3,
+      "tick_generation": "61cb801d1ce5f355e507d1cdcdba54fbb9d52a794bb294f80b1a275e711d1fd3",
+      "feature_generation": "e0f530bc8d06c0434b980b5a27981336fc10469781cd825270e3290e8a2d1f69",
+      "plan_identity": "1e849138f50b67ecbe767c117ea324b0d05ef6d2c7ba41bbeee3e46e5b6e551f",
+      "raw_identity": "44194cf40d0c8193d3fd408ec262230190c237410e46a87c415fc29d8ec4b48c",
+      "outcome_generation": "3eebfff593c548b37d146aed54aeb1e8665c0613d3ca256f8e9053fdfdabcdfd",
+      "streams": [
+        {
+          "stream": {
+            "duration_seconds": 20,
+            "offset_seconds": 0
+          },
+          "columns": [
+            {
+              "name": "candle_direction",
+              "source": "candle_direction",
+              "kind": "text"
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "events": 5,
+  "final_state_identity": "f506de9bec65a1bb5aa37da8bfaeefc49f275e9359779ecda47910baff83ea5d",
+  "summary_identity": "0653b1eb02aeb752e237d500e3bd83a9a59d0196587b20810b8ec9d88235507e",
+  "objects": [
+    {
+      "role": "normalized",
+      "path": "ledger/events.jsonl",
+      "key": "objects/5f886816d3b694e04d8ed10ae849cca9f05e733db2a2f2e7602296d25d459fda",
+      "bytes": 5698,
+      "sha256": "5f886816d3b694e04d8ed10ae849cca9f05e733db2a2f2e7602296d25d459fda",
+      "crc32c": null,
+      "generation": null
+    },
+    {
+      "role": "normalized",
+      "path": "summary.json",
+      "key": "objects/c588117b0ba39ef12b74dc871d990576cf8893b0682da3315a1d09cebb6c7706",
+      "bytes": 2449,
+      "sha256": "c588117b0ba39ef12b74dc871d990576cf8893b0682da3315a1d09cebb6c7706",
+      "crc32c": null,
+      "generation": null
+    }
+  ]
+}

@@ -1,0 +1,77 @@
+{
+  "kind": "engine_replay",
+  "schema_version": 1,
+  "generation": "0042b3790ac9698cc16d600bca9f6b62e0f70a93d168a744dcf2d5d6b97dfc36",
+  "role": "development",
+  "config_hash": "v3:sha256:08f8c5ba25a29eee89af4a8b3b4cef4051f406f7cdc5c37463714d146c2c6e80",
+  "code_revision": "fe93017a2fdec8d209d036ed8d7da9c370e185f9",
+  "availability": "provider_order_simulation",
+  "decision_start": "2026-01-05T01:00:20.000000Z",
+  "decision_end": "2026-01-05T01:01:40.000000Z",
+  "instruments": [
+    {
+      "instrument": "pocket_option:AEDCNY_otc",
+      "broker": "pocket_option",
+      "provider_symbol": "AEDCNY_otc",
+      "price_scale": 6,
+      "tick_generation": "99af8c0991265c02366977a4b568dcfc15d1a3f5811697d35425bd5f4f43baf4",
+      "feature_generation": "a17b7a09bd13b53be037fbfb740a8971daf1479ff06e7d80508bdfa413e153e9",
+      "plan_identity": "bdb7400d739469757be2196113cb51d382c65c92bbfd2d760e5d9153ca22c118",
+      "raw_identity": "932c23d24a36cbf5205045e07f2c67a3e65c0715ac9152b4b9695d1db7c2f1ef",
+      "streams": []
+    },
+    {
+      "instrument": "pocket_option:SECOND_otc",
+      "broker": "pocket_option",
+      "provider_symbol": "SECOND_otc",
+      "price_scale": 3,
+      "tick_generation": "93146e695247f59dc42e127bd5e33c271288d8d93e02cc52f293f61e2b02f901",
+      "feature_generation": "815f7ff188ace34ada25c914d6b806d6b3376b008c0d1d2c55c646bb2f00d19f",
+      "plan_identity": "1e849138f50b67ecbe767c117ea324b0d05ef6d2c7ba41bbeee3e46e5b6e551f",
+      "raw_identity": "44194cf40d0c8193d3fd408ec262230190c237410e46a87c415fc29d8ec4b48c",
+      "streams": [
+        {
+          "stream": {
+            "duration_seconds": 20,
+            "offset_seconds": 0
+          },
+          "columns": [
+            {
+              "name": "candle_direction",
+              "source": "candle_direction",
+              "kind": "text"
+            },
+            {
+              "name": "range_bps",
+              "source": "range_bps",
+              "kind": "float"
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "events": 6,
+  "final_state_identity": "c2cb7ed0898787ee7f845f4bc2593af8d82455fbf0cc91f62ef05282cb6ca23c",
+  "summary_identity": "84729ab2526a01c2c05e8842f4d4ced425a899e98e615eb694288f7d214ab7ae",
+  "objects": [
+    {
+      "role": "normalized",
+      "path": "ledger/events.jsonl",
+      "key": "objects/637631e80cc2605be32c1ed10eb4addb0a3e036ad330faba36e441527f538794",
+      "bytes": 6282,
+      "sha256": "637631e80cc2605be32c1ed10eb4addb0a3e036ad330faba36e441527f538794",
+      "crc32c": null,
+      "generation": null
+    },
+    {
+      "role": "normalized",
+      "path": "summary.json",
+      "key": "objects/164c56ec2a0fb5587e8d6f95e9c2529d686e009dce4bdc9d57d8c50705a66f71",
+      "bytes": 2402,
+      "sha256": "164c56ec2a0fb5587e8d6f95e9c2529d686e009dce4bdc9d57d8c50705a66f71",
+      "crc32c": null,
+      "generation": null
+    }
+  ]
+}

@@ -1,0 +1,178 @@
+{
+  "schema_version": 1,
+  "operator": "synthetic-operator",
+  "root": "file:///proc/self/cwd/governance",
+  "namespace": "phase11",
+  "populations": [
+    {
+      "id": "source-0",
+      "role": "development",
+      "instrument": "pocket_option:AEDCNY_otc",
+      "source": "invented-five-second-bars-v1",
+      "coverage": {
+        "first_event_time": "2026-01-05T00:00:00.000000Z",
+        "last_event_time": "2026-01-05T00:01:25.000000Z"
+      },
+      "generations": [
+        "f2f1b9cd5e4ca1db4e4afcfec207f63eb81320019fbf379056e7fdee2d1a7d33"
+      ],
+      "tokens": [
+        "source-0-a",
+        "source-0-b"
+      ]
+    },
+    {
+      "id": "source-1",
+      "role": "development",
+      "instrument": "pocket_option:SECOND_otc",
+      "source": "invented-five-second-bars-v1",
+      "coverage": {
+        "first_event_time": "2026-01-05T00:00:00.000000Z",
+        "last_event_time": "2026-01-05T00:01:25.000000Z"
+      },
+      "generations": [
+        "61cb801d1ce5f355e507d1cdcdba54fbb9d52a794bb294f80b1a275e711d1fd3"
+      ],
+      "tokens": [
+        "source-1-a",
+        "source-1-b"
+      ]
+    },
+    {
+      "id": "assessment-0",
+      "role": "development",
+      "instrument": "pocket_option:AEDCNY_otc",
+      "source": "invented-five-second-bars-v1",
+      "coverage": {
+        "first_event_time": "2026-01-05T01:00:00.000000Z",
+        "last_event_time": "2026-01-05T01:01:25.000000Z"
+      },
+      "generations": [
+        "99af8c0991265c02366977a4b568dcfc15d1a3f5811697d35425bd5f4f43baf4"
+      ],
+      "tokens": [
+        "assessment-0-a",
+        "assessment-0-b"
+      ]
+    },
+    {
+      "id": "assessment-1",
+      "role": "development",
+      "instrument": "pocket_option:SECOND_otc",
+      "source": "invented-five-second-bars-v1",
+      "coverage": {
+        "first_event_time": "2026-01-05T01:00:00.000000Z",
+        "last_event_time": "2026-01-05T01:01:25.000000Z"
+      },
+      "generations": [
+        "93146e695247f59dc42e127bd5e33c271288d8d93e02cc52f293f61e2b02f901"
+      ],
+      "tokens": [
+        "assessment-1-a",
+        "assessment-1-b"
+      ]
+    },
+    {
+      "id": "refit-0",
+      "role": "development",
+      "instrument": "pocket_option:AEDCNY_otc",
+      "source": "invented-five-second-bars-v1",
+      "coverage": {
+        "first_event_time": "2026-01-05T02:00:00.000000Z",
+        "last_event_time": "2026-01-05T02:01:25.000000Z"
+      },
+      "generations": [
+        "5e92163c490cbd67e82c024925f782dc63e9db8dc1fbfa1f33c3b3cc30c03a3b"
+      ],
+      "tokens": [
+        "refit-0-a",
+        "refit-0-b"
+      ]
+    },
+    {
+      "id": "refit-1",
+      "role": "development",
+      "instrument": "pocket_option:SECOND_otc",
+      "source": "invented-five-second-bars-v1",
+      "coverage": {
+        "first_event_time": "2026-01-05T02:00:00.000000Z",
+        "last_event_time": "2026-01-05T02:01:25.000000Z"
+      },
+      "generations": [
+        "95f72f27319922458d0fbf81d7cc584a06ba1883a365f70460996e4e3c7f6591"
+      ],
+      "tokens": [
+        "refit-1-a",
+        "refit-1-b"
+      ]
+    },
+    {
+      "id": "evaluation-0",
+      "role": "evaluation",
+      "instrument": "pocket_option:AEDCNY_otc",
+      "source": "invented-five-second-bars-v1",
+      "coverage": {
+        "first_event_time": "2026-01-05T03:00:00.000000Z",
+        "last_event_time": "2026-01-05T03:01:25.000000Z"
+      },
+      "generations": [
+        "617739e2385050e033241f5df03ba2fea8f6a14b58b277433107e860049abf33"
+      ],
+      "tokens": [
+        "evaluation-0-a",
+        "evaluation-0-b"
+      ]
+    },
+    {
+      "id": "evaluation-1",
+      "role": "evaluation",
+      "instrument": "pocket_option:SECOND_otc",
+      "source": "invented-five-second-bars-v1",
+      "coverage": {
+        "first_event_time": "2026-01-05T03:00:00.000000Z",
+        "last_event_time": "2026-01-05T03:01:25.000000Z"
+      },
+      "generations": [
+        "dfa3b2e968c8b9f477bd95bdae9d1ae52b0cafd7b82f0fbdae59201c1fa538a2"
+      ],
+      "tokens": [
+        "evaluation-1-a",
+        "evaluation-1-b"
+      ]
+    },
+    {
+      "id": "holdout-0",
+      "role": "holdout",
+      "instrument": "pocket_option:AEDCNY_otc",
+      "source": "invented-five-second-bars-v1",
+      "coverage": {
+        "first_event_time": "2026-01-05T04:00:00.000000Z",
+        "last_event_time": "2026-01-05T04:01:25.000000Z"
+      },
+      "generations": [
+        "73299f209dc0c3875942f0ee8c42b4cd51139067e686a6c6768ec3de46fe70b8"
+      ],
+      "tokens": [
+        "holdout-0-a",
+        "holdout-0-b"
+      ]
+    },
+    {
+      "id": "holdout-1",
+      "role": "holdout",
+      "instrument": "pocket_option:SECOND_otc",
+      "source": "invented-five-second-bars-v1",
+      "coverage": {
+        "first_event_time": "2026-01-05T04:00:00.000000Z",
+        "last_event_time": "2026-01-05T04:01:25.000000Z"
+      },
+      "generations": [
+        "1cc1b421fd6169c649d3285249124594c81c040ed7ed48180a7feb4ef862c01b"
+      ],
+      "tokens": [
+        "holdout-1-a",
+        "holdout-1-b"
+      ]
+    }
+  ]
+}

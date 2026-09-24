@@ -1,0 +1,77 @@
+{
+  "kind": "engine_replay",
+  "schema_version": 1,
+  "generation": "5e25f35127fb18311317581aa52f563ee07032dc020a5aaa5a15bd935344b6d3",
+  "role": "development",
+  "config_hash": "v3:sha256:adca2086d5b92d786055700bfc03ba47c11fb9f019f6fe15bd7fcd13e38a2ca1",
+  "code_revision": "fe93017a2fdec8d209d036ed8d7da9c370e185f9",
+  "availability": "provider_order_simulation",
+  "decision_start": "2026-01-05T01:00:20.000000Z",
+  "decision_end": "2026-01-05T01:01:40.000000Z",
+  "instruments": [
+    {
+      "instrument": "pocket_option:AEDCNY_otc",
+      "broker": "pocket_option",
+      "provider_symbol": "AEDCNY_otc",
+      "price_scale": 6,
+      "tick_generation": "99af8c0991265c02366977a4b568dcfc15d1a3f5811697d35425bd5f4f43baf4",
+      "feature_generation": "a17b7a09bd13b53be037fbfb740a8971daf1479ff06e7d80508bdfa413e153e9",
+      "plan_identity": "bdb7400d739469757be2196113cb51d382c65c92bbfd2d760e5d9153ca22c118",
+      "raw_identity": "932c23d24a36cbf5205045e07f2c67a3e65c0715ac9152b4b9695d1db7c2f1ef",
+      "streams": [
+        {
+          "stream": {
+            "duration_seconds": 20,
+            "offset_seconds": 0
+          },
+          "columns": [
+            {
+              "name": "candle_direction",
+              "source": "candle_direction",
+              "kind": "text"
+            },
+            {
+              "name": "range_bps",
+              "source": "range_bps",
+              "kind": "float"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "instrument": "pocket_option:SECOND_otc",
+      "broker": "pocket_option",
+      "provider_symbol": "SECOND_otc",
+      "price_scale": 3,
+      "tick_generation": "93146e695247f59dc42e127bd5e33c271288d8d93e02cc52f293f61e2b02f901",
+      "feature_generation": "815f7ff188ace34ada25c914d6b806d6b3376b008c0d1d2c55c646bb2f00d19f",
+      "plan_identity": "1e849138f50b67ecbe767c117ea324b0d05ef6d2c7ba41bbeee3e46e5b6e551f",
+      "raw_identity": "44194cf40d0c8193d3fd408ec262230190c237410e46a87c415fc29d8ec4b48c",
+      "streams": []
+    }
+  ],
+  "events": 6,
+  "final_state_identity": "400ba7790c73694221f31b5b6618aa41a1373ccb63731b4254df303ddb405e11",
+  "summary_identity": "b689ec856f63344d07573f573e5fd04975bda695cc99c03e23b5efd7d43776c5",
+  "objects": [
+    {
+      "role": "normalized",
+      "path": "ledger/events.jsonl",
+      "key": "objects/a3950c7655f207e904020ed4916dcb29b0bd82008463e7728c379e0c55409c56",
+      "bytes": 6281,
+      "sha256": "a3950c7655f207e904020ed4916dcb29b0bd82008463e7728c379e0c55409c56",
+      "crc32c": null,
+      "generation": null
+    },
+    {
+      "role": "normalized",
+      "path": "summary.json",
+      "key": "objects/88fcdfbafd5c6f0242ac759cb6c2081e1dc00cb7e9f6119cc1cd4c7ca01ec0b1",
+      "bytes": 2406,
+      "sha256": "88fcdfbafd5c6f0242ac759cb6c2081e1dc00cb7e9f6119cc1cd4c7ca01ec0b1",
+      "crc32c": null,
+      "generation": null
+    }
+  ]
+}

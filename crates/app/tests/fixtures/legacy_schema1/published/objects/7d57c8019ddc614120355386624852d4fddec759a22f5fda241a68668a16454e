@@ -1,0 +1,177 @@
+{
+  "schema_version": 1,
+  "kind": "feature_plan",
+  "instrument": "pocket_option:SECOND_otc",
+  "broker": "pocket_option",
+  "provider_symbol": "SECOND_otc",
+  "price_scale": 3,
+  "profile": {
+    "stream_generation": "7a1ee053dc20a85cb9fd6ec30175aa4e720c641ca568fbd0c521f88296bac480",
+    "profile_sha256": "eb033a6355230deff9fcf2a367924f24fedc21ecf9d7018dbb6b5cf53bca0c2e",
+    "source_generation": "95f72f27319922458d0fbf81d7cc584a06ba1883a365f70460996e4e3c7f6591",
+    "role": "development",
+    "definition": {
+      "broker": "pocket_option",
+      "provider_symbol": "SECOND_otc",
+      "quote_currency": "eur",
+      "price_scale": 3,
+      "native_granularity": {
+        "kind": "bar",
+        "period_seconds": 5
+      },
+      "gap": {
+        "max_seconds": 2,
+        "reopen_seconds": 60
+      },
+      "session": {
+        "kind": "always"
+      },
+      "candles": [
+        {
+          "duration_seconds": 20,
+          "offset_seconds": 0,
+          "min_observations": 4,
+          "hard_min_observations": 4
+        }
+      ]
+    },
+    "ticks": false
+  },
+  "development_generation": "95f72f27319922458d0fbf81d7cc584a06ba1883a365f70460996e4e3c7f6591",
+  "settings": {
+    "streams": [
+      {
+        "duration_seconds": 20,
+        "offset_seconds": 0
+      }
+    ],
+    "outputs": [
+      "candle_direction",
+      "range_bps"
+    ],
+    "moving_average_periods": [],
+    "rolling_window": null,
+    "min_history": null,
+    "structure": null,
+    "price_epsilon": null,
+    "price_epsilon_units": null,
+    "tick_path_streams": []
+  },
+  "definitions": {
+    "tick_path": "tick_path_pressure_v1",
+    "gap_class": "gap_class_v1",
+    "structure": "structure_labels_v1",
+    "sequence": "structure_sequence_v1",
+    "candle_shape": "candle_features_v1",
+    "moving_average": "moving_average_v1",
+    "regime": "regime_v1",
+    "eligibility": "clean_v1",
+    "encoder": "encoder_v1"
+  },
+  "max_labels": 32768,
+  "raw_identity": "6bc2e218fdf590aab37a7b69d0178dcf1c0ccdda63cf0d1ceb600b942bd7c439",
+  "fit_windows": [
+    {
+      "duration_seconds": 20,
+      "offset_seconds": 0,
+      "rows": 4,
+      "first_decision_time": "2026-01-05T02:00:20.000000Z",
+      "last_decision_time": "2026-01-05T02:01:20.000000Z"
+    }
+  ],
+  "streams": [
+    {
+      "duration_seconds": 20,
+      "offset_seconds": 0,
+      "tick_path": false,
+      "outputs": [
+        {
+          "name": "open_time_micros",
+          "kind": "time",
+          "stage": "candle",
+          "predictive": false,
+          "readiness": "available on every accepted candle"
+        },
+        {
+          "name": "close_time_micros",
+          "kind": "time",
+          "stage": "candle",
+          "predictive": false,
+          "readiness": "available on every accepted candle"
+        },
+        {
+          "name": "known_at_micros",
+          "kind": "time",
+          "stage": "candle",
+          "predictive": false,
+          "readiness": "available on every accepted candle"
+        },
+        {
+          "name": "first_event_micros",
+          "kind": "time",
+          "stage": "candle",
+          "predictive": false,
+          "readiness": "available on every accepted candle"
+        },
+        {
+          "name": "last_event_micros",
+          "kind": "time",
+          "stage": "candle",
+          "predictive": false,
+          "readiness": "available on every accepted candle"
+        },
+        {
+          "name": "candle_ordinal",
+          "kind": "int",
+          "stage": "candle",
+          "predictive": false,
+          "readiness": "available on every accepted candle"
+        },
+        {
+          "name": "open_units",
+          "kind": "int",
+          "stage": "candle",
+          "predictive": false,
+          "readiness": "available on every accepted candle"
+        },
+        {
+          "name": "high_units",
+          "kind": "int",
+          "stage": "candle",
+          "predictive": false,
+          "readiness": "available on every accepted candle"
+        },
+        {
+          "name": "low_units",
+          "kind": "int",
+          "stage": "candle",
+          "predictive": false,
+          "readiness": "available on every accepted candle"
+        },
+        {
+          "name": "close_units",
+          "kind": "int",
+          "stage": "candle",
+          "predictive": false,
+          "readiness": "available on every accepted candle"
+        },
+        {
+          "name": "candle_direction",
+          "kind": "text",
+          "stage": "anatomy",
+          "predictive": true,
+          "readiness": "available on every accepted candle"
+        },
+        {
+          "name": "range_bps",
+          "kind": "float",
+          "stage": "anatomy",
+          "predictive": true,
+          "readiness": "unavailable when the open is zero"
+        }
+      ],
+      "excluded": [],
+      "encodings": []
+    }
+  ]
+}

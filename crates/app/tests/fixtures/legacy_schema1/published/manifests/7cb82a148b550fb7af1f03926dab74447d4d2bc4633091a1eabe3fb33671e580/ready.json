@@ -1,0 +1,72 @@
+{
+  "kind": "engine_replay",
+  "schema_version": 1,
+  "generation": "7cb82a148b550fb7af1f03926dab74447d4d2bc4633091a1eabe3fb33671e580",
+  "role": "evaluation",
+  "config_hash": "v3:sha256:2b335a8a3b43a9190aa21240a5fe7c0f12bc4d1154536b03efd25163ad973634",
+  "code_revision": "fe93017a2fdec8d209d036ed8d7da9c370e185f9",
+  "availability": "provider_order_simulation",
+  "decision_start": "2026-01-05T03:00:20.000000Z",
+  "decision_end": "2026-01-05T03:01:40.000000Z",
+  "instruments": [
+    {
+      "instrument": "pocket_option:AEDCNY_otc",
+      "broker": "pocket_option",
+      "provider_symbol": "AEDCNY_otc",
+      "price_scale": 6,
+      "tick_generation": "617739e2385050e033241f5df03ba2fea8f6a14b58b277433107e860049abf33",
+      "feature_generation": "49988f58f2b54839ab1f1fddaa13f9294c277e7d86a87a6786d7771cb3a92109",
+      "plan_identity": "fd08eeb5231757853942e275a03d88e39edd1de2fef9ccf9a424fb413fbcb956",
+      "raw_identity": "b8be8a203a13e7fae63ec0e4666be805e9b548a28ad1b7b3d3f0c26f7722243e",
+      "streams": []
+    },
+    {
+      "instrument": "pocket_option:SECOND_otc",
+      "broker": "pocket_option",
+      "provider_symbol": "SECOND_otc",
+      "price_scale": 3,
+      "tick_generation": "dfa3b2e968c8b9f477bd95bdae9d1ae52b0cafd7b82f0fbdae59201c1fa538a2",
+      "feature_generation": "95dbb99ab1490049f7d2f199e84750d739a9801665bec176b6c58c32e31f77f7",
+      "plan_identity": "976c576c1087085825d10d7a13d53a793ab8bb84ef9a921a7d31c38a070ca932",
+      "raw_identity": "6bc2e218fdf590aab37a7b69d0178dcf1c0ccdda63cf0d1ceb600b942bd7c439",
+      "streams": [
+        {
+          "stream": {
+            "duration_seconds": 20,
+            "offset_seconds": 0
+          },
+          "columns": [
+            {
+              "name": "candle_direction",
+              "source": "candle_direction",
+              "kind": "text"
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "events": 8,
+  "final_state_identity": "9fa3fad76b44d8e82fdf31558e72a83587c3f13db3b860453fcac9243a8a1da7",
+  "summary_identity": "8e8db20101e9d779be869afaa7cbe3295a52ce4f0c6b66cebec73bb26bc64d4c",
+  "objects": [
+    {
+      "role": "normalized",
+      "path": "ledger/events.jsonl",
+      "key": "objects/1beff00798c953f3f0403661b7a2880eea1955c5d39847d498d80e9430c94e15",
+      "bytes": 7623,
+      "sha256": "1beff00798c953f3f0403661b7a2880eea1955c5d39847d498d80e9430c94e15",
+      "crc32c": null,
+      "generation": null
+    },
+    {
+      "role": "normalized",
+      "path": "summary.json",
+      "key": "objects/b448f233a5958844d22f9b03ffcbac2d1b2f4082d53ed68090a608004ca1a221",
+      "bytes": 2586,
+      "sha256": "b448f233a5958844d22f9b03ffcbac2d1b2f4082d53ed68090a608004ca1a221",
+      "crc32c": null,
+      "generation": null
+    }
+  ]
+}

@@ -1,0 +1,64 @@
+{
+  "schema_version": 2,
+  "broker": "pocket_option",
+  "provider_symbol": "SECOND_otc",
+  "role": "development",
+  "native_granularity": {
+    "kind": "bar",
+    "period_seconds": 5
+  },
+  "acquisitions": [
+    {
+      "acquisition_id": "6828934bc1f5da61e264a565587bda26c11cdf4d64d310ab4a2896d31feb9153",
+      "source_identity": "import:bar_parquet",
+      "requested": [
+        {
+          "start": "2026-01-05T00:00:00.000000Z",
+          "end": "2026-01-06T00:00:00.000000Z"
+        }
+      ],
+      "verified": [],
+      "shortfalls": [],
+      "unresolved": [
+        {
+          "start": "2026-01-05T00:00:00.000000Z",
+          "end": "2026-01-06T00:00:00.000000Z"
+        }
+      ]
+    }
+  ],
+  "days": [
+    {
+      "date": "2026-01-05",
+      "family": "observations",
+      "acquisition_ids": [
+        "6828934bc1f5da61e264a565587bda26c11cdf4d64d310ab4a2896d31feb9153"
+      ],
+      "basis": "retained import source metadata",
+      "verified": [],
+      "unresolved": [
+        {
+          "start": "2026-01-05T00:00:00.000000Z",
+          "end": "2026-01-06T00:00:00.000000Z"
+        }
+      ],
+      "reason": "source evidence without whole-day completeness"
+    },
+    {
+      "date": "2025-05-19",
+      "family": "pages",
+      "acquisition_ids": [
+        "6828934bc1f5da61e264a565587bda26c11cdf4d64d310ab4a2896d31feb9153"
+      ],
+      "basis": "retained import response occurrences; no whole-day occurrence claim",
+      "verified": [],
+      "unresolved": [
+        {
+          "start": "2025-05-19T00:00:00.000000Z",
+          "end": "2025-05-20T00:00:00.000000Z"
+        }
+      ],
+      "reason": "source evidence without whole-day completeness"
+    }
+  ]
+}

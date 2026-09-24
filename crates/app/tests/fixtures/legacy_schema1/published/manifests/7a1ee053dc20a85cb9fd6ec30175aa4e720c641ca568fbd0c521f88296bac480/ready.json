@@ -1,0 +1,94 @@
+{
+  "layout": "daily-v2",
+  "day_inventory": [
+    {
+      "date": "2026-01-05",
+      "family": "candles",
+      "duration": 20,
+      "offset": 0,
+      "object": "objects/a65ef93202eac528dec6d5c1f2fd19a8d432fc503e0d47c25d38f3f25fc3a4b6",
+      "rows": 4,
+      "first_time": "2026-01-05T02:00:00.000000Z",
+      "last_time": "2026-01-05T02:01:00.000000Z",
+      "state": "partial",
+      "reason": "source evidence without whole-day completeness; last candle may be finalized by later input",
+      "unresolved": [
+        {
+          "start": "2026-01-05T00:00:00.000000Z",
+          "end": "2026-01-06T00:00:00.000000Z"
+        }
+      ]
+    }
+  ],
+  "kind": "instrument_stream",
+  "schema_version": 1,
+  "generation": "7a1ee053dc20a85cb9fd6ec30175aa4e720c641ca568fbd0c521f88296bac480",
+  "broker": "pocket_option",
+  "provider_symbol": "SECOND_otc",
+  "instrument": "pocket_option:SECOND_otc",
+  "role": "development",
+  "source_generation": "95f72f27319922458d0fbf81d7cc584a06ba1883a365f70460996e4e3c7f6591",
+  "source_manifest_uri": "file:///proc/self/cwd/published/manifests/95f72f27319922458d0fbf81d7cc584a06ba1883a365f70460996e4e3c7f6591/ready.json",
+  "source_kind": "bar_parquet",
+  "definition": {
+    "broker": "pocket_option",
+    "provider_symbol": "SECOND_otc",
+    "quote_currency": "eur",
+    "price_scale": 3,
+    "native_granularity": {
+      "kind": "bar",
+      "period_seconds": 5
+    },
+    "gap": {
+      "max_seconds": 2,
+      "reopen_seconds": 60
+    },
+    "session": {
+      "kind": "always"
+    },
+    "candles": [
+      {
+        "duration_seconds": 20,
+        "offset_seconds": 0,
+        "min_observations": 4,
+        "hard_min_observations": 4
+      }
+    ]
+  },
+  "config_hash": "v3:sha256:ca974c93864b8fa85bdf2455379d6865937888614191779ba220d987c57e5094",
+  "code_revision": "fe93017a2fdec8d209d036ed8d7da9c370e185f9",
+  "observations": 18,
+  "coverage": {
+    "first_event_time": "2026-01-05T02:00:00.000000Z",
+    "last_event_time": "2026-01-05T02:01:25.000000Z"
+  },
+  "streams": [
+    {
+      "duration_seconds": 20,
+      "offset_seconds": 0,
+      "rows": 4,
+      "first_open_time": "2026-01-05T02:00:00.000000Z",
+      "last_close_time": "2026-01-05T02:01:20.000000Z"
+    }
+  ],
+  "objects": [
+    {
+      "role": "normalized",
+      "path": "profile.json",
+      "key": "objects/eb033a6355230deff9fcf2a367924f24fedc21ecf9d7018dbb6b5cf53bca0c2e",
+      "bytes": 3036,
+      "sha256": "eb033a6355230deff9fcf2a367924f24fedc21ecf9d7018dbb6b5cf53bca0c2e",
+      "crc32c": null,
+      "generation": null
+    },
+    {
+      "role": "normalized",
+      "path": "candles/20s_0s/2026-01-05.parquet",
+      "key": "objects/a65ef93202eac528dec6d5c1f2fd19a8d432fc503e0d47c25d38f3f25fc3a4b6",
+      "bytes": 4513,
+      "sha256": "a65ef93202eac528dec6d5c1f2fd19a8d432fc503e0d47c25d38f3f25fc3a4b6",
+      "crc32c": null,
+      "generation": null
+    }
+  ]
+}

@@ -1,0 +1,96 @@
+{
+  "kind": "engine_replay",
+  "schema_version": 1,
+  "generation": "3590985e246c576ac3f986c9a6d64d4e5f6ef71b72a6ce8ca2fdabc193466cf4",
+  "role": "development",
+  "config_hash": "v3:sha256:23feeab303a8e2d4e24dc0a301caecf403088a056f52cbbe6bebdb41f44e0284",
+  "code_revision": "fe93017a2fdec8d209d036ed8d7da9c370e185f9",
+  "availability": "provider_order_simulation",
+  "decision_start": "2026-01-05T01:00:20.000000Z",
+  "decision_end": "2026-01-05T01:01:40.000000Z",
+  "instruments": [
+    {
+      "instrument": "pocket_option:AEDCNY_otc",
+      "broker": "pocket_option",
+      "provider_symbol": "AEDCNY_otc",
+      "price_scale": 6,
+      "tick_generation": "99af8c0991265c02366977a4b568dcfc15d1a3f5811697d35425bd5f4f43baf4",
+      "feature_generation": "a17b7a09bd13b53be037fbfb740a8971daf1479ff06e7d80508bdfa413e153e9",
+      "plan_identity": "bdb7400d739469757be2196113cb51d382c65c92bbfd2d760e5d9153ca22c118",
+      "raw_identity": "932c23d24a36cbf5205045e07f2c67a3e65c0715ac9152b4b9695d1db7c2f1ef",
+      "streams": [
+        {
+          "stream": {
+            "duration_seconds": 20,
+            "offset_seconds": 0
+          },
+          "columns": [
+            {
+              "name": "candle_direction",
+              "source": "candle_direction",
+              "kind": "text"
+            },
+            {
+              "name": "range_bps",
+              "source": "range_bps",
+              "kind": "float"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "instrument": "pocket_option:SECOND_otc",
+      "broker": "pocket_option",
+      "provider_symbol": "SECOND_otc",
+      "price_scale": 3,
+      "tick_generation": "93146e695247f59dc42e127bd5e33c271288d8d93e02cc52f293f61e2b02f901",
+      "feature_generation": "815f7ff188ace34ada25c914d6b806d6b3376b008c0d1d2c55c646bb2f00d19f",
+      "plan_identity": "1e849138f50b67ecbe767c117ea324b0d05ef6d2c7ba41bbeee3e46e5b6e551f",
+      "raw_identity": "44194cf40d0c8193d3fd408ec262230190c237410e46a87c415fc29d8ec4b48c",
+      "streams": [
+        {
+          "stream": {
+            "duration_seconds": 20,
+            "offset_seconds": 0
+          },
+          "columns": [
+            {
+              "name": "candle_direction",
+              "source": "candle_direction",
+              "kind": "text"
+            },
+            {
+              "name": "range_bps",
+              "source": "range_bps",
+              "kind": "float"
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "events": 10,
+  "final_state_identity": "44841f24d8a50d325dca1ad230696c046f403baea179b4fcbbe0218478e9d42c",
+  "summary_identity": "4bc1ef63e9c829b8a69a6cc38fa18aa0de53cc6c502d25424a282c70f47e296e",
+  "objects": [
+    {
+      "role": "normalized",
+      "path": "ledger/events.jsonl",
+      "key": "objects/c5c9f9b7d9724a0f6556bb38a766d33f7c11359fd76e663c0fb2242d6bada8e9",
+      "bytes": 9843,
+      "sha256": "c5c9f9b7d9724a0f6556bb38a766d33f7c11359fd76e663c0fb2242d6bada8e9",
+      "crc32c": null,
+      "generation": null
+    },
+    {
+      "role": "normalized",
+      "path": "summary.json",
+      "key": "objects/e37499ca18359bcbf0a9bdc1a8c5a7234f0147d041e1ae81aaa58562d5202630",
+      "bytes": 3125,
+      "sha256": "e37499ca18359bcbf0a9bdc1a8c5a7234f0147d041e1ae81aaa58562d5202630",
+      "crc32c": null,
+      "generation": null
+    }
+  ]
+}

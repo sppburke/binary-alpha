@@ -1,0 +1,1034 @@
+{
+  "config": {
+    "schema_version": 1,
+    "run_mode": "research",
+    "storage": {
+      "historical_data_dir": "/proc/self/cwd/retained",
+      "publication_uri": "file:///proc/self/cwd/published"
+    },
+    "portfolio": {
+      "families": [
+        "file:///proc/self/cwd/published/manifests/409663ae0efeeb5f7a8cc0b4014f80827e11e3f7bbada6dfe4746211a8d493e9/ready.json",
+        "file:///proc/self/cwd/published/manifests/4421d5db7f772c227901e75804145cda10079a6afdf1cd9cce0c77fab73b90cf/ready.json"
+      ],
+      "max_policies": 12,
+      "embargo_micros": 10000000,
+      "objective": "profit_then_drawdown",
+      "gates": {
+        "min_settled": 1,
+        "max_unresolved": 0,
+        "min_profit": "0",
+        "max_drawdown": "1000"
+      },
+      "accounts": [
+        {
+          "id": "a0",
+          "broker": "pocket_option",
+          "currency": "unit",
+          "scale": 2,
+          "initial_cash": "10000"
+        },
+        {
+          "id": "a1",
+          "broker": "pocket_option",
+          "currency": "eur",
+          "scale": 2,
+          "initial_cash": "10000"
+        }
+      ],
+      "reporting_currency": "unit",
+      "reporting_scale": 2,
+      "max_rate_age_micros": 86400000000,
+      "rates": [
+        {
+          "id": "eur-unit",
+          "source_currency": "eur",
+          "reporting_currency": "unit",
+          "provider": "synthetic-fx",
+          "provider_time": "2026-01-05T00:00:00.000000Z",
+          "available_at": "2026-01-05T00:00:00.000000Z",
+          "rate": "2"
+        }
+      ],
+      "members": [
+        {
+          "family": 0,
+          "member": 0
+        },
+        {
+          "family": 0,
+          "member": 1
+        },
+        {
+          "family": 1,
+          "member": 0
+        },
+        {
+          "family": 1,
+          "member": 1
+        }
+      ],
+      "repairs": [
+        {
+          "id": "none"
+        },
+        {
+          "id": "narrow",
+          "conditions": [
+            {
+              "stream": {
+                "duration_seconds": 20,
+                "offset_seconds": 0
+              },
+              "output": "range_bps",
+              "comparator": "lt",
+              "threshold": 0.08
+            }
+          ]
+        }
+      ],
+      "bindings": [
+        {
+          "id": "b0",
+          "account": "a0",
+          "instrument": "pocket_option:AEDCNY_otc",
+          "alternatives": [
+            {
+              "contract": {
+                "id": "0-small",
+                "direction": "buy",
+                "duration_micros": 5000000,
+                "currency": "unit",
+                "stake": "1",
+                "quoted_cost": "1",
+                "entry_fee": "0",
+                "win": {
+                  "gross_return": "1.80",
+                  "terminal_fee": "0"
+                },
+                "loss": {
+                  "gross_return": "0",
+                  "terminal_fee": "0"
+                },
+                "tie": {
+                  "gross_return": "1",
+                  "terminal_fee": "0"
+                },
+                "settlement": {
+                  "rule": "price_at_due_v1",
+                  "max_settlement_delay_micros": 5000000,
+                  "max_tick_gap_micros": 5000000
+                }
+              },
+              "envelope": {
+                "max_purchase_cost": "1",
+                "max_entry_fee": "0",
+                "max_win_terminal_fee": "0",
+                "max_loss_terminal_fee": "0",
+                "max_tie_terminal_fee": "0",
+                "min_winning_net_return": "0.80",
+                "settlement_rule": "price_at_due_v1"
+              }
+            },
+            {
+              "contract": {
+                "id": "0-large",
+                "direction": "buy",
+                "duration_micros": 5000000,
+                "currency": "unit",
+                "stake": "2",
+                "quoted_cost": "2",
+                "entry_fee": "0.05",
+                "win": {
+                  "gross_return": "3.60",
+                  "terminal_fee": "0"
+                },
+                "loss": {
+                  "gross_return": "0",
+                  "terminal_fee": "0"
+                },
+                "tie": {
+                  "gross_return": "2.05",
+                  "terminal_fee": "0"
+                },
+                "settlement": {
+                  "rule": "price_at_due_v1",
+                  "max_settlement_delay_micros": 5000000,
+                  "max_tick_gap_micros": 5000000
+                }
+              },
+              "envelope": {
+                "max_purchase_cost": "2",
+                "max_entry_fee": "0.05",
+                "max_win_terminal_fee": "0",
+                "max_loss_terminal_fee": "0",
+                "max_tie_terminal_fee": "0",
+                "min_winning_net_return": "1.55",
+                "settlement_rule": "price_at_due_v1"
+              }
+            }
+          ]
+        },
+        {
+          "id": "b1",
+          "account": "a1",
+          "instrument": "pocket_option:SECOND_otc",
+          "alternatives": [
+            {
+              "contract": {
+                "id": "1-small",
+                "direction": "buy",
+                "duration_micros": 5000000,
+                "currency": "eur",
+                "stake": "1",
+                "quoted_cost": "1",
+                "entry_fee": "0",
+                "win": {
+                  "gross_return": "1.80",
+                  "terminal_fee": "0"
+                },
+                "loss": {
+                  "gross_return": "0",
+                  "terminal_fee": "0"
+                },
+                "tie": {
+                  "gross_return": "1",
+                  "terminal_fee": "0"
+                },
+                "settlement": {
+                  "rule": "price_at_due_v1",
+                  "max_settlement_delay_micros": 5000000,
+                  "max_tick_gap_micros": 5000000
+                }
+              },
+              "envelope": {
+                "max_purchase_cost": "1",
+                "max_entry_fee": "0",
+                "max_win_terminal_fee": "0",
+                "max_loss_terminal_fee": "0",
+                "max_tie_terminal_fee": "0",
+                "min_winning_net_return": "0.80",
+                "settlement_rule": "price_at_due_v1"
+              }
+            },
+            {
+              "contract": {
+                "id": "1-large",
+                "direction": "buy",
+                "duration_micros": 5000000,
+                "currency": "eur",
+                "stake": "2",
+                "quoted_cost": "2",
+                "entry_fee": "0.05",
+                "win": {
+                  "gross_return": "3.60",
+                  "terminal_fee": "0"
+                },
+                "loss": {
+                  "gross_return": "0",
+                  "terminal_fee": "0"
+                },
+                "tie": {
+                  "gross_return": "2.05",
+                  "terminal_fee": "0"
+                },
+                "settlement": {
+                  "rule": "price_at_due_v1",
+                  "max_settlement_delay_micros": 5000000,
+                  "max_tick_gap_micros": 5000000
+                }
+              },
+              "envelope": {
+                "max_purchase_cost": "2",
+                "max_entry_fee": "0.05",
+                "max_win_terminal_fee": "0",
+                "max_loss_terminal_fee": "0",
+                "max_tie_terminal_fee": "0",
+                "min_winning_net_return": "1.55",
+                "settlement_rule": "price_at_due_v1"
+              }
+            }
+          ]
+        }
+      ],
+      "subsets": [
+        {
+          "deployments": [
+            {
+              "member": 0,
+              "repair": 1,
+              "binding": 0
+            }
+          ]
+        },
+        {
+          "deployments": [
+            {
+              "member": 3,
+              "repair": 1,
+              "binding": 1
+            }
+          ]
+        },
+        {
+          "deployments": [
+            {
+              "member": 0,
+              "repair": 1,
+              "binding": 0
+            },
+            {
+              "member": 3,
+              "repair": 1,
+              "binding": 1
+            }
+          ]
+        },
+        {
+          "deployments": [
+            {
+              "member": 0,
+              "repair": 0,
+              "binding": 0
+            }
+          ]
+        },
+        {
+          "deployments": [
+            {
+              "member": 3,
+              "repair": 0,
+              "binding": 1
+            }
+          ]
+        }
+      ],
+      "risk_policies": [
+        {
+          "id": "cap2",
+          "max_open_total": 2,
+          "same_entry": "all",
+          "deduplicate_signal_logic": false,
+          "max_feature_age_micros": 60000000,
+          "max_quote_age_micros": 0
+        }
+      ],
+      "folds": [
+        {
+          "cutoff": "2026-01-05T00:01:40.000000Z",
+          "decision_start": "2026-01-05T01:00:20.000000Z",
+          "decision_end": "2026-01-05T01:01:40.000000Z",
+          "inputs": [
+            {
+              "fit": {
+                "role": "development",
+                "input_manifest": "file:///proc/self/cwd/published/manifests/f2f1b9cd5e4ca1db4e4afcfec207f63eb81320019fbf379056e7fdee2d1a7d33/ready.json",
+                "profile_manifest": "file:///proc/self/cwd/published/manifests/6b5c0ed2c2ce8cd491227dc08c0c70689f2c5d8cc65271beab3cafeec3e377d0/ready.json",
+                "streams": [
+                  {
+                    "duration_seconds": 20,
+                    "offset_seconds": 0
+                  }
+                ],
+                "outputs": [
+                  "candle_direction",
+                  "range_bps"
+                ]
+              },
+              "assessment_manifest": "file:///proc/self/cwd/published/manifests/99af8c0991265c02366977a4b568dcfc15d1a3f5811697d35425bd5f4f43baf4/ready.json"
+            },
+            {
+              "fit": {
+                "role": "development",
+                "input_manifest": "file:///proc/self/cwd/published/manifests/61cb801d1ce5f355e507d1cdcdba54fbb9d52a794bb294f80b1a275e711d1fd3/ready.json",
+                "profile_manifest": "file:///proc/self/cwd/published/manifests/5d253a8808829f5f95557669ed760942069ecf467f00a9c9d24d789613d8d916/ready.json",
+                "streams": [
+                  {
+                    "duration_seconds": 20,
+                    "offset_seconds": 0
+                  }
+                ],
+                "outputs": [
+                  "candle_direction",
+                  "range_bps"
+                ]
+              },
+              "assessment_manifest": "file:///proc/self/cwd/published/manifests/93146e695247f59dc42e127bd5e33c271288d8d93e02cc52f293f61e2b02f901/ready.json"
+            }
+          ]
+        }
+      ],
+      "refit": {
+        "cutoff": "2026-01-05T02:01:40.000000Z",
+        "fits": [
+          {
+            "role": "development",
+            "input_manifest": "file:///proc/self/cwd/published/manifests/5e92163c490cbd67e82c024925f782dc63e9db8dc1fbfa1f33c3b3cc30c03a3b/ready.json",
+            "profile_manifest": "file:///proc/self/cwd/published/manifests/0086183c6f00746e9a6aee78b53a792766c17fcf46219ebdfcd410e31eeb2903/ready.json",
+            "streams": [
+              {
+                "duration_seconds": 20,
+                "offset_seconds": 0
+              }
+            ],
+            "outputs": [
+              "candle_direction",
+              "range_bps"
+            ]
+          },
+          {
+            "role": "development",
+            "input_manifest": "file:///proc/self/cwd/published/manifests/95f72f27319922458d0fbf81d7cc584a06ba1883a365f70460996e4e3c7f6591/ready.json",
+            "profile_manifest": "file:///proc/self/cwd/published/manifests/7a1ee053dc20a85cb9fd6ec30175aa4e720c641ca568fbd0c521f88296bac480/ready.json",
+            "streams": [
+              {
+                "duration_seconds": 20,
+                "offset_seconds": 0
+              }
+            ],
+            "outputs": [
+              "candle_direction",
+              "range_bps"
+            ]
+          }
+        ]
+      }
+    }
+  },
+  "families": [
+    {
+      "generation": "409663ae0efeeb5f7a8cc0b4014f80827e11e3f7bbada6dfe4746211a8d493e9",
+      "plan_identity": "bdb7400d739469757be2196113cb51d382c65c92bbfd2d760e5d9153ca22c118",
+      "base_stream": {
+        "duration_seconds": 20,
+        "offset_seconds": 0
+      },
+      "members": [
+        {
+          "logic_identity": "b388d61796cf02777ed8e1dd0b97faee339d903a1f842266dd1532ce2f817e33",
+          "contract": "0-small",
+          "bases": [
+            0
+          ]
+        },
+        {
+          "logic_identity": "ffad6c1cc8d361a3e9eaabc3ac200a0d42a3083a23b538687d306c087c48b0dc",
+          "contract": "0-small",
+          "bases": [
+            1
+          ]
+        }
+      ]
+    },
+    {
+      "generation": "4421d5db7f772c227901e75804145cda10079a6afdf1cd9cce0c77fab73b90cf",
+      "plan_identity": "1e849138f50b67ecbe767c117ea324b0d05ef6d2c7ba41bbeee3e46e5b6e551f",
+      "base_stream": {
+        "duration_seconds": 20,
+        "offset_seconds": 0
+      },
+      "members": [
+        {
+          "logic_identity": "b986d9df9d7cacf668432ead5f61a0b30f9bc61a8db74ac09dbddb71eb7290c0",
+          "contract": "1-small",
+          "bases": [
+            2
+          ]
+        },
+        {
+          "logic_identity": "3788cf8c0422ec2457d7d054ac15d740d68ce80ea38394cdb337186c13fe41e2",
+          "contract": "1-small",
+          "bases": [
+            3
+          ]
+        }
+      ]
+    }
+  ],
+  "members": [
+    {
+      "family": 0,
+      "member": 0,
+      "base_stream": {
+        "duration_seconds": 20,
+        "offset_seconds": 0
+      },
+      "conditions": [
+        {
+          "condition": {
+            "stream": {
+              "duration_seconds": 20,
+              "offset_seconds": 0
+            },
+            "output": "candle_direction",
+            "comparator": "eq",
+            "threshold": "up"
+          }
+        }
+      ]
+    },
+    {
+      "family": 0,
+      "member": 1,
+      "base_stream": {
+        "duration_seconds": 20,
+        "offset_seconds": 0
+      },
+      "conditions": [
+        {
+          "condition": {
+            "stream": {
+              "duration_seconds": 20,
+              "offset_seconds": 0
+            },
+            "output": "candle_direction",
+            "comparator": "eq",
+            "threshold": "down"
+          }
+        }
+      ]
+    },
+    {
+      "family": 1,
+      "member": 0,
+      "base_stream": {
+        "duration_seconds": 20,
+        "offset_seconds": 0
+      },
+      "conditions": [
+        {
+          "condition": {
+            "stream": {
+              "duration_seconds": 20,
+              "offset_seconds": 0
+            },
+            "output": "candle_direction",
+            "comparator": "eq",
+            "threshold": "up"
+          }
+        }
+      ]
+    },
+    {
+      "family": 1,
+      "member": 1,
+      "base_stream": {
+        "duration_seconds": 20,
+        "offset_seconds": 0
+      },
+      "conditions": [
+        {
+          "condition": {
+            "stream": {
+              "duration_seconds": 20,
+              "offset_seconds": 0
+            },
+            "output": "candle_direction",
+            "comparator": "eq",
+            "threshold": "down"
+          }
+        }
+      ]
+    }
+  ],
+  "declared": 12,
+  "rejected": 0,
+  "valid": 12,
+  "passing": 12,
+  "folds": [
+    {
+      "fits": [
+        {
+          "instrument": "pocket_option:AEDCNY_otc",
+          "input_generation": "f2f1b9cd5e4ca1db4e4afcfec207f63eb81320019fbf379056e7fdee2d1a7d33",
+          "generation": "096abefd050eeb42e68e17ed4d8a52e7bd0298f48a51794a78615cdb9dcdba8f",
+          "plan_identity": "bdb7400d739469757be2196113cb51d382c65c92bbfd2d760e5d9153ca22c118"
+        },
+        {
+          "instrument": "pocket_option:SECOND_otc",
+          "input_generation": "61cb801d1ce5f355e507d1cdcdba54fbb9d52a794bb294f80b1a275e711d1fd3",
+          "generation": "e0f530bc8d06c0434b980b5a27981336fc10469781cd825270e3290e8a2d1f69",
+          "plan_identity": "1e849138f50b67ecbe767c117ea324b0d05ef6d2c7ba41bbeee3e46e5b6e551f"
+        }
+      ],
+      "assessments": [
+        {
+          "instrument": "pocket_option:AEDCNY_otc",
+          "input_generation": "99af8c0991265c02366977a4b568dcfc15d1a3f5811697d35425bd5f4f43baf4",
+          "generation": "a17b7a09bd13b53be037fbfb740a8971daf1479ff06e7d80508bdfa413e153e9",
+          "plan_identity": "bdb7400d739469757be2196113cb51d382c65c92bbfd2d760e5d9153ca22c118"
+        },
+        {
+          "instrument": "pocket_option:SECOND_otc",
+          "input_generation": "93146e695247f59dc42e127bd5e33c271288d8d93e02cc52f293f61e2b02f901",
+          "generation": "815f7ff188ace34ada25c914d6b806d6b3376b008c0d1d2c55c646bb2f00d19f",
+          "plan_identity": "1e849138f50b67ecbe767c117ea324b0d05ef6d2c7ba41bbeee3e46e5b6e551f"
+        }
+      ]
+    }
+  ],
+  "choices": [
+    {
+      "subset": 0,
+      "alternatives": [
+        0
+      ],
+      "risk_policy": 0,
+      "identity": "81c8160237810f634669604669c49f301a579c04d94fa5cb7c2abf47d14c7966",
+      "folds": [
+        {
+          "replay": {
+            "generation": "687a406e9188eadb6f15808db4e7f706835fee9f279749dde11dc7b2d0c2fa13",
+            "summary_identity": "9648f9c105f820a74d237066607fe3f7c5e0d684505398cef257aa770ca37687"
+          },
+          "projection": {
+            "settled": 1,
+            "unresolved": 0,
+            "valued_at": "2026-01-05T01:01:20.000000Z",
+            "profit": "0.80",
+            "rates": [
+              "eur-unit"
+            ],
+            "drawdown": "0.00",
+            "unavailable_observations": 0
+          }
+        }
+      ],
+      "profit": "0.80",
+      "drawdown": "0.00",
+      "rank": 12
+    },
+    {
+      "subset": 0,
+      "alternatives": [
+        1
+      ],
+      "risk_policy": 0,
+      "identity": "9a1eca8a51dd94e1ae86952a65ab8d294db330d6e8ecb241bdb620b70b6bbf69",
+      "folds": [
+        {
+          "replay": {
+            "generation": "5e25f35127fb18311317581aa52f563ee07032dc020a5aaa5a15bd935344b6d3",
+            "summary_identity": "b689ec856f63344d07573f573e5fd04975bda695cc99c03e23b5efd7d43776c5"
+          },
+          "projection": {
+            "settled": 1,
+            "unresolved": 0,
+            "valued_at": "2026-01-05T01:01:20.000000Z",
+            "profit": "1.55",
+            "rates": [
+              "eur-unit"
+            ],
+            "drawdown": "0.00",
+            "unavailable_observations": 0
+          }
+        }
+      ],
+      "profit": "1.55",
+      "drawdown": "0.00",
+      "rank": 11
+    },
+    {
+      "subset": 1,
+      "alternatives": [
+        0
+      ],
+      "risk_policy": 0,
+      "identity": "1749eff77f6503390e00ff877df417a9de1fe0fcde9fd7674481dbb932c5952c",
+      "folds": [
+        {
+          "replay": {
+            "generation": "846861d375df9d050b4aaa38b2367fc1e6fc10c77e7d341726e7ffffea918803",
+            "summary_identity": "d22f5c6f221f5baa78ea8afca05375027e64f35b5743adce2f139b61d2f8ad35"
+          },
+          "projection": {
+            "settled": 1,
+            "unresolved": 0,
+            "valued_at": "2026-01-05T01:00:40.000000Z",
+            "profit": "1.60",
+            "rates": [
+              "eur-unit"
+            ],
+            "drawdown": "0.00",
+            "unavailable_observations": 0
+          }
+        }
+      ],
+      "profit": "1.60",
+      "drawdown": "0.00",
+      "rank": 9
+    },
+    {
+      "subset": 1,
+      "alternatives": [
+        1
+      ],
+      "risk_policy": 0,
+      "identity": "7f8864a169ba837ab54e1b12bf740330ae213e1457296abde7f7e18e16bd7ff2",
+      "folds": [
+        {
+          "replay": {
+            "generation": "0042b3790ac9698cc16d600bca9f6b62e0f70a93d168a744dcf2d5d6b97dfc36",
+            "summary_identity": "84729ab2526a01c2c05e8842f4d4ced425a899e98e615eb694288f7d214ab7ae"
+          },
+          "projection": {
+            "settled": 1,
+            "unresolved": 0,
+            "valued_at": "2026-01-05T01:00:40.000000Z",
+            "profit": "3.10",
+            "rates": [
+              "eur-unit"
+            ],
+            "drawdown": "0.00",
+            "unavailable_observations": 0
+          }
+        }
+      ],
+      "profit": "3.10",
+      "drawdown": "0.00",
+      "rank": 6
+    },
+    {
+      "subset": 2,
+      "alternatives": [
+        0,
+        0
+      ],
+      "risk_policy": 0,
+      "identity": "dff683c88c8beddcf7300a588c6ea27466b85039c9baa39eb4e40e229b491696",
+      "folds": [
+        {
+          "replay": {
+            "generation": "3590985e246c576ac3f986c9a6d64d4e5f6ef71b72a6ce8ca2fdabc193466cf4",
+            "summary_identity": "4bc1ef63e9c829b8a69a6cc38fa18aa0de53cc6c502d25424a282c70f47e296e"
+          },
+          "projection": {
+            "settled": 2,
+            "unresolved": 0,
+            "valued_at": "2026-01-05T01:01:20.000000Z",
+            "profit": "2.40",
+            "rates": [
+              "eur-unit"
+            ],
+            "drawdown": "0.00",
+            "unavailable_observations": 0
+          }
+        }
+      ],
+      "profit": "2.40",
+      "drawdown": "0.00",
+      "rank": 8
+    },
+    {
+      "subset": 2,
+      "alternatives": [
+        0,
+        1
+      ],
+      "risk_policy": 0,
+      "identity": "12fa62a709965cb84f196eca2571fd3aafd998c58aa0b6fd9056838830710c5e",
+      "folds": [
+        {
+          "replay": {
+            "generation": "5e47fb7ee355f0cb675194c98349e8601d3cd450bd68987e2489280a93d4cb26",
+            "summary_identity": "eaf544190c56c07ef0dcf036d0b45cb237de53123e0288f4998af309c7980eaf"
+          },
+          "projection": {
+            "settled": 2,
+            "unresolved": 0,
+            "valued_at": "2026-01-05T01:01:20.000000Z",
+            "profit": "3.90",
+            "rates": [
+              "eur-unit"
+            ],
+            "drawdown": "0.00",
+            "unavailable_observations": 0
+          }
+        }
+      ],
+      "profit": "3.90",
+      "drawdown": "0.00",
+      "rank": 3
+    },
+    {
+      "subset": 2,
+      "alternatives": [
+        1,
+        0
+      ],
+      "risk_policy": 0,
+      "identity": "bf2c75f94c2177016204d00463e9c70a876055b673937c6c5745f627bbdf61bf",
+      "folds": [
+        {
+          "replay": {
+            "generation": "a60f84e1e676a5313e85bf2de72c36e58a3969479f07423015f5ca933bb608a7",
+            "summary_identity": "43a8cf473548369ee639478d354395632cdb853ae6d725563d306f315af85804"
+          },
+          "projection": {
+            "settled": 2,
+            "unresolved": 0,
+            "valued_at": "2026-01-05T01:01:20.000000Z",
+            "profit": "3.15",
+            "rates": [
+              "eur-unit"
+            ],
+            "drawdown": "0.00",
+            "unavailable_observations": 0
+          }
+        }
+      ],
+      "profit": "3.15",
+      "drawdown": "0.00",
+      "rank": 5
+    },
+    {
+      "subset": 2,
+      "alternatives": [
+        1,
+        1
+      ],
+      "risk_policy": 0,
+      "identity": "e02812702e7bd390291a2183c5c5118f132de95019757002416855b0027b1f60",
+      "folds": [
+        {
+          "replay": {
+            "generation": "23e880a515f5b59507c0e2306cb6554dd4fe16589ec4f5ce39a41cf337bb89d3",
+            "summary_identity": "544c29a911a48b24fe0fd4c7467e3f7650ab6d6624fb66b40c2d00bb617e0625"
+          },
+          "projection": {
+            "settled": 2,
+            "unresolved": 0,
+            "valued_at": "2026-01-05T01:01:20.000000Z",
+            "profit": "4.65",
+            "rates": [
+              "eur-unit"
+            ],
+            "drawdown": "0.00",
+            "unavailable_observations": 0
+          }
+        }
+      ],
+      "profit": "4.65",
+      "drawdown": "0.00",
+      "rank": 2
+    },
+    {
+      "subset": 3,
+      "alternatives": [
+        0
+      ],
+      "risk_policy": 0,
+      "identity": "c66984252303d7f9a7ebbbf884a17525a0a9e26d1536abcb06df6cc6438485dc",
+      "folds": [
+        {
+          "replay": {
+            "generation": "478a6a32c5df02d1d9b660770f72785bb1152f832fedf3c1d128b3c0622945d7",
+            "summary_identity": "6f475809b5077fe4e3ab22cc72849b73dbae1fc9c4348377709fbdfb9b789858"
+          },
+          "projection": {
+            "settled": 2,
+            "unresolved": 0,
+            "valued_at": "2026-01-05T01:01:25.000000Z",
+            "profit": "1.60",
+            "rates": [
+              "eur-unit"
+            ],
+            "drawdown": "0.00",
+            "unavailable_observations": 0
+          }
+        }
+      ],
+      "profit": "1.60",
+      "drawdown": "0.00",
+      "rank": 10
+    },
+    {
+      "subset": 3,
+      "alternatives": [
+        1
+      ],
+      "risk_policy": 0,
+      "identity": "ec95cf2fb65ba4e79356c42ef3590febe151533d6f02b1432c199f90cb83dd83",
+      "folds": [
+        {
+          "replay": {
+            "generation": "a51f4378df103e569ee4c54ff75b658773432e647f57fb8cdf9ab2cd59713a69",
+            "summary_identity": "55a8c708f0919b6565a10341081ff0404827ea72d03679f22c9400ebb2492e9e"
+          },
+          "projection": {
+            "settled": 2,
+            "unresolved": 0,
+            "valued_at": "2026-01-05T01:01:25.000000Z",
+            "profit": "3.10",
+            "rates": [
+              "eur-unit"
+            ],
+            "drawdown": "0.00",
+            "unavailable_observations": 0
+          }
+        }
+      ],
+      "profit": "3.10",
+      "drawdown": "0.00",
+      "rank": 7
+    },
+    {
+      "subset": 4,
+      "alternatives": [
+        0
+      ],
+      "risk_policy": 0,
+      "identity": "9aa3508451b9f2d73848c31d99ac2727f499e7cca711cd2b06631904fec81a75",
+      "folds": [
+        {
+          "replay": {
+            "generation": "5843bb901c069f7c0c397db76886a81ff74a247b53c0092c7c74048b4ea9159d",
+            "summary_identity": "419a17abf9adf9ce80d53213fac6b6902908991c46aa8c4fdb6fb5c6d2f85ab5"
+          },
+          "projection": {
+            "settled": 2,
+            "unresolved": 0,
+            "valued_at": "2026-01-05T01:00:45.000000Z",
+            "profit": "3.20",
+            "rates": [
+              "eur-unit"
+            ],
+            "drawdown": "0.00",
+            "unavailable_observations": 0
+          }
+        }
+      ],
+      "profit": "3.20",
+      "drawdown": "0.00",
+      "rank": 4
+    },
+    {
+      "subset": 4,
+      "alternatives": [
+        1
+      ],
+      "risk_policy": 0,
+      "identity": "50efe58ea60a883e84595f07a0cb44179ae8ba080e773a5cfbfdf0faa1097d4a",
+      "folds": [
+        {
+          "replay": {
+            "generation": "c19863ebf91df7a988b2845cac433eb8a7785b7196cf1e3844a340b3a349ab8a",
+            "summary_identity": "9587b871b297c659c93c8ec2c136a8801057ce4a1115a1ff7c44468e196cf5f5"
+          },
+          "projection": {
+            "settled": 2,
+            "unresolved": 0,
+            "valued_at": "2026-01-05T01:00:45.000000Z",
+            "profit": "6.20",
+            "rates": [
+              "eur-unit"
+            ],
+            "drawdown": "0.00",
+            "unavailable_observations": 0
+          }
+        }
+      ],
+      "profit": "6.20",
+      "drawdown": "0.00",
+      "rank": 1
+    }
+  ],
+  "selected": 11,
+  "refit": [
+    {
+      "instrument": "pocket_option:AEDCNY_otc",
+      "input_generation": "5e92163c490cbd67e82c024925f782dc63e9db8dc1fbfa1f33c3b3cc30c03a3b",
+      "generation": "212696cf966a83bbb1cb21941a2e83e644f29d3a065c8a59410b5e3593cd1b31",
+      "plan_identity": "fd08eeb5231757853942e275a03d88e39edd1de2fef9ccf9a424fb413fbcb956"
+    },
+    {
+      "instrument": "pocket_option:SECOND_otc",
+      "input_generation": "95f72f27319922458d0fbf81d7cc584a06ba1883a365f70460996e4e3c7f6591",
+      "generation": "057aae44fd62c232dc1aea9bbb25df1b732efd0f041a1f714aae3dea12ba79ac",
+      "plan_identity": "976c576c1087085825d10d7a13d53a793ab8bb84ef9a921a7d31c38a070ca932"
+    }
+  ],
+  "frozen": {
+    "strategies": [
+      {
+        "id": "d0",
+        "plan_identity": "976c576c1087085825d10d7a13d53a793ab8bb84ef9a921a7d31c38a070ca932",
+        "base_stream": {
+          "duration_seconds": 20,
+          "offset_seconds": 0
+        },
+        "conditions": [
+          {
+            "stream": {
+              "duration_seconds": 20,
+              "offset_seconds": 0
+            },
+            "output": "candle_direction",
+            "comparator": "eq",
+            "threshold": "down"
+          }
+        ]
+      }
+    ],
+    "bindings": [
+      {
+        "id": "d0",
+        "strategy": "d0",
+        "account": "a1",
+        "instrument": "pocket_option:SECOND_otc",
+        "contract": "1-large",
+        "risk_policy": "cap2",
+        "envelope": {
+          "max_purchase_cost": "2",
+          "max_entry_fee": "0.05",
+          "max_win_terminal_fee": "0",
+          "max_loss_terminal_fee": "0",
+          "max_tie_terminal_fee": "0",
+          "min_winning_net_return": "1.55",
+          "settlement_rule": "price_at_due_v1"
+        }
+      }
+    ],
+    "contracts": [
+      {
+        "id": "1-large",
+        "direction": "buy",
+        "duration_micros": 5000000,
+        "currency": "eur",
+        "stake": "2",
+        "quoted_cost": "2",
+        "entry_fee": "0.05",
+        "win": {
+          "gross_return": "3.60",
+          "terminal_fee": "0"
+        },
+        "loss": {
+          "gross_return": "0",
+          "terminal_fee": "0"
+        },
+        "tie": {
+          "gross_return": "2.05",
+          "terminal_fee": "0"
+        },
+        "settlement": {
+          "rule": "price_at_due_v1",
+          "max_settlement_delay_micros": 5000000,
+          "max_tick_gap_micros": 5000000
+        }
+      }
+    ],
+    "risk_policies": [
+      {
+        "id": "cap2",
+        "max_open_total": 2,
+        "same_entry": "all",
+        "deduplicate_signal_logic": false,
+        "max_feature_age_micros": 60000000,
+        "max_quote_age_micros": 0
+      }
+    ]
+  },
+  "state": {
+    "status": "selected"
+  }
+}

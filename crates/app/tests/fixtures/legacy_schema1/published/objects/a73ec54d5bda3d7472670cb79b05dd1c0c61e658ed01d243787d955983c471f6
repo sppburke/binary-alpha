@@ -1,0 +1,237 @@
+{
+  "search": {
+    "scope": "exhaustive",
+    "seed": 7,
+    "chunk_size": 8,
+    "max_candidates": 100,
+    "min_conditions": 1,
+    "max_conditions": 1,
+    "embargo_micros": 10000000,
+    "base_stream": {
+      "duration_seconds": 20,
+      "offset_seconds": 0
+    },
+    "development": {
+      "decision_start": "2026-01-05T00:00:20.000000Z",
+      "decision_end": "2026-01-05T00:01:40.000000Z",
+      "inputs": [
+        {
+          "tick_manifest": "file:///proc/self/cwd/published/manifests/61cb801d1ce5f355e507d1cdcdba54fbb9d52a794bb294f80b1a275e711d1fd3/ready.json",
+          "feature_manifest": "file:///proc/self/cwd/published/manifests/e0f530bc8d06c0434b980b5a27981336fc10469781cd825270e3290e8a2d1f69/ready.json",
+          "outcome_manifest": "file:///proc/self/cwd/published/manifests/3eebfff593c548b37d146aed54aeb1e8665c0613d3ca256f8e9053fdfdabcdfd/ready.json"
+        }
+      ]
+    },
+    "conditions": [
+      {
+        "stream": {
+          "duration_seconds": 20,
+          "offset_seconds": 0
+        },
+        "output": "candle_direction",
+        "comparator": "eq",
+        "thresholds": [
+          "up",
+          "down"
+        ]
+      }
+    ],
+    "contracts": [
+      {
+        "id": "1-small",
+        "direction": "buy",
+        "duration_micros": 5000000,
+        "currency": "eur",
+        "stake": "1",
+        "quoted_cost": "1",
+        "entry_fee": "0",
+        "win": {
+          "gross_return": "1.80",
+          "terminal_fee": "0"
+        },
+        "loss": {
+          "gross_return": "0",
+          "terminal_fee": "0"
+        },
+        "tie": {
+          "gross_return": "1",
+          "terminal_fee": "0"
+        },
+        "settlement": {
+          "rule": "price_at_due_v1",
+          "max_settlement_delay_micros": 5000000,
+          "max_tick_gap_micros": 5000000
+        }
+      }
+    ],
+    "account": {
+      "broker": "pocket_option",
+      "currency": "eur",
+      "scale": 2,
+      "initial_cash": "1000"
+    },
+    "risk_policy": {
+      "id": "one",
+      "max_open_per_strategy": 1,
+      "same_entry": "all",
+      "deduplicate_signal_logic": false,
+      "max_feature_age_micros": 60000000,
+      "max_quote_age_micros": 0
+    },
+    "envelope": {
+      "max_purchase_cost": "1",
+      "max_entry_fee": "0",
+      "max_win_terminal_fee": "0",
+      "max_loss_terminal_fee": "0",
+      "max_tie_terminal_fee": "0",
+      "min_winning_net_return": "0.80",
+      "settlement_rule": "price_at_due_v1"
+    },
+    "gates": {
+      "min_settled": 1,
+      "max_unresolved": 0,
+      "min_net_profit": "0"
+    },
+    "stability": {
+      "block_length": 4,
+      "simulations": 16,
+      "rolling_horizon": 4
+    }
+  },
+  "plan_identity": "1e849138f50b67ecbe767c117ea324b0d05ef6d2c7ba41bbeee3e46e5b6e551f",
+  "base_stream": {
+    "duration_seconds": 20,
+    "offset_seconds": 0
+  },
+  "kernel_module": "6f682af805efe67dbcc84b763a2b3cb356dd2cc1cf83de8f7d7df9cf5ea350f8",
+  "sampler": "stationary_block_sha256_v1",
+  "applicable": 2,
+  "members": [
+    {
+      "logic_identity": "b986d9df9d7cacf668432ead5f61a0b30f9bc61a8db74ac09dbddb71eb7290c0",
+      "conditions": [
+        {
+          "stream": {
+            "duration_seconds": 20,
+            "offset_seconds": 0
+          },
+          "output": "candle_direction",
+          "comparator": "eq",
+          "threshold": "up"
+        }
+      ],
+      "contract": "1-small",
+      "raw": {
+        "total": 2,
+        "wins": 2,
+        "losses": 0,
+        "ties": 0,
+        "invalid": 0
+      },
+      "null": {
+        "net_win": "0.80",
+        "net_loss": "1",
+        "break_even": 0.5555555555555556
+      },
+      "score": 0.308641975308642,
+      "adjusted": 0.308641975308642,
+      "development": {
+        "signals": 2,
+        "dispositions": {
+          "admitted": 2
+        },
+        "accepted": 2,
+        "released": 0,
+        "settled": 2,
+        "wins": 2,
+        "losses": 0,
+        "ties": 0,
+        "unresolved": 0,
+        "open": 0,
+        "profit": {
+          "eur": "1.60"
+        }
+      },
+      "rank": 1,
+      "stability": {
+        "development": {
+          "status": "unavailable",
+          "reason": "rolling horizon 4 exceeds 2 settlements"
+        }
+      }
+    },
+    {
+      "logic_identity": "3788cf8c0422ec2457d7d054ac15d740d68ce80ea38394cdb337186c13fe41e2",
+      "conditions": [
+        {
+          "stream": {
+            "duration_seconds": 20,
+            "offset_seconds": 0
+          },
+          "output": "candle_direction",
+          "comparator": "eq",
+          "threshold": "down"
+        }
+      ],
+      "contract": "1-small",
+      "raw": {
+        "total": 2,
+        "wins": 2,
+        "losses": 0,
+        "ties": 0,
+        "invalid": 0
+      },
+      "null": {
+        "net_win": "0.80",
+        "net_loss": "1",
+        "break_even": 0.5555555555555556
+      },
+      "score": 0.308641975308642,
+      "adjusted": 0.308641975308642,
+      "development": {
+        "signals": 2,
+        "dispositions": {
+          "admitted": 2
+        },
+        "accepted": 2,
+        "released": 0,
+        "settled": 2,
+        "wins": 2,
+        "losses": 0,
+        "ties": 0,
+        "unresolved": 0,
+        "open": 0,
+        "profit": {
+          "eur": "1.60"
+        }
+      },
+      "rank": 2,
+      "stability": {
+        "development": {
+          "status": "unavailable",
+          "reason": "rolling horizon 4 exceeds 2 settlements"
+        }
+      }
+    }
+  ],
+  "lowering": {
+    "role": "development",
+    "generation": "54899997050a3b9b3eba75d29f5176fa60666127317b032a523dfae7d0b1b185",
+    "summary_identity": "0653b1eb02aeb752e237d500e3bd83a9a59d0196587b20810b8ec9d88235507e",
+    "bindings": [
+      "c0",
+      "c1"
+    ]
+  },
+  "chunks": [
+    {
+      "role": "development",
+      "generation": "1a34206b71eaff3e1cd4b49fd3991a42d52ac7767e9dfc6ace81da0fd3aef5f8",
+      "summary_identity": "d35f846169390967888fe6eb9e28f481437b7f508acb8b1a20beeaf9ff31c9ae",
+      "bindings": [
+        "m0",
+        "m1"
+      ]
+    }
+  ]
+}

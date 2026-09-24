@@ -1,0 +1,123 @@
+{
+  "schema_version": 1,
+  "instrument": "pocket_option:AEDCNY_otc",
+  "broker": "pocket_option",
+  "provider_symbol": "AEDCNY_otc",
+  "base_currency": null,
+  "quote_currency": "unit",
+  "price_scale": 6,
+  "source": {
+    "generation": "f2f1b9cd5e4ca1db4e4afcfec207f63eb81320019fbf379056e7fdee2d1a7d33",
+    "source_kind": "bar_parquet",
+    "role": "development",
+    "native_granularity": {
+      "kind": "bar",
+      "period_seconds": 5
+    },
+    "price_scale": null,
+    "capabilities": [
+      "bars"
+    ]
+  },
+  "observations": 18,
+  "duplicates": 0,
+  "coverage": {
+    "first_event_time": "2026-01-05T00:00:00.000000Z",
+    "last_event_time": "2026-01-05T00:01:25.000000Z"
+  },
+  "cadence": [
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    17
+  ],
+  "prices": {
+    "min_units": 1799988,
+    "max_units": 1800012,
+    "step_units": 1,
+    "moves": 13
+  },
+  "gaps": {
+    "count": 0,
+    "max_micros": 0,
+    "total_micros": 0
+  },
+  "frozen_runs": null,
+  "jumps": null,
+  "sessions": null,
+  "streams": [
+    {
+      "duration_seconds": 20,
+      "offset_seconds": 0,
+      "finalized": 4,
+      "withheld_observations": 2,
+      "activity": [
+        0,
+        0,
+        0,
+        4
+      ],
+      "flagged": {
+        "low_activity": 0,
+        "hard_low_activity": 0,
+        "gap_before": 0,
+        "gap_inside": 0,
+        "missing_before": 0,
+        "frozen": 0,
+        "jump": 0,
+        "delayed_jump": 0,
+        "reopen_jump": 0,
+        "short_span": 0,
+        "complete": 4,
+        "clean": 4
+      }
+    }
+  ],
+  "calculations": [
+    {
+      "calculation": "tick_count",
+      "supported": false,
+      "reason": "{\"required\":\"ticks\",\"provided\":[\"bars\"],\"instrument\":\"pocket_option:AEDCNY_otc\",\"generation\":\"f2f1b9cd5e4ca1db4e4afcfec207f63eb81320019fbf379056e7fdee2d1a7d33\"}"
+    },
+    {
+      "calculation": "tick_path",
+      "supported": false,
+      "reason": "{\"required\":\"ticks\",\"provided\":[\"bars\"],\"instrument\":\"pocket_option:AEDCNY_otc\",\"generation\":\"f2f1b9cd5e4ca1db4e4afcfec207f63eb81320019fbf379056e7fdee2d1a7d33\"}"
+    },
+    {
+      "calculation": "tick_gaps",
+      "supported": false,
+      "reason": "{\"required\":\"ticks\",\"provided\":[\"bars\"],\"instrument\":\"pocket_option:AEDCNY_otc\",\"generation\":\"f2f1b9cd5e4ca1db4e4afcfec207f63eb81320019fbf379056e7fdee2d1a7d33\"}"
+    },
+    {
+      "calculation": "entry_tick",
+      "supported": false,
+      "reason": "{\"required\":\"ticks\",\"provided\":[\"bars\"],\"instrument\":\"pocket_option:AEDCNY_otc\",\"generation\":\"f2f1b9cd5e4ca1db4e4afcfec207f63eb81320019fbf379056e7fdee2d1a7d33\"}"
+    },
+    {
+      "calculation": "tick_settlement",
+      "supported": false,
+      "reason": "{\"required\":\"ticks\",\"provided\":[\"bars\"],\"instrument\":\"pocket_option:AEDCNY_otc\",\"generation\":\"f2f1b9cd5e4ca1db4e4afcfec207f63eb81320019fbf379056e7fdee2d1a7d33\"}"
+    }
+  ]
+}

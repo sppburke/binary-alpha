@@ -1,0 +1,456 @@
+{
+  "framing": {
+    "acquisition_id": "6828934bc1f5da61e264a565587bda26c11cdf4d64d310ab4a2896d31feb9153",
+    "checkpoint": {
+      "framing": {
+        "final_newline": true,
+        "line_terminators": [
+          "\n"
+        ]
+      },
+      "object": {
+        "bytes": 115,
+        "crc32c": null,
+        "generation": null,
+        "key": "objects/b8df44b693d6a64f750ff33fa79c938205cc93de56feecb6368f397465ccee89",
+        "path": "checkpoint.ndjson",
+        "role": "provenance",
+        "sha256": "b8df44b693d6a64f750ff33fa79c938205cc93de56feecb6368f397465ccee89"
+      }
+    },
+    "raw_pages": {
+      "framing": {
+        "final_newline": true,
+        "line_terminators": [
+          "\n"
+        ]
+      },
+      "object": {
+        "bytes": 36,
+        "crc32c": null,
+        "generation": null,
+        "key": "objects/6828934bc1f5da61e264a565587bda26c11cdf4d64d310ab4a2896d31feb9153",
+        "path": "raw_pages.ndjson",
+        "role": "provenance",
+        "sha256": "6828934bc1f5da61e264a565587bda26c11cdf4d64d310ab4a2896d31feb9153"
+      }
+    }
+  },
+  "kind": "import",
+  "observation_objects": [
+    {
+      "bytes": 1879,
+      "crc32c": null,
+      "generation": null,
+      "key": "objects/48de122c05838ed21b2503ab8f07bc26722d92fb67d0817bf9b89cd6f5c3f133",
+      "path": "observations/2026-01-05.parquet",
+      "role": "normalized",
+      "sha256": "48de122c05838ed21b2503ab8f07bc26722d92fb67d0817bf9b89cd6f5c3f133"
+    }
+  ],
+  "original_objects": [
+    {
+      "object": {
+        "bytes": 3194,
+        "crc32c": null,
+        "generation": null,
+        "key": "objects/fe79e07412338bf372ca8b759dce83762c7b9124384dba367ed175d6a410e42a",
+        "path": "dataset/parquet/year=2025/month=05/part-00000.parquet",
+        "role": "source",
+        "sha256": "fe79e07412338bf372ca8b759dce83762c7b9124384dba367ed175d6a410e42a"
+      },
+      "rows": 18
+    },
+    {
+      "object": {
+        "bytes": 115,
+        "crc32c": null,
+        "generation": null,
+        "key": "objects/b8df44b693d6a64f750ff33fa79c938205cc93de56feecb6368f397465ccee89",
+        "path": "checkpoint.ndjson",
+        "role": "provenance",
+        "sha256": "b8df44b693d6a64f750ff33fa79c938205cc93de56feecb6368f397465ccee89"
+      },
+      "rows": null
+    },
+    {
+      "object": {
+        "bytes": 0,
+        "crc32c": null,
+        "generation": null,
+        "key": "objects/e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "path": "dataset/_SUCCESS",
+        "role": "provenance",
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "rows": null
+    },
+    {
+      "object": {
+        "bytes": 112,
+        "crc32c": null,
+        "generation": null,
+        "key": "objects/f569ade1a042a90ad5c9885a4241b5f0681bec9b359d267b2e5b56ff351592b4",
+        "path": "dataset/hashes.sha256",
+        "role": "provenance",
+        "sha256": "f569ade1a042a90ad5c9885a4241b5f0681bec9b359d267b2e5b56ff351592b4"
+      },
+      "rows": null
+    },
+    {
+      "object": {
+        "bytes": 46,
+        "crc32c": null,
+        "generation": null,
+        "key": "objects/2f36a977694b22ad87057dd452f4ae0f9cae8b08c853eea80c1aafb9a380626e",
+        "path": "dataset/manifest.json",
+        "role": "provenance",
+        "sha256": "2f36a977694b22ad87057dd452f4ae0f9cae8b08c853eea80c1aafb9a380626e"
+      },
+      "rows": null
+    },
+    {
+      "object": {
+        "bytes": 3,
+        "crc32c": null,
+        "generation": null,
+        "key": "objects/ca3d163bab055381827226140568f3bef7eaac187cebd76878e0b63e9e442356",
+        "path": "dataset/reports/quality.json",
+        "role": "provenance",
+        "sha256": "ca3d163bab055381827226140568f3bef7eaac187cebd76878e0b63e9e442356"
+      },
+      "rows": null
+    },
+    {
+      "object": {
+        "bytes": 24,
+        "crc32c": null,
+        "generation": null,
+        "key": "objects/31ccad44a5007965f26cbed47171e3db2989a1c9deb69bd57f5e85ae082149b3",
+        "path": "download_manifest.json",
+        "role": "provenance",
+        "sha256": "31ccad44a5007965f26cbed47171e3db2989a1c9deb69bd57f5e85ae082149b3"
+      },
+      "rows": null
+    },
+    {
+      "object": {
+        "bytes": 36,
+        "crc32c": null,
+        "generation": null,
+        "key": "objects/6828934bc1f5da61e264a565587bda26c11cdf4d64d310ab4a2896d31feb9153",
+        "path": "raw_pages.ndjson",
+        "role": "provenance",
+        "sha256": "6828934bc1f5da61e264a565587bda26c11cdf4d64d310ab4a2896d31feb9153"
+      },
+      "rows": null
+    },
+    {
+      "object": {
+        "bytes": 1831,
+        "crc32c": null,
+        "generation": null,
+        "key": "objects/091fc07ad02ddb0505527f387f9b2f79b7a938e8b4de487a1d341456ead2ef5d",
+        "path": "collection/collection.json",
+        "role": "provenance",
+        "sha256": "091fc07ad02ddb0505527f387f9b2f79b7a938e8b4de487a1d341456ead2ef5d"
+      },
+      "rows": null
+    }
+  ],
+  "proofs": {
+    "ndjson_reconstruction": "sha256 and byte count verified",
+    "observation_rows": 18,
+    "source_validation": "ordered rows and provider columns"
+  },
+  "provenance": [
+    {
+      "bytes_verbatim": null,
+      "object": {
+        "bytes": 0,
+        "crc32c": null,
+        "generation": null,
+        "key": "objects/e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "path": "dataset/_SUCCESS",
+        "role": "provenance",
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      }
+    },
+    {
+      "bytes_verbatim": [
+        102,
+        101,
+        55,
+        57,
+        101,
+        48,
+        55,
+        52,
+        49,
+        50,
+        51,
+        51,
+        56,
+        98,
+        102,
+        51,
+        55,
+        50,
+        99,
+        97,
+        56,
+        98,
+        55,
+        53,
+        57,
+        100,
+        99,
+        101,
+        56,
+        51,
+        55,
+        54,
+        50,
+        99,
+        55,
+        98,
+        57,
+        49,
+        50,
+        52,
+        51,
+        56,
+        52,
+        100,
+        98,
+        97,
+        51,
+        54,
+        55,
+        101,
+        100,
+        49,
+        55,
+        53,
+        100,
+        54,
+        97,
+        52,
+        49,
+        48,
+        101,
+        52,
+        50,
+        97,
+        32,
+        32,
+        112,
+        97,
+        114,
+        113,
+        117,
+        101,
+        116,
+        47,
+        121,
+        101,
+        97,
+        114,
+        61,
+        50,
+        48,
+        50,
+        53,
+        47,
+        109,
+        111,
+        110,
+        116,
+        104,
+        61,
+        48,
+        53,
+        47,
+        112,
+        97,
+        114,
+        116,
+        45,
+        48,
+        48,
+        48,
+        48,
+        48,
+        46,
+        112,
+        97,
+        114,
+        113,
+        117,
+        101,
+        116,
+        10
+      ],
+      "object": {
+        "bytes": 112,
+        "crc32c": null,
+        "generation": null,
+        "key": "objects/f569ade1a042a90ad5c9885a4241b5f0681bec9b359d267b2e5b56ff351592b4",
+        "path": "dataset/hashes.sha256",
+        "role": "provenance",
+        "sha256": "f569ade1a042a90ad5c9885a4241b5f0681bec9b359d267b2e5b56ff351592b4"
+      }
+    },
+    {
+      "bytes_verbatim": [
+        123,
+        34,
+        97,
+        115,
+        115,
+        101,
+        116,
+        34,
+        58,
+        32,
+        34,
+        83,
+        69,
+        67,
+        79,
+        78,
+        68,
+        95,
+        111,
+        116,
+        99,
+        34,
+        44,
+        32,
+        34,
+        99,
+        97,
+        110,
+        111,
+        110,
+        105,
+        99,
+        97,
+        108,
+        95,
+        114,
+        111,
+        119,
+        115,
+        34,
+        58,
+        32,
+        49,
+        56,
+        125,
+        10
+      ],
+      "object": {
+        "bytes": 46,
+        "crc32c": null,
+        "generation": null,
+        "key": "objects/2f36a977694b22ad87057dd452f4ae0f9cae8b08c853eea80c1aafb9a380626e",
+        "path": "dataset/manifest.json",
+        "role": "provenance",
+        "sha256": "2f36a977694b22ad87057dd452f4ae0f9cae8b08c853eea80c1aafb9a380626e"
+      }
+    },
+    {
+      "bytes_verbatim": [
+        123,
+        125,
+        10
+      ],
+      "object": {
+        "bytes": 3,
+        "crc32c": null,
+        "generation": null,
+        "key": "objects/ca3d163bab055381827226140568f3bef7eaac187cebd76878e0b63e9e442356",
+        "path": "dataset/reports/quality.json",
+        "role": "provenance",
+        "sha256": "ca3d163bab055381827226140568f3bef7eaac187cebd76878e0b63e9e442356"
+      }
+    },
+    {
+      "bytes_verbatim": [
+        123,
+        34,
+        97,
+        115,
+        115,
+        101,
+        116,
+        34,
+        58,
+        32,
+        34,
+        83,
+        69,
+        67,
+        79,
+        78,
+        68,
+        95,
+        111,
+        116,
+        99,
+        34,
+        125,
+        10
+      ],
+      "object": {
+        "bytes": 24,
+        "crc32c": null,
+        "generation": null,
+        "key": "objects/31ccad44a5007965f26cbed47171e3db2989a1c9deb69bd57f5e85ae082149b3",
+        "path": "download_manifest.json",
+        "role": "provenance",
+        "sha256": "31ccad44a5007965f26cbed47171e3db2989a1c9deb69bd57f5e85ae082149b3"
+      }
+    },
+    {
+      "instrument_entry": {
+        "asset": "SECOND_otc",
+        "asset_root": "/proc/self/cwd/sources/source/SECOND_otc",
+        "canonical_rows": 18,
+        "dataset_root": "/proc/self/cwd/sources/source/SECOND_otc/dataset",
+        "expected_symbol_id": 8,
+        "interval_contract": {
+          "closed": "left",
+          "frequency": "5s",
+          "interval": "[timestamp,timestamp+5s)",
+          "label": "left",
+          "offset_seconds": 0,
+          "origin": "unix_epoch_utc",
+          "timestamp_semantics": "bar_start"
+        },
+        "interval_contract_provenance": "manifest_and_parquet_metadata",
+        "parquet_files": [
+          {
+            "bytes": 3194,
+            "path": "parquet/year=2025/month=05/part-00000.parquet",
+            "rows": 18,
+            "sha256": "fe79e07412338bf372ca8b759dce83762c7b9124384dba367ed175d6a410e42a"
+          }
+        ],
+        "symbol_id": 8
+      },
+      "object": {
+        "bytes": 1831,
+        "crc32c": null,
+        "generation": null,
+        "key": "objects/091fc07ad02ddb0505527f387f9b2f79b7a938e8b4de487a1d341456ead2ef5d",
+        "path": "collection/collection.json",
+        "role": "provenance",
+        "sha256": "091fc07ad02ddb0505527f387f9b2f79b7a938e8b4de487a1d341456ead2ef5d"
+      }
+    }
+  ],
+  "replaced_generations": [],
+  "schema_version": 1
+}
