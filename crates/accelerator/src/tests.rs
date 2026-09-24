@@ -46,6 +46,20 @@ fn column_blocks_bound_memory_and_sparse_indices() {
 }
 
 #[test]
+fn column_blocks_count_physical_pool_reservation() {
+    // One row, one column, and one batch request 405 bytes in total.
+    let unit = 32 * 1024 * 1024;
+    let required = unit;
+    let plan = plan_column_blocks_with_granularity(&[1], 1, 1, 1, 1, 1, (required, unit)).unwrap();
+    assert_eq!(plan.blocks[0].columns, 0..1);
+    assert!(
+        plan_column_blocks_with_granularity(&[1], 1, 1, 1, 1, 1, (required - 1, unit))
+            .unwrap_err()
+            .contains("one-column")
+    );
+}
+
+#[test]
 fn column_blocks_split_before_sparse_key_count_exceeds_i32() {
     let plan = plan_column_blocks(&[0; 32_768], 1, 65_536, 1, 1, 1, 14_000_000_000).unwrap();
     assert!(plan.blocks.len() > 1);

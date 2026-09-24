@@ -1748,25 +1748,6 @@ fn score_streamed(
         clock.construction_visits += codes.len();
         lengths.push(codes.iter().filter(|&&code| code == buckets[0]).count());
     }
-    #[cfg(feature = "cuda")]
-    let mut budget = usize::MAX;
-    #[cfg(not(feature = "cuda"))]
-    let mut budget = usize::MAX;
-    #[cfg(feature = "cuda")]
-    for (position, backend) in backends.iter().enumerate() {
-        if let Backend::Cuda(device) = backend {
-            let ordinals = device_ordinals.ok_or("CUDA screening has no device ordinals")?;
-            let duplicate_workers = ordinals
-                .iter()
-                .filter(|&&ordinal| ordinal == ordinals[position])
-                .count();
-            budget = budget.min(device.memory_info()?.0 / duplicate_workers);
-        }
-    }
-    #[cfg(not(feature = "cuda"))]
-    let _ = (backends, device_ordinals);
-    budget =
-        budget.min(test_screen_limit("BINARY_ALPHA_TEST_COLUMN_BUDGET")?.unwrap_or(usize::MAX));
     let batch_size = test_screen_limit("BINARY_ALPHA_TEST_SCREEN_BATCH")?.unwrap_or_else(|| {
         if backends
             .iter()
@@ -1777,15 +1758,71 @@ fn score_streamed(
             65_536
         }
     });
-    let plan = kernels::plan_column_blocks(
-        &lengths,
-        rows,
-        condition_slots(settings.max_conditions, conditions.len()),
-        batch_size,
-        1,
-        1,
-        budget,
-    )?;
+    #[cfg(feature = "cuda")]
+    let mut budget = usize::MAX;
+    #[cfg(not(feature = "cuda"))]
+    let budget = usize::MAX;
+    #[cfg(feature = "cuda")]
+    for (position, backend) in backends.iter().enumerate() {
+        if let Backend::Cuda(device) = backend {
+            let ordinals = device_ordinals.ok_or("CUDA screening has no device ordinals")?;
+            let duplicate_workers = ordinals
+                .iter()
+                .filter(|&&ordinal| ordinal == ordinals[position])
+                .count();
+            budget = budget.min(device.search_planning_free_bytes(batch_size)? / duplicate_workers);
+        }
+    }
+    #[cfg(not(feature = "cuda"))]
+    let _ = device_ordinals;
+    let forced_budget = test_screen_limit("BINARY_ALPHA_TEST_COLUMN_BUDGET")?;
+    #[cfg(feature = "cuda")]
+    let allocation_unit = if backends
+        .iter()
+        .any(|backend| matches!(backend, Backend::Cuda(_)))
+    {
+        binary_alpha_accelerator::cuda::SEARCH_POOL_RESERVATION_UNIT_BYTES
+    } else {
+        1
+    };
+    #[cfg(not(feature = "cuda"))]
+    let allocation_unit = 1;
+    let slots = condition_slots(settings.max_conditions, conditions.len());
+    let plan = if let Some(forced) = forced_budget {
+        let logical = kernels::plan_column_blocks(&lengths, rows, slots, batch_size, 1, 1, forced)?;
+        let mut blocks = Vec::new();
+        for block in logical.blocks {
+            let physical = kernels::plan_column_blocks_with_granularity(
+                &lengths[block.columns.clone()],
+                rows,
+                slots,
+                batch_size,
+                1,
+                1,
+                (budget, allocation_unit),
+            )?;
+            blocks.extend(
+                physical
+                    .blocks
+                    .into_iter()
+                    .map(|part| kernels::ColumnBlock {
+                        columns: block.columns.start + part.columns.start
+                            ..block.columns.start + part.columns.end,
+                    }),
+            );
+        }
+        kernels::ColumnBlockPlan { blocks }
+    } else {
+        kernels::plan_column_blocks_with_granularity(
+            &lengths,
+            rows,
+            slots,
+            batch_size,
+            1,
+            1,
+            (budget, allocation_unit),
+        )?
+    };
     clock.blocks = plan.blocks.len();
     let mut suffix_capacity = vec![0; plan.blocks.len() + 1];
     for block in (0..plan.blocks.len()).rev() {

@@ -12,6 +12,9 @@ use cudarc::driver::{
 use cudarc::nvrtc::Ptx;
 use std::{sync::Arc, time::Instant};
 
+/// The CUDA async pool's 32 MiB reserve unit measured across the sparse tuple workloads.
+pub const SEARCH_POOL_RESERVATION_UNIT_BYTES: usize = 32 * 1024 * 1024;
+
 /// Observed identity of the opened device and driver.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeviceInfo {
@@ -107,6 +110,55 @@ impl Device {
         self.context
             .mem_get_info()
             .map_err(|e| error("CUDA device", "memory_info", e))
+    }
+
+    /// Establish the sparse dual kernel's device-local stack reservation before planning.
+    /// The planner then measures the free memory of this same physical device and context.
+    pub fn search_planning_free_bytes(&self, batch_capacity: usize) -> Result<usize, String> {
+        let count = i32::try_from(batch_capacity)
+            .map_err(|_| "search planning: batch capacity exceeds i32")?;
+        if count == 0 {
+            return Err("search planning: batch capacity is zero".into());
+        }
+        let features = vec![0_i32; batch_capacity];
+        let buckets = vec![0_i16; batch_capacity];
+        let offsets: Vec<i32> = (0..=count).collect();
+        let drivers = vec![0_i32; batch_capacity];
+        let request = Request {
+            kind: 6,
+            buffers: SearchBuffers {
+                feature_codes: &[0],
+                feature_count: 1,
+                row_count: 1,
+                ordered_rows: &[0],
+                decision_time_ms: &[1],
+                release_time_ms: &[2],
+                settlement_time_ms: &[2],
+                valid: &[1],
+                buy_win: &[1],
+                sell_win: &[0],
+                tie: &[0],
+            },
+            split_mask: &[1],
+            candidates: CandidateConditions {
+                condition_feature: &features,
+                condition_bucket: &buckets,
+                candidate_offsets: &offsets,
+                candidate_count: count,
+            },
+            sparse: Some(SparseIndex {
+                candidate_driver_key: &drivers,
+                key_chrono_offsets: &[0, 1],
+                key_chrono_rows: &[0],
+            }),
+            expiry_ms: 0,
+            direction_code: 1,
+            payout_basis: 0,
+        };
+        request.validate()?;
+        self.score(request)?;
+        self.sync("search planning", "release")?;
+        Ok(self.memory_info()?.0)
     }
 
     fn sync(&self, kernel: &str, phase: &str) -> Result<(), String> {

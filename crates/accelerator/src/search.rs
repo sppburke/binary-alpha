@@ -41,6 +41,29 @@ pub fn plan_column_blocks(
     split_masks: usize,
     budget_bytes: usize,
 ) -> Result<ColumnBlockPlan, String> {
+    plan_column_blocks_with_granularity(
+        row_list_lengths,
+        row_count,
+        max_conditions,
+        batch_capacity,
+        workers,
+        split_masks,
+        (budget_bytes, 1),
+    )
+}
+
+/// Plans against the allocator pool's physical reservation unit rather than only
+/// requested buffer lengths. A unit of one retains the logical-byte model.
+pub fn plan_column_blocks_with_granularity(
+    row_list_lengths: &[usize],
+    row_count: usize,
+    max_conditions: usize,
+    batch_capacity: usize,
+    workers: usize,
+    split_masks: usize,
+    budget_and_granularity: (usize, usize),
+) -> Result<ColumnBlockPlan, String> {
+    let (budget_bytes, granularity) = budget_and_granularity;
     if row_count > i32::MAX as usize
         || max_conditions == 0
         || batch_capacity == 0
@@ -50,15 +73,17 @@ pub fn plan_column_blocks(
         || batch_capacity
             .checked_mul(max_conditions)
             .is_none_or(|n| n > i32::MAX as usize)
+        || granularity == 0
     {
         return Err("column blocks: invalid row, condition, batch, worker, or split bound".into());
     }
     let rows = row_count as u128;
+    let slots = max_conditions as u128;
+    let unit = granularity as u128;
     // Ordered rows, three time arrays, four flags, and the resident split masks.
     let resident_row_bytes = rows * (36 + split_masks as u128);
     // Feature IDs, bucket codes, candidate offsets, sparse driver IDs, and two full 21-i64 outputs.
-    let batch_bytes =
-        batch_capacity as u128 * (max_conditions as u128 * 6 + 4 + 4 + 2 * 21 * 8) + 4;
+    let batch_bytes = batch_capacity as u128 * (slots * 6 + 4 + 4 + 2 * 21 * 8) + 4;
     let concurrent_batch_bytes = batch_bytes * workers as u128;
     let budget = budget_bytes as u128;
     let fits = |columns: usize, list_len: usize| -> bool {
@@ -73,10 +98,10 @@ pub fn plan_column_blocks(
         {
             return false;
         }
-        let slots = max_conditions as u128;
         let feature_bytes = slots * columns as u128 * rows * 2;
         let sparse_bytes = 4 * (slots * columns as u128 + 1 + slots * list_len as u128);
-        resident_row_bytes + concurrent_batch_bytes + feature_bytes + sparse_bytes <= budget
+        let requested = resident_row_bytes + concurrent_batch_bytes + feature_bytes + sparse_bytes;
+        requested.div_ceil(unit) * unit <= budget
     };
     let mut blocks = Vec::new();
     let mut start = 0;
