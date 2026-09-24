@@ -50,6 +50,10 @@ pub struct Gates {
     pub max_unresolved: u64,
     pub min_profit: Decimal,
     pub max_drawdown: Decimal,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_decisive: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_win_rate: Option<Decimal>,
 }
 
 // ----------------------------------------------------------------------------------------------
@@ -164,6 +168,11 @@ pub fn validate(portfolio: &Portfolio) -> Result<(), String> {
     }
     if portfolio.gates.max_drawdown.is_negative() {
         return Err("gates.max_drawdown: must not be negative".to_string());
+    }
+    if let Some(rate) = portfolio.gates.min_win_rate
+        && (rate.is_negative() || rate.compare(Decimal::parse("1")?)? == Ordering::Greater)
+    {
+        return Err("gates.min_win_rate: must lie in [0, 1]".to_string());
     }
     if portfolio.members.is_empty() {
         return Err("members: at least one base member is required".to_string());
@@ -752,6 +761,12 @@ pub fn structure(portfolio: &Portfolio, policy: &Policy) -> Result<(), String> {
 pub struct Projection {
     pub settled: u64,
     pub unresolved: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wins: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub losses: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ties: Option<u64>,
     /// The restored ledger's final event time, at which every account is valued.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub valued_at: Option<String>,
@@ -766,6 +781,40 @@ pub struct Projection {
     pub failure: Option<String>,
 }
 
+pub(crate) fn decisive_support_failure(projection: &Projection, gates: &Gates) -> Option<String> {
+    if gates.min_decisive.is_none() && gates.min_win_rate.is_none() {
+        return None;
+    }
+    let (Some(wins), Some(losses)) = (projection.wins, projection.losses) else {
+        return Some("decisive trade counts are unavailable".to_string());
+    };
+    let decisive = u128::from(wins) + u128::from(losses);
+    let minimum = gates.min_decisive.unwrap_or(0);
+    (decisive == 0 || decisive < u128::from(minimum)).then(|| {
+        format!("decisive trades {decisive} below the minimum {minimum} (zero is insufficient)")
+    })
+}
+
+pub(crate) fn decisive_rate_failure(
+    projection: &Projection,
+    gates: &Gates,
+) -> Result<Option<String>, String> {
+    let Some(minimum) = gates.min_win_rate else {
+        return Ok(None);
+    };
+    let (Some(wins), Some(losses)) = (projection.wins, projection.losses) else {
+        return Ok(None);
+    };
+    let decisive = u128::from(wins) + u128::from(losses);
+    if decisive == 0 {
+        return Ok(None);
+    }
+    let winning = Decimal::parse(&wins.to_string())?;
+    let required = Decimal::parse(&decisive.to_string())?.checked_mul(minimum)?;
+    Ok((winning.compare(required)? == Ordering::Less)
+        .then(|| format!("decisive win rate {wins}/{decisive} below the minimum {minimum}")))
+}
+
 /// Projects and gates one verified restored engine: settlement support first; only then every
 /// account's native completed profit converted by the engine at the restored ledger's final
 /// event time and summed with checked arithmetic; then the engine's reporting drawdown, which
@@ -773,9 +822,13 @@ pub struct Projection {
 /// gate; an arithmetic error stops.
 pub fn project(engine: &Engine, gates: &Gates) -> Result<Projection, String> {
     let summary = engine.summary();
+    let decisive_gates = gates.min_decisive.is_some() || gates.min_win_rate.is_some();
     let mut projection = Projection {
         settled: summary.portfolio.settled,
         unresolved: summary.portfolio.unresolved,
+        wins: decisive_gates.then_some(summary.portfolio.wins),
+        losses: decisive_gates.then_some(summary.portfolio.losses),
+        ties: decisive_gates.then_some(summary.portfolio.ties),
         valued_at: summary.last_time_micros.map(format_event_time_micros),
         profit: None,
         rates: BTreeSet::new(),
@@ -795,6 +848,10 @@ pub fn project(engine: &Engine, gates: &Gates) -> Result<Projection, String> {
             "unresolved {} above the maximum {}",
             projection.unresolved, gates.max_unresolved
         ));
+        return Ok(projection);
+    }
+    if let Some(reason) = decisive_support_failure(&projection, gates) {
+        projection.failure = Some(reason);
         return Ok(projection);
     }
     let replay = &engine.definition().replay;
@@ -842,6 +899,9 @@ pub fn project(engine: &Engine, gates: &Gates) -> Result<Projection, String> {
                 "drawdown is unavailable: {unavailable} reporting observations were unavailable"
             ));
         }
+    }
+    if projection.failure.is_none() {
+        projection.failure = decisive_rate_failure(&projection, gates)?;
     }
     Ok(projection)
 }
@@ -1254,6 +1314,9 @@ mod tests {
                 projection: Some(Projection {
                     settled: 1,
                     unresolved: 0,
+                    wins: None,
+                    losses: None,
+                    ties: None,
                     valued_at: None,
                     profit: Some(Decimal::parse(profit).unwrap()),
                     rates: BTreeSet::new(),
@@ -1267,6 +1330,51 @@ mod tests {
             failure: None,
             rank: None,
         }
+    }
+
+    #[test]
+    fn decisive_fold_gates_exclude_ties_and_compare_exact_boundary() {
+        let gates = Gates {
+            min_settled: 3,
+            max_unresolved: 0,
+            min_profit: Decimal::parse("0").unwrap(),
+            max_drawdown: Decimal::parse("5").unwrap(),
+            min_decisive: Some(2),
+            min_win_rate: Some(Decimal::parse("0.5").unwrap()),
+        };
+        let mut projection = choice("a", "1", "0")
+            .folds
+            .into_iter()
+            .next()
+            .unwrap()
+            .projection
+            .unwrap();
+        projection.settled = 3;
+        projection.wins = Some(1);
+        projection.losses = Some(0);
+        projection.ties = Some(2);
+        assert!(
+            decisive_support_failure(&projection, &gates)
+                .unwrap()
+                .contains("decisive trades 1")
+        );
+
+        projection.losses = Some(2);
+        projection.ties = Some(0);
+        assert_eq!(decisive_support_failure(&projection, &gates), None);
+        assert!(
+            decisive_rate_failure(&projection, &gates)
+                .unwrap()
+                .unwrap()
+                .contains("1/3")
+        );
+
+        projection.losses = Some(1);
+        projection.ties = Some(1);
+        assert_eq!(decisive_rate_failure(&projection, &gates).unwrap(), None);
+        projection.wins = Some(0);
+        projection.losses = Some(0);
+        assert!(decisive_support_failure(&projection, &gates).is_some());
     }
 
     #[test]
@@ -1296,6 +1404,9 @@ mod tests {
             projection: Some(Projection {
                 settled: 1,
                 unresolved: 0,
+                wins: None,
+                losses: None,
+                ties: None,
                 valued_at: None,
                 profit: Some(Decimal::parse("-0.25").unwrap()),
                 rates: BTreeSet::new(),

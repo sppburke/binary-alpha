@@ -692,6 +692,62 @@ fn bars_keep_only_observation_days_and_apply_frozen_evaluation_features() {
 }
 
 #[test]
+fn split_without_holdout_publishes_only_development_and_evaluation() {
+    let scratch = Scratch::new("split_without_holdout");
+    let pair = common::daily::pair(&scratch, true);
+    let mut config = bar_split_config(&scratch, &pair.v2);
+    config.split.as_mut().unwrap().holdout.clear();
+    for role in [DatasetRole::Development, DatasetRole::Evaluation] {
+        let mut missing = config.clone();
+        let split = missing.split.as_mut().unwrap();
+        match role {
+            DatasetRole::Development => split.development.clear(),
+            DatasetRole::Evaluation => split.evaluation.clear(),
+            DatasetRole::Holdout => unreachable!(),
+        }
+        let error = Config::parse(&missing.canonical_toml())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("at least one window is required"), "{error}");
+    }
+    let (report, declaration, _) = split(&scratch, &config);
+    assert_eq!(declaration.populations.len(), 2);
+    assert_eq!(report.lines().count(), 3);
+    let published = scratch.path("split-published");
+    for (population, role) in declaration
+        .populations
+        .iter()
+        .zip([DatasetRole::Development, DatasetRole::Evaluation])
+    {
+        assert_eq!(population.role, role);
+        let manifest = read_manifest(&published, &population.id);
+        assert_eq!(manifest.role, role);
+        command(&[
+            "data",
+            "verify",
+            "--manifest",
+            &uri(&published, &population.id).to_string(),
+        ])
+        .unwrap();
+    }
+    assert!(
+        declaration
+            .populations
+            .iter()
+            .all(|population| population.role != DatasetRole::Holdout)
+    );
+
+    let mut research = fixture::configuration(&scratch.root);
+    research.research.as_mut().unwrap().holdout.inputs.clear();
+    let path = scratch.path("research-without-holdout.toml");
+    fs::write(&path, research.canonical_toml()).unwrap();
+    let before = snapshots(&published);
+    let error = command(&["research", "run", "--config", path.to_str().unwrap()]).unwrap_err();
+    assert!(error.contains("research.holdout.inputs"), "{error}");
+    assert_eq!(snapshots(&published), before);
+}
+
+#[test]
 fn invalid_configuration_sources_windows_and_locations_write_nothing() {
     let scratch = Scratch::new("split_refusals");
     let pair = common::daily::pair(&scratch, true);
@@ -765,7 +821,6 @@ fn invalid_configuration_sources_windows_and_locations_write_nothing() {
     for (name, mutation, reason) in [
         ("empty development", "development", "at least one window"),
         ("empty evaluation", "evaluation", "at least one window"),
-        ("empty holdout", "holdout", "at least one window"),
         ("empty sources", "sources", "at least one source"),
     ] {
         let mut value = serde_json::to_value(&base).unwrap();

@@ -1303,6 +1303,9 @@ pub fn verdict(projection: &Projection, gates: &Gates) -> Verdict {
             projection.unresolved, gates.max_unresolved
         ));
     }
+    if let Some(reason) = crate::portfolio::decisive_support_failure(projection, gates) {
+        return insufficient(reason);
+    }
     if projection.profit.is_none() {
         return insufficient(
             projection
@@ -1317,12 +1320,17 @@ pub fn verdict(projection: &Projection, gates: &Gates) -> Verdict {
             projection.unavailable_observations
         ));
     }
-    match &projection.failure {
-        Some(reason) => Verdict::EconomicFailure {
+    if let Some(reason) = &projection.failure {
+        return Verdict::EconomicFailure {
             reason: reason.clone(),
-        },
-        None => Verdict::Pass,
+        };
     }
+    if let Some(reason) = crate::portfolio::decisive_rate_failure(projection, gates)
+        .expect("validated win rate and u64 counts fit checked decimal arithmetic")
+    {
+        return Verdict::EconomicFailure { reason };
+    }
+    Verdict::Pass
 }
 
 /// The complete frozen scenario set aggregated once: any insufficient scenario makes the
@@ -2332,6 +2340,9 @@ mod tests {
         Projection {
             settled,
             unresolved: 0,
+            wins: None,
+            losses: None,
+            ties: None,
             valued_at: None,
             profit: profit.map(decimal),
             rates: BTreeSet::new(),
@@ -2347,6 +2358,8 @@ mod tests {
             max_unresolved: 0,
             min_profit: decimal("1"),
             max_drawdown: decimal("5"),
+            min_decisive: None,
+            min_win_rate: None,
         }
     }
 
@@ -2428,6 +2441,62 @@ mod tests {
             }
         );
         assert_eq!(mixed.reason(), Some("insufficient_evidence"));
+    }
+
+    #[test]
+    fn decisive_verdicts_follow_existing_support_gates() {
+        let mut gates = gates();
+        gates.min_decisive = Some(2);
+        gates.min_win_rate = Some(decimal("0.5"));
+        let mut result = projection(3, Some("1"), Some("0"), 0, None);
+        result.wins = Some(1);
+        result.losses = Some(0);
+        result.ties = Some(2);
+        assert!(matches!(
+            verdict(&result, &gates),
+            Verdict::InsufficientEvidence { reason } if reason.contains("decisive trades 1")
+        ));
+        result.settled = 1;
+        assert!(matches!(
+            verdict(&result, &gates),
+            Verdict::InsufficientEvidence { reason } if reason.contains("settled 1")
+        ));
+        result.settled = 3;
+        result.unresolved = 1;
+        assert!(matches!(
+            verdict(&result, &gates),
+            Verdict::InsufficientEvidence { reason } if reason.contains("unresolved 1")
+        ));
+        result.unresolved = 0;
+        result.losses = Some(2);
+        result.ties = Some(0);
+        result.profit = None;
+        assert!(matches!(
+            verdict(&result, &gates),
+            Verdict::InsufficientEvidence { reason } if reason.contains("profit is unavailable")
+        ));
+        result.profit = Some(decimal("1"));
+        result.unavailable_observations = 1;
+        assert!(matches!(
+            verdict(&result, &gates),
+            Verdict::InsufficientEvidence { reason } if reason.contains("drawdown is unavailable")
+        ));
+        result.unavailable_observations = 0;
+        assert!(matches!(
+            verdict(&result, &gates),
+            Verdict::EconomicFailure { reason } if reason.contains("1/3")
+        ));
+        result.losses = Some(1);
+        result.ties = Some(1);
+        assert_eq!(verdict(&result, &gates), Verdict::Pass);
+        result.wins = Some(0);
+        result.losses = Some(0);
+        gates.min_decisive = None;
+        gates.min_win_rate = Some(decimal("0"));
+        assert!(matches!(
+            verdict(&result, &gates),
+            Verdict::InsufficientEvidence { reason } if reason.contains("zero is insufficient")
+        ));
     }
 
     #[test]

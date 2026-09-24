@@ -2365,7 +2365,7 @@ impl DataSplit {
             (DatasetRole::Evaluation, &self.evaluation),
             (DatasetRole::Holdout, &self.holdout),
         ] {
-            if ranges.is_empty() {
+            if ranges.is_empty() && role != DatasetRole::Holdout {
                 return Err(format!("{role}: at least one window is required"));
             }
             for range in ranges {

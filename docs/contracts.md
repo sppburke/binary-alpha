@@ -112,7 +112,7 @@ from a path.
 | `storage.historical_data_dir` | string | a non-empty path of the retained historical-data folder; a relative path resolves against the configuration file's directory |
 | `storage.publication_uri` | string | `gs://BUCKET` or `gs://BUCKET/PREFIX` in every run mode; `file:///ABSOLUTE/DIR` only with `run_mode = "research"`, for non-live tests and the research data pipeline |
 | `import.sources` | array of tables | optional; consumed only by `data import`, which requires at least one entry |
-| `split` | table | optional; consumed only by `data split`; declares `namespace`, development daily-root `sources`, and nonempty `development`, `evaluation`, and `holdout` arrays of whole-day `{ start, end }` windows |
+| `split` | table | optional; consumed only by `data split`; declares `namespace`, development daily-root `sources`, nonempty `development` and `evaluation` arrays, and a `holdout` array that may be empty; every window is a whole-day `{ start, end }` range |
 | `instruments` | array of tables | optional; maps audit generations and selected broker history/live instruments |
 | `features.instruments` | array of tables | optional; consumed only by `features build`, which requires at least one entry |
 | `outcomes` | table | optional; consumed only by `outcomes build`, which requires it |
@@ -542,6 +542,10 @@ a distinct instrument. Every window contains observations. All sources, windows,
 are checked before retention or publication starts. The retained folder, the destination, and the
 destination's namespace location resolve through any alias to locations that neither lie inside
 nor contain a source store and are never at or below a managed pipeline store.
+
+Development and evaluation each require at least one window. `holdout = []` publishes no holdout
+generation or population in the declaration; `research run` still requires a declared holdout
+input for every instrument.
 
 Each slice preserves the selected observation day objects, including duplicate occurrences and
 empty inventory days, and carries reduced coverage evidence and split lineage naming the source
@@ -2193,8 +2197,9 @@ The optional `portfolio` table declares, in canonical order: `families` (nonempt
 ready-manifest locations of development-only search families), positive `max_policies`, positive
 `embargo_micros`, the `objective` (`profit_then_drawdown`: larger completed net profit then lower
 drawdown; `drawdown_then_profit`: lower drawdown then larger profit), the `gates` (positive
-`min_settled`, `max_unresolved`, `min_profit`, non-negative `max_drawdown`, in the reporting
-currency), the shared funded `accounts`, the reporting contract (`reporting_currency`,
+`min_settled`, `max_unresolved`, `min_profit`, non-negative `max_drawdown`, optional
+`min_decisive`, and optional `min_win_rate` in `[0, 1]`, in the reporting currency where
+applicable), the shared funded `accounts`, the reporting contract (`reporting_currency`,
 `reporting_scale`, `max_rate_age_micros` and optional `rates`, as in `replay`), the nonempty base
 universe `members` (each a `family` index, a `member` index of that family and optional
 `ordinals`, each naming a `condition` index of the member and an interval `ordinal` `0` to `4`),
@@ -2265,6 +2270,12 @@ when every fold passes; its profit is the sum of the fold profits and its drawdo
 fold drawdown. Ranking orders passing choices by the objective, then fewer deployments, then the
 canonical identity ascending, writing one-based ranks; the first is selected. No standalone
 profit, score or admission flag prunes.
+
+When either decisive gate is configured, the projection also records wins, losses, and ties.
+Only wins and losses are decisive: zero decisive trades or fewer than `min_decisive` fails for
+insufficient evidence, even when ties satisfy `min_settled`. With sufficient decisive trades,
+`wins / (wins + losses)` below `min_win_rate` fails the economic gate using exact decimal
+comparison. Without decisive gates, these counts are absent from the projection record.
 
 Only a selected choice is refitted: each refit fit builds a new plan on the full permitted
 development generation and the choice re-resolves under it; an inapplicable refit is terminal
@@ -2342,7 +2353,8 @@ instrument index); optional `scenarios` (each a unique identifier `id` other tha
 non-negative `acceptance_delay_micros`, and `alternatives` naming every portfolio binding exactly
 once with an exact `contract` and `envelope`; equal contract identifiers within one scenario carry
 equal terms); and `qualification` (`claim`, which must be `empirical_policy_qualification_v1`, and
-`gates`, the exact `min_settled`, `max_unresolved`, `min_profit`, and `max_drawdown` every
+`gates`, the exact `min_settled`, `max_unresolved`, `min_profit`, `max_drawdown`, and optional
+`min_decisive` and `min_win_rate` every
 scenario must satisfy, where `min_profit` is the minimum economically useful improvement over the
 analytic zero-profit benchmark on the same initial capital). Validation lowers the declared
 settings into the existing feature, outcome, search, and portfolio tables with the source
