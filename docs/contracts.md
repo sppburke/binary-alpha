@@ -2283,7 +2283,7 @@ drawdown; `drawdown_then_profit`: lower drawdown then larger profit), the `gates
 `min_settled`, `max_unresolved`, `min_profit`, non-negative `max_drawdown`, optional
 `min_decisive`, and optional `min_win_rate` in `[0, 1]`, in the reporting currency where
 applicable), the shared funded `accounts`, the reporting contract (`reporting_currency`,
-`reporting_scale`, `max_rate_age_micros` and optional `rates`, as in `replay`), the nonempty base
+`reporting_scale`, `max_rate_age_micros` and optional `rates`, as in `replay`), the nonempty explicit base
 universe `members` (each a `family` index, a `member` index of that family and optional
 `ordinals`, each naming a `condition` index of the member and an interval `ordinal` `0` to `4`),
 nonempty `repairs` (a unique `id` and a conjunction of existing conditions; an empty conjunction
@@ -2307,6 +2307,8 @@ before any choice is enumerated. For schema-2 families, `member` names a retaine
 index; an absent or screened index fails before folds. Schema-1 families use their all-member
 vector position. Omitting the table preserves every existing configuration
 identity.
+Standalone `portfolio optimize` always uses explicit members and subsets; it does not accept
+`[portfolio.generate]`.
 
 ### Stages and identities
 
@@ -2323,7 +2325,7 @@ followed; then the family verifies exactly as `data verify` does, whose chunk re
 referenced replay manifest's own role and summary before restoring it. Nothing is stripped to make
 an input acceptable.
 
-The logical universe is the declared members' conditions with their ordinals; an ordinal
+The logical universe is the resolved members' conditions with their ordinals; an ordinal
 condition compares text with `eq` or `ne`. Choices enumerate in declared order: subsets, then each
 deployment's alternatives with the last deployment cycling fastest, then risk policies;
 deployments keep their subset position as `d{position}`. A choice's logical form carries the plan
@@ -2394,10 +2396,14 @@ the winner is unchanged. The command writes
 followed by `[bind S folds S refit S publish S]` or `(already published)`, then the verification
 line. An interruption preserves every completed replay and feature generation and publishes no
 selection; the rerun reuses them and recomputes the rest. A schema-2 selection stores only
-declared source members, each keyed by its retained `global_index`; schema-1 selections retain
-their all-member source records and remain readable. `data verify` on a selection checks
+resolved source members, each keyed by its retained `global_index`; schema-1 selections retain
+their all-member source records and remain readable. A generated schema-2 selection also records
+the declared `generate` rule in its resolved configuration. Before folds, selection and its
+verifier re-derive the complete ordered members and singleton subsets from verified development
+families, ranks, fitted interval edges, bindings, and condition-free repair zero, and require exact
+equality with that configuration, including an empty resolution. `data verify` on a selection checks
 the recorded configuration's hash and schema against the manifest, re-reads the families through
-the development-only reader, checks every declared global source index, and re-enumerates the
+the development-only reader, checks every resolved global source index, and re-enumerates the
 choices, identities and structural rejections,
 verifies every recorded fit, assessment, refit and outer feature generation through the feature
 verifier and re-resolves every configured fit through the feature owner against the recorded plan
@@ -2438,7 +2444,8 @@ in instrument order); `refit` (`cutoff` and one development fit observation gene
 observation generation per instrument, optional `splits`; holdout references are validated for syntax
 and declared role only and are never opened before certification); `portfolio` (exactly the
 `portfolio` table without families, folds, refit, and evaluation; a member's family index is its
-instrument index); optional `scenarios` (each a unique identifier `id` other than `baseline`, a
+instrument index; optional `[research.portfolio.generate] top = N` replaces only `members` and
+`subsets` after the fitted development plans and ranks exist); optional `scenarios` (each a unique identifier `id` other than `baseline`, a
 non-negative `acceptance_delay_micros`, and `alternatives` naming every portfolio binding exactly
 once with an exact `contract` and `envelope`; equal contract identifiers within one scenario carry
 equal terms); and `qualification` (`claim`, which must be `empirical_policy_qualification_v1`, and
@@ -2454,6 +2461,20 @@ rules, so no later structural rejection consumes a claim. Omitting the table pre
 existing configuration identity; the
 table follows `portfolio` and precedes `[[brokers]]` in canonical order. The command requires
 `run_mode = "research"`.
+
+Generation requires positive `top` and a condition-free `repairs[0]`; its syntax and the remaining
+portfolio declarations are validated before search. After every development family verifies,
+the portfolio owner takes up to `top` passing members in rank order per instrument, skipping a
+member unless each development-fifths threshold identifies exactly one low-to-high interval
+through the fitted edges and retained `interval_label`. Each generated member uses its schema-2
+global index and the derived ordinals. Its singleton subset uses repair zero and exactly one
+binding on that instrument with a sole alternative equal to the ranked contract and search
+envelope; zero or multiple matching bindings fail. The fully resolved portfolio is validated
+before folds. When no member is eligible, generated members and subsets are both empty, so the
+portfolio enumerates zero choices and publishes `no_feasible_policy`; research publishes the
+matching run without reading evaluation or holdout. Explicit portfolios still require nonempty
+members and subsets. Research verification independently rebuilds the resolved configuration
+from the verified families and fitted plans before any outer assessment read.
 
 The optional `replay.scenario` descriptor, version `1`, carries `schema_version` (`1`), an
 identifier `id`, and a non-negative `acceptance_delay_micros`. Every admitted command's synthetic

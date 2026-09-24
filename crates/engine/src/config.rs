@@ -169,6 +169,11 @@ impl Config {
                 .map_err(|reason| format!("search.{reason}"))?;
         }
         if let Some(portfolio) = &self.portfolio {
+            if portfolio.generate.is_some() {
+                return Err(
+                    "portfolio.generate: only a research portfolio may generate members".into(),
+                );
+            }
             portfolio
                 .validate()
                 .map_err(|reason| format!("portfolio.{reason}"))?;
@@ -1835,6 +1840,8 @@ pub struct StabilitySettings {
 #[serde(deny_unknown_fields)]
 pub struct Portfolio {
     pub families: Vec<ManifestUri>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub generate: Option<PortfolioGenerate>,
     pub max_policies: u64,
     pub embargo_micros: i64,
     pub objective: crate::portfolio::Objective,
@@ -1854,6 +1861,13 @@ pub struct Portfolio {
     pub refit: Refit,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub evaluation: Option<Evaluation>,
+}
+
+/// Research-only rule resolved against verified, ranked development families.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PortfolioGenerate {
+    pub top: u32,
 }
 
 impl Portfolio {
@@ -2133,9 +2147,13 @@ pub struct ResearchPortfolio {
     pub max_rate_age_micros: i64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rates: Option<Vec<RateEvent>>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub members: Vec<PortfolioMember>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub generate: Option<PortfolioGenerate>,
     pub repairs: Vec<Repair>,
     pub bindings: Vec<PortfolioBinding>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub subsets: Vec<Subset>,
     pub risk_policies: Vec<RiskPolicy>,
 }

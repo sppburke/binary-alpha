@@ -11,15 +11,17 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant, SystemTime};
 
 use binary_alpha_engine::config::{
-    Config, EncodingSpec, Encodings, GeneratedSearchCondition, ManifestUri, ReplayScenario,
-    SearchCondition, StreamKey,
+    Config, EncodingSpec, Encodings, GeneratedSearchCondition, ManifestUri, PortfolioGenerate,
+    ReplayScenario, SearchCondition, StreamKey,
 };
 use binary_alpha_engine::dataset::{DatasetRole, GenerationManifest, manifest_key};
 use binary_alpha_engine::execution::{
     Comparator, Decimal, EventKind, FinancialEvent, Summary, Threshold,
 };
 use binary_alpha_engine::features::{FeatureManifest, FeaturePlan};
-use binary_alpha_engine::portfolio::{Selection, State};
+use binary_alpha_engine::portfolio::{
+    Selection, SelectionManifest, State, selection_generation_id,
+};
 use binary_alpha_engine::research::{
     self as research, CertificationManifest, CertificationRecord, Claim, ClaimKind, Declaration,
     Frozen, Grant, Intent, Population, Receipt, Run, RunManifest, RunState, Verdict,
@@ -655,6 +657,452 @@ fn five_stream_generated_search_publishes_and_verifies_in_research() {
                 .contains("verified search generation")
         );
     }
+}
+
+fn generated_fixture(name: &str, top: u32) -> Fixture {
+    let mut fixture = Fixture::new(name);
+    let research = fixture.config.research.as_mut().unwrap();
+    research.portfolio.generate = Some(PortfolioGenerate { top });
+    research.portfolio.members.clear();
+    research.portfolio.subsets.clear();
+    for binding in &mut research.portfolio.bindings {
+        binding.alternatives.truncate(1);
+    }
+    for instrument in &mut research.instruments {
+        instrument.search.gates.min_net_profit = decimal("-1000");
+        instrument.search.gates.max_unresolved = 100;
+    }
+    fixture.save();
+    fixture
+}
+
+#[test]
+fn generated_portfolio_selects_ranked_singletons_and_verifies_run() {
+    let fixture = generated_fixture("phase11_generated_portfolio", 2);
+    let report = fixture.run().unwrap();
+    let (_, run) = fixture.run_record();
+    let selection = fixture.selection(&run);
+    let settings = selection.config.portfolio.as_ref().unwrap();
+    assert_eq!(settings.generate, Some(PortfolioGenerate { top: 2 }));
+    for research in [None, fixture.config.research.clone()] {
+        let mut standalone = selection.config.clone();
+        standalone.research = research;
+        assert!(
+            Config::parse(&standalone.canonical_toml())
+                .unwrap_err()
+                .to_string()
+                .contains("portfolio.generate: only a research portfolio")
+        );
+    }
+    assert!(settings.members.len() >= 2, "{report}");
+    assert_eq!(settings.members.len(), settings.subsets.len());
+    for (index, subset) in settings.subsets.iter().enumerate() {
+        assert_eq!(subset.deployments.len(), 1);
+        let deployment = subset.deployments[0];
+        assert_eq!((deployment.member, deployment.repair), (index, 0));
+        assert_eq!(
+            settings.bindings[deployment.binding].instrument,
+            INSTRUMENTS[settings.members[index].family]
+        );
+        let family = Family::from_json(&fixture.object(
+            &run.instruments[settings.members[index].family].family,
+            "family.json",
+        ))
+        .unwrap();
+        let member = family
+            .members
+            .iter()
+            .find(|member| member.global_index == Some(settings.members[index].member as u64))
+            .unwrap();
+        assert!(member.rank.is_some());
+        assert_eq!(
+            settings.bindings[deployment.binding].alternatives[0]
+                .contract
+                .id,
+            member.contract
+        );
+    }
+    assert!(
+        fixture
+            .verify(&run.selection)
+            .unwrap()
+            .contains("verified portfolio generation")
+    );
+    assert!(
+        fixture
+            .verify(&fixture.generation())
+            .unwrap()
+            .contains("verified research generation")
+    );
+    no_access(&logged(&fixture.log()), &fixture.protected());
+}
+
+#[test]
+fn generated_top_syntax_fails_before_search_or_any_store_read() {
+    let fixture = generated_fixture("phase11_generated_top_zero", 0);
+    let error = fixture.run().unwrap_err();
+    assert!(
+        error.contains("portfolio.generate.top: must be positive"),
+        "{error}"
+    );
+    assert!(logged(&fixture.log()).is_empty());
+}
+
+#[test]
+fn generated_portfolio_validates_resolved_policy_count_before_folds() {
+    let mut fixture = generated_fixture("phase11_generated_count", 2);
+    fixture
+        .config
+        .research
+        .as_mut()
+        .unwrap()
+        .portfolio
+        .max_policies = 1;
+    fixture.save();
+    let error = fixture.run().unwrap_err();
+    assert!(
+        error.contains("portfolio.max_policies: the grid declares"),
+        "{error}"
+    );
+    no_access(&logged(&fixture.log()), &fixture.evaluation());
+    no_access(&logged(&fixture.log()), &fixture.protected());
+}
+
+#[test]
+fn generated_portfolio_empty_selection_and_run_skip_outer_inputs() {
+    let mut fixture = generated_fixture("phase11_generated_portfolio_empty", 2);
+    for instrument in &mut fixture.config.research.as_mut().unwrap().instruments {
+        instrument.search.gates.min_settled = 1_000_000;
+    }
+    fixture.save();
+    let report = fixture.run().unwrap();
+    let (_, run) = fixture.run_record();
+    let selection = fixture.selection(&run);
+    let settings = selection.config.portfolio.as_ref().unwrap();
+    assert_eq!(selection.state, State::NoFeasiblePolicy, "{report}");
+    assert_eq!(run.state, RunState::NoFeasiblePolicy);
+    assert!(settings.members.is_empty() && settings.subsets.is_empty());
+    assert_eq!(
+        (
+            selection.declared,
+            selection.choices.len(),
+            selection.selected
+        ),
+        (0, 0, None)
+    );
+    assert!(selection.refit.is_empty() && selection.outer.is_none());
+    assert!(run.claims.is_empty() && run.outer.is_empty());
+    fixture.verify(&run.selection).unwrap();
+    fixture.verify(&fixture.generation()).unwrap();
+    let log = logged(&fixture.log());
+    no_access(&log, &fixture.evaluation());
+    no_access(&log, &fixture.protected());
+}
+
+#[test]
+fn generated_portfolio_rejects_wrong_instrument_and_multiple_alternatives() {
+    for wrong in ["instrument", "alternative"] {
+        let mut fixture = generated_fixture(&format!("phase11_generated_bad_{wrong}"), 1);
+        let research = fixture.config.research.as_mut().unwrap();
+        match wrong {
+            "instrument" => research.portfolio.bindings[0].instrument = INSTRUMENTS[1].into(),
+            "alternative" => {
+                let original = fixture_config::configuration(&fixture.scratch.root);
+                research.portfolio.bindings[0]
+                    .alternatives
+                    .push(original.research.unwrap().portfolio.bindings[0].alternatives[1].clone());
+            }
+            _ => unreachable!(),
+        }
+        fixture.save();
+        let error = fixture.run().unwrap_err();
+        assert!(
+            error.contains("requires exactly one binding"),
+            "{wrong}: {error}"
+        );
+        no_access(&logged(&fixture.log()), &fixture.protected());
+    }
+}
+
+#[test]
+fn generated_selection_verifier_rederives_every_member_and_subset() {
+    let fixture = generated_fixture("phase11_generated_tamper", 1);
+    fixture.run().unwrap();
+    let (_, run) = fixture.run_record();
+    let selection = fixture.selection(&run);
+    let original = selection.config.portfolio.as_ref().unwrap();
+    assert_eq!(original.members.len(), 2);
+    let family =
+        Family::from_json(&fixture.object(&run.instruments[0].family, "family.json")).unwrap();
+    let lower = family
+        .members
+        .iter()
+        .find(|member| member.rank == Some(2))
+        .expect("second passing rank");
+    let store =
+        binary_alpha_app::store::Store::open(&fixture.config.storage.publication_uri).unwrap();
+    let manifest = SelectionManifest::from_json(
+        &fs::read(
+            fixture
+                .scratch
+                .path("published")
+                .join(manifest_key(&run.selection)),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    for case in ["omitted", "reordered", "lower_rank", "ordinal", "binding"] {
+        let mut changed = selection.clone();
+        let settings = changed.config.portfolio.as_mut().unwrap();
+        match case {
+            "omitted" => {
+                settings.members.pop();
+                settings.subsets.pop();
+            }
+            "reordered" => {
+                settings.members.swap(0, 1);
+                settings.subsets.swap(0, 1);
+            }
+            "lower_rank" => settings.members[0].member = lower.global_index.unwrap() as usize,
+            "ordinal" => settings.members[0]
+                .ordinals
+                .push(binary_alpha_engine::config::Ordinal {
+                    condition: 0,
+                    ordinal: 4,
+                }),
+            "binding" => settings.subsets[0].deployments[0].binding = 1,
+            _ => unreachable!(),
+        }
+        let mut altered_manifest = manifest.clone();
+        altered_manifest.config_hash = changed.config.content_hash();
+        altered_manifest.generation = selection_generation_id(
+            &altered_manifest.config_hash,
+            &altered_manifest.code_revision,
+            &altered_manifest.families,
+        );
+        let bytes = changed.to_json();
+        let object = &mut altered_manifest.objects[0];
+        object.sha256 = research::digest(b"", &bytes);
+        object.key = binary_alpha_engine::dataset::object_key(&object.sha256);
+        object.bytes = bytes.len() as u64;
+        object.crc32c = None;
+        object.generation = None;
+        write(&fixture.scratch.path("published").join(&object.key), bytes);
+        let key = altered_manifest.key();
+        let uri = store.uri(&key);
+        let error = binary_alpha_app::portfolio::verify_selection(
+            &uri,
+            &store,
+            &key,
+            &altered_manifest.to_json(),
+            research::Access::ORDINARY,
+        )
+        .unwrap_err();
+        assert!(
+            error.contains("generated members and subsets differ"),
+            "{case}: {error}"
+        );
+    }
+    no_access(&logged(&fixture.log()), &fixture.protected());
+}
+
+#[test]
+fn generated_ordinals_follow_fitted_edges_not_label_code_order() {
+    use binary_alpha_engine::features::{FittedEncoding, ProjectionKind};
+    let fixture = generated_fixture("phase11_generated_ordinals", 1);
+    fixture.run().unwrap();
+    let (_, run) = fixture.run_record();
+    let selection = fixture.selection(&run);
+    let settings = selection.config.portfolio.as_ref().unwrap();
+    let mut families = Vec::new();
+    let mut plans = Vec::new();
+    for record in &run.instruments {
+        families.push(Family::from_json(&fixture.object(&record.family, "family.json")).unwrap());
+        plans.push(FeaturePlan::from_json(&fixture.object(&record.feature, "plan.json")).unwrap());
+    }
+    let ranked = families[0]
+        .members
+        .iter_mut()
+        .find(|member| member.rank == Some(1))
+        .unwrap();
+    let source_index = ranked.global_index.unwrap() as usize;
+    ranked.conditions[0].output = "edge_probe".into();
+    ranked.conditions[0].threshold = Threshold::Text("3_to_4".into());
+    plans[0].streams[0].encodings.push(FittedEncoding {
+        output: "edge_probe".into(),
+        input: "range_bps".into(),
+        automatic: false,
+        encoding: ProjectionKind::DevelopmentFifths,
+        edges: Some(vec![1.0, 2.0, 3.0, 4.0]),
+        input_divisor: 1.0,
+        labels: vec![
+            "4_to_inf".into(),
+            "3_to_4".into(),
+            "-inf_to_1".into(),
+            "2_to_3".into(),
+            "1_to_2".into(),
+        ],
+    });
+    families[0].plan_identity = plans[0].identity();
+    let (members, subsets) =
+        binary_alpha_engine::portfolio::generated_members(settings, &families, &plans).unwrap();
+    let generated = members
+        .iter()
+        .find(|member| member.family == 0 && member.member == source_index)
+        .unwrap();
+    assert_eq!(
+        generated.ordinals,
+        vec![binary_alpha_engine::config::Ordinal {
+            condition: 0,
+            ordinal: 3
+        }]
+    );
+    assert_eq!(subsets.len(), members.len());
+    let mut resolved = settings.clone();
+    resolved.members = members;
+    resolved.subsets = subsets;
+    let logical = binary_alpha_engine::portfolio::logical_members(&resolved, &families).unwrap();
+    let plans_by_instrument: BTreeMap<_, _> = plans
+        .iter()
+        .cloned()
+        .map(|plan| (plan.instrument.clone(), plan))
+        .collect();
+    let policy = binary_alpha_engine::portfolio::policy(
+        &resolved,
+        &logical,
+        &binary_alpha_engine::portfolio::ChoiceKey {
+            subset: 0,
+            alternatives: vec![0],
+            risk_policy: 0,
+        },
+        binary_alpha_engine::portfolio::Form::Resolved(&plans_by_instrument),
+    )
+    .unwrap();
+    assert_eq!(
+        policy.strategies[0].conditions[0].threshold,
+        Threshold::Text("3_to_4".into())
+    );
+    families[0]
+        .members
+        .iter_mut()
+        .find(|member| member.rank == Some(1))
+        .unwrap()
+        .conditions[0]
+        .threshold = Threshold::Text("not_an_interval".into());
+    let (fallback, _) =
+        binary_alpha_engine::portfolio::generated_members(settings, &families, &plans).unwrap();
+    let second_rank = families[0]
+        .members
+        .iter()
+        .find(|member| member.rank == Some(2))
+        .unwrap();
+    assert_eq!(
+        fallback[0].member,
+        second_rank.global_index.unwrap() as usize
+    );
+}
+
+#[test]
+fn generated_fifths_ordinals_publish_and_verify_through_folds() {
+    use binary_alpha_engine::config::Outputs;
+    let mut fixture = generated_fixture("phase11_generated_fifths", 1);
+    let varying = [0, 1].map(|instrument| {
+        ticks(BASE, &recipe(PLANTED), instrument)
+            .into_iter()
+            .enumerate()
+            .filter_map(|(position, line)| {
+                let candle = position / 80;
+                let step = position % 80;
+                (matches!(step, 0 | 20 | 21 | 32 | 48 | 79) || step % (2 + candle % 5) == 0)
+                    .then_some(line)
+            })
+            .collect::<Vec<_>>()
+    });
+    let sources = import_pair_text(
+        &fixture.scratch,
+        "fifths-source",
+        DatasetRole::Development,
+        varying,
+    );
+    for (index, source) in sources.into_iter().enumerate() {
+        let reference = uri(&fixture.scratch.root, &source.generation);
+        let research = fixture.config.research.as_mut().unwrap();
+        research.instruments[index].source_manifest = reference.clone();
+        research.folds[0].inputs[index].fit_manifest = reference;
+        research.instruments[index].features.outputs =
+            Some(Outputs::Named(vec!["tick_volume".into()]));
+        research.instruments[index].features.encodings = Some(Encodings {
+            max_labels: 8,
+            outputs: vec![EncodingSpec {
+                output: "tick_volume_dev_quantile".into(),
+                bins: None,
+            }],
+        });
+        research.instruments[index].search.conditions =
+            vec![SearchCondition::Generate(GeneratedSearchCondition {
+                stream: StreamKey {
+                    duration_seconds: 20,
+                    offset_seconds: 0,
+                },
+                output: "*".into(),
+                comparator: Comparator::Eq,
+            })];
+        fixture.declaration.populations[index].coverage = source.coverage.clone();
+        fixture.declaration.populations[index].source = "invented-variable-volume-v1".into();
+        fixture.declaration.populations[index].generations = vec![source.generation.clone()];
+        fixture.datasets[index] = source;
+    }
+    fixture.save();
+    let report = fixture.run().unwrap();
+    let (_, run) = fixture.run_record();
+    let selection = fixture.selection(&run);
+    let settings = selection.config.portfolio.as_ref().unwrap();
+    assert!(!settings.members.is_empty(), "{report}");
+    assert!(
+        settings
+            .members
+            .iter()
+            .all(|member| !member.ordinals.is_empty())
+    );
+    for member in &settings.members {
+        let record = &run.instruments[member.family];
+        let plan = FeaturePlan::from_json(&fixture.object(&record.feature, "plan.json")).unwrap();
+        let family = Family::from_json(&fixture.object(&record.family, "family.json")).unwrap();
+        let source = family
+            .members
+            .iter()
+            .find(|source| source.global_index == Some(member.member as u64))
+            .unwrap();
+        for ordinal in &member.ordinals {
+            let condition = &source.conditions[ordinal.condition];
+            let encoding = plan
+                .stream(condition.stream)
+                .unwrap()
+                .encodings
+                .iter()
+                .find(|encoding| encoding.output == condition.output)
+                .unwrap();
+            assert_eq!(
+                condition.threshold,
+                Threshold::Text(encoding.interval_label(ordinal.ordinal).unwrap())
+            );
+        }
+    }
+    assert!(
+        selection
+            .choices
+            .iter()
+            .all(|choice| choice.folds.iter().all(|fold| fold.inapplicable.is_none()))
+    );
+    assert!(
+        selection
+            .choices
+            .iter()
+            .any(|choice| { choice.folds.iter().any(|fold| fold.replay.is_some()) })
+    );
+    fixture.verify(&run.selection).unwrap();
+    fixture.verify(&fixture.generation()).unwrap();
+    no_access(&logged(&fixture.log()), &fixture.protected());
 }
 
 #[test]

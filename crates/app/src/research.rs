@@ -652,8 +652,11 @@ fn selection_table(
     research: &Research,
     families: Vec<ManifestUri>,
     profiles: &BTreeMap<String, ManifestUri>,
+    access: Access<'_>,
 ) -> Result<Portfolio, String> {
     let mut table = engine::portfolio_table(research, families, profiles, &research.evaluation)?;
+    portfolio::resolve_generated(&mut table, access)?;
+    engine::validate_resolved_portfolio(research, &table)?;
     table.evaluation = None;
     Ok(table)
 }
@@ -872,7 +875,7 @@ fn develop(
 
     // 3. The existing portfolio owner selects with evaluation disabled.
     let selecting = Instant::now();
-    let table = selection_table(research, families, &profiles)?;
+    let table = selection_table(research, families, &profiles, access)?;
     let selected = portfolio::select(&portfolio_config(config, table), local, destination, access)?;
     report(&selected.report)?;
     clock.selection = selecting.elapsed().as_secs_f64();
@@ -1766,7 +1769,8 @@ fn verified_children(
         &read_key(store, &selection_key)?,
         access,
     )?;
-    let expected = portfolio_config(config, selection_table(research, families, &profiles)?);
+    let table = selection_table(research, families, &profiles, access)?;
+    let expected = portfolio_config(config, table);
     if selected.config != expected {
         return Err(format!(
             "{uri}: selection generation {selection} is not the selection this configuration lowers"

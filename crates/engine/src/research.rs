@@ -672,6 +672,14 @@ pub fn validate(research: &Research) -> Result<(), String> {
     if research.study.changes.is_empty() {
         return Err("study.changes: the declared changes are required; `initial attempt` names a first attempt".to_string());
     }
+    if research
+        .portfolio
+        .generate
+        .as_ref()
+        .is_some_and(|rule| rule.top == 0)
+    {
+        return Err("portfolio.generate.top: must be positive".into());
+    }
     for (index, predecessor) in research.study.predecessors.iter().enumerate() {
         identifier(&format!("study.predecessors[{index}]"), predecessor)?;
         if *predecessor == research.study.attempt {
@@ -822,6 +830,26 @@ pub fn validate(research: &Research) -> Result<(), String> {
         .map(|uri| (uri.generation().to_string(), uri.clone()))
         .collect();
     let base = portfolio_table(research, sources, &profiles, &research.evaluation)?;
+    validate_resolved_portfolio(research, &base)?;
+    // Each later window's own splits under the execution rules, before any claim is consumed.
+    for (name, window) in [
+        ("evaluation", &research.evaluation),
+        ("holdout", &research.holdout),
+    ] {
+        let start = crate::market::parse_event_time_micros(&window.decision_start)
+            .map_err(|reason| format!("{name}.decision_start: {reason}"))?;
+        let end = crate::market::parse_event_time_micros(&window.decision_end)
+            .map_err(|reason| format!("{name}.decision_end: {reason}"))?;
+        crate::execution::validate_splits(window.splits.as_deref().unwrap_or(&[]), start, end)
+            .map_err(|reason| format!("{name}.{reason}"))?;
+    }
+    Ok(())
+}
+
+/// Checks the complete research portfolio under the base, holdout, qualification and every
+/// declared scenario. Called once with unresolved generated members for syntax, and again after
+/// verified development families resolve them, before folds.
+pub fn validate_resolved_portfolio(research: &Research, base: &Portfolio) -> Result<(), String> {
     base.validate()
         .map_err(|reason| format!("portfolio.{reason}"))?;
     Portfolio {
@@ -852,18 +880,6 @@ pub fn validate(research: &Research) -> Result<(), String> {
         table
             .validate()
             .map_err(|reason| format!("scenarios[{index}]: portfolio.{reason}"))?;
-    }
-    // Each later window's own splits under the execution rules, before any claim is consumed.
-    for (name, window) in [
-        ("evaluation", &research.evaluation),
-        ("holdout", &research.holdout),
-    ] {
-        let start = crate::market::parse_event_time_micros(&window.decision_start)
-            .map_err(|reason| format!("{name}.decision_start: {reason}"))?;
-        let end = crate::market::parse_event_time_micros(&window.decision_end)
-            .map_err(|reason| format!("{name}.decision_end: {reason}"))?;
-        crate::execution::validate_splits(window.splits.as_deref().unwrap_or(&[]), start, end)
-            .map_err(|reason| format!("{name}.{reason}"))?;
     }
     Ok(())
 }
@@ -991,6 +1007,7 @@ pub fn portfolio_table(
     }
     Ok(Portfolio {
         families,
+        generate: settings.generate.clone(),
         max_policies: settings.max_policies,
         embargo_micros: settings.embargo_micros,
         objective: settings.objective,
@@ -1000,10 +1017,18 @@ pub fn portfolio_table(
         reporting_scale: settings.reporting_scale,
         max_rate_age_micros: settings.max_rate_age_micros,
         rates: settings.rates.clone(),
-        members: settings.members.clone(),
+        members: if settings.generate.is_some() {
+            Vec::new()
+        } else {
+            settings.members.clone()
+        },
         repairs: settings.repairs.clone(),
         bindings: settings.bindings.clone(),
-        subsets: settings.subsets.clone(),
+        subsets: if settings.generate.is_some() {
+            Vec::new()
+        } else {
+            settings.subsets.clone()
+        },
         risk_policies: settings.risk_policies.clone(),
         folds,
         refit: crate::config::Refit {

@@ -13,7 +13,10 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::config::{Config, FeatureInstrument, Portfolio, Replay, StreamKey};
+use crate::config::{
+    Config, Deployment, FeatureInstrument, Ordinal, Portfolio, PortfolioMember, Replay, StreamKey,
+    Subset,
+};
 use crate::dataset::{DatasetRole, ObjectRecord};
 use crate::execution::{
     AccountSpec, Comparator, Condition, ContractTerms, Decimal, DeploymentBinding, Engine, Group,
@@ -175,7 +178,14 @@ pub fn validate(portfolio: &Portfolio) -> Result<(), String> {
     {
         return Err("gates.min_win_rate: must lie in [0, 1]".to_string());
     }
-    if portfolio.members.is_empty() {
+    if portfolio
+        .generate
+        .as_ref()
+        .is_some_and(|rule| rule.top == 0)
+    {
+        return Err("generate.top: must be positive".to_string());
+    }
+    if portfolio.members.is_empty() && portfolio.generate.is_none() {
         return Err("members: at least one base member is required".to_string());
     }
     for (index, member) in portfolio.members.iter().enumerate() {
@@ -206,6 +216,11 @@ pub fn validate(portfolio: &Portfolio) -> Result<(), String> {
         return Err(
             "repairs: at least one alternative is required; an empty conjunction is no repair"
                 .to_string(),
+        );
+    }
+    if portfolio.generate.is_some() && !portfolio.repairs[0].conditions.is_empty() {
+        return Err(
+            "repairs[0].conditions: generated members require a condition-free repair".to_string(),
         );
     }
     unique("repairs", portfolio.repairs.iter().map(|r| r.id.as_str()))?;
@@ -247,8 +262,12 @@ pub fn validate(portfolio: &Portfolio) -> Result<(), String> {
             }
         }
     }
-    if portfolio.subsets.is_empty() {
+    if portfolio.subsets.is_empty() && portfolio.generate.is_none() {
         return Err("subsets: at least one ordered subset is required".to_string());
+    }
+    if portfolio.generate.is_some() && portfolio.members.is_empty() != portfolio.subsets.is_empty()
+    {
+        return Err("members and subsets: generated resolution must be empty together".to_string());
     }
     for (index, subset) in portfolio.subsets.iter().enumerate() {
         if subset.deployments.is_empty() {
@@ -399,6 +418,146 @@ pub fn declared_count(portfolio: &Portfolio) -> Result<u64, String> {
             .ok_or_else(overflow)?;
     }
     Ok(total)
+}
+
+/// Re-derives the complete ordered generated universe from verified schema-2 development
+/// families and their fitted plans. Each family's `top` eligible passing ranks become singleton
+/// subsets, deploying the exact ranked contract and envelope on that plan's instrument through
+/// condition-free repair zero. A fifths threshold is eligible only when one retained interval
+/// label derived from fitted edges matches it. No code position is an interval ordinal.
+pub fn generated_members(
+    portfolio: &Portfolio,
+    families: &[Family],
+    plans: &[FeaturePlan],
+) -> Result<(Vec<PortfolioMember>, Vec<Subset>), String> {
+    let rule = portfolio
+        .generate
+        .as_ref()
+        .ok_or("generate: the rule is required")?;
+    if rule.top == 0 {
+        return Err("generate.top: must be positive".into());
+    }
+    if portfolio
+        .repairs
+        .first()
+        .is_none_or(|repair| !repair.conditions.is_empty())
+    {
+        return Err(
+            "repairs[0].conditions: generated members require a condition-free repair".into(),
+        );
+    }
+    if families.len() != portfolio.families.len() || plans.len() != families.len() {
+        return Err("generate: each family needs one fitted development plan".into());
+    }
+    let mut members = Vec::new();
+    let mut subsets = Vec::new();
+    for (family_index, (family, plan)) in families.iter().zip(plans).enumerate() {
+        if family.schema_version != 2 || family.plan_identity != plan.identity() {
+            return Err(format!(
+                "families[{family_index}]: generation requires a schema-2 family and its fitted plan"
+            ));
+        }
+        let mut ranked: Vec<_> = family
+            .members
+            .iter()
+            .filter(|member| member.rank.is_some())
+            .collect();
+        ranked.sort_by_key(|member| member.rank.expect("passing rank"));
+        let mut taken = 0;
+        for member in ranked {
+            if taken == rule.top {
+                break;
+            }
+            let mut ordinals = Vec::new();
+            let mut eligible = true;
+            for (condition_index, condition) in member.conditions.iter().enumerate() {
+                let encoding = plan.stream(condition.stream).and_then(|stream| {
+                    stream
+                        .encodings
+                        .iter()
+                        .find(|encoding| encoding.output == condition.output)
+                });
+                if let Some(encoding) = encoding
+                    .filter(|encoding| encoding.encoding == ProjectionKind::DevelopmentFifths)
+                {
+                    let Threshold::Text(label) = &condition.threshold else {
+                        eligible = false;
+                        break;
+                    };
+                    if !matches!(condition.comparator, Comparator::Eq | Comparator::Ne) {
+                        eligible = false;
+                        break;
+                    }
+                    let matching: Vec<u8> = (0..=4)
+                        .filter(|&ordinal| {
+                            encoding.interval_label(ordinal).ok().as_deref() == Some(label)
+                        })
+                        .collect();
+                    if matching.len() != 1 {
+                        eligible = false;
+                        break;
+                    }
+                    ordinals.push(Ordinal {
+                        condition: condition_index,
+                        ordinal: matching[0],
+                    });
+                }
+            }
+            if !eligible {
+                continue;
+            }
+            let contract = family
+                .search
+                .contracts
+                .iter()
+                .find(|contract| contract.id == member.contract)
+                .ok_or_else(|| {
+                    format!("families[{family_index}]: ranked member names an unknown contract")
+                })?;
+            let matching: Vec<usize> = portfolio
+                .bindings
+                .iter()
+                .enumerate()
+                .filter(|(_, binding)| {
+                    binding.instrument == plan.instrument
+                        && binding.alternatives.len() == 1
+                        && binding.alternatives[0].contract == *contract
+                        && binding.alternatives[0].envelope == family.search.envelope
+                })
+                .map(|(index, _)| index)
+                .collect();
+            if matching.len() != 1 {
+                return Err(format!(
+                    "families[{family_index}]: ranked member {} requires exactly one binding for instrument {}, contract {}, and search envelope with a sole alternative; found {}",
+                    member.global_index.unwrap_or_default(),
+                    plan.instrument,
+                    member.contract,
+                    matching.len()
+                ));
+            }
+            let source_index = member.global_index.ok_or_else(|| {
+                format!("families[{family_index}]: schema-2 member lacks a global index")
+            })?;
+            let source_index = usize::try_from(source_index).map_err(|_| {
+                format!("families[{family_index}]: global member index does not fit usize")
+            })?;
+            let base = members.len();
+            members.push(PortfolioMember {
+                family: family_index,
+                member: source_index,
+                ordinals,
+            });
+            subsets.push(Subset {
+                deployments: vec![Deployment {
+                    member: base,
+                    repair: 0,
+                    binding: matching[0],
+                }],
+            });
+            taken += 1;
+        }
+    }
+    Ok((members, subsets))
 }
 
 // ----------------------------------------------------------------------------------------------

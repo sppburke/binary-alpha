@@ -540,6 +540,16 @@ pub(crate) struct Selected {
 /// evaluate, publish, and verify one selection generation of the configuration's `portfolio`
 /// table, returning its report and verification lines.
 pub fn optimize(config: &Config, local: &Store, destination: &Store) -> Result<String, String> {
+    if config
+        .portfolio
+        .as_ref()
+        .is_some_and(|portfolio| portfolio.generate.is_some())
+    {
+        return Err(
+            "portfolio.generate: standalone portfolios declare members and subsets explicitly"
+                .into(),
+        );
+    }
     let declaration = crate::research::declaration(config)?;
     let verified = crate::verification_cache(Some(config));
     let access = Access {
@@ -548,6 +558,71 @@ pub fn optimize(config: &Config, local: &Store, destination: &Store) -> Result<S
         verified: Some(&verified),
     };
     select(config, local, destination, access).map(|selected| selected.report)
+}
+
+/// Resolves a research portfolio from verified development families before any fold is bound.
+/// The same engine rule is used below to check the recorded resolution during selection and
+/// verification.
+pub(crate) fn resolve_generated(
+    settings: &mut Portfolio,
+    access: Access<'_>,
+) -> Result<(), String> {
+    if settings.generate.is_none() {
+        return Ok(());
+    }
+    let (families, _) = families(settings, access)?;
+    let (members, subsets) = generated(settings, &families, access)?;
+    settings.members = members;
+    settings.subsets = subsets;
+    settings
+        .validate()
+        .map_err(|reason| format!("portfolio.{reason}"))
+}
+
+fn generated(
+    settings: &Portfolio,
+    families: &[Family],
+    access: Access<'_>,
+) -> Result<
+    (
+        Vec<binary_alpha_engine::config::PortfolioMember>,
+        Vec<binary_alpha_engine::config::Subset>,
+    ),
+    String,
+> {
+    let mut plans = Vec::with_capacity(families.len());
+    for (index, family) in families.iter().enumerate() {
+        let input = &family.search.development.inputs[0];
+        let uri = input.feature_manifest.to_string();
+        let (store, manifest) =
+            features::feature_manifest(&format!("families[{index}]"), &uri, access)?;
+        let plan = features::fitted_plan(&uri, &store, &manifest)?;
+        if manifest.role != DatasetRole::Development
+            || manifest.plan_identity != family.plan_identity
+            || manifest.instrument != plan.instrument
+            || manifest.input_generation != input.tick_manifest.generation()
+        {
+            return Err(format!(
+                "families[{index}]: the source feature plan is not the fitted development plan of the family"
+            ));
+        }
+        plans.push(plan);
+    }
+    engine::generated_members(settings, families, &plans)
+}
+
+fn check_generated(
+    settings: &Portfolio,
+    families: &[Family],
+    access: Access<'_>,
+) -> Result<(), String> {
+    if settings.generate.is_some() {
+        let (members, subsets) = generated(settings, families, access)?;
+        if settings.members != members || settings.subsets != subsets {
+            return Err("generated members and subsets differ from verified development ranks, fitted edges, bindings, or repairs".into());
+        }
+    }
+    Ok(())
 }
 
 /// `optimize` with its typed result, under the caller's read permit.
@@ -567,6 +642,7 @@ pub(crate) fn select(
     // 1. Verify the development-only families and declared member indices before opening any
     //    fold input, then bind the folds and enumerate choices.
     let (families, family_records) = families(settings, access)?;
+    check_generated(settings, &families, access)?;
     let members = engine::logical_members(settings, &families)?;
     let bound = bind(settings, access)?;
     let mut choices = choices(settings, &members)?;
@@ -1026,6 +1102,7 @@ pub(crate) fn verified_selection(
     }
     // The universe: verified families, their records, the logical members, and every choice.
     let (families, family_records) = families(settings, access)?;
+    check_generated(settings, &families, access).map_err(|reason| format!("{uri}: {reason}"))?;
     if family_records != selection.families
         || manifest.families
             != family_records
