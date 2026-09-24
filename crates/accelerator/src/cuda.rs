@@ -1,7 +1,9 @@
 //! A single context, default stream, and ahead-of-time module per device.
 //! Safe typed buffers own all allocations; only validated kernel launches are unsafe.
 
-use crate::search::{CandidateConditions, DualScores, Request, SearchBuffers, SparseIndex};
+use crate::search::{
+    CandidateConditions, DualScores, Request, SearchBuffers, SparseIndex, SparseKeys,
+};
 use crate::{KERNEL_SOURCES, MODULE_CUBIN, Measured, Timings};
 use cudarc::driver::{
     CudaContext, CudaFunction, CudaModule, CudaSlice, CudaStream, DeviceRepr, LaunchConfig,
@@ -105,6 +107,28 @@ impl Device {
         self.context
             .mem_get_info()
             .map_err(|e| error("CUDA device", "memory_info", e))
+    }
+
+    /// Plan against this device's current driver-reported free memory before any tuple upload.
+    pub fn search_column_blocks(
+        &self,
+        row_list_lengths: &[usize],
+        row_count: usize,
+        max_conditions: usize,
+        batch_capacity: usize,
+        workers: usize,
+        split_masks: usize,
+    ) -> Result<crate::search::ColumnBlockPlan, String> {
+        let (free, _) = self.memory_info()?;
+        crate::search::plan_column_blocks(
+            row_list_lengths,
+            row_count,
+            max_conditions,
+            batch_capacity,
+            workers,
+            split_masks,
+            free,
+        )
     }
 
     fn sync(&self, kernel: &str, phase: &str) -> Result<(), String> {
@@ -561,6 +585,180 @@ pub struct ResidentSearch<'a> {
     pub timings: Timings,
 }
 
+/// One tuple's matrix, chronological buffers, and sparse key lists reside on one device.
+pub struct ResidentTuple<'a> {
+    workspace: ResidentSearch<'a>,
+    keys: SparseKeys<'a>,
+    offsets: CudaSlice<i32>,
+    rows: CudaSlice<i32>,
+    pub timings: Timings,
+}
+
+/// A batch uploads only its conditions, offsets, and driver IDs.
+pub struct ResidentTupleBatch<'stage, 'data> {
+    tuple: &'stage ResidentTuple<'data>,
+    candidates: CandidateConditions<'stage>,
+    driver_keys: &'stage [i32],
+    uploaded: CandidateBuffers,
+    drivers: CudaSlice<i32>,
+    pub timings: Timings,
+}
+
+impl Device {
+    pub fn search_tuple_workspace<'a>(
+        &'a self,
+        buffers: SearchBuffers<'a>,
+        split_masks: &[&'a [u8]],
+        keys: SparseKeys<'a>,
+    ) -> Result<ResidentTuple<'a>, String> {
+        if split_masks.is_empty() {
+            return Err("resident tuple: no split masks".into());
+        }
+        Request {
+            kind: 6,
+            buffers,
+            split_mask: split_masks[0],
+            candidates: CandidateConditions {
+                condition_feature: &[],
+                condition_bucket: &[],
+                candidate_offsets: &[0],
+                candidate_count: 0,
+            },
+            sparse: Some(SparseIndex {
+                candidate_driver_key: &[],
+                key_chrono_offsets: keys.key_chrono_offsets,
+                key_chrono_rows: keys.key_chrono_rows,
+            }),
+            expiry_ms: 0,
+            direction_code: 1,
+            payout_basis: 0,
+        }
+        .validate()?;
+        for split_mask in split_masks.iter().skip(1) {
+            if split_mask.len() != buffers.row_count as usize {
+                return Err("resident tuple: split_mask length differs from row_count".into());
+            }
+        }
+        let shared = self.shared(buffers, split_masks, "search tuple")?;
+        let workspace = ResidentSearch {
+            device: self,
+            buffers,
+            split_masks: split_masks.to_vec(),
+            shared: shared.output,
+            timings: shared.timings,
+        };
+        self.sync("search tuple", "before upload")?;
+        let started = Instant::now();
+        let offsets = self.upload(
+            "search tuple",
+            "key_chrono_offsets",
+            keys.key_chrono_offsets,
+        )?;
+        let rows = self.upload("search tuple", "key_chrono_rows", keys.key_chrono_rows)?;
+        self.sync("search tuple", "upload")?;
+        let timings = Timings {
+            upload: workspace.timings.upload + started.elapsed(),
+            allocated_bytes: workspace.timings.allocated_bytes
+                + offsets.num_bytes()
+                + rows.num_bytes(),
+            ..Timings::default()
+        };
+        Ok(ResidentTuple {
+            workspace,
+            keys,
+            offsets,
+            rows,
+            timings,
+        })
+    }
+}
+
+impl<'data> ResidentTuple<'data> {
+    pub fn upload_batch<'stage>(
+        &'stage self,
+        candidates: CandidateConditions<'stage>,
+        driver_keys: &'stage [i32],
+    ) -> Result<ResidentTupleBatch<'stage, 'data>, String> {
+        let input = Request {
+            kind: 6,
+            buffers: self.workspace.buffers,
+            split_mask: self.workspace.split_masks[0],
+            candidates,
+            sparse: Some(SparseIndex {
+                candidate_driver_key: driver_keys,
+                key_chrono_offsets: self.keys.key_chrono_offsets,
+                key_chrono_rows: self.keys.key_chrono_rows,
+            }),
+            expiry_ms: 0,
+            direction_code: 1,
+            payout_basis: 0,
+        };
+        input.validate_resident_batch()?;
+        let uploaded =
+            self.workspace
+                .device
+                .candidate_buffers(candidates, None, "search tuple batch")?;
+        let started = Instant::now();
+        let drivers = self.workspace.device.upload(
+            "search tuple batch",
+            "candidate_driver_key",
+            driver_keys,
+        )?;
+        self.workspace.device.sync("search tuple batch", "upload")?;
+        let timings = Timings {
+            upload: uploaded.timings.upload + started.elapsed(),
+            allocated_bytes: uploaded.timings.allocated_bytes + drivers.num_bytes(),
+            ..Timings::default()
+        };
+        Ok(ResidentTupleBatch {
+            tuple: self,
+            candidates,
+            driver_keys,
+            uploaded: uploaded.output,
+            drivers,
+            timings,
+        })
+    }
+}
+
+impl ResidentTupleBatch<'_, '_> {
+    pub fn score_sparse_dual(
+        &self,
+        split: usize,
+        expiry_ms: i64,
+        payout_basis: i64,
+    ) -> Result<Measured<DualScores>, String> {
+        let split_mask = *self
+            .tuple
+            .workspace
+            .split_masks
+            .get(split)
+            .ok_or("resident tuple: split index outside split masks")?;
+        let input = Request {
+            kind: 6,
+            buffers: self.tuple.workspace.buffers,
+            split_mask,
+            candidates: self.candidates,
+            sparse: Some(SparseIndex {
+                candidate_driver_key: self.driver_keys,
+                key_chrono_offsets: self.tuple.keys.key_chrono_offsets,
+                key_chrono_rows: self.tuple.keys.key_chrono_rows,
+            }),
+            expiry_ms,
+            direction_code: 1,
+            payout_basis,
+        };
+        input.validate_resident_batch()?;
+        self.tuple.workspace.device.score_resident(
+            input,
+            &self.tuple.workspace.shared,
+            &self.uploaded,
+            split,
+            Some((&self.drivers, &self.tuple.offsets, &self.tuple.rows)),
+        )
+    }
+}
+
 impl Device {
     /// Uploads all shared search buffers and every split once for reuse by K1–K9.
     pub fn search_workspace<'a>(
@@ -663,7 +861,7 @@ impl Device {
     pub(crate) fn score(&self, input: Request<'_>) -> Result<Measured<DualScores>, String> {
         let shared = self.shared(input.buffers, &[input.split_mask], input.kernel())?;
         let candidates = self.candidate_buffers(input.candidates, input.sparse, input.kernel())?;
-        let mut result = self.score_resident(input, &shared.output, &candidates.output, 0)?;
+        let mut result = self.score_resident(input, &shared.output, &candidates.output, 0, None)?;
         result.timings.upload += shared.timings.upload + candidates.timings.upload;
         Ok(result)
     }
@@ -685,19 +883,24 @@ impl Device {
         shared: &Shared,
         candidates: &CandidateBuffers,
         split: usize,
+        sparse_override: Option<(&CudaSlice<i32>, &CudaSlice<i32>, &CudaSlice<i32>)>,
     ) -> Result<Measured<DualScores>, String> {
         let k = input.kernel();
         self.sync(k, "before upload")?;
         let start = Instant::now();
-        let sparse = &candidates.sparse;
+        let sparse =
+            sparse_override.or_else(|| candidates.sparse.as_ref().map(|(a, b, c)| (a, b, c)));
         let length = input.candidates.candidate_count as usize * input.width();
         let mut buy_output = self.zeros::<i64>(k, "buy_output/output", length)?;
         let mut sell_output =
             self.zeros::<i64>(k, "sell_output", if input.dual() { length } else { 0 })?;
         self.sync(k, "upload")?;
         let upload = start.elapsed();
-        let allocated_bytes =
-            shared.bytes() + candidates.bytes() + buy_output.num_bytes() + sell_output.num_bytes();
+        let allocated_bytes = shared.bytes()
+            + candidates.bytes()
+            + sparse_override.map_or(0, |(a, b, c)| a.num_bytes() + b.num_bytes() + c.num_bytes())
+            + buy_output.num_bytes()
+            + sell_output.num_bytes();
         let start = Instant::now();
         if input.candidates.candidate_count > 0 {
             let mut builder = self.stream.launch_builder(&self.functions[input.kind]);
@@ -776,7 +979,7 @@ impl Device {
                 }
                 4 => {
                     let (candidate_driver_key, key_chrono_offsets, key_chrono_rows) =
-                        sparse.as_ref().expect("sparse request validated");
+                        sparse.expect("sparse request validated");
                     builder.arg(candidate_driver_key);
                     builder.arg(key_chrono_offsets);
                     builder.arg(key_chrono_rows);
@@ -797,7 +1000,7 @@ impl Device {
                 }
                 5 => {
                     let (candidate_driver_key, key_chrono_offsets, key_chrono_rows) =
-                        sparse.as_ref().expect("sparse request validated");
+                        sparse.expect("sparse request validated");
                     builder.arg(candidate_driver_key);
                     builder.arg(key_chrono_offsets);
                     builder.arg(key_chrono_rows);
@@ -817,7 +1020,7 @@ impl Device {
                 }
                 6 => {
                     let (candidate_driver_key, key_chrono_offsets, key_chrono_rows) =
-                        sparse.as_ref().expect("sparse request validated");
+                        sparse.expect("sparse request validated");
                     builder.arg(candidate_driver_key);
                     builder.arg(key_chrono_offsets);
                     builder.arg(key_chrono_rows);
@@ -838,7 +1041,7 @@ impl Device {
                 }
                 7 => {
                     let (candidate_driver_key, key_chrono_offsets, key_chrono_rows) =
-                        sparse.as_ref().expect("sparse request validated");
+                        sparse.expect("sparse request validated");
                     builder.arg(candidate_driver_key);
                     builder.arg(key_chrono_offsets);
                     builder.arg(key_chrono_rows);
@@ -1005,6 +1208,7 @@ impl ResidentChunk<'_, '_> {
             &self.workspace.shared,
             &self.uploaded,
             split,
+            None,
         )?;
         Ok(Measured {
             output: result.output.buy_output,
@@ -1037,6 +1241,7 @@ impl ResidentChunk<'_, '_> {
             &self.workspace.shared,
             &self.uploaded,
             split,
+            None,
         )?;
         Ok(result)
     }
@@ -1067,6 +1272,7 @@ impl ResidentChunk<'_, '_> {
             &self.workspace.shared,
             &self.uploaded,
             split,
+            None,
         )?;
         Ok(Measured {
             output: result.output.buy_output,
@@ -1099,6 +1305,7 @@ impl ResidentChunk<'_, '_> {
             &self.workspace.shared,
             &self.uploaded,
             split,
+            None,
         )?;
         Ok(result)
     }
@@ -1134,6 +1341,7 @@ impl ResidentChunk<'_, '_> {
             &self.workspace.shared,
             &self.uploaded,
             split,
+            None,
         )?;
         Ok(Measured {
             output: result.output.buy_output,
@@ -1172,6 +1380,7 @@ impl ResidentChunk<'_, '_> {
             &self.workspace.shared,
             &self.uploaded,
             split,
+            None,
         )?;
         Ok(Measured {
             output: result.output.buy_output,
@@ -1209,6 +1418,7 @@ impl ResidentChunk<'_, '_> {
             &self.workspace.shared,
             &self.uploaded,
             split,
+            None,
         )?;
         Ok(result)
     }
@@ -1245,6 +1455,7 @@ impl ResidentChunk<'_, '_> {
             &self.workspace.shared,
             &self.uploaded,
             split,
+            None,
         )?;
         Ok(result)
     }

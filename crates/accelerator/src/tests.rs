@@ -12,6 +12,209 @@ fn bits(value: f64) -> i64 {
     value.to_bits() as i64
 }
 
+#[test]
+fn column_blocks_bound_memory_sparse_indices_and_schedule() {
+    let plan = plan_column_blocks(&[4; 6], 4, 2, 1, 1, 1, 600).unwrap();
+    assert!(plan.blocks.len() >= 3, "forced small budget: {plan:?}");
+    assert_eq!(plan.blocks.first().unwrap().columns.start, 0);
+    assert_eq!(plan.blocks.last().unwrap().columns.end, 6);
+    assert!(
+        plan_column_blocks(&[4], 4, 2, 1, 1, 1, 1)
+            .unwrap_err()
+            .contains("one-column")
+    );
+    assert!(
+        plan_column_blocks(&[i32::MAX as usize + 1], 4, 1, 1, 1, 1, usize::MAX)
+            .unwrap_err()
+            .contains("exceeds i32")
+    );
+    assert!(
+        plan_column_blocks(&[i32::MAX as usize], 4, 2, 1, 1, 1, usize::MAX)
+            .unwrap_err()
+            .contains("i32 sparse bounds")
+    );
+    let schedule = schedule_batches(&[5], 2).unwrap();
+    assert_eq!(
+        schedule.iter().map(|item| item.device).collect::<Vec<_>>(),
+        [0, 1, 0, 1, 0]
+    );
+    assert!(schedule.iter().all(|item| item.tuple == 0));
+    assert_eq!(
+        schedule_batches(&[1, 1], 2)
+            .unwrap()
+            .iter()
+            .map(|item| item.device)
+            .collect::<Vec<_>>(),
+        [0, 1]
+    );
+}
+
+#[test]
+fn cpu_resident_sparse_batches_match_one_shot_across_forced_blocks_and_expiries() {
+    let case = &search_cases()[0];
+    let rows = case.entry.len();
+    let plan = plan_column_blocks(&[rows; 6], rows, 2, 1, 1, 1, 600).unwrap();
+    assert!(plan.blocks.len() >= 3);
+    let ordered: Vec<i64> = (0..rows as i64).collect();
+    let sparse_rows: Vec<i32> = (0..rows as i32).collect();
+    let offsets = [0, rows as i32];
+    let split_masks = [&case.split[..]];
+    for block in &plan.blocks {
+        let codes: Vec<i16> = (0..block.columns.len())
+            .flat_map(|column| (0..rows).map(move |row| ((column + row) % 2) as i16))
+            .collect();
+        let buffers = SearchBuffers {
+            feature_codes: &codes,
+            feature_count: block.columns.len() as i32,
+            row_count: rows as i32,
+            ordered_rows: &ordered,
+            decision_time_ms: &case.entry,
+            release_time_ms: &case.release,
+            settlement_time_ms: &case.settlement,
+            valid: &case.valid,
+            buy_win: &case.buy,
+            sell_win: &case.sell,
+            tie: &case.tie,
+        };
+        let tuple = CpuSparseTuple::new(
+            buffers,
+            &split_masks,
+            SparseKeys {
+                key_chrono_offsets: &offsets,
+                key_chrono_rows: &sparse_rows,
+            },
+        )
+        .unwrap();
+        for bucket in [0_i16, 1] {
+            let features = [0_i32];
+            let buckets = [bucket];
+            let candidate_offsets = [0_i32, 1];
+            let drivers = [0_i32];
+            let candidates = CandidateConditions {
+                condition_feature: &features,
+                condition_bucket: &buckets,
+                candidate_offsets: &candidate_offsets,
+                candidate_count: 1,
+            };
+            for expiry in [1, case.expiry_ms, 120_000] {
+                let resident = tuple
+                    .score_batch(0, candidates, &drivers, expiry, case.payout)
+                    .unwrap();
+                let one_shot = score_bucket_plans_cap1_sparse_dual(
+                    &Backend::Cpu,
+                    &codes,
+                    &features,
+                    &buckets,
+                    &candidate_offsets,
+                    &drivers,
+                    &offsets,
+                    &sparse_rows,
+                    &case.split,
+                    &case.entry,
+                    &case.release,
+                    &case.settlement,
+                    &case.valid,
+                    &case.buy,
+                    &case.sell,
+                    &case.tie,
+                    1,
+                    rows as i32,
+                    expiry,
+                    case.payout,
+                )
+                .unwrap();
+                assert_eq!(resident.output, one_shot.output);
+            }
+        }
+    }
+}
+
+#[cfg(feature = "cuda")]
+#[test]
+fn cuda_resident_tuple_matches_cpu_reference() {
+    let Ok(device) = crate::cuda::Device::open(0) else {
+        return;
+    };
+    let case = &search_cases()[0];
+    let rows = case.entry.len();
+    assert!(
+        !device
+            .search_column_blocks(&[rows], rows, 1, 1, 1, 1)
+            .unwrap()
+            .blocks
+            .is_empty()
+    );
+    let codes = vec![0_i16; rows];
+    let ordered: Vec<i64> = (0..rows as i64).collect();
+    let sparse_rows: Vec<i32> = (0..rows as i32).collect();
+    let offsets = [0, rows as i32];
+    let buffers = SearchBuffers {
+        feature_codes: &codes,
+        feature_count: 1,
+        row_count: rows as i32,
+        ordered_rows: &ordered,
+        decision_time_ms: &case.entry,
+        release_time_ms: &case.release,
+        settlement_time_ms: &case.settlement,
+        valid: &case.valid,
+        buy_win: &case.buy,
+        sell_win: &case.sell,
+        tie: &case.tie,
+    };
+    let tuple = device
+        .search_tuple_workspace(
+            buffers,
+            &[&case.split],
+            SparseKeys {
+                key_chrono_offsets: &offsets,
+                key_chrono_rows: &sparse_rows,
+            },
+        )
+        .unwrap();
+    let features = [0_i32];
+    let buckets = [0_i16];
+    let candidate_offsets = [0_i32, 1];
+    let drivers = [0_i32];
+    let batch = tuple
+        .upload_batch(
+            CandidateConditions {
+                condition_feature: &features,
+                condition_bucket: &buckets,
+                candidate_offsets: &candidate_offsets,
+                candidate_count: 1,
+            },
+            &drivers,
+        )
+        .unwrap();
+    for expiry in [1, case.expiry_ms, 120_000] {
+        let actual = batch.score_sparse_dual(0, expiry, case.payout).unwrap();
+        let expected = score_bucket_plans_cap1_sparse_dual(
+            &Backend::Cpu,
+            &codes,
+            &features,
+            &buckets,
+            &candidate_offsets,
+            &drivers,
+            &offsets,
+            &sparse_rows,
+            &case.split,
+            &case.entry,
+            &case.release,
+            &case.settlement,
+            &case.valid,
+            &case.buy,
+            &case.sell,
+            &case.tie,
+            1,
+            rows as i32,
+            expiry,
+            case.payout,
+        )
+        .unwrap();
+        assert_eq!(actual.output, expected.output);
+    }
+}
+
 struct SearchCase {
     entry: Vec<i64>,
     release: Vec<i64>,

@@ -80,6 +80,13 @@ impl Config {
 
     /// Cross-field rules that a single field's deserializer cannot see.
     fn validate(&self) -> Result<(), String> {
+        if self
+            .accelerator
+            .as_ref()
+            .is_some_and(|accelerator| accelerator.devices.is_empty())
+        {
+            return Err("accelerator.devices: at least one device is required".into());
+        }
         if self.run_mode != RunMode::Research
             && matches!(self.storage.publication_uri, PublicationUri::Filesystem(_))
         {
@@ -2181,6 +2188,19 @@ pub struct ReplayScenario {
 pub struct Accelerator {
     /// The requested execution backend; application loading checks build availability.
     pub backend: Backend,
+    /// Device ordinals used by offline CUDA screening. The default preserves old config bytes.
+    #[serde(
+        default = "default_accelerator_devices",
+        skip_serializing_if = "default_devices"
+    )]
+    pub devices: Vec<usize>,
+}
+
+fn default_accelerator_devices() -> Vec<usize> {
+    vec![0]
+}
+fn default_devices(devices: &Vec<usize>) -> bool {
+    devices.as_slice() == [0]
 }
 
 crate::string_enum! {
@@ -3779,5 +3799,16 @@ mod accelerator_tests {
         for section in ["backend = \"automatic\"", "backend = \"cpu\"\nordinal = 0"] {
             assert!(Config::parse(&format!("{HEAD}\n[accelerator]\n{section}\n")).is_err());
         }
+        let source = format!("{HEAD}\n[accelerator]\nbackend = \"cuda\"\ndevices = [0, 1]\n");
+        let config = Config::parse(&source).unwrap();
+        assert_eq!(config.accelerator.unwrap().devices, [0, 1]);
+        assert!(
+            Config::parse(&format!(
+                "{HEAD}\n[accelerator]\nbackend = \"cuda\"\ndevices = []\n"
+            ))
+            .unwrap_err()
+            .to_string()
+            .contains("accelerator.devices")
+        );
     }
 }

@@ -38,6 +38,70 @@ use crate::store::{self, Put, Store};
 use crate::verify;
 use binary_alpha_engine::research::Access;
 
+/// One immutable CPU scoring batch. Global indices bind results independently of worker order.
+#[derive(Clone, Copy)]
+pub struct CpuBatch<'a> {
+    pub global_indices: &'a [u64],
+    pub candidates: kernels::CandidateConditions<'a>,
+    pub driver_keys: &'a [i32],
+}
+
+/// Score independent batches with the existing CPU sparse dual reference, preserving global order.
+/// The caller accumulates expiry counts into its compact whole-family records.
+pub fn score_cpu_batches(
+    tuple: &kernels::CpuSparseTuple<'_>,
+    batches: &[CpuBatch<'_>],
+    split: usize,
+    expiry_ms: i64,
+    payout_basis: i64,
+) -> Result<Vec<(u64, RawCounts, RawCounts)>, String> {
+    let scored = crate::parallel::map(batches, |batch| {
+        if batch.global_indices.len() != batch.candidates.candidate_count as usize {
+            return Err("CPU batch global index count differs from candidate count".to_string());
+        }
+        let output = tuple
+            .score_batch(
+                split,
+                batch.candidates,
+                batch.driver_keys,
+                expiry_ms,
+                payout_basis,
+            )?
+            .output;
+        Ok(batch
+            .global_indices
+            .iter()
+            .enumerate()
+            .map(|(position, &global)| {
+                let counts = |values: &[i64]| {
+                    let start = position * 21;
+                    RawCounts {
+                        total: values[start],
+                        wins: values[start + 1],
+                        losses: values[start + 2],
+                        ties: values[start + 3],
+                        invalid: values[start + 4],
+                    }
+                };
+                (
+                    global,
+                    counts(&output.buy_output),
+                    counts(&output.sell_output),
+                )
+            })
+            .collect::<Vec<_>>())
+    });
+    let mut merged = Vec::new();
+    for batch in scored {
+        merged.extend(batch?);
+    }
+    merged.sort_by_key(|item| item.0);
+    if merged.windows(2).any(|pair| pair[0].0 == pair[1].0) {
+        return Err("CPU batches repeat a global member index".into());
+    }
+    Ok(merged)
+}
+
 /// Runs the configured search, writing its report and verification lines to `out`.
 pub fn run(config_path: &Path, out: &mut dyn Write) -> Result<(), String> {
     let config = crate::load_config(config_path)?;
@@ -136,8 +200,8 @@ pub(crate) fn family(
         .search
         .as_ref()
         .ok_or("search: the table is required")?;
-    let backend = match config.accelerator.as_ref().map(|section| section.backend) {
-        Some(Selected::Cuda) => Backend::cuda(0)?,
+    let backend = match config.accelerator.as_ref() {
+        Some(section) if section.backend == Selected::Cuda => Backend::cuda(section.devices[0])?,
         _ => Backend::Cpu,
     };
     let mut clock = Clock::default();
@@ -158,6 +222,7 @@ pub(crate) fn family(
         .iter()
         .flat_map(|candidate| {
             settings.contracts.iter().map(|contract| Member {
+                global_index: None,
                 logic_identity: candidate.logic_identity.clone(),
                 conditions: candidate
                     .conditions
@@ -345,14 +410,17 @@ pub(crate) fn family(
     // 7. Publish the family, then its manifest, and verify before it becomes ready.
     let publishing = Instant::now();
     let family = Family {
+        schema_version: search::FAMILY_SCHEMA_VERSION,
         search: settings.clone(),
+        resolved_conditions: None,
+        resolved_hash: None,
         plan_identity: development.plan_identity.clone(),
         base_stream: settings.base_stream,
         kernel_module: kernel_identity(),
         sampler: SAMPLER_VERSION.to_string(),
         applicable,
         members,
-        lowering: lowering_ref,
+        lowering: Some(lowering_ref),
         chunks,
     };
     let generation = family_generation_id(&config.content_hash(), CODE_REVISION, &inputs);
@@ -1374,7 +1442,11 @@ pub(crate) fn development_family(
     let (family, _) = read_family(uri, &store, &manifest)?;
     let later = if family.search.evaluation.is_some() {
         Some("an evaluation window")
-    } else if family.lowering.role != development {
+    } else if family
+        .lowering
+        .as_ref()
+        .is_some_and(|lowering| lowering.role != development)
+    {
         Some("a lowering replay of another role")
     } else if family.chunks.iter().any(|chunk| chunk.role != development) {
         Some("a replay chunk of another role")
@@ -1519,11 +1591,15 @@ fn verify_read_family(
         let events = chunk_events(store, &chunk_manifest)?;
         Ok((chunk_manifest, events))
     };
-    let (_, lowering_events) = read_chunk(&family.lowering)?;
+    let lowering = family
+        .lowering
+        .as_ref()
+        .ok_or_else(|| format!("{uri}: schema-1 family has no lowering"))?;
+    let (_, lowering_events) = read_chunk(lowering)?;
     let expected_lowering =
         search::lowering_replay(settings, &family.plan_identity, &development.instrument);
     if restored_definition(&lowering_events)?.replay != expected_lowering
-        || family.lowering.bindings
+        || lowering.bindings
             != expected_lowering
                 .strategies
                 .iter()
@@ -1685,6 +1761,72 @@ mod projection_tests {
     use binary_alpha_engine::config::StreamKey;
     use binary_alpha_engine::execution::{Comparator, Condition, Threshold};
     use binary_alpha_engine::features::{FittedEncoding, ProjectionKind};
+
+    #[test]
+    fn cpu_batches_merge_by_global_member_index() {
+        let codes = [0_i16; 3];
+        let ordered = [0_i64, 1, 2];
+        let entry = [1_i64, 2, 3];
+        let release = [2_i64, 3, 4];
+        let valid = [1_u8; 3];
+        let buy = [1_u8, 0, 1];
+        let sell = [0_u8, 1, 0];
+        let tie = [0_u8; 3];
+        let mask = [1_u8; 3];
+        let rows = [0_i32, 1, 2];
+        let offsets = [0_i32, 3];
+        let tuple = kernels::CpuSparseTuple::new(
+            kernels::SearchBuffers {
+                feature_codes: &codes,
+                feature_count: 1,
+                row_count: 3,
+                ordered_rows: &ordered,
+                decision_time_ms: &entry,
+                release_time_ms: &release,
+                settlement_time_ms: &release,
+                valid: &valid,
+                buy_win: &buy,
+                sell_win: &sell,
+                tie: &tie,
+            },
+            &[&mask],
+            kernels::SparseKeys {
+                key_chrono_offsets: &offsets,
+                key_chrono_rows: &rows,
+            },
+        )
+        .unwrap();
+        let features = [0_i32];
+        let buckets = [0_i16];
+        let candidate_offsets = [0_i32, 1];
+        let drivers = [0_i32];
+        let candidates = kernels::CandidateConditions {
+            condition_feature: &features,
+            condition_bucket: &buckets,
+            candidate_offsets: &candidate_offsets,
+            candidate_count: 1,
+        };
+        let batches = [
+            CpuBatch {
+                global_indices: &[7],
+                candidates,
+                driver_keys: &drivers,
+            },
+            CpuBatch {
+                global_indices: &[2],
+                candidates,
+                driver_keys: &drivers,
+            },
+        ];
+        let scored = score_cpu_batches(&tuple, &batches, 0, 1, 92).unwrap();
+        assert_eq!(scored.iter().map(|item| item.0).collect::<Vec<_>>(), [2, 7]);
+        assert_eq!(scored[0].1, scored[1].1);
+        assert!(
+            score_cpu_batches(&tuple, &[batches[0], batches[0]], 0, 1, 92)
+                .unwrap_err()
+                .contains("repeat")
+        );
+    }
 
     fn stream(duration_seconds: u32, offset_seconds: u32) -> StreamKey {
         StreamKey {

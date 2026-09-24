@@ -1150,7 +1150,10 @@ fn governed_candidate_evaluation() {
         config.storage.publication_uri = format!("file://{}", scratch.path("published").display())
             .parse()
             .unwrap();
-        config.accelerator = Some(Accelerator { backend });
+        config.accelerator = Some(Accelerator {
+            backend,
+            devices: vec![0],
+        });
         config.search = Some(search.clone());
         let path = scratch.path(&format!("search_{backend}.toml"));
         fs::write(&path, config.canonical_toml()).unwrap();
@@ -1217,7 +1220,7 @@ fn governed_candidate_evaluation() {
         family.members.len(),
         family.applicable,
         passing.len(),
-        family.lowering.generation,
+        family.lowering.as_ref().unwrap().generation,
         family.chunks.len()
     );
 }

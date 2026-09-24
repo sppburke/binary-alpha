@@ -25,6 +25,8 @@ use crate::market::parse_event_time_micros;
 /// The manifest kind of a published search family.
 pub const FAMILY_MANIFEST_KIND: &str = "search_family";
 pub const FAMILY_SCHEMA_VERSION: u32 = 1;
+/// Survivor-only family format; schema 1 remains the writer until search is switched over.
+pub const STREAMED_FAMILY_SCHEMA_VERSION: u32 = 2;
 /// The one object of a family generation.
 pub const FAMILY_OBJECT_PATH: &str = "family.json";
 /// The frozen sampler identity recorded with every stability result.
@@ -554,13 +556,173 @@ pub fn conditions(menu: &[SearchCondition]) -> Vec<Condition> {
 pub fn family_size(count: usize, min: usize, max: usize, contracts: usize) -> Option<u64> {
     let mut total = 0_u64;
     for k in min..=max.min(count) {
-        let mut choose = 1_u64;
-        for i in 0..k {
-            choose = choose.checked_mul((count - i) as u64)? / (i as u64 + 1);
+        if k == 0 {
+            continue;
         }
+        let choose = binomial(count, k)?;
         total = total.checked_add(choose)?;
     }
-    total.checked_mul(contracts as u64)
+    total.checked_mul(u64::try_from(contracts).ok()?)
+}
+
+/// Exact coefficient while it fits a family index. With k <= n/2 coefficients increase at
+/// every step, so an intermediate coefficient above u64 cannot later become representable.
+fn binomial(n: usize, k: usize) -> Option<u64> {
+    if k > n {
+        return Some(0);
+    }
+    let k = k.min(n - k);
+    let mut value = 1_u128;
+    for i in 1..=k {
+        value = value.checked_mul((n - k + i) as u128)? / i as u128;
+        if value > u64::MAX as u128 {
+            return None;
+        }
+    }
+    u64::try_from(value).ok()
+}
+
+/// Global member index in size/lexicographic order, with contracts fastest.
+pub fn member_rank(
+    count: usize,
+    min: usize,
+    max: usize,
+    contracts: usize,
+    indices: &[usize],
+    contract: usize,
+) -> Option<u64> {
+    if indices.is_empty()
+        || indices.len() < min
+        || indices.len() > max.min(count)
+        || contracts == 0
+        || contract >= contracts
+    {
+        return None;
+    }
+    let mut rank = 0_u64;
+    for size in min.max(1)..indices.len() {
+        rank = rank.checked_add(binomial(count, size)?)?;
+    }
+    let mut first = 0;
+    for (position, &index) in indices.iter().enumerate() {
+        if index < first || index >= count {
+            return None;
+        }
+        for skipped in first..index {
+            rank =
+                rank.checked_add(binomial(count - skipped - 1, indices.len() - position - 1)?)?;
+        }
+        first = index + 1;
+    }
+    rank.checked_mul(u64::try_from(contracts).ok()?)?
+        .checked_add(u64::try_from(contract).ok()?)
+}
+
+/// Inverse of `member_rank` for a bounded family.
+pub fn member_unrank(
+    count: usize,
+    min: usize,
+    max: usize,
+    contracts: usize,
+    global: u64,
+) -> Option<(Vec<usize>, usize)> {
+    let total = family_size(count, min, max, contracts)?;
+    if contracts == 0 || global >= total {
+        return None;
+    }
+    let contracts = u64::try_from(contracts).ok()?;
+    let contract = (global % contracts) as usize;
+    let mut ordinal = global / contracts;
+    for size in min.max(1)..=max.min(count) {
+        let group = binomial(count, size)?;
+        if ordinal >= group {
+            ordinal -= group;
+            continue;
+        }
+        let mut indices = Vec::with_capacity(size);
+        let mut first = 0;
+        for position in 0..size {
+            let mut selected = None;
+            for index in first..count {
+                let following = binomial(count - index - 1, size - position - 1)?;
+                if ordinal < following {
+                    selected = Some(index);
+                    break;
+                }
+                ordinal -= following;
+            }
+            let index = selected?;
+            indices.push(index);
+            first = index + 1;
+        }
+        return Some((indices, contract));
+    }
+    None
+}
+
+/// Streams bounded members without allocating the family or its candidate conjunctions.
+pub fn stream_members(
+    count: usize,
+    min: usize,
+    max: usize,
+    contracts: usize,
+) -> Option<MemberStream> {
+    let total = family_size(count, min, max, contracts)?;
+    let size = min.max(1);
+    Some(MemberStream {
+        count,
+        max: max.min(count),
+        contracts,
+        total,
+        global: 0,
+        contract: 0,
+        indices: if total == 0 {
+            Vec::new()
+        } else {
+            (0..size).collect()
+        },
+    })
+}
+
+/// Current conjunction and contract are the only retained enumeration state.
+pub struct MemberStream {
+    count: usize,
+    max: usize,
+    contracts: usize,
+    total: u64,
+    global: u64,
+    contract: usize,
+    indices: Vec<usize>,
+}
+
+impl Iterator for MemberStream {
+    type Item = (u64, Vec<usize>, usize);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.global == self.total {
+            return None;
+        }
+        let item = (self.global, self.indices.clone(), self.contract);
+        self.global += 1;
+        self.contract += 1;
+        if self.contract == self.contracts {
+            self.contract = 0;
+            let size = self.indices.len();
+            let mut position = size;
+            while position > 0 && self.indices[position - 1] == self.count - size + position - 1 {
+                position -= 1;
+            }
+            if position > 0 {
+                self.indices[position - 1] += 1;
+                for later in position..size {
+                    self.indices[later] = self.indices[later - 1] + 1;
+                }
+            } else if size < self.max {
+                self.indices = (0..size + 1).collect();
+            }
+        }
+        Some(item)
+    }
 }
 
 /// Every combination of `min..=max` distinct indices below `count`, in lexicographic order.
@@ -1164,6 +1326,101 @@ pub fn score(members: &mut [Member], contracts: &[ContractTerms], screen: Option
     applicable.len() as u64
 }
 
+/// Minimal whole-family screening state; contract and identity are recovered from the global
+/// member index only for retained records. Input records must be in global index order.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CompactMember {
+    pub raw: RawCounts,
+    pub score: Option<f64>,
+    pub adjusted: Option<f64>,
+}
+
+impl CompactMember {
+    pub fn new(raw: RawCounts) -> Self {
+        Self {
+            raw,
+            score: None,
+            adjusted: None,
+        }
+    }
+
+    /// Populate the existing member fields after the whole-family screen.
+    pub fn apply(&self, member: &mut Member, contract: &ContractTerms, screen: Option<&Screen>) {
+        member.raw = self.raw.clone();
+        match null_rate(contract) {
+            Ok(null) => {
+                member.null = Some(null);
+                member.inapplicable = None;
+                member.score = self.score;
+                member.adjusted = self.adjusted;
+                member.screened = None;
+            }
+            Err(reason) => {
+                member.null = None;
+                member.inapplicable = Some(reason.clone());
+                member.score = None;
+                member.adjusted = None;
+                member.screened = screen.map(|_| format!("inapplicable: {reason}"));
+            }
+        }
+    }
+}
+
+/// Returns the applicable count and exactly the unscreened global indices, in family order.
+/// The BH calculation and both tie breaks match `score` over the complete family.
+pub fn screen_compact(
+    records: &mut [CompactMember],
+    contracts: &[ContractTerms],
+    screen: Option<&Screen>,
+) -> (u64, Vec<u64>) {
+    assert!(!contracts.is_empty(), "a family has at least one contract");
+    let nulls: Vec<_> = contracts.iter().map(null_rate).collect();
+    let mut applicable = Vec::new();
+    let mut scores = Vec::new();
+    for (index, record) in records.iter_mut().enumerate() {
+        record.adjusted = None;
+        record.score = nulls[index % contracts.len()].as_ref().ok().map(|null| {
+            upper_tail(
+                record.raw.wins.max(0) as u64,
+                record.raw.losses.max(0) as u64,
+                null.break_even,
+            )
+        });
+        if let Some(score) = record.score {
+            applicable.push(index);
+            scores.push(score);
+        }
+    }
+    for (&index, adjusted) in applicable.iter().zip(benjamini_hochberg(&scores)) {
+        records[index].adjusted = Some(adjusted);
+    }
+    let mut retained = vec![screen.is_none(); records.len()];
+    if let Some(screen) = screen {
+        let mut order = applicable.clone();
+        order.sort_by(|&a, &b| {
+            records[a]
+                .adjusted
+                .partial_cmp(&records[b].adjusted)
+                .unwrap_or(Ordering::Equal)
+                .then(a.cmp(&b))
+        });
+        for (position, index) in order.into_iter().enumerate() {
+            retained[index] = records[index].adjusted.is_some_and(|adjusted| {
+                adjusted <= screen.max_adjusted_score
+                    && screen.top.is_none_or(|top| position < top as usize)
+            });
+        }
+    }
+    (
+        applicable.len() as u64,
+        retained
+            .into_iter()
+            .enumerate()
+            .filter_map(|(i, keep)| keep.then_some(i as u64))
+            .collect(),
+    )
+}
+
 /// Gates every replayed member on its development group and ranks the passing members: net
 /// profit descending, settled count descending, then member order. Returns the passing members
 /// in rank order.
@@ -1216,6 +1473,9 @@ pub struct RawCounts {
 /// One member of the complete family and everything computed for it.
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 pub struct Member {
+    /// Schema-2 global family index; absent from schema-1 bytes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub global_index: Option<u64>,
     pub logic_identity: String,
     pub conditions: Vec<Condition>,
     pub contract: String,
@@ -1259,14 +1519,23 @@ pub struct ChunkRef {
 /// plan, and every member with everything computed for it. Backend and timings stay outside.
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 pub struct Family {
+    /// Schema-2 marker; omitted from schema-1 JSON.
+    #[serde(default = "schema_one", skip_serializing_if = "is_schema_one")]
+    pub schema_version: u32,
     pub search: Search,
+    /// The resolved concrete table and hash retained beside schema-2 search rules.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolved_conditions: Option<Vec<Condition>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolved_hash: Option<String>,
     pub plan_identity: String,
     pub base_stream: StreamKey,
     pub kernel_module: String,
     pub sampler: String,
     pub applicable: u64,
     pub members: Vec<Member>,
-    pub lowering: ChunkRef,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lowering: Option<ChunkRef>,
     pub chunks: Vec<ChunkRef>,
 }
 
@@ -1278,8 +1547,55 @@ impl Family {
     }
 
     pub fn from_json(bytes: &[u8]) -> Result<Self, String> {
-        serde_json::from_slice(bytes).map_err(|error| error.to_string())
+        let family: Self = serde_json::from_slice(bytes).map_err(|error| error.to_string())?;
+        if !matches!(family.schema_version, 1 | 2) {
+            return Err(format!(
+                "unsupported family schema_version {}",
+                family.schema_version
+            ));
+        }
+        if family.schema_version == STREAMED_FAMILY_SCHEMA_VERSION {
+            let resolved = family
+                .resolved_conditions
+                .as_ref()
+                .ok_or("schema-2 family has no resolved_conditions")?;
+            family
+                .resolved_hash
+                .as_ref()
+                .ok_or("schema-2 family has no resolved_hash")?;
+            let mut previous = None;
+            for member in &family.members {
+                let index = member
+                    .global_index
+                    .ok_or("schema-2 member has no global_index")?;
+                if previous.is_some_and(|old| index <= old) || member.screened.is_some() {
+                    return Err(
+                        "schema-2 members must be unscreened and strictly ordered by global_index"
+                            .into(),
+                    );
+                }
+                previous = Some(index);
+            }
+            if resolved.len() < family.search.min_conditions as usize
+                && (family.applicable != 0
+                    || !family.members.is_empty()
+                    || family.lowering.is_some()
+                    || !family.chunks.is_empty())
+            {
+                return Err(
+                    "schema-2 empty family has counts, members, lowering, or chunks".into(),
+                );
+            }
+        }
+        Ok(family)
     }
+}
+
+fn schema_one() -> u32 {
+    1
+}
+fn is_schema_one(version: &u32) -> bool {
+    *version == 1
 }
 
 /// One bound input generation of a family.
@@ -1322,9 +1638,12 @@ impl FamilyManifest {
                 manifest.kind
             ));
         }
-        if manifest.schema_version != FAMILY_SCHEMA_VERSION {
+        if !matches!(
+            manifest.schema_version,
+            FAMILY_SCHEMA_VERSION | STREAMED_FAMILY_SCHEMA_VERSION
+        ) {
             return Err(format!(
-                "unsupported schema_version {}, expected {FAMILY_SCHEMA_VERSION}",
+                "unsupported schema_version {}, expected 1 or 2",
                 manifest.schema_version
             ));
         }
@@ -1468,6 +1787,195 @@ mod tests {
         assert_eq!(
             candidates[2].logic_identity,
             signal_logic_identity(&strategy("x", "plan", stream, &conditions, &[1, 0]))
+        );
+    }
+
+    #[test]
+    fn streamed_ranks_match_exhaustive_order_and_large_edge() {
+        for count in 1..=8 {
+            for min in 1..=count + 1 {
+                for max in min..=count + 1 {
+                    let expected = combinations(count, min, max);
+                    let streamed: Vec<_> = stream_members(count, min, max, 3).unwrap().collect();
+                    assert_eq!(streamed.len(), expected.len() * 3);
+                    for (ordinal, indices) in expected.iter().enumerate() {
+                        for contract in 0..3 {
+                            let global = (ordinal * 3 + contract) as u64;
+                            assert_eq!(
+                                streamed[global as usize],
+                                (global, indices.clone(), contract)
+                            );
+                            assert_eq!(
+                                member_rank(count, min, max, 3, indices, contract),
+                                Some(global)
+                            );
+                            assert_eq!(
+                                member_unrank(count, min, max, 3, global),
+                                Some((indices.clone(), contract))
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        let max_candidates = 100;
+        assert_eq!(family_size(100, 99, 99, 1), Some(max_candidates));
+        let expected = combinations(100, 99, 99);
+        for (global, indices, contract) in stream_members(100, 99, 99, 1).unwrap() {
+            assert_eq!(indices, expected[global as usize]);
+            assert_eq!(contract, 0);
+            assert_eq!(member_rank(100, 99, 99, 1, &indices, 0), Some(global));
+        }
+    }
+
+    #[test]
+    fn compact_screen_matches_member_scoring_on_random_families() {
+        let contracts = [
+            contract("1", "0", "1.80", "1"),
+            contract("1", "0", "1.80", "0.95"),
+        ];
+        let screens = [
+            None,
+            Some(Screen {
+                max_adjusted_score: 0.5,
+                top: Some(4),
+            }),
+            Some(Screen {
+                max_adjusted_score: 1.0,
+                top: Some(2),
+            }),
+        ];
+        let mut state = 0x1234_5678_9abc_def0_u64;
+        for size in [0, 1, 2, 7, 32, 101] {
+            for screen in &screens {
+                let mut members: Vec<Member> = (0..size)
+                    .map(|_| {
+                        state ^= state << 13;
+                        state ^= state >> 7;
+                        state ^= state << 17;
+                        let wins = (state % 32) as i64;
+                        let losses = ((state >> 8) % 32) as i64;
+                        Member {
+                            global_index: None,
+                            logic_identity: String::new(),
+                            conditions: Vec::new(),
+                            contract: String::new(),
+                            raw: RawCounts {
+                                total: wins + losses,
+                                wins,
+                                losses,
+                                ties: 0,
+                                invalid: 0,
+                            },
+                            null: None,
+                            inapplicable: None,
+                            score: None,
+                            adjusted: None,
+                            screened: None,
+                            development: None,
+                            rejected: None,
+                            rank: None,
+                            evaluation: None,
+                            evaluation_splits: BTreeMap::new(),
+                            stability: BTreeMap::new(),
+                        }
+                    })
+                    .collect();
+                let mut compact: Vec<_> = members
+                    .iter()
+                    .map(|m| CompactMember::new(m.raw.clone()))
+                    .collect();
+                let applicable = score(&mut members, &contracts, screen.as_ref());
+                let (actual_applicable, survivors) =
+                    screen_compact(&mut compact, &contracts, screen.as_ref());
+                assert_eq!(actual_applicable, applicable);
+                let expected: Vec<_> = members
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(i, m)| m.screened.is_none().then_some(i as u64))
+                    .collect();
+                assert_eq!(survivors, expected);
+                for &global in &survivors {
+                    let index = global as usize;
+                    let mut rebuilt = members[index].clone();
+                    rebuilt.raw = RawCounts::default();
+                    rebuilt.score = None;
+                    rebuilt.adjusted = None;
+                    rebuilt.null = None;
+                    compact[index].apply(
+                        &mut rebuilt,
+                        &contracts[index % contracts.len()],
+                        screen.as_ref(),
+                    );
+                    assert_eq!(rebuilt, members[index]);
+                }
+                let gates = Gates {
+                    min_settled: 1,
+                    max_unresolved: 0,
+                    min_net_profit: decimal("0"),
+                };
+                for (index, member) in members.iter_mut().enumerate() {
+                    member.development = Some(Group {
+                        settled: 2,
+                        profit: BTreeMap::from([(
+                            "unit".into(),
+                            Some(decimal(if index % 3 == 0 { "2" } else { "1" })),
+                        )]),
+                        ..Group::default()
+                    });
+                }
+                let mut retained: Vec<Member> = survivors
+                    .iter()
+                    .map(|&global| members[global as usize].clone())
+                    .collect();
+                rank(&mut members, &gates, "unit");
+                rank(&mut retained, &gates, "unit");
+                for (global, member) in survivors.iter().zip(&retained) {
+                    assert_eq!(member.rank, members[*global as usize].rank);
+                    assert_eq!(member.rejected, members[*global as usize].rejected);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn schema_two_empty_family_round_trips_without_changing_schema_one_bytes() {
+        let bytes = include_bytes!(
+            "../../app/tests/fixtures/legacy_schema1/published/objects/24e476f4f6bb8abbd2211c19ba7b0659762b682b299cb240ec6d40a694d51327"
+        );
+        let original = Family::from_json(bytes).unwrap();
+        assert_eq!(original.schema_version, 1);
+        assert_eq!(original.to_json(), bytes);
+        let mut empty = original;
+        empty.schema_version = STREAMED_FAMILY_SCHEMA_VERSION;
+        empty.resolved_conditions = Some(Vec::new());
+        empty.resolved_hash = Some("v1:sha256:empty".into());
+        empty.applicable = 0;
+        empty.members.clear();
+        empty.lowering = None;
+        empty.chunks.clear();
+        let serialized = empty.to_json();
+        assert_eq!(Family::from_json(&serialized).unwrap(), empty);
+        let document: serde_json::Value = serde_json::from_slice(&serialized).unwrap();
+        assert!(document.get("lowering").is_none());
+        assert_eq!(document["members"].as_array().unwrap().len(), 0);
+        let mut malformed = empty.clone();
+        malformed.applicable = 1;
+        assert!(
+            Family::from_json(&malformed.to_json())
+                .unwrap_err()
+                .contains("empty family")
+        );
+        let manifest_bytes = include_bytes!(
+            "../../app/tests/fixtures/legacy_schema1/published/manifests/73486072a7f59ab1df2e6f2f2b704454759ec5c23ff977b874b58c0f3fd180d7/ready.json"
+        );
+        let mut manifest = FamilyManifest::from_json(manifest_bytes).unwrap();
+        assert_eq!(manifest.to_json(), manifest_bytes);
+        manifest.schema_version = STREAMED_FAMILY_SCHEMA_VERSION;
+        manifest.members = 0;
+        assert_eq!(
+            FamilyManifest::from_json(&manifest.to_json()).unwrap(),
+            manifest
         );
     }
 
@@ -1792,6 +2300,7 @@ mod tests {
             ..Group::default()
         };
         let member = |development: Option<Group>, screened: Option<&str>| Member {
+            global_index: None,
             logic_identity: String::new(),
             conditions: Vec::new(),
             contract: "c".into(),
@@ -1834,6 +2343,7 @@ mod tests {
         let mut members: Vec<Member> = [(16, 16), (12, 4), (0, 0), (16, 16), (12, 4), (0, 0)]
             .into_iter()
             .map(|(wins, losses)| Member {
+                global_index: None,
                 logic_identity: String::new(),
                 conditions: Vec::new(),
                 contract: String::new(),

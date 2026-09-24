@@ -16,6 +16,138 @@
 //! admission flags, including admitted entries whose outcome is invalid.
 
 use crate::{Backend, Measured, count, length, product};
+use std::ops::Range;
+
+/// A contiguous column block; a tuple may contain one block for each condition slot.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ColumnBlock {
+    pub columns: Range<usize>,
+    pub row_list_len: usize,
+}
+
+/// Conservative peak device allocation for a tuple and its concurrent batches.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ColumnBlockPlan {
+    pub blocks: Vec<ColumnBlock>,
+    pub resident_row_bytes: u128,
+    pub concurrent_batch_bytes: u128,
+    pub budget_bytes: u128,
+}
+
+/// Greedily packs columns under a device's reported free-byte budget. `row_list_lengths` gives
+/// one chronological sparse list per column; the caller may pass a smaller budget in tests.
+pub fn plan_column_blocks(
+    row_list_lengths: &[usize],
+    row_count: usize,
+    max_conditions: usize,
+    batch_capacity: usize,
+    workers: usize,
+    split_masks: usize,
+    budget_bytes: usize,
+) -> Result<ColumnBlockPlan, String> {
+    if row_count > i32::MAX as usize
+        || max_conditions == 0
+        || batch_capacity == 0
+        || workers == 0
+        || split_masks == 0
+        || batch_capacity > i32::MAX as usize
+        || batch_capacity
+            .checked_mul(max_conditions)
+            .is_none_or(|n| n > i32::MAX as usize)
+    {
+        return Err("column blocks: invalid row, condition, batch, worker, or split bound".into());
+    }
+    let rows = row_count as u128;
+    // Ordered rows, three time arrays, four flags, and the resident split masks.
+    let resident_row_bytes = rows * (36 + split_masks as u128);
+    // Feature IDs, bucket codes, candidate offsets, sparse driver IDs, and two full 21-i64 outputs.
+    let batch_bytes =
+        batch_capacity as u128 * (max_conditions as u128 * 6 + 4 + 4 + 2 * 21 * 8) + 4;
+    let concurrent_batch_bytes = batch_bytes * workers as u128;
+    let budget = budget_bytes as u128;
+    let fits = |columns: usize, list_len: usize| -> bool {
+        if columns > i32::MAX as usize
+            || list_len > i32::MAX as usize
+            || list_len
+                .checked_mul(max_conditions)
+                .is_none_or(|n| n > i32::MAX as usize)
+        {
+            return false;
+        }
+        let slots = max_conditions as u128;
+        let feature_bytes = slots * columns as u128 * rows * 2;
+        let sparse_bytes = 4 * (slots * columns as u128 + 1 + slots * list_len as u128);
+        resident_row_bytes + concurrent_batch_bytes + feature_bytes + sparse_bytes <= budget
+    };
+    let mut blocks = Vec::new();
+    let mut start = 0;
+    let mut list_len = 0_usize;
+    for (index, &length) in row_list_lengths.iter().enumerate() {
+        if length > i32::MAX as usize {
+            return Err(format!(
+                "column blocks: column {index} sparse row list exceeds i32"
+            ));
+        }
+        let next_len = list_len.checked_add(length);
+        if next_len.is_some_and(|n| fits(index + 1 - start, n)) {
+            list_len = next_len.expect("checked");
+            continue;
+        }
+        if start == index || !fits(1, length) {
+            return Err(format!(
+                "column blocks: column {index} cannot fit one-column block in device budget or i32 sparse bounds"
+            ));
+        }
+        blocks.push(ColumnBlock {
+            columns: start..index,
+            row_list_len: list_len,
+        });
+        start = index;
+        list_len = length;
+    }
+    if start < row_list_lengths.len() {
+        blocks.push(ColumnBlock {
+            columns: start..row_list_lengths.len(),
+            row_list_len: list_len,
+        });
+    }
+    Ok(ColumnBlockPlan {
+        blocks,
+        resident_row_bytes,
+        concurrent_batch_bytes,
+        budget_bytes: budget,
+    })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BatchAssignment {
+    pub tuple: usize,
+    pub batch: usize,
+    pub device: usize,
+}
+
+/// A stable round-robin assignment; even a single tuple uses every device when it has enough batches.
+pub fn schedule_batches(
+    tuple_batch_counts: &[usize],
+    devices: usize,
+) -> Result<Vec<BatchAssignment>, String> {
+    if devices == 0 {
+        return Err("batch schedule: no devices".into());
+    }
+    let mut assignments = Vec::new();
+    let mut next_device = 0;
+    for (tuple, &count) in tuple_batch_counts.iter().enumerate() {
+        for batch in 0..count {
+            assignments.push(BatchAssignment {
+                tuple,
+                batch,
+                device: next_device,
+            });
+            next_device = (next_device + 1) % devices;
+        }
+    }
+    Ok(assignments)
+}
 
 /// Shared search-stage buffers, uploaded once by a resident CUDA workspace.
 #[derive(Clone, Copy)]
@@ -68,6 +200,96 @@ pub struct SparseIndex<'a> {
     pub key_chrono_rows: &'a [i32],
 }
 
+/// Tuple-owned sparse key table, independent of each candidate batch's driver IDs.
+#[derive(Clone, Copy)]
+pub struct SparseKeys<'a> {
+    pub key_chrono_offsets: &'a [i32],
+    pub key_chrono_rows: &'a [i32],
+}
+
+/// CPU reference for the resident tuple contract. Shared arrays and sparse rows are checked
+/// once; each batch still checks its own conditions, offsets, driver IDs, and output bounds.
+pub struct CpuSparseTuple<'a> {
+    buffers: SearchBuffers<'a>,
+    split_masks: Vec<&'a [u8]>,
+    keys: SparseKeys<'a>,
+}
+
+impl<'a> CpuSparseTuple<'a> {
+    pub fn new(
+        buffers: SearchBuffers<'a>,
+        split_masks: &[&'a [u8]],
+        keys: SparseKeys<'a>,
+    ) -> Result<Self, String> {
+        if split_masks.is_empty() {
+            return Err("resident tuple: no split masks".into());
+        }
+        Request {
+            kind: 6,
+            buffers,
+            split_mask: split_masks[0],
+            candidates: CandidateConditions {
+                condition_feature: &[],
+                condition_bucket: &[],
+                candidate_offsets: &[0],
+                candidate_count: 0,
+            },
+            sparse: Some(SparseIndex {
+                candidate_driver_key: &[],
+                key_chrono_offsets: keys.key_chrono_offsets,
+                key_chrono_rows: keys.key_chrono_rows,
+            }),
+            expiry_ms: 0,
+            direction_code: 1,
+            payout_basis: 0,
+        }
+        .validate()?;
+        for split_mask in split_masks.iter().skip(1) {
+            length(
+                "resident tuple",
+                "split_mask",
+                split_mask.len(),
+                buffers.row_count as usize,
+            )?;
+        }
+        Ok(Self {
+            buffers,
+            split_masks: split_masks.to_vec(),
+            keys,
+        })
+    }
+
+    pub fn score_batch(
+        &self,
+        split: usize,
+        candidates: CandidateConditions<'_>,
+        driver_keys: &[i32],
+        expiry_ms: i64,
+        payout_basis: i64,
+    ) -> Result<Measured<DualScores>, String> {
+        let split_mask = *self
+            .split_masks
+            .get(split)
+            .ok_or("resident tuple: split index outside split masks")?;
+        let input = Request {
+            kind: 6,
+            buffers: self.buffers,
+            split_mask,
+            candidates,
+            sparse: Some(SparseIndex {
+                candidate_driver_key: driver_keys,
+                key_chrono_offsets: self.keys.key_chrono_offsets,
+                key_chrono_rows: self.keys.key_chrono_rows,
+            }),
+            expiry_ms,
+            direction_code: 1,
+            payout_basis,
+        };
+        input.validate_resident_batch()?;
+        Ok(crate::cpu(|| input.reference()))
+    }
+}
+
 /// Two direction-specific output buffers, each `[candidate][21 or 8]`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DualScores {
@@ -104,35 +326,50 @@ impl Request<'_> {
     }
 
     pub fn validate(&self) -> Result<(), String> {
+        self.validate_mode(false)
+    }
+
+    /// Tuple-owned matrix, row buffers, and sparse lists were validated at workspace creation.
+    pub(crate) fn validate_resident_batch(&self) -> Result<(), String> {
+        self.validate_mode(true)
+    }
+
+    fn validate_mode(&self, resident: bool) -> Result<(), String> {
         let k = self.kernel();
         let b = self.buffers;
         let rows = count(k, "row_count", b.row_count)?;
         let features = count(k, "feature_count", b.feature_count)?;
         let candidates = count(k, "candidate_count", self.candidates.candidate_count)?;
-        length(
-            k,
-            "feature_codes",
-            b.feature_codes.len(),
-            product(k, "feature_codes", features, rows)?,
-        )?;
-        length(k, "split_mask", self.split_mask.len(), rows)?;
-        for (name, len) in [
-            ("decision_time_ms", b.decision_time_ms.len()),
-            ("release_time_ms", b.release_time_ms.len()),
-        ] {
-            length(k, name, len, rows)?;
+        if !resident {
+            length(
+                k,
+                "feature_codes",
+                b.feature_codes.len(),
+                product(k, "feature_codes", features, rows)?,
+            )?;
         }
-        if self.full() {
-            length(k, "settlement_time_ms", b.settlement_time_ms.len(), rows)?;
+        if !resident {
+            length(k, "split_mask", self.split_mask.len(), rows)?;
         }
-        if self.kind != 8 {
+        if !resident {
             for (name, len) in [
-                ("valid", b.valid.len()),
-                ("buy_win", b.buy_win.len()),
-                ("sell_win", b.sell_win.len()),
-                ("tie", b.tie.len()),
+                ("decision_time_ms", b.decision_time_ms.len()),
+                ("release_time_ms", b.release_time_ms.len()),
             ] {
                 length(k, name, len, rows)?;
+            }
+            if self.full() {
+                length(k, "settlement_time_ms", b.settlement_time_ms.len(), rows)?;
+            }
+            if self.kind != 8 {
+                for (name, len) in [
+                    ("valid", b.valid.len()),
+                    ("buy_win", b.buy_win.len()),
+                    ("sell_win", b.sell_win.len()),
+                    ("tie", b.tie.len()),
+                ] {
+                    length(k, name, len, rows)?;
+                }
             }
         }
         let c = self.candidates;
@@ -181,26 +418,28 @@ impl Request<'_> {
                     "{k}: key_chrono_rows/key_chrono_offsets count exceeds i32"
                 ));
             }
-            let mut previous = 0;
-            for &offset in sparse.key_chrono_offsets {
-                if offset < previous || offset as usize > sparse.key_chrono_rows.len() {
-                    return Err(format!(
-                        "{k}: key_chrono_offsets must be monotone and within key_chrono_rows"
-                    ));
+            if !resident {
+                let mut previous = 0;
+                for &offset in sparse.key_chrono_offsets {
+                    if offset < previous || offset as usize > sparse.key_chrono_rows.len() {
+                        return Err(format!(
+                            "{k}: key_chrono_offsets must be monotone and within key_chrono_rows"
+                        ));
+                    }
+                    previous = offset;
                 }
-                previous = offset;
+                for &row in sparse.key_chrono_rows {
+                    if row < 0 || row as usize >= rows {
+                        return Err(format!(
+                            "{k}: key_chrono_rows index {row} outside row_count"
+                        ));
+                    }
+                }
             }
             for &key in sparse.candidate_driver_key {
                 if key >= 0 && key as usize >= sparse.key_chrono_offsets.len() - 1 {
                     return Err(format!(
                         "{k}: candidate_driver_key {key} outside key_chrono_offsets"
-                    ));
-                }
-            }
-            for &row in sparse.key_chrono_rows {
-                if row < 0 || row as usize >= rows {
-                    return Err(format!(
-                        "{k}: key_chrono_rows index {row} outside row_count"
                     ));
                 }
             }
