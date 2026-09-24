@@ -1767,7 +1767,16 @@ fn score_streamed(
     let _ = (backends, device_ordinals);
     budget =
         budget.min(test_screen_limit("BINARY_ALPHA_TEST_COLUMN_BUDGET")?.unwrap_or(usize::MAX));
-    let batch_size = test_screen_limit("BINARY_ALPHA_TEST_SCREEN_BATCH")?.unwrap_or(1024);
+    let batch_size = test_screen_limit("BINARY_ALPHA_TEST_SCREEN_BATCH")?.unwrap_or_else(|| {
+        if backends
+            .iter()
+            .all(|backend| matches!(backend, Backend::Cpu))
+        {
+            1_024
+        } else {
+            65_536
+        }
+    });
     let plan = kernels::plan_column_blocks(
         &lengths,
         rows,
