@@ -21,7 +21,7 @@ use binary_alpha_engine::{
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, HashSet},
     fs,
     path::Path,
 };
@@ -2036,6 +2036,7 @@ pub(crate) fn diagnostics(
         file.set_len(complete as u64).map_err(err)?;
         file.sync_all().map_err(err)?;
     }
+    let indexed: HashSet<_> = indexed.iter().map(|p| &p.occurrence).collect();
     let mut pages = BTreeMap::new();
     for line in bytes[..complete].split_inclusive(|b| *b == b'\n') {
         let page: PageCoverage = serde_json::from_slice(line).map_err(err)?;
@@ -2046,7 +2047,7 @@ pub(crate) fn diagnostics(
         if page.receipt_time.is_none() {
             return Err("received response lacks receipt time".into());
         }
-        if !indexed.iter().any(|p| p.occurrence == page.occurrence) {
+        if !indexed.contains(&page.occurrence) {
             pages.insert((identity.acquisition_id.clone(), identity.ordinal), page);
         }
     }
@@ -3591,5 +3592,59 @@ mod migration_selection_tests {
                 .v2_root,
             "e".repeat(64)
         );
+    }
+}
+
+#[cfg(test)]
+mod diagnostics_tests {
+    use super::*;
+    use crate::fetch::OccurrenceIdentity;
+
+    fn page(ordinal: u64) -> PageCoverage {
+        PageCoverage {
+            occurrence: Some(OccurrenceIdentity {
+                acquisition_id: "acquisition".into(),
+                intent: Some("intent".into()),
+                ordinal,
+            }),
+            path: format!("raw/{ordinal}.json"),
+            sha256: format!("{ordinal:064x}"),
+            bytes: 4332,
+            offset: None,
+            anchor: None,
+            rows: 40,
+            first: None,
+            last: None,
+            receipt_time: Some("2026-09-23T15:03:51.745016Z".into()),
+        }
+    }
+
+    /// The AEDCNY intent's shape: 47,112 indexed pages, each journaled twice, and two received
+    /// responses that were never indexed.
+    #[test]
+    fn a_long_received_log_resolves_against_its_indexed_pages() {
+        let state =
+            std::env::temp_dir().join(format!("binary-alpha-diagnostics-{}", std::process::id()));
+        fs::create_dir_all(&state).unwrap();
+        let indexed: Vec<_> = (0..47_112).map(page).collect();
+        let unindexed = [page(47_112), page(47_113)];
+        let mut log = Vec::new();
+        for page in indexed
+            .iter()
+            .flat_map(|page| [page, page])
+            .chain(&unindexed)
+        {
+            serde_json::to_writer(&mut log, page).unwrap();
+            log.push(b'\n');
+        }
+        fs::write(state.join(RECEIVED), log).unwrap();
+        let started = std::time::Instant::now();
+        let resolved = diagnostics(&state, Some(&indexed)).unwrap();
+        eprintln!(
+            "94,226 received records resolved in {:?}",
+            started.elapsed()
+        );
+        assert_eq!(resolved, (unindexed.to_vec(), false));
+        fs::remove_dir_all(&state).unwrap();
     }
 }

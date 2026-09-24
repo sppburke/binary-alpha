@@ -33,6 +33,7 @@ cargo run --locked -p binary-alpha-app -- config validate --config configs/examp
 cargo run --release --locked -p binary-alpha-app -- data import --config PATH
 cargo run --release --locked -p binary-alpha-app -- data split --config PATH
 cargo run --release --locked -p binary-alpha-app -- data fetch --config PATH
+cargo run --release --locked -p binary-alpha-app -- data pipeline update --config PATH [--job ID] [--end TIME]
 cargo run --release --locked -p binary-alpha-app -- broker inspect --config PATH
 cargo run --release --locked -p binary-alpha-app -- data audit --config PATH --manifest URI
 cargo run --release --locked -p binary-alpha-app -- data verify --manifest URI [--config PATH]
