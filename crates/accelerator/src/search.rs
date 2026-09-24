@@ -111,45 +111,6 @@ pub fn plan_column_blocks(
     Ok(ColumnBlockPlan { blocks })
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct BatchAssignment {
-    pub tuple: usize,
-    pub batch: usize,
-    pub device: usize,
-}
-
-/// A stable round-robin assignment; even a single tuple uses every device when it has enough batches.
-pub fn schedule_batches(
-    tuple_batch_counts: &[usize],
-    devices: usize,
-) -> Result<Vec<BatchAssignment>, String> {
-    schedule_batches_from(tuple_batch_counts, devices, 0)
-}
-
-/// Continue a deterministic round robin across bounded groups of streamed batches.
-pub fn schedule_batches_from(
-    tuple_batch_counts: &[usize],
-    devices: usize,
-    first_device: usize,
-) -> Result<Vec<BatchAssignment>, String> {
-    if devices == 0 {
-        return Err("batch schedule: no devices".into());
-    }
-    let mut assignments = Vec::new();
-    let mut next_device = first_device % devices;
-    for (tuple, &count) in tuple_batch_counts.iter().enumerate() {
-        for batch in 0..count {
-            assignments.push(BatchAssignment {
-                tuple,
-                batch,
-                device: next_device,
-            });
-            next_device = (next_device + 1) % devices;
-        }
-    }
-    Ok(assignments)
-}
-
 /// Shared search-stage buffers, uploaded once by a resident CUDA workspace.
 #[derive(Clone, Copy)]
 pub struct SearchBuffers<'a> {
@@ -239,6 +200,45 @@ pub(crate) fn validate_tuple_outcome(
     Ok(())
 }
 
+pub(crate) fn validate_tuple(
+    buffers: SearchBuffers<'_>,
+    split_masks: &[&[u8]],
+    keys: SparseKeys<'_>,
+) -> Result<(), String> {
+    let Some(&first) = split_masks.first() else {
+        return Err("resident tuple: no split masks".into());
+    };
+    Request {
+        kind: 6,
+        buffers,
+        split_mask: first,
+        candidates: CandidateConditions {
+            condition_feature: &[],
+            condition_bucket: &[],
+            candidate_offsets: &[0],
+            candidate_count: 0,
+        },
+        sparse: Some(SparseIndex {
+            candidate_driver_key: &[],
+            key_chrono_offsets: keys.key_chrono_offsets,
+            key_chrono_rows: keys.key_chrono_rows,
+        }),
+        expiry_ms: 0,
+        direction_code: 1,
+        payout_basis: 0,
+    }
+    .validate()?;
+    for split_mask in split_masks.iter().skip(1) {
+        length(
+            "resident tuple",
+            "split_mask",
+            split_mask.len(),
+            buffers.row_count as usize,
+        )?;
+    }
+    Ok(())
+}
+
 /// CPU reference for the resident tuple contract. Shared arrays and sparse rows are checked
 /// once; each batch still checks its own conditions, offsets, driver IDs, and output bounds.
 pub struct CpuSparseTuple<'a> {
@@ -258,37 +258,7 @@ impl<'a> CpuSparseTuple<'a> {
         split_masks: &[&'a [u8]],
         keys: SparseKeys<'a>,
     ) -> Result<Self, String> {
-        if split_masks.is_empty() {
-            return Err("resident tuple: no split masks".into());
-        }
-        Request {
-            kind: 6,
-            buffers,
-            split_mask: split_masks[0],
-            candidates: CandidateConditions {
-                condition_feature: &[],
-                condition_bucket: &[],
-                candidate_offsets: &[0],
-                candidate_count: 0,
-            },
-            sparse: Some(SparseIndex {
-                candidate_driver_key: &[],
-                key_chrono_offsets: keys.key_chrono_offsets,
-                key_chrono_rows: keys.key_chrono_rows,
-            }),
-            expiry_ms: 0,
-            direction_code: 1,
-            payout_basis: 0,
-        }
-        .validate()?;
-        for split_mask in split_masks.iter().skip(1) {
-            length(
-                "resident tuple",
-                "split_mask",
-                split_mask.len(),
-                buffers.row_count as usize,
-            )?;
-        }
+        validate_tuple(buffers, split_masks, keys)?;
         #[cfg(test)]
         CPU_TUPLE_CONSTRUCTIONS.with(|count| count.set(count.get() + 1));
         Ok(Self {

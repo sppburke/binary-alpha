@@ -30,7 +30,7 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 const RESOURCES: &[u8] = include_bytes!("../../../configs/study_p_resources.toml");
-const RESOURCES_SHA256: &str = "c82a1732c0092bcf48af440f00bfd8a0253b03ef3b11f0a01fb194b2a8eae285";
+const RESOURCES_SHA256: &str = "4133a4379876ea6841fda537186063c29a181a4a885550c81c61da08d2ca0bd8";
 const DAYS: i64 = 493;
 const BARS_PER_DAY: usize = 17_280;
 const OPERATOR: &str = "synthetic-quantum-operator";
@@ -365,13 +365,27 @@ fn quantum_study_p_combined_scale() {
     config.instruments.truncate(1);
     config.instruments[0].native_granularity =
         binary_alpha_engine::dataset::NativeGranularity::Bar { period_seconds: 5 };
-    let streams: Vec<_> = [5, 15, 30, 60, 300, 900, 3600]
+    let streams: Vec<_> = numbers(&resources, &["gate", "streams_seconds"])
         .into_iter()
         .map(|duration_seconds| StreamKey {
-            duration_seconds,
+            duration_seconds: duration_seconds.try_into().unwrap(),
             offset_seconds: 0,
         })
         .collect();
+    let generated_streams = numbers(&resources, &["gate", "generated_streams_seconds"]);
+    let expiries: Vec<u32> = numbers(&resources, &["gate", "expiries_seconds"])
+        .into_iter()
+        .map(|seconds| seconds.try_into().unwrap())
+        .collect();
+    let rolling_windows: Vec<u32> = numbers(&resources, &["search", "rolling_windows"])
+        .into_iter()
+        .map(|window| window.try_into().unwrap())
+        .collect();
+    let moving_average_periods: Vec<u32> =
+        numbers(&resources, &["search", "moving_average_periods"])
+            .into_iter()
+            .map(|period| period.try_into().unwrap())
+            .collect();
     config.instruments[0].candles = streams
         .iter()
         .map(|stream| binary_alpha_engine::config::CandleSpec {
@@ -397,13 +411,13 @@ fn quantum_study_p_combined_scale() {
     instrument.source_manifest = reference(0);
     instrument.features.streams = Some(streams.clone());
     instrument.features.outputs = Some(Outputs::AllSupported);
-    instrument.features.moving_average_periods = Some(vec![8, 21, 50]);
-    instrument.features.rolling_window = Some(32);
-    instrument.features.min_history = Some(8);
+    instrument.features.moving_average_periods = Some(moving_average_periods.clone());
+    instrument.features.rolling_window = Some(*rolling_windows.iter().max().unwrap());
+    instrument.features.min_history = Some(*moving_average_periods.iter().min().unwrap());
     instrument.features.price_epsilon = Some("0".into());
     instrument.features.structure = Some(
         serde_json::from_value(serde_json::json!({
-            "swing_left":2,"swing_right":2,"rolling_windows":[4,8,16,32],"direction_window":8,
+            "swing_left":2,"swing_right":2,"rolling_windows":rolling_windows,"direction_window":8,
             "trend_efficiency_threshold":0.35,"trend_min_abs_momentum_bps":3.0,
             "range_efficiency_threshold":0.25,"compression_ratio_threshold":0.7,
             "expanded_ratio_threshold":1.3,"extreme_ratio_threshold":1.8,
@@ -412,13 +426,15 @@ fn quantum_study_p_combined_scale() {
         .unwrap(),
     );
     instrument.features.encodings = Some(Encodings {
-        max_labels: 32,
+        max_labels: number(&resources, &["search", "max_labels"])
+            .try_into()
+            .unwrap(),
         outputs: vec![EncodingSpec {
             output: "all_supported".into(),
             bins: None,
         }],
     });
-    instrument.outcomes.expiry_seconds = vec![30, 45, 60, 90, 120, 180, 240, 300];
+    instrument.outcomes.expiry_seconds = expiries.clone();
     instrument.outcomes.max_entry_delay_ms = 5_000;
     instrument.outcomes.max_settlement_delay_ms = 5_000;
     instrument.outcomes.max_tick_gap_ms = 5_000;
@@ -428,15 +444,25 @@ fn quantum_study_p_combined_scale() {
     search.decision_end = time(BASE + 257 * DAY_MICROS + 1_000_000);
     search.base_stream = streams[0];
     search.scope = Scope::Heuristic;
-    search.min_conditions = 2;
-    search.max_conditions = 2;
-    search.max_candidates = 40_000_000;
-    search.chunk_size = 8;
+    search.min_conditions = number(&resources, &["search", "max_conditions"])
+        .try_into()
+        .unwrap();
+    search.max_conditions = search.min_conditions;
+    search.max_candidates = number(&resources, &["search", "max_candidates"]);
+    search.chunk_size = number(&resources, &["search", "chunk_size"])
+        .try_into()
+        .unwrap();
     search.screen = Some(Screen {
         max_adjusted_score: 1.0,
-        top: Some(8),
+        top: Some(
+            number(&resources, &["search", "screen_top"])
+                .try_into()
+                .unwrap(),
+        ),
     });
-    search.stability.simulations = 16;
+    search.stability.simulations = number(&resources, &["search", "stability_simulations"])
+        .try_into()
+        .unwrap();
     search.embargo_micros = 305_000_000;
     search.gates.min_settled = 0;
     search.gates.min_net_profit = Decimal::parse("-1000000000").unwrap();
@@ -444,6 +470,7 @@ fn quantum_study_p_combined_scale() {
     search.risk_policy.max_feature_age_micros = 7_200_000_000;
     search.conditions = streams
         .iter()
+        .filter(|stream| generated_streams.contains(&u64::from(stream.duration_seconds)))
         .map(|&stream| {
             SearchCondition::Generate(GeneratedSearchCondition {
                 stream,
@@ -456,7 +483,7 @@ fn quantum_study_p_combined_scale() {
         })
         .collect();
     let template = search.contracts[0].clone();
-    search.contracts = [30, 45, 60, 90, 120, 180, 240, 300]
+    search.contracts = expiries
         .into_iter()
         .flat_map(|expiry| {
             [Direction::Buy, Direction::Sell]
@@ -468,7 +495,7 @@ fn quantum_study_p_combined_scale() {
             let mut contract = template.clone();
             contract.id = format!("synthetic-{index}");
             contract.direction = direction;
-            contract.duration_micros = expiry * 1_000_000;
+            contract.duration_micros = i64::from(expiry) * 1_000_000;
             contract.settlement.max_settlement_delay_micros = 5_000_000;
             contract.settlement.max_tick_gap_micros = 5_000_000;
             contract
@@ -495,7 +522,11 @@ fn quantum_study_p_combined_scale() {
     research.portfolio.repairs.truncate(1);
     research.portfolio.members.clear();
     research.portfolio.subsets.clear();
-    research.portfolio.generate = Some(PortfolioGenerate { top: 8 });
+    research.portfolio.generate = Some(PortfolioGenerate {
+        top: number(&resources, &["search", "portfolio_top"])
+            .try_into()
+            .unwrap(),
+    });
     research.portfolio.max_policies = 128;
     research.portfolio.embargo_micros = 305_000_000;
     research.portfolio.max_rate_age_micros = 493 * DAY_MICROS;
@@ -540,80 +571,6 @@ fn quantum_study_p_combined_scale() {
     config.accelerator =
         Some(serde_json::from_value(serde_json::json!({"backend":"cuda","devices":[0]})).unwrap());
     let research = config.research.as_ref().unwrap();
-    assert_eq!(
-        numbers(&resources, &["gate", "streams_seconds"]),
-        streams
-            .iter()
-            .map(|stream| u64::from(stream.duration_seconds))
-            .collect::<Vec<_>>()
-    );
-    assert_eq!(
-        numbers(&resources, &["gate", "expiries_seconds"]),
-        research.instruments[0]
-            .outcomes
-            .expiry_seconds
-            .iter()
-            .map(|&seconds| u64::from(seconds))
-            .collect::<Vec<_>>()
-    );
-    assert_eq!(
-        numbers(&resources, &["search", "rolling_windows"]),
-        vec![4, 8, 16, 32]
-    );
-    assert_eq!(
-        numbers(&resources, &["search", "moving_average_periods"]),
-        research.instruments[0]
-            .features
-            .moving_average_periods
-            .as_ref()
-            .unwrap()
-            .iter()
-            .map(|&period| u64::from(period))
-            .collect::<Vec<_>>()
-    );
-    assert_eq!(
-        number(&resources, &["search", "max_labels"]),
-        u64::from(
-            research.instruments[0]
-                .features
-                .encodings
-                .as_ref()
-                .unwrap()
-                .max_labels
-        )
-    );
-    assert_eq!(
-        number(&resources, &["search", "max_candidates"]),
-        research.instruments[0].search.max_candidates
-    );
-    assert_eq!(
-        number(&resources, &["search", "max_conditions"]),
-        u64::from(research.instruments[0].search.max_conditions)
-    );
-    assert_eq!(
-        number(&resources, &["search", "screen_top"]),
-        u64::from(
-            research.instruments[0]
-                .search
-                .screen
-                .as_ref()
-                .unwrap()
-                .top
-                .unwrap()
-        )
-    );
-    assert_eq!(
-        number(&resources, &["search", "chunk_size"]),
-        u64::from(research.instruments[0].search.chunk_size)
-    );
-    assert_eq!(
-        number(&resources, &["search", "stability_simulations"]),
-        u64::from(research.instruments[0].search.stability.simulations)
-    );
-    assert_eq!(
-        number(&resources, &["search", "portfolio_top"]),
-        u64::from(research.portfolio.generate.as_ref().unwrap().top)
-    );
     assert_eq!(
         research.scenarios.len() as u64 + 1,
         number(&resources, &["minimum", "scenarios"])

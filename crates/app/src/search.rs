@@ -2003,14 +2003,8 @@ fn score_streamed(
                                 &mut clock.driver_visits,
                                 |group| {
                                     let mut scored = Vec::new();
-                                    let schedule = kernels::schedule_batches_from(
-                                        &[group.len()],
-                                        workspaces.len(),
-                                        next_device,
-                                    )?;
-                                    next_device += group.len();
-                                    for (batch, assignment) in group.iter().zip(schedule) {
-                                        let device = assignment.device;
+                                    for (i, batch) in group.iter().enumerate() {
+                                        let device = (next_device + i) % workspaces.len();
                                         let uploaded = workspaces[device]
                                             .upload_batch(batch.candidates(), &batch.drivers)?;
                                         clock.transfer_bytes +=
@@ -2030,6 +2024,7 @@ fn score_streamed(
                                             ));
                                         }
                                     }
+                                    next_device = (next_device + group.len()) % workspaces.len();
                                     apply(scored, &mut records);
                                     Ok(())
                                 },

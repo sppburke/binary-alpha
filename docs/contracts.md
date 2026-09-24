@@ -2249,7 +2249,9 @@ survivors. Verification re-expands the recorded rules against the recorded fitte
 plan, requires exact ordered equality with the resolved table, checks optional lowering against
 only fallback conditions, rebuilds projections, and re-scores every global member through the
 same sparse scorer. It recomputes applicability, exact BH adjustments, the survivor index set,
-gates and ranks, then verifies each retained member's replay chunks. A configured `data verify
+gates and ranks, then verifies each retained member's replay chunks and their definitions against
+the recorded members, and compares groups and split groups with verified summaries and the ledger
+projection. A configured `data verify
 --config` uses its accelerator devices only for schema-2 re-scoring; without one it uses CPU
 batches fanned across cores. Within a command, successful full verification is cached by URI
 after the development-only role guard. Certified and ordinary contexts have separate cache keys;
@@ -2259,11 +2261,7 @@ their full-member, full-lowering and close-time CPU verification path and remain
 The command writes
 `search SCOPE generation GENERATION members M applicable A screened S replayed R passed P evaluated E objects 1`
 followed by stage timings, resolved columns, block tuples, sparse-list entries, sparse-list construction visits, tuple-index validation visits, candidate-driver row visits, host-to-device transfer bytes, and peak resident memory or `(already published)`, then the
-verification line. `data verify` on a family generation validates the manifest and object,
-re-enumerates the family, restores every referenced replay through its verifier and checks its
-definition against the table synthesized for its recorded members, compares every group and split group with the verified summaries
-and the ledger projection, recomputes stability, applicability, scores, adjustments, screen
-decisions, gates and ranks, and writes
+verification line. `data verify` writes
 `verified search generation GENERATION members M applicable A replayed R passed P objects 1 bytes B`.
 
 ## Portfolio selection

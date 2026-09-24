@@ -5,13 +5,16 @@ max_elapsed_seconds = 14400
 max_swap_growth_kb = 0
 base_bar_seconds = 5
 streams_seconds = [5, 15, 30, 60, 300, 900, 3600]
+# The measured synthetic plan generated rules on 5 s and 15 s while features built all seven streams.
+generated_streams_seconds = [5, 15]
 expiries_seconds = [30, 45, 60, 90, 120, 180, 240, 300]
 
 [search]
 rolling_windows = [4, 8, 16, 32]
 moving_average_periods = [8, 21, 50]
 max_labels = 32
-max_candidates = 40000000
+# The measured 1,127 conditions produced 16 × C(1127, 2) = 10,152,016 members.
+max_candidates = 12000000
 max_conditions = 2
 screen_top = 8
 chunk_size = 8
@@ -20,12 +23,15 @@ portfolio_top = 8
 generated_output = "*"
 
 [minimum]
+# The measured synthetic development plan resolved 1,127 conditions.
 resolved_conditions = 1119
+# The measured 16 × C(1127, 2) family had 10,152,016 members.
 members = 10000000
 screened_survivors = 1
 folds = 1
 scenarios = 3
-candidate_driver_row_visits = 1000000000
+# The measured synthetic development plan made 3,385,174,275,832 candidate-driver visits.
+candidate_driver_row_visits = 3000000000000
 projected_columns = 1119
 block_tuples = 1
 sparse_list_entries = 1

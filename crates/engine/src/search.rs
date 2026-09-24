@@ -1194,71 +1194,34 @@ pub fn gate(group: &Group, currency: &str, gates: &Gates) -> Result<(), String> 
 /// of the complete family, and applies the heuristic screen when one is configured. Returns
 /// the applicable count. Members are in canonical order, contracts cycling fastest.
 pub fn score(members: &mut [Member], contracts: &[ContractTerms], screen: Option<&Screen>) -> u64 {
-    for (index, member) in members.iter_mut().enumerate() {
-        let contract = &contracts[index % contracts.len()];
-        (
-            member.null,
-            member.inapplicable,
-            member.score,
-            member.adjusted,
-            member.screened,
-        ) = match null_rate(contract) {
-            Ok(null) => {
-                let score = upper_tail(
-                    member.raw.wins.max(0) as u64,
-                    member.raw.losses.max(0) as u64,
-                    null.break_even,
-                );
-                (Some(null), None, Some(score), None, None)
-            }
-            Err(reason) => (
-                None,
-                Some(reason.clone()),
-                None,
-                None,
-                screen.map(|_| format!("inapplicable: {reason}")),
-            ),
-        };
+    if members.is_empty() {
+        return 0;
     }
-    let applicable: Vec<usize> = (0..members.len())
-        .filter(|&index| members[index].score.is_some())
+    let mut records: Vec<_> = members
+        .iter()
+        .map(|member| CompactMember::new(member.raw.clone()))
         .collect();
-    let adjusted = benjamini_hochberg(
-        &applicable
-            .iter()
-            .map(|&index| members[index].score.expect("applicable"))
-            .collect::<Vec<_>>(),
-    );
-    for (&index, &value) in applicable.iter().zip(&adjusted) {
-        members[index].adjusted = Some(value);
-    }
-    if let Some(screen) = screen {
-        let mut order = applicable.clone();
-        order.sort_by(|&a, &b| {
-            members[a]
-                .adjusted
-                .partial_cmp(&members[b].adjusted)
-                .unwrap_or(Ordering::Equal)
-                .then(a.cmp(&b))
-        });
-        for (position, &index) in order.iter().enumerate() {
-            let adjusted = members[index].adjusted.expect("applicable");
-            members[index].screened = if adjusted > screen.max_adjusted_score {
-                Some(format!(
+    let (applicable, retained) = screen_compact(&mut records, contracts, screen);
+    let mut retained = retained.into_iter().peekable();
+    for (index, (member, record)) in members.iter_mut().zip(&records).enumerate() {
+        record.apply(member, &contracts[index % contracts.len()], screen);
+        if retained.peek() == Some(&(index as u64)) {
+            retained.next();
+        } else if let (Some(screen), Some(adjusted)) = (screen, member.adjusted) {
+            member.screened = Some(if adjusted > screen.max_adjusted_score {
+                format!(
                     "adjusted score {adjusted} above the maximum {}",
                     screen.max_adjusted_score
-                ))
-            } else if screen.top.is_some_and(|top| position >= top as usize) {
-                Some(format!(
-                    "beyond the first {} members by adjusted score",
-                    screen.top.expect("set")
-                ))
+                )
             } else {
-                None
-            };
+                format!(
+                    "beyond the first {} members by adjusted score",
+                    screen.top.expect("screened by top")
+                )
+            });
         }
     }
-    applicable.len() as u64
+    applicable
 }
 
 /// Minimal whole-family screening state; contract and identity are recovered from the global

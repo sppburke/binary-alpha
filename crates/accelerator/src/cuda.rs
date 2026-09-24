@@ -109,28 +109,6 @@ impl Device {
             .map_err(|e| error("CUDA device", "memory_info", e))
     }
 
-    /// Plan against this device's current driver-reported free memory before any tuple upload.
-    pub fn search_column_blocks(
-        &self,
-        row_list_lengths: &[usize],
-        row_count: usize,
-        max_conditions: usize,
-        batch_capacity: usize,
-        workers: usize,
-        split_masks: usize,
-    ) -> Result<crate::search::ColumnBlockPlan, String> {
-        let (free, _) = self.memory_info()?;
-        crate::search::plan_column_blocks(
-            row_list_lengths,
-            row_count,
-            max_conditions,
-            batch_capacity,
-            workers,
-            split_masks,
-            free,
-        )
-    }
-
     fn sync(&self, kernel: &str, phase: &str) -> Result<(), String> {
         self.stream
             .synchronize()
@@ -612,34 +590,13 @@ impl Device {
         keys: SparseKeys<'a>,
     ) -> Result<ResidentTuple<'a>, String> {
         let validation_started = Instant::now();
-        if split_masks.is_empty() {
-            return Err("resident tuple: no split masks".into());
-        }
-        Request {
-            kind: 6,
-            buffers,
-            split_mask: split_masks[0],
-            candidates: CandidateConditions {
-                condition_feature: &[],
-                condition_bucket: &[],
-                candidate_offsets: &[0],
-                candidate_count: 0,
-            },
-            sparse: Some(SparseIndex {
-                candidate_driver_key: &[],
-                key_chrono_offsets: keys.key_chrono_offsets,
-                key_chrono_rows: keys.key_chrono_rows,
-            }),
-            expiry_ms: 0,
-            direction_code: 1,
-            payout_basis: 0,
-        }
-        .validate()?;
-        for split_mask in split_masks.iter().skip(1) {
-            if split_mask.len() != buffers.row_count as usize {
-                return Err("resident tuple: split_mask length differs from row_count".into());
+        crate::search::validate_tuple(buffers, split_masks, keys).map_err(|error| {
+            if error.starts_with("resident tuple: split_mask length") {
+                "resident tuple: split_mask length differs from row_count".into()
+            } else {
+                error
             }
-        }
+        })?;
         let validation = validation_started.elapsed();
         let shared = self.shared(buffers, split_masks, "search tuple")?;
         let workspace = ResidentSearch {
@@ -799,7 +756,6 @@ impl ResidentTupleBatch<'_, '_> {
             direction_code: 1,
             payout_basis,
         };
-        input.validate_resident_batch()?;
         self.tuple.workspace.device.score_resident(
             input,
             &self.tuple.workspace.shared,

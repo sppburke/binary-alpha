@@ -24,7 +24,7 @@ fn blocks_cover_columns(blocks: &[ColumnBlock], columns: usize) -> bool {
 }
 
 #[test]
-fn column_blocks_bound_memory_sparse_indices_and_schedule() {
+fn column_blocks_bound_memory_and_sparse_indices() {
     let plan = plan_column_blocks(&[4; 6], 4, 2, 1, 1, 1, 600).unwrap();
     assert!(plan.blocks.len() >= 3, "forced small budget: {plan:?}");
     assert!(blocks_cover_columns(&plan.blocks, 6));
@@ -42,20 +42,6 @@ fn column_blocks_bound_memory_sparse_indices_and_schedule() {
         plan_column_blocks(&[i32::MAX as usize], 4, 2, 1, 1, 1, usize::MAX)
             .unwrap_err()
             .contains("i32 sparse bounds")
-    );
-    let schedule = schedule_batches(&[5], 2).unwrap();
-    assert_eq!(
-        schedule.iter().map(|item| item.device).collect::<Vec<_>>(),
-        [0, 1, 0, 1, 0]
-    );
-    assert!(schedule.iter().all(|item| item.tuple == 0));
-    assert_eq!(
-        schedule_batches(&[1, 1], 2)
-            .unwrap()
-            .iter()
-            .map(|item| item.device)
-            .collect::<Vec<_>>(),
-        [0, 1]
     );
 }
 
@@ -226,7 +212,8 @@ fn cuda_resident_tuple_matches_cpu_reference() {
     let rows = case.entry.len();
     assert!(
         !device
-            .search_column_blocks(&[rows], rows, 1, 1, 1, 1)
+            .memory_info()
+            .and_then(|(free, _)| plan_column_blocks(&[rows], rows, 1, 1, 1, 1, free))
             .unwrap()
             .blocks
             .is_empty()
