@@ -314,8 +314,15 @@ pub(crate) struct RowCursor {
     rows: u64,
 }
 
+#[cfg(test)]
+thread_local! {
+    pub(crate) static ROW_CURSOR_OPENS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 impl RowCursor {
     pub(crate) fn open(bound: &Bound, stream: &StreamColumns) -> Result<Self, String> {
+        #[cfg(test)]
+        ROW_CURSOR_OPENS.with(|count| count.set(count.get() + 1));
         let plan_stream = bound
             .plan
             .stream(stream.stream)

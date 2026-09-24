@@ -7,7 +7,7 @@
 //! The engine module owns every pure rule; this module owns binding, the replay batches, the
 //! device calls, temporary files, publication, and the verifier.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::Write;
 use std::path::Path;
@@ -117,6 +117,7 @@ pub fn run(config_path: &Path, out: &mut dyn Write) -> Result<(), String> {
 
 /// One member's executable identity inside a chunk.
 type ChunkMember = (String, StrategySpec, usize);
+type ProjectedRows = BTreeMap<(u32, u32, String), Vec<i16>>;
 
 /// The bound development input: plan, instrument, and the outcome generation's stored rows.
 struct Development {
@@ -1021,10 +1022,12 @@ impl ProjectionIndex {
     }
 }
 
-/// Read only clocks through replay's verified row cursor; derive stored entries from the
-/// published outcome indices rather than recomputing close-referenced outcomes.
-#[allow(dead_code)]
-fn projection_index(development: &Development) -> Result<ProjectionIndex, String> {
+/// Read each stream's clocks and every required fitted encoding in one verified cursor pass;
+/// derive stored entries from published outcome indices rather than recomputing outcomes.
+fn projection_index(
+    development: &Development,
+    conditions: &[binary_alpha_engine::execution::Condition],
+) -> Result<(ProjectionIndex, ProjectedRows), String> {
     let streams: Vec<_> = development
         .bound
         .plan
@@ -1032,20 +1035,74 @@ fn projection_index(development: &Development) -> Result<ProjectionIndex, String
         .iter()
         .map(|stream| stream.key())
         .collect();
+    let mut projected = BTreeMap::new();
     let clocks: Vec<Vec<(i64, i64)>> = streams
         .iter()
         .map(|&stream| {
-            let mut cursor = replay::RowCursor::open(
-                &development.bound,
-                &StreamColumns {
-                    stream,
-                    columns: Vec::new(),
-                },
-            )?;
+            let plan_stream = development
+                .bound
+                .plan
+                .stream(stream)
+                .ok_or("projected stream is absent from the plan")?;
+            let mut columns = Vec::new();
+            let mut outputs = Vec::new();
+            for condition in conditions
+                .iter()
+                .filter(|condition| condition.stream == stream)
+            {
+                if projected_bucket(&development.bound.plan, condition).is_none()
+                    || outputs.iter().any(
+                        |(name, _, _, _): &(String, ColumnSpec, usize, Vec<usize>)| {
+                            name == &condition.output
+                        },
+                    )
+                {
+                    continue;
+                }
+                let mut spec = replay::column_spec(plan_stream, &condition.output)
+                    .ok_or("projected encoding is absent from the plan")?;
+                let readiness = development.bound.plan.readiness_of(&spec.source);
+                spec.readiness = readiness.flags;
+                spec.unready = readiness.unready;
+                let mut readiness_indices = Vec::new();
+                for flag in &spec.readiness {
+                    let flag_spec = replay::column_spec(plan_stream, flag)
+                        .ok_or_else(|| format!("readiness flag `{flag}` is absent"))?;
+                    readiness_indices.push(column_index(&mut columns, flag_spec));
+                }
+                let value_index = column_index(&mut columns, spec.clone());
+                outputs.push((
+                    condition.output.clone(),
+                    spec,
+                    value_index,
+                    readiness_indices,
+                ));
+            }
+            let mut cursor =
+                replay::RowCursor::open(&development.bound, &StreamColumns { stream, columns })?;
             let mut rows = Vec::new();
+            let mut codes = vec![Vec::new(); outputs.len()];
             while cursor.peek()?.is_some() {
-                let (close, known, _) = cursor.next()?;
+                let (close, known, values) = cursor.next()?;
                 rows.push((close, known));
+                for ((_, spec, value_index, readiness_indices), row_codes) in
+                    outputs.iter().zip(&mut codes)
+                {
+                    row_codes.push(project_fitted_label(
+                        i64::MAX,
+                        Some((close, values[*value_index].as_ref())),
+                        spec,
+                        readiness_indices
+                            .iter()
+                            .map(|&index| values[index] == Some(Value::Bool(true))),
+                    ));
+                }
+            }
+            for ((output, _, _, _), row_codes) in outputs.into_iter().zip(codes) {
+                projected.insert(
+                    (stream.duration_seconds, stream.offset_seconds, output),
+                    row_codes,
+                );
             }
             Ok(rows)
         })
@@ -1083,7 +1140,22 @@ fn projection_index(development: &Development) -> Result<ProjectionIndex, String
             }
         })
         .collect::<Result<_, _>>()?;
-    ProjectionIndex::from_clocks(streams, clocks, development.base_stream, entry_times)
+    Ok((
+        ProjectionIndex::from_clocks(streams, clocks, development.base_stream, entry_times)?,
+        projected,
+    ))
+}
+
+fn column_index(columns: &mut Vec<ColumnSpec>, spec: ColumnSpec) -> usize {
+    if let Some(index) = columns
+        .iter()
+        .position(|column| column.source == spec.source)
+    {
+        index
+    } else {
+        columns.push(spec);
+        columns.len() - 1
+    }
 }
 
 /// The retained code of an equality condition, or None when it must use engine lowering.
@@ -1130,61 +1202,13 @@ fn projected_code_at(
         .map_or(-1, |row| codes[row])
 }
 
-fn projected_row_codes(
-    development: &Development,
-    condition: &binary_alpha_engine::execution::Condition,
-) -> Result<Vec<i16>, String> {
-    let plan_stream = development
-        .bound
-        .plan
-        .stream(condition.stream)
-        .ok_or("projected stream is absent from the plan")?;
-    let mut spec = replay::column_spec(plan_stream, &condition.output)
-        .ok_or("projected encoding is absent from the plan")?;
-    let readiness = development.bound.plan.readiness_of(&spec.source);
-    spec.readiness = readiness.flags;
-    spec.unready = readiness.unready;
-    let mut columns: Vec<ColumnSpec> = spec
-        .readiness
-        .iter()
-        .map(|flag| {
-            replay::column_spec(plan_stream, flag)
-                .ok_or_else(|| format!("readiness flag `{flag}` is absent"))
-        })
-        .collect::<Result<_, _>>()?;
-    let value_index = columns.len();
-    columns.push(spec.clone());
-    let mut cursor = replay::RowCursor::open(
-        &development.bound,
-        &StreamColumns {
-            stream: condition.stream,
-            columns,
-        },
-    )?;
-    let mut row_codes = Vec::new();
-    while cursor.peek()?.is_some() {
-        let (close, _, values) = cursor.next()?;
-        let ready = spec
-            .readiness
-            .iter()
-            .enumerate()
-            .map(|(flag, _)| values[flag] == Some(Value::Bool(true)));
-        row_codes.push(project_fitted_label(
-            i64::MAX,
-            Some((close, values[value_index].as_ref())),
-            &spec,
-            ready,
-        ));
-    }
-    Ok(row_codes)
-}
-
 fn projection_block_from_development(
     development: &Development,
     index: &ProjectionIndex,
     conditions: &[binary_alpha_engine::execution::Condition],
     requested: &[usize],
-    signals: &[FinancialEvent],
+    projected: &ProjectedRows,
+    signals_by_binding: &BTreeMap<&str, Vec<usize>>,
     lowered_bindings: &BTreeMap<usize, String>,
 ) -> Result<(Vec<i16>, Vec<i16>), String> {
     projection_block(
@@ -1192,34 +1216,72 @@ fn projection_block_from_development(
         index,
         conditions,
         requested,
-        signals,
+        signals_by_binding,
         lowered_bindings,
-        |condition| projected_row_codes(development, condition),
+        |condition| {
+            projected
+                .get(&(
+                    condition.stream.duration_seconds,
+                    condition.stream.offset_seconds,
+                    condition.output.clone(),
+                ))
+                .map(Vec::as_slice)
+                .ok_or_else(|| "projected encoding has no row codes".to_string())
+        },
     )
 }
 
-/// Build only the requested condition columns. Fitted equalities carry retained label codes;
-/// all other columns carry 0/1 from the engine's own lowering Signal records.
-#[allow(dead_code)]
-fn projection_block(
-    plan: &binary_alpha_engine::features::FeaturePlan,
+/// Bind lowering signals to base rows once per scoring call. The BTreeMap preserves the
+/// previous duplicate-close rule: a signal at a repeated close selects the last base row.
+fn lowering_rows_by_binding<'a>(
     index: &ProjectionIndex,
-    conditions: &[binary_alpha_engine::execution::Condition],
-    requested: &[usize],
-    signals: &[FinancialEvent],
+    signals: &'a [FinancialEvent],
     lowered_bindings: &BTreeMap<usize, String>,
-    mut projected_rows: impl FnMut(
-        &binary_alpha_engine::execution::Condition,
-    ) -> Result<Vec<i16>, String>,
-) -> Result<(Vec<i16>, Vec<i16>), String> {
-    let mut codes = Vec::with_capacity(requested.len() * index.base.len());
-    let mut buckets = Vec::with_capacity(requested.len());
+) -> Result<BTreeMap<&'a str, Vec<usize>>, String> {
+    if signals.is_empty() || lowered_bindings.is_empty() {
+        return Ok(BTreeMap::new());
+    }
     let row_of: BTreeMap<i64, usize> = index
         .base
         .iter()
         .enumerate()
         .map(|(row, base)| (base.close, row))
         .collect();
+    let bindings: BTreeSet<&str> = lowered_bindings.values().map(String::as_str).collect();
+    let mut rows = BTreeMap::<&str, Vec<usize>>::new();
+    for event in signals {
+        if let EventKind::Signal {
+            binding,
+            close_time_micros,
+            ..
+        } = &event.kind
+            && bindings.contains(binding.as_str())
+        {
+            rows.entry(binding.as_str()).or_default().push(
+                *row_of
+                    .get(close_time_micros)
+                    .ok_or("lowering signal has no base row")?,
+            );
+        }
+    }
+    Ok(rows)
+}
+
+/// Build only the requested condition columns. Fitted equalities carry retained label codes;
+/// all other columns carry 0/1 from the engine's own lowering Signal records.
+fn projection_block<'a>(
+    plan: &binary_alpha_engine::features::FeaturePlan,
+    index: &ProjectionIndex,
+    conditions: &[binary_alpha_engine::execution::Condition],
+    requested: &[usize],
+    signals_by_binding: &BTreeMap<&str, Vec<usize>>,
+    lowered_bindings: &BTreeMap<usize, String>,
+    mut projected_rows: impl FnMut(
+        &binary_alpha_engine::execution::Condition,
+    ) -> Result<&'a [i16], String>,
+) -> Result<(Vec<i16>, Vec<i16>), String> {
+    let mut codes = Vec::with_capacity(requested.len() * index.base.len());
+    let mut buckets = Vec::with_capacity(requested.len());
     for &condition_index in requested {
         let condition = conditions
             .get(condition_index)
@@ -1235,7 +1297,7 @@ fn projection_block(
                 return Err("projection row count changed after clock indexing".into());
             }
             for base_row in 0..index.base.len() {
-                codes.push(projected_code_at(index, base_row, stream_index, &row_codes));
+                codes.push(projected_code_at(index, base_row, stream_index, row_codes));
             }
             buckets.push(bucket);
         } else {
@@ -1243,18 +1305,9 @@ fn projection_block(
             let binding_id = lowered_bindings
                 .get(&condition_index)
                 .ok_or_else(|| format!("condition {condition_index} has no lowering binding"))?;
-            for event in signals {
-                if let EventKind::Signal {
-                    binding,
-                    close_time_micros,
-                    ..
-                } = &event.kind
-                    && binding == binding_id
-                {
-                    let row = row_of
-                        .get(close_time_micros)
-                        .ok_or("lowering signal has no base row")?;
-                    column[*row] = 1;
+            if let Some(rows) = signals_by_binding.get(binding_id.as_str()) {
+                for &row in rows {
+                    column[row] = 1;
                 }
             }
             codes.extend(column);
@@ -1645,7 +1698,8 @@ fn score_streamed(
     )
     .ok_or("resolved family size overflows")?;
     let total = usize::try_from(total).map_err(|_| "family is too large for this host")?;
-    let index = projection_index(development)?;
+    let (index, projected) = projection_index(development, conditions)?;
+    let signals_by_binding = lowering_rows_by_binding(&index, signals, lowered_bindings)?;
     let rows = index.base.len();
     let expiries = expiry_columns(settings, development)?;
     let builder = outcome_builder(development)?;
@@ -1687,7 +1741,8 @@ fn score_streamed(
             &index,
             conditions,
             &[column],
-            signals,
+            &projected,
+            &signals_by_binding,
             lowered_bindings,
         )?;
         clock.construction_visits += codes.len();
@@ -1752,7 +1807,8 @@ fn score_streamed(
                     &index,
                     conditions,
                     &requested,
-                    signals,
+                    &projected,
+                    &signals_by_binding,
                     lowered_bindings,
                 )?;
                 let mut offsets = vec![0_i32];
@@ -3054,14 +3110,15 @@ mod projection_tests {
             comparator: Comparator::Eq,
             threshold: Threshold::Text("up".into()),
         };
+        let row_codes = [0, 0];
         let (codes, buckets) = projection_block(
             &plan,
             &index,
             &[condition],
             &[0],
-            &[],
             &BTreeMap::new(),
-            |_| Ok(vec![0, 0]),
+            &BTreeMap::new(),
+            |_| Ok(&row_codes),
         )
         .unwrap();
         assert_eq!(index.latest(0, 1), Some(1));
@@ -3161,7 +3218,21 @@ mod projection_tests {
                 plan,
             },
         };
-        let index = projection_index(&development).unwrap();
+        let conditions = vec![
+            Condition {
+                stream,
+                output: "direction_encoded".into(),
+                comparator: Comparator::Eq,
+                threshold: Threshold::Text("up".into()),
+            },
+            Condition {
+                stream,
+                output: "candle_direction".into(),
+                comparator: Comparator::Eq,
+                threshold: Threshold::Text("down".into()),
+            },
+        ];
+        let (index, projected) = projection_index(&development, &conditions).unwrap();
         let family =
             Family::from_json(&fs::read(root.join(&family_manifest.objects[0].key)).unwrap())
                 .unwrap();
@@ -3179,28 +3250,16 @@ mod projection_tests {
             .filter(|line| !line.is_empty())
             .map(|line| FinancialEvent::from_line(line).unwrap())
             .collect();
-        let conditions = vec![
-            Condition {
-                stream,
-                output: "direction_encoded".into(),
-                comparator: Comparator::Eq,
-                threshold: Threshold::Text("up".into()),
-            },
-            Condition {
-                stream,
-                output: "candle_direction".into(),
-                comparator: Comparator::Eq,
-                threshold: Threshold::Text("down".into()),
-            },
-        ];
         let mut bindings = BTreeMap::new();
         bindings.insert(1, "c1".into());
+        let signals_by_binding = lowering_rows_by_binding(&index, &signals, &bindings).unwrap();
         let (codes, buckets) = projection_block_from_development(
             &development,
             &index,
             &conditions,
             &[0, 1],
-            &signals,
+            &projected,
+            &signals_by_binding,
             &bindings,
         )
         .unwrap();
@@ -3217,5 +3276,21 @@ mod projection_tests {
             );
             assert_eq!(codes[n + row], lowered[n + row], "fallback row {row}");
         }
+        crate::replay::ROW_CURSOR_OPENS.with(|count| count.set(0));
+        let mut clock = Clock::default();
+        score_streamed(
+            &family.search,
+            &development,
+            &conditions,
+            &signals,
+            &bindings,
+            &[Backend::Cpu],
+            None,
+            &mut clock,
+        )
+        .unwrap();
+        crate::replay::ROW_CURSOR_OPENS.with(|count| {
+            assert_eq!(count.get(), development.bound.plan.streams.len());
+        });
     }
 }
