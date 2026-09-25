@@ -1338,84 +1338,169 @@ fn wide_search_batches_blocks_and_devices_have_exact_parity() {
         ("duplicate", vec![0, 0]),
     ] {
         for batch in [8, 16] {
-            let mut config = base.clone();
-            if !devices.is_empty() {
-                config.accelerator = Some(
-                    serde_json::from_value(serde_json::json!({
-                        "backend":"cuda", "devices":devices
-                    }))
-                    .unwrap(),
-                );
-            }
-            let label = format!("{device}-{batch}");
-            let config_path = fixture.scratch.path(&format!("{label}.toml"));
-            let digest_path = fixture.scratch.path(&format!("{label}-screen.json"));
-            write(&config_path, config.canonical_toml());
-            let result = Command::new(env!("CARGO_BIN_EXE_binary-alpha"))
-                .args(["search", "--config", config_path.to_str().unwrap()])
-                .env("BINARY_ALPHA_TEST_SCREEN_BATCH", batch.to_string())
-                .env("BINARY_ALPHA_TEST_COLUMN_BUDGET", "45000")
-                .env("BINARY_ALPHA_TEST_SCREEN_DIGEST", &digest_path)
-                .output()
-                .unwrap();
-            assert!(
-                result.status.success(),
-                "{label}: {}",
-                String::from_utf8_lossy(&result.stderr)
-            );
-            let report = String::from_utf8(result.stdout).unwrap();
-            let generation = common::generation(report.lines().next().unwrap());
-            let family_bytes = fixture.object(&generation, "family.json");
-            let digest: Value = serde_json::from_slice(&fs::read(digest_path).unwrap()).unwrap();
-            let first = report.lines().next().unwrap();
-            let counter = |name: &str| -> u64 {
-                let words: Vec<_> = first.split_whitespace().collect();
-                words.windows(2).find(|pair| pair[0] == name).unwrap()[1]
-                    .parse()
-                    .unwrap()
-            };
-            assert!(digest["members"].as_u64().unwrap() > batch);
-            let counters = (batch == 8).then(|| {
-                assert!(counter("blocks") >= 3, "{label}: {report}");
-                (
-                    [
-                        "columns",
-                        "blocks",
-                        "tuples",
-                        "list_entries",
-                        "construction_visits",
-                        "driver_visits",
-                    ]
-                    .map(counter),
-                    counter("validation_visits"),
-                )
-            });
-            if let Some((bytes, reference, reference_counters, cpu_validation)) = &expected {
-                assert_eq!(&family_bytes, bytes, "family.json {label}");
-                assert_eq!(&digest, reference, "whole-family raw/BH/survivor {label}");
-                if let Some((counters, validation)) = counters {
-                    assert_eq!(
-                        &counters, reference_counters,
-                        "non-transfer counters {label}"
-                    );
-                    assert_eq!(
-                        validation,
-                        if device == "duplicate" {
-                            2 * cpu_validation
-                        } else {
-                            *cpu_validation
-                        },
-                        "workspace validations {label}"
+            for threads in [32, 64] {
+                let mut config = base.clone();
+                if !devices.is_empty() {
+                    config.accelerator = Some(
+                        serde_json::from_value(serde_json::json!({
+                            "backend":"cuda", "devices":devices
+                        }))
+                        .unwrap(),
                     );
                 }
-            } else {
-                let (counters, validation) = counters.expect("first search is created");
-                assert!(validation > 0, "CPU workspace validations");
-                expected = Some((family_bytes, digest, counters, validation));
+                let label = format!("{device}-{batch}-{threads}");
+                let config_path = fixture.scratch.path(&format!("{label}.toml"));
+                let digest_path = fixture.scratch.path(&format!("{label}-screen.json"));
+                write(&config_path, config.canonical_toml());
+                let result = Command::new(env!("CARGO_BIN_EXE_binary-alpha"))
+                    .args(["search", "--config", config_path.to_str().unwrap()])
+                    .env("BINARY_ALPHA_SCREEN_BATCH_SIZE", batch.to_string())
+                    .env("BINARY_ALPHA_SCREEN_MEMORY_BUDGET_BYTES", "45000")
+                    .env("BINARY_ALPHA_SCREEN_THREADS_PER_BLOCK", threads.to_string())
+                    .env("BINARY_ALPHA_TEST_SCREEN_DIGEST", &digest_path)
+                    .output()
+                    .unwrap();
+                assert!(
+                    result.status.success(),
+                    "{label}: {}",
+                    String::from_utf8_lossy(&result.stderr)
+                );
+                let report = String::from_utf8(result.stdout).unwrap();
+                let generation = common::generation(report.lines().next().unwrap());
+                let family_bytes = fixture.object(&generation, "family.json");
+                let digest: Value =
+                    serde_json::from_slice(&fs::read(digest_path).unwrap()).unwrap();
+                let first = report.lines().next().unwrap();
+                let counter = |name: &str| -> u64 {
+                    let words: Vec<_> = first.split_whitespace().collect();
+                    words.windows(2).find(|pair| pair[0] == name).unwrap()[1]
+                        .parse()
+                        .unwrap()
+                };
+                assert!(digest["members"].as_u64().unwrap() > batch);
+                let counters = (batch == 8).then(|| {
+                    assert!(counter("blocks") >= 3, "{label}: {report}");
+                    (
+                        [
+                            "columns",
+                            "blocks",
+                            "tuples",
+                            "list_entries",
+                            "construction_visits",
+                            "driver_visits",
+                        ]
+                        .map(counter),
+                        counter("validation_visits"),
+                    )
+                });
+                if let Some((bytes, reference, reference_counters, cpu_validation)) = &expected {
+                    assert_eq!(&family_bytes, bytes, "family.json {label}");
+                    assert_eq!(&digest, reference, "whole-family raw/BH/survivor {label}");
+                    if let Some((counters, validation)) = counters {
+                        assert_eq!(
+                            &counters, reference_counters,
+                            "non-transfer counters {label}"
+                        );
+                        assert_eq!(
+                            validation,
+                            if device == "duplicate" {
+                                2 * cpu_validation
+                            } else {
+                                *cpu_validation
+                            },
+                            "workspace validations {label}"
+                        );
+                    }
+                } else {
+                    let (counters, validation) = counters.expect("first search is created");
+                    assert!(validation > 0, "CPU workspace validations");
+                    expected = Some((family_bytes, digest, counters, validation));
+                }
+                println!("{label}: {report}");
             }
-            println!("{label}: {report}");
         }
     }
+}
+
+#[cfg(feature = "cuda")]
+#[test]
+fn screening_overrides_leave_family_identity_and_bytes_unchanged() {
+    let fixture = Fixture::wide_split("phase11_screening_override_identity");
+    let config = wide_search_ready(&fixture);
+    let path = fixture.scratch.path("screening-overrides.toml");
+    let canonical = config.canonical_toml();
+    let hash = config.content_hash();
+    write(&path, canonical.clone());
+    let run = |override_value: Option<(&str, &str)>| {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_binary-alpha"));
+        command.args(["search", "--config", path.to_str().unwrap()]);
+        if let Some((name, value)) = override_value {
+            command.env(name, value);
+        }
+        command.output().unwrap()
+    };
+    let baseline = run(None);
+    assert!(
+        baseline.status.success(),
+        "{}",
+        String::from_utf8_lossy(&baseline.stderr)
+    );
+    let baseline_report = String::from_utf8(baseline.stdout).unwrap();
+    let generation = common::generation(baseline_report.lines().next().unwrap());
+    let family = fixture.object(&generation, "family.json");
+    for (name, value) in [
+        ("BINARY_ALPHA_SCREEN_THREADS_PER_BLOCK", "32"),
+        ("BINARY_ALPHA_SCREEN_BATCH_SIZE", "8"),
+        ("BINARY_ALPHA_SCREEN_MEMORY_BUDGET_BYTES", "45000"),
+        ("BINARY_ALPHA_CUDA_RESERVATION_UNIT_BYTES", "64"),
+    ] {
+        let output = run(Some((name, value)));
+        assert!(
+            output.status.success(),
+            "{name}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let report = String::from_utf8(output.stdout).unwrap();
+        assert_eq!(
+            common::generation(report.lines().next().unwrap()),
+            generation,
+            "{name}"
+        );
+        assert_eq!(fixture.object(&generation, "family.json"), family, "{name}");
+        assert_eq!(config.content_hash(), hash, "{name}");
+        assert_eq!(config.canonical_toml(), canonical, "{name}");
+    }
+    for name in [
+        "BINARY_ALPHA_SCREEN_THREADS_PER_BLOCK",
+        "BINARY_ALPHA_SCREEN_BATCH_SIZE",
+        "BINARY_ALPHA_SCREEN_MEMORY_BUDGET_BYTES",
+        "BINARY_ALPHA_CUDA_RESERVATION_UNIT_BYTES",
+    ] {
+        let output = run(Some((name, "0")));
+        assert!(!output.status.success(), "{name} unexpectedly succeeded");
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains(name),
+            "{name} was not named"
+        );
+    }
+    let one_byte = run(Some(("BINARY_ALPHA_SCREEN_MEMORY_BUDGET_BYTES", "1")));
+    let error = String::from_utf8_lossy(&one_byte.stderr);
+    let required: usize = error
+        .split(" needs ")
+        .nth(1)
+        .unwrap()
+        .split_whitespace()
+        .next()
+        .unwrap()
+        .parse()
+        .unwrap();
+    let below = (required - 1).to_string();
+    let output = run(Some(("BINARY_ALPHA_SCREEN_MEMORY_BUDGET_BYTES", &below)));
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains(&format!("needs {required} logical bytes"))
+    );
 }
 
 /// Manual release gate: the object contains only retained records while the manifest binds

@@ -128,7 +128,16 @@ supports the workflow's background and parallel steps. The workflow supplies
 `BINARY_ALPHA_CUDA_REFERENCE=/mnt/data/binary-alpha-phase07-reference/attempt5/reference.json`.
 For manual runs, export the same variables in the runner process environment; the governed wrapper
 must resolve its existing development inputs and reference files. `BINARY_ALPHA_CUDA_ARCH` is
-optional and defaults to the proved `sm_120` target. The workflow never regenerates expectations.
+optional and defaults to `sm_120`. Set it at build time for a rented GPU, for example
+`BINARY_ALPHA_CUDA_ARCH=sm_90`. A binary with no compatible image fails at device open.
+
+CUDA search tuning is process scoped and leaves configuration and family identities unchanged.
+`BINARY_ALPHA_SCREEN_THREADS_PER_BLOCK` selects a warp-multiple launch width;
+`BINARY_ALPHA_SCREEN_BATCH_SIZE` selects candidates per batch;
+`BINARY_ALPHA_SCREEN_MEMORY_BUDGET_BYTES` caps the free-memory budget; and
+`BINARY_ALPHA_CUDA_RESERVATION_UNIT_BYTES` overrides the measured allocator-unit planning
+hint. Invalid values fail before screening. The search report records each chosen value
+and its source. The workflow never regenerates expectations.
 The authorized offline setup and runner rollback are recorded in [operations](docs/operations.md).
 
 ## Layout
@@ -138,7 +147,7 @@ The authorized offline setup and runner rollback are recorded in [operations](do
 | `crates/engine` | Package `binary-alpha-engine`: configuration validation and identity, immutable tick and bar records, dataset roles and capabilities, generation identity, ready manifests, the instrument stream with its profile, candles, and stream manifest, the feature engine and frozen plans, future-only outcome labels, and the execution engine with exact money, its ledger, and its summaries. No files, network, cloud, broker, command-line, or device calls. |
 | `crates/app` | Package `binary-alpha-app`: the `binary-alpha` executable, configuration loading, historical-data import, instrument audit, feature and outcome builds, replay, verification, Parquet input and output, the filesystem and Google Cloud Storage artifact stores, and all other external adapters. |
 | `crates/app/schemas` | Pinned used Deriv schema subset, release and digest provenance; no build-time download. |
-| `crates/accelerator` | Package `binary-alpha-accelerator`: the thirteen retained device kernels, the ahead-of-time CUDA build behind the `cuda` feature, the device host over cudarc, and the central-processor reference of every kernel. No engine or application dependency. |
+| `crates/accelerator` | Package `binary-alpha-accelerator`: thirteen retained device kernels plus fused screening, the ahead-of-time CUDA build behind the `cuda` feature, the device host over cudarc, and the central-processor reference of the retained kernels. No engine or application dependency. |
 | `configs/example.toml` | The checked-in example configuration; it contains only implemented fields, one instrument, and no credentials. |
 | `docs/` | [architecture](docs/architecture.md), [contracts](docs/contracts.md), [migration map](docs/migration-map.md), and [operations](docs/operations.md). |
 

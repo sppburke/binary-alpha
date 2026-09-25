@@ -30,6 +30,122 @@ pub struct ColumnBlockPlan {
     pub blocks: Vec<ColumnBlock>,
 }
 
+/// Exact screening allocation shape for one resident tuple and one reusable batch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScreenShape {
+    pub rows: usize,
+    pub slots: usize,
+    pub batch: usize,
+    pub tile_strides: Vec<usize>,
+    pub largest_tile: usize,
+    /// Function local memory at maximum resident threads; an initial-width hint only.
+    pub local_hint_bytes: usize,
+}
+
+impl ScreenShape {
+    pub fn logical_bytes(&self, columns: usize, list_entries: usize) -> Result<usize, String> {
+        let columns = columns
+            .checked_mul(self.slots)
+            .ok_or("screen blocks: column slots overflow")?;
+        let list_entries = list_entries
+            .checked_mul(self.slots)
+            .ok_or("screen blocks: sparse slots overflow")?;
+        self.exact_bytes(columns, list_entries)
+    }
+
+    /// Actual simultaneous allocation after a block tuple has built its scoped index.
+    pub fn exact_bytes(&self, columns: usize, list_entries: usize) -> Result<usize, String> {
+        if self.rows > i32::MAX as usize
+            || self.slots == 0
+            || self.batch == 0
+            || self.batch > i32::MAX as usize
+            || self.largest_tile == 0
+            || self.largest_tile > 8
+            || self.tile_strides.is_empty()
+            || columns > i32::MAX as usize
+            || list_entries > i32::MAX as usize
+            || self
+                .batch
+                .checked_mul(self.slots)
+                .is_none_or(|n| n > i32::MAX as usize)
+        {
+            return Err("screen blocks: invalid i32 shape".into());
+        }
+        let rows = self.rows as u128;
+        let cols = columns as u128;
+        let lists = list_entries as u128;
+        let batch = self.batch as u128;
+        // Feature matrix, key offsets and lists, entry times, split mask, every packed tile,
+        // conditions, buckets, candidate offsets, driver IDs, and compact output.
+        let total = 2 * cols * rows
+            + 4 * (cols + 1)
+            + 4 * lists
+            + rows * (8 + 1 + self.tile_strides.iter().map(|&n| n as u128).sum::<u128>())
+            + batch * (self.slots as u128 * 6 + 4 + 4 + self.largest_tile as u128 * 5 * 4)
+            + 4;
+        usize::try_from(total).map_err(|_| "screen blocks: byte size overflows usize".into())
+    }
+}
+
+/// Plan exact logical sizes. The allocator-unit estimate only narrows the initial width.
+pub fn plan_screen_blocks(
+    row_list_lengths: &[usize],
+    shape: &ScreenShape,
+    budget: usize,
+    unit_hint: Option<usize>,
+    max_width: usize,
+) -> Result<ColumnBlockPlan, String> {
+    let mut blocks = Vec::new();
+    let mut start = 0;
+    let mut list_len = 0usize;
+    for (index, &length) in row_list_lengths.iter().enumerate() {
+        if length > i32::MAX as usize {
+            return Err(format!(
+                "screen blocks: column {index} sparse list exceeds i32"
+            ));
+        }
+        let next = list_len.checked_add(length);
+        let columns = index + 1 - start;
+        let logical = next.and_then(|n| shape.logical_bytes(columns, n).ok());
+        let hinted = logical.map(|bytes| {
+            unit_hint
+                .filter(|&unit| unit > 0 && unit <= budget)
+                .map_or(bytes, |unit| bytes.div_ceil(unit).saturating_mul(unit))
+                .saturating_add(shape.local_hint_bytes)
+        });
+        if columns <= max_width
+            && logical.is_some_and(|bytes| bytes <= budget)
+            && (columns == 1 || hinted.is_some_and(|bytes| bytes <= budget))
+        {
+            list_len = next.expect("checked");
+            continue;
+        }
+        if start == index {
+            return Err(format!(
+                "screen blocks: one-column block {index} needs {} logical bytes, free budget {budget}",
+                shape.logical_bytes(1, length)?
+            ));
+        }
+        blocks.push(ColumnBlock {
+            columns: start..index,
+        });
+        start = index;
+        list_len = length;
+        let one = shape.logical_bytes(1, length)?;
+        if one > budget {
+            return Err(format!(
+                "screen blocks: one-column block {index} needs {one} logical bytes, free budget {budget}"
+            ));
+        }
+    }
+    if start < row_list_lengths.len() {
+        blocks.push(ColumnBlock {
+            columns: start..row_list_lengths.len(),
+        });
+    }
+    Ok(ColumnBlockPlan { blocks })
+}
+
 /// Greedily packs columns under a device's reported free-byte budget. `row_list_lengths` gives
 /// one chronological sparse list per column; the caller may pass a smaller budget in tests.
 pub fn plan_column_blocks(
@@ -323,6 +439,36 @@ impl<'a> CpuSparseTuple<'a> {
             expiry_ms,
             direction_code: 1,
             payout_basis,
+        };
+        input.validate_resident_batch()?;
+        Ok(crate::cpu(|| input.reference()))
+    }
+
+    /// Basic sparse dual reference for schema-2 screening, with eight values per direction.
+    pub fn score_screen_batch(
+        &self,
+        split: usize,
+        candidates: CandidateConditions<'_>,
+        driver_keys: &[i32],
+        expiry_ms: i64,
+    ) -> Result<Measured<DualScores>, String> {
+        let split_mask = *self
+            .split_masks
+            .get(split)
+            .ok_or("resident tuple: split index outside split masks")?;
+        let input = Request {
+            kind: 7,
+            buffers: self.buffers,
+            split_mask,
+            candidates,
+            sparse: Some(SparseIndex {
+                candidate_driver_key: driver_keys,
+                key_chrono_offsets: self.keys.key_chrono_offsets,
+                key_chrono_rows: self.keys.key_chrono_rows,
+            }),
+            expiry_ms,
+            direction_code: 1,
+            payout_basis: 0,
         };
         input.validate_resident_batch()?;
         Ok(crate::cpu(|| input.reference()))

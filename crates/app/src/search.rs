@@ -13,7 +13,9 @@ use std::io::Write;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
-use binary_alpha_accelerator::{Backend, KERNEL_SOURCES, Timings, bootstrap, search as kernels};
+use binary_alpha_accelerator::{
+    Backend, KERNEL_SOURCES, SCREEN_KERNEL_SOURCE, Timings, bootstrap, search as kernels,
+};
 use binary_alpha_engine::config::{Backend as Selected, Config, RunMode, Search};
 use binary_alpha_engine::dataset::{DatasetRole, ObjectRecord, ObjectRole, manifest_key};
 use binary_alpha_engine::execution::{
@@ -60,14 +62,9 @@ pub fn score_cpu_batches(
         if batch.global_indices.len() != batch.candidates.candidate_count as usize {
             return Err("CPU batch global index count differs from candidate count".to_string());
         }
+        let _ = payout_basis;
         let output = tuple
-            .score_batch(
-                split,
-                batch.candidates,
-                batch.driver_keys,
-                expiry_ms,
-                payout_basis,
-            )?
+            .score_screen_batch(split, batch.candidates, batch.driver_keys, expiry_ms)?
             .output;
         Ok(batch
             .global_indices
@@ -76,8 +73,8 @@ pub fn score_cpu_batches(
             .map(|(position, &global)| {
                 (
                     global,
-                    raw_at(&output.buy_output, position),
-                    raw_at(&output.sell_output, position),
+                    raw_at_basic(&output.buy_output, position),
+                    raw_at_basic(&output.sell_output, position),
                 )
             })
             .collect::<Vec<_>>())
@@ -140,6 +137,62 @@ struct DeviceRows {
     tie: Vec<u8>,
 }
 
+#[cfg(feature = "cuda")]
+struct PackedTile {
+    expiries: Vec<usize>,
+    bytes: Vec<u8>,
+    stride: usize,
+}
+
+#[cfg(feature = "cuda")]
+fn packed_tiles(
+    outcomes: &BTreeMap<usize, DeviceRows>,
+    rows: usize,
+) -> Result<Vec<PackedTile>, String> {
+    for outcome in outcomes.values() {
+        if [
+            outcome.release_ms.len(),
+            outcome.valid.len(),
+            outcome.buy_win.len(),
+            outcome.sell_win.len(),
+            outcome.tie.len(),
+        ]
+        .into_iter()
+        .any(|len| len != rows)
+        {
+            return Err("packed outcome row count differs".into());
+        }
+    }
+    let distinct: Vec<_> = outcomes.iter().collect();
+    distinct
+        .chunks(8)
+        .map(|chunk| {
+            let active = chunk.len();
+            let stride = (active * 9).div_ceil(8) * 8;
+            let mut bytes = vec![0_u8; rows.checked_mul(stride).ok_or("packed outcomes overflow")?];
+            for row in 0..rows {
+                for (expiry, (_, outcome)) in chunk.iter().enumerate() {
+                    let release = outcome
+                        .release_ms
+                        .get(row)
+                        .ok_or("packed outcome row count differs")?;
+                    let at = row * stride + expiry * 8;
+                    bytes[at..at + 8].copy_from_slice(&release.to_le_bytes());
+                    bytes[row * stride + active * 8 + expiry] = outcome.valid[row]
+                        | (outcome.tie[row] << 1)
+                        | (outcome.buy_win[row] << 2)
+                        | (outcome.sell_win[row] << 3);
+                }
+            }
+            Ok(PackedTile {
+                expiries: chunk.iter().map(|(column, _)| **column).collect(),
+                bytes,
+                stride,
+            })
+        })
+        .collect()
+}
+
 #[derive(Default)]
 struct SparseBatch {
     globals: Vec<u64>,
@@ -157,6 +210,27 @@ impl SparseBatch {
             candidate_offsets: &self.offsets,
             candidate_count: self.globals.len() as i32,
         }
+    }
+
+    fn sort_by_driver_rank(&mut self) {
+        let mut positions: Vec<usize> = (0..self.globals.len()).collect();
+        positions
+            .sort_unstable_by_key(|&position| (self.drivers[position], self.globals[position]));
+        let mut sorted = Self {
+            offsets: vec![0],
+            ..Self::default()
+        };
+        for position in positions {
+            sorted.globals.push(self.globals[position]);
+            sorted.drivers.push(self.drivers[position]);
+            let range = self.offsets[position] as usize..self.offsets[position + 1] as usize;
+            sorted
+                .features
+                .extend_from_slice(&self.features[range.clone()]);
+            sorted.buckets.extend_from_slice(&self.buckets[range]);
+            sorted.offsets.push(sorted.features.len() as i32);
+        }
+        *self = sorted;
     }
 }
 
@@ -204,6 +278,23 @@ fn visit_tuple_conditions(
     Ok(())
 }
 
+fn tuple_candidate_index(
+    chosen: &[usize],
+    condition_count: usize,
+    settings: &Search,
+) -> Result<usize, String> {
+    let global = search::member_rank(
+        condition_count,
+        settings.min_conditions as usize,
+        settings.max_conditions as usize,
+        settings.contracts.len(),
+        chosen,
+        0,
+    )
+    .ok_or("cannot rank streamed member")?;
+    Ok(global as usize / settings.contracts.len())
+}
+
 #[allow(clippy::too_many_arguments)]
 fn tuple_batches(
     blocks: &[kernels::ColumnBlock],
@@ -214,6 +305,8 @@ fn tuple_batches(
     count: usize,
     settings: &Search,
     batch_size: usize,
+    expiry_multiplier: usize,
+    completed: &[bool],
     driver_visits: &mut usize,
     mut consume: impl FnMut(&[SparseBatch]) -> Result<(), String>,
 ) -> Result<(), String> {
@@ -233,6 +326,9 @@ fn tuple_batches(
             0,
         )
         .ok_or("cannot rank streamed member")?;
+        if completed[global as usize / settings.contracts.len()] {
+            return Ok(());
+        }
         batch.globals.push(global);
         let mut driver = None;
         for &condition in chosen {
@@ -245,10 +341,12 @@ fn tuple_batches(
             }
         }
         let driver = driver.expect("nonempty member").0;
-        *driver_visits += (offsets[driver as usize + 1] - offsets[driver as usize]) as usize;
+        *driver_visits +=
+            (offsets[driver as usize + 1] - offsets[driver as usize]) as usize * expiry_multiplier;
         batch.drivers.push(driver);
         batch.offsets.push(batch.features.len() as i32);
         if batch.globals.len() == batch_size {
+            batch.sort_by_driver_rank();
             group.push(std::mem::replace(
                 &mut batch,
                 SparseBatch {
@@ -264,6 +362,7 @@ fn tuple_batches(
         Ok(())
     })?;
     if !batch.globals.is_empty() {
+        batch.sort_by_driver_rank();
         group.push(batch);
     }
     if !group.is_empty() {
@@ -272,15 +371,13 @@ fn tuple_batches(
     Ok(())
 }
 
-/// Test instrumentation for subprocess gates: `BINARY_ALPHA_TEST_SCREEN_BATCH` and
-/// `BINARY_ALPHA_TEST_COLUMN_BUDGET` bound scoring, while
-/// `BINARY_ALPHA_TEST_SCREEN_DIGEST` writes the final scoring population's digests.
-/// Ordinary searches use the fixed production limits and do not write a digest.
+/// Process-scoped screening tuning, outside every configuration identity.
 fn test_screen_limit(name: &str) -> Result<Option<usize>, String> {
-    std::env::var(name)
-        .ok()
+    std::env::var_os(name)
         .map(|value| {
             value
+                .into_string()
+                .map_err(|_| format!("{name}: expected a positive integer"))?
                 .parse::<usize>()
                 .ok()
                 .filter(|&limit| limit > 0)
@@ -367,6 +464,9 @@ fn screen_compact(
 /// Wall-clock stages of one run, outside every identity.
 #[derive(Default)]
 struct Clock {
+    #[cfg(feature = "cuda")]
+    started: Option<Instant>,
+    setup_before_gpu: Duration,
     load: Duration,
     lowering: Duration,
     device: Timings,
@@ -381,6 +481,10 @@ struct Clock {
     validation_visits: usize,
     driver_visits: usize,
     transfer_bytes: usize,
+    tuning: String,
+    memory: String,
+    #[cfg(feature = "cuda")]
+    memory_peak_bytes: usize,
 }
 
 fn add(total: &mut Timings, measured: Timings) {
@@ -448,6 +552,8 @@ pub fn family(
     destination: &Store,
     access: Access<'_>,
 ) -> Result<Searched, String> {
+    #[cfg(feature = "cuda")]
+    let command_started = Instant::now();
     let settings = config
         .search
         .as_ref()
@@ -461,6 +567,12 @@ pub fn family(
         _ => vec![Backend::Cpu],
     };
     let backend = &backends[0];
+    #[cfg(feature = "cuda")]
+    let mut clock = Clock {
+        started: Some(command_started),
+        ..Clock::default()
+    };
+    #[cfg(not(feature = "cuda"))]
     let mut clock = Clock::default();
     let started = Instant::now();
 
@@ -737,11 +849,25 @@ pub fn family(
         }
     );
     let line = match put {
-        Put::Reused(_) => format!("{report} (already published)"),
+        Put::Reused(_) => format!(
+            "{report} columns {} blocks {} tuples {} list_entries {} construction_visits {} validation_visits {} driver_visits {} transfer_bytes {} peak_rss_kb {} {} {} (already published)",
+            clock.columns,
+            clock.blocks,
+            clock.tuples,
+            clock.list_entries,
+            clock.construction_visits,
+            clock.validation_visits,
+            clock.driver_visits,
+            clock.transfer_bytes,
+            peak_rss_kb(),
+            clock.tuning,
+            clock.memory,
+        ),
         Put::Created(_) => format!(
-            "{report} [load {:.3}s lowering {:.3}s device upload {:.3}s execute {:.3}s download {:.3}s bytes {} replay {:.3}s stability {:.3}s publish {:.3}s] columns {} blocks {} tuples {} list_entries {} construction_visits {} validation_visits {} driver_visits {} transfer_bytes {} peak_rss_kb {}",
+            "{report} [load {:.3}s lowering {:.3}s setup_before_gpu {:.3}s device upload {:.3}s execute {:.3}s download {:.3}s bytes {} replay {:.3}s stability {:.3}s publish {:.3}s] columns {} blocks {} tuples {} list_entries {} construction_visits {} validation_visits {} driver_visits {} transfer_bytes {} peak_rss_kb {} {} {}",
             clock.load.as_secs_f64(),
             clock.lowering.as_secs_f64(),
+            clock.setup_before_gpu.as_secs_f64(),
             clock.device.upload.as_secs_f64(),
             clock.device.execute.as_secs_f64(),
             clock.device.download.as_secs_f64(),
@@ -757,7 +883,9 @@ pub fn family(
             clock.validation_visits,
             clock.driver_visits,
             clock.transfer_bytes,
-            peak_rss_kb()
+            peak_rss_kb(),
+            clock.tuning,
+            clock.memory,
         ),
     };
     Ok(Searched {
@@ -1494,15 +1622,22 @@ fn resample(
 }
 
 /// The identity of the retained kernel sources this binary carries, on every backend.
-fn kernel_identity() -> String {
+fn kernel_identity_for_schema(schema_version: u32) -> String {
     let mut hasher = Sha256::new();
-    for (name, source) in KERNEL_SOURCES {
+    let sources = KERNEL_SOURCES.iter().chain(
+        (schema_version == search::STREAMED_FAMILY_SCHEMA_VERSION).then_some(&SCREEN_KERNEL_SOURCE),
+    );
+    for (name, source) in sources {
         hasher.update(name.as_bytes());
         hasher.update(b"\n");
         hasher.update(source.as_bytes());
         hasher.update(b"\n");
     }
     binary_alpha_engine::hex(&hasher.finalize())
+}
+
+fn kernel_identity() -> String {
+    kernel_identity_for_schema(search::STREAMED_FAMILY_SCHEMA_VERSION)
 }
 
 pub(crate) fn peak_rss_kb() -> u64 {
@@ -1639,8 +1774,8 @@ fn score_members(
         .collect())
 }
 
-fn raw_at(values: &[i64], position: usize) -> RawCounts {
-    let at = position * 21;
+fn raw_at_basic(values: &[i64], position: usize) -> RawCounts {
+    let at = position * 8;
     RawCounts {
         total: values[at],
         wins: values[at + 1],
@@ -1680,6 +1815,90 @@ fn tuple_buffers<'a>(
 }
 
 #[allow(clippy::too_many_arguments)]
+fn parallel_projection_block(
+    development: &Development,
+    index: &ProjectionIndex,
+    conditions: &[binary_alpha_engine::execution::Condition],
+    requested: &[usize],
+    projected: &ProjectedRows,
+    signals_by_binding: &BTreeMap<&str, Vec<usize>>,
+    lowered_bindings: &BTreeMap<usize, String>,
+) -> Result<(Vec<i16>, Vec<i16>), String> {
+    let columns = crate::parallel::map(requested, |&column| {
+        projection_block_from_development(
+            development,
+            index,
+            conditions,
+            &[column],
+            projected,
+            signals_by_binding,
+            lowered_bindings,
+        )
+    });
+    let mut codes = Vec::with_capacity(requested.len() * index.base.len());
+    let mut buckets = Vec::with_capacity(requested.len());
+    for column in columns {
+        let (one, bucket) = column?;
+        codes.extend(one);
+        buckets.extend(bucket);
+    }
+    Ok((codes, buckets))
+}
+
+fn parallel_sparse_lists(
+    codes: &[i16],
+    buckets: &[i16],
+    ordered: &[i64],
+    rows: usize,
+) -> Result<(Vec<i32>, Vec<i32>), String> {
+    let columns: Vec<usize> = (0..buckets.len()).collect();
+    let lists = crate::parallel::map(&columns, |&column| {
+        ordered
+            .iter()
+            .filter_map(|&row| {
+                (codes[column * rows + row as usize] == buckets[column]).then_some(row as i32)
+            })
+            .collect::<Vec<_>>()
+    });
+    let mut offsets = vec![0_i32];
+    let mut sparse_rows = Vec::new();
+    for list in lists {
+        let next = sparse_rows
+            .len()
+            .checked_add(list.len())
+            .ok_or("sparse list length overflows")?;
+        offsets.push(i32::try_from(next).map_err(|_| "sparse row list exceeds i32")?);
+        sparse_rows.extend(list);
+    }
+    Ok((offsets, sparse_rows))
+}
+
+fn with_screen_plan<T>(
+    lengths: &[usize],
+    shape: &kernels::ScreenShape,
+    budget: usize,
+    unit_hint: Option<usize>,
+    mut attempt: impl FnMut(&kernels::ColumnBlockPlan) -> Result<T, String>,
+) -> Result<(kernels::ColumnBlockPlan, T), String> {
+    let mut width = lengths.len().max(1);
+    loop {
+        let plan = kernels::plan_screen_blocks(lengths, shape, budget, unit_hint, width)?;
+        match attempt(&plan) {
+            Ok(value) => return Ok((plan, value)),
+            Err(error)
+                if (error.starts_with("screen preallocation failed:")
+                    || error.starts_with("screen tuple budget exceeded:"))
+                    && width > 1 =>
+            {
+                eprintln!("{error}; re-planning at half block width");
+                width = (width / 2).max(1);
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn score_streamed(
     settings: &Search,
     development: &Development,
@@ -1690,6 +1909,14 @@ fn score_streamed(
     device_ordinals: Option<&[usize]>,
     clock: &mut Clock,
 ) -> Result<Vec<search::CompactMember>, String> {
+    #[cfg(feature = "cuda")]
+    let upload_start: Vec<usize> = backends
+        .iter()
+        .map(|backend| match backend {
+            Backend::Cuda(device) => device.uploaded_bytes(),
+            Backend::Cpu => 0,
+        })
+        .collect();
     let total = search::family_size(
         conditions.len(),
         settings.min_conditions as usize,
@@ -1701,6 +1928,9 @@ fn score_streamed(
     let (index, projected) = projection_index(development, conditions)?;
     let signals_by_binding = lowering_rows_by_binding(&index, signals, lowered_bindings)?;
     let rows = index.base.len();
+    if rows > i32::MAX as usize {
+        return Err("search base rows exceed i32".into());
+    }
     let expiries = expiry_columns(settings, development)?;
     let builder = outcome_builder(development)?;
     let references = read_references(development)?;
@@ -1734,8 +1964,8 @@ fn score_streamed(
     }
     let mut ordered: Vec<i64> = (0..rows as i64).collect();
     ordered.sort_by_key(|&row| (entry_times[row as usize], row));
-    let mut lengths = Vec::with_capacity(conditions.len());
-    for column in 0..conditions.len() {
+    let columns: Vec<usize> = (0..conditions.len()).collect();
+    let lengths = crate::parallel::map(&columns, |&column| {
         let (codes, buckets) = projection_block_from_development(
             development,
             &index,
@@ -1745,165 +1975,247 @@ fn score_streamed(
             &signals_by_binding,
             lowered_bindings,
         )?;
-        clock.construction_visits += codes.len();
-        lengths.push(codes.iter().filter(|&&code| code == buckets[0]).count());
-    }
-    let batch_size = test_screen_limit("BINARY_ALPHA_TEST_SCREEN_BATCH")?.unwrap_or_else(|| {
-        if backends
-            .iter()
-            .all(|backend| matches!(backend, Backend::Cpu))
-        {
-            1_024
-        } else {
-            65_536
-        }
-    });
+        Ok::<usize, String>(codes.iter().filter(|&&code| code == buckets[0]).count())
+    })
+    .into_iter()
+    .collect::<Result<Vec<_>, _>>()?;
+    clock.construction_visits += rows * conditions.len();
+    #[cfg(feature = "cuda")]
+    let packed = packed_tiles(&outcome_rows, rows)?;
+    let slots = condition_slots(settings.max_conditions, conditions.len());
+    let forced_budget = test_screen_limit("BINARY_ALPHA_SCREEN_MEMORY_BUDGET_BYTES")?;
+    let forced_unit = test_screen_limit("BINARY_ALPHA_CUDA_RESERVATION_UNIT_BYTES")?;
+    let forced_batch = test_screen_limit("BINARY_ALPHA_SCREEN_BATCH_SIZE")?;
+    let _forced_threads = test_screen_limit("BINARY_ALPHA_SCREEN_THREADS_PER_BLOCK")?;
     #[cfg(feature = "cuda")]
     let mut budget = usize::MAX;
     #[cfg(not(feature = "cuda"))]
-    let budget = usize::MAX;
+    let mut budget = usize::MAX;
+    #[cfg(feature = "cuda")]
+    let mut derived_batch = if backends
+        .iter()
+        .any(|backend| matches!(backend, Backend::Cuda(_)))
+    {
+        usize::MAX
+    } else {
+        1_024
+    };
+    #[cfg(not(feature = "cuda"))]
+    let derived_batch = 1_024;
+    #[cfg(feature = "cuda")]
+    let mut measured_unit = None;
+    #[cfg(feature = "cuda")]
+    let mut local_hint_bytes = 0;
+    #[cfg(not(feature = "cuda"))]
+    let local_hint_bytes = 0;
     #[cfg(feature = "cuda")]
     for (position, backend) in backends.iter().enumerate() {
         if let Backend::Cuda(device) = backend {
+            if clock.setup_before_gpu.is_zero() {
+                clock.setup_before_gpu = clock
+                    .started
+                    .map_or(Duration::ZERO, |start| start.elapsed());
+            }
             let ordinals = device_ordinals.ok_or("CUDA screening has no device ordinals")?;
             let duplicate_workers = ordinals
                 .iter()
                 .filter(|&&ordinal| ordinal == ordinals[position])
                 .count();
-            budget = budget.min(device.search_planning_free_bytes(batch_size)? / duplicate_workers);
+            budget = budget.min(device.screen_warmup_free_bytes()? / duplicate_workers);
+            derived_batch = derived_batch.min(device.screening_batch_capacity()?);
+            local_hint_bytes = local_hint_bytes.max(device.screening_local_hint_bytes()?);
+            measured_unit = match (measured_unit, device.reservation_unit()) {
+                (Some(left), Some(right)) if left == right => Some(left),
+                (None, value) => value,
+                _ => None,
+            };
         }
     }
     #[cfg(not(feature = "cuda"))]
     let _ = device_ordinals;
-    let forced_budget = test_screen_limit("BINARY_ALPHA_TEST_COLUMN_BUDGET")?;
-    #[cfg(feature = "cuda")]
-    let allocation_unit = if backends
-        .iter()
-        .any(|backend| matches!(backend, Backend::Cuda(_)))
-    {
-        binary_alpha_accelerator::cuda::SEARCH_POOL_RESERVATION_UNIT_BYTES
-    } else {
-        1
-    };
     #[cfg(not(feature = "cuda"))]
-    let allocation_unit = 1;
-    let slots = condition_slots(settings.max_conditions, conditions.len());
-    let plan = if let Some(forced) = forced_budget {
-        let logical = kernels::plan_column_blocks(&lengths, rows, slots, batch_size, 1, 1, forced)?;
-        let mut blocks = Vec::new();
-        for block in logical.blocks {
-            let physical = kernels::plan_column_blocks_with_granularity(
-                &lengths[block.columns.clone()],
-                rows,
-                slots,
-                batch_size,
-                1,
-                1,
-                (budget, allocation_unit),
-            )?;
-            blocks.extend(
-                physical
-                    .blocks
-                    .into_iter()
-                    .map(|part| kernels::ColumnBlock {
-                        columns: block.columns.start + part.columns.start
-                            ..block.columns.start + part.columns.end,
-                    }),
-            );
-        }
-        kernels::ColumnBlockPlan { blocks }
-    } else {
-        kernels::plan_column_blocks_with_granularity(
-            &lengths,
-            rows,
-            slots,
-            batch_size,
-            1,
-            1,
-            (budget, allocation_unit),
-        )?
+    let measured_unit: Option<usize> = None;
+    let budget_derived = budget;
+    if let Some(forced) = forced_budget {
+        budget = budget.min(forced);
+    }
+    let mut batch_size = forced_batch.unwrap_or(derived_batch.min(i32::MAX as usize / slots));
+    let mut shape = kernels::ScreenShape {
+        rows,
+        slots,
+        batch: batch_size,
+        tile_strides: (0..outcome_rows.len())
+            .collect::<Vec<_>>()
+            .chunks(8)
+            .map(|chunk| (chunk.len() * 9).div_ceil(8) * 8)
+            .collect(),
+        largest_tile: outcome_rows.len().min(8),
+        local_hint_bytes,
     };
-    clock.blocks = plan.blocks.len();
-    let mut suffix_capacity = vec![0; plan.blocks.len() + 1];
-    for block in (0..plan.blocks.len()).rev() {
-        suffix_capacity[block] = suffix_capacity[block + 1] + plan.blocks[block].columns.len();
+    if forced_batch.is_none() && budget != usize::MAX {
+        let largest_list = lengths.iter().copied().max().unwrap_or(0);
+        while batch_size > 1
+            && shape
+                .logical_bytes(1, largest_list)
+                .map_or(true, |n| n > budget)
+        {
+            batch_size = (batch_size / 2).max(1);
+            shape.batch = batch_size;
+        }
+    }
+    let unit_hint = forced_unit.or(measured_unit);
+    clock.tuning = format!(
+        "screen_batch {}({}) screen_budget {}({}) reservation_unit {}({}) local_hint_bytes {}(derived)",
+        batch_size,
+        if forced_batch.is_some() {
+            "override"
+        } else {
+            "derived"
+        },
+        budget,
+        if forced_budget.is_some_and(|forced| forced < budget_derived) {
+            "override"
+        } else {
+            "derived"
+        },
+        unit_hint.map_or("none".to_string(), |n| n.to_string()),
+        if forced_unit.is_some() {
+            "override"
+        } else if measured_unit.is_some() {
+            "measured"
+        } else {
+            "unavailable"
+        },
+        local_hint_bytes
+    );
+    #[cfg(feature = "cuda")]
+    for backend in backends {
+        if let Backend::Cuda(device) = backend {
+            let info = device.info();
+            let (threads, source) = device.screening_threads()?;
+            clock.tuning.push_str(&format!(
+                " device={}({}) sm_{}{}({}) build_target={}({}) screen_threads={}({})",
+                info.name.replace(' ', "_"),
+                "device_query",
+                info.compute_capability.0,
+                info.compute_capability.1,
+                "device_query",
+                info.build_target,
+                info.build_target_source,
+                threads,
+                source
+            ));
+        }
     }
     let mut records = vec![search::CompactMember::new(RawCounts::default()); total];
-    #[cfg(feature = "cuda")]
-    let mut next_device = 0_usize;
-    for size in settings.min_conditions as usize
-        ..=settings.max_conditions.min(conditions.len() as u32) as usize
-    {
-        visit_block_tuples(
-            &plan.blocks,
-            &suffix_capacity,
-            size,
-            0,
-            &mut Vec::new(),
-            &mut |tuple| {
-                clock.tuples += 1;
-                let mut requested = Vec::new();
-                for &block in tuple {
-                    requested.extend(plan.blocks[block].columns.clone());
-                }
-                requested.sort_unstable();
-                requested.dedup();
-                let (codes, buckets) = projection_block_from_development(
-                    development,
-                    &index,
-                    conditions,
-                    &requested,
-                    &projected,
-                    &signals_by_binding,
-                    lowered_bindings,
-                )?;
-                let mut offsets = vec![0_i32];
-                let mut sparse_rows = Vec::new();
-                for (column, &bucket) in buckets.iter().enumerate() {
-                    for &row in &ordered {
-                        if codes[column * rows + row as usize] == bucket {
-                            sparse_rows
-                                .push(i32::try_from(row).map_err(|_| "sparse row exceeds i32")?);
+    let mut completed = vec![false; total / settings.contracts.len()];
+    let mut attempts = 0_usize;
+    with_screen_plan(&lengths, &shape, budget, unit_hint, |plan| {
+        attempts += 1;
+        clock.blocks = plan.blocks.len();
+        let mut suffix_capacity = vec![0; plan.blocks.len() + 1];
+        for block in (0..plan.blocks.len()).rev() {
+            suffix_capacity[block] = suffix_capacity[block + 1] + plan.blocks[block].columns.len();
+        }
+        #[cfg(feature = "cuda")]
+        let mut next_device = 0_usize;
+        for size in settings.min_conditions as usize
+            ..=settings.max_conditions.min(conditions.len() as u32) as usize
+        {
+            visit_block_tuples(
+                &plan.blocks,
+                &suffix_capacity,
+                size,
+                0,
+                &mut Vec::new(),
+                &mut |tuple| {
+                    if attempts > 1 {
+                        let mut pending = false;
+                        visit_tuple_conditions(
+                            &plan.blocks,
+                            tuple,
+                            0,
+                            0,
+                            &mut Vec::new(),
+                            &mut |chosen| {
+                                pending |= !completed
+                                    [tuple_candidate_index(chosen, conditions.len(), settings)?];
+                                Ok(())
+                            },
+                        )?;
+                        if !pending {
+                            return Ok(());
                         }
                     }
-                    offsets.push(
-                        i32::try_from(sparse_rows.len())
-                            .map_err(|_| "sparse row list exceeds i32")?,
-                    );
-                }
-                clock.construction_visits += buckets.len() * ordered.len();
-                clock.list_entries += sparse_rows.len();
-                clock.validation_visits += (offsets.len() + sparse_rows.len()) * backends.len();
-                let keys = kernels::SparseKeys {
-                    key_chrono_offsets: &offsets,
-                    key_chrono_rows: &sparse_rows,
-                };
-                let first = outcome_rows.first_key_value().expect("nonempty outcomes").1;
-                let cpu = backends.len() == 1 && matches!(backends[0], Backend::Cpu);
-                let mut cpu_workspace = if cpu {
-                    Some(kernels::CpuSparseTuple::new(
-                        tuple_buffers(
-                            &codes,
-                            requested.len() as i32,
-                            rows as i32,
-                            &ordered,
-                            entry_times,
-                            first,
-                        ),
-                        &[&split_mask],
-                        keys,
-                    )?)
-                } else {
-                    None
-                };
-                #[cfg(feature = "cuda")]
-                let mut workspaces = if cpu {
-                    Vec::new()
-                } else {
-                    let workspaces: Vec<_> = backends
+                    clock.tuples += 1;
+                    let mut requested = Vec::new();
+                    for &block in tuple {
+                        requested.extend(plan.blocks[block].columns.clone());
+                    }
+                    requested.sort_unstable();
+                    requested.dedup();
+                    let (codes, buckets) = parallel_projection_block(
+                        development,
+                        &index,
+                        conditions,
+                        &requested,
+                        &projected,
+                        &signals_by_binding,
+                        lowered_bindings,
+                    )?;
+                    let (offsets, sparse_rows) =
+                        parallel_sparse_lists(&codes, &buckets, &ordered, rows)?;
+                    let tuple_bytes = shape.exact_bytes(requested.len(), sparse_rows.len())?;
+                    if tuple_bytes > budget {
+                        return Err(format!(
+                            "screen tuple budget exceeded: planned {tuple_bytes} logical bytes, free budget {budget} bytes"
+                        ));
+                    }
+                    clock.construction_visits += buckets.len() * ordered.len();
+                    clock.list_entries += sparse_rows.len();
+                    let keys = kernels::SparseKeys {
+                        key_chrono_offsets: &offsets,
+                        key_chrono_rows: &sparse_rows,
+                    };
+                    let first = outcome_rows.first_key_value().expect("nonempty outcomes").1;
+                    let cpu = backends.len() == 1 && matches!(backends[0], Backend::Cpu);
+                    let mut cpu_workspace = if cpu {
+                        let workspace = kernels::CpuSparseTuple::new(
+                            tuple_buffers(
+                                &codes,
+                                requested.len() as i32,
+                                rows as i32,
+                                &ordered,
+                                entry_times,
+                                first,
+                            ),
+                            &[&split_mask],
+                            keys,
+                        )?;
+                        clock.validation_visits += offsets.len() + sparse_rows.len();
+                        Some(workspace)
+                    } else {
+                        None
+                    };
+                    #[cfg(feature = "cuda")]
+                    let mut workspaces = if cpu {
+                        Vec::new()
+                    } else {
+                        let tiles: Vec<_> = packed
+                            .iter()
+                            .map(|tile| binary_alpha_accelerator::cuda::ScreenTile {
+                                bytes: &tile.bytes,
+                                active: tile.expiries.len() as i32,
+                                stride: tile.stride as i32,
+                            })
+                            .collect();
+                        let workspaces: Vec<_> = backends
                         .iter()
                         .map(|backend| match backend {
-                            Backend::Cuda(device) => device.search_tuple_workspace(
+                            Backend::Cuda(device) => {
+                                let free = device.memory_info()?.0;
+                                clock.validation_visits += offsets.len() + sparse_rows.len();
+                                device.screen_tuple_workspace(
                                 tuple_buffers(
                                     &codes,
                                     requested.len() as i32,
@@ -1912,73 +2224,58 @@ fn score_streamed(
                                     entry_times,
                                     first,
                                 ),
-                                &[&split_mask],
+                                &split_mask,
                                 keys,
-                            ),
+                                &tiles,
+                                batch_size,
+                                slots,
+                                ).map_err(|reason| {
+                                    if reason.contains("CUDA_ERROR_OUT_OF_MEMORY") {
+                                        format!("screen preallocation failed: planned {tuple_bytes} logical bytes, free {free} bytes: {reason}")
+                                    } else { reason }
+                                })
+                            },
                             Backend::Cpu => Err("mixed CPU and CUDA search devices".into()),
                         })
                         .collect::<Result<_, String>>()?;
-                    for workspace in &workspaces {
-                        add(&mut clock.device, workspace.timings);
-                    }
-                    let buffers = tuple_buffers(
-                        &codes,
-                        requested.len() as i32,
-                        rows as i32,
-                        &ordered,
-                        entry_times,
-                        first,
-                    );
-                    let workspace_bytes = std::mem::size_of_val(buffers.feature_codes)
-                        + std::mem::size_of_val(buffers.ordered_rows)
-                        + std::mem::size_of_val(buffers.decision_time_ms)
-                        + std::mem::size_of_val(buffers.release_time_ms)
-                        + std::mem::size_of_val(buffers.settlement_time_ms)
-                        + std::mem::size_of_val(buffers.valid)
-                        + std::mem::size_of_val(buffers.buy_win)
-                        + std::mem::size_of_val(buffers.sell_win)
-                        + std::mem::size_of_val(buffers.tie)
-                        + std::mem::size_of_val(split_mask.as_slice())
-                        + std::mem::size_of_val(keys.key_chrono_offsets)
-                        + std::mem::size_of_val(keys.key_chrono_rows);
-                    clock.transfer_bytes += workspace_bytes * workspaces.len();
-                    workspaces
-                };
-                for (&expiry, outcome) in &outcome_rows {
-                    let duration =
-                        i64::from(development.outcome.rule.expiry_seconds[expiry]) * 1_000_000;
-                    let buffers = tuple_buffers(
-                        &codes,
-                        requested.len() as i32,
-                        rows as i32,
-                        &ordered,
-                        entry_times,
-                        outcome,
-                    );
-                    if !std::ptr::eq(outcome, first) {
-                        if let Some(workspace) = &mut cpu_workspace {
-                            workspace.set_outcome(buffers, &split_mask)?;
+                        for workspace in &workspaces {
+                            add(&mut clock.device, workspace.timings);
                         }
-                        #[cfg(feature = "cuda")]
-                        for workspace in &mut workspaces {
-                            add(
-                                &mut clock.device,
-                                workspace.set_outcome(buffers, &split_mask)?,
+                        for workspace in &workspaces {
+                            if workspace.allocated_bytes() >= clock.memory_peak_bytes {
+                                clock.memory_peak_bytes = workspace.allocated_bytes();
+                                clock.memory = format!(
+                                    "screen_preallocated {} screen_batch {} screen_free_before {} screen_free_prelaunch {} screen_free_after {} pool_before {:?} pool_prelaunch {:?} pool_after {:?}",
+                                    workspace.allocated_bytes(),
+                                    batch_size,
+                                    workspace.free_before,
+                                    workspace.free_prelaunch,
+                                    workspace.free_after,
+                                    workspace.pool_before,
+                                    workspace.pool_prelaunch,
+                                    workspace.pool_after
+                                );
+                            }
+                        }
+                        workspaces
+                    };
+                    if let Some(workspace) = &mut cpu_workspace {
+                        for (&expiry, outcome) in &outcome_rows {
+                            let duration =
+                                i64::from(development.outcome.rule.expiry_seconds[expiry])
+                                    * 1_000_000;
+                            let buffers = tuple_buffers(
+                                &codes,
+                                requested.len() as i32,
+                                rows as i32,
+                                &ordered,
+                                entry_times,
+                                outcome,
                             );
-                        }
-                        #[cfg(feature = "cuda")]
-                        {
-                            clock.transfer_bytes += workspaces.len()
-                                * (std::mem::size_of_val(buffers.release_time_ms)
-                                    + std::mem::size_of_val(buffers.settlement_time_ms)
-                                    + std::mem::size_of_val(buffers.valid)
-                                    + std::mem::size_of_val(buffers.buy_win)
-                                    + std::mem::size_of_val(buffers.sell_win)
-                                    + std::mem::size_of_val(buffers.tie)
-                                    + std::mem::size_of_val(split_mask.as_slice()));
-                        }
-                    }
-                    let apply =
+                            if !std::ptr::eq(outcome, first) {
+                                workspace.set_outcome(buffers, &split_mask)?;
+                            }
+                            let apply =
                         |scored: Vec<(u64, RawCounts, RawCounts)>,
                          records: &mut [search::CompactMember]| {
                             for (global, buy, sell) in scored {
@@ -1999,35 +2296,6 @@ fn score_streamed(
                                 }
                             }
                         };
-                    if let Some(workspace) = &cpu_workspace {
-                        tuple_batches(
-                            &plan.blocks,
-                            tuple,
-                            &requested,
-                            &buckets,
-                            &offsets,
-                            conditions.len(),
-                            settings,
-                            batch_size,
-                            &mut clock.driver_visits,
-                            |group| {
-                                let batches: Vec<_> = group
-                                    .iter()
-                                    .map(|batch| CpuBatch {
-                                        global_indices: &batch.globals,
-                                        candidates: batch.candidates(),
-                                        driver_keys: &batch.drivers,
-                                    })
-                                    .collect();
-                                let scored =
-                                    score_cpu_batches(workspace, &batches, 0, duration, 0)?;
-                                apply(scored, &mut records);
-                                Ok(())
-                            },
-                        )?;
-                    } else {
-                        #[cfg(feature = "cuda")]
-                        {
                             tuple_batches(
                                 &plan.blocks,
                                 tuple,
@@ -2037,43 +2305,114 @@ fn score_streamed(
                                 conditions.len(),
                                 settings,
                                 batch_size,
+                                1,
+                                &completed,
                                 &mut clock.driver_visits,
                                 |group| {
-                                    let mut scored = Vec::new();
-                                    for (i, batch) in group.iter().enumerate() {
-                                        let device = (next_device + i) % workspaces.len();
-                                        let uploaded = workspaces[device]
-                                            .upload_batch(batch.candidates(), &batch.drivers)?;
-                                        clock.transfer_bytes +=
-                                            std::mem::size_of_val(batch.features.as_slice())
-                                                + std::mem::size_of_val(batch.buckets.as_slice())
-                                                + std::mem::size_of_val(batch.offsets.as_slice())
-                                                + std::mem::size_of_val(batch.drivers.as_slice());
-                                        add(&mut clock.device, uploaded.timings);
-                                        let output = uploaded.score_sparse_dual(0, duration, 0)?;
-                                        add(&mut clock.device, output.timings);
-                                        for (position, &global) in batch.globals.iter().enumerate()
-                                        {
-                                            scored.push((
-                                                global,
-                                                raw_at(&output.output.buy_output, position),
-                                                raw_at(&output.output.sell_output, position),
-                                            ));
-                                        }
-                                    }
-                                    next_device = (next_device + group.len()) % workspaces.len();
+                                    let batches: Vec<_> = group
+                                        .iter()
+                                        .map(|batch| CpuBatch {
+                                            global_indices: &batch.globals,
+                                            candidates: batch.candidates(),
+                                            driver_keys: &batch.drivers,
+                                        })
+                                        .collect();
+                                    let scored =
+                                        score_cpu_batches(workspace, &batches, 0, duration, 0)?;
                                     apply(scored, &mut records);
                                     Ok(())
                                 },
                             )?;
                         }
+                    } else {
+                        #[cfg(feature = "cuda")]
+                        tuple_batches(
+                            &plan.blocks,
+                            tuple,
+                            &requested,
+                            &buckets,
+                            &offsets,
+                            conditions.len(),
+                            settings,
+                            batch_size,
+                            outcome_rows.len(),
+                            &completed,
+                            &mut clock.driver_visits,
+                            |group| {
+                                for (i, batch) in group.iter().enumerate() {
+                                    let device = (next_device + i) % workspaces.len();
+                                    for (tile_index, tile) in packed.iter().enumerate() {
+                                        let output = workspaces[device].score_batch(
+                                            batch.candidates(),
+                                            &batch.drivers,
+                                            tile_index,
+                                        )?;
+                                        add(&mut clock.device, output.timings);
+                                        for (position, &global) in batch.globals.iter().enumerate()
+                                        {
+                                            for (local_expiry, &expiry) in
+                                                tile.expiries.iter().enumerate()
+                                            {
+                                                let at = (position * tile.expiries.len()
+                                                    + local_expiry)
+                                                    * 5;
+                                                let counts = &output.output[at..at + 5];
+                                                for (contract, &column) in
+                                                    expiries.iter().enumerate()
+                                                {
+                                                    if column == expiry {
+                                                        let raw = RawCounts {
+                                                        total: i64::from(counts[0]),
+                                                        wins: i64::from(counts[if matches!(settings.contracts[contract].direction, binary_alpha_engine::execution::Direction::Buy) { 1 } else { 2 }]),
+                                                        losses: i64::from(counts[if matches!(settings.contracts[contract].direction, binary_alpha_engine::execution::Direction::Buy) { 2 } else { 1 }]),
+                                                        ties: i64::from(counts[3]),
+                                                        invalid: i64::from(counts[4]),
+                                                    };
+                                                        records[global as usize + contract].raw =
+                                                            raw;
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                next_device = (next_device + group.len()) % workspaces.len();
+                                Ok(())
+                            },
+                        )?;
                         #[cfg(not(feature = "cuda"))]
                         return Err("CUDA screening requires the cuda feature".into());
                     }
-                }
-                Ok(())
-            },
-        )?;
+                    visit_tuple_conditions(
+                        &plan.blocks,
+                        tuple,
+                        0,
+                        0,
+                        &mut Vec::new(),
+                        &mut |chosen| {
+                            completed[tuple_candidate_index(chosen, conditions.len(), settings)?] =
+                                true;
+                            Ok(())
+                        },
+                    )
+                },
+            )?;
+        }
+        Ok(())
+    })?;
+    if completed.iter().any(|&done| !done) {
+        return Err("screen blocks: re-plan left candidate ranks unscored".into());
+    }
+    #[cfg(feature = "cuda")]
+    {
+        clock.transfer_bytes = backends
+            .iter()
+            .zip(upload_start)
+            .map(|(backend, start)| match backend {
+                Backend::Cuda(device) => device.uploaded_bytes() - start,
+                Backend::Cpu => 0,
+            })
+            .sum();
     }
     Ok(records)
 }
@@ -2357,7 +2696,9 @@ fn read_family(
             family.members.len()
         ));
     }
-    if family.kernel_module != kernel_identity() || family.sampler != SAMPLER_VERSION {
+    if family.kernel_module != kernel_identity_for_schema(family.schema_version)
+        || family.sampler != SAMPLER_VERSION
+    {
         return Err(format!(
             "{uri}: the family records kernel sources or a sampler this binary does not carry"
         ));
@@ -2936,6 +3277,65 @@ mod projection_tests {
     use binary_alpha_engine::config::StreamKey;
     use binary_alpha_engine::execution::{Comparator, Condition, Threshold};
     use binary_alpha_engine::features::{FittedEncoding, ProjectionKind};
+
+    #[test]
+    fn preallocation_failure_halves_width_and_keeps_exact_column_coverage() {
+        let lengths = [2, 0, 3, 1, 4];
+        let shape = kernels::ScreenShape {
+            rows: 8,
+            slots: 2,
+            batch: 3,
+            tile_strides: vec![72],
+            largest_tile: 8,
+            local_hint_bytes: 0,
+        };
+        let score = |plan: &kernels::ColumnBlockPlan| {
+            plan.blocks
+                .iter()
+                .flat_map(|block| block.columns.clone())
+                .map(|column| lengths[column] * (column + 1))
+                .sum::<usize>()
+        };
+        let expected =
+            score(&kernels::plan_screen_blocks(&lengths, &shape, 1_000_000, None, 5).unwrap());
+        let mut attempts = 0;
+        let mut completed = [false; 5];
+        let mut visits = [0_u8; 5];
+        let mut counts = 0;
+        let (plan, ()) = with_screen_plan(&lengths, &shape, 1_000_000, None, |plan| {
+            attempts += 1;
+            for column in plan.blocks.iter().flat_map(|block| block.columns.clone()) {
+                if completed[column] {
+                    continue;
+                }
+                if attempts == 1 && column == 2 {
+                    return Err("screen preallocation failed: injected".into());
+                }
+                completed[column] = true;
+                visits[column] += 1;
+                counts += lengths[column] * (column + 1);
+            }
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(attempts, 2);
+        assert_eq!(
+            plan.blocks
+                .iter()
+                .map(|block| block.columns.len())
+                .collect::<Vec<_>>(),
+            [2, 2, 1]
+        );
+        assert_eq!(
+            plan.blocks
+                .iter()
+                .flat_map(|block| block.columns.clone())
+                .collect::<Vec<_>>(),
+            [0, 1, 2, 3, 4]
+        );
+        assert_eq!(counts, expected);
+        assert_eq!(visits, [1; 5], "completed columns are skipped on re-plan");
+    }
 
     #[test]
     fn wide_search_budget_uses_resolved_condition_slots() {

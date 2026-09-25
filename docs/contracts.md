@@ -2180,16 +2180,25 @@ their retained `_ms` names. Schema-2 slots use the base row's installation time 
 development window and require a stored entry tick at or after installation; rows without an
 entry are masked. The sparse scorer orders rows by stored entry time then row index, constructs
 chronological lists for each requested `(column, code)`, and drives each candidate by its least
-frequent condition while checking its whole conjunction. `payout_basis` is zero; columns zero to
-four give total, wins, losses, ties and invalid. A device free-memory budget determines column
-blocks, including row buffers, sparse lists and candidate/output allocations. Candidates stream
-by nondecreasing block tuple in bounded batches; global combinatorial ranks place their counts
-in the compact whole-family array. CUDA batches follow a deterministic round robin over every
-configured `[accelerator] devices` entry; CPU uses the same sparse scorer.
+frequent condition while checking its whole conjunction. Screening uses the basic sparse
+transition's total, directional wins, ties and invalid counts; losses are the other direction's
+wins. A fused CUDA launch scores up to eight distinct expiries per tile from packed outcome rows.
+The CPU reference uses the basic sparse dual scorer once per distinct expiry. A device
+free-memory budget determines column blocks from resident row, sparse-list, packed-outcome,
+candidate and compact-output allocations. Candidates stream by nondecreasing block tuple and
+are ordered within each batch by driver and global rank; global combinatorial ranks place their
+counts in the compact whole-family array. CUDA batches follow a deterministic round robin over
+every configured `[accelerator] devices` entry.
+Schema-1 family verification retains the identity of the original thirteen kernel sources;
+schema-2 family identity includes the fused screening source as the fourteenth.
 The created search report lists `columns C blocks K tuples T` before the visit counters.
 `validation_visits` counts sparse tuple-index entries once per constructed workspace: once
 for CPU, or once per configured CUDA device entry, including repeated device ordinals.
 Candidate-driver row visits are reported separately.
+The report also records the device name, compute capability, build target, launch threads,
+batch size, memory budget, allocator-unit hint, their derived or override sources, and observed
+free and pool memory around tuple preallocation. These diagnostic fields are outside the
+configuration hash, family generation, and published `family.json` identity.
 
 The statistic of a member applies when `W = winning_net() >= 0`,
 `L = purchase() + loss.terminal_fee - loss.gross_return > 0`, and the tie nets exactly zero,

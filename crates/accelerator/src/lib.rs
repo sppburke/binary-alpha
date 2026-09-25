@@ -69,6 +69,12 @@ pub const KERNEL_SOURCES: [(&str, &str); 13] = [
     ),
 ];
 
+/// Schema-2 screening source; kept separate from the thirteen retained kernel identities.
+pub const SCREEN_KERNEL_SOURCE: (&str, &str) = (
+    "score_screen_fused",
+    include_str!("../kernels/score_screen_fused.cu"),
+);
+
 /// The native device binary compiled at build time.
 #[cfg(feature = "cuda")]
 pub const MODULE_CUBIN: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/module.cubin"));

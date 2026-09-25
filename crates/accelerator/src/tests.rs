@@ -24,6 +24,38 @@ fn blocks_cover_columns(blocks: &[ColumnBlock], columns: usize) -> bool {
 }
 
 #[test]
+fn screen_logical_budget_and_allocator_hints_are_separate() {
+    let shape = ScreenShape {
+        rows: 3,
+        slots: 2,
+        batch: 4,
+        tile_strides: vec![16],
+        largest_tile: 1,
+        local_hint_bytes: 0,
+    };
+    let required = shape.logical_bytes(1, 2).unwrap();
+    assert!(
+        plan_screen_blocks(&[2], &shape, required - 1, None, 1)
+            .unwrap_err()
+            .contains("one-column")
+    );
+    for hint in [None, Some(64), Some(4096)] {
+        let plan = plan_screen_blocks(&[2], &shape, required, hint, 1).unwrap();
+        assert!(blocks_cover_columns(&plan.blocks, 1));
+    }
+    let baseline = plan_screen_blocks(&[2, 2, 2], &shape, required + 70, None, 3).unwrap();
+    let hinted = plan_screen_blocks(&[2, 2, 2], &shape, required + 70, Some(256), 3).unwrap();
+    assert!(hinted.blocks.len() >= baseline.blocks.len());
+    assert!(blocks_cover_columns(&hinted.blocks, 3));
+    let oversized =
+        plan_screen_blocks(&[2, 2, 2], &shape, required + 70, Some(1 << 20), 3).unwrap();
+    assert_eq!(
+        oversized, baseline,
+        "a hint larger than an explicit cap is ignored"
+    );
+}
+
+#[test]
 fn column_blocks_bound_memory_and_sparse_indices() {
     let plan = plan_column_blocks(&[4; 6], 4, 2, 1, 1, 1, 600).unwrap();
     assert!(plan.blocks.len() >= 3, "forced small budget: {plan:?}");
@@ -214,6 +246,242 @@ fn cpu_resident_sparse_batches_match_one_shot_across_forced_blocks_and_expiries(
         CpuSparseTuple::construction_count() - before,
         plan.blocks.len()
     );
+}
+
+#[cfg(feature = "cuda")]
+#[test]
+fn incompatible_sm90_image_names_build_target_at_open() {
+    if env!("BINARY_ALPHA_CUDA_ARCH") != "sm_90" {
+        return;
+    }
+    let error = match crate::cuda::Device::open(0) {
+        Ok(_) => panic!("sm_90 image unexpectedly opened on the sm_120 test device"),
+        Err(error) => error,
+    };
+    assert!(error.contains("BINARY_ALPHA_CUDA_ARCH"), "{error}");
+}
+
+#[cfg(feature = "cuda")]
+#[test]
+fn fused_screen_matches_basic_and_full_sparse_references() {
+    use crate::cuda::ScreenTile;
+    fn draw(seed: u64, stream: u64, row: usize) -> u64 {
+        let mut value = seed ^ stream.wrapping_mul(0x9e37_79b9_7f4a_7c15) ^ row as u64;
+        value = (value ^ (value >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        value = (value ^ (value >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        value ^ (value >> 31)
+    }
+    let device = crate::cuda::Device::open(0).unwrap();
+    assert_eq!(
+        device.screening_function().local_bytes,
+        0,
+        "fused scorer must not spill to local memory"
+    );
+    for seed in [0_u64, 17, 0x53c0_12ab, 0xa5a5_a5a5] {
+        let rows = 20usize + (seed as usize % 3) * 4;
+        let entry: Vec<i64> = (0..rows).map(|row| (row / 2) as i64 * 10).collect();
+        let split: Vec<u8> = (0..rows)
+            .map(|row| ((row + seed as usize) % 3) as u8)
+            .collect();
+        let codes: Vec<i16> = (0..3)
+            .flat_map(|column| {
+                (0..rows).map(move |row| match column {
+                    0 => 1,
+                    1 => draw(seed, 1, row).is_multiple_of(4) as i16,
+                    _ => 0,
+                })
+            })
+            .collect();
+        let ordered: Vec<i64> = (0..rows as i64).collect();
+        let mut key_rows = Vec::new();
+        let mut key_offsets = vec![0_i32];
+        for column in 0..3 {
+            for &row in &ordered {
+                if codes[column * rows + row as usize] == 1 {
+                    key_rows.push(row as i32);
+                }
+            }
+            key_offsets.push(key_rows.len() as i32);
+        }
+        let features = [0, 0, 1, 0, 1, 2, 2];
+        let buckets = [1_i16; 7];
+        let candidate_offsets = [0, 1, 3, 6, 7];
+        let drivers = [0, 1, 2, 2];
+        let candidates = CandidateConditions {
+            condition_feature: &features,
+            condition_bucket: &buckets,
+            candidate_offsets: &candidate_offsets,
+            candidate_count: 4,
+        };
+        let releases: Vec<Vec<i64>> = (0..12)
+            .map(|expiry| {
+                (0..rows)
+                    .map(|row| {
+                        if draw(seed, expiry as u64 + 2, row).is_multiple_of(7) {
+                            0
+                        } else if draw(seed, expiry as u64 + 17, row).is_multiple_of(11) {
+                            -1
+                        } else {
+                            entry[row] + 5 + (expiry as i64 % 3) * 10
+                        }
+                    })
+                    .collect()
+            })
+            .collect();
+        let valid: Vec<Vec<u8>> = (0..12)
+            .map(|expiry| {
+                (0..rows)
+                    .map(|row| (!draw(seed, expiry as u64 + 43, row).is_multiple_of(6)) as u8)
+                    .collect()
+            })
+            .collect();
+        let tie: Vec<u8> = (0..rows)
+            .map(|row| draw(seed, 61, row).is_multiple_of(5) as u8)
+            .collect();
+        let buy: Vec<u8> = (0..rows)
+            .map(|row| draw(seed, 62, row).is_multiple_of(3) as u8)
+            .collect();
+        let sell: Vec<u8> = (0..rows)
+            .map(|row| draw(seed, 63, row).is_multiple_of(4) as u8)
+            .collect();
+        let first = SearchBuffers {
+            feature_codes: &codes,
+            feature_count: 3,
+            row_count: rows as i32,
+            ordered_rows: &ordered,
+            decision_time_ms: &entry,
+            release_time_ms: &releases[0],
+            settlement_time_ms: &releases[0],
+            valid: &valid[0],
+            buy_win: &buy,
+            sell_win: &sell,
+            tie: &tie,
+        };
+        let keys = SparseKeys {
+            key_chrono_offsets: &key_offsets,
+            key_chrono_rows: &key_rows,
+        };
+        let mut cpu = CpuSparseTuple::new(first, &[&split], keys).unwrap();
+        for expiry_count in [1, 2, 3, 4, 5, 6, 7, 8, 9, 12] {
+            let packed: Vec<Vec<u8>> = (0..expiry_count)
+                .collect::<Vec<_>>()
+                .chunks(8)
+                .map(|chunk| {
+                    let active = chunk.len();
+                    let stride = (active * 9).div_ceil(8) * 8;
+                    let mut bytes = vec![0_u8; rows * stride];
+                    for row in 0..rows {
+                        for (local, &expiry) in chunk.iter().enumerate() {
+                            bytes[row * stride + local * 8..row * stride + (local + 1) * 8]
+                                .copy_from_slice(&releases[expiry][row].to_le_bytes());
+                            bytes[row * stride + active * 8 + local] = valid[expiry][row]
+                                | (tie[row] << 1)
+                                | (buy[row] << 2)
+                                | (sell[row] << 3);
+                        }
+                    }
+                    bytes
+                })
+                .collect();
+            let tiles: Vec<_> = packed
+                .iter()
+                .enumerate()
+                .map(|(index, bytes)| {
+                    let active = (expiry_count - index * 8).min(8);
+                    ScreenTile {
+                        bytes,
+                        active: active as i32,
+                        stride: ((active * 9).div_ceil(8) * 8) as i32,
+                    }
+                })
+                .collect();
+            let mut gpu = device
+                .screen_tuple_workspace(first, &split, keys, &tiles, 4, 3)
+                .unwrap();
+            let shape = ScreenShape {
+                rows,
+                slots: 3,
+                batch: 4,
+                tile_strides: tiles.iter().map(|tile| tile.stride as usize).collect(),
+                largest_tile: expiry_count.min(8),
+                local_hint_bytes: 0,
+            };
+            assert_eq!(
+                gpu.allocated_bytes(),
+                shape.exact_bytes(3, key_rows.len()).unwrap(),
+                "seed {seed} expiry count {expiry_count}"
+            );
+            for (tile_index, tile) in tiles.iter().enumerate() {
+                let actual = gpu
+                    .score_batch(candidates, &drivers, tile_index)
+                    .unwrap()
+                    .output;
+                for local in 0..tile.active as usize {
+                    let expiry = tile_index * 8 + local;
+                    let buffers = SearchBuffers {
+                        release_time_ms: &releases[expiry],
+                        settlement_time_ms: &releases[expiry],
+                        valid: &valid[expiry],
+                        ..first
+                    };
+                    cpu.set_outcome(buffers, &split).unwrap();
+                    let basic = cpu
+                        .score_screen_batch(0, candidates, &drivers, 0)
+                        .unwrap()
+                        .output;
+                    let full = score_bucket_plans_cap1_sparse_dual(
+                        &Backend::Cpu,
+                        &codes,
+                        &features,
+                        &buckets,
+                        &candidate_offsets,
+                        &drivers,
+                        &key_offsets,
+                        &key_rows,
+                        &split,
+                        &entry,
+                        &releases[expiry],
+                        &releases[expiry],
+                        &valid[expiry],
+                        &buy,
+                        &sell,
+                        &tie,
+                        4,
+                        rows as i32,
+                        0,
+                        0,
+                    )
+                    .unwrap()
+                    .output;
+                    for candidate in 0..4 {
+                        let at = (candidate * tile.active as usize + local) * 5;
+                        let compact = &actual[at..at + 5];
+                        assert_eq!(
+                            compact,
+                            &[
+                                basic.buy_output[candidate * 8] as i32,
+                                basic.buy_output[candidate * 8 + 1] as i32,
+                                basic.sell_output[candidate * 8 + 1] as i32,
+                                basic.buy_output[candidate * 8 + 3] as i32,
+                                basic.buy_output[candidate * 8 + 4] as i32,
+                            ],
+                            "seed {seed} expiry {expiry} candidate {candidate}"
+                        );
+                        for field in 0..5 {
+                            assert_eq!(
+                                basic.buy_output[candidate * 8 + field],
+                                full.buy_output[candidate * 21 + field]
+                            );
+                            assert_eq!(
+                                basic.sell_output[candidate * 8 + field],
+                                full.sell_output[candidate * 21 + field]
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
 
 #[cfg(feature = "cuda")]
