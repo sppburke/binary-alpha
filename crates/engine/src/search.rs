@@ -1215,7 +1215,7 @@ pub fn score(members: &mut [Member], contracts: &[ContractTerms], screen: Option
                 )
             } else {
                 format!(
-                    "beyond the first {} members by adjusted score",
+                    "beyond the first {} members by score",
                     screen.top.expect("screened by top")
                 )
             });
@@ -1297,8 +1297,8 @@ pub fn screen_compact(
         let mut order = applicable.clone();
         order.sort_by(|&a, &b| {
             records[a]
-                .adjusted
-                .partial_cmp(&records[b].adjusted)
+                .score
+                .partial_cmp(&records[b].score)
                 .unwrap_or(Ordering::Equal)
                 .then(a.cmp(&b))
         });
@@ -2257,6 +2257,37 @@ mod tests {
             Some("settled 0 below the minimum 2")
         );
         assert_eq!(members[3].rejected, None);
+    }
+
+    #[test]
+    fn saturated_adjusted_scores_keep_the_strongest_raw_evidence() {
+        // Nine members never trade and the last is weak but real: every adjusted value
+        // saturates at 1, so only the raw score can rank the evidence-bearing member first.
+        let mut records: Vec<_> = (0..10)
+            .map(|index| {
+                let (wins, losses) = if index == 9 { (12, 8) } else { (0, 0) };
+                CompactMember::new(RawCounts {
+                    total: wins + losses,
+                    wins,
+                    losses,
+                    ties: 0,
+                    invalid: 0,
+                })
+            })
+            .collect();
+        let screen = Screen {
+            max_adjusted_score: 1.0,
+            top: Some(1),
+        };
+        let (applicable, retained) = screen_compact(
+            &mut records,
+            &[contract("1", "0", "1.80", "1")],
+            Some(&screen),
+        );
+        assert_eq!(applicable, 10);
+        assert!(records.iter().all(|record| record.adjusted == Some(1.0)));
+        assert!(records[9].score.unwrap() < 1.0);
+        assert_eq!(retained, [9]);
     }
 
     #[test]

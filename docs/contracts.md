@@ -2211,8 +2211,8 @@ one, and an inapplicable member records its reason. The score is the one-sided e
 upper tail on decisive counts summed in log space away from the mode; the adjusted value is the
 reverse cumulative minimum of `min(1, m * p / rank)` after sorting by score then member order
 over the applicable members. Heuristic scope screens members whose adjusted value exceeds
-`max_adjusted_score`, beyond the first `top` by adjusted value then order, and every inapplicable
-member; screened members are never replayed.
+`max_adjusted_score`, beyond the first `top` by raw score, breaking ties by global member index,
+and every inapplicable member; screened members are never replayed.
 
 Only retained survivors become schema-2 `Member` records, ordered by `global_index`; logic
 identities are computed for those members. Survivors are replayed in canonical chunks of
