@@ -1,4 +1,7 @@
-//! Manual, synthetic-only Study P resource gate on the quantum CUDA runner.
+//! Manual, synthetic-only Study P resource gate on the quantum CUDA runner. Run it in a
+//! swap-disabled memory scope so shared-host reclaim cannot swap gate memory, and memory that
+//! does not fit fails the gate:
+//! `systemd-run --user --scope -p MemorySwapMax=0 cargo test --release --locked -p binary-alpha-app --features cuda --test phase11_quantum_scale quantum_study_p_combined_scale -- --exact --ignored --nocapture`.
 #![cfg(feature = "cuda")]
 mod common;
 #[path = "common/research.rs"]
@@ -109,6 +112,20 @@ fn process_tree_swap_kb(root: u32) -> u64 {
         }
     }
     total
+}
+
+/// The swap limit of this process's cgroup v2 memory scope, recorded with the gate.
+fn scope_swap_max() -> String {
+    fs::read_to_string("/proc/self/cgroup")
+        .ok()
+        .and_then(|groups| {
+            let path = groups
+                .lines()
+                .find_map(|line| line.strip_prefix("0::"))?
+                .to_owned();
+            fs::read_to_string(format!("/sys/fs/cgroup{path}/memory.swap.max")).ok()
+        })
+        .map_or_else(|| "unavailable".to_owned(), |value| value.trim().to_owned())
 }
 
 fn gpu_memory() -> (u64, u64) {
@@ -238,7 +255,8 @@ fn quantum_study_p_combined_scale() {
     let (vram_before, free_mib) = gpu_memory();
     let stability_bytes = number(&resources, &["stability", "development_bytes"]);
     println!(
-        "resource start gpu_used_mib {vram_before} gpu_free_mib {free_mib} swap_used_kb {swap_before} stability_full_rows_bytes {stability_bytes} concurrent_cuda_reserve_bytes {}",
+        "resource start gpu_used_mib {vram_before} gpu_free_mib {free_mib} swap_used_kb {swap_before} scope_swap_max {} stability_full_rows_bytes {stability_bytes} concurrent_cuda_reserve_bytes {}",
+        scope_swap_max(),
         1024 * 1024 * 1024_u64
     );
     assert!(
@@ -255,8 +273,13 @@ fn quantum_study_p_combined_scale() {
     let sample_process_swap = Arc::clone(&peak_process_swap);
     let sampler = std::thread::spawn(move || {
         while sample_flag.load(Ordering::Relaxed) {
-            sample_process_swap
-                .fetch_max(process_tree_swap_kb(std::process::id()), Ordering::Relaxed);
+            let swapped = process_tree_swap_kb(std::process::id());
+            if swapped > sample_process_swap.fetch_max(swapped, Ordering::Relaxed) {
+                println!(
+                    "process swap peak {swapped} KiB at {:.0}s",
+                    started.elapsed().as_secs_f64()
+                );
+            }
             if let Ok(output) = Command::new("nvidia-smi")
                 .args(["--query-gpu=memory.used", "--format=csv,noheader,nounits"])
                 .output()
