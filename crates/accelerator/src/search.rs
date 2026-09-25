@@ -107,6 +107,12 @@ pub fn plan_screen_blocks(
                 "screen blocks: column {index} sparse list exceeds i32"
             ));
         }
+        let exact_one = shape.exact_bytes(1, length)?;
+        if exact_one > budget {
+            return Err(format!(
+                "screen blocks: column {index} requires {exact_one} bytes, exceeding budget {budget}"
+            ));
+        }
         let next = list_len.checked_add(length);
         let columns = index + 1 - start;
         let logical = next.and_then(|n| shape.logical_bytes(columns, n).ok());

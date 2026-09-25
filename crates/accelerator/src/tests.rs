@@ -35,13 +35,10 @@ fn screen_logical_budget_and_allocator_hints_are_separate() {
     };
     let required = shape.logical_bytes(1, 2).unwrap();
     assert_eq!(shape.exact_bytes(1, 2).unwrap(), 261);
-    assert_eq!(
-        plan_screen_blocks(&[2], &shape, required - 1, None, 1)
-            .unwrap()
-            .blocks[0]
-            .columns,
-        0..1
-    );
+    let error = plan_screen_blocks(&[2], &shape, 1, None, 1).unwrap_err();
+    assert!(error.contains("column 0 requires 261 bytes"), "{error}");
+    let error = plan_screen_blocks(&[0, 2], &shape, 260, None, 2).unwrap_err();
+    assert!(error.contains("column 1 requires"), "{error}");
     for hint in [None, Some(64), Some(4096)] {
         let plan = plan_screen_blocks(&[2], &shape, required, hint, 1).unwrap();
         assert!(blocks_cover_columns(&plan.blocks, 1));

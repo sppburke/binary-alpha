@@ -553,6 +553,45 @@ fn verify_frozen_before_revision(
     Ok((manifest.code_revision == revision).then_some(verified))
 }
 
+struct FrozenRequest<'a> {
+    generation: &'a str,
+    role: DatasetRole,
+    input_generation: &'a str,
+    profile_generation: &'a str,
+    frozen_from: &'a str,
+    plan_identity: &'a str,
+    code_revision: &'a str,
+}
+
+fn check_frozen_ready(
+    destination: &Store,
+    request: FrozenRequest<'_>,
+    access: Access<'_>,
+) -> Result<Option<(FeatureManifest, String)>, String> {
+    let key = binary_alpha_engine::dataset::manifest_key(request.generation);
+    if destination.head(&key)?.is_none() {
+        return Ok(None);
+    }
+    let (bytes, manifest) =
+        ready_feature(destination, request.generation, access).map_err(immutable_conflict)?;
+    if manifest.role != request.role
+        || manifest.input_generation != request.input_generation
+        || manifest.profile_generation != request.profile_generation
+        || manifest.frozen_from.as_deref() != Some(request.frozen_from)
+        || manifest.plan_identity != request.plan_identity
+    {
+        return Err(immutable_conflict(format!(
+            "{} does not match the frozen application request",
+            destination.uri(&key)
+        )));
+    }
+    let verified =
+        verify_frozen_before_revision(destination, &key, &bytes, &manifest, request.code_revision)?;
+    Ok(verified
+        .filter(|_| reusable_revision(request.code_revision))
+        .map(|verified| (manifest, verified)))
+}
+
 /// One cap is shared by outer stream work and its nested column work. Reserve at most a
 /// quarter of currently available memory for simultaneous tasks. The fallback is conservative
 /// on systems without Linux MemAvailable.
@@ -858,30 +897,22 @@ pub(crate) fn build(
     let receipt_key = request
         .as_ref()
         .map(|request| fit_receipt_key(&fit_request_digest(request)));
-    if let Some(frozen_from) = &frozen_from
-        && reusable_revision(CODE_REVISION)
-    {
+    if let Some(frozen_from) = &frozen_from {
         let generation = generation_of(&plan);
-        let key = binary_alpha_engine::dataset::manifest_key(&generation);
-        if destination.head(&key)?.is_some() {
-            let (bytes, manifest) =
-                ready_feature(destination, &generation, access).map_err(immutable_conflict)?;
-            if manifest.role != bound.input.role
-                || manifest.input_generation != bound.input.generation
-                || manifest.profile_generation != bound.stream_manifest.generation
-                || manifest.frozen_from.as_ref() != Some(frozen_from)
-                || manifest.plan_identity != plan.identity()
-            {
-                return Err(immutable_conflict(format!(
-                    "{} does not match the frozen application request",
-                    destination.uri(&key)
-                )));
-            }
-            if let Some(verified) =
-                verify_frozen_before_revision(destination, &key, &bytes, &manifest, CODE_REVISION)?
-            {
-                return Ok(reused_feature(manifest, plan, verified));
-            }
+        if let Some((manifest, verified)) = check_frozen_ready(
+            destination,
+            FrozenRequest {
+                generation: &generation,
+                role: bound.input.role,
+                input_generation: &bound.input.generation,
+                profile_generation: &bound.stream_manifest.generation,
+                frozen_from,
+                plan_identity: &plan.identity(),
+                code_revision: CODE_REVISION,
+            },
+            access,
+        )? {
+            return Ok(reused_feature(manifest, plan, verified));
         }
     } else if let (Some(request), Some(receipt_key)) = (&request, &receipt_key)
         && destination.head(receipt_key)?.is_some()
@@ -1428,18 +1459,68 @@ pub fn verify_feature(uri: &str, store: &Store, key: &str, bytes: &[u8]) -> Resu
 #[cfg(test)]
 mod tests {
     use super::{
-        FeatureParallelism, FitReceipt, reusable_revision, verify_frozen_before_revision,
-        write_fit_receipt,
+        FeatureParallelism, FitReceipt, FrozenRequest, check_frozen_ready, reusable_revision,
+        verify_frozen_before_revision, write_fit_receipt,
     };
     use crate::store::Store;
     use binary_alpha_engine::dataset::GenerationManifest;
     use binary_alpha_engine::features::FeatureManifest;
+    use binary_alpha_engine::research::Access;
 
     #[test]
     fn reuse_requires_a_unique_producer_revision() {
         assert!(reusable_revision("358940f"));
         assert!(!reusable_revision("358940f-dirty"));
         assert!(!reusable_revision("unavailable"));
+    }
+
+    #[test]
+    fn dirty_revision_checks_existing_frozen_request_and_objects() {
+        let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/legacy_schema1/published");
+        let bytes = std::fs::read(fixture.join(
+            "manifests/24409612301a6ee325fcdac35b37641c65cca1475a72f93b244f7df2efe79cc1/ready.json",
+        ))
+        .unwrap();
+        let mut manifest = FeatureManifest::from_json(&bytes).unwrap();
+        manifest.frozen_from = Some("original-frozen-plan".into());
+        let root = std::env::temp_dir().join(format!(
+            "binary-alpha-dirty-frozen-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let path = root.join(manifest.key());
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, manifest.to_json()).unwrap();
+        let destination = Store::filesystem(&root);
+        let request = |frozen_from| FrozenRequest {
+            generation: &manifest.generation,
+            role: manifest.role,
+            input_generation: &manifest.input_generation,
+            profile_generation: &manifest.profile_generation,
+            frozen_from,
+            plan_identity: &manifest.plan_identity,
+            code_revision: "test-dirty",
+        };
+        let mismatch = check_frozen_ready(
+            &destination,
+            request("another-frozen-plan"),
+            Access::ORDINARY,
+        )
+        .unwrap_err();
+        assert!(mismatch.contains("immutable feature generation conflict"));
+        assert!(mismatch.contains("does not match the frozen application request"));
+        let corrupt = check_frozen_ready(
+            &destination,
+            request("original-frozen-plan"),
+            Access::ORDINARY,
+        )
+        .unwrap_err();
+        assert!(corrupt.contains("immutable feature generation conflict"));
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
