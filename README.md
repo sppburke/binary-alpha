@@ -15,8 +15,9 @@ builds feature and future-only outcome generations, replays governed historical 
 one execution engine into a reconstructable financial ledger, runs candidate search and portfolio
 selection, runs the one-command study to an awaiting state and, under a separately created grant,
 to one certification result, and verifies every kind of generation. The accelerator supplies thirteen retained device
-kernels and their deterministic
-central-processor references; it has no production consumer. Phase 12 implements the ordered live
+kernels and their deterministic central-processor references. Offline search screens batches on
+every configured `[accelerator] devices` entry; the accelerator has no production execution
+consumer. Phase 12 implements the ordered live
 runtime, baseline projection, journal, cooperative lease/claim control, immutable authorization,
 recorded replay, deployment manifests, compatibility receipts, and live commands;
 see [Live runtime](docs/contracts.md#live-runtime). Browser-driven operation, click execution, and any live, paper, certification,
@@ -65,14 +66,17 @@ events, and encoded rows as a feature generation; `binary-alpha outcomes build -
 labels every decision row of the `[outcomes]` feature generation against its observation generation
 under the [outcome binding](docs/contracts.md#outcomes) and publishes the future-only outcome generation;
 `binary-alpha replay --config PATH` feeds the `[replay]` inputs through the engine with the configured simulation and publishes the ledger and
-summary as a replay generation; `binary-alpha search --config PATH` enumerates, scores, replays,
-evaluates, and resamples one candidate family and publishes it; `binary-alpha portfolio optimize
+summary as a replay generation; `binary-alpha search --config PATH` expands generated conditions
+(`output = "*"`), screens candidates in batches, replays, evaluates, and resamples one candidate
+family, and publishes only schema-2 survivors; `binary-alpha portfolio optimize
 --config PATH` enumerates every declared complete joint policy over development-only families,
 replays each one jointly per inner fold through the engine, selects under the frozen objective,
 refits, optionally evaluates once, and publishes one selection generation; `binary-alpha research
-run --config PATH` runs the one-command study over the declared historical generations to one
-immutable awaiting state and, once the separately created grant exists, resumes to one certified or
-rejected result; `binary-alpha holdout grant create` is the operator-only authorization that never
+run --config PATH` runs the one-command study over the declared historical generations, can derive
+members from `[portfolio.generate]`, and applies configured `min_decisive` and `min_win_rate` gates
+to folds, evaluation, and holdout. A passing evaluation reaches an immutable awaiting state; once
+the separately created grant exists, the run resumes to one certified or rejected result;
+`binary-alpha holdout grant create` is the operator-only authorization that never
 opens holdout data; `binary-alpha data verify --manifest URI` re-reads one generation of any kind
 from its manifest and objects alone, with `--config PATH` permitting the target through the
 configuration's governance declaration before it is opened.
@@ -124,7 +128,16 @@ supports the workflow's background and parallel steps. The workflow supplies
 `BINARY_ALPHA_CUDA_REFERENCE=/mnt/data/binary-alpha-phase07-reference/attempt5/reference.json`.
 For manual runs, export the same variables in the runner process environment; the governed wrapper
 must resolve its existing development inputs and reference files. `BINARY_ALPHA_CUDA_ARCH` is
-optional and defaults to the proved `sm_120` target. The workflow never regenerates expectations.
+optional and defaults to `sm_120`. Set it at build time for a rented GPU, for example
+`BINARY_ALPHA_CUDA_ARCH=sm_90`. A binary with no compatible image fails at device open.
+
+CUDA search tuning is process scoped and leaves configuration and family identities unchanged.
+`BINARY_ALPHA_SCREEN_THREADS_PER_BLOCK` selects a warp-multiple launch width;
+`BINARY_ALPHA_SCREEN_BATCH_SIZE` selects candidates per batch;
+`BINARY_ALPHA_SCREEN_MEMORY_BUDGET_BYTES` caps the free-memory budget; and
+`BINARY_ALPHA_CUDA_RESERVATION_UNIT_BYTES` overrides the measured allocator-unit planning
+hint. Invalid values fail before screening. The search report records each chosen value
+and its source. The workflow never regenerates expectations.
 The authorized offline setup and runner rollback are recorded in [operations](docs/operations.md).
 
 ## Layout
@@ -134,7 +147,7 @@ The authorized offline setup and runner rollback are recorded in [operations](do
 | `crates/engine` | Package `binary-alpha-engine`: configuration validation and identity, immutable tick and bar records, dataset roles and capabilities, generation identity, ready manifests, the instrument stream with its profile, candles, and stream manifest, the feature engine and frozen plans, future-only outcome labels, and the execution engine with exact money, its ledger, and its summaries. No files, network, cloud, broker, command-line, or device calls. |
 | `crates/app` | Package `binary-alpha-app`: the `binary-alpha` executable, configuration loading, historical-data import, instrument audit, feature and outcome builds, replay, verification, Parquet input and output, the filesystem and Google Cloud Storage artifact stores, and all other external adapters. |
 | `crates/app/schemas` | Pinned used Deriv schema subset, release and digest provenance; no build-time download. |
-| `crates/accelerator` | Package `binary-alpha-accelerator`: the thirteen retained device kernels, the ahead-of-time CUDA build behind the `cuda` feature, the device host over cudarc, and the central-processor reference of every kernel. No engine or application dependency. |
+| `crates/accelerator` | Package `binary-alpha-accelerator`: thirteen retained device kernels plus fused screening, the ahead-of-time CUDA build behind the `cuda` feature, the device host over cudarc, and the central-processor reference of the retained kernels. No engine or application dependency. |
 | `configs/example.toml` | The checked-in example configuration; it contains only implemented fields, one instrument, and no credentials. |
 | `docs/` | [architecture](docs/architecture.md), [contracts](docs/contracts.md), [migration map](docs/migration-map.md), and [operations](docs/operations.md). |
 

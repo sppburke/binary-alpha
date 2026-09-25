@@ -386,14 +386,52 @@ impl Certification {
 pub struct Access<'a> {
     pub declaration: Option<&'a Declaration>,
     pub certification: Option<&'a Certification>,
-    /// Manifests this phase has already verified, by URI, with each verifier summary. A phase
+    /// Manifests this phase has already verified, by URI and authorization context, with each
+    /// verifier summary. A phase
     /// that holds the store's writer lock verifies a manifest once however many closures
     /// share it; a phase that must observe fresh state starts an empty memo.
     pub verified: Option<&'a Verified>,
 }
 
-/// The memo behind [`Access::verified`].
-pub type Verified = std::sync::Mutex<std::collections::BTreeMap<String, String>>;
+/// The command-owned memo behind [`Access::verified`]. Device ordinals affect only the
+/// computation used to verify schema-2 families, never their recorded identity.
+#[derive(Debug, Default)]
+pub struct Verified {
+    summaries: std::sync::Mutex<std::collections::BTreeMap<String, String>>,
+    devices: Option<Vec<usize>>,
+    family_rescores: std::sync::atomic::AtomicUsize,
+}
+
+impl Verified {
+    pub fn with_devices(devices: Option<Vec<usize>>) -> Self {
+        Self {
+            summaries: std::sync::Mutex::default(),
+            devices,
+            family_rescores: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+
+    pub fn devices(&self) -> Option<&[usize]> {
+        self.devices.as_deref()
+    }
+
+    pub fn family_rescores(&self) -> usize {
+        self.family_rescores
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub fn note_family_rescore(&self) {
+        self.family_rescores
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub fn lock(
+        &self,
+    ) -> std::sync::LockResult<std::sync::MutexGuard<'_, std::collections::BTreeMap<String, String>>>
+    {
+        self.summaries.lock()
+    }
+}
 
 impl Access<'_> {
     /// An ordinary reader: development and evaluation only, checked on the manifest after it
@@ -634,6 +672,14 @@ pub fn validate(research: &Research) -> Result<(), String> {
     if research.study.changes.is_empty() {
         return Err("study.changes: the declared changes are required; `initial attempt` names a first attempt".to_string());
     }
+    if research
+        .portfolio
+        .generate
+        .as_ref()
+        .is_some_and(|rule| rule.top == 0)
+    {
+        return Err("portfolio.generate.top: must be positive".into());
+    }
     for (index, predecessor) in research.study.predecessors.iter().enumerate() {
         identifier(&format!("study.predecessors[{index}]"), predecessor)?;
         if *predecessor == research.study.attempt {
@@ -784,6 +830,26 @@ pub fn validate(research: &Research) -> Result<(), String> {
         .map(|uri| (uri.generation().to_string(), uri.clone()))
         .collect();
     let base = portfolio_table(research, sources, &profiles, &research.evaluation)?;
+    validate_resolved_portfolio(research, &base)?;
+    // Each later window's own splits under the execution rules, before any claim is consumed.
+    for (name, window) in [
+        ("evaluation", &research.evaluation),
+        ("holdout", &research.holdout),
+    ] {
+        let start = crate::market::parse_event_time_micros(&window.decision_start)
+            .map_err(|reason| format!("{name}.decision_start: {reason}"))?;
+        let end = crate::market::parse_event_time_micros(&window.decision_end)
+            .map_err(|reason| format!("{name}.decision_end: {reason}"))?;
+        crate::execution::validate_splits(window.splits.as_deref().unwrap_or(&[]), start, end)
+            .map_err(|reason| format!("{name}.{reason}"))?;
+    }
+    Ok(())
+}
+
+/// Checks the complete research portfolio under the base, holdout, qualification and every
+/// declared scenario. Called once with unresolved generated members for syntax, and again after
+/// verified development families resolve them, before folds.
+pub fn validate_resolved_portfolio(research: &Research, base: &Portfolio) -> Result<(), String> {
     base.validate()
         .map_err(|reason| format!("portfolio.{reason}"))?;
     Portfolio {
@@ -814,18 +880,6 @@ pub fn validate(research: &Research) -> Result<(), String> {
         table
             .validate()
             .map_err(|reason| format!("scenarios[{index}]: portfolio.{reason}"))?;
-    }
-    // Each later window's own splits under the execution rules, before any claim is consumed.
-    for (name, window) in [
-        ("evaluation", &research.evaluation),
-        ("holdout", &research.holdout),
-    ] {
-        let start = crate::market::parse_event_time_micros(&window.decision_start)
-            .map_err(|reason| format!("{name}.decision_start: {reason}"))?;
-        let end = crate::market::parse_event_time_micros(&window.decision_end)
-            .map_err(|reason| format!("{name}.decision_end: {reason}"))?;
-        crate::execution::validate_splits(window.splits.as_deref().unwrap_or(&[]), start, end)
-            .map_err(|reason| format!("{name}.{reason}"))?;
     }
     Ok(())
 }
@@ -953,6 +1007,7 @@ pub fn portfolio_table(
     }
     Ok(Portfolio {
         families,
+        generate: settings.generate.clone(),
         max_policies: settings.max_policies,
         embargo_micros: settings.embargo_micros,
         objective: settings.objective,
@@ -962,10 +1017,18 @@ pub fn portfolio_table(
         reporting_scale: settings.reporting_scale,
         max_rate_age_micros: settings.max_rate_age_micros,
         rates: settings.rates.clone(),
-        members: settings.members.clone(),
+        members: if settings.generate.is_some() {
+            Vec::new()
+        } else {
+            settings.members.clone()
+        },
         repairs: settings.repairs.clone(),
         bindings: settings.bindings.clone(),
-        subsets: settings.subsets.clone(),
+        subsets: if settings.generate.is_some() {
+            Vec::new()
+        } else {
+            settings.subsets.clone()
+        },
         risk_policies: settings.risk_policies.clone(),
         folds,
         refit: crate::config::Refit {
@@ -1303,6 +1366,9 @@ pub fn verdict(projection: &Projection, gates: &Gates) -> Verdict {
             projection.unresolved, gates.max_unresolved
         ));
     }
+    if let Some(reason) = crate::portfolio::decisive_support_failure(projection, gates) {
+        return insufficient(reason);
+    }
     if projection.profit.is_none() {
         return insufficient(
             projection
@@ -1317,12 +1383,17 @@ pub fn verdict(projection: &Projection, gates: &Gates) -> Verdict {
             projection.unavailable_observations
         ));
     }
-    match &projection.failure {
-        Some(reason) => Verdict::EconomicFailure {
+    if let Some(reason) = &projection.failure {
+        return Verdict::EconomicFailure {
             reason: reason.clone(),
-        },
-        None => Verdict::Pass,
+        };
     }
+    if let Some(reason) = crate::portfolio::decisive_rate_failure(projection, gates)
+        .expect("validated win rate and u64 counts fit checked decimal arithmetic")
+    {
+        return Verdict::EconomicFailure { reason };
+    }
+    Verdict::Pass
 }
 
 /// The complete frozen scenario set aggregated once: any insufficient scenario makes the
@@ -1661,12 +1732,39 @@ pub fn certification_generation_id(research: &str, grant_hash: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::{GeneratedSearchCondition, SearchCondition};
     use crate::dataset::ObjectRole;
     use crate::execution::Decimal;
     use crate::portfolio::ReplayRef;
 
     fn decimal(text: &str) -> Decimal {
         Decimal::parse(text).unwrap()
+    }
+
+    #[test]
+    fn research_validates_generation_rule_syntax_before_binding_a_plan() {
+        let config = Config::parse(include_str!(
+            "../../app/tests/fixtures/legacy_schema1/research.toml"
+        ))
+        .unwrap();
+        let mut research = config.research.unwrap();
+        let stream = research.instruments[0].search.base_stream;
+        research.instruments[0].search.conditions =
+            vec![SearchCondition::Generate(GeneratedSearchCondition {
+                stream,
+                output: "*".into(),
+                comparator: crate::execution::Comparator::Eq,
+            })];
+        research.validate().unwrap();
+        if let SearchCondition::Generate(rule) = &mut research.instruments[0].search.conditions[0] {
+            rule.output = "candle_direction".into();
+        }
+        assert!(
+            research
+                .validate()
+                .unwrap_err()
+                .contains("generation rule requires output `*`")
+        );
     }
 
     fn generation(byte: u8) -> String {
@@ -1761,6 +1859,7 @@ mod tests {
             "contracts":[contract,second],"risk_policies":[risk]
         })).unwrap();
         let selection = Selection {
+            schema_version: 1,
             config: config.clone(),
             families: Vec::new(),
             members: Vec::new(),
@@ -2332,6 +2431,9 @@ mod tests {
         Projection {
             settled,
             unresolved: 0,
+            wins: None,
+            losses: None,
+            ties: None,
             valued_at: None,
             profit: profit.map(decimal),
             rates: BTreeSet::new(),
@@ -2347,6 +2449,8 @@ mod tests {
             max_unresolved: 0,
             min_profit: decimal("1"),
             max_drawdown: decimal("5"),
+            min_decisive: None,
+            min_win_rate: None,
         }
     }
 
@@ -2428,6 +2532,84 @@ mod tests {
             }
         );
         assert_eq!(mixed.reason(), Some("insufficient_evidence"));
+    }
+
+    #[test]
+    fn tie_only_projection_keeps_its_verdict_without_decisive_gates() {
+        let mut gates = gates();
+        gates.min_profit = decimal("0");
+        let mut ties = projection(3, Some("0"), Some("0"), 0, None);
+        assert_eq!(verdict(&ties, &gates), Verdict::Pass);
+        ties.wins = Some(0);
+        ties.losses = Some(0);
+        ties.ties = Some(3);
+        gates.min_decisive = Some(1);
+        assert!(matches!(
+            verdict(&ties, &gates),
+            Verdict::InsufficientEvidence { reason } if reason.contains("decisive trades 0")
+        ));
+        gates.min_decisive = None;
+        gates.min_win_rate = Some(decimal("0.5"));
+        assert!(matches!(
+            verdict(&ties, &gates),
+            Verdict::InsufficientEvidence { reason } if reason.contains("zero is insufficient")
+        ));
+    }
+
+    #[test]
+    fn decisive_verdicts_follow_existing_support_gates() {
+        let mut gates = gates();
+        gates.min_decisive = Some(2);
+        gates.min_win_rate = Some(decimal("0.5"));
+        let mut result = projection(3, Some("1"), Some("0"), 0, None);
+        result.wins = Some(1);
+        result.losses = Some(0);
+        result.ties = Some(2);
+        assert!(matches!(
+            verdict(&result, &gates),
+            Verdict::InsufficientEvidence { reason } if reason.contains("decisive trades 1")
+        ));
+        result.settled = 1;
+        assert!(matches!(
+            verdict(&result, &gates),
+            Verdict::InsufficientEvidence { reason } if reason.contains("settled 1")
+        ));
+        result.settled = 3;
+        result.unresolved = 1;
+        assert!(matches!(
+            verdict(&result, &gates),
+            Verdict::InsufficientEvidence { reason } if reason.contains("unresolved 1")
+        ));
+        result.unresolved = 0;
+        result.losses = Some(2);
+        result.ties = Some(0);
+        result.profit = None;
+        assert!(matches!(
+            verdict(&result, &gates),
+            Verdict::InsufficientEvidence { reason } if reason.contains("profit is unavailable")
+        ));
+        result.profit = Some(decimal("1"));
+        result.unavailable_observations = 1;
+        assert!(matches!(
+            verdict(&result, &gates),
+            Verdict::InsufficientEvidence { reason } if reason.contains("drawdown is unavailable")
+        ));
+        result.unavailable_observations = 0;
+        assert!(matches!(
+            verdict(&result, &gates),
+            Verdict::EconomicFailure { reason } if reason.contains("1/3")
+        ));
+        result.losses = Some(1);
+        result.ties = Some(1);
+        assert_eq!(verdict(&result, &gates), Verdict::Pass);
+        result.wins = Some(0);
+        result.losses = Some(0);
+        gates.min_decisive = None;
+        gates.min_win_rate = Some(decimal("0"));
+        assert!(matches!(
+            verdict(&result, &gates),
+            Verdict::InsufficientEvidence { reason } if reason.contains("zero is insufficient")
+        ));
     }
 
     #[test]

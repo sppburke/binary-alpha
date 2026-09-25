@@ -1,5 +1,8 @@
 # Kernel sources
 
+`score_screen_fused.cu` is the Phase 2 screening kernel added after the thirteen preserved
+symbols. It has no legacy source digest; the preserved source files remain unchanged.
+
 The original digests below identify the thirteen extracted string payloads, including whitespace,
 from legacy commit `b509964cd1c40180e9d98b0e55a95699b0abe9ed`. The order below is the
 module build order. Only `replay_policies` carried the legacy compile option

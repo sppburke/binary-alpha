@@ -1,0 +1,126 @@
+{
+  "events": 6,
+  "last_time_micros": 1767574840000000,
+  "accounts": [
+    {
+      "id": "a0",
+      "currency": "unit",
+      "scale": 2,
+      "cash": "10000.00",
+      "reserved": "0.00",
+      "paid_basis": "0.00",
+      "unresolved_loss": "0.00",
+      "completed_profit": "0.00",
+      "epoch_peak": "0.00",
+      "lifetime_peak": "0.00",
+      "max_drawdown": "0.00",
+      "open": 0
+    },
+    {
+      "id": "a1",
+      "currency": "eur",
+      "scale": 2,
+      "cash": "10001.55",
+      "reserved": "0.00",
+      "paid_basis": "0.00",
+      "unresolved_loss": "0.00",
+      "completed_profit": "1.55",
+      "epoch_peak": "1.55",
+      "lifetime_peak": "1.55",
+      "max_drawdown": "0.00",
+      "open": 0
+    }
+  ],
+  "portfolio": {
+    "signals": 2,
+    "dispositions": {
+      "admitted": 1,
+      "repair_blocked": 1
+    },
+    "accepted": 1,
+    "released": 0,
+    "settled": 1,
+    "wins": 1,
+    "losses": 0,
+    "ties": 0,
+    "unresolved": 0,
+    "open": 0,
+    "profit": {
+      "eur": "1.55"
+    }
+  },
+  "strategies": {
+    "d0": {
+      "signals": 2,
+      "dispositions": {
+        "admitted": 1,
+        "repair_blocked": 1
+      },
+      "accepted": 1,
+      "released": 0,
+      "settled": 1,
+      "wins": 1,
+      "losses": 0,
+      "ties": 0,
+      "unresolved": 0,
+      "open": 0,
+      "profit": {
+        "eur": "1.55"
+      }
+    }
+  },
+  "durations": {
+    "5000000": {
+      "signals": 2,
+      "dispositions": {
+        "admitted": 1,
+        "repair_blocked": 1
+      },
+      "accepted": 1,
+      "released": 0,
+      "settled": 1,
+      "wins": 1,
+      "losses": 0,
+      "ties": 0,
+      "unresolved": 0,
+      "open": 0,
+      "profit": {
+        "eur": "1.55"
+      }
+    }
+  },
+  "instruments": {
+    "pocket_option:SECOND_otc": {
+      "signals": 2,
+      "dispositions": {
+        "admitted": 1,
+        "repair_blocked": 1
+      },
+      "accepted": 1,
+      "released": 0,
+      "settled": 1,
+      "wins": 1,
+      "losses": 0,
+      "ties": 0,
+      "unresolved": 0,
+      "open": 0,
+      "profit": {
+        "eur": "1.55"
+      }
+    }
+  },
+  "splits": {},
+  "reporting": {
+    "currency": "unit",
+    "scale": 2,
+    "settled_equity": "30003.10",
+    "unresolved_loss": "0.00",
+    "peak_equity": "30003.10",
+    "max_drawdown": "0.00",
+    "observations": 5,
+    "unavailable_observations": 0,
+    "used_rates": [
+      "eur-unit"
+    ]
+  }
+}

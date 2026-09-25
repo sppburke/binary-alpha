@@ -25,6 +25,7 @@ use binary_alpha_engine::config::{
 };
 use binary_alpha_engine::dataset::{DatasetRole, ObjectRecord, ObjectRole, manifest_key};
 use binary_alpha_engine::execution::ReplayInput;
+use binary_alpha_engine::features::FeaturePlan;
 use binary_alpha_engine::market::format_event_time_micros;
 use binary_alpha_engine::outcomes::{
     OUTCOME_MANIFEST_KIND, OutcomeManifest, OutcomeRule, outcome_generation_id,
@@ -218,6 +219,7 @@ struct Study<'a> {
     identity: String,
     governance: Store,
     generation: String,
+    verified: binary_alpha_engine::research::Verified,
 }
 
 impl Study<'_> {
@@ -225,7 +227,7 @@ impl Study<'_> {
         Access {
             declaration: Some(&self.declaration),
             certification: None,
-            verified: None,
+            verified: Some(&self.verified),
         }
     }
 
@@ -547,6 +549,7 @@ fn bind(config: &Config) -> Result<Study<'_>, String> {
         identity,
         governance,
         generation,
+        verified: crate::verification_cache(Some(config)),
     })
 }
 
@@ -649,8 +652,11 @@ fn selection_table(
     research: &Research,
     families: Vec<ManifestUri>,
     profiles: &BTreeMap<String, ManifestUri>,
+    access: Access<'_>,
 ) -> Result<Portfolio, String> {
     let mut table = engine::portfolio_table(research, families, profiles, &research.evaluation)?;
+    portfolio::resolve_generated(&mut table, access)?;
+    engine::validate_resolved_portfolio(research, &table)?;
     table.evaluation = None;
     Ok(table)
 }
@@ -807,6 +813,7 @@ fn develop(
             &portfolio::features_config(config, &fit),
             local,
             destination,
+            access,
         )?;
         report(&built.report)?;
         let feature = ready_uri(destination, &built.manifest.generation)?;
@@ -849,6 +856,23 @@ fn develop(
             family: searched.generation,
         });
     }
+    if research.portfolio.generate.is_some() {
+        // Portfolio lowering needs profile URIs for fold and refit fits, but generation and
+        // static validation do not read those profiles. Bind their declared URIs provisionally
+        // so a bad generated portfolio fails before any of their audits publish.
+        let mut provisional = profiles.clone();
+        for fit in research
+            .folds
+            .iter()
+            .flat_map(|fold| fold.inputs.iter().map(|input| &input.fit_manifest))
+            .chain(research.refit.fits.iter())
+        {
+            provisional
+                .entry(fit.generation().to_string())
+                .or_insert_with(|| fit.clone());
+        }
+        selection_table(research, families.clone(), &provisional, access)?;
+    }
     for fit in research
         .folds
         .iter()
@@ -869,7 +893,7 @@ fn develop(
 
     // 3. The existing portfolio owner selects with evaluation disabled.
     let selecting = Instant::now();
-    let table = selection_table(research, families, &profiles)?;
+    let table = selection_table(research, families, &profiles, access)?;
     let selected = portfolio::select(&portfolio_config(config, table), local, destination, access)?;
     report(&selected.report)?;
     clock.selection = selecting.elapsed().as_secs_f64();
@@ -1227,7 +1251,7 @@ fn certify(
     let access = Access {
         declaration: Some(&study.declaration),
         certification: Some(&certification),
-        verified: None,
+        verified: Some(&study.verified),
     };
 
     // A completed result under this grant is terminal: verify it in context and return.
@@ -1543,6 +1567,15 @@ pub fn verify_run(
     };
     let selection =
         verified_children(uri, store, config, &run.instruments, &run.selection, access)?;
+    if matches!(
+        selection.state,
+        State::NoFeasiblePolicy | State::RefitInapplicable { .. }
+    ) && (!run.claims.is_empty() || !run.outer.is_empty())
+    {
+        return Err(format!(
+            "{uri}: a non-selected run cannot carry outer claims and results"
+        ));
+    }
     // The state and, for a selected policy, the outer claims and every scenario.
     let expected_state = match &selection.state {
         State::NoFeasiblePolicy => RunState::NoFeasiblePolicy,
@@ -1675,7 +1708,14 @@ fn verified_children(
         }
         let plan = features::fitted_plan(uri, &feature_store, &feature)?;
         let fit = engine::fit_entry(instrument, source, profile);
-        if *features::resolve(&fit, access)?.plan() != plan.unfitted() {
+        let resolved = features::resolve(&fit, access)?;
+        let recorded = FeaturePlan::resolve_with_definitions(
+            &fit,
+            resolved.plan().profile.clone(),
+            &resolved.plan().development_generation,
+            plan.definitions.clone(),
+        )?;
+        if recorded != plan.unfitted() {
             return Err(format!(
                 "{uri}: feature generation {} is not the configured fit of {}",
                 record.feature, record.instrument
@@ -1756,7 +1796,8 @@ fn verified_children(
         &read_key(store, &selection_key)?,
         access,
     )?;
-    let expected = portfolio_config(config, selection_table(research, families, &profiles)?);
+    let table = selection_table(research, families, &profiles, access)?;
+    let expected = portfolio_config(config, table);
     if selected.config != expected {
         return Err(format!(
             "{uri}: selection generation {selection} is not the selection this configuration lowers"

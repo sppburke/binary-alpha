@@ -19,11 +19,14 @@ use crate::execution::{
     AccountSpec, Condition, ContractTerms, Decimal, DeploymentBinding, Disposition, EventKind,
     FinancialEvent, Group, Resolution, SettlementRule, StrategySpec, signal_logic_identity,
 };
+use crate::features::{FeaturePlan, Kind};
 use crate::market::parse_event_time_micros;
 
 /// The manifest kind of a published search family.
 pub const FAMILY_MANIFEST_KIND: &str = "search_family";
 pub const FAMILY_SCHEMA_VERSION: u32 = 1;
+/// Survivor-only family format written by search; schema 1 remains readable.
+pub const STREAMED_FAMILY_SCHEMA_VERSION: u32 = 2;
 /// The one object of a family generation.
 pub const FAMILY_OBJECT_PATH: &str = "family.json";
 /// The frozen sampler identity recorded with every stability result.
@@ -62,10 +65,25 @@ pub fn validate(search: &Search) -> Result<(), String> {
         return Err("conditions: at least one menu entry is required".to_string());
     }
     for (index, entry) in search.conditions.iter().enumerate() {
-        if entry.thresholds.is_empty() {
-            return Err(format!(
-                "conditions[{index}].thresholds: at least one threshold is required"
-            ));
+        match entry {
+            SearchCondition::Named(entry) if entry.thresholds.is_empty() => {
+                return Err(format!(
+                    "conditions[{index}].thresholds: at least one threshold is required"
+                ));
+            }
+            SearchCondition::Named(entry) if entry.output == "*" => {
+                return Err(format!(
+                    "conditions[{index}].output: `*` requires a generation rule without thresholds"
+                ));
+            }
+            SearchCondition::Generate(entry)
+                if entry.output != "*" || entry.comparator != crate::execution::Comparator::Eq =>
+            {
+                return Err(format!(
+                    "conditions[{index}]: a generation rule requires output `*` and comparator `eq`"
+                ));
+            }
+            _ => {}
         }
     }
     if search.contracts.is_empty() {
@@ -140,26 +158,12 @@ pub fn validate(search: &Search) -> Result<(), String> {
             return Err(format!("stability.{name}: must be positive"));
         }
     }
-    let conditions = conditions(&search.conditions);
-    if search.max_conditions as usize > conditions.len() {
-        return Err(format!(
-            "max_conditions: {} exceeds the {} distinct conditions of the menu",
-            search.max_conditions,
-            conditions.len()
-        ));
-    }
-    let size = family_size(
-        conditions.len(),
-        search.min_conditions as usize,
-        search.max_conditions as usize,
-        search.contracts.len(),
-    )
-    .ok_or("conditions: the family size overflows")?;
-    if size > search.max_candidates {
-        return Err(format!(
-            "max_candidates: the menu enumerates {size} members, above the maximum {}",
-            search.max_candidates
-        ));
+    let generated = search
+        .conditions
+        .iter()
+        .any(|entry| matches!(entry, SearchCondition::Generate(_)));
+    if !generated {
+        validate_size(search, conditions(&search.conditions).len(), false)?;
     }
     if search.embargo_micros < 0 {
         return Err("embargo_micros: must not be negative".to_string());
@@ -185,7 +189,18 @@ pub fn validate(search: &Search) -> Result<(), String> {
         return Err("evaluation.splits: `none` names the undeclared split".to_string());
     }
     let placeholder_instrument = format!("{}:validation", search.account.broker);
-    let lowering = lowering_replay(search, "validation", &placeholder_instrument);
+    let placeholder = [Condition {
+        stream: search.base_stream,
+        output: "validation_only".into(),
+        comparator: crate::execution::Comparator::Eq,
+        threshold: crate::execution::Threshold::Bool(true),
+    }];
+    let named = conditions(&search.conditions);
+    let lowering = if generated && named.is_empty() {
+        lowering_replay_for(search, "validation", &placeholder_instrument, &placeholder)
+    } else {
+        lowering_replay_for(search, "validation", &placeholder_instrument, &named)
+    };
     crate::execution::validate(&lowering)?;
     if let Some(evaluation) = &search.evaluation {
         let development_end = parse_event_time_micros(&search.development.decision_end)?;
@@ -214,6 +229,193 @@ pub fn validate(search: &Search) -> Result<(), String> {
     Ok(())
 }
 
+fn validate_size(search: &Search, count: usize, allow_short: bool) -> Result<u64, String> {
+    if !allow_short && search.max_conditions as usize > count {
+        return Err(format!(
+            "max_conditions: {} exceeds the {} distinct conditions of the menu",
+            search.max_conditions, count
+        ));
+    }
+    let size = family_size(
+        count,
+        search.min_conditions as usize,
+        search.max_conditions as usize,
+        search.contracts.len(),
+    )
+    .ok_or("conditions: the family size overflows")?;
+    if size > search.max_candidates {
+        return Err(format!(
+            "max_candidates: the menu enumerates {size} members, above the maximum {}",
+            search.max_candidates
+        ));
+    }
+    Ok(size)
+}
+
+/// The ordered concrete table and its canonical identity, available to search and verification.
+#[derive(Debug)]
+pub struct ResolvedConditions {
+    pub conditions: Vec<Condition>,
+    pub hash: String,
+    pub members: u64,
+}
+
+/// Resolve all generation rules against the frozen development plan, then validate the complete
+/// lowering table and bound family size before any candidate allocation.
+pub fn resolve_conditions(
+    search: &Search,
+    plan: &FeaturePlan,
+) -> Result<ResolvedConditions, String> {
+    validate(search)?;
+    let mut resolved = Vec::new();
+    for (index, entry) in search.conditions.iter().enumerate() {
+        match entry {
+            SearchCondition::Named(entry) => {
+                for threshold in &entry.thresholds {
+                    let condition = Condition {
+                        stream: entry.stream,
+                        output: entry.output.clone(),
+                        comparator: entry.comparator,
+                        threshold: threshold.clone(),
+                    };
+                    if !resolved.contains(&condition) {
+                        resolved.push(condition);
+                    }
+                }
+            }
+            SearchCondition::Generate(rule) => {
+                let stream = plan.stream(rule.stream).ok_or_else(|| {
+                    format!(
+                        "conditions[{index}].stream: {} is not in the development plan",
+                        rule.stream
+                    )
+                })?;
+                for encoding in &stream.encodings {
+                    if encoding.labels.len() <= 1
+                        || stream
+                            .outputs
+                            .iter()
+                            .any(|output| output.name == encoding.output)
+                    {
+                        continue;
+                    }
+                    let unready = &plan.readiness_of(&encoding.input).unready;
+                    for label in &encoding.labels {
+                        if !crate::features::coded_label(label) || unready.contains(label) {
+                            continue;
+                        }
+                        let condition = Condition {
+                            stream: rule.stream,
+                            output: encoding.output.clone(),
+                            comparator: crate::execution::Comparator::Eq,
+                            threshold: crate::execution::Threshold::Text(label.clone()),
+                        };
+                        if !resolved.contains(&condition) {
+                            resolved.push(condition);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    for (index, condition) in resolved.iter().enumerate() {
+        let stream = plan.stream(condition.stream).ok_or_else(|| {
+            format!(
+                "resolved conditions[{index}].stream: {} is not in the development plan",
+                condition.stream
+            )
+        })?;
+        let (kind, source) = if let Some(output) = stream
+            .outputs
+            .iter()
+            .find(|output| output.name == condition.output)
+        {
+            (output.kind, output.name.as_str())
+        } else if let Some(encoding) = stream
+            .encodings
+            .iter()
+            .find(|encoding| encoding.output == condition.output)
+        {
+            if !stream
+                .outputs
+                .iter()
+                .any(|output| output.name == encoding.input)
+            {
+                return Err(format!(
+                    "resolved conditions[{index}].output: encoding `{}` has no compiled input `{}`",
+                    encoding.output, encoding.input
+                ));
+            }
+            (Kind::Text, encoding.input.as_str())
+        } else {
+            return Err(format!(
+                "resolved conditions[{index}].output: `{}` is not a compiled output or fitted encoding of stream {}",
+                condition.output, condition.stream
+            ));
+        };
+        if !matches!(
+            (&condition.threshold, kind),
+            (crate::execution::Threshold::Text(_), Kind::Text)
+                | (crate::execution::Threshold::Bool(_), Kind::Bool)
+                | (
+                    crate::execution::Threshold::Number(_),
+                    Kind::Int | Kind::Float | Kind::Time
+                )
+        ) {
+            return Err(format!(
+                "resolved conditions[{index}]: `{}` is a {kind} output; the threshold type does not match",
+                condition.output
+            ));
+        }
+        for flag in plan.readiness_of(source).flags {
+            if !stream.outputs.iter().any(|output| output.name == flag)
+                && !stream
+                    .encodings
+                    .iter()
+                    .any(|encoding| encoding.output == flag)
+            {
+                return Err(format!(
+                    "resolved conditions[{index}].output: readiness flag `{flag}` of `{}` is absent from stream {}",
+                    condition.output, condition.stream
+                ));
+            }
+        }
+    }
+    let members = validate_size(search, resolved.len(), true)?;
+    let placeholder = format!("{}:validation", search.account.broker);
+    let lowering = lowering_replay_for(search, "validation", &placeholder, &resolved);
+    // An empty resolved table has no replay strategies; the next stage publishes an empty family.
+    if !resolved.is_empty() {
+        crate::execution::validate(&lowering)?;
+    }
+    if let Some(evaluation) = &search.evaluation {
+        let members: Vec<_> = lowering
+            .strategies
+            .into_iter()
+            .map(|strategy| (strategy.id.clone(), strategy, 0))
+            .collect();
+        if !members.is_empty() {
+            crate::execution::validate(&replay_table(
+                search,
+                DatasetRole::Evaluation,
+                evaluation,
+                &placeholder,
+                &members,
+                search.account.initial_cash,
+            ))
+            .map_err(|reason| format!("evaluation.{reason}"))?;
+        }
+    }
+    let mut hasher = Sha256::new();
+    hasher.update(b"binary-alpha resolved search conditions v1\n");
+    hasher.update(serde_json::to_vec(&resolved).expect("conditions serialize"));
+    Ok(ResolvedConditions {
+        conditions: resolved,
+        hash: crate::hex(&hasher.finalize()),
+        members,
+    })
+}
+
 /// The contract with every amount normalized, so equal money written at different scales
 /// compares equal.
 fn normalized_terms(contract: &ContractTerms) -> ContractTerms {
@@ -236,19 +438,27 @@ fn normalized_terms(contract: &ContractTerms) -> ContractTerms {
 /// account and one single-condition strategy per condition, so every base row where a
 /// condition holds is a `signal` record and nothing is ever funded.
 pub fn lowering_replay(search: &Search, plan_identity: &str, instrument: &str) -> Replay {
-    let conditions = conditions(&search.conditions);
+    lowering_replay_for(
+        search,
+        plan_identity,
+        instrument,
+        &conditions(&search.conditions),
+    )
+}
+
+/// Lower an already resolved table; unlike menu lowering, this includes generated conditions.
+pub fn lowering_replay_for(
+    search: &Search,
+    plan_identity: &str,
+    instrument: &str,
+    conditions: &[Condition],
+) -> Replay {
     let members: Vec<(String, StrategySpec, usize)> = (0..conditions.len())
         .map(|index| {
             let id = format!("c{index}");
             (
                 id.clone(),
-                strategy(
-                    &id,
-                    plan_identity,
-                    search.base_stream,
-                    &conditions,
-                    &[index],
-                ),
+                strategy(&id, plan_identity, search.base_stream, conditions, &[index]),
                 0,
             )
         })
@@ -323,6 +533,9 @@ pub fn replay_table(
 pub fn conditions(menu: &[SearchCondition]) -> Vec<Condition> {
     let mut conditions: Vec<Condition> = Vec::new();
     for entry in menu {
+        let SearchCondition::Named(entry) = entry else {
+            continue;
+        };
         for threshold in &entry.thresholds {
             let condition = Condition {
                 stream: entry.stream,
@@ -343,13 +556,108 @@ pub fn conditions(menu: &[SearchCondition]) -> Vec<Condition> {
 pub fn family_size(count: usize, min: usize, max: usize, contracts: usize) -> Option<u64> {
     let mut total = 0_u64;
     for k in min..=max.min(count) {
-        let mut choose = 1_u64;
-        for i in 0..k {
-            choose = choose.checked_mul((count - i) as u64)? / (i as u64 + 1);
+        if k == 0 {
+            continue;
         }
+        let choose = binomial(count, k)?;
         total = total.checked_add(choose)?;
     }
-    total.checked_mul(contracts as u64)
+    total.checked_mul(u64::try_from(contracts).ok()?)
+}
+
+/// Exact coefficient while it fits a family index. With k <= n/2 coefficients increase at
+/// every step, so an intermediate coefficient above u64 cannot later become representable.
+fn binomial(n: usize, k: usize) -> Option<u64> {
+    if k > n {
+        return Some(0);
+    }
+    let k = k.min(n - k);
+    let mut value = 1_u128;
+    for i in 1..=k {
+        value = value.checked_mul((n - k + i) as u128)? / i as u128;
+        if value > u64::MAX as u128 {
+            return None;
+        }
+    }
+    u64::try_from(value).ok()
+}
+
+/// Global member index in size/lexicographic order, with contracts fastest.
+pub fn member_rank(
+    count: usize,
+    min: usize,
+    max: usize,
+    contracts: usize,
+    indices: &[usize],
+    contract: usize,
+) -> Option<u64> {
+    if indices.is_empty()
+        || indices.len() < min
+        || indices.len() > max.min(count)
+        || contracts == 0
+        || contract >= contracts
+    {
+        return None;
+    }
+    let mut rank = 0_u64;
+    for size in min.max(1)..indices.len() {
+        rank = rank.checked_add(binomial(count, size)?)?;
+    }
+    let mut first = 0;
+    for (position, &index) in indices.iter().enumerate() {
+        if index < first || index >= count {
+            return None;
+        }
+        for skipped in first..index {
+            rank =
+                rank.checked_add(binomial(count - skipped - 1, indices.len() - position - 1)?)?;
+        }
+        first = index + 1;
+    }
+    rank.checked_mul(u64::try_from(contracts).ok()?)?
+        .checked_add(u64::try_from(contract).ok()?)
+}
+
+/// Inverse of `member_rank` for a bounded family.
+pub fn member_unrank(
+    count: usize,
+    min: usize,
+    max: usize,
+    contracts: usize,
+    global: u64,
+) -> Option<(Vec<usize>, usize)> {
+    let total = family_size(count, min, max, contracts)?;
+    if contracts == 0 || global >= total {
+        return None;
+    }
+    let contracts = u64::try_from(contracts).ok()?;
+    let contract = (global % contracts) as usize;
+    let mut ordinal = global / contracts;
+    for size in min.max(1)..=max.min(count) {
+        let group = binomial(count, size)?;
+        if ordinal >= group {
+            ordinal -= group;
+            continue;
+        }
+        let mut indices = Vec::with_capacity(size);
+        let mut first = 0;
+        for position in 0..size {
+            let mut selected = None;
+            for index in first..count {
+                let following = binomial(count - index - 1, size - position - 1)?;
+                if ordinal < following {
+                    selected = Some(index);
+                    break;
+                }
+                ordinal -= following;
+            }
+            let index = selected?;
+            indices.push(index);
+            first = index + 1;
+        }
+        return Some((indices, contract));
+    }
+    None
 }
 
 /// Every combination of `min..=max` distinct indices below `count`, in lexicographic order.
@@ -886,71 +1194,129 @@ pub fn gate(group: &Group, currency: &str, gates: &Gates) -> Result<(), String> 
 /// of the complete family, and applies the heuristic screen when one is configured. Returns
 /// the applicable count. Members are in canonical order, contracts cycling fastest.
 pub fn score(members: &mut [Member], contracts: &[ContractTerms], screen: Option<&Screen>) -> u64 {
-    for (index, member) in members.iter_mut().enumerate() {
-        let contract = &contracts[index % contracts.len()];
-        (
-            member.null,
-            member.inapplicable,
-            member.score,
-            member.adjusted,
-            member.screened,
-        ) = match null_rate(contract) {
-            Ok(null) => {
-                let score = upper_tail(
-                    member.raw.wins.max(0) as u64,
-                    member.raw.losses.max(0) as u64,
-                    null.break_even,
-                );
-                (Some(null), None, Some(score), None, None)
-            }
-            Err(reason) => (
-                None,
-                Some(reason.clone()),
-                None,
-                None,
-                screen.map(|_| format!("inapplicable: {reason}")),
-            ),
-        };
+    if members.is_empty() {
+        return 0;
     }
-    let applicable: Vec<usize> = (0..members.len())
-        .filter(|&index| members[index].score.is_some())
+    let mut records: Vec<_> = members
+        .iter()
+        .map(|member| CompactMember::new(member.raw.clone()))
         .collect();
-    let adjusted = benjamini_hochberg(
-        &applicable
-            .iter()
-            .map(|&index| members[index].score.expect("applicable"))
-            .collect::<Vec<_>>(),
-    );
-    for (&index, &value) in applicable.iter().zip(&adjusted) {
-        members[index].adjusted = Some(value);
+    let (applicable, retained) = screen_compact(&mut records, contracts, screen);
+    let mut retained = retained.into_iter().peekable();
+    for (index, (member, record)) in members.iter_mut().zip(&records).enumerate() {
+        record.apply(member, &contracts[index % contracts.len()], screen);
+        if retained.peek() == Some(&(index as u64)) {
+            retained.next();
+        } else if let (Some(screen), Some(adjusted)) = (screen, member.adjusted) {
+            member.screened = Some(if adjusted > screen.max_adjusted_score {
+                format!(
+                    "adjusted score {adjusted} above the maximum {}",
+                    screen.max_adjusted_score
+                )
+            } else {
+                format!(
+                    "beyond the first {} members by adjusted score",
+                    screen.top.expect("screened by top")
+                )
+            });
+        }
     }
+    applicable
+}
+
+/// Minimal whole-family screening state; contract and identity are recovered from the global
+/// member index only for retained records. Input records must be in global index order.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CompactMember {
+    pub raw: RawCounts,
+    pub score: Option<f64>,
+    pub adjusted: Option<f64>,
+}
+
+impl CompactMember {
+    pub fn new(raw: RawCounts) -> Self {
+        Self {
+            raw,
+            score: None,
+            adjusted: None,
+        }
+    }
+
+    /// Populate the existing member fields after the whole-family screen.
+    pub fn apply(&self, member: &mut Member, contract: &ContractTerms, screen: Option<&Screen>) {
+        member.raw = self.raw.clone();
+        match null_rate(contract) {
+            Ok(null) => {
+                member.null = Some(null);
+                member.inapplicable = None;
+                member.score = self.score;
+                member.adjusted = self.adjusted;
+                member.screened = None;
+            }
+            Err(reason) => {
+                member.null = None;
+                member.inapplicable = Some(reason.clone());
+                member.score = None;
+                member.adjusted = None;
+                member.screened = screen.map(|_| format!("inapplicable: {reason}"));
+            }
+        }
+    }
+}
+
+/// Returns the applicable count and exactly the unscreened global indices, in family order.
+/// The BH calculation and both tie breaks match `score` over the complete family.
+pub fn screen_compact(
+    records: &mut [CompactMember],
+    contracts: &[ContractTerms],
+    screen: Option<&Screen>,
+) -> (u64, Vec<u64>) {
+    assert!(!contracts.is_empty(), "a family has at least one contract");
+    let nulls: Vec<_> = contracts.iter().map(null_rate).collect();
+    let mut applicable = Vec::new();
+    let mut scores = Vec::new();
+    for (index, record) in records.iter_mut().enumerate() {
+        record.adjusted = None;
+        record.score = nulls[index % contracts.len()].as_ref().ok().map(|null| {
+            upper_tail(
+                record.raw.wins.max(0) as u64,
+                record.raw.losses.max(0) as u64,
+                null.break_even,
+            )
+        });
+        if let Some(score) = record.score {
+            applicable.push(index);
+            scores.push(score);
+        }
+    }
+    for (&index, adjusted) in applicable.iter().zip(benjamini_hochberg(&scores)) {
+        records[index].adjusted = Some(adjusted);
+    }
+    let mut retained = vec![screen.is_none(); records.len()];
     if let Some(screen) = screen {
         let mut order = applicable.clone();
         order.sort_by(|&a, &b| {
-            members[a]
+            records[a]
                 .adjusted
-                .partial_cmp(&members[b].adjusted)
+                .partial_cmp(&records[b].adjusted)
                 .unwrap_or(Ordering::Equal)
                 .then(a.cmp(&b))
         });
-        for (position, &index) in order.iter().enumerate() {
-            let adjusted = members[index].adjusted.expect("applicable");
-            members[index].screened = if adjusted > screen.max_adjusted_score {
-                Some(format!(
-                    "adjusted score {adjusted} above the maximum {}",
-                    screen.max_adjusted_score
-                ))
-            } else if screen.top.is_some_and(|top| position >= top as usize) {
-                Some(format!(
-                    "beyond the first {} members by adjusted score",
-                    screen.top.expect("set")
-                ))
-            } else {
-                None
-            };
+        for (position, index) in order.into_iter().enumerate() {
+            retained[index] = records[index].adjusted.is_some_and(|adjusted| {
+                adjusted <= screen.max_adjusted_score
+                    && screen.top.is_none_or(|top| position < top as usize)
+            });
         }
     }
-    applicable.len() as u64
+    (
+        applicable.len() as u64,
+        retained
+            .into_iter()
+            .enumerate()
+            .filter_map(|(i, keep)| keep.then_some(i as u64))
+            .collect(),
+    )
 }
 
 /// Gates every replayed member on its development group and ranks the passing members: net
@@ -1002,9 +1368,12 @@ pub struct RawCounts {
     pub invalid: i64,
 }
 
-/// One member of the complete family and everything computed for it.
+/// One published member and everything computed for it.
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 pub struct Member {
+    /// Schema-2 global family index; absent from schema-1 bytes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub global_index: Option<u64>,
     pub logic_identity: String,
     pub conditions: Vec<Condition>,
     pub contract: String,
@@ -1044,18 +1413,27 @@ pub struct ChunkRef {
     pub bindings: Vec<String>,
 }
 
-/// The complete family as published in `family.json`: the resolved search table, the bound
-/// plan, and every member with everything computed for it. Backend and timings stay outside.
+/// A published family: declared rules, the bound plan, and its member records. Schema 2 stores
+/// only retained members; backend and timings stay outside.
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 pub struct Family {
+    /// Schema-2 marker; omitted from schema-1 JSON.
+    #[serde(default = "schema_one", skip_serializing_if = "is_schema_one")]
+    pub schema_version: u32,
     pub search: Search,
+    /// The resolved concrete table and hash retained beside schema-2 search rules.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolved_conditions: Option<Vec<Condition>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolved_hash: Option<String>,
     pub plan_identity: String,
     pub base_stream: StreamKey,
     pub kernel_module: String,
     pub sampler: String,
     pub applicable: u64,
     pub members: Vec<Member>,
-    pub lowering: ChunkRef,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lowering: Option<ChunkRef>,
     pub chunks: Vec<ChunkRef>,
 }
 
@@ -1067,8 +1445,55 @@ impl Family {
     }
 
     pub fn from_json(bytes: &[u8]) -> Result<Self, String> {
-        serde_json::from_slice(bytes).map_err(|error| error.to_string())
+        let family: Self = serde_json::from_slice(bytes).map_err(|error| error.to_string())?;
+        if !matches!(family.schema_version, 1 | 2) {
+            return Err(format!(
+                "unsupported family schema_version {}",
+                family.schema_version
+            ));
+        }
+        if family.schema_version == STREAMED_FAMILY_SCHEMA_VERSION {
+            let resolved = family
+                .resolved_conditions
+                .as_ref()
+                .ok_or("schema-2 family has no resolved_conditions")?;
+            family
+                .resolved_hash
+                .as_ref()
+                .ok_or("schema-2 family has no resolved_hash")?;
+            let mut previous = None;
+            for member in &family.members {
+                let index = member
+                    .global_index
+                    .ok_or("schema-2 member has no global_index")?;
+                if previous.is_some_and(|old| index <= old) || member.screened.is_some() {
+                    return Err(
+                        "schema-2 members must be unscreened and strictly ordered by global_index"
+                            .into(),
+                    );
+                }
+                previous = Some(index);
+            }
+            if resolved.len() < family.search.min_conditions as usize
+                && (family.applicable != 0
+                    || !family.members.is_empty()
+                    || family.lowering.is_some()
+                    || !family.chunks.is_empty())
+            {
+                return Err(
+                    "schema-2 empty family has counts, members, lowering, or chunks".into(),
+                );
+            }
+        }
+        Ok(family)
     }
+}
+
+fn schema_one() -> u32 {
+    1
+}
+fn is_schema_one(version: &u32) -> bool {
+    *version == 1
 }
 
 /// One bound input generation of a family.
@@ -1111,9 +1536,12 @@ impl FamilyManifest {
                 manifest.kind
             ));
         }
-        if manifest.schema_version != FAMILY_SCHEMA_VERSION {
+        if !matches!(
+            manifest.schema_version,
+            FAMILY_SCHEMA_VERSION | STREAMED_FAMILY_SCHEMA_VERSION
+        ) {
             return Err(format!(
-                "unsupported schema_version {}, expected {FAMILY_SCHEMA_VERSION}",
+                "unsupported schema_version {}, expected 1 or 2",
                 manifest.schema_version
             ));
         }
@@ -1180,6 +1608,35 @@ mod tests {
         Cashflow, Comparator, Direction, Settlement, SettlementRule, Threshold,
     };
 
+    fn legacy_manifest(generation: &str) -> Vec<u8> {
+        std::fs::read(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../app/tests/fixtures/legacy_schema1/published/manifests")
+                .join(generation)
+                .join("ready.json"),
+        )
+        .unwrap()
+    }
+
+    fn legacy_object(generation: &str, path: &str) -> Vec<u8> {
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&legacy_manifest(generation)).unwrap();
+        let key = manifest["objects"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|object| object["path"] == path)
+            .unwrap()["key"]
+            .as_str()
+            .unwrap();
+        std::fs::read(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../app/tests/fixtures/legacy_schema1/published")
+                .join(key),
+        )
+        .unwrap()
+    }
+
     fn decimal(text: &str) -> Decimal {
         Decimal::parse(text).unwrap()
     }
@@ -1236,18 +1693,18 @@ mod tests {
             offset_seconds: 0,
         };
         let menu = vec![
-            SearchCondition {
+            SearchCondition::Named(crate::config::NamedSearchCondition {
                 stream,
                 output: "candle_direction".into(),
                 comparator: Comparator::Eq,
                 thresholds: vec![Threshold::Text("up".into()), Threshold::Text("up".into())],
-            },
-            SearchCondition {
+            }),
+            SearchCondition::Named(crate::config::NamedSearchCondition {
                 stream,
                 output: "range_bps".into(),
                 comparator: Comparator::Gt,
                 thresholds: vec![Threshold::Number(0.08)],
-            },
+            }),
         ];
         let conditions = conditions(&menu);
         assert_eq!(conditions.len(), 2);
@@ -1258,6 +1715,370 @@ mod tests {
             candidates[2].logic_identity,
             signal_logic_identity(&strategy("x", "plan", stream, &conditions, &[1, 0]))
         );
+    }
+
+    #[test]
+    fn member_ranks_match_exhaustive_order() {
+        for count in 1..=8 {
+            for min in 1..=count + 1 {
+                for max in min..=count + 1 {
+                    let expected = combinations(count, min, max);
+                    for (ordinal, indices) in expected.iter().enumerate() {
+                        for contract in 0..3 {
+                            let global = (ordinal * 3 + contract) as u64;
+                            assert_eq!(
+                                member_rank(count, min, max, 3, indices, contract),
+                                Some(global)
+                            );
+                            assert_eq!(
+                                member_unrank(count, min, max, 3, global),
+                                Some((indices.clone(), contract))
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn compact_screen_matches_member_scoring_on_random_families() {
+        let contracts = [
+            contract("1", "0", "1.80", "1"),
+            contract("1", "0", "1.80", "0.95"),
+        ];
+        let screens = [
+            None,
+            Some(Screen {
+                max_adjusted_score: 0.5,
+                top: Some(4),
+            }),
+            Some(Screen {
+                max_adjusted_score: 1.0,
+                top: Some(2),
+            }),
+        ];
+        let mut state = 0x1234_5678_9abc_def0_u64;
+        for size in [0, 1, 2, 7, 32, 101] {
+            for screen in &screens {
+                let mut members: Vec<Member> = (0..size)
+                    .map(|_| {
+                        state ^= state << 13;
+                        state ^= state >> 7;
+                        state ^= state << 17;
+                        let wins = (state % 32) as i64;
+                        let losses = ((state >> 8) % 32) as i64;
+                        Member {
+                            global_index: None,
+                            logic_identity: String::new(),
+                            conditions: Vec::new(),
+                            contract: String::new(),
+                            raw: RawCounts {
+                                total: wins + losses,
+                                wins,
+                                losses,
+                                ties: 0,
+                                invalid: 0,
+                            },
+                            null: None,
+                            inapplicable: None,
+                            score: None,
+                            adjusted: None,
+                            screened: None,
+                            development: None,
+                            rejected: None,
+                            rank: None,
+                            evaluation: None,
+                            evaluation_splits: BTreeMap::new(),
+                            stability: BTreeMap::new(),
+                        }
+                    })
+                    .collect();
+                let mut compact: Vec<_> = members
+                    .iter()
+                    .map(|m| CompactMember::new(m.raw.clone()))
+                    .collect();
+                let applicable = score(&mut members, &contracts, screen.as_ref());
+                let (actual_applicable, survivors) =
+                    screen_compact(&mut compact, &contracts, screen.as_ref());
+                assert_eq!(actual_applicable, applicable);
+                let expected: Vec<_> = members
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(i, m)| m.screened.is_none().then_some(i as u64))
+                    .collect();
+                assert_eq!(survivors, expected);
+                for &global in &survivors {
+                    let index = global as usize;
+                    let mut rebuilt = members[index].clone();
+                    rebuilt.raw = RawCounts::default();
+                    rebuilt.score = None;
+                    rebuilt.adjusted = None;
+                    rebuilt.null = None;
+                    compact[index].apply(
+                        &mut rebuilt,
+                        &contracts[index % contracts.len()],
+                        screen.as_ref(),
+                    );
+                    assert_eq!(rebuilt, members[index]);
+                }
+                let gates = Gates {
+                    min_settled: 1,
+                    max_unresolved: 0,
+                    min_net_profit: decimal("0"),
+                };
+                for (index, member) in members.iter_mut().enumerate() {
+                    member.development = Some(Group {
+                        settled: 2,
+                        profit: BTreeMap::from([(
+                            "unit".into(),
+                            Some(decimal(if index % 3 == 0 { "2" } else { "1" })),
+                        )]),
+                        ..Group::default()
+                    });
+                }
+                let mut retained: Vec<Member> = survivors
+                    .iter()
+                    .map(|&global| members[global as usize].clone())
+                    .collect();
+                rank(&mut members, &gates, "unit");
+                rank(&mut retained, &gates, "unit");
+                for (global, member) in survivors.iter().zip(&retained) {
+                    assert_eq!(member.rank, members[*global as usize].rank);
+                    assert_eq!(member.rejected, members[*global as usize].rejected);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn schema_two_empty_family_round_trips_without_changing_schema_one_bytes() {
+        let bytes = legacy_object(
+            "d7924115f6ec1c2219d5239081221020315db2bf998d950c10cb60d194c53f67",
+            "family.json",
+        );
+        let original = Family::from_json(&bytes).unwrap();
+        assert_eq!(original.schema_version, 1);
+        assert_eq!(original.to_json(), bytes);
+        let mut empty = original;
+        empty.schema_version = STREAMED_FAMILY_SCHEMA_VERSION;
+        empty.resolved_conditions = Some(Vec::new());
+        empty.resolved_hash = Some("v1:sha256:empty".into());
+        empty.applicable = 0;
+        empty.members.clear();
+        empty.lowering = None;
+        empty.chunks.clear();
+        let serialized = empty.to_json();
+        assert_eq!(Family::from_json(&serialized).unwrap(), empty);
+        let document: serde_json::Value = serde_json::from_slice(&serialized).unwrap();
+        assert!(document.get("lowering").is_none());
+        assert_eq!(document["members"].as_array().unwrap().len(), 0);
+        let mut malformed = empty.clone();
+        malformed.applicable = 1;
+        assert!(
+            Family::from_json(&malformed.to_json())
+                .unwrap_err()
+                .contains("empty family")
+        );
+        let manifest_bytes =
+            legacy_manifest("73486072a7f59ab1df2e6f2f2b704454759ec5c23ff977b874b58c0f3fd180d7");
+        let mut manifest = FamilyManifest::from_json(&manifest_bytes).unwrap();
+        assert_eq!(manifest.to_json(), manifest_bytes);
+        manifest.schema_version = STREAMED_FAMILY_SCHEMA_VERSION;
+        manifest.members = 0;
+        assert_eq!(
+            FamilyManifest::from_json(&manifest.to_json()).unwrap(),
+            manifest
+        );
+    }
+
+    #[test]
+    fn generated_rules_resolve_fitted_labels_only_after_binding() {
+        use crate::config::{GeneratedSearchCondition, NamedSearchCondition};
+        use crate::features::{FittedEncoding, OutputSpec, ProjectionKind, Value};
+        let family: Family = serde_json::from_slice(&legacy_object(
+            "d7924115f6ec1c2219d5239081221020315db2bf998d950c10cb60d194c53f67",
+            "family.json",
+        ))
+        .unwrap();
+        let mut search = family.search;
+        let mut plan = FeaturePlan::from_json(&legacy_object(
+            "a7ccab4e17b84ad665de5b29c9ccbca10df2b926d7dfe7a3c4987267092f8f29",
+            "plan.json",
+        ))
+        .unwrap();
+        let stream = plan.streams[0].key();
+        let mut boolean: OutputSpec = plan.streams[0]
+            .outputs
+            .iter()
+            .find(|output| output.name == "candle_direction")
+            .unwrap()
+            .clone();
+        boolean.name = "is_bullish".into();
+        boolean.kind = Kind::Bool;
+        plan.streams[0].outputs.push(boolean);
+        let mut sequence = plan.streams[0]
+            .outputs
+            .iter()
+            .find(|output| output.name == "candle_direction")
+            .unwrap()
+            .clone();
+        sequence.name = "market_structure_sequence".into();
+        plan.streams[0].outputs.push(sequence);
+        let mut numeric = FittedEncoding {
+            output: "range_bps__dev_fifths".into(),
+            input: "range_bps".into(),
+            automatic: true,
+            encoding: ProjectionKind::DevelopmentFifths,
+            edges: None,
+            input_divisor: 1.0,
+            labels: vec![],
+        };
+        numeric
+            .fit(
+                &(0..100)
+                    .map(|x| Some(Value::Float(x as f64)))
+                    .collect::<Vec<_>>(),
+                5,
+            )
+            .unwrap();
+        assert_eq!(numeric.labels.len(), 5);
+        plan.streams[0].encodings = vec![
+            numeric.clone(),
+            FittedEncoding {
+                output: "is_bullish__category".into(),
+                input: "is_bullish".into(),
+                automatic: true,
+                encoding: ProjectionKind::Category,
+                edges: None,
+                input_divisor: 1.0,
+                labels: vec!["true".into(), "false".into()],
+            },
+            FittedEncoding {
+                output: "constant".into(),
+                input: "candle_direction".into(),
+                automatic: true,
+                encoding: ProjectionKind::Category,
+                edges: None,
+                input_divisor: 1.0,
+                labels: vec!["up".into()],
+            },
+            FittedEncoding {
+                output: "collided".into(),
+                input: "range_bps".into(),
+                automatic: true,
+                encoding: ProjectionKind::DevelopmentFifths,
+                edges: None,
+                input_divisor: 1.0,
+                labels: vec![],
+            },
+            FittedEncoding {
+                output: "range_bps".into(),
+                input: "range_bps".into(),
+                automatic: false,
+                encoding: ProjectionKind::Category,
+                edges: None,
+                input_divisor: 1.0,
+                labels: vec!["a".into(), "b".into()],
+            },
+            FittedEncoding {
+                output: "uncoded".into(),
+                input: "candle_direction".into(),
+                automatic: true,
+                encoding: ProjectionKind::Category,
+                edges: None,
+                input_divisor: 1.0,
+                labels: vec!["missing".into(), "none".into()],
+            },
+            FittedEncoding {
+                output: "unready_dominant".into(),
+                input: "market_structure_sequence".into(),
+                automatic: true,
+                encoding: ProjectionKind::Category,
+                edges: None,
+                input_divisor: 1.0,
+                labels: vec!["unknown".into(), "warming_up".into()],
+            },
+        ];
+        search.conditions = vec![
+            SearchCondition::Named(NamedSearchCondition {
+                stream,
+                output: numeric.output.clone(),
+                comparator: Comparator::Eq,
+                thresholds: vec![Threshold::Text(numeric.labels[0].clone())],
+            }),
+            SearchCondition::Generate(GeneratedSearchCondition {
+                stream,
+                output: "*".into(),
+                comparator: Comparator::Eq,
+            }),
+        ];
+        search.min_conditions = 1;
+        search.max_conditions = 2;
+        search.max_candidates = 1000;
+        validate(&search).unwrap(); // Syntax requires no plan or resolved family count.
+        let resolved = resolve_conditions(&search, &plan).unwrap();
+        assert_eq!(resolved.conditions.len(), 7);
+        assert_eq!(
+            resolved.conditions[0].threshold,
+            Threshold::Text(numeric.labels[0].clone())
+        );
+        assert_eq!(
+            resolved.conditions[1].threshold,
+            Threshold::Text(numeric.labels[1].clone())
+        );
+        assert_eq!(
+            resolved.conditions[5].threshold,
+            Threshold::Text("true".into())
+        );
+        assert_eq!(
+            resolved.conditions[6].threshold,
+            Threshold::Text("false".into())
+        );
+        assert_eq!(
+            resolved.members,
+            family_size(7, 1, 2, search.contracts.len()).unwrap()
+        );
+        assert_eq!(
+            resolve_conditions(&search, &plan).unwrap().hash,
+            resolved.hash
+        );
+        plan.streams[0].encodings[0].input = "absent".into();
+        assert!(
+            resolve_conditions(&search, &plan)
+                .unwrap_err()
+                .contains("has no compiled input")
+        );
+        plan.streams[0].encodings[0].input = "range_bps".into();
+        search.max_candidates = 1;
+        assert!(validate(&search).is_ok());
+        assert!(
+            resolve_conditions(&search, &plan)
+                .unwrap_err()
+                .contains("max_candidates")
+        );
+        search.max_candidates = 1000;
+        search.conditions.remove(0);
+        plan.streams[0].encodings.truncate(1);
+        plan.streams[0].encodings[0].labels.truncate(1);
+        search.min_conditions = 2;
+        let short = resolve_conditions(&search, &plan).unwrap();
+        assert!(short.conditions.is_empty());
+        assert_eq!(short.members, 0);
+        search.conditions.insert(
+            0,
+            SearchCondition::Named(NamedSearchCondition {
+                stream,
+                output: "candle_direction".into(),
+                comparator: Comparator::Eq,
+                thresholds: vec![Threshold::Text("up".into())],
+            }),
+        );
+        search.min_conditions = 1;
+        search.max_conditions = 3;
+        let one = resolve_conditions(&search, &plan).unwrap();
+        assert_eq!(one.conditions.len(), 1);
+        assert_eq!(one.members, search.contracts.len() as u64);
     }
 
     #[test]
@@ -1400,6 +2221,7 @@ mod tests {
             ..Group::default()
         };
         let member = |development: Option<Group>, screened: Option<&str>| Member {
+            global_index: None,
             logic_identity: String::new(),
             conditions: Vec::new(),
             contract: "c".into(),
@@ -1442,6 +2264,7 @@ mod tests {
         let mut members: Vec<Member> = [(16, 16), (12, 4), (0, 0), (16, 16), (12, 4), (0, 0)]
             .into_iter()
             .map(|(wins, losses)| Member {
+                global_index: None,
                 logic_identity: String::new(),
                 conditions: Vec::new(),
                 contract: String::new(),

@@ -3,6 +3,18 @@
 
 use std::process::Command;
 
+pub const REVISION_INPUTS: &[&str] = &[
+    "src",
+    "../engine/src",
+    "../accelerator/src",
+    "../accelerator/kernels",
+    "../../Cargo.toml",
+    "../../Cargo.lock",
+    "Cargo.toml",
+    "../engine/Cargo.toml",
+    "../accelerator/Cargo.toml",
+];
+
 fn git(args: &[&str]) -> Option<String> {
     let output = Command::new("git").args(args).output().ok()?;
     output
@@ -20,10 +32,11 @@ fn main() {
         _ => "unavailable".to_string(),
     };
     println!("cargo:rustc-env=BINARY_ALPHA_CODE_REVISION={revision}");
-    // Any source edit changes the dirty state, and `--git-path` resolves HEAD, the checked-out
-    // branch ref, and packed refs correctly for linked worktrees.
-    println!("cargo:rerun-if-changed=src");
-    println!("cargo:rerun-if-changed=../engine/src");
+    // Any computation input edit changes the dirty state, and `--git-path` resolves HEAD,
+    // the checked-out branch ref, and packed refs correctly for linked worktrees.
+    for path in REVISION_INPUTS {
+        println!("cargo:rerun-if-changed={path}");
+    }
     let mut watched = vec![
         "HEAD".to_string(),
         "index".to_string(),

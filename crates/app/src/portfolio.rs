@@ -28,8 +28,8 @@ use binary_alpha_engine::market::{format_event_time_micros, parse_event_time_mic
 use binary_alpha_engine::portfolio::{
     self as engine, Choice, Failure, FamilyRecord, FeatureRef, FoldRecord, FoldResult, Form,
     LogicalMember, Outer, Policy, ReplayRef, SELECTION_MANIFEST_KIND, SELECTION_OBJECT_PATH,
-    SELECTION_SCHEMA_VERSION, Selection, SelectionManifest, SourceMember, State,
-    selection_generation_id,
+    SELECTION_SCHEMA_VERSION, STREAMED_SELECTION_SCHEMA_VERSION, Selection, SelectionManifest,
+    SourceMember, State, selection_generation_id,
 };
 use binary_alpha_engine::research::Access;
 use binary_alpha_engine::search::Family;
@@ -320,6 +320,7 @@ pub(crate) fn apply(
         &features_config(config, &entry),
         local,
         destination,
+        access,
     )?;
     Ok((
         feature_ref(&applied.manifest),
@@ -346,6 +347,7 @@ fn fit_and_apply(
         &features_config(config, &bound.entry),
         local,
         destination,
+        access,
     )?;
     let (applied, input) = apply(
         config,
@@ -457,16 +459,21 @@ fn families(
                 .members
                 .iter()
                 .enumerate()
-                .map(|(member, source)| SourceMember {
-                    logic_identity: source.logic_identity.clone(),
-                    contract: source.contract.clone(),
-                    bases: settings
+                .filter_map(|(position, source)| {
+                    let member = source.global_index.map_or(position, |index| index as usize);
+                    let bases: Vec<usize> = settings
                         .members
                         .iter()
                         .enumerate()
                         .filter(|(_, base)| base.family == index && base.member == member)
                         .map(|(base, _)| base)
-                        .collect(),
+                        .collect();
+                    (family.schema_version == 1 || !bases.is_empty()).then_some(SourceMember {
+                        global_index: source.global_index,
+                        logic_identity: source.logic_identity.clone(),
+                        contract: source.contract.clone(),
+                        bases,
+                    })
                 })
                 .collect(),
         });
@@ -535,13 +542,89 @@ pub(crate) struct Selected {
 /// evaluate, publish, and verify one selection generation of the configuration's `portfolio`
 /// table, returning its report and verification lines.
 pub fn optimize(config: &Config, local: &Store, destination: &Store) -> Result<String, String> {
+    if config
+        .portfolio
+        .as_ref()
+        .is_some_and(|portfolio| portfolio.generate.is_some())
+    {
+        return Err(
+            "portfolio.generate: standalone portfolios declare members and subsets explicitly"
+                .into(),
+        );
+    }
     let declaration = crate::research::declaration(config)?;
+    let verified = crate::verification_cache(Some(config));
     let access = Access {
         declaration: declaration.as_ref(),
         certification: None,
-        verified: None,
+        verified: Some(&verified),
     };
     select(config, local, destination, access).map(|selected| selected.report)
+}
+
+/// Resolves a research portfolio from verified development families before any fold is bound.
+/// The same engine rule is used below to check the recorded resolution during selection and
+/// verification.
+pub(crate) fn resolve_generated(
+    settings: &mut Portfolio,
+    access: Access<'_>,
+) -> Result<(), String> {
+    if settings.generate.is_none() {
+        return Ok(());
+    }
+    let (families, _) = families(settings, access)?;
+    let (members, subsets) = generated(settings, &families, access)?;
+    settings.members = members;
+    settings.subsets = subsets;
+    settings
+        .validate()
+        .map_err(|reason| format!("portfolio.{reason}"))
+}
+
+fn generated(
+    settings: &Portfolio,
+    families: &[Family],
+    access: Access<'_>,
+) -> Result<
+    (
+        Vec<binary_alpha_engine::config::PortfolioMember>,
+        Vec<binary_alpha_engine::config::Subset>,
+    ),
+    String,
+> {
+    let mut plans = Vec::with_capacity(families.len());
+    for (index, family) in families.iter().enumerate() {
+        let input = &family.search.development.inputs[0];
+        let uri = input.feature_manifest.to_string();
+        let (store, manifest) =
+            features::feature_manifest(&format!("families[{index}]"), &uri, access)?;
+        let plan = features::fitted_plan(&uri, &store, &manifest)?;
+        if manifest.role != DatasetRole::Development
+            || manifest.plan_identity != family.plan_identity
+            || manifest.instrument != plan.instrument
+            || manifest.input_generation != input.tick_manifest.generation()
+        {
+            return Err(format!(
+                "families[{index}]: the source feature plan is not the fitted development plan of the family"
+            ));
+        }
+        plans.push(plan);
+    }
+    engine::generated_members(settings, families, &plans)
+}
+
+fn check_generated(
+    settings: &Portfolio,
+    families: &[Family],
+    access: Access<'_>,
+) -> Result<(), String> {
+    if settings.generate.is_some() {
+        let (members, subsets) = generated(settings, families, access)?;
+        if settings.members != members || settings.subsets != subsets {
+            return Err("generated members and subsets differ from verified development ranks, fitted edges, bindings, or repairs".into());
+        }
+    }
+    Ok(())
 }
 
 /// `optimize` with its typed result, under the caller's read permit.
@@ -558,11 +641,12 @@ pub(crate) fn select(
     let mut clock = Clock::default();
     let started = Instant::now();
 
-    // 1. Every declared input on its manifest bytes, then the verified development-only
-    //    families, the frozen logical universe, and every declared choice.
-    let bound = bind(settings, access)?;
+    // 1. Verify the development-only families and declared member indices before opening any
+    //    fold input, then bind the folds and enumerate choices.
     let (families, family_records) = families(settings, access)?;
+    check_generated(settings, &families, access)?;
     let members = engine::logical_members(settings, &families)?;
+    let bound = bind(settings, access)?;
     let mut choices = choices(settings, &members)?;
     let declared = engine::declared_count(settings)?;
     let rejected = choices
@@ -661,6 +745,7 @@ pub(crate) fn select(
                     &features_config(config, &entry),
                     local,
                     destination,
+                    access,
                 )?;
                 refit.push(feature_ref(&built.manifest));
                 plans.insert(bound.instrument, built.plan);
@@ -731,7 +816,13 @@ pub(crate) fn select(
 
     // 4. Publish the selection, then its manifest, and verify before it becomes ready.
     let publishing = Instant::now();
+    let selection_schema = if families.iter().any(|family| family.schema_version == 2) {
+        STREAMED_SELECTION_SCHEMA_VERSION
+    } else {
+        SELECTION_SCHEMA_VERSION
+    };
     let selection = Selection {
+        schema_version: selection_schema,
         config: config.clone(),
         families: family_records,
         members,
@@ -768,7 +859,7 @@ pub(crate) fn select(
         .map_err(|error| format!("cannot remove {}: {error}", temporary.display()))?;
     let manifest = SelectionManifest {
         kind: SELECTION_MANIFEST_KIND.to_string(),
-        schema_version: SELECTION_SCHEMA_VERSION,
+        schema_version: selection_schema,
         generation: generation.clone(),
         config_hash: config.content_hash(),
         code_revision: CODE_REVISION.to_string(),
@@ -927,7 +1018,13 @@ fn configured_fit(
 ) -> Result<(), String> {
     let resolved =
         bind_fit(field, entry, cutoff, access).map_err(|reason| format!("{uri}: {reason}"))?;
-    if *resolved.plan() != plan.unfitted() {
+    let recorded = FeaturePlan::resolve_with_definitions(
+        entry,
+        resolved.plan().profile.clone(),
+        &resolved.plan().development_generation,
+        plan.definitions.clone(),
+    )?;
+    if recorded != plan.unfitted() {
         return Err(format!(
             "{uri}: {field} does not resolve to the recorded plan before its fit"
         ));
@@ -981,6 +1078,11 @@ pub(crate) fn verified_selection(
     let selection_bytes = search::read_object(store, &manifest.objects, SELECTION_OBJECT_PATH)?;
     let selection = Selection::from_json(&selection_bytes)
         .map_err(|error| format!("{uri}: {SELECTION_OBJECT_PATH}: {error}"))?;
+    if selection.schema_version != manifest.schema_version {
+        return Err(format!(
+            "{uri}: selection and manifest schema versions differ"
+        ));
+    }
     if selection.config.content_hash() != manifest.config_hash {
         return Err(format!(
             "{uri}: the recorded configuration does not hash to the manifest's configuration hash"
@@ -1003,6 +1105,17 @@ pub(crate) fn verified_selection(
     }
     // The universe: verified families, their records, the logical members, and every choice.
     let (families, family_records) = families(settings, access)?;
+    let required_schema = if families.iter().any(|family| family.schema_version == 2) {
+        STREAMED_SELECTION_SCHEMA_VERSION
+    } else {
+        SELECTION_SCHEMA_VERSION
+    };
+    if selection.schema_version != required_schema {
+        return Err(format!(
+            "{uri}: selection schema version differs from its source families"
+        ));
+    }
+    check_generated(settings, &families, access).map_err(|reason| format!("{uri}: {reason}"))?;
     if family_records != selection.families
         || manifest.families
             != family_records

@@ -16,6 +16,133 @@
 //! admission flags, including admitted entries whose outcome is invalid.
 
 use crate::{Backend, Measured, count, length, product};
+use std::ops::Range;
+
+/// A contiguous column block; a tuple may contain one block for each condition slot.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ColumnBlock {
+    pub columns: Range<usize>,
+}
+
+/// Column blocks selected for screening.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ColumnBlockPlan {
+    pub blocks: Vec<ColumnBlock>,
+}
+
+/// Exact screening allocation shape for one resident tuple and one reusable batch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScreenShape {
+    pub rows: usize,
+    pub slots: usize,
+    pub batch: usize,
+    pub tile_strides: Vec<usize>,
+    pub largest_tile: usize,
+    /// Function local memory at maximum resident threads; an initial-width hint only.
+    pub local_hint_bytes: usize,
+}
+
+impl ScreenShape {
+    pub fn logical_bytes(&self, columns: usize, list_entries: usize) -> Result<usize, String> {
+        let columns = columns
+            .checked_mul(self.slots)
+            .ok_or("screen blocks: column slots overflow")?;
+        let list_entries = list_entries
+            .checked_mul(self.slots)
+            .ok_or("screen blocks: sparse slots overflow")?;
+        self.exact_bytes(columns, list_entries)
+    }
+
+    /// Actual simultaneous allocation after a block tuple has built its scoped index.
+    pub fn exact_bytes(&self, columns: usize, list_entries: usize) -> Result<usize, String> {
+        if self.rows > i32::MAX as usize
+            || self.slots == 0
+            || self.batch == 0
+            || self.batch > i32::MAX as usize
+            || self.largest_tile == 0
+            || self.largest_tile > 8
+            || self.tile_strides.is_empty()
+            || columns > i32::MAX as usize
+            || list_entries > i32::MAX as usize
+            || self
+                .batch
+                .checked_mul(self.slots)
+                .is_none_or(|n| n > i32::MAX as usize)
+        {
+            return Err("screen blocks: invalid i32 shape".into());
+        }
+        let rows = self.rows as u128;
+        let cols = columns as u128;
+        let lists = list_entries as u128;
+        let batch = self.batch as u128;
+        // Feature matrix, key offsets and lists, entry times, split mask, every packed tile,
+        // conditions, buckets, candidate offsets, driver IDs, and compact output.
+        let total = 2 * cols * rows
+            + 4 * (cols + 1)
+            + 4 * lists
+            + rows * (8 + 1 + self.tile_strides.iter().map(|&n| n as u128).sum::<u128>())
+            + batch * (self.slots as u128 * 6 + 4 + 4 + self.largest_tile as u128 * 5 * 4)
+            + 4;
+        usize::try_from(total).map_err(|_| "screen blocks: byte size overflows usize".into())
+    }
+}
+
+/// Plan exact logical sizes. The allocator-unit estimate only narrows the initial width.
+pub fn plan_screen_blocks(
+    row_list_lengths: &[usize],
+    shape: &ScreenShape,
+    budget: usize,
+    unit_hint: Option<usize>,
+    max_width: usize,
+) -> Result<ColumnBlockPlan, String> {
+    // The estimate is only a width hint. Validate the fixed shape now; exact
+    // tuple bytes are checked after the scoped index is built.
+    shape.exact_bytes(0, 0)?;
+    let mut blocks = Vec::new();
+    let mut start = 0;
+    let mut list_len = 0usize;
+    for (index, &length) in row_list_lengths.iter().enumerate() {
+        if length > i32::MAX as usize {
+            return Err(format!(
+                "screen blocks: column {index} sparse list exceeds i32"
+            ));
+        }
+        let exact_one = shape.exact_bytes(1, length)?;
+        if exact_one > budget {
+            return Err(format!(
+                "screen blocks: column {index} requires {exact_one} bytes, exceeding budget {budget}"
+            ));
+        }
+        let next = list_len.checked_add(length);
+        let columns = index + 1 - start;
+        let logical = next.and_then(|n| shape.logical_bytes(columns, n).ok());
+        let hinted = logical.map(|bytes| {
+            unit_hint
+                .filter(|&unit| unit > 0 && unit <= budget)
+                .map_or(bytes, |unit| bytes.div_ceil(unit).saturating_mul(unit))
+                .saturating_add(shape.local_hint_bytes)
+        });
+        if columns == 1
+            || (columns <= max_width
+                && logical.is_some_and(|bytes| bytes <= budget)
+                && hinted.is_some_and(|bytes| bytes <= budget))
+        {
+            list_len = next.expect("checked");
+            continue;
+        }
+        blocks.push(ColumnBlock {
+            columns: start..index,
+        });
+        start = index;
+        list_len = length;
+    }
+    if start < row_list_lengths.len() {
+        blocks.push(ColumnBlock {
+            columns: start..row_list_lengths.len(),
+        });
+    }
+    Ok(ColumnBlockPlan { blocks })
+}
 
 /// Shared search-stage buffers, uploaded once by a resident CUDA workspace.
 #[derive(Clone, Copy)]
@@ -68,6 +195,190 @@ pub struct SparseIndex<'a> {
     pub key_chrono_rows: &'a [i32],
 }
 
+/// Tuple-owned sparse key table, independent of each candidate batch's driver IDs.
+#[derive(Clone, Copy)]
+pub struct SparseKeys<'a> {
+    pub key_chrono_offsets: &'a [i32],
+    pub key_chrono_rows: &'a [i32],
+}
+
+pub(crate) fn validate_tuple_outcome(
+    original: SearchBuffers<'_>,
+    replacement: SearchBuffers<'_>,
+    split_mask: &[u8],
+) -> Result<(), String> {
+    if original.row_count != replacement.row_count
+        || original.feature_count != replacement.feature_count
+        || !std::ptr::eq(original.feature_codes, replacement.feature_codes)
+        || !std::ptr::eq(original.ordered_rows, replacement.ordered_rows)
+        || !std::ptr::eq(original.decision_time_ms, replacement.decision_time_ms)
+    {
+        return Err(
+            "resident tuple: feature matrix or entry order changed between expiries".into(),
+        );
+    }
+    let rows = original.row_count as usize;
+    for (name, len) in [
+        ("split_mask", split_mask.len()),
+        ("decision_time_ms", replacement.decision_time_ms.len()),
+        ("release_time_ms", replacement.release_time_ms.len()),
+        ("settlement_time_ms", replacement.settlement_time_ms.len()),
+        ("valid", replacement.valid.len()),
+        ("buy_win", replacement.buy_win.len()),
+        ("sell_win", replacement.sell_win.len()),
+        ("tie", replacement.tie.len()),
+    ] {
+        length("resident tuple", name, len, rows)?;
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_tuple(
+    buffers: SearchBuffers<'_>,
+    split_masks: &[&[u8]],
+    keys: SparseKeys<'_>,
+) -> Result<(), String> {
+    let Some(&first) = split_masks.first() else {
+        return Err("resident tuple: no split masks".into());
+    };
+    Request {
+        kind: 6,
+        buffers,
+        split_mask: first,
+        candidates: CandidateConditions {
+            condition_feature: &[],
+            condition_bucket: &[],
+            candidate_offsets: &[0],
+            candidate_count: 0,
+        },
+        sparse: Some(SparseIndex {
+            candidate_driver_key: &[],
+            key_chrono_offsets: keys.key_chrono_offsets,
+            key_chrono_rows: keys.key_chrono_rows,
+        }),
+        expiry_ms: 0,
+        direction_code: 1,
+        payout_basis: 0,
+    }
+    .validate()?;
+    for split_mask in split_masks.iter().skip(1) {
+        length(
+            "resident tuple",
+            "split_mask",
+            split_mask.len(),
+            buffers.row_count as usize,
+        )?;
+    }
+    Ok(())
+}
+
+/// CPU reference for the resident tuple contract. Shared arrays and sparse rows are checked
+/// once; each batch still checks its own conditions, offsets, driver IDs, and output bounds.
+pub struct CpuSparseTuple<'a> {
+    buffers: SearchBuffers<'a>,
+    split_masks: Vec<&'a [u8]>,
+    keys: SparseKeys<'a>,
+}
+
+#[cfg(test)]
+thread_local! {
+    static CPU_TUPLE_CONSTRUCTIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+impl<'a> CpuSparseTuple<'a> {
+    pub fn new(
+        buffers: SearchBuffers<'a>,
+        split_masks: &[&'a [u8]],
+        keys: SparseKeys<'a>,
+    ) -> Result<Self, String> {
+        validate_tuple(buffers, split_masks, keys)?;
+        #[cfg(test)]
+        CPU_TUPLE_CONSTRUCTIONS.with(|count| count.set(count.get() + 1));
+        Ok(Self {
+            buffers,
+            split_masks: split_masks.to_vec(),
+            keys,
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn construction_count() -> usize {
+        CPU_TUPLE_CONSTRUCTIONS.with(std::cell::Cell::get)
+    }
+
+    pub fn score_batch(
+        &self,
+        split: usize,
+        candidates: CandidateConditions<'_>,
+        driver_keys: &[i32],
+        expiry_ms: i64,
+        payout_basis: i64,
+    ) -> Result<Measured<DualScores>, String> {
+        let split_mask = *self
+            .split_masks
+            .get(split)
+            .ok_or("resident tuple: split index outside split masks")?;
+        let input = Request {
+            kind: 6,
+            buffers: self.buffers,
+            split_mask,
+            candidates,
+            sparse: Some(SparseIndex {
+                candidate_driver_key: driver_keys,
+                key_chrono_offsets: self.keys.key_chrono_offsets,
+                key_chrono_rows: self.keys.key_chrono_rows,
+            }),
+            expiry_ms,
+            direction_code: 1,
+            payout_basis,
+        };
+        input.validate_resident_batch()?;
+        Ok(crate::cpu(|| input.reference()))
+    }
+
+    /// Basic sparse dual reference for schema-2 screening, with eight values per direction.
+    pub fn score_screen_batch(
+        &self,
+        split: usize,
+        candidates: CandidateConditions<'_>,
+        driver_keys: &[i32],
+        expiry_ms: i64,
+    ) -> Result<Measured<DualScores>, String> {
+        let split_mask = *self
+            .split_masks
+            .get(split)
+            .ok_or("resident tuple: split index outside split masks")?;
+        let input = Request {
+            kind: 7,
+            buffers: self.buffers,
+            split_mask,
+            candidates,
+            sparse: Some(SparseIndex {
+                candidate_driver_key: driver_keys,
+                key_chrono_offsets: self.keys.key_chrono_offsets,
+                key_chrono_rows: self.keys.key_chrono_rows,
+            }),
+            expiry_ms,
+            direction_code: 1,
+            payout_basis: 0,
+        };
+        input.validate_resident_batch()?;
+        Ok(crate::cpu(|| input.reference()))
+    }
+
+    /// Keep the validated feature matrix and sparse index while changing expiry outcomes.
+    pub fn set_outcome(
+        &mut self,
+        buffers: SearchBuffers<'a>,
+        split_mask: &'a [u8],
+    ) -> Result<(), String> {
+        validate_tuple_outcome(self.buffers, buffers, split_mask)?;
+        self.buffers = buffers;
+        self.split_masks[0] = split_mask;
+        Ok(())
+    }
+}
+
 /// Two direction-specific output buffers, each `[candidate][21 or 8]`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DualScores {
@@ -104,35 +415,50 @@ impl Request<'_> {
     }
 
     pub fn validate(&self) -> Result<(), String> {
+        self.validate_mode(false)
+    }
+
+    /// Tuple-owned matrix, row buffers, and sparse lists were validated at workspace creation.
+    pub(crate) fn validate_resident_batch(&self) -> Result<(), String> {
+        self.validate_mode(true)
+    }
+
+    fn validate_mode(&self, resident: bool) -> Result<(), String> {
         let k = self.kernel();
         let b = self.buffers;
         let rows = count(k, "row_count", b.row_count)?;
         let features = count(k, "feature_count", b.feature_count)?;
         let candidates = count(k, "candidate_count", self.candidates.candidate_count)?;
-        length(
-            k,
-            "feature_codes",
-            b.feature_codes.len(),
-            product(k, "feature_codes", features, rows)?,
-        )?;
-        length(k, "split_mask", self.split_mask.len(), rows)?;
-        for (name, len) in [
-            ("decision_time_ms", b.decision_time_ms.len()),
-            ("release_time_ms", b.release_time_ms.len()),
-        ] {
-            length(k, name, len, rows)?;
+        if !resident {
+            length(
+                k,
+                "feature_codes",
+                b.feature_codes.len(),
+                product(k, "feature_codes", features, rows)?,
+            )?;
         }
-        if self.full() {
-            length(k, "settlement_time_ms", b.settlement_time_ms.len(), rows)?;
+        if !resident {
+            length(k, "split_mask", self.split_mask.len(), rows)?;
         }
-        if self.kind != 8 {
+        if !resident {
             for (name, len) in [
-                ("valid", b.valid.len()),
-                ("buy_win", b.buy_win.len()),
-                ("sell_win", b.sell_win.len()),
-                ("tie", b.tie.len()),
+                ("decision_time_ms", b.decision_time_ms.len()),
+                ("release_time_ms", b.release_time_ms.len()),
             ] {
                 length(k, name, len, rows)?;
+            }
+            if self.full() {
+                length(k, "settlement_time_ms", b.settlement_time_ms.len(), rows)?;
+            }
+            if self.kind != 8 {
+                for (name, len) in [
+                    ("valid", b.valid.len()),
+                    ("buy_win", b.buy_win.len()),
+                    ("sell_win", b.sell_win.len()),
+                    ("tie", b.tie.len()),
+                ] {
+                    length(k, name, len, rows)?;
+                }
             }
         }
         let c = self.candidates;
@@ -163,6 +489,9 @@ impl Request<'_> {
             }
         }
         if let Some(sparse) = self.sparse {
+            if !resident && b.ordered_rows.len() > rows {
+                return Err(format!("{k}: ordered_rows length exceeds row_count"));
+            }
             length(
                 k,
                 "candidate_driver_key",
@@ -181,26 +510,28 @@ impl Request<'_> {
                     "{k}: key_chrono_rows/key_chrono_offsets count exceeds i32"
                 ));
             }
-            let mut previous = 0;
-            for &offset in sparse.key_chrono_offsets {
-                if offset < previous || offset as usize > sparse.key_chrono_rows.len() {
-                    return Err(format!(
-                        "{k}: key_chrono_offsets must be monotone and within key_chrono_rows"
-                    ));
+            if !resident {
+                let mut previous = 0;
+                for &offset in sparse.key_chrono_offsets {
+                    if offset < previous || offset as usize > sparse.key_chrono_rows.len() {
+                        return Err(format!(
+                            "{k}: key_chrono_offsets must be monotone and within key_chrono_rows"
+                        ));
+                    }
+                    previous = offset;
                 }
-                previous = offset;
+                for &row in sparse.key_chrono_rows {
+                    if row < 0 || row as usize >= rows {
+                        return Err(format!(
+                            "{k}: key_chrono_rows index {row} outside row_count"
+                        ));
+                    }
+                }
             }
             for &key in sparse.candidate_driver_key {
                 if key >= 0 && key as usize >= sparse.key_chrono_offsets.len() - 1 {
                     return Err(format!(
                         "{k}: candidate_driver_key {key} outside key_chrono_offsets"
-                    ));
-                }
-            }
-            for &row in sparse.key_chrono_rows {
-                if row < 0 || row as usize >= rows {
-                    return Err(format!(
-                        "{k}: key_chrono_rows index {row} outside row_count"
                     ));
                 }
             }

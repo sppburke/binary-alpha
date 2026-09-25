@@ -57,6 +57,8 @@ pub struct Definitions {
     pub regime: String,
     pub eligibility: String,
     pub encoder: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub statistics: Option<String>,
 }
 
 /// The eligibility verdict every accepted row carries: the Phase 03 strict `clean` verdict.
@@ -75,6 +77,7 @@ impl Definitions {
             regime: "regime_v1".to_string(),
             eligibility: ELIGIBILITY_VERSION.to_string(),
             encoder: "encoder_v1".to_string(),
+            statistics: Some("rolling_statistics_v1".to_string()),
         }
     }
 }
@@ -264,6 +267,17 @@ enum Field {
     UpperWickToRange,
     LowerWickToRange,
     Return1Bps,
+    ReturnStd(u32),
+    ReturnSkew(u32),
+    ReturnKurtosis(u32),
+    ReturnAutocorr(u32),
+    SignReversalRate(u32),
+    UpMoveRatio(u32),
+    TrendR2(u32),
+    TrendResidual(u32),
+    RangePosition(u32),
+    RangeOverlap,
+    CandlePattern,
     Momentum(u32),
     Efficiency(u32),
     AbsReturnMean(u32),
@@ -399,6 +413,39 @@ fn readiness(field: Field) -> &'static str {
     match field {
         F::Return1Bps => {
             "unavailable on the first accepted candle; state advances across every accepted candle"
+        }
+        F::ReturnStd(_) => {
+            "unavailable until the window has at least two unrounded returns and a prior candle; zero variance yields zero; non-finite results are unavailable"
+        }
+        F::ReturnSkew(_) => {
+            "unavailable until the window has at least three unrounded returns and a prior candle; zero return variance or a non-finite result is unavailable"
+        }
+        F::ReturnKurtosis(_) => {
+            "unavailable until the window has at least four unrounded returns and a prior candle; zero return variance or a non-finite result is unavailable"
+        }
+        F::ReturnAutocorr(_) => {
+            "unavailable until the window has at least three unrounded returns and a prior candle; zero variance in either adjacent series or a non-finite result is unavailable"
+        }
+        F::SignReversalRate(_) => {
+            "unavailable until the window has at least two adjacent unrounded return pairs and a prior candle; zero pairs with both returns nonzero or a non-finite result is unavailable"
+        }
+        F::UpMoveRatio(_) => {
+            "unavailable until the window has at least two unrounded returns and a prior candle; zero absolute-return sum or a non-finite result is unavailable"
+        }
+        F::TrendR2(_) => {
+            "unavailable until the window has at least three closes; zero close variance or a non-finite result is unavailable"
+        }
+        F::TrendResidual(_) => {
+            "unavailable until the window has at least three closes; zero last close or a non-finite result is unavailable"
+        }
+        F::RangePosition(_) => {
+            "unavailable until the window has at least two candles; zero high-low span or a non-finite result is unavailable"
+        }
+        F::RangeOverlap => {
+            "unavailable unless the prior accepted candle is adjacent with no skipped or rejected stream interval, or when the current high-low range is zero; non-finite results are unavailable"
+        }
+        F::CandlePattern => {
+            "unavailable unless the prior accepted candle is adjacent with no skipped or rejected stream interval; `none` for doji bodies or when neither opposite-body pattern holds"
         }
         F::Momentum(_) => {
             "unavailable until the window count of previous accepted candles; state advances across every accepted candle"
@@ -693,10 +740,32 @@ fn catalog(settings: &FormulaSettings) -> Vec<OutputDef> {
         t(F::BodyToRange, Float, S::Anatomy, &[]),
         t(F::UpperWickToRange, Float, S::Anatomy, &[]),
         t(F::LowerWickToRange, Float, S::Anatomy, &[]),
+        t(F::RangeOverlap, Float, S::Anatomy, &[]),
+        t(F::CandlePattern, Text, S::Anatomy, &[]),
         t(F::Return1Bps, Float, S::Rolling, &[Structure]),
     ];
     if let Some(structure) = &settings.structure {
         for &w in &structure.rolling_windows {
+            let req = &[Structure, Window(w)];
+            if w >= 2 {
+                for field in [F::ReturnStd(w), F::UpMoveRatio(w), F::RangePosition(w)] {
+                    table.push(t(field, Float, S::Rolling, req));
+                }
+            }
+            if w >= 3 {
+                for field in [F::ReturnSkew(w), F::TrendR2(w), F::TrendResidual(w)] {
+                    table.push(t(field, Float, S::Rolling, req));
+                }
+            }
+            if w >= 4 {
+                for field in [
+                    F::ReturnKurtosis(w),
+                    F::ReturnAutocorr(w),
+                    F::SignReversalRate(w),
+                ] {
+                    table.push(t(field, Float, S::Rolling, req));
+                }
+            }
             table.push(t(
                 F::Momentum(w),
                 Float,
@@ -961,6 +1030,17 @@ fn field_name(field: Field) -> String {
         F::UpperWickToRange => "upper_wick_to_range",
         F::LowerWickToRange => "lower_wick_to_range",
         F::Return1Bps => "return_1_bps",
+        F::ReturnStd(w) => return format!("return_std_{w}_bps"),
+        F::ReturnSkew(w) => return format!("return_skew_{w}"),
+        F::ReturnKurtosis(w) => return format!("return_kurtosis_{w}"),
+        F::ReturnAutocorr(w) => return format!("return_autocorr_{w}"),
+        F::SignReversalRate(w) => return format!("sign_reversal_rate_{w}"),
+        F::UpMoveRatio(w) => return format!("up_move_ratio_{w}"),
+        F::TrendR2(w) => return format!("trend_r2_{w}"),
+        F::TrendResidual(w) => return format!("trend_residual_{w}_bps"),
+        F::RangePosition(w) => return format!("range_position_{w}"),
+        F::RangeOverlap => "range_overlap",
+        F::CandlePattern => "candle_pattern",
         F::Momentum(w) => return format!("momentum_{w}_bps"),
         F::Efficiency(w) => return format!("directional_efficiency_{w}"),
         F::AbsReturnMean(w) => return format!("abs_return_mean_{w}_bps"),
@@ -1070,6 +1150,23 @@ fn field_name(field: Field) -> String {
         F::UtcSession6h => "utc_session_6h",
     };
     fixed.to_string()
+}
+
+fn statistical(field: Field) -> bool {
+    matches!(
+        field,
+        Field::ReturnStd(_)
+            | Field::ReturnSkew(_)
+            | Field::ReturnKurtosis(_)
+            | Field::ReturnAutocorr(_)
+            | Field::SignReversalRate(_)
+            | Field::UpMoveRatio(_)
+            | Field::TrendR2(_)
+            | Field::TrendResidual(_)
+            | Field::RangePosition(_)
+            | Field::RangeOverlap
+            | Field::CandlePattern
+    )
 }
 
 /// The source-defined fixed right-closed bins of the named numeric projections, keyed by the
@@ -1792,6 +1889,9 @@ pub struct FittedEncoding {
     pub output: String,
     /// The row output the labels are computed from.
     pub input: String,
+    /// Automatically selected encodings fit only ready rows and may retain no numeric bins.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub automatic: bool,
     pub encoding: ProjectionKind,
     /// Right-closed bin edges for `fixed` and `development_fifths`; the first edge is included.
     /// Serialized as exact decimal text so infinite tails and every binary value round-trip.
@@ -1807,6 +1907,10 @@ pub struct FittedEncoding {
 
 fn one() -> f64 {
     1.0
+}
+
+fn is_false(value: &bool) -> bool {
+    !value
 }
 
 /// Bin edges as text: Rust's shortest round-trip rendering, which also spells `inf` and `-inf`.
@@ -1949,7 +2053,12 @@ impl FeaturePlan {
             ));
         }
         if plan.raw_identity
-            != raw_identity(&plan.profile, &plan.development_generation, &plan.settings)
+            != raw_identity(
+                &plan.profile,
+                &plan.development_generation,
+                &plan.settings,
+                &plan.definitions,
+            )
         {
             return Err("plan raw identity does not match its profile, input, and settings".into());
         }
@@ -2013,6 +2122,21 @@ impl FeaturePlan {
         entry: &FeatureInstrument,
         profile: ProfileReference,
         development_generation: &str,
+    ) -> Result<Self, String> {
+        Self::resolve_with_definitions(
+            entry,
+            profile,
+            development_generation,
+            Definitions::current(),
+        )
+    }
+
+    /// Re-resolves a configured fit using the definitions recorded by its plan.
+    pub fn resolve_with_definitions(
+        entry: &FeatureInstrument,
+        profile: ProfileReference,
+        development_generation: &str,
+        definitions: Definitions,
     ) -> Result<Self, String> {
         if profile.role != DatasetRole::Development {
             return Err(format!(
@@ -2092,6 +2216,11 @@ impl FeaturePlan {
             let mut excluded = Vec::new();
             let mut supported: HashMap<&str, Result<(), String>> = HashMap::new();
             for output in &table {
+                if statistical(output.field)
+                    && definitions.statistics.as_deref() != Some("rolling_statistics_v1")
+                {
+                    continue;
+                }
                 let verdict = output.requires.iter().try_for_each(|req| available(*req));
                 supported.insert(&output.name, verdict.clone());
                 let spec = OutputSpec {
@@ -2132,9 +2261,43 @@ impl FeaturePlan {
             }
             let mut encodings = Vec::new();
             if let Some(Encodings { outputs: specs, .. }) = &entry.encodings {
-                for spec in specs {
-                    if let Some(encoding) = compile_encoding(spec, &outputs, &mut excluded, key)? {
-                        encodings.push(encoding);
+                if specs.len() == 1 && specs[0].output == "all_supported" && specs[0].bins.is_none()
+                {
+                    for output in outputs
+                        .iter()
+                        .filter(|output| output.predictive && output.kind != Kind::Time)
+                    {
+                        let mut name = format!("{}_auto_encoded", output.name);
+                        let mut suffix = 1;
+                        while table.iter().any(|raw| raw.name == name)
+                            || encodings
+                                .iter()
+                                .any(|encoded: &FittedEncoding| encoded.output == name)
+                        {
+                            name = format!("{}_auto_encoded_{suffix}", output.name);
+                            suffix += 1;
+                        }
+                        encodings.push(FittedEncoding {
+                            output: name,
+                            input: output.name.clone(),
+                            automatic: true,
+                            encoding: if matches!(output.kind, Kind::Int | Kind::Float) {
+                                ProjectionKind::DevelopmentFifths
+                            } else {
+                                ProjectionKind::Category
+                            },
+                            edges: None,
+                            input_divisor: 1.0,
+                            labels: Vec::new(),
+                        });
+                    }
+                } else {
+                    for spec in specs {
+                        if let Some(encoding) =
+                            compile_encoding(spec, &outputs, &mut excluded, key)?
+                        {
+                            encodings.push(encoding);
+                        }
                     }
                 }
             }
@@ -2147,7 +2310,7 @@ impl FeaturePlan {
                 encodings,
             });
         }
-        let raw_identity = raw_identity(&profile, development_generation, &settings);
+        let raw_identity = raw_identity(&profile, development_generation, &settings, &definitions);
         Ok(Self {
             schema_version: FEATURE_SCHEMA_VERSION,
             kind: "feature_plan".to_string(),
@@ -2158,7 +2321,7 @@ impl FeaturePlan {
             profile,
             development_generation: development_generation.to_string(),
             settings,
-            definitions: Definitions::current(),
+            definitions,
             max_labels: entry
                 .encodings
                 .as_ref()
@@ -2253,6 +2416,7 @@ fn compile_encoding(
     Ok(Some(FittedEncoding {
         output: spec.output.clone(),
         input: input.to_string(),
+        automatic: false,
         encoding,
         edges,
         input_divisor: match kind {
@@ -2269,6 +2433,7 @@ pub fn raw_identity(
     profile: &ProfileReference,
     development_generation: &str,
     settings: &FormulaSettings,
+    definitions: &Definitions,
 ) -> String {
     let mut hasher = Sha256::new();
     hasher.update(RAW_IDENTITY_DOMAIN_V1);
@@ -2281,7 +2446,7 @@ pub fn raw_identity(
         hasher.update(b"\n");
     }
     hasher.update(serde_json::to_vec(settings).expect("settings serialize"));
-    hasher.update(serde_json::to_vec(&Definitions::current()).expect("definitions serialize"));
+    hasher.update(serde_json::to_vec(definitions).expect("definitions serialize"));
     crate::hex(&hasher.finalize())
 }
 
@@ -2759,6 +2924,7 @@ struct Rolling {
 /// The rolling outputs of one accepted candle.
 #[derive(Debug, Clone)]
 struct RollingRow {
+    return_1_unrounded: Option<f64>,
     return_1_bps: Option<f64>,
     windows: Vec<(u32, WindowRow)>,
     range_to_avg20: Option<f64>,
@@ -2768,6 +2934,233 @@ struct RollingRow {
     trend_direction: &'static str,
     trend_age: u64,
     pullback: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct StatisticalCandle {
+    open: i64,
+    high: i64,
+    low: i64,
+    close: i64,
+    doji: bool,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct StatisticalWindow {
+    std: Option<f64>,
+    skew: Option<f64>,
+    kurtosis: Option<f64>,
+    autocorr: Option<f64>,
+    reversal: Option<f64>,
+    up_ratio: Option<f64>,
+    r2: Option<f64>,
+    residual: Option<f64>,
+    position: Option<f64>,
+}
+
+struct StatisticalRow {
+    windows: Vec<(u32, StatisticalWindow)>,
+    overlap: Option<f64>,
+    pattern: Option<&'static str>,
+}
+
+struct Statistics {
+    candles: History<StatisticalCandle>,
+    returns: History<Option<f64>>,
+    windows: Vec<u32>,
+}
+
+fn finite_six(value: f64) -> Option<f64> {
+    value
+        .is_finite()
+        .then(|| six(value))
+        .filter(|value| value.is_finite())
+}
+
+fn pearson(left: &[f64], right: &[f64]) -> Option<f64> {
+    let n = left.len() as f64;
+    let left_mean = sum(left.iter().copied()) / n;
+    let right_mean = sum(right.iter().copied()) / n;
+    let cross = sum(left
+        .iter()
+        .zip(right)
+        .map(|(a, b)| (a - left_mean) * (b - right_mean)));
+    let left_var = sum(left.iter().map(|a| (a - left_mean).powi(2)));
+    let right_var = sum(right.iter().map(|b| (b - right_mean).powi(2)));
+    (left_var > 0.0 && right_var > 0.0)
+        .then(|| cross / (left_var * right_var).sqrt())
+        .and_then(finite_six)
+}
+
+fn candle_pattern(previous: StatisticalCandle, current: StatisticalCandle) -> &'static str {
+    if previous.doji || current.doji {
+        return "none";
+    }
+    let bullish = previous.close < previous.open && current.close > current.open;
+    let bearish = previous.close > previous.open && current.close < current.open;
+    if bullish && current.open <= previous.close && current.close >= previous.open {
+        "bullish_engulfing"
+    } else if bearish && current.open >= previous.close && current.close <= previous.open {
+        "bearish_engulfing"
+    } else if bullish && current.open >= previous.close && current.close <= previous.open {
+        "bullish_harami"
+    } else if bearish && current.open <= previous.close && current.close >= previous.open {
+        "bearish_harami"
+    } else {
+        "none"
+    }
+}
+
+impl Statistics {
+    fn new(windows: Vec<u32>) -> Self {
+        let capacity = windows.last().copied().unwrap_or(1) as usize + 1;
+        Self {
+            candles: History::new(capacity),
+            returns: History::new(capacity),
+            windows,
+        }
+    }
+
+    fn update(
+        &mut self,
+        candle: &Candle,
+        adjacent: bool,
+        doji: bool,
+        return_1: Option<f64>,
+    ) -> StatisticalRow {
+        let current = StatisticalCandle {
+            open: candle.open_units,
+            high: candle.high_units,
+            low: candle.low_units,
+            close: candle.close_units,
+            doji,
+        };
+        let previous = self.candles.last();
+        let overlap = previous
+            .filter(|_| adjacent)
+            .and_then(|prior| {
+                let width = i128::from(current.high) - i128::from(current.low);
+                (width > 0).then(|| {
+                    let shared = (i128::from(current.high.min(prior.high))
+                        - i128::from(current.low.max(prior.low)))
+                    .max(0);
+                    shared as f64 / width as f64
+                })
+            })
+            .and_then(finite_six);
+        let pattern = previous
+            .filter(|_| adjacent)
+            .map(|prior| candle_pattern(prior, current));
+        self.candles.push(current);
+        self.returns.push(return_1);
+        let mut windows = Vec::with_capacity(self.windows.len());
+        for &w in &self.windows {
+            let n = w as usize;
+            let mut row = StatisticalWindow::default();
+            if self.candles.len() >= n {
+                let candles: Vec<_> = self.candles.tail(n).collect();
+                let min_low = candles.iter().map(|c| c.low).min().unwrap();
+                let max_high = candles.iter().map(|c| c.high).max().unwrap();
+                if max_high > min_low {
+                    row.position = finite_six(
+                        (i128::from(current.close) - i128::from(min_low)) as f64
+                            / (i128::from(max_high) - i128::from(min_low)) as f64,
+                    );
+                }
+                if n >= 3 {
+                    let reference = i128::from(candles[0].close);
+                    let closes: Vec<f64> = candles
+                        .iter()
+                        .map(|c| (i128::from(c.close) - reference) as f64)
+                        .collect();
+                    let mean_x = (n - 1) as f64 / 2.0;
+                    let mean_y = sum(closes.iter().copied()) / n as f64;
+                    let sxx = sum((0..n).map(|i| (i as f64 - mean_x).powi(2)));
+                    let slope = sum(closes
+                        .iter()
+                        .enumerate()
+                        .map(|(i, y)| (i as f64 - mean_x) * (y - mean_y)))
+                        / sxx;
+                    let fitted_last = mean_y + slope * ((n - 1) as f64 - mean_x);
+                    let sse = sum(closes
+                        .iter()
+                        .enumerate()
+                        .map(|(i, y)| (y - (mean_y + slope * (i as f64 - mean_x))).powi(2)));
+                    let sst = sum(closes.iter().map(|y| (y - mean_y).powi(2)));
+                    if sst > 0.0 {
+                        row.r2 = finite_six(1.0 - sse / sst);
+                    }
+                    if current.close != 0 {
+                        row.residual = finite_six(
+                            10_000.0 * (closes[n - 1] - fitted_last) / current.close as f64,
+                        );
+                    }
+                }
+            }
+            if self.returns.len() >= n {
+                let returns: Option<Vec<f64>> = self.returns.tail(n).collect();
+                if let Some(values) = returns {
+                    let mean = sum(values.iter().copied()) / n as f64;
+                    let variance = sum(values.iter().map(|v| (v - mean).powi(2))) / n as f64;
+                    row.std = finite_six(variance.sqrt());
+                    let absolute = sum(values.iter().map(|v| v.abs()));
+                    if absolute > 0.0 {
+                        row.up_ratio =
+                            finite_six(sum(values.iter().copied().filter(|v| *v > 0.0)) / absolute);
+                    }
+                    if variance > 0.0 && n >= 3 {
+                        row.skew = finite_six(
+                            sum(values.iter().map(|v| (v - mean).powi(3)))
+                                / n as f64
+                                / variance.powf(1.5),
+                        );
+                    }
+                    if variance > 0.0 && n >= 4 {
+                        row.kurtosis = finite_six(
+                            sum(values.iter().map(|v| (v - mean).powi(4)))
+                                / n as f64
+                                / variance.powi(2)
+                                - 3.0,
+                        );
+                    }
+                    if n >= 4 {
+                        row.autocorr = pearson(&values[..n - 1], &values[1..]);
+                        let pairs: Vec<_> = values
+                            .windows(2)
+                            .filter(|pair| pair[0] != 0.0 && pair[1] != 0.0)
+                            .collect();
+                        if !pairs.is_empty() {
+                            row.reversal = finite_six(
+                                pairs
+                                    .iter()
+                                    .filter(|pair| pair[0].signum() != pair[1].signum())
+                                    .count() as f64
+                                    / pairs.len() as f64,
+                            );
+                        }
+                    }
+                }
+            }
+            windows.push((w, row));
+        }
+        StatisticalRow {
+            windows,
+            overlap,
+            pattern,
+        }
+    }
+
+    #[cfg(test)]
+    fn update_test(&mut self, candle: &Candle, adjacent: bool, doji: bool) -> StatisticalRow {
+        let previous = self.candles.last();
+        let return_1 = previous.and_then(|prior| {
+            bps_size(
+                (i128::from(candle.close_units) - i128::from(prior.close)) as f64,
+                prior.close as f64,
+            )
+        });
+        self.update(candle, adjacent, doji, return_1)
+    }
 }
 
 impl Rolling {
@@ -2892,6 +3285,7 @@ impl Rolling {
         }
         self.closes.push(close);
         RollingRow {
+            return_1_unrounded: return_1,
             return_1_bps: return_1.map(six),
             windows,
             range_to_avg20: range_to_avg20.map(six),
@@ -4179,6 +4573,7 @@ struct Scratch<'a> {
     jumps: Option<JumpMagnitudes>,
     anatomy: Anatomy,
     rolling: Option<RollingRow>,
+    statistics: Option<StatisticalRow>,
     structure: Option<StructureRow>,
     sequence: Option<SequenceRow>,
     shape: ShapeRow,
@@ -4210,6 +4605,14 @@ impl Scratch<'_> {
         let structure = self.structure.as_ref();
         let sequence = self.sequence.as_ref();
         let rolling = self.rolling.as_ref();
+        let statistics = self.statistics.as_ref();
+        let stat_window = |w: u32| {
+            statistics?
+                .windows
+                .iter()
+                .find(|(key, _)| *key == w)
+                .map(|(_, row)| *row)
+        };
         let count = |value: u64| Int(value as i64);
         Some(match field {
             F::OpenTime => Time(candle.open_time_micros),
@@ -4278,6 +4681,17 @@ impl Scratch<'_> {
             F::UpperWickToRange => Float(self.anatomy.upper_wick_to_range),
             F::LowerWickToRange => Float(self.anatomy.lower_wick_to_range),
             F::Return1Bps => Float(rolling?.return_1_bps?),
+            F::ReturnStd(w) => Float(stat_window(w)?.std?),
+            F::ReturnSkew(w) => Float(stat_window(w)?.skew?),
+            F::ReturnKurtosis(w) => Float(stat_window(w)?.kurtosis?),
+            F::ReturnAutocorr(w) => Float(stat_window(w)?.autocorr?),
+            F::SignReversalRate(w) => Float(stat_window(w)?.reversal?),
+            F::UpMoveRatio(w) => Float(stat_window(w)?.up_ratio?),
+            F::TrendR2(w) => Float(stat_window(w)?.r2?),
+            F::TrendResidual(w) => Float(stat_window(w)?.residual?),
+            F::RangePosition(w) => Float(stat_window(w)?.position?),
+            F::RangeOverlap => Float(statistics?.overlap?),
+            F::CandlePattern => text(statistics?.pattern?),
             F::Momentum(w) => Float(window(w)?.momentum?),
             F::Efficiency(w) => Float(window(w)?.efficiency?),
             F::AbsReturnMean(w) => Float(window(w)?.abs_return_mean?),
@@ -4486,6 +4900,7 @@ struct StreamState {
     ordinal: u64,
     accepted: u64,
     rolling: Option<Rolling>,
+    statistics: Option<Statistics>,
     structure: Option<Structure>,
     sequence: Option<Sequence>,
     shape: Shape,
@@ -4623,11 +5038,20 @@ impl FeatureEngine {
                     })
                 })
                 .collect();
+            let statistics = fields.iter().any(|field| statistical(*field)).then(|| {
+                Statistics::new(
+                    settings
+                        .structure
+                        .as_ref()
+                        .map_or(Vec::new(), |s| s.rolling_windows.clone()),
+                )
+            });
             states.push(StreamState {
                 definition_index,
                 duration_micros: i64::from(spec.duration_seconds) * MICROS_PER_SECOND,
                 offset_micros: i64::from(spec.offset_seconds) * MICROS_PER_SECOND,
                 fields,
+                statistics,
                 tick_path: None,
                 tick_path_enabled: stream_plan.tick_path && ticks && needs.tick_path,
                 jumps_needed: ticks && needs.jumps,
@@ -4820,6 +5244,14 @@ impl StreamState {
             _ => None,
         };
         let shape = self.shape.update(swing_candle, &anatomy, tick_volume);
+        let statistics = self.statistics.as_mut().map(|statistics| {
+            statistics.update(
+                candle,
+                shape.adjacent,
+                shape.doji,
+                rolling.as_ref().and_then(|row| row.return_1_unrounded),
+            )
+        });
         let regime = regime(
             rolling.as_ref(),
             structure.as_ref(),
@@ -4834,6 +5266,7 @@ impl StreamState {
             jumps,
             anatomy,
             rolling,
+            statistics,
             structure,
             sequence,
             shape,
@@ -4872,6 +5305,11 @@ impl StreamState {
 /// Labels the reference never assigns a code: empty text, missing, and the sentinel spellings of
 /// missing values.
 const UNCODED_LABELS: [&str; 6] = ["", "missing", "none", "<NA>", "nan", "NaT"];
+
+/// Whether a label can receive a fitted code and therefore a generated condition.
+pub fn coded_label(label: &str) -> bool {
+    !UNCODED_LABELS.contains(&label)
+}
 
 /// The reference's general number format: six significant digits, trailing zeros removed, and
 /// an exponent below `1e-4` or at `1e6` and above.
@@ -5047,6 +5485,11 @@ impl FittedEncoding {
                 .enumerate()
                 .find(|(index, label)| labels[..*index].contains(label))
             {
+                if self.automatic && self.encoding == ProjectionKind::DevelopmentFifths {
+                    self.edges = None;
+                    self.labels.clear();
+                    return Ok(());
+                }
                 return Err(format!(
                     "encoding `{}`: bin label `{}` is not unique at six significant digits",
                     self.output, duplicate.1
@@ -5061,7 +5504,7 @@ impl FittedEncoding {
         }
         let mut ranked: Vec<(u64, String)> = counts
             .into_iter()
-            .filter(|(label, count)| *count > 0 && !UNCODED_LABELS.contains(&label.as_str()))
+            .filter(|(label, count)| *count > 0 && coded_label(label))
             .map(|(label, count)| (count, label))
             .collect();
         ranked.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
@@ -5370,6 +5813,86 @@ mod tests {
         }
     }
 
+    #[test]
+    fn all_supported_fitted_numeric_and_boolean_labels_generate_conditions() {
+        use crate::config::{EncodingSpec, Encodings, GeneratedSearchCondition, SearchCondition};
+        let mut request = entry(&[(5, 0)], Outputs::AllSupported);
+        request.encodings = Some(Encodings {
+            max_labels: 8,
+            outputs: vec![EncodingSpec {
+                output: "all_supported".into(),
+                bins: None,
+            }],
+        });
+        let mut plan = FeaturePlan::resolve(
+            &request,
+            profile(NativeGranularity::Tick, true, &[(5, 0)]),
+            "input",
+        )
+        .unwrap();
+        let stream = plan.streams[0].key();
+        let numeric = plan.streams[0]
+            .encodings
+            .iter_mut()
+            .find(|encoding| encoding.input == "range_bps")
+            .unwrap();
+        assert!(numeric.automatic && numeric.output != numeric.input);
+        numeric
+            .fit(&numbers(&(0..100).map(f64::from).collect::<Vec<_>>()), 8)
+            .unwrap();
+        let numeric_output = numeric.output.clone();
+        let boolean_input = plan.streams[0]
+            .outputs
+            .iter()
+            .find(|output| output.predictive && output.kind == Kind::Bool)
+            .unwrap()
+            .name
+            .clone();
+        let boolean = plan.streams[0]
+            .encodings
+            .iter_mut()
+            .find(|encoding| encoding.input == boolean_input)
+            .unwrap();
+        assert!(boolean.automatic && boolean.output != boolean.input);
+        boolean
+            .fit(&[Some(Value::Bool(true)), Some(Value::Bool(false))], 8)
+            .unwrap();
+        let boolean_output = boolean.output.clone();
+        let family: crate::search::Family = serde_json::from_slice(include_bytes!("../../app/tests/fixtures/legacy_schema1/published/objects/24e476f4f6bb8abbd2211c19ba7b0659762b682b299cb240ec6d40a694d51327")).unwrap();
+        let mut search = family.search;
+        search.base_stream = stream;
+        search.conditions = vec![SearchCondition::Generate(GeneratedSearchCondition {
+            stream,
+            output: "*".into(),
+            comparator: crate::execution::Comparator::Eq,
+        })];
+        search.max_conditions = 2;
+        search.max_candidates = 1000;
+        let resolved = crate::search::resolve_conditions(&search, &plan).unwrap();
+        assert_eq!(resolved.conditions.len(), 7);
+        assert_eq!(
+            resolved
+                .conditions
+                .iter()
+                .filter(|condition| condition.output == numeric_output)
+                .count(),
+            5
+        );
+        let boolean_labels: Vec<_> = resolved
+            .conditions
+            .iter()
+            .filter(|condition| condition.output == boolean_output)
+            .map(|condition| &condition.threshold)
+            .collect();
+        assert_eq!(
+            boolean_labels,
+            [
+                &crate::execution::Threshold::Text("false".into()),
+                &crate::execution::Threshold::Text("true".into())
+            ]
+        );
+    }
+
     fn category(values: &[&str]) -> Vec<Option<Value>> {
         values
             .iter()
@@ -5388,10 +5911,280 @@ mod tests {
         FittedEncoding {
             output: "x".to_string(),
             input: "x".to_string(),
+            automatic: false,
             encoding: kind,
             edges,
             input_divisor: 1.0,
             labels: Vec::new(),
+        }
+    }
+
+    fn statistical_candle(open: i64, close: i64) -> Candle {
+        Candle {
+            open_time_micros: 0,
+            close_time_micros: 1,
+            known_at_micros: 1,
+            first_event_micros: 0,
+            last_event_micros: 1,
+            active_span_micros: 1,
+            open_units: open,
+            high_units: open.max(close) + 10,
+            low_units: open.min(close) - 10,
+            close_units: close,
+            observations: 1,
+            duplicates: 0,
+            volume: None,
+            gap_before_micros: None,
+            max_gap_inside_micros: 0,
+            missing_buckets_before: 0,
+            frozen_observations: 0,
+            frozen_micros: 0,
+            max_jump_basis_points: 0,
+            max_delayed_jump_basis_points: 0,
+            max_reopen_jump_basis_points: 0,
+            flags: Flags::default(),
+        }
+    }
+
+    #[test]
+    fn rolling_statistics_pin_windows_formulas_and_degenerate_cases() {
+        let mut statistics = Statistics::new(vec![2, 3, 4]);
+        let first = statistics.update_test(&statistical_candle(100, 100), false, true);
+        assert_eq!(first.pattern, None);
+        assert_eq!(first.overlap, None);
+        assert!(
+            first
+                .windows
+                .iter()
+                .all(|(_, row)| row.std.is_none() && row.position.is_none())
+        );
+        for (open, close) in [(100, 110), (110, 90), (90, 120), (120, 80)] {
+            statistics.update_test(&statistical_candle(open, close), true, false);
+        }
+        let last = statistics.update_test(&statistical_candle(80, 130), true, false);
+        let w4 = last.windows.iter().find(|(w, _)| *w == 4).unwrap().1;
+        assert_eq!(w4.std, Some(3862.649811));
+        assert_eq!(w4.skew, Some(0.148881));
+        assert_eq!(w4.kurtosis, Some(-1.668039));
+        assert_eq!(w4.autocorr, Some(-0.996566));
+        assert_eq!(w4.reversal, Some(1.0));
+        assert_eq!(w4.up_ratio, Some(0.650386));
+        assert_eq!(w4.r2, Some(0.188235));
+        assert_eq!(w4.residual, Some(1000.0));
+        assert_eq!(w4.position, Some(0.857143));
+        assert_eq!(last.overlap, Some(0.857143));
+        let flat = statistical_candle(100, 100);
+        let mut zero = Statistics::new(vec![2, 3, 4]);
+        for _ in 0..5 {
+            zero.update_test(&flat, true, true);
+        }
+        let row = zero.update_test(&flat, true, true).windows[2].1;
+        assert_eq!(row.std, Some(0.0));
+        assert_eq!(row.skew, None);
+        assert_eq!(row.kurtosis, None);
+        assert_eq!(row.autocorr, None);
+        assert_eq!(row.reversal, None);
+        assert_eq!(row.up_ratio, None);
+        assert_eq!(row.r2, None);
+        assert_eq!(row.residual, Some(0.0));
+        let mut degenerate = statistical_candle(100, 100);
+        degenerate.high_units = 100;
+        degenerate.low_units = 100;
+        assert_eq!(zero.update_test(&degenerate, true, true).overlap, None);
+        let mut zero_range = Statistics::new(vec![2]);
+        zero_range.update_test(&degenerate, false, true);
+        assert_eq!(
+            zero_range.update_test(&degenerate, true, true).windows[0]
+                .1
+                .position,
+            None
+        );
+        let mut zero_close = statistical_candle(100, 0);
+        zero_close.close_units = 0;
+        let mut zero = Statistics::new(vec![3]);
+        for _ in 0..2 {
+            zero.update_test(&flat, true, true);
+        }
+        assert_eq!(
+            zero.update_test(&zero_close, true, false).windows[0]
+                .1
+                .residual,
+            None
+        );
+        let mut missing_return = Statistics::new(vec![2]);
+        missing_return.update_test(&statistical_candle(0, 0), false, true);
+        missing_return.update_test(&statistical_candle(0, 1), true, false);
+        assert_eq!(
+            missing_return
+                .update_test(&statistical_candle(1, 2), true, false)
+                .windows[0]
+                .1
+                .std,
+            None
+        );
+        let mut one_pair = Statistics::new(vec![4]);
+        for close in [100, 110, 120, 120, 110] {
+            let row = one_pair.update_test(&statistical_candle(close, close), true, true);
+            if close == 110 && one_pair.candles.len() == 5 {
+                assert_eq!(row.windows[0].1.reversal, Some(0.0));
+            }
+        }
+    }
+
+    #[test]
+    fn statistics_keep_unit_differences_above_f64_integer_precision() {
+        let base = 1_i64 << 53;
+        let mut position = Statistics::new(vec![2]);
+        for close in [base, base + 1] {
+            let mut candle = statistical_candle(close, close);
+            candle.low_units = base;
+            candle.high_units = base + 2;
+            let row = position.update_test(&candle, true, false);
+            if close == base + 1 {
+                assert_eq!(row.windows[0].1.position, Some(0.5));
+            }
+        }
+
+        let mut trend = Statistics::new(vec![3]);
+        for close in [base, base + 1, base + 2] {
+            let row = trend.update_test(&statistical_candle(close, close), true, false);
+            if close == base + 2 {
+                assert_eq!(row.windows[0].1.r2, Some(1.0));
+                assert_eq!(row.windows[0].1.residual, Some(0.0));
+            }
+        }
+        assert!(trend.returns.last().flatten().unwrap() > 0.0);
+    }
+
+    #[test]
+    fn disjoint_adjacent_ranges_have_zero_overlap() {
+        let mut statistics = Statistics::new(vec![]);
+        let mut prior = statistical_candle(0, 1);
+        prior.low_units = 0;
+        prior.high_units = 1;
+        statistics.update_test(&prior, false, false);
+        let mut current = statistical_candle(2, 3);
+        current.low_units = 2;
+        current.high_units = 3;
+        assert_eq!(
+            statistics.update_test(&current, true, false).overlap,
+            Some(0.0)
+        );
+    }
+
+    #[test]
+    fn candle_patterns_pin_equality_priority_and_doji() {
+        let candle = |open, close| StatisticalCandle {
+            open,
+            close,
+            high: open.max(close),
+            low: open.min(close),
+            doji: false,
+        };
+        assert_eq!(
+            candle_pattern(candle(12, 10), candle(10, 12)),
+            "bullish_engulfing"
+        );
+        assert_eq!(
+            candle_pattern(candle(10, 12), candle(12, 10)),
+            "bearish_engulfing"
+        );
+        assert_eq!(
+            candle_pattern(candle(14, 10), candle(11, 13)),
+            "bullish_harami"
+        );
+        assert_eq!(
+            candle_pattern(candle(10, 14), candle(13, 11)),
+            "bearish_harami"
+        );
+        assert_eq!(candle_pattern(candle(10, 10), candle(9, 12)), "none");
+        let mut doji = candle(12, 10);
+        doji.doji = true;
+        assert_eq!(candle_pattern(doji, candle(10, 12)), "none");
+        let mut doji = candle(10, 12);
+        doji.doji = true;
+        assert_eq!(candle_pattern(candle(12, 10), doji), "none");
+    }
+
+    #[test]
+    fn candle_pattern_reuses_the_six_rounded_shape_doji_decision() {
+        let base = 10_000_000;
+        let mut prior = statistical_candle(base + 1_000_004, base);
+        prior.high_units = base + 5_000_000;
+        prior.low_units = base - 5_000_000;
+        let current = statistical_candle(base, base + 1_000_004);
+        let mut shape = Shape::new(None, &[]);
+        let mut statistics = Statistics::new(vec![]);
+        for (ordinal, candle) in [(1, &prior), (2, &current)] {
+            let anatomy = Anatomy::new(candle, 1.0);
+            let row = shape.update(
+                SwingCandle {
+                    row: ordinal,
+                    ordinal,
+                    close_time: ordinal as i64,
+                    known_at: ordinal as i64,
+                    high_units: candle.high_units,
+                    low_units: candle.low_units,
+                },
+                &anatomy,
+                None,
+            );
+            if ordinal == 1 {
+                assert_eq!(anatomy.body_to_range, 0.1);
+                assert!(row.doji);
+            } else {
+                assert!(row.adjacent);
+                assert!(!row.doji);
+                assert_eq!(
+                    statistics
+                        .update_test(candle, row.adjacent, row.doji)
+                        .pattern,
+                    Some("none")
+                );
+                break;
+            }
+            statistics.update_test(candle, row.adjacent, row.doji);
+        }
+    }
+
+    #[test]
+    fn statistics_catalog_starts_each_formula_at_its_minimum_window() {
+        let plan = FeaturePlan::resolve(
+            &entry(&[(5, 0)], Outputs::AllSupported),
+            profile(
+                NativeGranularity::Bar { period_seconds: 5 },
+                false,
+                &[(5, 0)],
+            ),
+            "input",
+        )
+        .unwrap();
+        let mut settings = plan.settings;
+        settings.structure.as_mut().unwrap().rolling_windows = vec![1, 2, 3, 4];
+        let names: Vec<_> = catalog(&settings)
+            .into_iter()
+            .map(|output| output.name)
+            .collect();
+        for (stem, min) in [
+            ("return_std_", 2),
+            ("up_move_ratio_", 2),
+            ("range_position_", 2),
+            ("return_skew_", 3),
+            ("trend_r2_", 3),
+            ("trend_residual_", 3),
+            ("return_kurtosis_", 4),
+            ("return_autocorr_", 4),
+            ("sign_reversal_rate_", 4),
+        ] {
+            for w in 1..=4 {
+                assert_eq!(
+                    names
+                        .iter()
+                        .any(|name| name.starts_with(stem) && name.contains(&format!("_{w}"))),
+                    w >= min,
+                    "{stem}{w}"
+                );
+            }
         }
     }
 
@@ -5498,6 +6291,18 @@ mod tests {
             .collect();
         let error = duplicate.fit(&numbers(&values), 32_768).unwrap_err();
         assert!(error.contains("1e+08_to_1e+08"), "{error}");
+        duplicate.automatic = true;
+        duplicate.fit(&numbers(&values), 32_768).unwrap();
+        assert_eq!(duplicate.edges, None);
+        assert!(duplicate.labels.is_empty());
+        duplicate
+            .fit(&numbers(&[1.0, 1.0, 2.0, 3.0]), 32_768)
+            .unwrap();
+        assert_eq!(duplicate.edges, None);
+        assert!(duplicate.labels.is_empty());
+        duplicate.fit(&[], 32_768).unwrap();
+        assert_eq!(duplicate.edges, None);
+        assert!(duplicate.labels.is_empty());
     }
 
     #[test]
@@ -6069,7 +6874,12 @@ mod tests {
         });
         let mut request = entry(
             &[(5, 0)],
-            Outputs::Named(vec!["clean_segment_index".into()]),
+            Outputs::Named(vec![
+                "clean_segment_index".into(),
+                "range_overlap".into(),
+                "candle_pattern".into(),
+                "previous_candle_relation".into(),
+            ]),
         );
         request.tick_path_streams = None;
         let plan = FeaturePlan::resolve(&request, reference, "input").unwrap();
@@ -6108,6 +6918,87 @@ mod tests {
                 Some(Value::Int(2))
             ]
         );
+        for name in ["range_overlap", "candle_pattern"] {
+            let column = plan.streams[0].output_index(name).unwrap();
+            assert_eq!(out.rows[0].1.values[column], None, "{name}: first row");
+            assert_eq!(
+                out.rows[2].1.values[column], None,
+                "{name}: skipped interval"
+            );
+            assert!(
+                out.rows[1].1.values[column].is_some(),
+                "{name}: adjacent row"
+            );
+            assert!(
+                out.rows[3].1.values[column].is_some(),
+                "{name}: recovered row"
+            );
+        }
+        let relation = plan.streams[0]
+            .output_index("previous_candle_relation")
+            .unwrap();
+        assert_eq!(
+            out.rows[2].1.values[relation],
+            Some(Value::Text("no_adjacent_previous_clean_candle".into()))
+        );
+        let pattern = plan.streams[0].output_index("candle_pattern").unwrap();
+        assert_eq!(
+            out.rows[3].1.values[pattern],
+            Some(Value::Text("none".into()))
+        );
+    }
+
+    #[test]
+    fn tiny_returns_publish_zero_but_remain_eligible_for_reversal() {
+        let native = NativeGranularity::Bar { period_seconds: 5 };
+        let mut request = entry(
+            &[(5, 0)],
+            Outputs::Named(vec!["return_1_bps".into(), "sign_reversal_rate_5".into()]),
+        );
+        request.tick_path_streams = None;
+        let mut reference = profile(native, false, &[(5, 0)]);
+        reference.definition.candles[0].min_observations = None;
+        reference.definition.candles[0].hard_min_observations = None;
+        let plan = FeaturePlan::resolve(&request, reference, "input").unwrap();
+        let mut engine = FeatureEngine::new(&plan, source(native, false)).unwrap();
+        let mut out = FeatureOutput::default();
+        let base = 1_000_000_000_000_i64;
+        for (index, close) in [base, base + 1, base, base + 1, base, base + 1]
+            .into_iter()
+            .enumerate()
+        {
+            let open = if index == 0 {
+                base
+            } else if close == base {
+                base + 1
+            } else {
+                base
+            };
+            engine
+                .push(
+                    Observation::Bar(crate::stream::BarUnits {
+                        start_micros: index as i64 * 5 * MICROS_PER_SECOND,
+                        period_micros: 5 * MICROS_PER_SECOND,
+                        open,
+                        high: open.max(close) + 10,
+                        low: open.min(close) - 10,
+                        close,
+                        volume: 1.0,
+                    }),
+                    &mut out,
+                )
+                .unwrap();
+        }
+        assert_eq!(out.rows.len(), 6);
+        let returns = plan.streams[0].output_index("return_1_bps").unwrap();
+        assert_eq!(out.rows[0].1.values[returns], None);
+        for (_, row) in &out.rows[1..] {
+            assert_eq!(row.values[returns], Some(Value::Float(0.0)));
+        }
+        let reversal = plan.streams[0]
+            .output_index("sign_reversal_rate_5")
+            .unwrap();
+        assert_eq!(out.rows[5].1.values[reversal], Some(Value::Float(1.0)));
     }
 
     #[test]

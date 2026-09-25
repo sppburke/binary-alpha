@@ -1,0 +1,157 @@
+{
+  "layout": "daily-v2",
+  "day_inventory": [
+    {
+      "date": "2026-01-05",
+      "family": "observations",
+      "object": "objects/616ba00748a4d456ca22f43bfa9c178ecad39bc0772eee590c48a3a9af52a317",
+      "rows": 18,
+      "first_time": "2026-01-05T01:00:00.000000Z",
+      "last_time": "2026-01-05T01:01:25.000000Z",
+      "state": "unknown",
+      "reason": "source evidence without whole-day completeness",
+      "unresolved": [
+        {
+          "start": "2026-01-05T00:00:00.000000Z",
+          "end": "2026-01-06T00:00:00.000000Z"
+        }
+      ]
+    },
+    {
+      "date": "2025-05-19",
+      "family": "pages",
+      "object": "objects/1b32cf64ea783decd8f13c739334cc829b06890578b6e7269dbdbf8b83df54df",
+      "rows": 1,
+      "first_time": "2025-05-19T11:15:00.000000Z",
+      "last_time": "2025-05-19T11:15:00.000000Z",
+      "state": "unknown",
+      "reason": "source evidence without whole-day completeness",
+      "unresolved": [
+        {
+          "start": "2025-05-19T00:00:00.000000Z",
+          "end": "2025-05-20T00:00:00.000000Z"
+        }
+      ]
+    }
+  ],
+  "schema_version": 1,
+  "generation": "99af8c0991265c02366977a4b568dcfc15d1a3f5811697d35425bd5f4f43baf4",
+  "broker": "pocket_option",
+  "provider_symbol": "AEDCNY_otc",
+  "instrument": "pocket_option:AEDCNY_otc",
+  "role": "development",
+  "source_kind": "bar_parquet",
+  "native_granularity": {
+    "kind": "bar",
+    "period_seconds": 5
+  },
+  "time_unit": "second",
+  "price_representation": {
+    "kind": "binary_float64"
+  },
+  "coverage": {
+    "first_event_time": "2026-01-05T01:00:00.000000Z",
+    "last_event_time": "2026-01-05T01:01:25.000000Z"
+  },
+  "row_count": 18,
+  "capabilities": [
+    "bars"
+  ],
+  "config_hash": "v3:sha256:8edb08d03a7b39dd09b1f48252b8c3648324269b32241180752489558a0778a6",
+  "code_revision": "fe93017a2fdec8d209d036ed8d7da9c370e185f9",
+  "inputs": [
+    {
+      "path": "/tmp/claude-1000/-mnt-data-binary-alpha/0542aee6-2795-4c53-a425-6af541d9ea7e/scratchpad/s2c/generated_clean/sources/assessment/AEDCNY_otc/dataset/parquet/year=2025/month=05/part-00000.parquet",
+      "bytes": 3193,
+      "sha256": "66f8d43c5cd14c9ead4017ef66916e7b24e98eab97c805292c400e6216d1c7db"
+    },
+    {
+      "path": "/tmp/claude-1000/-mnt-data-binary-alpha/0542aee6-2795-4c53-a425-6af541d9ea7e/scratchpad/s2c/generated_clean/sources/assessment/AEDCNY_otc/checkpoint.ndjson",
+      "bytes": 115,
+      "sha256": "83e133ac93ac74140bc45cde3e5141287372a5b19a91fd14ad9a2fe3c0ee2f62"
+    },
+    {
+      "path": "/tmp/claude-1000/-mnt-data-binary-alpha/0542aee6-2795-4c53-a425-6af541d9ea7e/scratchpad/s2c/generated_clean/sources/assessment/AEDCNY_otc/dataset/_SUCCESS",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "/tmp/claude-1000/-mnt-data-binary-alpha/0542aee6-2795-4c53-a425-6af541d9ea7e/scratchpad/s2c/generated_clean/sources/assessment/AEDCNY_otc/dataset/hashes.sha256",
+      "bytes": 112,
+      "sha256": "8d2c8fd73dea89f15f6fd601a1f237ffa7f3c885f9fe4c61c35ceb3ba987201d"
+    },
+    {
+      "path": "/tmp/claude-1000/-mnt-data-binary-alpha/0542aee6-2795-4c53-a425-6af541d9ea7e/scratchpad/s2c/generated_clean/sources/assessment/AEDCNY_otc/dataset/manifest.json",
+      "bytes": 46,
+      "sha256": "7156dcaa0173b4524854175641404d911465a105952077144828ad03ca067f34"
+    },
+    {
+      "path": "/tmp/claude-1000/-mnt-data-binary-alpha/0542aee6-2795-4c53-a425-6af541d9ea7e/scratchpad/s2c/generated_clean/sources/assessment/AEDCNY_otc/dataset/reports/quality.json",
+      "bytes": 3,
+      "sha256": "ca3d163bab055381827226140568f3bef7eaac187cebd76878e0b63e9e442356"
+    },
+    {
+      "path": "/tmp/claude-1000/-mnt-data-binary-alpha/0542aee6-2795-4c53-a425-6af541d9ea7e/scratchpad/s2c/generated_clean/sources/assessment/AEDCNY_otc/download_manifest.json",
+      "bytes": 24,
+      "sha256": "669af98b228ae50069bedd085f1548063fbfa216ad3e69109d74da3d2ed97336"
+    },
+    {
+      "path": "/tmp/claude-1000/-mnt-data-binary-alpha/0542aee6-2795-4c53-a425-6af541d9ea7e/scratchpad/s2c/generated_clean/sources/assessment/AEDCNY_otc/raw_pages.ndjson",
+      "bytes": 36,
+      "sha256": "c23cde4d60f910f7eca9d3e8f87893eb987d3892b00842d254de6000db37b513"
+    },
+    {
+      "path": "/tmp/claude-1000/-mnt-data-binary-alpha/0542aee6-2795-4c53-a425-6af541d9ea7e/scratchpad/s2c/generated_clean/sources/assessment/collection.json",
+      "bytes": 1847,
+      "sha256": "0cb66093ce6b3c6aaf0e05020c4536dc779a84242d2c978c47503cd58fff240f"
+    }
+  ],
+  "interval": {
+    "closed": "left",
+    "frequency": "5s",
+    "interval": "[timestamp,timestamp+5s)",
+    "label": "left",
+    "offset_seconds": 0,
+    "origin": "unix_epoch_utc",
+    "timestamp_semantics": "bar_start",
+    "provenance": "parquet_metadata"
+  },
+  "objects": [
+    {
+      "role": "normalized",
+      "path": "observations/2026-01-05.parquet",
+      "key": "objects/616ba00748a4d456ca22f43bfa9c178ecad39bc0772eee590c48a3a9af52a317",
+      "bytes": 1877,
+      "sha256": "616ba00748a4d456ca22f43bfa9c178ecad39bc0772eee590c48a3a9af52a317",
+      "crc32c": null,
+      "generation": null
+    },
+    {
+      "role": "source",
+      "path": "pages/2025-05-19.parquet",
+      "key": "objects/1b32cf64ea783decd8f13c739334cc829b06890578b6e7269dbdbf8b83df54df",
+      "bytes": 2354,
+      "sha256": "1b32cf64ea783decd8f13c739334cc829b06890578b6e7269dbdbf8b83df54df",
+      "crc32c": null,
+      "generation": null
+    },
+    {
+      "role": "provenance",
+      "path": "provenance/coverage.json",
+      "key": "objects/9a1f92957164612e370b41f74e722f290715e500a3270b970bd6d9a70f111795",
+      "bytes": 1688,
+      "sha256": "9a1f92957164612e370b41f74e722f290715e500a3270b970bd6d9a70f111795",
+      "crc32c": null,
+      "generation": null
+    },
+    {
+      "role": "provenance",
+      "path": "provenance/lineage.json",
+      "key": "objects/8b2f5adf898186e6222ec00136314f780b5f33a6d7b586c602db67da1aa76f69",
+      "bytes": 10723,
+      "sha256": "8b2f5adf898186e6222ec00136314f780b5f33a6d7b586c602db67da1aa76f69",
+      "crc32c": null,
+      "generation": null
+    }
+  ]
+}

@@ -1,0 +1,16 @@
+{
+  "schema_version": 1,
+  "kind": "assessment_use",
+  "token": "evaluation-0-b",
+  "study": "synthetic",
+  "attempt": "first",
+  "research": "e735202ea7ecc1345825215733510b9276a11e2927f523d40ae33a46e45a68cf",
+  "frozen": "ba76abacb6dfc0c319193dfb261693e16d81737ef7d049259163861e38408990",
+  "declaration": "7c3e0e70ac2c572f8c1264e4c9dc0db747a0070b064c90e40129046a4b217baa",
+  "tokens": [
+    "evaluation-0-a",
+    "evaluation-0-b",
+    "evaluation-1-a",
+    "evaluation-1-b"
+  ]
+}

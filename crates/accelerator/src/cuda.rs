@@ -1,14 +1,56 @@
 //! A single context, default stream, and ahead-of-time module per device.
 //! Safe typed buffers own all allocations; only validated kernel launches are unsafe.
 
-use crate::search::{CandidateConditions, DualScores, Request, SearchBuffers, SparseIndex};
-use crate::{KERNEL_SOURCES, MODULE_CUBIN, Measured, Timings};
+use crate::search::{
+    CandidateConditions, DualScores, Request, SearchBuffers, SparseIndex, SparseKeys,
+};
+use crate::{KERNEL_SOURCES, MODULE_CUBIN, Measured, SCREEN_KERNEL_SOURCE, Timings};
+use cudarc::driver::sys::CUdevice_attribute as Attribute;
 use cudarc::driver::{
     CudaContext, CudaFunction, CudaModule, CudaSlice, CudaStream, DeviceRepr, LaunchConfig,
     PushKernelArg, ValidAsZeroBits,
 };
 use cudarc::nvrtc::Ptx;
-use std::{sync::Arc, time::Instant};
+use std::{
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
+    time::Instant,
+};
+
+#[path = "cuda_screen.rs"]
+mod screen;
+pub use screen::{ScreenTile, ScreenTuple};
+
+extern "C" fn no_dynamic_shared_memory(_: i32) -> usize {
+    0
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeviceCapacity {
+    pub sm_count: u32,
+    pub warp_size: u32,
+    pub threads_per_sm: u32,
+    pub threads_per_block: u32,
+    pub blocks_per_sm: u32,
+    pub registers_per_sm: u32,
+    pub registers_per_block: u32,
+    pub shared_per_sm: u32,
+    pub shared_per_block: u32,
+    pub l2_bytes: u32,
+    pub free_bytes: usize,
+    pub total_bytes: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FunctionCapacity {
+    pub registers: u32,
+    pub local_bytes: u32,
+    pub max_threads_per_block: u32,
+    pub derived_threads: u32,
+    pub active_blocks_per_sm: u32,
+}
 
 /// Observed identity of the opened device and driver.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -19,27 +61,69 @@ pub struct DeviceInfo {
     pub compute_capability: (i32, i32),
     /// CUDA driver API version as `cuDriverGetVersion` reports it (13000 for 13.0).
     pub driver_version: i32,
+    pub build_target: &'static str,
+    pub build_target_source: &'static str,
+    pub capacity: DeviceCapacity,
 }
 
-/// An opened device with one loaded native module and its thirteen entry points.
+/// An opened device with one loaded native module and its fourteen entry points.
 pub struct Device {
     context: Arc<CudaContext>,
     stream: Arc<CudaStream>,
     _module: Arc<CudaModule>,
     functions: Vec<CudaFunction>,
-    info: DeviceInfo,
+    function_capacity: Vec<FunctionCapacity>,
+    info: Box<DeviceInfo>,
+    reservation_unit: Option<usize>,
+    uploaded_bytes: AtomicUsize,
 }
 
 fn error(kernel: &str, argument: &str, error: impl std::fmt::Display) -> String {
     format!("{kernel}: {argument}: {error}")
 }
 
-fn launch_config(count: i32) -> LaunchConfig {
-    LaunchConfig {
-        grid_dim: ((count as u32).div_ceil(128), 1, 1),
-        block_dim: (128, 1, 1),
-        shared_mem_bytes: 0,
-    }
+fn positive_attribute(context: &CudaContext, attribute: Attribute) -> Result<u32, String> {
+    let value = context
+        .attribute(attribute)
+        .map_err(|e| error("CUDA device", "attribute", e))?;
+    u32::try_from(value)
+        .ok()
+        .filter(|&n| n > 0)
+        .ok_or_else(|| format!("CUDA device: invalid {attribute:?} value {value}"))
+}
+
+fn function_capacity(function: &CudaFunction) -> Result<FunctionCapacity, String> {
+    let (_, derived_threads) = function
+        .occupancy_max_potential_block_size(no_dynamic_shared_memory, 0, 0, None)
+        .map_err(|e| error("CUDA function", "occupancy", e))?;
+    let active_blocks_per_sm = function
+        .occupancy_max_active_blocks_per_multiprocessor(derived_threads, 0, None)
+        .map_err(|e| error("CUDA function", "active blocks", e))?;
+    let convert = |name, value| {
+        u32::try_from(value).map_err(|_| format!("CUDA function: {name} is negative"))
+    };
+    Ok(FunctionCapacity {
+        registers: convert(
+            "registers",
+            function
+                .num_regs()
+                .map_err(|e| error("CUDA function", "registers", e))?,
+        )?,
+        local_bytes: convert(
+            "local bytes",
+            function
+                .local_size_bytes()
+                .map_err(|e| error("CUDA function", "local bytes", e))?,
+        )?,
+        max_threads_per_block: convert(
+            "maximum threads",
+            function
+                .max_threads_per_block()
+                .map_err(|e| error("CUDA function", "maximum threads", e))?,
+        )?,
+        derived_threads,
+        active_blocks_per_sm,
+    })
 }
 
 impl Device {
@@ -69,30 +153,84 @@ impl Device {
                 format!("{status:?}"),
             ));
         }
+        let (free_bytes, total_bytes) = context
+            .mem_get_info()
+            .map_err(|e| error("CUDA device", "memory", e))?;
+        let capacity = DeviceCapacity {
+            sm_count: positive_attribute(
+                &context,
+                Attribute::CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT,
+            )?,
+            warp_size: positive_attribute(&context, Attribute::CU_DEVICE_ATTRIBUTE_WARP_SIZE)?,
+            threads_per_sm: positive_attribute(
+                &context,
+                Attribute::CU_DEVICE_ATTRIBUTE_MAX_THREADS_PER_MULTIPROCESSOR,
+            )?,
+            threads_per_block: positive_attribute(
+                &context,
+                Attribute::CU_DEVICE_ATTRIBUTE_MAX_THREADS_PER_BLOCK,
+            )?,
+            blocks_per_sm: positive_attribute(
+                &context,
+                Attribute::CU_DEVICE_ATTRIBUTE_MAX_BLOCKS_PER_MULTIPROCESSOR,
+            )?,
+            registers_per_sm: positive_attribute(
+                &context,
+                Attribute::CU_DEVICE_ATTRIBUTE_MAX_REGISTERS_PER_MULTIPROCESSOR,
+            )?,
+            registers_per_block: positive_attribute(
+                &context,
+                Attribute::CU_DEVICE_ATTRIBUTE_MAX_REGISTERS_PER_BLOCK,
+            )?,
+            shared_per_sm: positive_attribute(
+                &context,
+                Attribute::CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_MULTIPROCESSOR,
+            )?,
+            shared_per_block: positive_attribute(
+                &context,
+                Attribute::CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK,
+            )?,
+            l2_bytes: positive_attribute(&context, Attribute::CU_DEVICE_ATTRIBUTE_L2_CACHE_SIZE)?,
+            free_bytes,
+            total_bytes,
+        };
         let info = DeviceInfo {
             name,
             compute_capability,
             driver_version,
+            build_target: env!("BINARY_ALPHA_CUDA_ARCH"),
+            build_target_source: env!("BINARY_ALPHA_CUDA_ARCH_SOURCE"),
+            capacity,
         };
         let stream = context.default_stream();
         let module = context
             .load_module(Ptx::from_binary(MODULE_CUBIN.to_vec()))
-            .map_err(|e| error("CUDA module", "MODULE_CUBIN", e))?;
-        let functions = KERNEL_SOURCES
+            .map_err(|e| format!("CUDA module: BINARY_ALPHA_CUDA_ARCH={} has no compatible image for {} (sm_{}{}): {e}", info.build_target, info.name, compute_capability.0, compute_capability.1))?;
+        let functions: Vec<CudaFunction> = KERNEL_SOURCES
             .iter()
+            .chain(std::iter::once(&SCREEN_KERNEL_SOURCE))
             .map(|(name, _)| {
                 module
                     .load_function(name)
-                    .map_err(|e| error(name, "symbol", e))
+                    .map_err(|e| format!("{name}: BINARY_ALPHA_CUDA_ARCH={} has no compatible image for sm_{}{}: {e}", info.build_target, compute_capability.0, compute_capability.1))
             })
             .collect::<Result<_, _>>()?;
-        Ok(Self {
+        let function_capacity = functions
+            .iter()
+            .map(function_capacity)
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut device = Self {
             context,
             stream,
             _module: module,
             functions,
-            info,
-        })
+            function_capacity,
+            info: Box::new(info),
+            reservation_unit: None,
+            uploaded_bytes: AtomicUsize::new(0),
+        };
+        device.reservation_unit = device.measure_reservation_unit().unwrap_or(None);
+        Ok(device)
     }
 
     /// Identity read when the device was opened.
@@ -100,11 +238,164 @@ impl Device {
         &self.info
     }
 
+    pub fn screening_function(&self) -> &FunctionCapacity {
+        &self.function_capacity[13]
+    }
+
+    pub fn screening_threads(&self) -> Result<(u32, &'static str), String> {
+        let derived = self.screening_function().derived_threads;
+        let Some(value) = std::env::var_os("BINARY_ALPHA_SCREEN_THREADS_PER_BLOCK") else {
+            return Ok((derived, "derived"));
+        };
+        let text = value.to_string_lossy();
+        let requested: u32 = text.parse().map_err(|_| {
+            "BINARY_ALPHA_SCREEN_THREADS_PER_BLOCK: expected a positive integer".to_string()
+        })?;
+        let limit = self
+            .info
+            .capacity
+            .threads_per_block
+            .min(self.screening_function().max_threads_per_block);
+        if requested == 0
+            || requested > limit
+            || !requested.is_multiple_of(self.info.capacity.warp_size)
+        {
+            return Err(format!(
+                "BINARY_ALPHA_SCREEN_THREADS_PER_BLOCK: {requested} must be a positive warp multiple at most {limit}"
+            ));
+        }
+        let active = self.functions[13]
+            .occupancy_max_active_blocks_per_multiprocessor(requested, 0, None)
+            .map_err(|e| error("BINARY_ALPHA_SCREEN_THREADS_PER_BLOCK", "occupancy", e))?;
+        if active == 0 {
+            return Err(
+                "BINARY_ALPHA_SCREEN_THREADS_PER_BLOCK: no active blocks at requested width".into(),
+            );
+        }
+        Ok((requested, "override"))
+    }
+
+    pub fn screening_batch_capacity(&self) -> Result<usize, String> {
+        let (threads, _) = self.screening_threads()?;
+        let blocks = self.functions[13]
+            .occupancy_max_active_blocks_per_multiprocessor(threads, 0, None)
+            .map_err(|e| error("score_screen_fused", "occupancy", e))?;
+        (threads as usize)
+            .checked_mul(blocks as usize)
+            .and_then(|n| n.checked_mul(self.info.capacity.sm_count as usize))
+            .and_then(|n| n.checked_mul(4))
+            .map(|n| n.min(i32::MAX as usize))
+            .ok_or("screening batch capacity overflows".into())
+    }
+
+    pub fn screening_local_hint_bytes(&self) -> Result<usize, String> {
+        let (threads, _) = self.screening_threads()?;
+        let blocks = self.functions[13]
+            .occupancy_max_active_blocks_per_multiprocessor(threads, 0, None)
+            .map_err(|e| error("score_screen_fused", "occupancy", e))?;
+        (threads as usize)
+            .checked_mul(blocks as usize)
+            .and_then(|n| n.checked_mul(self.info.capacity.sm_count as usize))
+            .and_then(|n| n.checked_mul(self.screening_function().local_bytes as usize))
+            .ok_or("screening local memory estimate overflows".into())
+    }
+
+    fn launch_config(&self, function: usize, count: i32) -> Result<LaunchConfig, String> {
+        let threads = if function == 13 {
+            self.screening_threads()?.0
+        } else {
+            self.function_capacity[function].derived_threads
+        };
+        let count = u64::try_from(count).map_err(|_| "CUDA launch count is negative")?;
+        let blocks = count.div_ceil(u64::from(threads));
+        let grid_x = u32::try_from(blocks).map_err(|_| "CUDA launch grid exceeds u32")?;
+        blocks
+            .checked_mul(u64::from(threads))
+            .ok_or("CUDA launch padded lane count overflows u64")?;
+        Ok(LaunchConfig {
+            grid_dim: (grid_x, 1, 1),
+            block_dim: (threads, 1, 1),
+            shared_mem_bytes: 0,
+        })
+    }
+
     /// Driver-reported (free, total) bytes, distinct from operation allocation accounting.
     pub fn memory_info(&self) -> Result<(usize, usize), String> {
         self.context
             .mem_get_info()
             .map_err(|e| error("CUDA device", "memory_info", e))
+    }
+
+    pub fn reservation_unit(&self) -> Option<usize> {
+        self.reservation_unit
+    }
+
+    /// Successful host-to-device copy bytes on this opened context.
+    pub fn uploaded_bytes(&self) -> usize {
+        self.uploaded_bytes.load(Ordering::Relaxed)
+    }
+
+    fn record_upload(&self, bytes: usize) {
+        self.uploaded_bytes.fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    /// (reserved, used) bytes in the device's default async allocation pool.
+    pub fn pool_usage(&self) -> Result<(usize, usize), String> {
+        use cudarc::driver::sys::{CUmemPool_attribute_enum as PoolAttribute, CUresult};
+        let mut pool = std::ptr::null_mut();
+        // SAFETY: the CUDA device ordinal is valid for this opened context; output storage
+        // is initialized and each attribute receives a writable 64-bit value.
+        let status = unsafe {
+            cudarc::driver::sys::cuDeviceGetDefaultMemPool(&mut pool, self.context.ordinal() as i32)
+        };
+        if status != CUresult::CUDA_SUCCESS {
+            return Err(format!("CUDA pool: default pool query failed: {status:?}"));
+        }
+        let read = |attribute| {
+            let mut bytes = 0_u64;
+            let status = unsafe {
+                cudarc::driver::sys::cuMemPoolGetAttribute(
+                    pool,
+                    attribute,
+                    (&mut bytes as *mut u64).cast(),
+                )
+            };
+            if status == CUresult::CUDA_SUCCESS {
+                Ok(bytes as usize)
+            } else {
+                Err(format!("CUDA pool: attribute query failed: {status:?}"))
+            }
+        };
+        Ok((
+            read(PoolAttribute::CU_MEMPOOL_ATTR_RESERVED_MEM_CURRENT)?,
+            read(PoolAttribute::CU_MEMPOOL_ATTR_USED_MEM_CURRENT)?,
+        ))
+    }
+
+    fn measure_reservation_unit(&self) -> Result<Option<usize>, String> {
+        let before = self.pool_usage()?.0;
+        let one = self.zeros::<u8>("CUDA pool probe", "one byte", 1)?;
+        self.sync("CUDA pool probe", "one byte")?;
+        let after_one = self.pool_usage()?.0;
+        drop(one);
+        self.sync("CUDA pool probe", "release one byte")?;
+        let Some(unit) = after_one.checked_sub(before).filter(|&n| n > 0) else {
+            return Ok(None);
+        };
+        let same = self.zeros::<u8>("CUDA pool probe", "unit bytes", unit)?;
+        self.sync("CUDA pool probe", "unit bytes")?;
+        let after_unit = self.pool_usage()?.0;
+        drop(same);
+        self.sync("CUDA pool probe", "release unit bytes")?;
+        let plus = self.zeros::<u8>("CUDA pool probe", "unit plus one bytes", unit + 1)?;
+        self.sync("CUDA pool probe", "unit plus one bytes")?;
+        let after_plus = self.pool_usage()?.0;
+        drop(plus);
+        self.sync("CUDA pool probe", "release unit plus one bytes")?;
+        Ok(
+            (after_unit == after_one && after_plus == after_one.saturating_add(unit))
+                .then_some(unit),
+        )
     }
 
     fn sync(&self, kernel: &str, phase: &str) -> Result<(), String> {
@@ -119,9 +410,12 @@ impl Device {
         name: &str,
         values: &[T],
     ) -> Result<CudaSlice<T>, String> {
-        self.stream
+        let uploaded = self
+            .stream
             .clone_htod(values)
-            .map_err(|e| error(kernel, name, e))
+            .map_err(|e| error(kernel, name, e))?;
+        self.record_upload(std::mem::size_of_val(values));
+        Ok(uploaded)
     }
 
     fn zeros<T: DeviceRepr + ValidAsZeroBits>(
@@ -181,7 +475,7 @@ impl Device {
             builder.arg(&input.rolling_horizon);
             // SAFETY: validation proves every buffer length, index, offset, and local-array
             // bound; typed arguments follow this symbol's ABI and remain alive through sync.
-            unsafe { builder.launch(launch_config(input.simulations)) }
+            unsafe { builder.launch(self.launch_config(9, input.simulations)?) }
                 .map_err(|e| error(k, "launch", e))?;
         }
         self.sync(k, "execute")?;
@@ -258,7 +552,7 @@ impl Device {
             builder.arg(&input.max_expiry);
             // SAFETY: validation proves every buffer length, index, offset, and local-array
             // bound; typed arguments follow this symbol's ABI and remain alive through sync.
-            unsafe { builder.launch(launch_config(input.portfolio_count)) }
+            unsafe { builder.launch(self.launch_config(10, input.portfolio_count)?) }
                 .map_err(|e| error(k, "launch", e))?;
         }
         self.sync(k, "execute")?;
@@ -307,7 +601,7 @@ impl Device {
             builder.arg(&input.portfolio_count);
             // SAFETY: validation proves every buffer length, index, offset, and local-array
             // bound; typed arguments follow this symbol's ABI and remain alive through sync.
-            unsafe { builder.launch(launch_config(input.portfolio_count)) }
+            unsafe { builder.launch(self.launch_config(11, input.portfolio_count)?) }
                 .map_err(|e| error(k, "launch", e))?;
         }
         self.sync(k, "execute")?;
@@ -434,7 +728,7 @@ impl Device {
             builder.arg(&mut out_downside_squares_fp2);
             // SAFETY: validation proves every buffer length, index, offset, and local-array
             // bound; typed arguments follow this symbol's ABI and remain alive through sync.
-            unsafe { builder.launch(launch_config(input.policy_count)) }
+            unsafe { builder.launch(self.launch_config(12, input.policy_count)?) }
                 .map_err(|e| error(k, "launch", e))?;
         }
         self.sync(k, "execute")?;
@@ -561,6 +855,209 @@ pub struct ResidentSearch<'a> {
     pub timings: Timings,
 }
 
+/// One tuple's matrix, chronological buffers, and sparse key lists reside on one device.
+pub struct ResidentTuple<'a> {
+    workspace: ResidentSearch<'a>,
+    keys: SparseKeys<'a>,
+    offsets: CudaSlice<i32>,
+    rows: CudaSlice<i32>,
+    pub timings: Timings,
+}
+
+/// A batch uploads only its conditions, offsets, and driver IDs.
+pub struct ResidentTupleBatch<'stage, 'data> {
+    tuple: &'stage ResidentTuple<'data>,
+    candidates: CandidateConditions<'stage>,
+    driver_keys: &'stage [i32],
+    uploaded: CandidateBuffers,
+    drivers: CudaSlice<i32>,
+    pub timings: Timings,
+}
+
+impl Device {
+    pub fn search_tuple_workspace<'a>(
+        &'a self,
+        buffers: SearchBuffers<'a>,
+        split_masks: &[&'a [u8]],
+        keys: SparseKeys<'a>,
+    ) -> Result<ResidentTuple<'a>, String> {
+        let validation_started = Instant::now();
+        crate::search::validate_tuple(buffers, split_masks, keys).map_err(|error| {
+            if error.starts_with("resident tuple: split_mask length") {
+                "resident tuple: split_mask length differs from row_count".into()
+            } else {
+                error
+            }
+        })?;
+        let validation = validation_started.elapsed();
+        let shared = self.shared(buffers, split_masks, "search tuple")?;
+        let workspace = ResidentSearch {
+            device: self,
+            buffers,
+            split_masks: split_masks.to_vec(),
+            shared: shared.output,
+            timings: shared.timings,
+        };
+        self.sync("search tuple", "before upload")?;
+        let started = Instant::now();
+        let offsets = self.upload(
+            "search tuple",
+            "key_chrono_offsets",
+            keys.key_chrono_offsets,
+        )?;
+        let rows = self.upload("search tuple", "key_chrono_rows", keys.key_chrono_rows)?;
+        self.sync("search tuple", "upload")?;
+        let timings = Timings {
+            upload: validation + workspace.timings.upload + started.elapsed(),
+            allocated_bytes: workspace.timings.allocated_bytes
+                + offsets.num_bytes()
+                + rows.num_bytes(),
+            ..Timings::default()
+        };
+        Ok(ResidentTuple {
+            workspace,
+            keys,
+            offsets,
+            rows,
+            timings,
+        })
+    }
+}
+
+impl<'data> ResidentTuple<'data> {
+    /// Replace only expiry-dependent arrays; the feature matrix and sparse keys stay resident.
+    pub fn set_outcome(
+        &mut self,
+        buffers: SearchBuffers<'data>,
+        split_mask: &'data [u8],
+    ) -> Result<Timings, String> {
+        let started = Instant::now();
+        crate::search::validate_tuple_outcome(self.workspace.buffers, buffers, split_mask)?;
+        let device = self.workspace.device;
+        device.sync("search tuple outcome", "before upload")?;
+        let shared = &mut self.workspace.shared;
+        device
+            .stream
+            .memcpy_htod(buffers.release_time_ms, &mut shared.release_time_ms)
+            .map_err(|source| error("search tuple outcome", "release_time_ms", source))?;
+        device
+            .stream
+            .memcpy_htod(buffers.settlement_time_ms, &mut shared.settlement_time_ms)
+            .map_err(|source| error("search tuple outcome", "settlement_time_ms", source))?;
+        device
+            .stream
+            .memcpy_htod(buffers.valid, &mut shared.valid)
+            .map_err(|source| error("search tuple outcome", "valid", source))?;
+        device
+            .stream
+            .memcpy_htod(buffers.buy_win, &mut shared.buy_win)
+            .map_err(|source| error("search tuple outcome", "buy_win", source))?;
+        device
+            .stream
+            .memcpy_htod(buffers.sell_win, &mut shared.sell_win)
+            .map_err(|source| error("search tuple outcome", "sell_win", source))?;
+        device
+            .stream
+            .memcpy_htod(buffers.tie, &mut shared.tie)
+            .map_err(|source| error("search tuple outcome", "tie", source))?;
+        device
+            .stream
+            .memcpy_htod(split_mask, &mut shared.split_masks[0])
+            .map_err(|source| error("search tuple outcome", "split_mask", source))?;
+        device.sync("search tuple outcome", "upload")?;
+        self.workspace.buffers = buffers;
+        self.workspace.split_masks[0] = split_mask;
+        Ok(Timings {
+            upload: started.elapsed(),
+            allocated_bytes: self.timings.allocated_bytes,
+            ..Timings::default()
+        })
+    }
+
+    pub fn upload_batch<'stage>(
+        &'stage self,
+        candidates: CandidateConditions<'stage>,
+        driver_keys: &'stage [i32],
+    ) -> Result<ResidentTupleBatch<'stage, 'data>, String> {
+        let input = Request {
+            kind: 6,
+            buffers: self.workspace.buffers,
+            split_mask: self.workspace.split_masks[0],
+            candidates,
+            sparse: Some(SparseIndex {
+                candidate_driver_key: driver_keys,
+                key_chrono_offsets: self.keys.key_chrono_offsets,
+                key_chrono_rows: self.keys.key_chrono_rows,
+            }),
+            expiry_ms: 0,
+            direction_code: 1,
+            payout_basis: 0,
+        };
+        input.validate_resident_batch()?;
+        let uploaded =
+            self.workspace
+                .device
+                .candidate_buffers(candidates, None, "search tuple batch")?;
+        let started = Instant::now();
+        let drivers = self.workspace.device.upload(
+            "search tuple batch",
+            "candidate_driver_key",
+            driver_keys,
+        )?;
+        self.workspace.device.sync("search tuple batch", "upload")?;
+        let timings = Timings {
+            upload: uploaded.timings.upload + started.elapsed(),
+            allocated_bytes: uploaded.timings.allocated_bytes + drivers.num_bytes(),
+            ..Timings::default()
+        };
+        Ok(ResidentTupleBatch {
+            tuple: self,
+            candidates,
+            driver_keys,
+            uploaded: uploaded.output,
+            drivers,
+            timings,
+        })
+    }
+}
+
+impl ResidentTupleBatch<'_, '_> {
+    pub fn score_sparse_dual(
+        &self,
+        split: usize,
+        expiry_ms: i64,
+        payout_basis: i64,
+    ) -> Result<Measured<DualScores>, String> {
+        let split_mask = *self
+            .tuple
+            .workspace
+            .split_masks
+            .get(split)
+            .ok_or("resident tuple: split index outside split masks")?;
+        let input = Request {
+            kind: 6,
+            buffers: self.tuple.workspace.buffers,
+            split_mask,
+            candidates: self.candidates,
+            sparse: Some(SparseIndex {
+                candidate_driver_key: self.driver_keys,
+                key_chrono_offsets: self.tuple.keys.key_chrono_offsets,
+                key_chrono_rows: self.tuple.keys.key_chrono_rows,
+            }),
+            expiry_ms,
+            direction_code: 1,
+            payout_basis,
+        };
+        self.tuple.workspace.device.score_resident(
+            input,
+            &self.tuple.workspace.shared,
+            &self.uploaded,
+            split,
+            Some((&self.drivers, &self.tuple.offsets, &self.tuple.rows)),
+        )
+    }
+}
+
 impl Device {
     /// Uploads all shared search buffers and every split once for reuse by K1–K9.
     pub fn search_workspace<'a>(
@@ -663,7 +1160,7 @@ impl Device {
     pub(crate) fn score(&self, input: Request<'_>) -> Result<Measured<DualScores>, String> {
         let shared = self.shared(input.buffers, &[input.split_mask], input.kernel())?;
         let candidates = self.candidate_buffers(input.candidates, input.sparse, input.kernel())?;
-        let mut result = self.score_resident(input, &shared.output, &candidates.output, 0)?;
+        let mut result = self.score_resident(input, &shared.output, &candidates.output, 0, None)?;
         result.timings.upload += shared.timings.upload + candidates.timings.upload;
         Ok(result)
     }
@@ -685,19 +1182,24 @@ impl Device {
         shared: &Shared,
         candidates: &CandidateBuffers,
         split: usize,
+        sparse_override: Option<(&CudaSlice<i32>, &CudaSlice<i32>, &CudaSlice<i32>)>,
     ) -> Result<Measured<DualScores>, String> {
         let k = input.kernel();
         self.sync(k, "before upload")?;
         let start = Instant::now();
-        let sparse = &candidates.sparse;
+        let sparse =
+            sparse_override.or_else(|| candidates.sparse.as_ref().map(|(a, b, c)| (a, b, c)));
         let length = input.candidates.candidate_count as usize * input.width();
         let mut buy_output = self.zeros::<i64>(k, "buy_output/output", length)?;
         let mut sell_output =
             self.zeros::<i64>(k, "sell_output", if input.dual() { length } else { 0 })?;
         self.sync(k, "upload")?;
         let upload = start.elapsed();
-        let allocated_bytes =
-            shared.bytes() + candidates.bytes() + buy_output.num_bytes() + sell_output.num_bytes();
+        let allocated_bytes = shared.bytes()
+            + candidates.bytes()
+            + sparse_override.map_or(0, |(a, b, c)| a.num_bytes() + b.num_bytes() + c.num_bytes())
+            + buy_output.num_bytes()
+            + sell_output.num_bytes();
         let start = Instant::now();
         if input.candidates.candidate_count > 0 {
             let mut builder = self.stream.launch_builder(&self.functions[input.kind]);
@@ -776,7 +1278,7 @@ impl Device {
                 }
                 4 => {
                     let (candidate_driver_key, key_chrono_offsets, key_chrono_rows) =
-                        sparse.as_ref().expect("sparse request validated");
+                        sparse.expect("sparse request validated");
                     builder.arg(candidate_driver_key);
                     builder.arg(key_chrono_offsets);
                     builder.arg(key_chrono_rows);
@@ -797,7 +1299,7 @@ impl Device {
                 }
                 5 => {
                     let (candidate_driver_key, key_chrono_offsets, key_chrono_rows) =
-                        sparse.as_ref().expect("sparse request validated");
+                        sparse.expect("sparse request validated");
                     builder.arg(candidate_driver_key);
                     builder.arg(key_chrono_offsets);
                     builder.arg(key_chrono_rows);
@@ -817,7 +1319,7 @@ impl Device {
                 }
                 6 => {
                     let (candidate_driver_key, key_chrono_offsets, key_chrono_rows) =
-                        sparse.as_ref().expect("sparse request validated");
+                        sparse.expect("sparse request validated");
                     builder.arg(candidate_driver_key);
                     builder.arg(key_chrono_offsets);
                     builder.arg(key_chrono_rows);
@@ -838,7 +1340,7 @@ impl Device {
                 }
                 7 => {
                     let (candidate_driver_key, key_chrono_offsets, key_chrono_rows) =
-                        sparse.as_ref().expect("sparse request validated");
+                        sparse.expect("sparse request validated");
                     builder.arg(candidate_driver_key);
                     builder.arg(key_chrono_offsets);
                     builder.arg(key_chrono_rows);
@@ -861,8 +1363,10 @@ impl Device {
             // SAFETY: shared validation proves buffer shapes and every active feature,
             // row, and sparse offset; arguments follow the selected symbol's exact ABI.
             // All inputs and writable outputs live through the synchronized launch.
-            unsafe { builder.launch(launch_config(input.candidates.candidate_count)) }
-                .map_err(|e| error(k, "launch", e))?;
+            unsafe {
+                builder.launch(self.launch_config(input.kind, input.candidates.candidate_count)?)
+            }
+            .map_err(|e| error(k, "launch", e))?;
         }
         self.sync(k, "execute")?;
         let execute = start.elapsed();
@@ -921,7 +1425,7 @@ impl Device {
             // SAFETY: shared validation proves buffer shapes and every active feature,
             // row, and sparse offset; arguments follow the selected symbol's exact ABI.
             // All inputs and writable outputs live through the synchronized launch.
-            unsafe { builder.launch(launch_config(input.candidates.candidate_count)) }
+            unsafe { builder.launch(self.launch_config(8, input.candidates.candidate_count)?) }
                 .map_err(|e| error(k, "launch", e))?;
         }
         self.sync(k, "execute")?;
@@ -1005,6 +1509,7 @@ impl ResidentChunk<'_, '_> {
             &self.workspace.shared,
             &self.uploaded,
             split,
+            None,
         )?;
         Ok(Measured {
             output: result.output.buy_output,
@@ -1037,6 +1542,7 @@ impl ResidentChunk<'_, '_> {
             &self.workspace.shared,
             &self.uploaded,
             split,
+            None,
         )?;
         Ok(result)
     }
@@ -1067,6 +1573,7 @@ impl ResidentChunk<'_, '_> {
             &self.workspace.shared,
             &self.uploaded,
             split,
+            None,
         )?;
         Ok(Measured {
             output: result.output.buy_output,
@@ -1099,6 +1606,7 @@ impl ResidentChunk<'_, '_> {
             &self.workspace.shared,
             &self.uploaded,
             split,
+            None,
         )?;
         Ok(result)
     }
@@ -1134,6 +1642,7 @@ impl ResidentChunk<'_, '_> {
             &self.workspace.shared,
             &self.uploaded,
             split,
+            None,
         )?;
         Ok(Measured {
             output: result.output.buy_output,
@@ -1172,6 +1681,7 @@ impl ResidentChunk<'_, '_> {
             &self.workspace.shared,
             &self.uploaded,
             split,
+            None,
         )?;
         Ok(Measured {
             output: result.output.buy_output,
@@ -1209,6 +1719,7 @@ impl ResidentChunk<'_, '_> {
             &self.workspace.shared,
             &self.uploaded,
             split,
+            None,
         )?;
         Ok(result)
     }
@@ -1245,6 +1756,7 @@ impl ResidentChunk<'_, '_> {
             &self.workspace.shared,
             &self.uploaded,
             split,
+            None,
         )?;
         Ok(result)
     }

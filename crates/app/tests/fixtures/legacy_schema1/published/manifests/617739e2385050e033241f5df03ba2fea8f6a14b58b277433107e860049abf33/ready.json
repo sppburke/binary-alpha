@@ -1,0 +1,55 @@
+{
+  "schema_version": 1,
+  "generation": "617739e2385050e033241f5df03ba2fea8f6a14b58b277433107e860049abf33",
+  "broker": "pocket_option",
+  "provider_symbol": "AEDCNY_otc",
+  "instrument": "pocket_option:AEDCNY_otc",
+  "role": "evaluation",
+  "source_kind": "bar_parquet",
+  "native_granularity": {
+    "kind": "bar",
+    "period_seconds": 5
+  },
+  "time_unit": "second",
+  "price_representation": {
+    "kind": "binary_float64"
+  },
+  "coverage": {
+    "first_event_time": "2026-01-05T03:00:00.000000Z",
+    "last_event_time": "2026-01-05T03:01:25.000000Z"
+  },
+  "row_count": 18,
+  "capabilities": [
+    "bars"
+  ],
+  "config_hash": "v3:sha256:4b45c1697b86a5f0d667f1dde423985c4c09412473bfa09feba67137c61db19d",
+  "code_revision": "synthetic-consumer-fixture",
+  "inputs": [
+    {
+      "path": "/proc/self/cwd/sources/evaluation/AEDCNY_otc/dataset/parquet/year=2025/month=05/part-00000.parquet",
+      "bytes": 3193,
+      "sha256": "22e13a0eeba3717e79a4f721ffeb19add3044321e7746a2ac8892f9dbb51c6f4"
+    }
+  ],
+  "interval": {
+    "closed": "left",
+    "frequency": "5s",
+    "interval": "[timestamp,timestamp+5s)",
+    "label": "left",
+    "offset_seconds": 0,
+    "origin": "unix_epoch_utc",
+    "timestamp_semantics": "bar_start",
+    "provenance": "parquet_metadata"
+  },
+  "objects": [
+    {
+      "role": "source",
+      "path": "source/parquet/year=2025/month=05/part-00000.parquet",
+      "key": "objects/22e13a0eeba3717e79a4f721ffeb19add3044321e7746a2ac8892f9dbb51c6f4",
+      "bytes": 3193,
+      "sha256": "22e13a0eeba3717e79a4f721ffeb19add3044321e7746a2ac8892f9dbb51c6f4",
+      "crc32c": 3740392134,
+      "generation": null
+    }
+  ]
+}

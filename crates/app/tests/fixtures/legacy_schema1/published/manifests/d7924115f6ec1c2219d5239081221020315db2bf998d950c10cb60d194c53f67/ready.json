@@ -1,0 +1,29 @@
+{
+  "kind": "search_family",
+  "schema_version": 1,
+  "generation": "d7924115f6ec1c2219d5239081221020315db2bf998d950c10cb60d194c53f67",
+  "config_hash": "v3:sha256:9b589616b151d226eb831d857ecb2bd7d2fb429082d22818da857824ebe3ca4a",
+  "code_revision": "fe93017a2fdec8d209d036ed8d7da9c370e185f9",
+  "inputs": [
+    {
+      "role": "development",
+      "instrument": "pocket_option:AEDCNY_otc",
+      "tick_generation": "f2f1b9cd5e4ca1db4e4afcfec207f63eb81320019fbf379056e7fdee2d1a7d33",
+      "feature_generation": "bc01ba9344f078a18659c982b05c74801d43ae44e2eaff729e8e7defa60bf05c",
+      "plan_identity": "c2c579fbc3504ab7dfc4a632633a7be73334fadd322fe6f5048633735bec5b74",
+      "outcome_generation": "a377abdc0fdc92a8c71d2e98163cad588803d64c256d145cfbf2bfe8b2fc993f"
+    }
+  ],
+  "members": 2,
+  "objects": [
+    {
+      "role": "normalized",
+      "path": "family.json",
+      "key": "objects/24e476f4f6bb8abbd2211c19ba7b0659762b682b299cb240ec6d40a694d51327",
+      "bytes": 6017,
+      "sha256": "24e476f4f6bb8abbd2211c19ba7b0659762b682b299cb240ec6d40a694d51327",
+      "crc32c": null,
+      "generation": null
+    }
+  ]
+}

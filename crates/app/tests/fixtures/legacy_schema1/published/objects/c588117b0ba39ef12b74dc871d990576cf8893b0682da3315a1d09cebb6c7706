@@ -1,0 +1,127 @@
+{
+  "events": 5,
+  "last_time_micros": 1767571280000000,
+  "accounts": [
+    {
+      "id": "c0",
+      "currency": "eur",
+      "scale": 2,
+      "cash": "0.00",
+      "reserved": "0.00",
+      "paid_basis": "0.00",
+      "unresolved_loss": "0.00",
+      "completed_profit": "0.00",
+      "epoch_peak": "0.00",
+      "lifetime_peak": "0.00",
+      "max_drawdown": "0.00",
+      "open": 0
+    },
+    {
+      "id": "c1",
+      "currency": "eur",
+      "scale": 2,
+      "cash": "0.00",
+      "reserved": "0.00",
+      "paid_basis": "0.00",
+      "unresolved_loss": "0.00",
+      "completed_profit": "0.00",
+      "epoch_peak": "0.00",
+      "lifetime_peak": "0.00",
+      "max_drawdown": "0.00",
+      "open": 0
+    }
+  ],
+  "portfolio": {
+    "signals": 4,
+    "dispositions": {
+      "insufficient_cash": 4
+    },
+    "accepted": 0,
+    "released": 0,
+    "settled": 0,
+    "wins": 0,
+    "losses": 0,
+    "ties": 0,
+    "unresolved": 0,
+    "open": 0,
+    "profit": {}
+  },
+  "strategies": {
+    "c0": {
+      "signals": 2,
+      "dispositions": {
+        "insufficient_cash": 2
+      },
+      "accepted": 0,
+      "released": 0,
+      "settled": 0,
+      "wins": 0,
+      "losses": 0,
+      "ties": 0,
+      "unresolved": 0,
+      "open": 0,
+      "profit": {}
+    },
+    "c1": {
+      "signals": 2,
+      "dispositions": {
+        "insufficient_cash": 2
+      },
+      "accepted": 0,
+      "released": 0,
+      "settled": 0,
+      "wins": 0,
+      "losses": 0,
+      "ties": 0,
+      "unresolved": 0,
+      "open": 0,
+      "profit": {}
+    }
+  },
+  "durations": {
+    "5000000": {
+      "signals": 4,
+      "dispositions": {
+        "insufficient_cash": 4
+      },
+      "accepted": 0,
+      "released": 0,
+      "settled": 0,
+      "wins": 0,
+      "losses": 0,
+      "ties": 0,
+      "unresolved": 0,
+      "open": 0,
+      "profit": {}
+    }
+  },
+  "instruments": {
+    "pocket_option:SECOND_otc": {
+      "signals": 4,
+      "dispositions": {
+        "insufficient_cash": 4
+      },
+      "accepted": 0,
+      "released": 0,
+      "settled": 0,
+      "wins": 0,
+      "losses": 0,
+      "ties": 0,
+      "unresolved": 0,
+      "open": 0,
+      "profit": {}
+    }
+  },
+  "splits": {},
+  "reporting": {
+    "currency": "eur",
+    "scale": 2,
+    "settled_equity": "0.00",
+    "unresolved_loss": "0.00",
+    "peak_equity": "0.00",
+    "max_drawdown": "0.00",
+    "observations": 1,
+    "unavailable_observations": 0,
+    "used_rates": []
+  }
+}

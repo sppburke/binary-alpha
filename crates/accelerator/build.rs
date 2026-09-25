@@ -39,6 +39,7 @@ fn main() {
         "replay_capacity",
         "path_drawdown",
         "replay_policies",
+        "score_screen_fused",
     ];
     let compiler = env::var_os("BINARY_ALPHA_NVCC").map(PathBuf::from).unwrap_or_else(|| {
         env::split_paths(&env::var_os("PATH").unwrap_or_default())
@@ -101,7 +102,15 @@ fn main() {
     let source_path = out.join("module.cu");
     let binary_path = out.join("module.cubin");
     fs::write(&source_path, source).expect("write concatenated source");
-    let architecture = env::var("BINARY_ALPHA_CUDA_ARCH").unwrap_or_else(|_| "sm_120".into());
+    let architecture_override = env::var("BINARY_ALPHA_CUDA_ARCH").ok();
+    let architecture_source = if architecture_override.is_some() {
+        "override"
+    } else {
+        "default"
+    };
+    let architecture = architecture_override.unwrap_or_else(|| "sm_120".into());
+    println!("cargo:rustc-env=BINARY_ALPHA_CUDA_ARCH={architecture}");
+    println!("cargo:rustc-env=BINARY_ALPHA_CUDA_ARCH_SOURCE={architecture_source}");
     let mut flags = vec![
         format!("-arch={architecture}"),
         "-cubin".into(),
@@ -124,7 +133,7 @@ fn main() {
         String::from_utf8_lossy(&result.stderr)
     );
     let metadata = format!(
-        "{{\n  \"compiler_path\": {},\n  \"compiler_version\": {},\n  \"host_compiler_path\": {},\n  \"host_compiler_version\": {},\n  \"host_compiler_explicit\": {},\n  \"flags\": [{}],\n  \"architecture\": {},\n  \"source_order\": [{}]\n}}\n",
+        "{{\n  \"compiler_path\": {},\n  \"compiler_version\": {},\n  \"host_compiler_path\": {},\n  \"host_compiler_version\": {},\n  \"host_compiler_explicit\": {},\n  \"flags\": [{}],\n  \"architecture\": {},\n  \"architecture_source\": {},\n  \"source_order\": [{}]\n}}\n",
         quote(&compiler.display().to_string()),
         quote(&version),
         quote(&host_compiler.display().to_string()),
@@ -136,6 +145,7 @@ fn main() {
             .collect::<Vec<_>>()
             .join(", "),
         quote(&architecture),
+        quote(architecture_source),
         sources
             .iter()
             .map(|symbol| quote(symbol))

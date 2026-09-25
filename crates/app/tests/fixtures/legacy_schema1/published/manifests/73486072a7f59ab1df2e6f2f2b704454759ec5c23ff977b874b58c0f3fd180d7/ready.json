@@ -1,0 +1,29 @@
+{
+  "kind": "search_family",
+  "schema_version": 1,
+  "generation": "73486072a7f59ab1df2e6f2f2b704454759ec5c23ff977b874b58c0f3fd180d7",
+  "config_hash": "v3:sha256:2683fb43f0aa5811e3515ca21a0679d4ea599edbb143a2cd22fb8eb7f36a3105",
+  "code_revision": "fe93017a2fdec8d209d036ed8d7da9c370e185f9",
+  "inputs": [
+    {
+      "role": "development",
+      "instrument": "pocket_option:SECOND_otc",
+      "tick_generation": "61cb801d1ce5f355e507d1cdcdba54fbb9d52a794bb294f80b1a275e711d1fd3",
+      "feature_generation": "24409612301a6ee325fcdac35b37641c65cca1475a72f93b244f7df2efe79cc1",
+      "plan_identity": "09c0ab2fc423f0024f66af3b2d4ab46f2593356fd0322f4cf7f797cab123850d",
+      "outcome_generation": "1236c0faf0ce00179c0cb64eaae4392f2438b132461f38e7037e665b48eeb2e9"
+    }
+  ],
+  "members": 2,
+  "objects": [
+    {
+      "role": "normalized",
+      "path": "family.json",
+      "key": "objects/41e77f617e2f85e4a2571c9904dc9ba5e8f408239ece363fe1188fa034a08e2b",
+      "bytes": 6013,
+      "sha256": "41e77f617e2f85e4a2571c9904dc9ba5e8f408239ece363fe1188fa034a08e2b",
+      "crc32c": null,
+      "generation": null
+    }
+  ]
+}

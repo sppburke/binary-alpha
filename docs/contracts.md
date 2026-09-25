@@ -112,7 +112,7 @@ from a path.
 | `storage.historical_data_dir` | string | a non-empty path of the retained historical-data folder; a relative path resolves against the configuration file's directory |
 | `storage.publication_uri` | string | `gs://BUCKET` or `gs://BUCKET/PREFIX` in every run mode; `file:///ABSOLUTE/DIR` only with `run_mode = "research"`, for non-live tests and the research data pipeline |
 | `import.sources` | array of tables | optional; consumed only by `data import`, which requires at least one entry |
-| `split` | table | optional; consumed only by `data split`; declares `namespace`, development daily-root `sources`, and nonempty `development`, `evaluation`, and `holdout` arrays of whole-day `{ start, end }` windows |
+| `split` | table | optional; consumed only by `data split`; declares `namespace`, development daily-root `sources`, nonempty `development` and `evaluation` arrays, and a `holdout` array that may be empty; every window is a whole-day `{ start, end }` range |
 | `instruments` | array of tables | optional; maps audit generations and selected broker history/live instruments |
 | `features.instruments` | array of tables | optional; consumed only by `features build`, which requires at least one entry |
 | `outcomes` | table | optional; consumed only by `outcomes build`, which requires it |
@@ -542,6 +542,10 @@ a distinct instrument. Every window contains observations. All sources, windows,
 are checked before retention or publication starts. The retained folder, the destination, and the
 destination's namespace location resolve through any alias to locations that neither lie inside
 nor contain a source store and are never at or below a managed pipeline store.
+
+Development and evaluation each require at least one window. `holdout = []` publishes no holdout
+generation or population in the declaration; `research run` still requires a declared holdout
+input for every instrument.
 
 Each slice preserves the selected observation day objects, including duplicate occurrences and
 empty inventory days, and carries reduced coverage evidence and split lineage naming the source
@@ -1489,6 +1493,45 @@ substitute volume, counts, zero diagnostics, or `clean`; bar-compatible geometry
 prior ratios, moving averages, returns, momentum, efficiency, structure, sequences, and the
 trend, volatility, structure, transition, and bias regime components remain available.
 
+`rolling_statistics_v1` is present only when the plan's recorded `definitions.statistics`
+names it. New plans record that definition; plans without it retain their original
+`all_supported` membership and raw identity. For each configured structure window `w`, the
+following use the last `w` accepted candles, oldest to newest. Return statistics use the
+unrounded `bps_change` values used by `Rolling::update`, before `return_1_bps` is rounded
+for publication; a return that rounds to zero remains nonzero in these calculations.
+Thus `w` returns require a preceding candle. `return_std_{w}_bps` is the population
+standard deviation; `return_skew_{w}` is the population third central
+moment divided by variance to the power 3/2; `return_kurtosis_{w}` is the population fourth
+central moment divided by squared variance, minus 3. `return_autocorr_{w}` is Pearson
+correlation of returns 0..w-2 and 1..w-1. `sign_reversal_rate_{w}` is the opposite-sign
+share of adjacent pairs for which both returns are nonzero, requiring at least two
+adjacent pair positions and at least one eligible pair. `up_move_ratio_{w}` is
+positive-return sum divided by absolute-return sum.
+`trend_r2_{w}` is `1 - SSE/SST` from ordinary least squares of close units on indices
+0..w-1; `trend_residual_{w}_bps` is 10000 times (last close minus fitted last close)
+divided by last close. `range_position_{w}` is (last close minus minimum low) divided by
+(maximum high minus minimum low). The standard deviation, up ratio, and range position
+start at `w = 2`; skew, R², and residual at `w = 3`; kurtosis, autocorrelation, and
+reversal rate at `w = 4`. A missing preceding candle, unfilled window, zero return
+variance for skew/kurtosis, zero series variance for autocorrelation, zero absolute-return
+sum for up ratio, zero close variance for R², zero last close for residual, and zero
+high-low span for range position yield unavailable values. All non-finite computations
+are unavailable. Each finite emitted statistic is rounded with `six` once. A flat return
+window has standard deviation zero when filled.
+
+Per candle, `range_overlap` is the positive overlap of current and prior high-low ranges
+divided by the current high-low range; it is unavailable without an immediately preceding
+accepted candle with no skipped or rejected stream interval, or with zero current range.
+`candle_pattern` uses the same prior requirement and is unavailable when it is unmet.
+It compares opposite non-doji bodies in exact price units, using `is_doji` as computed
+from six-rounded `body_to_range <= 0.10`. It is `bullish_engulfing` or `bearish_engulfing`
+when current body endpoints enclose the prior body, otherwise `bullish_harami` or
+`bearish_harami` when the current
+body is inside it; equality counts, engulfing takes priority, and every other case with
+an adjacent prior, including a doji, is `none`. Every statistics output records these
+warmup and degenerate rules in its own `readiness` text. Both bar and tick-built candles
+use this one causal computation.
+
 ### Computation
 
 One ordered chain per stream consumes the Phase 03 stream's records: the tick path and the
@@ -1543,7 +1586,18 @@ six-significant-digit general format, and duplicate labels are an error rather t
 intervals. Labels rank by development count descending then text ascending, are limited to
 `max_labels`, and take zero-based signed 16-bit codes; a missing, unseen, out-of-range, or
 uncoded (`""`, `missing`, `none`, `<NA>`, `nan`, `NaT`) label encodes as `-1`, and raw values
-stay beside their codes. The fitted plan records the fit windows (rows and first and last
+stay beside their codes.
+
+With `encodings.outputs = "all_supported"`, the plan attempts development fifths for
+every selected predictive numeric output and category fitting for every selected predictive
+text or boolean output. Each encoding's output is a deterministic distinct name; `input`
+names the raw column. Only development rows passing that input's plan-declared readiness
+flags and `value_ready` contribute to automatic fitting. No ready values produce no edges
+or labels. Fewer than four distinct ready numeric values or duplicate six-significant-digit
+interval labels leave automatic numeric edges absent and labels empty. Explicit encoding
+lists retain fitting on all development rows and their duplicate-label error.
+
+The fitted plan records the fit windows (rows and first and last
 decision time per stream), every label list and edge list, and its identity is SHA-256 over
 `binary-alpha feature plan v1` and the plan's JSON bytes. Applying a frozen plan recomputes
 rows under its settings and encodes under its labels without refitting; no artifact records
@@ -2075,13 +2129,14 @@ expected return.
 The optional `search` table declares, in canonical order: `scope` (`exhaustive` replays every
 member; `heuristic` requires `screen` and replays only members it keeps), `seed`, positive
 `chunk_size` and `max_candidates`, `min_conditions` and `max_conditions` with
-`1 <= min <= max <= distinct conditions`, non-negative `embargo_micros` at least every
+`1 <= min <= max`, non-negative `embargo_micros` at least every
 contract's `duration_micros + settlement.max_settlement_delay_micros`, `base_stream`,
 `development` and optional `evaluation` (each a `decision_start`, `decision_end`, exactly one
 `inputs` entry as in `replay`, and optional `splits`, no evaluation split named `none`; the development input
 must name its `outcome_manifest`; `evaluation.decision_start - development.decision_end` must be
-at least the embargo), a nonempty `conditions` menu (each entry a `stream`, `output`,
-`comparator` and nonempty ordered `thresholds`), the `contracts` (existing contract terms with
+at least the embargo), a nonempty `conditions` menu (a named entry has a `stream`, `output`,
+`comparator` and nonempty ordered `thresholds`; a generation rule has a `stream`,
+`output = "*"`, `comparator = "eq"` and no `thresholds`), the `contracts` (existing contract terms with
 unique ids, no two agreeing in every field but their id, and every duration a whole number of
 seconds among the bound outcome generation's expiries), the `account` template (`broker`,
 `currency`, `scale`, `initial_cash`), one `risk_policy` (existing fields; `max_open_per_duration`,
@@ -2094,15 +2149,25 @@ existing configuration identity; the `accelerator` table selects the backend, `c
 
 ### Stages and identities
 
-The menu expands to distinct conditions in menu order. Candidates are every combination of
-`min_conditions..=max_conditions` conditions in increasing count then lexicographic index order,
-deduplicated by signal-logic identity (the first combination keeps it). A member is one candidate
-paired with one contract in configured order; members keep their zero-based global index
-`m{index}` everywhere. The family size is computed with checked arithmetic before any allocation.
+After binding the fitted development plan, each generation rule expands in plan order to every
+retained, coded label of each encoding on its stream with at least two labels. It skips unready
+labels and encodings whose output name collides with a raw output. Named thresholds and generated
+conditions deduplicate in menu order. The ordered resolved table and its hash are stored beside
+the declared rules. Sizing uses the resolved condition count, checked binomial arithmetic and
+`max_candidates` before family allocation. If fewer than `min_conditions` remain, the schema-2
+family has zero enumerated and applicable members, no retained members, lowering or replay chunks;
+it does not open an optional evaluation input.
+Otherwise members enumerate by condition count, lexicographic condition indices and configured
+contracts fastest. Each member's zero-based global index binds its `m{index}` replay ID.
 
-Lowering runs one development replay whose strategies are one single-condition strategy per
-distinct condition (`c{index}`), each on its own unfunded account with the first contract, the
-configured policy and envelope; each `signal` record marks a base row where that condition held.
+A fitted-label equality projects directly when it names a distinct-name encoding and its label
+is retained in the fitted plan. The projection uses the latest causally installed row per stream
+after all rows installed at the same time; a latest row closing after the base close yields no
+match, even if an older row matched. Readiness and the fitted code use the engine projection
+shared with `holds`. All other conditions, including equalities for dropped labels, use one
+development lowering replay with one unfunded single-condition strategy per fallback condition;
+each `signal` marks a base row where that condition held. Lowering is absent when all conditions
+project. The code matrix consists of requested projected encoding columns and lowered 0/1 columns.
 Every synthesized replay carries only the schema version, run mode, storage and its role's replay
 table (contracts in configured order, `max_rate_age_micros = 0`, no rates), so its generation is
 independent of backend and of the other role. The base rows are the base stream's reference rows
@@ -2110,10 +2175,32 @@ of the bound outcome generation; for each contract duration the device rows are 
 outcome reader's cell: a row without an entry tick is masked out, the decision clock is the entry
 tick time, `valid` is set only for `valid` cells, the outcome flags follow the cell, and the
 release clock is the settlement tick time when valid and the nominal due time otherwise. The
-basic dual kernel compares its clock arguments only, so they carry microsecond times unchanged
-under their retained `_ms` names; rows are ordered by decision time then index, the mask is one
-inside the development window, the equality bucket is one, `payout_basis` is zero, and columns
-zero to four (total, wins, losses, ties, invalid) are read.
+dual kernel compares its clock arguments only, so they carry microsecond times unchanged under
+their retained `_ms` names. Schema-2 slots use the base row's installation time inside the
+development window and require a stored entry tick at or after installation; rows without an
+entry are masked. The sparse scorer orders rows by stored entry time then row index, constructs
+chronological lists for each requested `(column, code)`, and drives each candidate by its least
+frequent condition while checking its whole conjunction. Screening uses the basic sparse
+transition's total, directional wins, ties and invalid counts; losses are the other direction's
+wins. A fused CUDA launch scores up to eight distinct expiries per tile from packed outcome rows.
+The CPU reference uses the basic sparse dual scorer once per distinct expiry. A device
+free-memory budget determines column blocks from resident row, sparse-list, packed-outcome,
+candidate and compact-output allocations. Candidates stream by nondecreasing block tuple and
+are ordered within each batch by driver and global rank; global combinatorial ranks place their
+counts in the compact whole-family array. CUDA batches follow a deterministic round robin over
+every configured `[accelerator] devices` entry.
+Schema-1 family verification retains the identity of the original thirteen kernel sources;
+schema-2 family identity includes the fused screening source as the fourteenth.
+The created search report lists `columns C blocks K tuples T replans N` before the visit
+counters; `replans` counts plans halved after a tuple failed to fit, and the command writes
+nothing to standard error when it succeeds.
+`validation_visits` counts sparse tuple-index entries once per constructed workspace: once
+for CPU, or once per configured CUDA device entry, including repeated device ordinals.
+Candidate-driver row visits are reported separately.
+The report also records the device name, compute capability, build target, launch threads,
+batch size, memory budget, allocator-unit hint, their derived or override sources, and observed
+free and pool memory around tuple preallocation. These diagnostic fields are outside the
+configuration hash, family generation, and published `family.json` identity.
 
 The statistic of a member applies when `W = winning_net() >= 0`,
 `L = purchase() + loss.terminal_fee - loss.gross_return > 0`, and the tie nets exactly zero,
@@ -2125,7 +2212,9 @@ over the applicable members. Heuristic scope screens members whose adjusted valu
 `max_adjusted_score`, beyond the first `top` by adjusted value then order, and every inapplicable
 member; screened members are never replayed.
 
-Survivors are replayed in canonical chunks of `chunk_size`, one account, strategy and binding per
+Only retained survivors become schema-2 `Member` records, ordered by `global_index`; logic
+identities are computed for those members. Survivors are replayed in canonical chunks of
+`chunk_size`, one account, strategy and binding per
 member. A completed chunk generation is reused only after its own verifier restores it and its
 manifest records the same instruments, configuration hash and code revision. The development
 group of a member is its binding's summary group (a zero group when it never signalled); profit
@@ -2151,28 +2240,39 @@ two settlements or a horizon beyond them is `unavailable` with its reason.
 
 ### Family generations
 
-The family generation publishes one object, `family.json`: the resolved `search` table, the plan
+The family generation publishes one object, `family.json`: the declared `search` table, the plan
 identity and base stream, the SHA-256 identity of the retained kernel sources, the sampler
-version, the applicable count, every member (conditions, contract, logic identity, raw counts,
-null, applicability, score, adjusted value, screen reason, development group, gate reason, rank,
+version, the applicable count, the schema-2 resolved condition table and hash, and retained
+members (global index, conditions, contract, logic identity, raw counts, null, applicability,
+score, adjusted value, development group, gate reason, rank,
 evaluation group, evaluation split groups, stability outcomes), and the lowering and chunk
 generation references with their summary identities; pretty-printed JSON in declared field order
 with one trailing newline, and identical on every backend. The ready manifest records `kind`
-(`search_family`), `schema_version` (`1`), `generation`, `config_hash`, `code_revision`, the
+(`search_family`), `schema_version` (`2` for new families, `1` for legacy readers),
+`generation`, `config_hash`, `code_revision`, the
 ordered `inputs` (role, instrument, tick, feature, plan and outcome identities), `members`, and
 `objects`. The generation is SHA-256 over `binary-alpha search family v1\n`, the configuration
 hash and the code revision each followed by a newline, then one line per input
 (`role instrument tick feature plan outcome`, a dash for an absent outcome) followed by a newline.
+The schema-2 manifest's `members` and the report's `members` count the complete enumerated
+family, including screened and inapplicable members; `Family.members.len()` counts retained
+survivors. Verification re-expands the recorded rules against the recorded fitted development
+plan, requires exact ordered equality with the resolved table, checks optional lowering against
+only fallback conditions, rebuilds projections, and re-scores every global member through the
+same sparse scorer. It recomputes applicability, exact BH adjustments, the survivor index set,
+gates and ranks, then verifies each retained member's replay chunks and their definitions against
+the recorded members, and compares groups and split groups with verified summaries and the ledger
+projection. A configured `data verify
+--config` uses its accelerator devices only for schema-2 re-scoring; without one it uses CPU
+batches fanned across cores. Within a command, successful full verification is cached by URI
+after the development-only role guard. Certified and ordinary contexts have separate cache keys;
+a separate command re-scores. Schema-1 families retain
+their full-member, full-lowering and close-time CPU verification path and remain readable.
+
 The command writes
 `search SCOPE generation GENERATION members M applicable A screened S replayed R passed P evaluated E objects 1`
-followed by the stage timings and peak resident memory or `(already published)`, then the
-verification line. `data verify` on a family generation validates the manifest and object,
-re-enumerates the members from the recorded table, restores every referenced replay through its
-verifier and checks its definition against the table synthesized for its recorded members,
-recomputes the raw counts through the central-processor kernel from the verified lowering records
-and the bound outcome objects, compares every group and split group with the verified summaries
-and the ledger projection, recomputes stability, applicability, scores, adjustments, screen
-decisions, gates and ranks, and writes
+followed by stage timings, resolved columns, block tuples, re-plans, sparse-list entries, sparse-list construction visits, tuple-index validation visits, candidate-driver row visits, host-to-device transfer bytes, and peak resident memory or `(already published)`, then the
+verification line. `data verify` writes
 `verified search generation GENERATION members M applicable A replayed R passed P objects 1 bytes B`.
 
 ## Portfolio selection
@@ -2193,9 +2293,10 @@ The optional `portfolio` table declares, in canonical order: `families` (nonempt
 ready-manifest locations of development-only search families), positive `max_policies`, positive
 `embargo_micros`, the `objective` (`profit_then_drawdown`: larger completed net profit then lower
 drawdown; `drawdown_then_profit`: lower drawdown then larger profit), the `gates` (positive
-`min_settled`, `max_unresolved`, `min_profit`, non-negative `max_drawdown`, in the reporting
-currency), the shared funded `accounts`, the reporting contract (`reporting_currency`,
-`reporting_scale`, `max_rate_age_micros` and optional `rates`, as in `replay`), the nonempty base
+`min_settled`, `max_unresolved`, `min_profit`, non-negative `max_drawdown`, optional
+`min_decisive`, and optional `min_win_rate` in `[0, 1]`, in the reporting currency where
+applicable), the shared funded `accounts`, the reporting contract (`reporting_currency`,
+`reporting_scale`, `max_rate_age_micros` and optional `rates`, as in `replay`), the nonempty explicit base
 universe `members` (each a `family` index, a `member` index of that family and optional
 `ordinals`, each naming a `condition` index of the member and an interval `ordinal` `0` to `4`),
 nonempty `repairs` (a unique `id` and a conjunction of existing conditions; an empty conjunction
@@ -2215,8 +2316,12 @@ alternative count, times the number of risk policies, must neither overflow nor 
 settlement delay; one contract identity names one contract, so identical terms may repeat under
 their identity while conflicting terms may not. Accounts, every alternative, every risk policy,
 the rates, the reporting contract and the first fold's window are validated by the execution rules
-before any choice is enumerated. Omitting the table preserves every existing configuration
+before any choice is enumerated. For schema-2 families, `member` names a retained global family
+index; an absent or screened index fails before folds. Schema-1 families use their all-member
+vector position. Omitting the table preserves every existing configuration
 identity.
+Standalone `portfolio optimize` always uses explicit members and subsets; it does not accept
+`[portfolio.generate]`.
 
 ### Stages and identities
 
@@ -2233,7 +2338,7 @@ followed; then the family verifies exactly as `data verify` does, whose chunk re
 referenced replay manifest's own role and summary before restoring it. Nothing is stripped to make
 an input acceptable.
 
-The logical universe is the declared members' conditions with their ordinals; an ordinal
+The logical universe is the resolved members' conditions with their ordinals; an ordinal
 condition compares text with `eq` or `ne`. Choices enumerate in declared order: subsets, then each
 deployment's alternatives with the last deployment cycling fastest, then risk policies;
 deployments keep their subset position as `d{position}`. A choice's logical form carries the plan
@@ -2266,6 +2371,12 @@ fold drawdown. Ranking orders passing choices by the objective, then fewer deplo
 canonical identity ascending, writing one-based ranks; the first is selected. No standalone
 profit, score or admission flag prunes.
 
+When either decisive gate is configured, the projection also records wins, losses, and ties.
+Only wins and losses are decisive: zero decisive trades or fewer than `min_decisive` fails for
+insufficient evidence, even when ties satisfy `min_settled`. With sufficient decisive trades,
+`wins / (wins + losses)` below `min_win_rate` fails the economic gate using exact decimal
+comparison. Without decisive gates, these counts are absent from the projection record.
+
 Only a selected choice is refitted: each refit fit builds a new plan on the full permitted
 development generation and the choice re-resolves under it; an inapplicable refit is terminal
 (`refit_inapplicable`) and never chooses the next rank, and a resolved choice whose conditions or
@@ -2279,8 +2390,8 @@ passing choice the result is `no_feasible_policy` with no refit and no outer rea
 ### Selection generations
 
 The selection generation publishes one object, `selection.json`: the resolved configuration,
-whose content hash the manifest binds, every family (generation, plan identity, base stream and every source member with its logic
-identity, contract and the bases that declare it), the logical members, the declared, rejected,
+whose content hash the manifest binds, every family (generation, plan identity, base stream and
+source members with their logic identity, contract and declaring bases), the logical members, the declared, rejected,
 valid and passing counts, every fold's fit and assessment generations, every choice (subset,
 alternatives, risk policy, identity, structural rejection, fold results with their replay
 generation and summary identity, projection and inapplicability, aggregate profit and drawdown,
@@ -2288,7 +2399,8 @@ failure and rank), the selected index, the refit generations, the frozen policy,
 (feature generations, replay reference, projection and split groups) and the terminal `state`
 (`selected`, `no_feasible_policy`, `refit_inapplicable` with its reason, `outer_rejected` with its
 reason); only `selected` carries a deployable candidate, never a certification. The ready manifest
-records `kind` (`portfolio_selection`), `schema_version` (`1`), `generation`, `config_hash`,
+records `kind` (`portfolio_selection`), `schema_version` (`2` when any source family is schema 2,
+otherwise `1`), `generation`, `config_hash`,
 `code_revision`, the `families` generations, `state` and `objects`; the generation is SHA-256 over
 `binary-alpha portfolio selection v1\n`, the configuration hash, the code revision and every
 family generation, each followed by a newline, so extending a grid changes the identity even when
@@ -2296,9 +2408,16 @@ the winner is unchanged. The command writes
 `portfolio generation GENERATION declared D rejected R valid V passing P state S objects 1`
 followed by `[bind S folds S refit S publish S]` or `(already published)`, then the verification
 line. An interruption preserves every completed replay and feature generation and publishes no
-selection; the rerun reuses them and recomputes the rest. `data verify` on a selection checks
-the recorded configuration's hash against the manifest, re-reads the families through the
-development-only reader, re-enumerates the choices, identities and structural rejections,
+selection; the rerun reuses them and recomputes the rest. A schema-2 selection stores only
+resolved source members, each keyed by its retained `global_index`; schema-1 selections retain
+their all-member source records and remain readable. A generated schema-2 selection also records
+the declared `generate` rule in its resolved configuration. Before folds, selection and its
+verifier re-derive the complete ordered members and singleton subsets from verified development
+families, ranks, fitted interval edges, bindings, and condition-free repair zero, and require exact
+equality with that configuration, including an empty resolution. `data verify` on a selection checks
+the recorded configuration's hash and schema against the manifest, re-reads the families through
+the development-only reader, checks every resolved global source index, and re-enumerates the
+choices, identities and structural rejections,
 verifies every recorded fit, assessment, refit and outer feature generation through the feature
 verifier and re-resolves every configured fit through the feature owner against the recorded plan
 before its fit and against its cutoff, restores every recorded replay through its verifier and checks its definition against the table
@@ -2338,11 +2457,13 @@ in instrument order); `refit` (`cutoff` and one development fit observation gene
 observation generation per instrument, optional `splits`; holdout references are validated for syntax
 and declared role only and are never opened before certification); `portfolio` (exactly the
 `portfolio` table without families, folds, refit, and evaluation; a member's family index is its
-instrument index); optional `scenarios` (each a unique identifier `id` other than `baseline`, a
+instrument index; optional `[research.portfolio.generate] top = N` replaces only `members` and
+`subsets` after the fitted development plans and ranks exist); optional `scenarios` (each a unique identifier `id` other than `baseline`, a
 non-negative `acceptance_delay_micros`, and `alternatives` naming every portfolio binding exactly
 once with an exact `contract` and `envelope`; equal contract identifiers within one scenario carry
 equal terms); and `qualification` (`claim`, which must be `empirical_policy_qualification_v1`, and
-`gates`, the exact `min_settled`, `max_unresolved`, `min_profit`, and `max_drawdown` every
+`gates`, the exact `min_settled`, `max_unresolved`, `min_profit`, `max_drawdown`, and optional
+`min_decisive` and `min_win_rate` every
 scenario must satisfy, where `min_profit` is the minimum economically useful improvement over the
 analytic zero-profit benchmark on the same initial capital). Validation lowers the declared
 settings into the existing feature, outcome, search, and portfolio tables with the source
@@ -2353,6 +2474,20 @@ rules, so no later structural rejection consumes a claim. Omitting the table pre
 existing configuration identity; the
 table follows `portfolio` and precedes `[[brokers]]` in canonical order. The command requires
 `run_mode = "research"`.
+
+Generation requires positive `top` and a condition-free `repairs[0]`; its syntax and the remaining
+portfolio declarations are validated before search. After every development family verifies,
+the portfolio owner takes up to `top` passing members in rank order per instrument, skipping a
+member unless each development-fifths threshold identifies exactly one low-to-high interval
+through the fitted edges and retained `interval_label`. Each generated member uses its schema-2
+global index and the derived ordinals. Its singleton subset uses repair zero and exactly one
+binding on that instrument with a sole alternative equal to the ranked contract and search
+envelope; zero or multiple matching bindings fail. The fully resolved portfolio is validated
+before folds. When no member is eligible, generated members and subsets are both empty, so the
+portfolio enumerates zero choices and publishes `no_feasible_policy`; research publishes the
+matching run without reading evaluation or holdout. Explicit portfolios still require nonempty
+members and subsets. Research verification independently rebuilds the resolved configuration
+from the verified families and fitted plans before any outer assessment read.
 
 The optional `replay.scenario` descriptor, version `1`, carries `schema_version` (`1`), an
 identifier `id`, and a non-negative `acceptance_delay_micros`. Every admitted command's synthetic

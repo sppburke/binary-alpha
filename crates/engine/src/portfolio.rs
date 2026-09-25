@@ -13,7 +13,10 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::config::{Config, FeatureInstrument, Portfolio, Replay, StreamKey};
+use crate::config::{
+    Config, Deployment, FeatureInstrument, Ordinal, Portfolio, PortfolioMember, Replay, StreamKey,
+    Subset,
+};
 use crate::dataset::{DatasetRole, ObjectRecord};
 use crate::execution::{
     AccountSpec, Comparator, Condition, ContractTerms, Decimal, DeploymentBinding, Engine, Group,
@@ -26,6 +29,7 @@ use crate::search::Family;
 /// The manifest kind of a published selection.
 pub const SELECTION_MANIFEST_KIND: &str = "portfolio_selection";
 pub const SELECTION_SCHEMA_VERSION: u32 = 1;
+pub const STREAMED_SELECTION_SCHEMA_VERSION: u32 = 2;
 /// The one object of a selection generation.
 pub const SELECTION_OBJECT_PATH: &str = "selection.json";
 /// The plan identity prefix of a strategy's logical form, before a fold resolves it: the
@@ -50,6 +54,10 @@ pub struct Gates {
     pub max_unresolved: u64,
     pub min_profit: Decimal,
     pub max_drawdown: Decimal,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_decisive: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_win_rate: Option<Decimal>,
 }
 
 // ----------------------------------------------------------------------------------------------
@@ -165,7 +173,19 @@ pub fn validate(portfolio: &Portfolio) -> Result<(), String> {
     if portfolio.gates.max_drawdown.is_negative() {
         return Err("gates.max_drawdown: must not be negative".to_string());
     }
-    if portfolio.members.is_empty() {
+    if let Some(rate) = portfolio.gates.min_win_rate
+        && (rate.is_negative() || rate.compare(Decimal::parse("1")?)? == Ordering::Greater)
+    {
+        return Err("gates.min_win_rate: must lie in [0, 1]".to_string());
+    }
+    if portfolio
+        .generate
+        .as_ref()
+        .is_some_and(|rule| rule.top == 0)
+    {
+        return Err("generate.top: must be positive".to_string());
+    }
+    if portfolio.members.is_empty() && portfolio.generate.is_none() {
         return Err("members: at least one base member is required".to_string());
     }
     for (index, member) in portfolio.members.iter().enumerate() {
@@ -196,6 +216,11 @@ pub fn validate(portfolio: &Portfolio) -> Result<(), String> {
         return Err(
             "repairs: at least one alternative is required; an empty conjunction is no repair"
                 .to_string(),
+        );
+    }
+    if portfolio.generate.is_some() && !portfolio.repairs[0].conditions.is_empty() {
+        return Err(
+            "repairs[0].conditions: generated members require a condition-free repair".to_string(),
         );
     }
     unique("repairs", portfolio.repairs.iter().map(|r| r.id.as_str()))?;
@@ -237,8 +262,12 @@ pub fn validate(portfolio: &Portfolio) -> Result<(), String> {
             }
         }
     }
-    if portfolio.subsets.is_empty() {
+    if portfolio.subsets.is_empty() && portfolio.generate.is_none() {
         return Err("subsets: at least one ordered subset is required".to_string());
+    }
+    if portfolio.generate.is_some() && portfolio.members.is_empty() != portfolio.subsets.is_empty()
+    {
+        return Err("members and subsets: generated resolution must be empty together".to_string());
     }
     for (index, subset) in portfolio.subsets.iter().enumerate() {
         if subset.deployments.is_empty() {
@@ -391,6 +420,141 @@ pub fn declared_count(portfolio: &Portfolio) -> Result<u64, String> {
     Ok(total)
 }
 
+/// Re-derives the complete ordered generated universe from verified schema-2 development
+/// families and their fitted plans. Each family's `top` eligible passing ranks become singleton
+/// subsets, deploying the exact ranked contract and envelope on that plan's instrument through
+/// condition-free repair zero. A fifths threshold is eligible only when one retained interval
+/// label derived from fitted edges matches it. No code position is an interval ordinal.
+pub fn generated_members(
+    portfolio: &Portfolio,
+    families: &[Family],
+    plans: &[FeaturePlan],
+) -> Result<(Vec<PortfolioMember>, Vec<Subset>), String> {
+    let rule = portfolio
+        .generate
+        .as_ref()
+        .ok_or("generate: the rule is required")?;
+    if rule.top == 0 {
+        return Err("generate.top: must be positive".into());
+    }
+    if portfolio
+        .repairs
+        .first()
+        .is_none_or(|repair| !repair.conditions.is_empty())
+    {
+        return Err(
+            "repairs[0].conditions: generated members require a condition-free repair".into(),
+        );
+    }
+    if families.len() != portfolio.families.len() || plans.len() != families.len() {
+        return Err("generate: each family needs one fitted development plan".into());
+    }
+    let mut members = Vec::new();
+    let mut subsets = Vec::new();
+    for (family_index, (family, plan)) in families.iter().zip(plans).enumerate() {
+        if family.schema_version != 2 || family.plan_identity != plan.identity() {
+            return Err(format!(
+                "families[{family_index}]: generation requires a schema-2 family and its fitted plan"
+            ));
+        }
+        let mut ranked: Vec<_> = family
+            .members
+            .iter()
+            .filter(|member| member.rank.is_some())
+            .collect();
+        ranked.sort_by_key(|member| member.rank.expect("passing rank"));
+        let mut taken = 0;
+        for member in ranked {
+            if taken == rule.top {
+                break;
+            }
+            let mut ordinals = Vec::new();
+            let mut eligible = true;
+            for (condition_index, condition) in member.conditions.iter().enumerate() {
+                let encoding = encoding_of(plan, condition);
+                if let Some(encoding) = encoding
+                    .filter(|encoding| encoding.encoding == ProjectionKind::DevelopmentFifths)
+                {
+                    let Threshold::Text(label) = &condition.threshold else {
+                        eligible = false;
+                        break;
+                    };
+                    if !matches!(condition.comparator, Comparator::Eq | Comparator::Ne) {
+                        eligible = false;
+                        break;
+                    }
+                    let matching: Vec<u8> = (0..=4)
+                        .filter(|&ordinal| {
+                            encoding.interval_label(ordinal).ok().as_deref() == Some(label)
+                        })
+                        .collect();
+                    if matching.len() != 1 {
+                        eligible = false;
+                        break;
+                    }
+                    ordinals.push(Ordinal {
+                        condition: condition_index,
+                        ordinal: matching[0],
+                    });
+                }
+            }
+            if !eligible {
+                continue;
+            }
+            let contract = family
+                .search
+                .contracts
+                .iter()
+                .find(|contract| contract.id == member.contract)
+                .ok_or_else(|| {
+                    format!("families[{family_index}]: ranked member names an unknown contract")
+                })?;
+            let matching: Vec<usize> = portfolio
+                .bindings
+                .iter()
+                .enumerate()
+                .filter(|(_, binding)| {
+                    binding.instrument == plan.instrument
+                        && binding.alternatives.len() == 1
+                        && binding.alternatives[0].contract == *contract
+                        && binding.alternatives[0].envelope == family.search.envelope
+                })
+                .map(|(index, _)| index)
+                .collect();
+            if matching.len() != 1 {
+                return Err(format!(
+                    "families[{family_index}]: ranked member {} requires exactly one binding for instrument {}, contract {}, and search envelope with a sole alternative; found {}",
+                    member.global_index.unwrap_or_default(),
+                    plan.instrument,
+                    member.contract,
+                    matching.len()
+                ));
+            }
+            let source_index = member.global_index.ok_or_else(|| {
+                format!("families[{family_index}]: schema-2 member lacks a global index")
+            })?;
+            let source_index = usize::try_from(source_index).map_err(|_| {
+                format!("families[{family_index}]: global member index does not fit usize")
+            })?;
+            let base = members.len();
+            members.push(PortfolioMember {
+                family: family_index,
+                member: source_index,
+                ordinals,
+            });
+            subsets.push(Subset {
+                deployments: vec![Deployment {
+                    member: base,
+                    repair: 0,
+                    binding: matching[0],
+                }],
+            });
+            taken += 1;
+        }
+    }
+    Ok((members, subsets))
+}
+
 // ----------------------------------------------------------------------------------------------
 // The logical universe and its enumeration
 // ----------------------------------------------------------------------------------------------
@@ -426,7 +590,18 @@ pub fn logical_members(
         .enumerate()
         .map(|(index, base)| {
             let family = &families[base.family];
-            let member = family.members.get(base.member).ok_or_else(|| {
+            let member = (if family.schema_version == 2 {
+                family
+                    .members
+                    .binary_search_by_key(&(base.member as u64), |member| {
+                        member.global_index.expect("checked schema-2 family")
+                    })
+                    .ok()
+                    .and_then(|position| family.members.get(position))
+            } else {
+                family.members.get(base.member)
+            })
+            .ok_or_else(|| {
                 format!(
                     "members[{index}].member: {} is not a member of family {}, which holds {}",
                     base.member,
@@ -567,7 +742,11 @@ pub enum Failure {
 
 /// The fitted encoding a condition reads, when its output is one.
 fn encoding_of<'a>(plan: &'a FeaturePlan, condition: &Condition) -> Option<&'a FittedEncoding> {
-    plan.stream(condition.stream)?
+    let stream = plan.stream(condition.stream)?;
+    if stream.output_index(&condition.output).is_some() {
+        return None;
+    }
+    stream
         .encodings
         .iter()
         .find(|encoding| encoding.output == condition.output)
@@ -752,6 +931,12 @@ pub fn structure(portfolio: &Portfolio, policy: &Policy) -> Result<(), String> {
 pub struct Projection {
     pub settled: u64,
     pub unresolved: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wins: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub losses: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ties: Option<u64>,
     /// The restored ledger's final event time, at which every account is valued.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub valued_at: Option<String>,
@@ -766,6 +951,40 @@ pub struct Projection {
     pub failure: Option<String>,
 }
 
+pub(crate) fn decisive_support_failure(projection: &Projection, gates: &Gates) -> Option<String> {
+    if gates.min_decisive.is_none() && gates.min_win_rate.is_none() {
+        return None;
+    }
+    let (Some(wins), Some(losses)) = (projection.wins, projection.losses) else {
+        return Some("decisive trade counts are unavailable".to_string());
+    };
+    let decisive = u128::from(wins) + u128::from(losses);
+    let minimum = gates.min_decisive.unwrap_or(0);
+    (decisive == 0 || decisive < u128::from(minimum)).then(|| {
+        format!("decisive trades {decisive} below the minimum {minimum} (zero is insufficient)")
+    })
+}
+
+pub(crate) fn decisive_rate_failure(
+    projection: &Projection,
+    gates: &Gates,
+) -> Result<Option<String>, String> {
+    let Some(minimum) = gates.min_win_rate else {
+        return Ok(None);
+    };
+    let (Some(wins), Some(losses)) = (projection.wins, projection.losses) else {
+        return Ok(None);
+    };
+    let decisive = u128::from(wins) + u128::from(losses);
+    if decisive == 0 {
+        return Ok(None);
+    }
+    let winning = Decimal::parse(&wins.to_string())?;
+    let required = Decimal::parse(&decisive.to_string())?.checked_mul(minimum)?;
+    Ok((winning.compare(required)? == Ordering::Less)
+        .then(|| format!("decisive win rate {wins}/{decisive} below the minimum {minimum}")))
+}
+
 /// Projects and gates one verified restored engine: settlement support first; only then every
 /// account's native completed profit converted by the engine at the restored ledger's final
 /// event time and summed with checked arithmetic; then the engine's reporting drawdown, which
@@ -773,9 +992,13 @@ pub struct Projection {
 /// gate; an arithmetic error stops.
 pub fn project(engine: &Engine, gates: &Gates) -> Result<Projection, String> {
     let summary = engine.summary();
+    let decisive_gates = gates.min_decisive.is_some() || gates.min_win_rate.is_some();
     let mut projection = Projection {
         settled: summary.portfolio.settled,
         unresolved: summary.portfolio.unresolved,
+        wins: decisive_gates.then_some(summary.portfolio.wins),
+        losses: decisive_gates.then_some(summary.portfolio.losses),
+        ties: decisive_gates.then_some(summary.portfolio.ties),
         valued_at: summary.last_time_micros.map(format_event_time_micros),
         profit: None,
         rates: BTreeSet::new(),
@@ -795,6 +1018,10 @@ pub fn project(engine: &Engine, gates: &Gates) -> Result<Projection, String> {
             "unresolved {} above the maximum {}",
             projection.unresolved, gates.max_unresolved
         ));
+        return Ok(projection);
+    }
+    if let Some(reason) = decisive_support_failure(&projection, gates) {
+        projection.failure = Some(reason);
         return Ok(projection);
     }
     let replay = &engine.definition().replay;
@@ -842,6 +1069,9 @@ pub fn project(engine: &Engine, gates: &Gates) -> Result<Projection, String> {
                 "drawdown is unavailable: {unavailable} reporting observations were unavailable"
             ));
         }
+    }
+    if projection.failure.is_none() {
+        projection.failure = decisive_rate_failure(&projection, gates)?;
     }
     Ok(projection)
 }
@@ -1030,6 +1260,9 @@ pub fn rank(
 /// is excluded from the universe by configuration, never by a search rank, score, or screen.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub struct SourceMember {
+    /// The declared source's global family index in schema 2; absent in schema 1.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub global_index: Option<u64>,
     pub logic_identity: String,
     pub contract: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -1102,6 +1335,11 @@ impl State {
 /// hash the manifest binds, then everything the procedure computed.
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 pub struct Selection {
+    #[serde(
+        default = "selection_schema_one",
+        skip_serializing_if = "selection_is_schema_one"
+    )]
+    pub schema_version: u32,
     pub config: Config,
     pub families: Vec<FamilyRecord>,
     pub members: Vec<LogicalMember>,
@@ -1131,8 +1369,22 @@ impl Selection {
     }
 
     pub fn from_json(bytes: &[u8]) -> Result<Self, String> {
-        serde_json::from_slice(bytes).map_err(|error| error.to_string())
+        let selection: Self = serde_json::from_slice(bytes).map_err(|error| error.to_string())?;
+        if !matches!(selection.schema_version, 1 | 2) {
+            return Err(format!(
+                "unsupported selection schema_version {}",
+                selection.schema_version
+            ));
+        }
+        Ok(selection)
     }
+}
+
+fn selection_schema_one() -> u32 {
+    1
+}
+fn selection_is_schema_one(version: &u32) -> bool {
+    *version == 1
 }
 
 /// The ready manifest of a selection generation.
@@ -1163,9 +1415,12 @@ impl SelectionManifest {
                 manifest.kind
             ));
         }
-        if manifest.schema_version != SELECTION_SCHEMA_VERSION {
+        if !matches!(
+            manifest.schema_version,
+            SELECTION_SCHEMA_VERSION | STREAMED_SELECTION_SCHEMA_VERSION
+        ) {
             return Err(format!(
-                "unsupported schema_version {}, expected {SELECTION_SCHEMA_VERSION}",
+                "unsupported schema_version {}, expected 1 or 2",
                 manifest.schema_version
             ));
         }
@@ -1254,6 +1509,9 @@ mod tests {
                 projection: Some(Projection {
                     settled: 1,
                     unresolved: 0,
+                    wins: None,
+                    losses: None,
+                    ties: None,
                     valued_at: None,
                     profit: Some(Decimal::parse(profit).unwrap()),
                     rates: BTreeSet::new(),
@@ -1267,6 +1525,51 @@ mod tests {
             failure: None,
             rank: None,
         }
+    }
+
+    #[test]
+    fn decisive_fold_gates_exclude_ties_and_compare_exact_boundary() {
+        let gates = Gates {
+            min_settled: 3,
+            max_unresolved: 0,
+            min_profit: Decimal::parse("0").unwrap(),
+            max_drawdown: Decimal::parse("5").unwrap(),
+            min_decisive: Some(2),
+            min_win_rate: Some(Decimal::parse("0.5").unwrap()),
+        };
+        let mut projection = choice("a", "1", "0")
+            .folds
+            .into_iter()
+            .next()
+            .unwrap()
+            .projection
+            .unwrap();
+        projection.settled = 3;
+        projection.wins = Some(1);
+        projection.losses = Some(0);
+        projection.ties = Some(2);
+        assert!(
+            decisive_support_failure(&projection, &gates)
+                .unwrap()
+                .contains("decisive trades 1")
+        );
+
+        projection.losses = Some(2);
+        projection.ties = Some(0);
+        assert_eq!(decisive_support_failure(&projection, &gates), None);
+        assert!(
+            decisive_rate_failure(&projection, &gates)
+                .unwrap()
+                .unwrap()
+                .contains("1/3")
+        );
+
+        projection.losses = Some(1);
+        projection.ties = Some(1);
+        assert_eq!(decisive_rate_failure(&projection, &gates).unwrap(), None);
+        projection.wins = Some(0);
+        projection.losses = Some(0);
+        assert!(decisive_support_failure(&projection, &gates).is_some());
     }
 
     #[test]
@@ -1296,6 +1599,9 @@ mod tests {
             projection: Some(Projection {
                 settled: 1,
                 unresolved: 0,
+                wins: None,
+                losses: None,
+                ties: None,
                 valued_at: None,
                 profit: Some(Decimal::parse("-0.25").unwrap()),
                 rates: BTreeSet::new(),

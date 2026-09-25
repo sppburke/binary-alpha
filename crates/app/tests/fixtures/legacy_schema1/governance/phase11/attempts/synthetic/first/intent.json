@@ -1,0 +1,93 @@
+{
+  "schema_version": 1,
+  "study": "synthetic",
+  "attempt": "first",
+  "config_hash": "v3:sha256:ed808ef40f2fec9ccdf28c4facdca2a890d722dc9d1bf1714de08906ee7f9ccd",
+  "code_revision": "fe93017a2fdec8d209d036ed8d7da9c370e185f9",
+  "declaration": "7c3e0e70ac2c572f8c1264e4c9dc0db747a0070b064c90e40129046a4b217baa",
+  "root": "file:///proc/self/cwd/governance",
+  "namespace": "phase11",
+  "changes": "initial attempt",
+  "populations": [
+    {
+      "id": "assessment-0",
+      "role": "development",
+      "tokens": [
+        "assessment-0-a",
+        "assessment-0-b"
+      ]
+    },
+    {
+      "id": "assessment-1",
+      "role": "development",
+      "tokens": [
+        "assessment-1-a",
+        "assessment-1-b"
+      ]
+    },
+    {
+      "id": "evaluation-0",
+      "role": "evaluation",
+      "tokens": [
+        "evaluation-0-a",
+        "evaluation-0-b"
+      ]
+    },
+    {
+      "id": "evaluation-1",
+      "role": "evaluation",
+      "tokens": [
+        "evaluation-1-a",
+        "evaluation-1-b"
+      ]
+    },
+    {
+      "id": "holdout-0",
+      "role": "holdout",
+      "tokens": [
+        "holdout-0-a",
+        "holdout-0-b"
+      ]
+    },
+    {
+      "id": "holdout-1",
+      "role": "holdout",
+      "tokens": [
+        "holdout-1-a",
+        "holdout-1-b"
+      ]
+    },
+    {
+      "id": "refit-0",
+      "role": "development",
+      "tokens": [
+        "refit-0-a",
+        "refit-0-b"
+      ]
+    },
+    {
+      "id": "refit-1",
+      "role": "development",
+      "tokens": [
+        "refit-1-a",
+        "refit-1-b"
+      ]
+    },
+    {
+      "id": "source-0",
+      "role": "development",
+      "tokens": [
+        "source-0-a",
+        "source-0-b"
+      ]
+    },
+    {
+      "id": "source-1",
+      "role": "development",
+      "tokens": [
+        "source-1-a",
+        "source-1-b"
+      ]
+    }
+  ]
+}

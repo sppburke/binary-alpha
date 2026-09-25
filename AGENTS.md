@@ -62,7 +62,7 @@ A third-party package requires explicit authorization in the reviewed issue, evi
 
 ## Operator closeout
 
-Every plan and delivery report states production operator tasks and linked matching Sentry issues, using `none` where evidence proves none. This reporting rule does not authorize creating a Sentry project or integration. Separately authorized production work creates nothing in a region whose name begins `us-west`, minimizes downtime, uses a safe non-quiescent alternative when it preserves proof and rollback, checkpoints each mutation for resumption, verifies the cause-specific result, and retains rollback. Close only an already linked matching Sentry issue after deployed proof, with no waiting period.
+Every plan and delivery report states production operator tasks and linked matching Sentry issues, using `none` where evidence proves none. This reporting rule does not authorize creating a Sentry project or integration. Separately authorized production work minimizes downtime, uses a safe non-quiescent alternative when it preserves proof and rollback, checkpoints each mutation for resumption, verifies the cause-specific result, and retains rollback. Close only an already linked matching Sentry issue after deployed proof, with no waiting period.
 
 ## Delegation
 

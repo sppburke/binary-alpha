@@ -1922,6 +1922,7 @@ mod governed {
             let mut encoding = FittedEncoding {
                 output: output.clone(),
                 input: output.clone(),
+                automatic: false,
                 encoding: ProjectionKind::Category,
                 edges: None,
                 input_divisor: 1.0,

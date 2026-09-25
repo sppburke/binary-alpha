@@ -143,21 +143,25 @@ Verify a selection with the same `data verify` command, which restores every ref
 Selection performs no broker, live, paper, or production action and needs no operator task.
 
 Cut research roles: declare `[split]` with a namespace, one development daily-root source per
-instrument, and whole-day development, evaluation, and holdout windows. Run
+instrument, whole-day development and evaluation windows, and optional holdout windows. Run
 `binary-alpha data split --config PATH` with a retained folder and destination outside the source
 stores and managed pipeline stores. Use the reviewed `storage.publication_uri` on Google Cloud
 Storage with existing credentials for real holdout authority; local publication is for fixtures.
 The command prints the bounded generations and their governance declaration location.
 
-Give the source one development window and make its search window equal to that range: historical
-replay refuses feature decisions outside the search window. For each fold, give the fit a window
-ending at its cutoff and the assessment a window equal to its decision window, with the start
-at least the embargo after the cutoff. Give the refit its own fit window; an identical source
-window reuses the same generation. Reserve one disjoint evaluation window and one disjoint
-holdout window per attempt, because each day's token is claimed once. Name these generations
-and the printed declaration in the research configuration. The unsliced root is never a research
-input. This command requires no production operator task or downtime; matching Sentry issues:
-none. It provisions no bucket and changes no broker, archive, or managed store.
+Give the source one development window and make its search window that range: historical replay
+refuses feature decisions outside the search window. Split data windows and their tokens stay whole
+UTC days. For a bar generation, every search, fold, evaluation, and holdout decision end and every
+fit cutoff is one second after the window's closing midnight, because the window's last bar is
+known at that midnight; tick generations keep midnight bounds. For each fold, give the fit a window
+ending at its cutoff and the assessment a window equal to its decision window, with the start at
+least the embargo after the cutoff. Give the refit its own fit window; an identical source window
+reuses the same generation. Reserve one disjoint evaluation window and one disjoint holdout window
+per research attempt, because each day's token is claimed once; a split that feeds no research run
+may declare `holdout = []`. Name these generations and the printed declaration in the research
+configuration. The unsliced root is never a research input. This command requires no production
+operator task or downtime; matching Sentry issues: none. It provisions no bucket and changes no
+broker, archive, or managed store.
 
 Research: use the declaration from `data split`, or author a non-sensitive governance declaration
 from authorized records (operator,
@@ -184,10 +188,10 @@ result is terminal for that frozen run: it never tunes, reranks, retries, or ope
 No live service quiescence or downtime is involved.
 
 Rollout to Google Cloud Storage: discover and reuse existing projects, buckets, identities, and
-regions first; create nothing in a region whose name begins `us-west`; provision the bucket and a
-least-privilege identity that can read and create objects but not create or delete buckets, outside
-the application; then run the import above. Rollback reverts the application and configuration
-change; source files, the retained copy, and published generations stay intact.
+regions first; provision the bucket and a least-privilege identity that can read and create objects
+but not create or delete buckets, outside the application; then run the import above. Rollback
+reverts the application and configuration change; source files, the retained copy, and published
+generations stay intact.
 
 ## Data pipeline
 
@@ -564,8 +568,7 @@ This procedure records the separately authorized rollout required by issue
 ### Rollout and handoff
 
 1. Discover and reuse an existing Supabase project and approved Google resources. If a resource
-   must be created, create nothing in a region whose name begins `us-west`; choose the existing
-   compute region or a measured permitted region.
+   must be created, choose the existing compute region or a measured region.
 2. Apply the `live_leases` and `live_dispatch_claims` migration idempotently. Record its schema
    version and result so another agent can resume. Grant the runtime only the row operations
    needed for its account lease and dispatch claims. The implemented `Postgres::migrate` uses
@@ -733,11 +736,6 @@ Runner rollback stops and unregisters only `binary-alpha-cuda-quantum`; keep the
 and unrelated machine setup. Accelerator rollback selects the explicit central-processor backend
 and reverts the accelerator change while preserving completed evidence. Production operator tasks:
 none. Linked matching Sentry issues: none.
-
-## Regions
-
-Create nothing in a region whose name begins `us-west`. This applies to every bucket, database,
-service, runner, and secret.
 
 ## Rollback
 

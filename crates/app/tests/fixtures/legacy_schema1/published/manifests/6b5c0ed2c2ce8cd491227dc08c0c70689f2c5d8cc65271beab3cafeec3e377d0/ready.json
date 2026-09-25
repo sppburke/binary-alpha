@@ -1,0 +1,94 @@
+{
+  "layout": "daily-v2",
+  "day_inventory": [
+    {
+      "date": "2026-01-05",
+      "family": "candles",
+      "duration": 20,
+      "offset": 0,
+      "object": "objects/18fa76392c48bb0e4d6eed5e008201f339ceca246cd6f865742aeb804be49813",
+      "rows": 4,
+      "first_time": "2026-01-05T00:00:00.000000Z",
+      "last_time": "2026-01-05T00:01:00.000000Z",
+      "state": "partial",
+      "reason": "source evidence without whole-day completeness; last candle may be finalized by later input",
+      "unresolved": [
+        {
+          "start": "2026-01-05T00:00:00.000000Z",
+          "end": "2026-01-06T00:00:00.000000Z"
+        }
+      ]
+    }
+  ],
+  "kind": "instrument_stream",
+  "schema_version": 1,
+  "generation": "6b5c0ed2c2ce8cd491227dc08c0c70689f2c5d8cc65271beab3cafeec3e377d0",
+  "broker": "pocket_option",
+  "provider_symbol": "AEDCNY_otc",
+  "instrument": "pocket_option:AEDCNY_otc",
+  "role": "development",
+  "source_generation": "f2f1b9cd5e4ca1db4e4afcfec207f63eb81320019fbf379056e7fdee2d1a7d33",
+  "source_manifest_uri": "file:///proc/self/cwd/published/manifests/f2f1b9cd5e4ca1db4e4afcfec207f63eb81320019fbf379056e7fdee2d1a7d33/ready.json",
+  "source_kind": "bar_parquet",
+  "definition": {
+    "broker": "pocket_option",
+    "provider_symbol": "AEDCNY_otc",
+    "quote_currency": "unit",
+    "price_scale": 6,
+    "native_granularity": {
+      "kind": "bar",
+      "period_seconds": 5
+    },
+    "gap": {
+      "max_seconds": 2,
+      "reopen_seconds": 60
+    },
+    "session": {
+      "kind": "always"
+    },
+    "candles": [
+      {
+        "duration_seconds": 20,
+        "offset_seconds": 0,
+        "min_observations": 4,
+        "hard_min_observations": 4
+      }
+    ]
+  },
+  "config_hash": "v3:sha256:ca974c93864b8fa85bdf2455379d6865937888614191779ba220d987c57e5094",
+  "code_revision": "fe93017a2fdec8d209d036ed8d7da9c370e185f9",
+  "observations": 18,
+  "coverage": {
+    "first_event_time": "2026-01-05T00:00:00.000000Z",
+    "last_event_time": "2026-01-05T00:01:25.000000Z"
+  },
+  "streams": [
+    {
+      "duration_seconds": 20,
+      "offset_seconds": 0,
+      "rows": 4,
+      "first_open_time": "2026-01-05T00:00:00.000000Z",
+      "last_close_time": "2026-01-05T00:01:20.000000Z"
+    }
+  ],
+  "objects": [
+    {
+      "role": "normalized",
+      "path": "profile.json",
+      "key": "objects/3225af7c220830926a28eeb2abdb9de153c11a88591d5ca530bdc5f9067772e3",
+      "bytes": 3037,
+      "sha256": "3225af7c220830926a28eeb2abdb9de153c11a88591d5ca530bdc5f9067772e3",
+      "crc32c": null,
+      "generation": null
+    },
+    {
+      "role": "normalized",
+      "path": "candles/20s_0s/2026-01-05.parquet",
+      "key": "objects/18fa76392c48bb0e4d6eed5e008201f339ceca246cd6f865742aeb804be49813",
+      "bytes": 4513,
+      "sha256": "18fa76392c48bb0e4d6eed5e008201f339ceca246cd6f865742aeb804be49813",
+      "crc32c": null,
+      "generation": null
+    }
+  ]
+}

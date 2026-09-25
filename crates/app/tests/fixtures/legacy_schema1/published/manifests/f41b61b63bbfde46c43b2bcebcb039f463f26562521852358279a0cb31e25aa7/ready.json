@@ -1,0 +1,23 @@
+{
+  "kind": "portfolio_selection",
+  "schema_version": 1,
+  "generation": "f41b61b63bbfde46c43b2bcebcb039f463f26562521852358279a0cb31e25aa7",
+  "config_hash": "v3:sha256:232385c87994f1e3dd80a492ff1e86598c954b7eb344176ec00f534b1bae341d",
+  "code_revision": "fe93017a2fdec8d209d036ed8d7da9c370e185f9",
+  "families": [
+    "d7924115f6ec1c2219d5239081221020315db2bf998d950c10cb60d194c53f67",
+    "73486072a7f59ab1df2e6f2f2b704454759ec5c23ff977b874b58c0f3fd180d7"
+  ],
+  "state": "selected",
+  "objects": [
+    {
+      "role": "normalized",
+      "path": "selection.json",
+      "key": "objects/2e45e7a4818bd4316fbfa778a1bf2907c64e1a121b6896426ac3db032a6cdafb",
+      "bytes": 29639,
+      "sha256": "2e45e7a4818bd4316fbfa778a1bf2907c64e1a121b6896426ac3db032a6cdafb",
+      "crc32c": null,
+      "generation": null
+    }
+  ]
+}

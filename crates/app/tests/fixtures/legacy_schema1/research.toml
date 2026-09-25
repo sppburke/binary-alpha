@@ -1,0 +1,756 @@
+schema_version = 1
+run_mode = "research"
+
+[storage]
+historical_data_dir = "/proc/self/cwd/retained"
+publication_uri = "file:///proc/self/cwd/published"
+
+[[instruments]]
+broker = "pocket_option"
+provider_symbol = "AEDCNY_otc"
+quote_currency = "unit"
+price_scale = 6
+
+[instruments.native_granularity]
+kind = "bar"
+period_seconds = 5
+
+[instruments.gap]
+max_seconds = 2
+reopen_seconds = 60
+
+[instruments.session]
+kind = "always"
+
+[[instruments.candles]]
+duration_seconds = 20
+offset_seconds = 0
+min_observations = 4
+hard_min_observations = 4
+
+[[instruments]]
+broker = "pocket_option"
+provider_symbol = "SECOND_otc"
+quote_currency = "eur"
+price_scale = 3
+
+[instruments.native_granularity]
+kind = "bar"
+period_seconds = 5
+
+[instruments.gap]
+max_seconds = 2
+reopen_seconds = 60
+
+[instruments.session]
+kind = "always"
+
+[[instruments.candles]]
+duration_seconds = 20
+offset_seconds = 0
+min_observations = 4
+hard_min_observations = 4
+
+[research.study]
+study = "synthetic"
+attempt = "first"
+governance_manifest = "file:///proc/self/cwd/declaration.json"
+changes = "initial attempt"
+
+[[research.instruments]]
+instrument = "pocket_option:AEDCNY_otc"
+source_manifest = "file:///proc/self/cwd/published/manifests/f2f1b9cd5e4ca1db4e4afcfec207f63eb81320019fbf379056e7fdee2d1a7d33/ready.json"
+
+[research.instruments.features]
+outputs = "all_supported"
+
+[[research.instruments.features.streams]]
+duration_seconds = 20
+offset_seconds = 0
+
+[research.instruments.outcomes]
+expiry_seconds = [5, 7, 20]
+max_entry_delay_ms = 5000
+max_settlement_delay_ms = 5000
+max_tick_gap_ms = 5000
+true_jump_max_gap_ms = 5000
+true_jump_basis_points = "5"
+frozen_min_ticks = 10
+frozen_min_ms = 5000
+
+[research.instruments.search]
+decision_start = "2026-01-05T00:00:20.000000Z"
+decision_end = "2026-01-05T00:01:40.000000Z"
+scope = "exhaustive"
+seed = 7
+chunk_size = 8
+max_candidates = 100
+min_conditions = 1
+max_conditions = 1
+embargo_micros = 10000000
+
+[research.instruments.search.base_stream]
+duration_seconds = 20
+offset_seconds = 0
+
+[[research.instruments.search.conditions]]
+output = "candle_direction"
+comparator = "eq"
+thresholds = ["up", "down"]
+
+[research.instruments.search.conditions.stream]
+duration_seconds = 20
+offset_seconds = 0
+
+[[research.instruments.search.contracts]]
+id = "0-small"
+direction = "buy"
+duration_micros = 5000000
+currency = "unit"
+stake = "1"
+quoted_cost = "1"
+entry_fee = "0"
+
+[research.instruments.search.contracts.win]
+gross_return = "1.80"
+terminal_fee = "0"
+
+[research.instruments.search.contracts.loss]
+gross_return = "0"
+terminal_fee = "0"
+
+[research.instruments.search.contracts.tie]
+gross_return = "1"
+terminal_fee = "0"
+
+[research.instruments.search.contracts.settlement]
+rule = "price_at_due_v1"
+max_settlement_delay_micros = 5000000
+max_tick_gap_micros = 5000000
+
+[research.instruments.search.account]
+broker = "pocket_option"
+currency = "unit"
+scale = 2
+initial_cash = "1000"
+
+[research.instruments.search.risk_policy]
+id = "one"
+max_open_per_strategy = 1
+same_entry = "all"
+deduplicate_signal_logic = false
+max_feature_age_micros = 60000000
+max_quote_age_micros = 0
+
+[research.instruments.search.envelope]
+max_purchase_cost = "1"
+max_entry_fee = "0"
+max_win_terminal_fee = "0"
+max_loss_terminal_fee = "0"
+max_tie_terminal_fee = "0"
+min_winning_net_return = "0.80"
+settlement_rule = "price_at_due_v1"
+
+[research.instruments.search.gates]
+min_settled = 1
+max_unresolved = 0
+min_net_profit = "0"
+
+[research.instruments.search.stability]
+block_length = 4
+simulations = 16
+rolling_horizon = 4
+
+[[research.instruments]]
+instrument = "pocket_option:SECOND_otc"
+source_manifest = "file:///proc/self/cwd/published/manifests/61cb801d1ce5f355e507d1cdcdba54fbb9d52a794bb294f80b1a275e711d1fd3/ready.json"
+
+[research.instruments.features]
+outputs = "all_supported"
+
+[[research.instruments.features.streams]]
+duration_seconds = 20
+offset_seconds = 0
+
+[research.instruments.outcomes]
+expiry_seconds = [5, 7, 20]
+max_entry_delay_ms = 5000
+max_settlement_delay_ms = 5000
+max_tick_gap_ms = 5000
+true_jump_max_gap_ms = 5000
+true_jump_basis_points = "5"
+frozen_min_ticks = 10
+frozen_min_ms = 5000
+
+[research.instruments.search]
+decision_start = "2026-01-05T00:00:20.000000Z"
+decision_end = "2026-01-05T00:01:40.000000Z"
+scope = "exhaustive"
+seed = 7
+chunk_size = 8
+max_candidates = 100
+min_conditions = 1
+max_conditions = 1
+embargo_micros = 10000000
+
+[research.instruments.search.base_stream]
+duration_seconds = 20
+offset_seconds = 0
+
+[[research.instruments.search.conditions]]
+output = "candle_direction"
+comparator = "eq"
+thresholds = ["up", "down"]
+
+[research.instruments.search.conditions.stream]
+duration_seconds = 20
+offset_seconds = 0
+
+[[research.instruments.search.contracts]]
+id = "1-small"
+direction = "buy"
+duration_micros = 5000000
+currency = "eur"
+stake = "1"
+quoted_cost = "1"
+entry_fee = "0"
+
+[research.instruments.search.contracts.win]
+gross_return = "1.80"
+terminal_fee = "0"
+
+[research.instruments.search.contracts.loss]
+gross_return = "0"
+terminal_fee = "0"
+
+[research.instruments.search.contracts.tie]
+gross_return = "1"
+terminal_fee = "0"
+
+[research.instruments.search.contracts.settlement]
+rule = "price_at_due_v1"
+max_settlement_delay_micros = 5000000
+max_tick_gap_micros = 5000000
+
+[research.instruments.search.account]
+broker = "pocket_option"
+currency = "eur"
+scale = 2
+initial_cash = "1000"
+
+[research.instruments.search.risk_policy]
+id = "one"
+max_open_per_strategy = 1
+same_entry = "all"
+deduplicate_signal_logic = false
+max_feature_age_micros = 60000000
+max_quote_age_micros = 0
+
+[research.instruments.search.envelope]
+max_purchase_cost = "1"
+max_entry_fee = "0"
+max_win_terminal_fee = "0"
+max_loss_terminal_fee = "0"
+max_tie_terminal_fee = "0"
+min_winning_net_return = "0.80"
+settlement_rule = "price_at_due_v1"
+
+[research.instruments.search.gates]
+min_settled = 1
+max_unresolved = 0
+min_net_profit = "0"
+
+[research.instruments.search.stability]
+block_length = 4
+simulations = 16
+rolling_horizon = 4
+
+[[research.folds]]
+cutoff = "2026-01-05T00:01:40.000000Z"
+decision_start = "2026-01-05T01:00:20.000000Z"
+decision_end = "2026-01-05T01:01:40.000000Z"
+
+[[research.folds.inputs]]
+fit_manifest = "file:///proc/self/cwd/published/manifests/f2f1b9cd5e4ca1db4e4afcfec207f63eb81320019fbf379056e7fdee2d1a7d33/ready.json"
+assessment_manifest = "file:///proc/self/cwd/published/manifests/99af8c0991265c02366977a4b568dcfc15d1a3f5811697d35425bd5f4f43baf4/ready.json"
+
+[[research.folds.inputs]]
+fit_manifest = "file:///proc/self/cwd/published/manifests/61cb801d1ce5f355e507d1cdcdba54fbb9d52a794bb294f80b1a275e711d1fd3/ready.json"
+assessment_manifest = "file:///proc/self/cwd/published/manifests/93146e695247f59dc42e127bd5e33c271288d8d93e02cc52f293f61e2b02f901/ready.json"
+
+[research.refit]
+cutoff = "2026-01-05T02:01:40.000000Z"
+fits = ["file:///proc/self/cwd/published/manifests/5e92163c490cbd67e82c024925f782dc63e9db8dc1fbfa1f33c3b3cc30c03a3b/ready.json", "file:///proc/self/cwd/published/manifests/95f72f27319922458d0fbf81d7cc584a06ba1883a365f70460996e4e3c7f6591/ready.json"]
+
+[research.evaluation]
+decision_start = "2026-01-05T03:00:20.000000Z"
+decision_end = "2026-01-05T03:01:40.000000Z"
+inputs = ["file:///proc/self/cwd/published/manifests/617739e2385050e033241f5df03ba2fea8f6a14b58b277433107e860049abf33/ready.json", "file:///proc/self/cwd/published/manifests/dfa3b2e968c8b9f477bd95bdae9d1ae52b0cafd7b82f0fbdae59201c1fa538a2/ready.json"]
+
+[[research.evaluation.splits]]
+name = "a"
+start = "2026-01-05T03:00:20.000000Z"
+end = "2026-01-05T03:01:00.000000Z"
+
+[[research.evaluation.splits]]
+name = "b"
+start = "2026-01-05T03:01:00.000000Z"
+end = "2026-01-05T03:01:40.000000Z"
+
+[research.holdout]
+decision_start = "2026-01-05T04:00:20.000000Z"
+decision_end = "2026-01-05T04:01:40.000000Z"
+inputs = ["file:///proc/self/cwd/published/manifests/73299f209dc0c3875942f0ee8c42b4cd51139067e686a6c6768ec3de46fe70b8/ready.json", "file:///proc/self/cwd/published/manifests/1cc1b421fd6169c649d3285249124594c81c040ed7ed48180a7feb4ef862c01b/ready.json"]
+
+[[research.holdout.splits]]
+name = "a"
+start = "2026-01-05T04:00:20.000000Z"
+end = "2026-01-05T04:01:00.000000Z"
+
+[[research.holdout.splits]]
+name = "b"
+start = "2026-01-05T04:01:00.000000Z"
+end = "2026-01-05T04:01:40.000000Z"
+
+[research.portfolio]
+max_policies = 12
+embargo_micros = 10000000
+objective = "profit_then_drawdown"
+reporting_currency = "unit"
+reporting_scale = 2
+max_rate_age_micros = 86400000000
+
+[research.portfolio.gates]
+min_settled = 1
+max_unresolved = 0
+min_profit = "0"
+max_drawdown = "1000"
+
+[[research.portfolio.accounts]]
+id = "a0"
+broker = "pocket_option"
+currency = "unit"
+scale = 2
+initial_cash = "10000"
+
+[[research.portfolio.accounts]]
+id = "a1"
+broker = "pocket_option"
+currency = "eur"
+scale = 2
+initial_cash = "10000"
+
+[[research.portfolio.rates]]
+id = "eur-unit"
+source_currency = "eur"
+reporting_currency = "unit"
+provider = "synthetic-fx"
+provider_time = "2026-01-05T00:00:00.000000Z"
+available_at = "2026-01-05T00:00:00.000000Z"
+rate = "2"
+
+[[research.portfolio.members]]
+family = 0
+member = 0
+
+[[research.portfolio.members]]
+family = 0
+member = 1
+
+[[research.portfolio.members]]
+family = 1
+member = 0
+
+[[research.portfolio.members]]
+family = 1
+member = 1
+
+[[research.portfolio.repairs]]
+id = "none"
+
+[[research.portfolio.repairs]]
+id = "narrow"
+
+[[research.portfolio.repairs.conditions]]
+output = "range_bps"
+comparator = "lt"
+threshold = 0.08
+
+[research.portfolio.repairs.conditions.stream]
+duration_seconds = 20
+offset_seconds = 0
+
+[[research.portfolio.bindings]]
+id = "b0"
+account = "a0"
+instrument = "pocket_option:AEDCNY_otc"
+
+[[research.portfolio.bindings.alternatives]]
+
+[research.portfolio.bindings.alternatives.contract]
+id = "0-small"
+direction = "buy"
+duration_micros = 5000000
+currency = "unit"
+stake = "1"
+quoted_cost = "1"
+entry_fee = "0"
+
+[research.portfolio.bindings.alternatives.contract.win]
+gross_return = "1.80"
+terminal_fee = "0"
+
+[research.portfolio.bindings.alternatives.contract.loss]
+gross_return = "0"
+terminal_fee = "0"
+
+[research.portfolio.bindings.alternatives.contract.tie]
+gross_return = "1"
+terminal_fee = "0"
+
+[research.portfolio.bindings.alternatives.contract.settlement]
+rule = "price_at_due_v1"
+max_settlement_delay_micros = 5000000
+max_tick_gap_micros = 5000000
+
+[research.portfolio.bindings.alternatives.envelope]
+max_purchase_cost = "1"
+max_entry_fee = "0"
+max_win_terminal_fee = "0"
+max_loss_terminal_fee = "0"
+max_tie_terminal_fee = "0"
+min_winning_net_return = "0.80"
+settlement_rule = "price_at_due_v1"
+
+[[research.portfolio.bindings.alternatives]]
+
+[research.portfolio.bindings.alternatives.contract]
+id = "0-large"
+direction = "buy"
+duration_micros = 5000000
+currency = "unit"
+stake = "2"
+quoted_cost = "2"
+entry_fee = "0.05"
+
+[research.portfolio.bindings.alternatives.contract.win]
+gross_return = "3.60"
+terminal_fee = "0"
+
+[research.portfolio.bindings.alternatives.contract.loss]
+gross_return = "0"
+terminal_fee = "0"
+
+[research.portfolio.bindings.alternatives.contract.tie]
+gross_return = "2.05"
+terminal_fee = "0"
+
+[research.portfolio.bindings.alternatives.contract.settlement]
+rule = "price_at_due_v1"
+max_settlement_delay_micros = 5000000
+max_tick_gap_micros = 5000000
+
+[research.portfolio.bindings.alternatives.envelope]
+max_purchase_cost = "2"
+max_entry_fee = "0.05"
+max_win_terminal_fee = "0"
+max_loss_terminal_fee = "0"
+max_tie_terminal_fee = "0"
+min_winning_net_return = "1.55"
+settlement_rule = "price_at_due_v1"
+
+[[research.portfolio.bindings]]
+id = "b1"
+account = "a1"
+instrument = "pocket_option:SECOND_otc"
+
+[[research.portfolio.bindings.alternatives]]
+
+[research.portfolio.bindings.alternatives.contract]
+id = "1-small"
+direction = "buy"
+duration_micros = 5000000
+currency = "eur"
+stake = "1"
+quoted_cost = "1"
+entry_fee = "0"
+
+[research.portfolio.bindings.alternatives.contract.win]
+gross_return = "1.80"
+terminal_fee = "0"
+
+[research.portfolio.bindings.alternatives.contract.loss]
+gross_return = "0"
+terminal_fee = "0"
+
+[research.portfolio.bindings.alternatives.contract.tie]
+gross_return = "1"
+terminal_fee = "0"
+
+[research.portfolio.bindings.alternatives.contract.settlement]
+rule = "price_at_due_v1"
+max_settlement_delay_micros = 5000000
+max_tick_gap_micros = 5000000
+
+[research.portfolio.bindings.alternatives.envelope]
+max_purchase_cost = "1"
+max_entry_fee = "0"
+max_win_terminal_fee = "0"
+max_loss_terminal_fee = "0"
+max_tie_terminal_fee = "0"
+min_winning_net_return = "0.80"
+settlement_rule = "price_at_due_v1"
+
+[[research.portfolio.bindings.alternatives]]
+
+[research.portfolio.bindings.alternatives.contract]
+id = "1-large"
+direction = "buy"
+duration_micros = 5000000
+currency = "eur"
+stake = "2"
+quoted_cost = "2"
+entry_fee = "0.05"
+
+[research.portfolio.bindings.alternatives.contract.win]
+gross_return = "3.60"
+terminal_fee = "0"
+
+[research.portfolio.bindings.alternatives.contract.loss]
+gross_return = "0"
+terminal_fee = "0"
+
+[research.portfolio.bindings.alternatives.contract.tie]
+gross_return = "2.05"
+terminal_fee = "0"
+
+[research.portfolio.bindings.alternatives.contract.settlement]
+rule = "price_at_due_v1"
+max_settlement_delay_micros = 5000000
+max_tick_gap_micros = 5000000
+
+[research.portfolio.bindings.alternatives.envelope]
+max_purchase_cost = "2"
+max_entry_fee = "0.05"
+max_win_terminal_fee = "0"
+max_loss_terminal_fee = "0"
+max_tie_terminal_fee = "0"
+min_winning_net_return = "1.55"
+settlement_rule = "price_at_due_v1"
+
+[[research.portfolio.subsets]]
+
+[[research.portfolio.subsets.deployments]]
+member = 0
+repair = 1
+binding = 0
+
+[[research.portfolio.subsets]]
+
+[[research.portfolio.subsets.deployments]]
+member = 3
+repair = 1
+binding = 1
+
+[[research.portfolio.subsets]]
+
+[[research.portfolio.subsets.deployments]]
+member = 0
+repair = 1
+binding = 0
+
+[[research.portfolio.subsets.deployments]]
+member = 3
+repair = 1
+binding = 1
+
+[[research.portfolio.subsets]]
+
+[[research.portfolio.subsets.deployments]]
+member = 0
+repair = 0
+binding = 0
+
+[[research.portfolio.subsets]]
+
+[[research.portfolio.subsets.deployments]]
+member = 3
+repair = 0
+binding = 1
+
+[[research.portfolio.risk_policies]]
+id = "cap2"
+max_open_total = 2
+same_entry = "all"
+deduplicate_signal_logic = false
+max_feature_age_micros = 60000000
+max_quote_age_micros = 0
+
+[[research.scenarios]]
+id = "delayed"
+acceptance_delay_micros = 100000
+
+[[research.scenarios.alternatives]]
+binding = "b0"
+
+[research.scenarios.alternatives.contract]
+id = "0-large"
+direction = "buy"
+duration_micros = 5000000
+currency = "unit"
+stake = "2"
+quoted_cost = "2"
+entry_fee = "0.05"
+
+[research.scenarios.alternatives.contract.win]
+gross_return = "3.60"
+terminal_fee = "0"
+
+[research.scenarios.alternatives.contract.loss]
+gross_return = "0"
+terminal_fee = "0"
+
+[research.scenarios.alternatives.contract.tie]
+gross_return = "2.05"
+terminal_fee = "0"
+
+[research.scenarios.alternatives.contract.settlement]
+rule = "price_at_due_v1"
+max_settlement_delay_micros = 5000000
+max_tick_gap_micros = 5000000
+
+[research.scenarios.alternatives.envelope]
+max_purchase_cost = "2"
+max_entry_fee = "0.05"
+max_win_terminal_fee = "0"
+max_loss_terminal_fee = "0"
+max_tie_terminal_fee = "0"
+min_winning_net_return = "1.55"
+settlement_rule = "price_at_due_v1"
+
+[[research.scenarios.alternatives]]
+binding = "b1"
+
+[research.scenarios.alternatives.contract]
+id = "1-large"
+direction = "buy"
+duration_micros = 5000000
+currency = "eur"
+stake = "2"
+quoted_cost = "2"
+entry_fee = "0.05"
+
+[research.scenarios.alternatives.contract.win]
+gross_return = "3.60"
+terminal_fee = "0"
+
+[research.scenarios.alternatives.contract.loss]
+gross_return = "0"
+terminal_fee = "0"
+
+[research.scenarios.alternatives.contract.tie]
+gross_return = "2.05"
+terminal_fee = "0"
+
+[research.scenarios.alternatives.contract.settlement]
+rule = "price_at_due_v1"
+max_settlement_delay_micros = 5000000
+max_tick_gap_micros = 5000000
+
+[research.scenarios.alternatives.envelope]
+max_purchase_cost = "2"
+max_entry_fee = "0.05"
+max_win_terminal_fee = "0"
+max_loss_terminal_fee = "0"
+max_tie_terminal_fee = "0"
+min_winning_net_return = "1.55"
+settlement_rule = "price_at_due_v1"
+
+[[research.scenarios]]
+id = "worse_terms"
+acceptance_delay_micros = 0
+
+[[research.scenarios.alternatives]]
+binding = "b0"
+
+[research.scenarios.alternatives.contract]
+id = "0-large"
+direction = "buy"
+duration_micros = 5000000
+currency = "unit"
+stake = "2"
+quoted_cost = "2"
+entry_fee = "0.05"
+
+[research.scenarios.alternatives.contract.win]
+gross_return = "3.50"
+terminal_fee = "0"
+
+[research.scenarios.alternatives.contract.loss]
+gross_return = "0"
+terminal_fee = "0"
+
+[research.scenarios.alternatives.contract.tie]
+gross_return = "2.05"
+terminal_fee = "0"
+
+[research.scenarios.alternatives.contract.settlement]
+rule = "price_at_due_v1"
+max_settlement_delay_micros = 5000000
+max_tick_gap_micros = 5000000
+
+[research.scenarios.alternatives.envelope]
+max_purchase_cost = "2"
+max_entry_fee = "0.05"
+max_win_terminal_fee = "0"
+max_loss_terminal_fee = "0"
+max_tie_terminal_fee = "0"
+min_winning_net_return = "1.45"
+settlement_rule = "price_at_due_v1"
+
+[[research.scenarios.alternatives]]
+binding = "b1"
+
+[research.scenarios.alternatives.contract]
+id = "1-large"
+direction = "buy"
+duration_micros = 5000000
+currency = "eur"
+stake = "2"
+quoted_cost = "2"
+entry_fee = "0.05"
+
+[research.scenarios.alternatives.contract.win]
+gross_return = "3.50"
+terminal_fee = "0"
+
+[research.scenarios.alternatives.contract.loss]
+gross_return = "0"
+terminal_fee = "0"
+
+[research.scenarios.alternatives.contract.tie]
+gross_return = "2.05"
+terminal_fee = "0"
+
+[research.scenarios.alternatives.contract.settlement]
+rule = "price_at_due_v1"
+max_settlement_delay_micros = 5000000
+max_tick_gap_micros = 5000000
+
+[research.scenarios.alternatives.envelope]
+max_purchase_cost = "2"
+max_entry_fee = "0.05"
+max_win_terminal_fee = "0"
+max_loss_terminal_fee = "0"
+max_tie_terminal_fee = "0"
+min_winning_net_return = "1.45"
+settlement_rule = "price_at_due_v1"
+
+[research.qualification]
+claim = "empirical_policy_qualification_v1"
+
+[research.qualification.gates]
+min_settled = 1
+max_unresolved = 0
+min_profit = "0"
+max_drawdown = "1000"

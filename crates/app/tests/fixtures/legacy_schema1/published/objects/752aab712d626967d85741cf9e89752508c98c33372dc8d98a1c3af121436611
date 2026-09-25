@@ -1,0 +1,137 @@
+{
+  "events": 13,
+  "last_time_micros": 1767571285000000,
+  "accounts": [
+    {
+      "id": "m0",
+      "currency": "unit",
+      "scale": 2,
+      "cash": "1001.60",
+      "reserved": "0.00",
+      "paid_basis": "0.00",
+      "unresolved_loss": "0.00",
+      "completed_profit": "1.60",
+      "epoch_peak": "1.60",
+      "lifetime_peak": "1.60",
+      "max_drawdown": "0.00",
+      "open": 0
+    },
+    {
+      "id": "m1",
+      "currency": "unit",
+      "scale": 2,
+      "cash": "1001.60",
+      "reserved": "0.00",
+      "paid_basis": "0.00",
+      "unresolved_loss": "0.00",
+      "completed_profit": "1.60",
+      "epoch_peak": "1.60",
+      "lifetime_peak": "1.60",
+      "max_drawdown": "0.00",
+      "open": 0
+    }
+  ],
+  "portfolio": {
+    "signals": 4,
+    "dispositions": {
+      "admitted": 4
+    },
+    "accepted": 4,
+    "released": 0,
+    "settled": 4,
+    "wins": 4,
+    "losses": 0,
+    "ties": 0,
+    "unresolved": 0,
+    "open": 0,
+    "profit": {
+      "unit": "3.20"
+    }
+  },
+  "strategies": {
+    "m0": {
+      "signals": 2,
+      "dispositions": {
+        "admitted": 2
+      },
+      "accepted": 2,
+      "released": 0,
+      "settled": 2,
+      "wins": 2,
+      "losses": 0,
+      "ties": 0,
+      "unresolved": 0,
+      "open": 0,
+      "profit": {
+        "unit": "1.60"
+      }
+    },
+    "m1": {
+      "signals": 2,
+      "dispositions": {
+        "admitted": 2
+      },
+      "accepted": 2,
+      "released": 0,
+      "settled": 2,
+      "wins": 2,
+      "losses": 0,
+      "ties": 0,
+      "unresolved": 0,
+      "open": 0,
+      "profit": {
+        "unit": "1.60"
+      }
+    }
+  },
+  "durations": {
+    "5000000": {
+      "signals": 4,
+      "dispositions": {
+        "admitted": 4
+      },
+      "accepted": 4,
+      "released": 0,
+      "settled": 4,
+      "wins": 4,
+      "losses": 0,
+      "ties": 0,
+      "unresolved": 0,
+      "open": 0,
+      "profit": {
+        "unit": "3.20"
+      }
+    }
+  },
+  "instruments": {
+    "pocket_option:AEDCNY_otc": {
+      "signals": 4,
+      "dispositions": {
+        "admitted": 4
+      },
+      "accepted": 4,
+      "released": 0,
+      "settled": 4,
+      "wins": 4,
+      "losses": 0,
+      "ties": 0,
+      "unresolved": 0,
+      "open": 0,
+      "profit": {
+        "unit": "3.20"
+      }
+    }
+  },
+  "splits": {},
+  "reporting": {
+    "currency": "unit",
+    "scale": 2,
+    "settled_equity": "2003.20",
+    "unresolved_loss": "0.00",
+    "peak_equity": "2003.20",
+    "max_drawdown": "0.00",
+    "observations": 13,
+    "unavailable_observations": 0,
+    "used_rates": []
+  }
+}

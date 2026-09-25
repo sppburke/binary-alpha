@@ -10,15 +10,20 @@ mod common;
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
 use binary_alpha_engine::config::Config;
-use binary_alpha_engine::dataset::GenerationManifest;
+use binary_alpha_engine::dataset::{
+    Capability, DatasetRole, GenerationManifest, NativeGranularity, SourceKind,
+};
 use binary_alpha_engine::features::{
-    Exclusion, FeatureEngine, FeatureManifest, FeatureOutput, FeaturePlan, SequenceEvent,
-    StructureEvent, Value, feature_generation_id, raw_identity,
+    Exclusion, FeatureEngine, FeatureManifest, FeatureOutput, FeaturePlan, ProfileReference,
+    SequenceEvent, StructureEvent, Value, development_fifths, feature_generation_id, raw_identity,
 };
 use binary_alpha_engine::market::{Tick, format_event_time_micros};
-use binary_alpha_engine::stream::{Observation, Source, StreamManifest};
+use binary_alpha_engine::stream::{
+    BarUnits, InstrumentStream, Observation, Source, StreamManifest,
+};
 use common::current::import;
 use common::*;
 
@@ -34,6 +39,24 @@ fn build(config: &Path) -> Result<Vec<String>, String> {
         assert_eq!(output.status.code(), Some(1));
         assert!(stdout.is_empty(), "{stdout}");
         Err(stderr)
+    }
+}
+
+fn build_logged(config: &Path, log: &Path) -> Result<Vec<String>, String> {
+    let output = Command::new(env!("CARGO_BIN_EXE_binary-alpha"))
+        .args(["features", "build", "--config", config.to_str().unwrap()])
+        .env("BINARY_ALPHA_STORE_LOG", log)
+        .output()
+        .unwrap();
+    if output.status.success() {
+        assert!(output.stderr.is_empty());
+        Ok(String::from_utf8(output.stdout)
+            .unwrap()
+            .lines()
+            .map(str::to_string)
+            .collect())
+    } else {
+        Err(String::from_utf8(output.stderr).unwrap())
     }
 }
 
@@ -362,6 +385,128 @@ fn value_of<'a>(row: &'a [Option<Value>], names: &[String], name: &str) -> Optio
 }
 
 #[test]
+fn entirely_missing_interval_rejects_next_candle_and_breaks_statistical_adjacency() {
+    let micros = 1_000_000;
+    for native in [
+        NativeGranularity::Bar { period_seconds: 5 },
+        NativeGranularity::Tick,
+    ] {
+        let scratch = Scratch::new(if native == NativeGranularity::Tick {
+            "phase04_missing_interval_ticks"
+        } else {
+            "phase04_missing_interval_bars"
+        });
+        let (granularity, candle, source_kind, capability) = if native == NativeGranularity::Tick {
+            (
+                "{ kind = \"tick\" }",
+                "{ duration_seconds = 5, offset_seconds = 0, min_observations = 2, hard_min_observations = 1 }",
+                SourceKind::TickCsv,
+                Capability::Ticks,
+            )
+        } else {
+            (
+                "{ kind = \"bar\", period_seconds = 5 }",
+                "{ duration_seconds = 5, offset_seconds = 0 }",
+                SourceKind::BarParquet,
+                Capability::Bars,
+            )
+        };
+        let config = scratch.config(
+            "missing.toml",
+            &format!(
+                "\n[[instruments]]\nbroker = \"pocket_option\"\nprovider_symbol = \"GAP\"\nquote_currency = \"USD\"\nprice_scale = 3\nsession = {{ kind = \"always\" }}\nnative_granularity = {granularity}\ngap = {{ max_seconds = 2, reopen_seconds = 60 }}\nfrozen = {{ min_observations = 10, min_seconds = 60 }}\njump = {{ min_basis_points = 1000 }}\nspan = {{ min_percent = 50 }}\ncandles = [{candle}]\n\n[[features.instruments]]\nrole = \"development\"\ninput_manifest = \"file:///fixture/manifests/1111111111111111111111111111111111111111111111111111111111111111/ready.json\"\nprofile_manifest = \"file:///fixture/manifests/2222222222222222222222222222222222222222222222222222222222222222/ready.json\"\nstreams = [{{ duration_seconds = 5, offset_seconds = 0 }}]\noutputs = [\"range_overlap\", \"candle_pattern\"]\n"
+            ),
+        );
+        let parsed = Config::parse(&fs::read_to_string(config).unwrap()).unwrap();
+        let instrument = parsed.instruments[0].clone();
+        let source = Source {
+            generation: "input".into(),
+            source_kind,
+            role: DatasetRole::Development,
+            native_granularity: native,
+            price_scale: (native == NativeGranularity::Tick).then_some(instrument.price_scale),
+            capabilities: vec![capability],
+        };
+        let profile = ProfileReference {
+            stream_generation: "profile".into(),
+            profile_sha256: "0".repeat(64),
+            source_generation: "input".into(),
+            role: DatasetRole::Development,
+            definition: instrument.clone(),
+            ticks: native == NativeGranularity::Tick,
+        };
+        let plan = FeaturePlan::resolve(&parsed.features.unwrap().instruments[0], profile, "input")
+            .unwrap();
+        let observations: Vec<Observation> = if native == NativeGranularity::Tick {
+            [0, 1, 2, 3, 4, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20]
+                .into_iter()
+                .map(|second| {
+                    Observation::Tick(Tick {
+                        event_time_micros: second * micros,
+                        price_units: 100_000 + second,
+                    })
+                })
+                .collect()
+        } else {
+            [0, 10, 15]
+                .into_iter()
+                .map(|second| {
+                    Observation::Bar(BarUnits {
+                        start_micros: second * micros,
+                        period_micros: 5 * micros,
+                        open: 100_000 + second,
+                        high: 100_004 + second,
+                        low: 99_999 + second,
+                        close: 100_003 + second,
+                        volume: 1.0,
+                    })
+                })
+                .collect()
+        };
+        let mut stream = InstrumentStream::new(&instrument, source.clone()).unwrap();
+        let mut candles = Vec::new();
+        let mut engine = FeatureEngine::new(&plan, source).unwrap();
+        let mut output = FeatureOutput::default();
+        for observation in observations {
+            stream.push(observation, &mut candles).unwrap();
+            engine.push(observation, &mut output).unwrap();
+        }
+        assert_eq!(candles.len(), 3, "{native:?}");
+        assert_eq!(
+            candles
+                .iter()
+                .map(|(_, candle)| candle.open_time_micros)
+                .collect::<Vec<_>>(),
+            [0, 10 * micros, 15 * micros],
+            "{native:?}"
+        );
+        assert!(candles[1].1.flags.missing_before, "{native:?}");
+        assert!(!candles[1].1.flags.clean(), "{native:?}");
+        assert!(candles[0].1.flags.clean(), "{native:?}");
+        assert!(candles[2].1.flags.clean(), "{native:?}");
+        assert_eq!(output.rows.len(), 2, "{native:?}");
+        assert_eq!(output.rows[0].1.close_time_micros, 5 * micros);
+        assert_eq!(output.rows[1].1.close_time_micros, 20 * micros);
+        let names: Vec<_> = plan.streams[0]
+            .outputs
+            .iter()
+            .map(|output| output.name.clone())
+            .collect();
+        assert_eq!(
+            value_of(&output.rows[1].1.values, &names, "candle_ordinal"),
+            Some(&Value::Int(3))
+        );
+        for name in ["range_overlap", "candle_pattern"] {
+            assert_eq!(
+                value_of(&output.rows[1].1.values, &names, name),
+                None,
+                "{native:?}: {name}"
+            );
+        }
+    }
+}
+
+#[test]
 fn features_build_fits_publishes_reconstructs_freezes_and_isolates() {
     let scratch = Scratch::new("phase04_ticks");
     let rows = synthetic_ticks(480);
@@ -469,7 +614,12 @@ fn features_build_fits_publishes_reconstructs_freezes_and_isolates() {
     assert_eq!(plan.development_generation, development);
     assert_eq!(
         plan.raw_identity,
-        raw_identity(&plan.profile, &development, &plan.settings)
+        raw_identity(
+            &plan.profile,
+            &development,
+            &plan.settings,
+            &plan.definitions
+        )
     );
     assert!(plan.is_fitted());
     assert_eq!(plan.streams.len(), 2);
@@ -484,6 +634,24 @@ fn features_build_fits_publishes_reconstructs_freezes_and_isolates() {
             "every configured tick stream carries a path, including sixty seconds"
         );
         assert_eq!(stream_plan.encodings.len(), 7);
+        for name in [
+            "return_std_5_bps",
+            "return_skew_5",
+            "return_kurtosis_5",
+            "return_autocorr_5",
+            "sign_reversal_rate_5",
+            "up_move_ratio_5",
+            "trend_r2_5",
+            "trend_residual_5_bps",
+            "range_position_5",
+            "range_overlap",
+            "candle_pattern",
+        ] {
+            assert!(
+                stream_plan.outputs.iter().any(|output| output.name == name),
+                "tick stream missing {name}"
+            );
+        }
         assert_eq!(
             (stream_plan.duration_seconds, stream_plan.offset_seconds),
             (summary.duration_seconds, summary.offset_seconds)
@@ -708,43 +876,188 @@ fn features_build_fits_publishes_reconstructs_freezes_and_isolates() {
         assert_prefix(&prefix, &full, ticks[cut - 1].event_time_micros, percent);
     }
 
-    // Repeating the build reuses every immutable object and the manifest.
-    let again = build(&config).unwrap();
-    assert!(
-        again[0].ends_with(&format!(
-            "objects {} reused {} (already published)",
-            manifest.objects.len(),
-            manifest.objects.len()
-        )),
-        "{}",
-        again[0]
-    );
-    assert_eq!(again[1], lines[1]);
+    let reusable_revision = !env!("BINARY_ALPHA_CODE_REVISION").ends_with("-dirty")
+        && env!("BINARY_ALPHA_CODE_REVISION") != "unavailable";
+    if reusable_revision {
+        // Repeating the build reuses every immutable object and the manifest.
+        let fit_log = scratch.path("fit-reuse-access.log");
+        let again = build_logged(&config, &fit_log).unwrap();
+        assert!(
+            again[0].ends_with(&format!(
+                "objects {} reused {} (already published)",
+                manifest.objects.len(),
+                manifest.objects.len()
+            )),
+            "{}",
+            again[0]
+        );
+        assert_eq!(again[1], lines[1]);
+        let access_log = fs::read_to_string(&fit_log).unwrap();
+        for object in &dataset.objects {
+            assert!(
+                !access_log.contains(&format!("read_to {}", object.key)),
+                "reused fit read input object {}",
+                object.key
+            );
+        }
+        assert!(access_log.contains("read_to features/fits/"));
 
-    // A run interrupted before the ready manifest leaves an incomplete generation that a rerun
-    // completes through the same immutable writes.
-    fs::remove_file(&manifest_path).unwrap();
-    assert!(verify(&manifest_path).unwrap_err().contains("cannot open"));
-    let resumed = build(&config).unwrap();
-    assert!(
-        resumed[0].ends_with(&format!(
-            "objects {} reused {} [",
-            manifest.objects.len(),
-            manifest.objects.len()
-        )) || resumed[0].contains(&format!("reused {} [", manifest.objects.len())),
-        "{}",
-        resumed[0]
-    );
-    assert_eq!(fs::read(&manifest_path).unwrap(), manifest.to_json());
+        let receipt_path = fs::read_dir(scratch.path("published/features/fits"))
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        let original_receipt = fs::read(&receipt_path).unwrap();
+        let receipt: serde_json::Value = serde_json::from_slice(&original_receipt).unwrap();
+        let rejected_receipt = |name: &str, bytes: &[u8]| {
+            fs::write(&receipt_path, bytes).unwrap();
+            let log = scratch.path(&format!("rejected-{name}.log"));
+            let error = build_logged(&config, &log).unwrap_err();
+            assert!(
+                error.contains("immutable feature generation conflict"),
+                "{name}: {error}"
+            );
+            let access = fs::read_to_string(log).unwrap();
+            for object in &dataset.objects {
+                assert!(
+                    !access.contains(&format!("read_to {}", object.key)),
+                    "{name}"
+                );
+            }
+            fs::write(&receipt_path, &original_receipt).unwrap();
+        };
+        rejected_receipt("malformed", b"{");
+        let mut wrong = receipt.clone();
+        wrong["request_digest"] = "0".repeat(64).into();
+        rejected_receipt("digest", &serde_json::to_vec(&wrong).unwrap());
+        wrong = receipt.clone();
+        wrong["code_revision"] = "another-revision".into();
+        rejected_receipt("revision", &serde_json::to_vec(&wrong).unwrap());
+        wrong = receipt.clone();
+        wrong["generation"] = "0".repeat(64).into();
+        rejected_receipt("missing-target", &serde_json::to_vec(&wrong).unwrap());
 
-    // Conflicting content under a completed identity fails without replacing anything.
-    let rows_object = scratch.path("published").join(&manifest.objects[1].key);
-    let original = fs::read(&rows_object).unwrap();
-    fs::write(&rows_object, b"tampered").unwrap();
-    let error = build(&config).unwrap_err();
-    assert!(error.contains("already holds different content"), "{error}");
-    assert_eq!(fs::read(&rows_object).unwrap(), b"tampered");
-    fs::write(&rows_object, &original).unwrap();
+        // A different request builds its own generation. Repointing the original receipt at that
+        // valid generation still fails its unfitted-plan comparison before input streaming.
+        let other = scratch.config(
+            "other-max-labels.toml",
+            &feature_entry(
+                "development",
+                &dataset_manifest,
+                &stream_manifest,
+                &TICK_SETTINGS.replace("max_labels = 32768", "max_labels = 32767"),
+            ),
+        );
+        let other_lines = build(&other).unwrap();
+        assert!(!other_lines[0].ends_with("(already published)"));
+        wrong = receipt.clone();
+        wrong["generation"] = generation(&other_lines[0]).into();
+        rejected_receipt("max-labels", &serde_json::to_vec(&wrong).unwrap());
+        let other_generation = generation(&other_lines[0]);
+        let other_manifest_path = scratch.path(&format!(
+            "published/manifests/{other_generation}/ready.json"
+        ));
+        let other_manifest_bytes = fs::read(&other_manifest_path).unwrap();
+        let other_manifest = FeatureManifest::from_json(&other_manifest_bytes).unwrap();
+        let mut protected: serde_json::Value =
+            serde_json::from_slice(&other_manifest_bytes).unwrap();
+        protected["role"] = "holdout".into();
+        fs::write(
+            &other_manifest_path,
+            serde_json::to_vec_pretty(&protected).unwrap(),
+        )
+        .unwrap();
+        fs::write(&receipt_path, serde_json::to_vec(&wrong).unwrap()).unwrap();
+        let protected_log = scratch.path("protected-target-access.log");
+        let error = build_logged(&config, &protected_log).unwrap_err();
+        assert!(
+            error.contains("immutable feature generation conflict"),
+            "{error}"
+        );
+        let protected_access = fs::read_to_string(protected_log).unwrap();
+        for object in &other_manifest.objects {
+            assert!(
+                !protected_access.contains(&format!("read_to {}", object.key)),
+                "protected target read child {}",
+                object.key
+            );
+        }
+        fs::write(&receipt_path, &original_receipt).unwrap();
+        fs::write(&other_manifest_path, other_manifest_bytes).unwrap();
+        let other = scratch.config(
+            "other-encodings.toml",
+            &feature_entry(
+                "development",
+                &dataset_manifest,
+                &stream_manifest,
+                &TICK_SETTINGS.replace(
+                    "output = \"range_bps\", bins = [0.0, 0.1, 0.2, 0.3, 0.5, 1.0]",
+                    "output = \"range_bps\", bins = [0.0, 0.1, 0.2, 0.3, 0.6, 1.0]",
+                ),
+            ),
+        );
+        let other_lines = build(&other).unwrap();
+        wrong["generation"] = generation(&other_lines[0]).into();
+        rejected_receipt("encodings", &serde_json::to_vec(&wrong).unwrap());
+
+        // A receipt cannot reuse a missing target. An interruption before the receipt is written
+        // can still complete through the same immutable writes.
+        fs::remove_file(&manifest_path).unwrap();
+        assert!(verify(&manifest_path).unwrap_err().contains("cannot open"));
+        assert!(
+            build(&config)
+                .unwrap_err()
+                .contains("immutable feature generation conflict")
+        );
+        fs::remove_file(&receipt_path).unwrap();
+        let resumed = build(&config).unwrap();
+        assert!(
+            resumed[0].ends_with(&format!(
+                "objects {} reused {} [",
+                manifest.objects.len(),
+                manifest.objects.len()
+            )) || resumed[0].contains(&format!("reused {} [", manifest.objects.len())),
+            "{}",
+            resumed[0]
+        );
+        assert_eq!(fs::read(&manifest_path).unwrap(), manifest.to_json());
+
+        // A code-revision-only rebuild can reuse a first-committed older manifest, but must not
+        // claim that older publication for this revision through a new fit receipt.
+        fs::remove_file(&receipt_path).unwrap();
+        let mut older: serde_json::Value = serde_json::from_slice(&manifest.to_json()).unwrap();
+        older["code_revision"] = "older-producer".into();
+        let retained_manifest_path = scratch.path(&format!(
+            "retained/manifests/{feature_generation}/ready.json"
+        ));
+        let older_bytes = serde_json::to_vec_pretty(&older).unwrap();
+        fs::write(&manifest_path, &older_bytes).unwrap();
+        fs::write(&retained_manifest_path, &older_bytes).unwrap();
+        let older_run = build(&config).unwrap();
+        assert!(older_run[0].ends_with("(already published)"));
+        assert!(!receipt_path.exists());
+        fs::write(&manifest_path, manifest.to_json()).unwrap();
+        fs::write(&retained_manifest_path, manifest.to_json()).unwrap();
+        build(&config).unwrap();
+        assert!(receipt_path.exists());
+
+        // Conflicting content under a completed identity fails without replacing anything.
+        let rows_object = scratch.path("published").join(&manifest.objects[1].key);
+        let original = fs::read(&rows_object).unwrap();
+        fs::write(&rows_object, b"tampered").unwrap();
+        let error = build(&config).unwrap_err();
+        assert!(
+            error.contains("immutable feature generation conflict"),
+            "{error}"
+        );
+        assert_eq!(fs::read(&rows_object).unwrap(), b"tampered");
+        fs::write(&rows_object, &original).unwrap();
+    } else {
+        let repeated = build(&config).unwrap();
+        assert!(repeated[0].ends_with("(already published)"));
+        assert!(!scratch.path("published/features/fits").exists());
+    }
 
     // Applying the frozen plan to an evaluation generation of the same instrument recomputes
     // rows under the frozen settings and encodings without refitting.
@@ -781,7 +1094,9 @@ fn features_build_fits_publishes_reconstructs_freezes_and_isolates() {
     );
     let lines = build(&frozen).unwrap();
     assert_eq!(lines.len(), 4, "{lines:?}");
-    assert!(lines[0].ends_with("(already published)"), "{}", lines[0]);
+    if reusable_revision {
+        assert!(lines[0].ends_with("(already published)"), "{}", lines[0]);
+    }
     assert!(lines[2].contains(" evaluation generation "), "{}", lines[2]);
     let applied_generation = generation(&lines[2]);
     assert_ne!(applied_generation, feature_generation);
@@ -806,6 +1121,80 @@ fn features_build_fits_publishes_reconstructs_freezes_and_isolates() {
         "the same ticks yield the same rows"
     );
     assert_eq!(applied.tables, published.tables);
+    let applied_path = scratch.path(&format!(
+        "published/manifests/{applied_generation}/ready.json"
+    ));
+    let applied_bytes = fs::read(&applied_path).unwrap();
+    if reusable_revision {
+        let mut wrong_frozen: serde_json::Value = serde_json::from_slice(&applied_bytes).unwrap();
+        wrong_frozen["frozen_from"] = "0".repeat(64).into();
+        fs::write(
+            &applied_path,
+            serde_json::to_vec_pretty(&wrong_frozen).unwrap(),
+        )
+        .unwrap();
+        let frozen_conflict_log = scratch.path("frozen-conflict-access.log");
+        let conflict = build_logged(&frozen, &frozen_conflict_log).unwrap_err();
+        assert!(
+            conflict.contains("immutable feature generation conflict"),
+            "{conflict}"
+        );
+        fs::write(&applied_path, &applied_bytes).unwrap();
+        let frozen_log = scratch.path("frozen-reuse-access.log");
+        let frozen_again = build_logged(&frozen, &frozen_log).unwrap();
+        assert!(frozen_again[2].ends_with("(already published)"));
+        let frozen_access = fs::read_to_string(&frozen_log).unwrap();
+        let frozen_conflict_access = fs::read_to_string(&frozen_conflict_log).unwrap();
+        let evaluation_manifest =
+            GenerationManifest::from_json(&fs::read(&eval_manifest).unwrap()).unwrap();
+        for object in &evaluation_manifest.objects {
+            assert!(
+                !frozen_access.contains(&format!("read_to {}", object.key)),
+                "reused frozen build read input object {}",
+                object.key
+            );
+            assert!(
+                !frozen_conflict_access.contains(&format!("read_to {}", object.key)),
+                "conflicted frozen build read input object {}",
+                object.key
+            );
+        }
+        // A different producer revision still verifies the published objects before streaming.
+        let mut older: serde_json::Value = serde_json::from_slice(&applied_bytes).unwrap();
+        older["code_revision"] = "older-producer".into();
+        fs::write(&applied_path, serde_json::to_vec_pretty(&older).unwrap()).unwrap();
+        let rows_object = scratch
+            .path("published")
+            .join(&applied.manifest.objects[1].key);
+        let original_rows = fs::read(&rows_object).unwrap();
+        fs::write(&rows_object, b"corrupt").unwrap();
+        let frozen_only = scratch.config(
+            "frozen-corrupt.toml",
+            &format!(
+                "\n[[features.instruments]]\nrole = \"evaluation\"\ninput_manifest = \"{}\"\nprofile_manifest = \"{}\"\nfrozen_plan = \"{}\"\n",
+                manifest_uri(&eval_manifest),
+                manifest_uri(&stream_manifest),
+                manifest_uri(&manifest_path),
+            ),
+        );
+        let corrupt_log = scratch.path("different-revision-corrupt-access.log");
+        let error = build_logged(&frozen_only, &corrupt_log).unwrap_err();
+        assert!(
+            error.contains("immutable feature generation conflict"),
+            "{error}"
+        );
+        let access = fs::read_to_string(&corrupt_log).unwrap();
+        assert!(access.contains(&format!("head {}", applied.manifest.objects[1].key)));
+        for object in &evaluation_manifest.objects {
+            assert!(
+                !access.contains(&format!("read_to {}", object.key)),
+                "{}",
+                object.key
+            );
+        }
+        fs::write(&rows_object, original_rows).unwrap();
+        fs::write(&applied_path, applied_bytes).unwrap();
+    }
 
     // Isolation: a declared holdout input and an evaluation input for a new fit are refused by
     // the configuration before anything is resolved.
@@ -1046,10 +1435,101 @@ fn bars_exclude_tick_outputs_with_their_reason_and_named_tick_requests_fail() {
         "missing_buckets_since_prev_candle",
         "active_span_micros",
         "swing_high_type",
+        "return_std_5_bps",
+        "return_skew_5",
+        "return_kurtosis_5",
+        "return_autocorr_5",
+        "sign_reversal_rate_5",
+        "up_move_ratio_5",
+        "trend_r2_5",
+        "trend_residual_5_bps",
+        "range_position_5",
+        "range_overlap",
+        "candle_pattern",
     ] {
         assert!(selected.contains(&name), "{name} is bar-compatible");
     }
     assert!(!selected.contains(&"ema20_minus_ema50_bps"));
+    for (name, fragments) in [
+        (
+            "return_std_5_bps",
+            &["window", "unrounded returns", "prior candle", "non-finite"][..],
+        ),
+        (
+            "return_skew_5",
+            &[
+                "window",
+                "unrounded returns",
+                "prior candle",
+                "zero return variance",
+            ],
+        ),
+        (
+            "return_kurtosis_5",
+            &[
+                "window",
+                "unrounded returns",
+                "prior candle",
+                "zero return variance",
+            ],
+        ),
+        (
+            "return_autocorr_5",
+            &[
+                "window",
+                "unrounded returns",
+                "prior candle",
+                "zero variance",
+            ],
+        ),
+        (
+            "sign_reversal_rate_5",
+            &[
+                "window",
+                "unrounded return pairs",
+                "prior candle",
+                "zero pairs with both returns nonzero",
+            ],
+        ),
+        (
+            "up_move_ratio_5",
+            &[
+                "window",
+                "unrounded returns",
+                "prior candle",
+                "zero absolute-return sum",
+            ],
+        ),
+        ("trend_r2_5", &["window", "zero close variance"]),
+        ("trend_residual_5_bps", &["window", "zero last close"]),
+        ("range_position_5", &["window", "zero high-low span"]),
+        (
+            "range_overlap",
+            &[
+                "prior accepted candle is adjacent",
+                "skipped or rejected",
+                "zero",
+            ],
+        ),
+        (
+            "candle_pattern",
+            &[
+                "prior accepted candle is adjacent",
+                "skipped or rejected",
+                "doji",
+            ],
+        ),
+    ] {
+        let description = &stream
+            .outputs
+            .iter()
+            .find(|output| output.name == name)
+            .unwrap()
+            .readiness;
+        for fragment in fragments {
+            assert!(description.contains(fragment), "{name}: {description}");
+        }
+    }
     assert!(
         excluded
             .get("ema20_minus_ema50_bps")
@@ -1076,6 +1556,8 @@ fn bars_exclude_tick_outputs_with_their_reason_and_named_tick_requests_fail() {
     );
     assert!(!names.contains(&"tick_volume".to_string()));
     let first = &rows[0];
+    assert_eq!(value_of(first, names, "range_overlap"), None);
+    assert_eq!(value_of(first, names, "candle_pattern"), None);
     assert_eq!(
         value_of(first, names, "is_ema8_ready"),
         Some(&Value::Bool(false))
@@ -1189,7 +1671,250 @@ fn bars_exclude_tick_outputs_with_their_reason_and_named_tick_requests_fail() {
     other.rolling_window = Some(31);
     assert_ne!(
         plan.raw_identity,
-        raw_identity(&plan.profile, &dataset, &other)
+        raw_identity(&plan.profile, &dataset, &other, &plan.definitions)
+    );
+}
+
+#[test]
+fn automatic_encodings_fit_only_ready_rows_and_keep_distinct_names() {
+    let scratch = Scratch::new("phase04_automatic_encodings");
+    let start = 1_747_653_300;
+    let rows: Vec<_> = (0..156_i64)
+        .map(|index| {
+            let rounded = |value: f64| (value * 1000.0).round() / 1000.0;
+            let open = rounded(100.0 + index as f64 * 0.01);
+            let close = rounded(open + if index % 3 == 0 { 0.004 } else { -0.003 });
+            bar(
+                "AAPL_otc",
+                7,
+                start + index * 5,
+                [
+                    open,
+                    rounded(open.max(close) + 0.006),
+                    rounded(open.min(close) - 0.006),
+                    close,
+                    3.0,
+                ],
+            )
+        })
+        .collect();
+    write_collection(
+        &scratch.path("sources/bars"),
+        &[AssetSpec {
+            asset: "AAPL_otc",
+            expected_symbol_id: Some(7),
+            symbol_id: Some(7),
+            files: vec![rows],
+            metadata: true,
+        }],
+    );
+    let import_config = scratch.config(
+        "import.toml",
+        &scratch
+            .bar_source()
+            .replace("\"evaluation\"", "\"development\""),
+    );
+    let dataset = generation(&import(&import_config).unwrap()[0]);
+    let dataset_manifest = scratch.path(&format!("published/manifests/{dataset}/ready.json"));
+    let audit_config = scratch.config("audit.toml", &bar_instrument("AAPL_otc"));
+    let stream_manifest = scratch.path(&format!(
+        "published/manifests/{}/ready.json",
+        generation(&audit(&audit_config, &dataset_manifest))
+    ));
+    let settings = format!(
+        "{}encodings = {{ max_labels = 1, outputs = \"all_supported\" }}\n",
+        BAR_SETTINGS.split("encodings =").next().unwrap()
+    );
+    let config = scratch.config(
+        "features.toml",
+        &feature_entry(
+            "development",
+            &dataset_manifest,
+            &stream_manifest,
+            &settings,
+        ),
+    );
+    let lines = build(&config).unwrap();
+    let manifest_path = scratch.path(&format!(
+        "published/manifests/{}/ready.json",
+        generation(&lines[0])
+    ));
+    let published = published_features(&scratch.path("published"), &manifest_path);
+    let stream = &published.plan.streams[0];
+    let encodings = &stream.encodings;
+    assert_eq!(
+        encodings.len(),
+        stream
+            .outputs
+            .iter()
+            .filter(|output| output.predictive
+                && output.kind != binary_alpha_engine::features::Kind::Time)
+            .count()
+    );
+    let mut names = std::collections::BTreeSet::new();
+    for encoding in encodings {
+        assert!(encoding.automatic);
+        assert!(
+            stream
+                .outputs
+                .iter()
+                .all(|output| output.name != encoding.output)
+        );
+        assert!(names.insert(&encoding.output));
+    }
+    let slope = encodings
+        .iter()
+        .find(|encoding| encoding.input == "ema8_slope_state")
+        .unwrap();
+    assert_eq!(slope.labels.len(), 1);
+    assert_ne!(slope.labels[0], "not_ready");
+    let (columns, rows) = &published.tables[0][0];
+    let slope_column = columns
+        .iter()
+        .position(|name| name == "ema8_slope_state")
+        .unwrap();
+    let unready = rows
+        .iter()
+        .filter(|row| row[slope_column] == Some(Value::Text("not_ready".into())))
+        .count();
+    assert!(
+        unready > rows.len() - unready,
+        "the test needs an unready-dominant category"
+    );
+    let flag = columns
+        .iter()
+        .position(|name| name == "is_ema8_ready")
+        .unwrap();
+    let ema = columns.iter().position(|name| name == "ema8").unwrap();
+    let preview: Vec<_> = rows
+        .iter()
+        .filter(|row| row[flag] == Some(Value::Bool(false)))
+        .filter_map(|row| row[ema].as_ref().and_then(Value::as_f64))
+        .collect();
+    assert!(preview.windows(2).any(|pair| pair[0] != pair[1]));
+    let mut ready: Vec<_> = rows
+        .iter()
+        .filter(|row| row[flag] == Some(Value::Bool(true)))
+        .filter_map(|row| row[ema].as_ref().and_then(Value::as_f64))
+        .collect();
+    let expected = development_fifths(&mut ready);
+    let mut all_values: Vec<_> = rows
+        .iter()
+        .filter_map(|row| row[ema].as_ref().and_then(Value::as_f64))
+        .collect();
+    assert_ne!(development_fifths(&mut all_values), expected);
+    let fitted = encodings
+        .iter()
+        .find(|encoding| encoding.input == "ema8")
+        .unwrap();
+    assert_eq!(fitted.edges, expected);
+    let no_ready = encodings
+        .iter()
+        .find(|encoding| encoding.input == "ema21")
+        .unwrap();
+    assert_eq!(no_ready.edges, None);
+    assert!(no_ready.labels.is_empty());
+    assert_eq!(
+        binary_alpha(&[
+            "data",
+            "verify",
+            "--manifest",
+            &manifest_uri(&manifest_path)
+        ])
+        .status
+        .code(),
+        Some(0)
+    );
+
+    let collision = Scratch::new("phase04_automatic_collision");
+    let rows: Vec<_> = (0..180_i64)
+        .map(|index| {
+            let open = 100_000.0 + index as f64 / 1000.0;
+            let close = open + 0.001;
+            let rounded = |value: f64| (value * 1000.0).round() / 1000.0;
+            bar(
+                "AAPL_otc",
+                7,
+                start + index * 5,
+                [
+                    rounded(open),
+                    rounded(close),
+                    rounded(open - 0.001),
+                    rounded(close),
+                    3.0,
+                ],
+            )
+        })
+        .collect();
+    write_collection(
+        &collision.path("sources/bars"),
+        &[AssetSpec {
+            asset: "AAPL_otc",
+            expected_symbol_id: Some(7),
+            symbol_id: Some(7),
+            files: vec![rows],
+            metadata: true,
+        }],
+    );
+    let import_config = collision.config(
+        "import.toml",
+        &collision
+            .bar_source()
+            .replace("\"evaluation\"", "\"development\""),
+    );
+    let dataset = generation(&import(&import_config).unwrap()[0]);
+    let dataset_manifest = collision.path(&format!("published/manifests/{dataset}/ready.json"));
+    let audit_config = collision.config("audit.toml", &bar_instrument("AAPL_otc"));
+    let stream_manifest = collision.path(&format!(
+        "published/manifests/{}/ready.json",
+        generation(&audit(&audit_config, &dataset_manifest))
+    ));
+    let config = collision.config(
+        "features.toml",
+        &feature_entry(
+            "development",
+            &dataset_manifest,
+            &stream_manifest,
+            &settings,
+        ),
+    );
+    let lines = build(&config).unwrap();
+    let manifest_path = collision.path(&format!(
+        "published/manifests/{}/ready.json",
+        generation(&lines[0])
+    ));
+    let published = published_features(&collision.path("published"), &manifest_path);
+    let (columns, rows) = &published.tables[0][0];
+    let flag = columns
+        .iter()
+        .position(|name| name == "is_ema8_ready")
+        .unwrap();
+    let ema = columns.iter().position(|name| name == "ema8").unwrap();
+    let mut ready: Vec<_> = rows
+        .iter()
+        .filter(|row| row[flag] == Some(Value::Bool(true)))
+        .filter_map(|row| row[ema].as_ref().and_then(Value::as_f64))
+        .collect();
+    ready.sort_by(f64::total_cmp);
+    ready.dedup();
+    assert!(ready.len() >= 4);
+    let encoding = published.plan.streams[0]
+        .encodings
+        .iter()
+        .find(|encoding| encoding.input == "ema8")
+        .unwrap();
+    assert_eq!(encoding.edges, None);
+    assert!(encoding.labels.is_empty());
+    assert_eq!(
+        binary_alpha(&[
+            "data",
+            "verify",
+            "--manifest",
+            &manifest_uri(&manifest_path)
+        ])
+        .status
+        .code(),
+        Some(0)
     );
 }
 

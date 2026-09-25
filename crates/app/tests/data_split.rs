@@ -8,6 +8,7 @@ use binary_alpha_engine::config::{Config, DataSplit, ManifestUri};
 use binary_alpha_engine::dataset::coverage::{CoverageRange, DailyCoverage};
 use binary_alpha_engine::dataset::daily::DAY_MICROS;
 use binary_alpha_engine::dataset::*;
+use binary_alpha_engine::execution::{Decimal, EventKind, FinancialEvent};
 use binary_alpha_engine::features::FeatureManifest;
 use binary_alpha_engine::market::{InstrumentId, Tick, parse_event_time_micros, parse_tick_line};
 use binary_alpha_engine::research::{
@@ -692,6 +693,341 @@ fn bars_keep_only_observation_days_and_apply_frozen_evaluation_features() {
 }
 
 #[test]
+fn split_without_holdout_publishes_only_development_and_evaluation() {
+    let scratch = Scratch::new("split_without_holdout");
+    let pair = common::daily::pair(&scratch, true);
+    let mut config = bar_split_config(&scratch, &pair.v2);
+    config.split.as_mut().unwrap().holdout.clear();
+    for role in [DatasetRole::Development, DatasetRole::Evaluation] {
+        let mut missing = config.clone();
+        let split = missing.split.as_mut().unwrap();
+        match role {
+            DatasetRole::Development => split.development.clear(),
+            DatasetRole::Evaluation => split.evaluation.clear(),
+            DatasetRole::Holdout => unreachable!(),
+        }
+        let error = Config::parse(&missing.canonical_toml())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("at least one window is required"), "{error}");
+    }
+    let (report, declaration, _) = split(&scratch, &config);
+    assert_eq!(declaration.populations.len(), 2);
+    assert_eq!(report.lines().count(), 3);
+    let published = scratch.path("split-published");
+    for (population, role) in declaration
+        .populations
+        .iter()
+        .zip([DatasetRole::Development, DatasetRole::Evaluation])
+    {
+        assert_eq!(population.role, role);
+        let manifest = read_manifest(&published, &population.id);
+        assert_eq!(manifest.role, role);
+        command(&[
+            "data",
+            "verify",
+            "--manifest",
+            &uri(&published, &population.id).to_string(),
+        ])
+        .unwrap();
+    }
+    assert!(
+        declaration
+            .populations
+            .iter()
+            .all(|population| population.role != DatasetRole::Holdout)
+    );
+
+    let mut research = fixture::configuration(&scratch.root);
+    research.research.as_mut().unwrap().holdout.inputs.clear();
+    let path = scratch.path("research-without-holdout.toml");
+    fs::write(&path, research.canonical_toml()).unwrap();
+    let before = snapshots(&published);
+    let error = command(&["research", "run", "--config", path.to_str().unwrap()]).unwrap_err();
+    assert!(error.contains("research.holdout.inputs"), "{error}");
+    assert_eq!(snapshots(&published), before);
+}
+
+#[test]
+fn bar_split_research_keeps_midnight_decisions_and_preceding_reporting_split() {
+    let scratch = Scratch::new("split_midnight_research");
+    let published = scratch.path("published");
+    let source = scratch.path("sources/midnight-bars");
+    let recipe = fixture::recipe(PLANTED);
+    common::write_collection(
+        &source,
+        &(0..2)
+            .map(|instrument| {
+                let bars = (0..5)
+                    .flat_map(|day| {
+                        let end = BASE + (day + 1) * DAY_MICROS;
+                        fixture::bar_rows(
+                            end - recipe.len() as i64 * fixture::CANDLE,
+                            &recipe,
+                            instrument,
+                        )
+                        .into_iter()
+                        .filter(move |bar| bar.unix * 1_000_000 < end)
+                    })
+                    .collect();
+                common::AssetSpec {
+                    asset: fixture::SYMBOLS[instrument],
+                    expected_symbol_id: Some(instrument as i32 + 7),
+                    symbol_id: Some(instrument as i32 + 7),
+                    files: vec![bars],
+                    metadata: true,
+                }
+            })
+            .collect::<Vec<_>>(),
+    );
+    let import_path = scratch.config(
+        "midnight-import.toml",
+        &scratch
+            .bar_source()
+            .replace("sources/bars", "sources/midnight-bars")
+            .replace("role = \"evaluation\"", "role = \"development\""),
+    );
+    let imported = common::current::import(&import_path).unwrap();
+    let roots: Vec<_> = imported
+        .iter()
+        .map(|line| read_manifest(&published, &common::generation(line)))
+        .collect();
+    assert_eq!(roots.len(), 2);
+    for root in &roots {
+        assert_eq!(root.layout, Some(Layout::DailyV2));
+        command(&[
+            "data",
+            "verify",
+            "--manifest",
+            &uri(&published, &root.generation).to_string(),
+        ])
+        .unwrap();
+    }
+    let mut split_config = split_config(
+        &scratch,
+        roots
+            .iter()
+            .map(|root| uri(&published, &root.generation))
+            .collect(),
+    );
+    split_config.storage.historical_data_dir =
+        serde_json::from_value(serde_json::json!(scratch.path("split-retained"))).unwrap();
+    split_config.storage.publication_uri =
+        format!("file://{}", scratch.path("split-published").display())
+            .parse()
+            .unwrap();
+    let split_settings = split_config.split.as_mut().unwrap();
+    split_settings.development = vec![window(0, 2), window(0, 1), window(1, 2)];
+    split_settings.evaluation = vec![window(2, 4)];
+    split_settings.holdout = vec![window(4, 5)];
+    let (_, declaration, declaration_uri) = split(&scratch, &split_config);
+    let published = scratch.path("split-published");
+    assert_eq!(declaration.populations.len(), 10);
+    for population in &declaration.populations {
+        if population.role != DatasetRole::Holdout {
+            command(&[
+                "data",
+                "verify",
+                "--manifest",
+                &uri(&published, &population.id).to_string(),
+            ])
+            .unwrap();
+        }
+    }
+    let mut config = fixture::configuration(&scratch.root);
+    config.storage.historical_data_dir =
+        serde_json::from_value(serde_json::json!(scratch.path("split-retained"))).unwrap();
+    config.storage.publication_uri = format!("file://{}", published.display()).parse().unwrap();
+    for instrument in &mut config.instruments {
+        instrument.native_granularity = NativeGranularity::Bar { period_seconds: 5 };
+        instrument.candles[0].min_observations = Some(4);
+        instrument.candles[0].hard_min_observations = Some(4);
+    }
+    let research = config.research.as_mut().unwrap();
+    research.study.governance_manifest = declaration_uri.parse().unwrap();
+    research.portfolio.max_rate_age_micros = 8 * DAY_MICROS;
+    research.portfolio.gates.max_unresolved = 4;
+    research.qualification.gates.max_unresolved = 4;
+    for policy in &mut research.portfolio.risk_policies {
+        policy.max_open_total = Some(4);
+    }
+    research.portfolio.gates.min_profit = Decimal::parse("-1000").unwrap();
+    research.qualification.gates.min_profit = Decimal::parse("-1000").unwrap();
+    research.portfolio.members = serde_json::from_value(serde_json::json!([
+        {"family":0,"member":0},{"family":1,"member":0}
+    ]))
+    .unwrap();
+    research.portfolio.subsets = serde_json::from_value(serde_json::json!([
+        {"deployments":[{"member":0,"repair":0,"binding":0},{"member":1,"repair":0,"binding":1}]}
+    ]))
+    .unwrap();
+    research.folds[0].cutoff = time(BASE + DAY_MICROS + 1_000_000);
+    research.folds[0].decision_start = time(BASE + DAY_MICROS + 20_000_000);
+    research.folds[0].decision_end = time(BASE + 2 * DAY_MICROS + 1_000_000);
+    research.refit.cutoff = time(BASE + 2 * DAY_MICROS + 1_000_000);
+    research.evaluation.decision_start = time(BASE + 2 * DAY_MICROS + 20_000_000);
+    research.evaluation.decision_end = time(BASE + 4 * DAY_MICROS + 1_000_000);
+    research.evaluation.splits = Some(vec![
+        serde_json::from_value(serde_json::json!({"name":"preceding","start":time(BASE + 2*DAY_MICROS + 20_000_000),"end":time(BASE + 3*DAY_MICROS + 1_000_000)})).unwrap(),
+        serde_json::from_value(serde_json::json!({"name":"following","start":time(BASE + 3*DAY_MICROS + 1_000_000),"end":time(BASE + 4*DAY_MICROS + 1_000_000)})).unwrap(),
+    ]);
+    research.holdout.decision_start = time(BASE + 4 * DAY_MICROS + 20_000_000);
+    research.holdout.decision_end = time(BASE + 5 * DAY_MICROS + 1_000_000);
+    research.holdout.splits = None;
+    for index in 0..2 {
+        let reference =
+            |slot: usize| uri(&published, &declaration.populations[index * 5 + slot].id);
+        let instrument = &mut research.instruments[index];
+        instrument.source_manifest = reference(0);
+        instrument.search.decision_start = time(BASE);
+        instrument.search.decision_end = time(BASE + 2 * DAY_MICROS + 1_000_000);
+        instrument.search.conditions = serde_json::from_value(serde_json::json!([{
+            "stream":{"duration_seconds":20,"offset_seconds":0},
+            "output":"candle_direction","comparator":"eq","thresholds":["up"]
+        }]))
+        .unwrap();
+        instrument.search.gates.min_net_profit = Decimal::parse("-1000").unwrap();
+        instrument.search.gates.max_unresolved = 2;
+        instrument.search.risk_policy.max_open_per_strategy = Some(2);
+        instrument.search.embargo_micros = 10_000_000;
+        for contract in &mut instrument.search.contracts {
+            contract.settlement.max_settlement_delay_micros = 5_000_000;
+            contract.settlement.max_tick_gap_micros = 5_000_000;
+        }
+        instrument.outcomes.expiry_seconds = vec![5];
+        instrument.outcomes.max_entry_delay_ms = 5_000;
+        instrument.outcomes.max_settlement_delay_ms = 5_000;
+        instrument.outcomes.max_tick_gap_ms = 5_000;
+        instrument.outcomes.true_jump_max_gap_ms = 5_000;
+        research.folds[0].inputs[index].fit_manifest = reference(1);
+        research.folds[0].inputs[index].assessment_manifest = reference(2);
+        research.refit.fits[index] = reference(0);
+        research.evaluation.inputs[index] = reference(3);
+        research.holdout.inputs[index] = reference(4);
+    }
+    research.portfolio.embargo_micros = 10_000_000;
+    for binding in &mut research.portfolio.bindings {
+        for alternative in &mut binding.alternatives {
+            alternative.contract.settlement.max_settlement_delay_micros = 5_000_000;
+            alternative.contract.settlement.max_tick_gap_micros = 5_000_000;
+        }
+    }
+    for scenario in &mut research.scenarios {
+        for alternative in &mut scenario.alternatives {
+            alternative.contract.settlement.max_settlement_delay_micros = 5_000_000;
+            alternative.contract.settlement.max_tick_gap_micros = 5_000_000;
+        }
+    }
+    let path = scratch.path("midnight-research.toml");
+    fs::write(&path, config.canonical_toml()).unwrap();
+    let log = scratch.path("midnight-research.log");
+    cli_as(
+        &log,
+        "split-fixture-researcher",
+        &["research", "run", "--config", path.to_str().unwrap()],
+    )
+    .unwrap();
+    let generation = research::run_generation_id(
+        &config.content_hash(),
+        binary_alpha_app::import::CODE_REVISION,
+        &declaration.identity(),
+    );
+    let run = Run::from_json(&object(&published, &generation, "research.json")).unwrap();
+    assert_eq!(run.state, RunState::AwaitingHoldoutAuthorization);
+    let access = fs::read_to_string(&log).unwrap();
+    for index in [4, 9] {
+        let holdout = read_manifest(&published, &declaration.populations[index].id);
+        assert!(!access.contains(&holdout.key()));
+        for object in &holdout.objects {
+            assert!(!access.contains(&object.key));
+        }
+    }
+    let terminal_signal = |generation: &str, close: i64, split: Option<&str>| {
+        let events = object(&published, generation, "ledger/events.jsonl");
+        let events = events
+            .split(|byte| *byte == b'\n')
+            .filter(|line| !line.is_empty())
+            .map(|line| FinancialEvent::from_line(line).unwrap())
+            .collect::<Vec<_>>();
+        let commands = events
+            .iter()
+            .filter_map(|event| match &event.kind {
+                EventKind::Signal {
+                    close_time_micros,
+                    known_at_micros,
+                    split: actual,
+                    command: Some(command),
+                    ..
+                } if *close_time_micros == close
+                    && *known_at_micros == close
+                    && actual.as_deref() == split =>
+                {
+                    Some(command)
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            !commands.is_empty(),
+            "missing admitted terminal decision {close} in {generation}"
+        );
+        assert!(events.iter().any(|event| {
+            matches!(&event.kind, EventKind::Unresolved { command, .. } if commands.contains(&command))
+        }), "terminal decision {close} has no unresolved obligation in {generation}");
+    };
+    let family = binary_alpha_engine::search::Family::from_json(&object(
+        &published,
+        &run.instruments[0].family,
+        "family.json",
+    ))
+    .unwrap();
+    let development_replay = family
+        .chunks
+        .iter()
+        .find(|chunk| chunk.role == "development")
+        .unwrap();
+    terminal_signal(&development_replay.generation, BASE + 2 * DAY_MICROS, None);
+    let development_summary = binary_alpha_engine::execution::Summary::from_json(&object(
+        &published,
+        &development_replay.generation,
+        "summary.json",
+    ))
+    .unwrap();
+    assert!(development_summary.portfolio.unresolved > 0);
+    let selection = binary_alpha_engine::portfolio::Selection::from_json(&object(
+        &published,
+        &run.selection,
+        "selection.json",
+    ))
+    .unwrap();
+    let winner = &selection.choices[selection.selected.unwrap()];
+    terminal_signal(
+        &winner.folds[0].replay.as_ref().unwrap().generation,
+        BASE + 2 * DAY_MICROS,
+        None,
+    );
+    let fold_summary = binary_alpha_engine::execution::Summary::from_json(&object(
+        &published,
+        &winner.folds[0].replay.as_ref().unwrap().generation,
+        "summary.json",
+    ))
+    .unwrap();
+    assert!(fold_summary.portfolio.unresolved > 0);
+    terminal_signal(
+        &run.outer[0].outer.replay.generation,
+        BASE + 3 * DAY_MICROS,
+        Some("preceding"),
+    );
+    let summary = binary_alpha_engine::execution::Summary::from_json(&object(
+        &published,
+        &run.outer[0].outer.replay.generation,
+        "summary.json",
+    ))
+    .unwrap();
+    assert!(summary.splits["preceding"].unresolved > 0);
+}
+
+#[test]
 fn invalid_configuration_sources_windows_and_locations_write_nothing() {
     let scratch = Scratch::new("split_refusals");
     let pair = common::daily::pair(&scratch, true);
@@ -765,7 +1101,6 @@ fn invalid_configuration_sources_windows_and_locations_write_nothing() {
     for (name, mutation, reason) in [
         ("empty development", "development", "at least one window"),
         ("empty evaluation", "evaluation", "at least one window"),
-        ("empty holdout", "holdout", "at least one window"),
         ("empty sources", "sources", "at least one source"),
     ] {
         let mut value = serde_json::to_value(&base).unwrap();

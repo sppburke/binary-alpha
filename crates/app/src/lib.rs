@@ -27,6 +27,7 @@ pub mod fetch;
 pub mod inspect;
 
 use binary_alpha_engine::config::Config;
+use binary_alpha_engine::research::Verified;
 use std::path::Path;
 
 /// The schema, run mode, and storage of a configuration with every table cleared: the base of
@@ -71,4 +72,13 @@ pub(crate) fn check_config_capabilities(config: &Config) -> Result<(), String> {
         return Err("accelerator.backend: `cuda` requested but this binary was built without the `cuda` feature".into());
     }
     Ok(())
+}
+
+pub(crate) fn verification_cache(config: Option<&Config>) -> Verified {
+    Verified::with_devices(config.and_then(|config| {
+        config.accelerator.as_ref().and_then(|section| {
+            (section.backend == binary_alpha_engine::config::Backend::Cuda)
+                .then(|| section.devices.clone())
+        })
+    }))
 }

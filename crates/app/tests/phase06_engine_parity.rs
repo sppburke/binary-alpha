@@ -18,9 +18,9 @@ use binary_alpha_engine::execution::{
     EventSource, FinancialEvent, HISTORICAL_AVAILABILITY, InstrumentBinding, Observation, Outcome,
     PathMetrics, Pause, REPLAY_SCHEMA_VERSION, RateEvent, ReplayInput, ReplayManifest, Resolution,
     RiskPolicy, RunDefinition, SUMMARY_OBJECT_PATH, SameEntry, SettlementRule, StrategySpec,
-    StreamColumns, Summary, Threshold, UnresolvedReason, basis_points_text,
+    StreamColumns, Summary, Threshold, UnresolvedReason, basis_points_text, project_fitted_label,
 };
-use binary_alpha_engine::features::{FeatureManifest, Kind, Value};
+use binary_alpha_engine::features::{FeatureManifest, FittedEncoding, Kind, ProjectionKind, Value};
 use binary_alpha_engine::market::{Currency, format_event_time_micros};
 use common::current::import;
 use common::*;
@@ -799,6 +799,275 @@ fn reconciliation(command: &str, time: i64, resolution: Resolution) -> Observati
         command: command.to_string(),
         source: source(&format!("broker:reconcile:{command}:{time}"), time),
         resolution,
+    }
+}
+
+#[test]
+fn fitted_projection_matches_engine_signals_at_causal_base_decisions() {
+    const SECOND: i64 = 1_000_000;
+    struct Case {
+        name: &'static str,
+        condition_rows: Vec<(i64, i64, &'static str, bool)>,
+        base_close: i64,
+        base_known: i64,
+        base_signal: bool,
+        start: i64,
+        end: i64,
+        expected: bool,
+    }
+    let cases = [
+        Case {
+            name: "offset installed earlier",
+            condition_rows: vec![(5, 10, "flat", true)],
+            base_close: 15,
+            base_known: 20,
+            base_signal: true,
+            start: 0,
+            end: 30,
+            expected: true,
+        },
+        Case {
+            name: "delayed known at same time",
+            condition_rows: vec![(5, 20, "flat", true)],
+            base_close: 15,
+            base_known: 20,
+            base_signal: true,
+            start: 0,
+            end: 30,
+            expected: true,
+        },
+        Case {
+            name: "later close replaces delayed earlier",
+            condition_rows: vec![(5, 10, "flat", true), (20, 20, "flat", true)],
+            base_close: 15,
+            base_known: 20,
+            base_signal: true,
+            start: 0,
+            end: 30,
+            expected: false,
+        },
+        Case {
+            name: "later close replaces earlier",
+            condition_rows: vec![(5, 5, "flat", true), (20, 20, "flat", true)],
+            base_close: 15,
+            base_known: 20,
+            base_signal: true,
+            start: 0,
+            end: 30,
+            expected: false,
+        },
+        Case {
+            name: "tick finalized 5s at 15 with 15s at 20",
+            condition_rows: vec![(20, 20, "flat", true)],
+            base_close: 15,
+            base_known: 20,
+            base_signal: true,
+            start: 0,
+            end: 30,
+            expected: false,
+        },
+        Case {
+            name: "window starts at installation",
+            condition_rows: vec![(5, 20, "flat", true)],
+            base_close: 15,
+            base_known: 20,
+            base_signal: true,
+            start: 20,
+            end: 30,
+            expected: true,
+        },
+        Case {
+            name: "window ends at installation",
+            condition_rows: vec![(20, 30, "flat", true)],
+            base_close: 25,
+            base_known: 30,
+            base_signal: true,
+            start: 0,
+            end: 30,
+            expected: false,
+        },
+        Case {
+            name: "declared unready",
+            condition_rows: vec![(5, 20, "not_ready", true)],
+            base_close: 15,
+            base_known: 20,
+            base_signal: true,
+            start: 0,
+            end: 30,
+            expected: false,
+        },
+        Case {
+            name: "readiness flag false",
+            condition_rows: vec![(5, 20, "flat", false)],
+            base_close: 15,
+            base_known: 20,
+            base_signal: true,
+            start: 0,
+            end: 30,
+            expected: false,
+        },
+        Case {
+            name: "uncoded label",
+            condition_rows: vec![(5, 20, "none", true)],
+            base_close: 15,
+            base_known: 20,
+            base_signal: true,
+            start: 0,
+            end: 30,
+            expected: false,
+        },
+        Case {
+            name: "base conjunction false",
+            condition_rows: vec![(5, 20, "flat", true)],
+            base_close: 15,
+            base_known: 20,
+            base_signal: false,
+            start: 0,
+            end: 30,
+            expected: false,
+        },
+    ];
+    for case in cases {
+        let mut definition = definition(|replay| {
+            replay.decision_start = format_event_time_micros(case.start * SECOND);
+            replay.decision_end = format_event_time_micros(case.end * SECOND);
+            replay.strategies[0].conditions.push(condition(
+                stream(15, 5),
+                "state_encoded",
+                Comparator::Eq,
+                Threshold::Text("flat".into()),
+            ));
+        });
+        let spec = &mut definition.instruments[0].streams[1].columns[4];
+        spec.name = "state_encoded".into();
+        spec.source = "state".into();
+        spec.readiness = vec!["count_ready".into()];
+        spec.unready = vec!["not_ready".into()];
+        spec.encoding = Some(FittedEncoding {
+            output: "state_encoded".into(),
+            input: "state".into(),
+            automatic: true,
+            encoding: ProjectionKind::Category,
+            edges: None,
+            input_divisor: 1.0,
+            labels: vec!["flat".into(), "other".into()],
+        });
+        let spec = spec.clone();
+        let mut engine = Engine::new(definition).unwrap();
+        engine.drain();
+        let mut at_base = vec![tick(case.base_known * SECOND, 100)];
+        let mut latest = None;
+        for (close, known, text, ready) in case.condition_rows {
+            let mut values = vec![
+                Some(Value::Bool(true)),
+                Some(Value::Bool(true)),
+                Some(Value::Int(4)),
+                Some(Value::Bool(ready)),
+                Some(Value::Text(text.into())),
+            ];
+            let observation = row_of(0, 1, close * SECOND, known * SECOND, values.clone());
+            if known == case.base_known {
+                at_base.push(observation);
+            } else {
+                engine
+                    .step(known * SECOND, vec![tick(known * SECOND, 100), observation])
+                    .unwrap();
+                engine.drain();
+            }
+            latest = Some((close * SECOND, std::mem::take(&mut values)));
+        }
+        at_base.push(row_of(
+            0,
+            0,
+            case.base_close * SECOND,
+            case.base_known * SECOND,
+            vec![Some(Value::Bool(case.base_signal))],
+        ));
+        engine.step(case.base_known * SECOND, at_base).unwrap();
+        let signals = engine.drain();
+        let lowered = signals
+            .iter()
+            .any(|event| matches!(event.kind, EventKind::Signal { .. }));
+        let code = project_fitted_label(
+            case.base_close * SECOND,
+            latest
+                .as_ref()
+                .map(|(close, values)| (*close, values[4].as_ref())),
+            &spec,
+            latest
+                .as_ref()
+                .map(|(_, values)| values[3] == Some(Value::Bool(true))),
+        );
+        let projected = code == 0
+            && case.base_signal
+            && case.start <= case.base_known
+            && case.base_known < case.end;
+        assert_eq!(projected, lowered, "{}: {signals:?}", case.name);
+        assert_eq!(lowered, case.expected, "{}", case.name);
+    }
+}
+
+#[test]
+fn dropped_fitted_label_keeps_lowering_and_replay_equality() {
+    for (label, retained, expected_code) in [("other", false, -1), ("flat", true, 0)] {
+        for lowering in [true, false] {
+            let mut definition = definition(|replay| {
+                replay.strategies[0].conditions = vec![condition(
+                    stream(15, 5),
+                    "state_encoded",
+                    Comparator::Eq,
+                    Threshold::Text(label.into()),
+                )];
+                if lowering {
+                    replay.accounts[0].initial_cash = Decimal::zero(0);
+                }
+            });
+            let spec = &mut definition.instruments[0].streams[1].columns[4];
+            spec.name = "state_encoded".into();
+            spec.source = "state".into();
+            spec.encoding = Some(FittedEncoding {
+                output: "state_encoded".into(),
+                input: "state".into(),
+                automatic: true,
+                encoding: ProjectionKind::Category,
+                edges: None,
+                input_divisor: 1.0,
+                labels: vec!["flat".into()], // The other category was dropped by max_labels = 1.
+            });
+            let spec = spec.clone();
+            let mut engine = Engine::new(definition).unwrap();
+            engine.drain();
+            let value = Value::Text(label.into());
+            let values = vec![
+                Some(Value::Bool(true)),
+                Some(Value::Bool(true)),
+                Some(Value::Int(4)),
+                Some(Value::Bool(true)),
+                Some(value.clone()),
+            ];
+            engine
+                .step(
+                    20_000_000,
+                    vec![
+                        tick(20_000_000, 100),
+                        row_of(0, 1, 5_000_000, 20_000_000, values),
+                        row_of(0, 0, 15_000_000, 20_000_000, vec![Some(Value::Bool(true))]),
+                    ],
+                )
+                .unwrap();
+            let events = engine.drain();
+            assert!(
+                events
+                    .iter()
+                    .any(|event| matches!(event.kind, EventKind::Signal { .. })),
+                "{label} lowering={lowering}: {events:?}"
+            );
+            assert_eq!(
+                project_fitted_label(15_000_000, Some((5_000_000, Some(&value))), &spec, []),
+                expected_code
+            );
+            assert_eq!(retained, expected_code >= 0);
+        }
     }
 }
 

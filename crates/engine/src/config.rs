@@ -80,6 +80,13 @@ impl Config {
 
     /// Cross-field rules that a single field's deserializer cannot see.
     fn validate(&self) -> Result<(), String> {
+        if self
+            .accelerator
+            .as_ref()
+            .is_some_and(|accelerator| accelerator.devices.is_empty())
+        {
+            return Err("accelerator.devices: at least one device is required".into());
+        }
         if self.run_mode != RunMode::Research
             && matches!(self.storage.publication_uri, PublicationUri::Filesystem(_))
         {
@@ -162,6 +169,11 @@ impl Config {
                 .map_err(|reason| format!("search.{reason}"))?;
         }
         if let Some(portfolio) = &self.portfolio {
+            if portfolio.generate.is_some() {
+                return Err(
+                    "portfolio.generate: only a research portfolio may generate members".into(),
+                );
+            }
             portfolio
                 .validate()
                 .map_err(|reason| format!("portfolio.{reason}"))?;
@@ -1153,7 +1165,73 @@ pub struct StructureSettings {
 pub struct Encodings {
     /// `1` to `32768`.
     pub max_labels: u32,
+    #[serde(with = "encoding_outputs")]
     pub outputs: Vec<EncodingSpec>,
+}
+
+mod encoding_outputs {
+    use super::EncodingSpec;
+    use serde::{
+        Deserializer, Serialize, Serializer,
+        de::{Error, SeqAccess, Visitor},
+    };
+    use std::fmt;
+
+    pub fn serialize<S: Serializer>(
+        outputs: &[EncodingSpec],
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        if outputs.len() == 1 && outputs[0].output == "all_supported" && outputs[0].bins.is_none() {
+            serializer.serialize_str("all_supported")
+        } else {
+            outputs.serialize(serializer)
+        }
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<Vec<EncodingSpec>, D::Error> {
+        struct OutputsVisitor;
+        impl<'de> Visitor<'de> for OutputsVisitor {
+            type Value = Vec<EncodingSpec>;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+                formatter.write_str("`all_supported` or an encoding list")
+            }
+
+            fn visit_str<E: Error>(self, text: &str) -> Result<Self::Value, E> {
+                if text == "all_supported" {
+                    Ok(vec![EncodingSpec {
+                        output: text.to_string(),
+                        bins: None,
+                    }])
+                } else {
+                    Err(E::custom(format!("unknown encodings outputs `{text}`")))
+                }
+            }
+
+            fn visit_string<E: Error>(self, text: String) -> Result<Self::Value, E> {
+                self.visit_str(&text)
+            }
+
+            fn visit_seq<A: SeqAccess<'de>>(
+                self,
+                mut sequence: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut outputs = Vec::new();
+                while let Some(output) = sequence.next_element::<EncodingSpec>()? {
+                    if output.output == "all_supported" {
+                        return Err(A::Error::custom(
+                            "`all_supported` is a string mode, not an encoding output",
+                        ));
+                    }
+                    outputs.push(output);
+                }
+                Ok(outputs)
+            }
+        }
+        deserializer.deserialize_any(OutputsVisitor)
+    }
 }
 
 /// One encoded output: a category output or a compiled projection needs no bins; a numeric
@@ -1700,14 +1778,30 @@ pub struct SearchWindow {
     pub splits: Option<Vec<Split>>,
 }
 
-/// One menu entry: one output and comparator with its ordered thresholds.
+/// A named menu entry or a plan-bound rule. The rule has no threshold field, so it cannot
+/// accidentally be treated as a named condition before the development plan is bound.
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(untagged)]
+pub enum SearchCondition {
+    Named(NamedSearchCondition),
+    Generate(GeneratedSearchCondition),
+}
+
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-pub struct SearchCondition {
+pub struct NamedSearchCondition {
     pub stream: StreamKey,
     pub output: String,
     pub comparator: Comparator,
     pub thresholds: Vec<Threshold>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct GeneratedSearchCondition {
+    pub stream: StreamKey,
+    pub output: String,
+    pub comparator: Comparator,
 }
 
 /// The account every member is funded from, one account per member.
@@ -1746,6 +1840,8 @@ pub struct StabilitySettings {
 #[serde(deny_unknown_fields)]
 pub struct Portfolio {
     pub families: Vec<ManifestUri>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub generate: Option<PortfolioGenerate>,
     pub max_policies: u64,
     pub embargo_micros: i64,
     pub objective: crate::portfolio::Objective,
@@ -1765,6 +1861,13 @@ pub struct Portfolio {
     pub refit: Refit,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub evaluation: Option<Evaluation>,
+}
+
+/// Research-only rule resolved against verified, ranked development families.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PortfolioGenerate {
+    pub top: u32,
 }
 
 impl Portfolio {
@@ -2044,9 +2147,13 @@ pub struct ResearchPortfolio {
     pub max_rate_age_micros: i64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rates: Option<Vec<RateEvent>>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub members: Vec<PortfolioMember>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub generate: Option<PortfolioGenerate>,
     pub repairs: Vec<Repair>,
     pub bindings: Vec<PortfolioBinding>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub subsets: Vec<Subset>,
     pub risk_policies: Vec<RiskPolicy>,
 }
@@ -2099,6 +2206,19 @@ pub struct ReplayScenario {
 pub struct Accelerator {
     /// The requested execution backend; application loading checks build availability.
     pub backend: Backend,
+    /// Device ordinals used by offline CUDA screening. The default preserves old config bytes.
+    #[serde(
+        default = "default_accelerator_devices",
+        skip_serializing_if = "default_devices"
+    )]
+    pub devices: Vec<usize>,
+}
+
+fn default_accelerator_devices() -> Vec<usize> {
+    vec![0]
+}
+fn default_devices(devices: &Vec<usize>) -> bool {
+    devices.as_slice() == [0]
 }
 
 crate::string_enum! {
@@ -2365,7 +2485,7 @@ impl DataSplit {
             (DatasetRole::Evaluation, &self.evaluation),
             (DatasetRole::Holdout, &self.holdout),
         ] {
-            if ranges.is_empty() {
+            if ranges.is_empty() && role != DatasetRole::Holdout {
                 return Err(format!("{role}: at least one window is required"));
             }
             for range in ranges {
@@ -3630,6 +3750,49 @@ mod search_tests {
             assert!(error.contains(expected), "{edit}: {error}");
         }
     }
+
+    #[test]
+    fn generation_rule_is_typed_and_checked_before_plan_binding() {
+        let source = table(|text| {
+            text.replace(
+            "output = \"candle_direction\"\ncomparator = \"eq\"\nthresholds = [\"up\", \"down\"]",
+            "output = \"*\"\ncomparator = \"eq\"",
+        )
+        });
+        let config = Config::parse(&source).unwrap();
+        assert!(matches!(
+            config.search.as_ref().unwrap().conditions[0],
+            SearchCondition::Generate(_)
+        ));
+        assert_eq!(Config::parse(&config.canonical_toml()).unwrap(), config);
+        for (edited, expected) in [
+            (
+                source.replace("output = \"*\"", "output = \"candle_direction\""),
+                "generation rule requires output `*`",
+            ),
+            (
+                source.replace(
+                    "output = \"*\"\ncomparator = \"eq\"",
+                    "output = \"*\"\ncomparator = \"ne\"",
+                ),
+                "generation rule requires output `*` and comparator `eq`",
+            ),
+            (
+                source.replace(
+                    "output = \"*\"\ncomparator = \"eq\"",
+                    "output = \"*\"\ncomparator = \"eq\"\nthresholds = [\"up\"]",
+                ),
+                "`*` requires a generation rule",
+            ),
+        ] {
+            assert!(
+                Config::parse(&edited)
+                    .unwrap_err()
+                    .to_string()
+                    .contains(expected)
+            );
+        }
+    }
 }
 
 #[cfg(test)]
@@ -3654,5 +3817,16 @@ mod accelerator_tests {
         for section in ["backend = \"automatic\"", "backend = \"cpu\"\nordinal = 0"] {
             assert!(Config::parse(&format!("{HEAD}\n[accelerator]\n{section}\n")).is_err());
         }
+        let source = format!("{HEAD}\n[accelerator]\nbackend = \"cuda\"\ndevices = [0, 1]\n");
+        let config = Config::parse(&source).unwrap();
+        assert_eq!(config.accelerator.unwrap().devices, [0, 1]);
+        assert!(
+            Config::parse(&format!(
+                "{HEAD}\n[accelerator]\nbackend = \"cuda\"\ndevices = []\n"
+            ))
+            .unwrap_err()
+            .to_string()
+            .contains("accelerator.devices")
+        );
     }
 }
