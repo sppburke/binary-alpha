@@ -10,21 +10,26 @@ use std::collections::HashMap;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
+
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use binary_alpha_engine::config::{Config, FeatureInstrument, StreamKey};
 use binary_alpha_engine::dataset::{DatasetRole, GenerationManifest, ObjectRecord, ObjectRole};
 use binary_alpha_engine::features::{
     FEATURE_MANIFEST_KIND, FEATURE_SCHEMA_VERSION, FeatureEngine, FeatureManifest, FeatureOutput,
-    FeaturePlan, FeatureStreamSummary, FitWindow, PLAN_OBJECT_PATH, SequenceEvent, StreamPlan,
-    StructureEvent, Value, feature_generation_id, profile_reference,
+    FeaturePlan, FeatureStreamSummary, FitWindow, FittedEncoding, PLAN_OBJECT_PATH, Readiness,
+    SequenceEvent, StreamPlan, StructureEvent, Value, feature_generation_id, profile_reference,
 };
 use binary_alpha_engine::market::format_event_time_micros;
 use binary_alpha_engine::stream::{
     InstrumentProfile, PROFILE_OBJECT_PATH, STREAM_MANIFEST_KIND, Source, StreamManifest,
 };
 
-use crate::archive::{ColumnType, TableColumn, TableReader, TableWriter};
+use crate::archive::{ColumnType, TABLE_ROW_GROUP_ROWS, TableColumn, TableReader, TableWriter};
 use crate::audit::feed_generation;
 use crate::import::{self, CODE_REVISION};
 use crate::store::{self, ObjectIdentity, Put, Store};
@@ -190,7 +195,7 @@ pub fn run(config_path: &Path, out: &mut dyn Write) -> Result<(), String> {
         resolved.push(item);
     }
     for (index, item) in resolved.into_iter().enumerate() {
-        let built = build(item, &config, &local, &destination)
+        let built = build(item, &config, &local, &destination, access)
             .map_err(|reason| format!("features.instruments[{index}]: {reason}"))?;
         writeln!(out, "{}", built.report)
             .and_then(|()| out.flush())
@@ -436,6 +441,313 @@ pub(crate) struct Built {
     pub(crate) report: String,
 }
 
+#[derive(Serialize)]
+struct FitRequest<'a> {
+    code_revision: &'a str,
+    unfitted_plan_identity: &'a str,
+    input_generation: &'a str,
+    profile_generation: &'a str,
+    role: DatasetRole,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct FitReceipt {
+    request_digest: String,
+    code_revision: String,
+    generation: String,
+}
+
+fn fit_request_digest(request: &FitRequest<'_>) -> String {
+    let bytes = serde_json::to_vec(request).expect("a fit request serializes");
+    binary_alpha_engine::hex(&Sha256::digest(bytes))
+}
+
+fn fit_receipt_key(digest: &str) -> String {
+    format!("features/fits/{digest}")
+}
+
+fn write_fit_receipt(
+    local: &Store,
+    destination: &Store,
+    key: &str,
+    receipt: &FitReceipt,
+) -> Result<(), String> {
+    let temporary = import::temporary_path(local, "feature-fit-receipt")?;
+    let mut bytes = serde_json::to_vec_pretty(receipt).expect("a fit receipt serializes");
+    bytes.push(b'\n');
+    fs::write(&temporary, bytes)
+        .map_err(|error| format!("cannot write {}: {error}", temporary.display()))?;
+    let identity = store::identify(&temporary)?;
+    let result = destination.put_new(key, &temporary, &identity);
+    fs::remove_file(&temporary)
+        .map_err(|error| format!("cannot remove {}: {error}", temporary.display()))?;
+    result.map(|_| ())
+}
+
+fn immutable_conflict(reason: impl std::fmt::Display) -> String {
+    format!("immutable feature generation conflict: {reason}")
+}
+
+/// Reads only a ready manifest, after the target generation's declaration check. The
+/// manifest's own role and input are checked before any child object can be opened.
+fn ready_feature(
+    store: &Store,
+    generation: &str,
+    access: Access<'_>,
+) -> Result<(Vec<u8>, FeatureManifest), String> {
+    access.lookup(generation)?;
+    let key = binary_alpha_engine::dataset::manifest_key(generation);
+    let mut bytes = Vec::new();
+    store.read_to(&key, None, &mut bytes)?;
+    let manifest = FeatureManifest::from_json(&bytes)
+        .map_err(|reason| format!("{}: {reason}", store.uri(&key)))?;
+    if manifest.key() != key {
+        return Err(format!("{} records another generation", store.uri(&key)));
+    }
+    if manifest.role == DatasetRole::Holdout
+        || access.lookup(&manifest.input_generation)? == Some(DatasetRole::Holdout)
+    {
+        access.protected(std::iter::once(manifest.input_generation.as_str()))?;
+    }
+    Ok((bytes, manifest))
+}
+
+fn reused_feature(manifest: FeatureManifest, plan: FeaturePlan, verified: String) -> Built {
+    let rows: u64 = manifest.streams.iter().map(|stream| stream.rows).sum();
+    let events: u64 = manifest
+        .streams
+        .iter()
+        .map(|stream| stream.structure_events + stream.sequence_events)
+        .sum();
+    let count = manifest.objects.len();
+    let report = format!(
+        "features {} {} generation {} plan {} input {} observations {} rows {rows} events {events} objects {count} reused {count} (already published)\n{verified}",
+        manifest.instrument,
+        manifest.role,
+        manifest.generation,
+        manifest.plan_identity,
+        manifest.input_generation,
+        manifest.observations,
+    );
+    Built {
+        manifest,
+        plan,
+        report,
+    }
+}
+
+/// One cap is shared by outer stream work and its nested column work. A decoded fit column can
+/// hold millions of optional values; reserve 128 bytes per row for the input, each readiness
+/// flag, and fitting scratch, and at most a quarter of currently available memory for all
+/// simultaneous fit tasks. The fallback is conservative on systems without Linux MemAvailable.
+struct FeatureParallelism {
+    limit: usize,
+    active: AtomicUsize,
+}
+
+impl FeatureParallelism {
+    fn new(max_fit_rows: u64, live_fit_columns: usize) -> Self {
+        let cores = std::thread::available_parallelism().map_or(1, |count| count.get());
+        let available = fs::read_to_string("/proc/meminfo")
+            .ok()
+            .and_then(|contents| {
+                contents.lines().find_map(|line| {
+                    line.strip_prefix("MemAvailable:")?
+                        .split_whitespace()
+                        .next()?
+                        .parse::<u64>()
+                        .ok()
+                        .and_then(|kib| kib.checked_mul(1024))
+                })
+            })
+            .unwrap_or(1 << 30);
+        let decoded_column = max_fit_rows
+            .max(TABLE_ROW_GROUP_ROWS as u64)
+            .saturating_mul(128)
+            .saturating_mul(live_fit_columns as u64);
+        let memory_limit = (available / 4 / decoded_column.max(1)).max(1);
+        let limit = cores.min(usize::try_from(memory_limit).unwrap_or(usize::MAX));
+        Self {
+            limit: limit.max(1),
+            active: AtomicUsize::new(1),
+        }
+    }
+
+    fn try_acquire(&self) -> bool {
+        self.active
+            .fetch_update(Ordering::AcqRel, Ordering::Relaxed, |count| {
+                (count < self.limit).then_some(count + 1)
+            })
+            .is_ok()
+    }
+
+    fn map<T: Sync, R: Send>(&self, items: &[T], worker: impl Fn(&T) -> R + Sync) -> Vec<R> {
+        self.map_limited(items, self.limit, worker)
+    }
+
+    fn map_streams<T: Sync, R: Send>(
+        &self,
+        items: &[T],
+        worker: impl Fn(&T) -> R + Sync,
+    ) -> Vec<R> {
+        // Leave slots for the row group's independent columns while streams overlap.
+        let streams = if self.limit == 2 {
+            1
+        } else {
+            self.limit.div_ceil(2)
+        };
+        self.map_limited(items, streams, worker)
+    }
+
+    fn map_limited<T: Sync, R: Send>(
+        &self,
+        items: &[T],
+        tasks: usize,
+        worker: impl Fn(&T) -> R + Sync,
+    ) -> Vec<R> {
+        let next = AtomicUsize::new(0);
+        let results: Mutex<Vec<Option<R>>> = Mutex::new((0..items.len()).map(|_| None).collect());
+        std::thread::scope(|scope| {
+            for _ in 1..items.len().min(tasks) {
+                if !self.try_acquire() {
+                    break;
+                }
+                let worker = &worker;
+                let next = &next;
+                let results = &results;
+                scope.spawn(move || {
+                    loop {
+                        let index = next.fetch_add(1, Ordering::Relaxed);
+                        let Some(item) = items.get(index) else { break };
+                        let value = worker(item);
+                        results.lock().expect("worker did not panic")[index] = Some(value);
+                    }
+                    self.active.fetch_sub(1, Ordering::Release);
+                });
+            }
+            loop {
+                let index = next.fetch_add(1, Ordering::Relaxed);
+                if index >= items.len() {
+                    break;
+                }
+                let value = worker(&items[index]);
+                results.lock().expect("worker did not panic")[index] = Some(value);
+            }
+        });
+        results
+            .into_inner()
+            .expect("worker did not panic")
+            .into_iter()
+            .map(|value| value.expect("every item was processed"))
+            .collect()
+    }
+}
+
+struct FitJob {
+    stream: usize,
+    column: usize,
+    rows_path: PathBuf,
+    encoding: FittedEncoding,
+    readiness: Readiness,
+}
+
+fn fit_column(job: &FitJob, max_labels: u32) -> Result<FittedEncoding, String> {
+    let reader = TableReader::open(&job.rows_path, ROWS_MESSAGE)?;
+    let index = reader.column_index(&job.encoding.input).ok_or_else(|| {
+        format!(
+            "encoding input `{}` is not a row column",
+            job.encoding.input
+        )
+    })?;
+    let mut column = reader.whole_column(index)?;
+    if job.encoding.automatic {
+        let flags: Vec<_> = job
+            .readiness
+            .flags
+            .iter()
+            .map(|flag| {
+                let index = reader
+                    .column_index(flag)
+                    .ok_or_else(|| format!("readiness flag `{flag}` is not a row column"))?;
+                reader.whole_column(index)
+            })
+            .collect::<Result<_, String>>()?;
+        for row in 0..column.len() {
+            if !binary_alpha_engine::execution::value_ready(
+                column[row].as_ref(),
+                &job.readiness.unready,
+                flags
+                    .iter()
+                    .map(|flag: &Vec<Option<Value>>| flag[row] == Some(Value::Bool(true))),
+            ) {
+                column[row] = None;
+            }
+        }
+    }
+    let mut encoding = job.encoding.clone();
+    encoding.fit(&column, max_labels)?;
+    Ok(encoding)
+}
+
+fn encode_stream(
+    stream: &StreamPlan,
+    rows_path: &Path,
+    path: &Path,
+    plan: &FeaturePlan,
+    plan_identity: &str,
+    parallelism: &FeatureParallelism,
+) -> Result<(), String> {
+    let columns = stream
+        .encodings
+        .iter()
+        .map(|encoding| TableColumn::new(&encoding.output, ColumnType::Int16))
+        .collect();
+    let mut writer = TableWriter::create(
+        path,
+        ENCODED_MESSAGE,
+        columns,
+        &table_metadata(plan, stream, ("plan_identity", plan_identity)),
+    )?;
+    // Parquet row-group readers share seek state. A bounded pool gives concurrent columns
+    // independent file descriptors without reopening them for every row group.
+    let readers: Vec<Mutex<TableReader>> = (0..stream.encodings.len().min(parallelism.limit))
+        .map(|_| TableReader::open(rows_path, ROWS_MESSAGE))
+        .map(|reader| reader.map(Mutex::new))
+        .collect::<Result<_, _>>()?;
+    let columns: Vec<_> = stream.encodings.iter().enumerate().collect();
+    let groups = readers[0]
+        .lock()
+        .expect("reader did not panic")
+        .row_groups();
+    for group in 0..groups {
+        let codes = parallelism.map(&columns, |(column, encoding)| {
+            let values = {
+                let reader = readers[*column % readers.len()]
+                    .lock()
+                    .expect("reader did not panic");
+                let index = reader.column_index(&encoding.input).ok_or_else(|| {
+                    format!("encoding input `{}` is not a row column", encoding.input)
+                })?;
+                reader.column(group, index)?
+            };
+            Ok::<_, String>(encoding.encode(&values))
+        });
+        let codes: Vec<Vec<i16>> = codes.into_iter().collect::<Result<_, _>>()?;
+        let rows = codes.first().map_or(0, Vec::len);
+        for row in 0..rows {
+            writer.push(
+                codes
+                    .iter()
+                    .map(|column| Some(Value::Int(i64::from(column[row]))))
+                    .collect(),
+            )?;
+        }
+    }
+    writer.finish()?;
+    Ok(())
+}
+
 /// Binds one entry's inputs and resolves its new plan or reads its frozen one; nothing is
 /// streamed or published.
 pub(crate) fn resolve(entry: &FeatureInstrument, access: Access<'_>) -> Result<Resolved, String> {
@@ -483,6 +795,7 @@ pub(crate) fn build(
     config: &Config,
     local: &Store,
     destination: &Store,
+    access: Access<'_>,
 ) -> Result<Built, String> {
     let Resolved {
         bound,
@@ -492,6 +805,91 @@ pub(crate) fn build(
     let id = bound.stream_manifest.definition.id();
     let generation_of =
         |plan: &FeaturePlan| feature_generation_id(&plan.identity(), &bound.input.generation);
+
+    // Binding has already permitted the input and frozen plan. The fast path checks the same
+    // target context before touching its receipt or any feature child object.
+    access.permit(Some(bound.input.role), &bound.input.generation)?;
+    let unfitted_identity = (frozen_from.is_none()).then(|| plan.unfitted().identity());
+    let request = unfitted_identity.as_ref().map(|identity| FitRequest {
+        code_revision: CODE_REVISION,
+        unfitted_plan_identity: identity,
+        input_generation: &bound.input.generation,
+        profile_generation: &bound.stream_manifest.generation,
+        role: bound.input.role,
+    });
+    let receipt_key = request
+        .as_ref()
+        .map(|request| fit_receipt_key(&fit_request_digest(request)));
+    if let Some(frozen_from) = &frozen_from {
+        let generation = generation_of(&plan);
+        let key = binary_alpha_engine::dataset::manifest_key(&generation);
+        if destination.head(&key)?.is_some() {
+            let (bytes, manifest) =
+                ready_feature(destination, &generation, access).map_err(immutable_conflict)?;
+            if manifest.role != bound.input.role
+                || manifest.input_generation != bound.input.generation
+                || manifest.profile_generation != bound.stream_manifest.generation
+                || manifest.frozen_from.as_ref() != Some(frozen_from)
+                || manifest.plan_identity != plan.identity()
+            {
+                return Err(immutable_conflict(format!(
+                    "{} does not match the frozen application request",
+                    destination.uri(&key)
+                )));
+            }
+            if manifest.code_revision == CODE_REVISION {
+                let verified = verify_feature(&destination.uri(&key), destination, &key, &bytes)
+                    .map_err(immutable_conflict)?;
+                return Ok(reused_feature(manifest, plan, verified));
+            }
+        }
+    } else if let (Some(request), Some(receipt_key)) = (&request, &receipt_key)
+        && destination.head(receipt_key)?.is_some()
+    {
+        let mut bytes = Vec::new();
+        destination.read_to(receipt_key, None, &mut bytes)?;
+        let receipt: FitReceipt = serde_json::from_slice(&bytes).map_err(|reason| {
+            immutable_conflict(format!("{}: {reason}", destination.uri(receipt_key)))
+        })?;
+        if receipt.request_digest != fit_request_digest(request)
+            || receipt.code_revision != CODE_REVISION
+            || receipt.generation.len() != 64
+            || !receipt
+                .generation
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit())
+        {
+            return Err(immutable_conflict(format!(
+                "{} does not match the fit request",
+                destination.uri(receipt_key)
+            )));
+        }
+        let key = binary_alpha_engine::dataset::manifest_key(&receipt.generation);
+        let (manifest_bytes, manifest) =
+            ready_feature(destination, &receipt.generation, access).map_err(immutable_conflict)?;
+        if manifest.role != request.role
+            || manifest.input_generation != request.input_generation
+            || manifest.profile_generation != request.profile_generation
+            || manifest.code_revision != request.code_revision
+            || manifest.frozen_from.is_some()
+        {
+            return Err(immutable_conflict(format!(
+                "{} does not match the fit request",
+                destination.uri(&key)
+            )));
+        }
+        let verified = verify_feature(&destination.uri(&key), destination, &key, &manifest_bytes)
+            .map_err(immutable_conflict)?;
+        let fitted = fitted_plan(&destination.uri(&key), destination, &manifest)
+            .map_err(immutable_conflict)?;
+        if fitted.unfitted().identity() != request.unfitted_plan_identity {
+            return Err(immutable_conflict(format!(
+                "{} has a different unfitted plan",
+                destination.uri(&key)
+            )));
+        }
+        return Ok(reused_feature(manifest, fitted, verified));
+    }
 
     // Stream the input through the engine into temporary tables.
     let streaming = Instant::now();
@@ -598,8 +996,24 @@ pub(crate) fn build(
         summaries.push(summary);
     }
     let streamed = streaming.elapsed();
+    let max_flags = plan
+        .streams
+        .iter()
+        .flat_map(|stream| stream.encodings.iter())
+        .map(|encoding| plan.readiness_of(&encoding.input).flags.len())
+        .max()
+        .unwrap_or(0);
+    // One fit keeps the input, its readiness flags, and fitting scratch live together.
+    let parallelism = FeatureParallelism::new(
+        summaries
+            .iter()
+            .map(|stream| stream.rows)
+            .max()
+            .unwrap_or(0),
+        max_flags + 2,
+    );
 
-    // Fit encodings on the development rows, one column at a time, and freeze the plan.
+    // Each fit owns its decoded column and returns an encoding to the original plan position.
     let fitting = Instant::now();
     if frozen_from.is_none() {
         plan.fit_windows = summaries
@@ -612,55 +1026,23 @@ pub(crate) fn build(
                 last_decision_time: summary.last_decision_time.clone(),
             })
             .collect();
-        let max_labels = plan.max_labels;
-        let readiness: Vec<_> = plan
-            .streams
-            .iter()
-            .map(|stream| {
-                stream
-                    .encodings
-                    .iter()
-                    .map(|encoding| plan.readiness_of(&encoding.input))
-                    .collect::<Vec<_>>()
-            })
-            .collect();
-        for ((stream, temporary), readiness) in plan
-            .streams
-            .iter_mut()
-            .zip(temporaries.chunks(3))
-            .zip(readiness)
-        {
-            let reader = TableReader::open(&temporary[0], ROWS_MESSAGE)?;
-            for (encoding, readiness) in stream.encodings.iter_mut().zip(readiness) {
-                let index = reader.column_index(&encoding.input).ok_or_else(|| {
-                    format!("encoding input `{}` is not a row column", encoding.input)
-                })?;
-                let mut column = reader.whole_column(index)?;
-                if encoding.automatic {
-                    let flags: Vec<_> = readiness
-                        .flags
-                        .iter()
-                        .map(|flag| {
-                            let index = reader.column_index(flag).ok_or_else(|| {
-                                format!("readiness flag `{flag}` is not a row column")
-                            })?;
-                            reader.whole_column(index)
-                        })
-                        .collect::<Result<_, String>>()?;
-                    for row in 0..column.len() {
-                        if !binary_alpha_engine::execution::value_ready(
-                            column[row].as_ref(),
-                            &readiness.unready,
-                            flags.iter().map(|flag: &Vec<Option<Value>>| {
-                                flag[row] == Some(Value::Bool(true))
-                            }),
-                        ) {
-                            column[row] = None;
-                        }
-                    }
-                }
-                encoding.fit(&column, max_labels)?;
+        let mut jobs = Vec::new();
+        for (stream_index, stream) in plan.streams.iter().enumerate() {
+            for (column, encoding) in stream.encodings.iter().enumerate() {
+                jobs.push(FitJob {
+                    stream: stream_index,
+                    column,
+                    rows_path: temporaries[stream_index * 3].clone(),
+                    encoding: encoding.clone(),
+                    readiness: plan.readiness_of(&encoding.input),
+                });
             }
+        }
+        for (job, result) in jobs
+            .iter()
+            .zip(parallelism.map(&jobs, |job| fit_column(job, plan.max_labels)))
+        {
+            plan.streams[job.stream].encodings[job.column] = result?;
         }
     }
     let plan_identity = plan.identity();
@@ -668,53 +1050,46 @@ pub(crate) fn build(
     let key = binary_alpha_engine::dataset::manifest_key(&generation);
     let fitted = fitting.elapsed();
 
-    // Encode every stream under the frozen encodings, row group by row group.
+    // Each stream writes its own table. Within a row group, columns are decoded and encoded
+    // independently, then returned in plan order to the serial row and metadata writer.
     let encoding = Instant::now();
-    let mut encoded_paths: Vec<Option<PathBuf>> = Vec::with_capacity(plan.streams.len());
-    for (stream, temporary) in plan.streams.iter().zip(temporaries.chunks(3)) {
-        if stream.encodings.is_empty() {
-            encoded_paths.push(None);
-            continue;
-        }
-        let path = import::temporary_path(
-            local,
-            &format!(
-                "features-{raw}-{}s-{}s-encoded",
-                stream.duration_seconds, stream.offset_seconds
-            ),
-        )?;
-        let columns = stream
-            .encodings
-            .iter()
-            .map(|encoding| TableColumn::new(&encoding.output, ColumnType::Int16))
-            .collect();
-        let mut writer = TableWriter::create(
-            &path,
-            ENCODED_MESSAGE,
-            columns,
-            &table_metadata(&plan, stream, ("plan_identity", &plan_identity)),
-        )?;
-        let reader = TableReader::open(&temporary[0], ROWS_MESSAGE)?;
-        for group in 0..reader.row_groups() {
-            let mut codes: Vec<Vec<i16>> = Vec::with_capacity(stream.encodings.len());
-            for encoding in &stream.encodings {
-                let index = reader.column_index(&encoding.input).ok_or_else(|| {
-                    format!("encoding input `{}` is not a row column", encoding.input)
-                })?;
-                codes.push(encoding.encode(&reader.column(group, index)?));
-            }
-            let rows = codes.first().map_or(0, Vec::len);
-            for row in 0..rows {
-                writer.push(
-                    codes
-                        .iter()
-                        .map(|column| Some(Value::Int(i64::from(column[row]))))
-                        .collect(),
-                )?;
-            }
-        }
-        writer.finish()?;
-        encoded_paths.push(Some(path));
+    let encoded_paths: Vec<Option<PathBuf>> = plan
+        .streams
+        .iter()
+        .map(|stream| {
+            (!stream.encodings.is_empty())
+                .then(|| {
+                    import::temporary_path(
+                        local,
+                        &format!(
+                            "features-{raw}-{}s-{}s-encoded",
+                            stream.duration_seconds, stream.offset_seconds
+                        ),
+                    )
+                })
+                .transpose()
+        })
+        .collect::<Result<_, String>>()?;
+    let stream_jobs: Vec<_> = plan
+        .streams
+        .iter()
+        .enumerate()
+        .filter(|(_, stream)| !stream.encodings.is_empty())
+        .map(|(index, stream)| {
+            (
+                stream,
+                temporaries[index * 3].as_path(),
+                encoded_paths[index]
+                    .as_ref()
+                    .expect("encoded path")
+                    .as_path(),
+            )
+        })
+        .collect();
+    for result in parallelism.map_streams(&stream_jobs, |(stream, rows, path)| {
+        encode_stream(stream, rows, path, &plan, &plan_identity, &parallelism)
+    }) {
+        result?;
     }
     let plan_path = import::temporary_path(local, &format!("features-{generation}-plan"))?;
     fs::write(&plan_path, plan.to_json())
@@ -820,6 +1195,26 @@ pub(crate) fn build(
     local.put_new(&key, &temporary, &identity)?;
     fs::remove_file(&temporary)
         .map_err(|error| format!("cannot remove {}: {error}", temporary.display()))?;
+    let manifest = FeatureManifest::from_json(&committed).expect("the committed manifest parsed");
+    if let (Some(request), Some(receipt_key)) = (&request, &receipt_key)
+        && manifest.role == request.role
+        && manifest.input_generation == request.input_generation
+        && manifest.profile_generation == request.profile_generation
+        && manifest.code_revision == request.code_revision
+        && manifest.frozen_from.is_none()
+        && plan.unfitted().identity() == request.unfitted_plan_identity
+    {
+        write_fit_receipt(
+            local,
+            destination,
+            receipt_key,
+            &FitReceipt {
+                request_digest: fit_request_digest(request),
+                code_revision: CODE_REVISION.to_string(),
+                generation: manifest.generation.clone(),
+            },
+        )?;
+    }
     let published = publishing.elapsed();
     let line = match put {
         Put::Reused(_) => format!("{report} (already published)"),
@@ -831,7 +1226,6 @@ pub(crate) fn build(
             published.as_secs_f64()
         ),
     };
-    let manifest = FeatureManifest::from_json(&committed).expect("the committed manifest parsed");
     Ok(Built {
         manifest,
         plan,
@@ -975,4 +1369,42 @@ pub fn verify_feature(uri: &str, store: &Store, key: &str, bytes: &[u8]) -> Resu
         manifest.generation,
         manifest.objects.len()
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{FitReceipt, write_fit_receipt};
+    use crate::store::Store;
+
+    #[test]
+    fn fit_receipt_accepts_identical_content_and_rejects_a_conflict() {
+        let root = std::env::temp_dir().join(format!(
+            "binary-alpha-fit-receipt-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let local = Store::filesystem(root.join("local"));
+        let destination = Store::filesystem(root.join("published"));
+        let key = "features/fits/receipt-test";
+        let receipt = FitReceipt {
+            request_digest: "request".into(),
+            code_revision: "revision".into(),
+            generation: "first".into(),
+        };
+        write_fit_receipt(&local, &destination, key, &receipt).unwrap();
+        write_fit_receipt(&local, &destination, key, &receipt).unwrap();
+        let conflict = FitReceipt {
+            generation: "second".into(),
+            ..receipt
+        };
+        assert!(
+            write_fit_receipt(&local, &destination, key, &conflict)
+                .unwrap_err()
+                .contains("already holds different content")
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
 }

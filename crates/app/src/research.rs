@@ -813,6 +813,7 @@ fn develop(
             &portfolio::features_config(config, &fit),
             local,
             destination,
+            access,
         )?;
         report(&built.report)?;
         let feature = ready_uri(destination, &built.manifest.generation)?;

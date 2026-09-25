@@ -320,6 +320,7 @@ pub(crate) fn apply(
         &features_config(config, &entry),
         local,
         destination,
+        access,
     )?;
     Ok((
         feature_ref(&applied.manifest),
@@ -346,6 +347,7 @@ fn fit_and_apply(
         &features_config(config, &bound.entry),
         local,
         destination,
+        access,
     )?;
     let (applied, input) = apply(
         config,
@@ -743,6 +745,7 @@ pub(crate) fn select(
                     &features_config(config, &entry),
                     local,
                     destination,
+                    access,
                 )?;
                 refit.push(feature_ref(&built.manifest));
                 plans.insert(bound.instrument, built.plan);

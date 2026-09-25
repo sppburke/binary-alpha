@@ -10,6 +10,7 @@ mod common;
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
 use binary_alpha_engine::config::Config;
 use binary_alpha_engine::dataset::{
@@ -38,6 +39,24 @@ fn build(config: &Path) -> Result<Vec<String>, String> {
         assert_eq!(output.status.code(), Some(1));
         assert!(stdout.is_empty(), "{stdout}");
         Err(stderr)
+    }
+}
+
+fn build_logged(config: &Path, log: &Path) -> Result<Vec<String>, String> {
+    let output = Command::new(env!("CARGO_BIN_EXE_binary-alpha"))
+        .args(["features", "build", "--config", config.to_str().unwrap()])
+        .env("BINARY_ALPHA_STORE_LOG", log)
+        .output()
+        .unwrap();
+    if output.status.success() {
+        assert!(output.stderr.is_empty());
+        Ok(String::from_utf8(output.stdout)
+            .unwrap()
+            .lines()
+            .map(str::to_string)
+            .collect())
+    } else {
+        Err(String::from_utf8(output.stderr).unwrap())
     }
 }
 
@@ -858,7 +877,8 @@ fn features_build_fits_publishes_reconstructs_freezes_and_isolates() {
     }
 
     // Repeating the build reuses every immutable object and the manifest.
-    let again = build(&config).unwrap();
+    let fit_log = scratch.path("fit-reuse-access.log");
+    let again = build_logged(&config, &fit_log).unwrap();
     assert!(
         again[0].ends_with(&format!(
             "objects {} reused {} (already published)",
@@ -869,11 +889,124 @@ fn features_build_fits_publishes_reconstructs_freezes_and_isolates() {
         again[0]
     );
     assert_eq!(again[1], lines[1]);
+    let access_log = fs::read_to_string(&fit_log).unwrap();
+    for object in &dataset.objects {
+        assert!(
+            !access_log.contains(&format!("read_to {}", object.key)),
+            "reused fit read input object {}",
+            object.key
+        );
+    }
+    assert!(access_log.contains("read_to features/fits/"));
 
-    // A run interrupted before the ready manifest leaves an incomplete generation that a rerun
-    // completes through the same immutable writes.
+    let receipt_path = fs::read_dir(scratch.path("published/features/fits"))
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    let original_receipt = fs::read(&receipt_path).unwrap();
+    let receipt: serde_json::Value = serde_json::from_slice(&original_receipt).unwrap();
+    let rejected_receipt = |name: &str, bytes: &[u8]| {
+        fs::write(&receipt_path, bytes).unwrap();
+        let log = scratch.path(&format!("rejected-{name}.log"));
+        let error = build_logged(&config, &log).unwrap_err();
+        assert!(
+            error.contains("immutable feature generation conflict"),
+            "{name}: {error}"
+        );
+        let access = fs::read_to_string(log).unwrap();
+        for object in &dataset.objects {
+            assert!(
+                !access.contains(&format!("read_to {}", object.key)),
+                "{name}"
+            );
+        }
+        fs::write(&receipt_path, &original_receipt).unwrap();
+    };
+    rejected_receipt("malformed", b"{");
+    let mut wrong = receipt.clone();
+    wrong["request_digest"] = "0".repeat(64).into();
+    rejected_receipt("digest", &serde_json::to_vec(&wrong).unwrap());
+    wrong = receipt.clone();
+    wrong["code_revision"] = "another-revision".into();
+    rejected_receipt("revision", &serde_json::to_vec(&wrong).unwrap());
+    wrong = receipt.clone();
+    wrong["generation"] = "0".repeat(64).into();
+    rejected_receipt("missing-target", &serde_json::to_vec(&wrong).unwrap());
+
+    // A different request builds its own generation. Repointing the original receipt at that
+    // valid generation still fails its unfitted-plan comparison before input streaming.
+    let other = scratch.config(
+        "other-max-labels.toml",
+        &feature_entry(
+            "development",
+            &dataset_manifest,
+            &stream_manifest,
+            &TICK_SETTINGS.replace("max_labels = 32768", "max_labels = 32767"),
+        ),
+    );
+    let other_lines = build(&other).unwrap();
+    assert!(!other_lines[0].ends_with("(already published)"));
+    wrong = receipt.clone();
+    wrong["generation"] = generation(&other_lines[0]).into();
+    rejected_receipt("max-labels", &serde_json::to_vec(&wrong).unwrap());
+    let other_generation = generation(&other_lines[0]);
+    let other_manifest_path = scratch.path(&format!(
+        "published/manifests/{other_generation}/ready.json"
+    ));
+    let other_manifest_bytes = fs::read(&other_manifest_path).unwrap();
+    let other_manifest = FeatureManifest::from_json(&other_manifest_bytes).unwrap();
+    let mut protected: serde_json::Value = serde_json::from_slice(&other_manifest_bytes).unwrap();
+    protected["role"] = "holdout".into();
+    fs::write(
+        &other_manifest_path,
+        serde_json::to_vec_pretty(&protected).unwrap(),
+    )
+    .unwrap();
+    fs::write(&receipt_path, serde_json::to_vec(&wrong).unwrap()).unwrap();
+    let protected_log = scratch.path("protected-target-access.log");
+    let error = build_logged(&config, &protected_log).unwrap_err();
+    assert!(
+        error.contains("immutable feature generation conflict"),
+        "{error}"
+    );
+    let protected_access = fs::read_to_string(protected_log).unwrap();
+    for object in &other_manifest.objects {
+        assert!(
+            !protected_access.contains(&format!("read_to {}", object.key)),
+            "protected target read child {}",
+            object.key
+        );
+    }
+    fs::write(&receipt_path, &original_receipt).unwrap();
+    fs::write(&other_manifest_path, other_manifest_bytes).unwrap();
+    let other = scratch.config(
+        "other-encodings.toml",
+        &feature_entry(
+            "development",
+            &dataset_manifest,
+            &stream_manifest,
+            &TICK_SETTINGS.replace(
+                "output = \"range_bps\", bins = [0.0, 0.1, 0.2, 0.3, 0.5, 1.0]",
+                "output = \"range_bps\", bins = [0.0, 0.1, 0.2, 0.3, 0.6, 1.0]",
+            ),
+        ),
+    );
+    let other_lines = build(&other).unwrap();
+    wrong["generation"] = generation(&other_lines[0]).into();
+    rejected_receipt("encodings", &serde_json::to_vec(&wrong).unwrap());
+
+    // A receipt cannot reuse a missing target. An interruption before the receipt is written
+    // can still complete through the same immutable writes.
     fs::remove_file(&manifest_path).unwrap();
     assert!(verify(&manifest_path).unwrap_err().contains("cannot open"));
+    assert!(
+        build(&config)
+            .unwrap_err()
+            .contains("immutable feature generation conflict")
+    );
+    fs::remove_file(&receipt_path).unwrap();
     let resumed = build(&config).unwrap();
     assert!(
         resumed[0].ends_with(&format!(
@@ -886,12 +1019,34 @@ fn features_build_fits_publishes_reconstructs_freezes_and_isolates() {
     );
     assert_eq!(fs::read(&manifest_path).unwrap(), manifest.to_json());
 
+    // A code-revision-only rebuild can reuse a first-committed older manifest, but must not
+    // claim that older publication for this revision through a new fit receipt.
+    fs::remove_file(&receipt_path).unwrap();
+    let mut older: serde_json::Value = serde_json::from_slice(&manifest.to_json()).unwrap();
+    older["code_revision"] = "older-producer".into();
+    let retained_manifest_path = scratch.path(&format!(
+        "retained/manifests/{feature_generation}/ready.json"
+    ));
+    let older_bytes = serde_json::to_vec_pretty(&older).unwrap();
+    fs::write(&manifest_path, &older_bytes).unwrap();
+    fs::write(&retained_manifest_path, &older_bytes).unwrap();
+    let older_run = build(&config).unwrap();
+    assert!(older_run[0].ends_with("(already published)"));
+    assert!(!receipt_path.exists());
+    fs::write(&manifest_path, manifest.to_json()).unwrap();
+    fs::write(&retained_manifest_path, manifest.to_json()).unwrap();
+    build(&config).unwrap();
+    assert!(receipt_path.exists());
+
     // Conflicting content under a completed identity fails without replacing anything.
     let rows_object = scratch.path("published").join(&manifest.objects[1].key);
     let original = fs::read(&rows_object).unwrap();
     fs::write(&rows_object, b"tampered").unwrap();
     let error = build(&config).unwrap_err();
-    assert!(error.contains("already holds different content"), "{error}");
+    assert!(
+        error.contains("immutable feature generation conflict"),
+        "{error}"
+    );
     assert_eq!(fs::read(&rows_object).unwrap(), b"tampered");
     fs::write(&rows_object, &original).unwrap();
 
@@ -955,6 +1110,43 @@ fn features_build_fits_publishes_reconstructs_freezes_and_isolates() {
         "the same ticks yield the same rows"
     );
     assert_eq!(applied.tables, published.tables);
+    let applied_path = scratch.path(&format!(
+        "published/manifests/{applied_generation}/ready.json"
+    ));
+    let applied_bytes = fs::read(&applied_path).unwrap();
+    let mut wrong_frozen: serde_json::Value = serde_json::from_slice(&applied_bytes).unwrap();
+    wrong_frozen["frozen_from"] = "0".repeat(64).into();
+    fs::write(
+        &applied_path,
+        serde_json::to_vec_pretty(&wrong_frozen).unwrap(),
+    )
+    .unwrap();
+    let frozen_conflict_log = scratch.path("frozen-conflict-access.log");
+    let conflict = build_logged(&frozen, &frozen_conflict_log).unwrap_err();
+    assert!(
+        conflict.contains("immutable feature generation conflict"),
+        "{conflict}"
+    );
+    fs::write(&applied_path, applied_bytes).unwrap();
+    let frozen_log = scratch.path("frozen-reuse-access.log");
+    let frozen_again = build_logged(&frozen, &frozen_log).unwrap();
+    assert!(frozen_again[2].ends_with("(already published)"));
+    let frozen_access = fs::read_to_string(&frozen_log).unwrap();
+    let frozen_conflict_access = fs::read_to_string(&frozen_conflict_log).unwrap();
+    let evaluation_manifest =
+        GenerationManifest::from_json(&fs::read(&eval_manifest).unwrap()).unwrap();
+    for object in &evaluation_manifest.objects {
+        assert!(
+            !frozen_access.contains(&format!("read_to {}", object.key)),
+            "reused frozen build read input object {}",
+            object.key
+        );
+        assert!(
+            !frozen_conflict_access.contains(&format!("read_to {}", object.key)),
+            "conflicted frozen build read input object {}",
+            object.key
+        );
+    }
 
     // Isolation: a declared holdout input and an evaluation input for a new fit are refused by
     // the configuration before anything is resolved.

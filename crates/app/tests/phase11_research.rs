@@ -4178,6 +4178,120 @@ fn ordinary_entry_points_are_denied_before_protected_access() {
 }
 
 #[test]
+fn holdout_feature_reuse_requires_matching_certification_context() {
+    let comparison = Comparison::new("phase11_holdout_feature_reuse");
+    let fixture = &comparison.fixture;
+    fixture.run().unwrap();
+    let (_, run) = fixture.run_record();
+    let (_, grant) = fixture.grant();
+    fixture.run().unwrap();
+    let (certification, record) = fixture.certification(&grant);
+    let features = &record.scenarios[0].outer.features;
+    assert_eq!(features.len(), 2);
+
+    // A new physical copy retains the original completed synthetic evidence. With only its
+    // certification ready marker absent, the same grant enters assessment and reuses each
+    // previously verified holdout feature under its matching declaration.
+    comparison.restart("authorized-reuse", &comparison.reference);
+    fs::remove_file(
+        fixture
+            .published()
+            .join(manifest_key(&certification.generation)),
+    )
+    .unwrap();
+    fixture.run().unwrap();
+    let (reused_certification, reused_record) = fixture.certification(&grant);
+    assert_eq!(reused_certification, certification);
+    assert_eq!(reused_record, record);
+    let log = logged(&fixture.log());
+    let input_keys: Vec<_> = fixture
+        .config
+        .research
+        .as_ref()
+        .unwrap()
+        .holdout
+        .inputs
+        .iter()
+        .flat_map(|input| {
+            let dataset = GenerationManifest::from_json(
+                &fs::read(fixture.published().join(&input.key)).unwrap(),
+            )
+            .unwrap();
+            dataset.objects.into_iter().map(|object| object.key)
+        })
+        .collect();
+    let first_input = log.iter().position(|line| {
+        input_keys
+            .iter()
+            .any(|key| line == &format!("read_to {key}"))
+    });
+    for feature in features {
+        let key = manifest_key(&feature.generation);
+        assert!(log.iter().any(|line| line == &format!("read_to {key}")));
+        let manifest =
+            FeatureManifest::from_json(&fs::read(fixture.published().join(key)).unwrap()).unwrap();
+        let plan = manifest
+            .objects
+            .iter()
+            .find(|object| object.path == "plan.json")
+            .unwrap();
+        let plan_read = log
+            .iter()
+            .position(|line| line == &format!("read_to {}", plan.key))
+            .unwrap();
+        if let Some(first_input) = first_input {
+            assert!(
+                plan_read < first_input,
+                "feature verification preceded holdout streaming"
+            );
+        }
+        for object in &manifest.objects {
+            assert!(
+                !log.iter()
+                    .any(|line| line == &format!("put_new {}", object.key)),
+                "reused feature object {} was published again",
+                object.key
+            );
+        }
+    }
+
+    let input = &fixture.config.research.as_ref().unwrap().holdout.inputs[0];
+    let entry: binary_alpha_engine::config::FeatureInstrument =
+        serde_json::from_value(serde_json::json!({
+            "role": "holdout",
+            "input_manifest": input,
+            "profile_manifest": uri(&fixture.scratch.root, &run.instruments[0].profile),
+            "frozen_plan": uri(&fixture.scratch.root, &run.instruments[0].feature),
+        }))
+        .unwrap();
+    let mut ordinary = fixture.config.clone();
+    ordinary.features = Some(binary_alpha_engine::config::Features {
+        instruments: vec![entry],
+    });
+    let path = fixture.scratch.path("denied-holdout-feature-reuse.toml");
+    write(&path, ordinary.canonical_toml());
+    let error = cli(
+        &fixture.log(),
+        &["features", "build", "--config", path.to_str().unwrap()],
+    )
+    .unwrap_err();
+    assert!(
+        error.contains("holdout data is never a feature-build input"),
+        "{error}"
+    );
+    let denied = logged(&fixture.log());
+    assert!(!denied.iter().any(|line| line.contains("features/fits/")));
+    no_access(&denied, &fixture.protected());
+    for feature in features {
+        let manifest = fixture.manifest(&feature.generation);
+        for object in manifest["objects"].as_array().unwrap() {
+            let key = object["key"].as_str().unwrap();
+            assert!(!denied.iter().any(|line| line.contains(key)));
+        }
+    }
+}
+
+#[test]
 fn research_configuration_is_validated_before_any_read() {
     let fixture = Fixture::new("phase11_invalid");
     let original = fixture.config.clone();
