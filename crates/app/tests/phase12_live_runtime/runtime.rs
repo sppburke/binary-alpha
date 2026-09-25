@@ -432,7 +432,7 @@ fn command_and_mode_boundaries() {
             &c,
             "replay",
             &format!(
-                "storage.publication_uri: a `file://` destination is the non-live test boundary and requires run_mode `research`, not `{mode}`"
+                "storage.publication_uri: a `file://` destination requires run_mode `research`, not `{mode}`"
             ),
         );
     }

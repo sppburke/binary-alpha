@@ -1,8 +1,8 @@
 //! The narrow artifact-store interface: content-addressed objects beneath one root, created once
 //! and never rewritten.
 //!
-//! The filesystem implementation serves the retained historical-data folder and the non-live test
-//! boundary; the Google Cloud Storage implementation is the durable publication owner.
+//! The filesystem implementation serves the retained historical-data folder and research
+//! publication; the Google Cloud Storage implementation serves publication in every run mode.
 
 use std::fs::{self, File};
 use std::io::{self, Write};
