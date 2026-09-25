@@ -4220,8 +4220,8 @@ fn holdout_feature_reuse_requires_matching_certification_context() {
     assert_eq!(features.len(), 2);
 
     // A new physical copy retains the original completed synthetic evidence. With only its
-    // certification ready marker absent, the same grant enters assessment and reuses each
-    // previously verified holdout feature under its matching declaration.
+    // certification ready marker absent, the same grant enters assessment and either reuses
+    // each verified holdout feature or rebuilds it when the producer revision is ambiguous.
     comparison.restart("authorized-reuse", &comparison.reference);
     fs::remove_file(
         fixture
@@ -4255,6 +4255,8 @@ fn holdout_feature_reuse_requires_matching_certification_context() {
             .iter()
             .any(|key| line == &format!("read_to {key}"))
     });
+    let reusable_revision = !env!("BINARY_ALPHA_CODE_REVISION").ends_with("-dirty")
+        && env!("BINARY_ALPHA_CODE_REVISION") != "unavailable";
     for feature in features {
         let key = manifest_key(&feature.generation);
         assert!(log.iter().any(|line| line == &format!("read_to {key}")));
@@ -4276,10 +4278,12 @@ fn holdout_feature_reuse_requires_matching_certification_context() {
             );
         }
         for object in &manifest.objects {
-            assert!(
-                !log.iter()
-                    .any(|line| line == &format!("put_new {}", object.key)),
-                "reused feature object {} was published again",
+            let published_again = log
+                .iter()
+                .any(|line| line == &format!("put_new {}", object.key));
+            assert_eq!(
+                published_again, !reusable_revision,
+                "feature object {} reuse depended on producer revision",
                 object.key
             );
         }

@@ -467,6 +467,10 @@ fn fit_receipt_key(digest: &str) -> String {
     format!("features/fits/{digest}")
 }
 
+fn reusable_revision(revision: &str) -> bool {
+    revision != "unavailable" && !revision.ends_with("-dirty")
+}
+
 fn write_fit_receipt(
     local: &Store,
     destination: &Store,
@@ -537,17 +541,58 @@ fn reused_feature(manifest: FeatureManifest, plan: FeaturePlan, verified: String
     }
 }
 
-/// One cap is shared by outer stream work and its nested column work. A decoded fit column can
-/// hold millions of optional values; reserve 128 bytes per row for the input, each readiness
-/// flag, and fitting scratch, and at most a quarter of currently available memory for all
-/// simultaneous fit tasks. The fallback is conservative on systems without Linux MemAvailable.
+fn verify_frozen_before_revision(
+    destination: &Store,
+    key: &str,
+    bytes: &[u8],
+    manifest: &FeatureManifest,
+    revision: &str,
+) -> Result<Option<String>, String> {
+    let verified = verify_feature(&destination.uri(key), destination, key, bytes)
+        .map_err(immutable_conflict)?;
+    Ok((manifest.code_revision == revision).then_some(verified))
+}
+
+/// One cap is shared by outer stream work and its nested column work. Reserve at most a
+/// quarter of currently available memory for simultaneous tasks. The fallback is conservative
+/// on systems without Linux MemAvailable.
 struct FeatureParallelism {
     limit: usize,
     active: AtomicUsize,
 }
 
 impl FeatureParallelism {
-    fn new(max_fit_rows: u64, live_fit_columns: usize) -> Self {
+    fn for_fitting(max_fit_rows: u64, live_fit_columns: usize) -> Self {
+        // A fit holds whole decoded input and readiness columns plus fitting scratch.
+        Self::new(Self::fit_bytes(max_fit_rows, live_fit_columns))
+    }
+
+    fn for_encoding(max_columns: usize) -> Self {
+        // A stream holds one decoded row-group column per worker, all completed i16
+        // columns, and the writer's row-group values and flush buffers.
+        Self::new(Self::encoding_bytes(max_columns))
+    }
+
+    fn fit_bytes(max_fit_rows: u64, live_fit_columns: usize) -> u64 {
+        max_fit_rows
+            .saturating_mul(128)
+            .saturating_mul(live_fit_columns as u64)
+    }
+
+    fn encoding_bytes(max_columns: usize) -> u64 {
+        (TABLE_ROW_GROUP_ROWS as u64)
+            .saturating_mul(256)
+            .saturating_mul(max_columns as u64)
+    }
+
+    fn memory_limit(available: u64, cores: usize, bytes_per_task: u64) -> usize {
+        let memory = (available / 4 / bytes_per_task.max(1)).max(1);
+        cores
+            .min(usize::try_from(memory).unwrap_or(usize::MAX))
+            .max(1)
+    }
+
+    fn new(bytes_per_task: u64) -> Self {
         let cores = std::thread::available_parallelism().map_or(1, |count| count.get());
         let available = fs::read_to_string("/proc/meminfo")
             .ok()
@@ -562,14 +607,8 @@ impl FeatureParallelism {
                 })
             })
             .unwrap_or(1 << 30);
-        let decoded_column = max_fit_rows
-            .max(TABLE_ROW_GROUP_ROWS as u64)
-            .saturating_mul(128)
-            .saturating_mul(live_fit_columns as u64);
-        let memory_limit = (available / 4 / decoded_column.max(1)).max(1);
-        let limit = cores.min(usize::try_from(memory_limit).unwrap_or(usize::MAX));
         Self {
-            limit: limit.max(1),
+            limit: Self::memory_limit(available, cores, bytes_per_task),
             active: AtomicUsize::new(1),
         }
     }
@@ -592,11 +631,7 @@ impl FeatureParallelism {
         worker: impl Fn(&T) -> R + Sync,
     ) -> Vec<R> {
         // Leave slots for the row group's independent columns while streams overlap.
-        let streams = if self.limit == 2 {
-            1
-        } else {
-            self.limit.div_ceil(2)
-        };
+        let streams = self.limit.min(self.limit.div_ceil(2).max(2));
         self.map_limited(items, streams, worker)
     }
 
@@ -810,17 +845,22 @@ pub(crate) fn build(
     // target context before touching its receipt or any feature child object.
     access.permit(Some(bound.input.role), &bound.input.generation)?;
     let unfitted_identity = (frozen_from.is_none()).then(|| plan.unfitted().identity());
-    let request = unfitted_identity.as_ref().map(|identity| FitRequest {
-        code_revision: CODE_REVISION,
-        unfitted_plan_identity: identity,
-        input_generation: &bound.input.generation,
-        profile_generation: &bound.stream_manifest.generation,
-        role: bound.input.role,
-    });
+    let request = unfitted_identity
+        .as_ref()
+        .filter(|_| reusable_revision(CODE_REVISION))
+        .map(|identity| FitRequest {
+            code_revision: CODE_REVISION,
+            unfitted_plan_identity: identity,
+            input_generation: &bound.input.generation,
+            profile_generation: &bound.stream_manifest.generation,
+            role: bound.input.role,
+        });
     let receipt_key = request
         .as_ref()
         .map(|request| fit_receipt_key(&fit_request_digest(request)));
-    if let Some(frozen_from) = &frozen_from {
+    if let Some(frozen_from) = &frozen_from
+        && reusable_revision(CODE_REVISION)
+    {
         let generation = generation_of(&plan);
         let key = binary_alpha_engine::dataset::manifest_key(&generation);
         if destination.head(&key)?.is_some() {
@@ -837,9 +877,9 @@ pub(crate) fn build(
                     destination.uri(&key)
                 )));
             }
-            if manifest.code_revision == CODE_REVISION {
-                let verified = verify_feature(&destination.uri(&key), destination, &key, &bytes)
-                    .map_err(immutable_conflict)?;
+            if let Some(verified) =
+                verify_frozen_before_revision(destination, &key, &bytes, &manifest, CODE_REVISION)?
+            {
                 return Ok(reused_feature(manifest, plan, verified));
             }
         }
@@ -1004,7 +1044,7 @@ pub(crate) fn build(
         .max()
         .unwrap_or(0);
     // One fit keeps the input, its readiness flags, and fitting scratch live together.
-    let parallelism = FeatureParallelism::new(
+    let parallelism = FeatureParallelism::for_fitting(
         summaries
             .iter()
             .map(|stream| stream.rows)
@@ -1086,8 +1126,22 @@ pub(crate) fn build(
             )
         })
         .collect();
-    for result in parallelism.map_streams(&stream_jobs, |(stream, rows, path)| {
-        encode_stream(stream, rows, path, &plan, &plan_identity, &parallelism)
+    let encoding_parallelism = FeatureParallelism::for_encoding(
+        plan.streams
+            .iter()
+            .map(|stream| stream.encodings.len())
+            .max()
+            .unwrap_or(0),
+    );
+    for result in encoding_parallelism.map_streams(&stream_jobs, |(stream, rows, path)| {
+        encode_stream(
+            stream,
+            rows,
+            path,
+            &plan,
+            &plan_identity,
+            &encoding_parallelism,
+        )
     }) {
         result?;
     }
@@ -1373,8 +1427,126 @@ pub fn verify_feature(uri: &str, store: &Store, key: &str, bytes: &[u8]) -> Resu
 
 #[cfg(test)]
 mod tests {
-    use super::{FitReceipt, write_fit_receipt};
+    use super::{
+        FeatureParallelism, FitReceipt, reusable_revision, verify_frozen_before_revision,
+        write_fit_receipt,
+    };
     use crate::store::Store;
+    use binary_alpha_engine::dataset::GenerationManifest;
+    use binary_alpha_engine::features::FeatureManifest;
+
+    #[test]
+    fn reuse_requires_a_unique_producer_revision() {
+        assert!(reusable_revision("358940f"));
+        assert!(!reusable_revision("358940f-dirty"));
+        assert!(!reusable_revision("unavailable"));
+    }
+
+    #[test]
+    fn fitting_and_encoding_use_their_own_live_memory() {
+        let available = 1 << 30;
+        let fit = FeatureParallelism::fit_bytes(1_000_000, 3);
+        let encode = FeatureParallelism::encoding_bytes(4);
+        assert_eq!(FeatureParallelism::memory_limit(available, 8, fit), 1);
+        assert_eq!(FeatureParallelism::memory_limit(available, 8, encode), 8);
+        assert_eq!(FeatureParallelism::memory_limit(available, 2, encode), 2);
+        assert_eq!(FeatureParallelism::memory_limit(0, 8, encode), 1);
+        assert_eq!(FeatureParallelism::encoding_bytes(8), encode * 2);
+        let two = FeatureParallelism {
+            limit: 2,
+            active: std::sync::atomic::AtomicUsize::new(1),
+        };
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let receiver = std::sync::Mutex::new(receiver);
+        let concurrent = two.map_streams(&[0, 1], |stream| {
+            if *stream == 0 {
+                receiver
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(std::time::Duration::from_secs(5))
+                    .is_ok()
+            } else {
+                sender.send(()).unwrap();
+                true
+            }
+        });
+        assert_eq!(concurrent, [true, true]);
+    }
+
+    #[test]
+    fn different_revision_verifies_corrupt_frozen_object_before_input() {
+        let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/legacy_schema1/published");
+        let manifest_path = fixture.join(
+            "manifests/24409612301a6ee325fcdac35b37641c65cca1475a72f93b244f7df2efe79cc1/ready.json",
+        );
+        let bytes = std::fs::read(manifest_path).unwrap();
+        let manifest = FeatureManifest::from_json(&bytes).unwrap();
+        if let Some(root) = std::env::var_os("BINARY_ALPHA_TEST_FROZEN_ROOT") {
+            let store = Store::filesystem(root);
+            let error = verify_frozen_before_revision(
+                &store,
+                &manifest.key(),
+                &bytes,
+                &manifest,
+                "another-unique-revision",
+            )
+            .unwrap_err();
+            assert!(
+                error.contains("immutable feature generation conflict"),
+                "{error}"
+            );
+            return;
+        }
+        let input = GenerationManifest::from_json(
+            &std::fs::read(fixture.join(format!(
+                "manifests/{}/ready.json",
+                manifest.input_generation
+            )))
+            .unwrap(),
+        )
+        .unwrap();
+        let root = std::env::temp_dir().join(format!(
+            "binary-alpha-frozen-revision-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let plan = &manifest.objects[0];
+        let rows = &manifest.objects[1];
+        for (object, source) in [(plan, Some(fixture.join(&plan.key))), (rows, None)] {
+            let path = root.join(&object.key);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            if let Some(source) = source {
+                std::fs::copy(source, path).unwrap();
+            } else {
+                std::fs::write(path, b"corrupt row object").unwrap();
+            }
+        }
+        let log = root.join("access.log");
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "features::tests::different_revision_verifies_corrupt_frozen_object_before_input",
+            ])
+            .env("BINARY_ALPHA_TEST_FROZEN_ROOT", &root)
+            .env("BINARY_ALPHA_STORE_LOG", &log)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        let access = std::fs::read_to_string(log).unwrap();
+        assert!(access.contains(&format!("head {}", rows.key)), "{access}");
+        for object in &input.objects {
+            assert!(!access.contains(&format!("read_to {}", object.key)));
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn fit_receipt_accepts_identical_content_and_rejects_a_conflict() {
