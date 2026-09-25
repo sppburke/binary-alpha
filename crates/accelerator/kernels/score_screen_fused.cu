@@ -18,8 +18,10 @@ extern "C" __global__ void score_screen_fused(
     const int active_expiries,
     const int row_stride
 ) {
-    const int candidate = blockIdx.x * blockDim.x + threadIdx.x;
-    if (candidate >= candidate_count) return;
+    const long long candidate_linear =
+        (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (candidate_linear >= candidate_count) return;
+    const int candidate = (int)candidate_linear;
     const int begin = candidate_offsets[candidate];
     const int end = candidate_offsets[candidate + 1];
     const int driver = candidate_driver_key[candidate];

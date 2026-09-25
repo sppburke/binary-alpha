@@ -56,13 +56,11 @@ pub fn score_cpu_batches(
     batches: &[CpuBatch<'_>],
     split: usize,
     expiry_ms: i64,
-    payout_basis: i64,
 ) -> Result<Vec<(u64, RawCounts, RawCounts)>, String> {
     let scored = crate::parallel::map(batches, |batch| {
         if batch.global_indices.len() != batch.candidates.candidate_count as usize {
             return Err("CPU batch global index count differs from candidate count".to_string());
         }
-        let _ = payout_basis;
         let output = tuple
             .score_screen_batch(split, batch.candidates, batch.driver_keys, expiry_ms)?
             .output;
@@ -848,9 +846,17 @@ pub fn family(
             0
         }
     );
+    let gpu_report = [clock.tuning.as_str(), clock.memory.as_str()]
+        .into_iter()
+        .filter(|field| !field.is_empty())
+        .fold(String::new(), |mut report, field| {
+            report.push(' ');
+            report.push_str(field);
+            report
+        });
     let line = match put {
         Put::Reused(_) => format!(
-            "{report} columns {} blocks {} tuples {} list_entries {} construction_visits {} validation_visits {} driver_visits {} transfer_bytes {} peak_rss_kb {} {} {} (already published)",
+            "{report} columns {} blocks {} tuples {} list_entries {} construction_visits {} validation_visits {} driver_visits {} transfer_bytes {} peak_rss_kb {}{gpu_report} (already published)",
             clock.columns,
             clock.blocks,
             clock.tuples,
@@ -860,11 +866,9 @@ pub fn family(
             clock.driver_visits,
             clock.transfer_bytes,
             peak_rss_kb(),
-            clock.tuning,
-            clock.memory,
         ),
         Put::Created(_) => format!(
-            "{report} [load {:.3}s lowering {:.3}s setup_before_gpu {:.3}s device upload {:.3}s execute {:.3}s download {:.3}s bytes {} replay {:.3}s stability {:.3}s publish {:.3}s] columns {} blocks {} tuples {} list_entries {} construction_visits {} validation_visits {} driver_visits {} transfer_bytes {} peak_rss_kb {} {} {}",
+            "{report} [load {:.3}s lowering {:.3}s setup_before_gpu {:.3}s device upload {:.3}s execute {:.3}s download {:.3}s bytes {} replay {:.3}s stability {:.3}s publish {:.3}s] columns {} blocks {} tuples {} list_entries {} construction_visits {} validation_visits {} driver_visits {} transfer_bytes {} peak_rss_kb {}{gpu_report}",
             clock.load.as_secs_f64(),
             clock.lowering.as_secs_f64(),
             clock.setup_before_gpu.as_secs_f64(),
@@ -884,8 +888,6 @@ pub fn family(
             clock.driver_visits,
             clock.transfer_bytes,
             peak_rss_kb(),
-            clock.tuning,
-            clock.memory,
         ),
     };
     Ok(Searched {
@@ -2035,6 +2037,7 @@ fn score_streamed(
     let _ = device_ordinals;
     #[cfg(not(feature = "cuda"))]
     let measured_unit: Option<usize> = None;
+    #[cfg(feature = "cuda")]
     let budget_derived = budget;
     if let Some(forced) = forced_budget {
         budget = budget.min(forced);
@@ -2064,33 +2067,48 @@ fn score_streamed(
         }
     }
     let unit_hint = forced_unit.or(measured_unit);
-    clock.tuning = format!(
-        "screen_batch {}({}) screen_budget {}({}) reservation_unit {}({}) local_hint_bytes {}(derived)",
-        batch_size,
-        if forced_batch.is_some() {
-            "override"
-        } else {
-            "derived"
-        },
-        budget,
-        if forced_budget.is_some_and(|forced| forced < budget_derived) {
-            "override"
-        } else {
-            "derived"
-        },
-        unit_hint.map_or("none".to_string(), |n| n.to_string()),
-        if forced_unit.is_some() {
-            "override"
-        } else if measured_unit.is_some() {
-            "measured"
-        } else {
-            "unavailable"
-        },
-        local_hint_bytes
-    );
     #[cfg(feature = "cuda")]
-    for backend in backends {
+    if backends
+        .iter()
+        .any(|backend| matches!(backend, Backend::Cuda(_)))
+    {
+        clock.tuning = format!(
+            "screen_batch {}({}) screen_budget {}({}) reservation_unit {}({}) local_hint_bytes {}(derived)",
+            batch_size,
+            if forced_batch.is_some() {
+                "override"
+            } else {
+                "derived"
+            },
+            budget,
+            if forced_budget.is_some_and(|forced| forced < budget_derived) {
+                "override"
+            } else {
+                "derived"
+            },
+            unit_hint.map_or("none".to_string(), |n| n.to_string()),
+            if forced_unit.is_some() {
+                "override"
+            } else if measured_unit.is_some() {
+                "measured"
+            } else {
+                "unavailable"
+            },
+            local_hint_bytes
+        );
+    }
+    #[cfg(feature = "cuda")]
+    let mut reported_devices = BTreeSet::new();
+    #[cfg(feature = "cuda")]
+    for (position, backend) in backends.iter().enumerate() {
         if let Backend::Cuda(device) = backend {
+            let ordinal = *device_ordinals
+                .ok_or("CUDA screening has no device ordinals")?
+                .get(position)
+                .ok_or("CUDA screening device ordinal count differs from backends")?;
+            if !reported_devices.insert(ordinal) {
+                continue;
+            }
             let info = device.info();
             let (threads, source) = device.screening_threads()?;
             clock.tuning.push_str(&format!(
@@ -2245,9 +2263,8 @@ fn score_streamed(
                             if workspace.allocated_bytes() >= clock.memory_peak_bytes {
                                 clock.memory_peak_bytes = workspace.allocated_bytes();
                                 clock.memory = format!(
-                                    "screen_preallocated {} screen_batch {} screen_free_before {} screen_free_prelaunch {} screen_free_after {} pool_before {:?} pool_prelaunch {:?} pool_after {:?}",
+                                    "screen_preallocated {} screen_free_before {} screen_free_prelaunch {} screen_free_after {} pool_before {:?} pool_prelaunch {:?} pool_after {:?}",
                                     workspace.allocated_bytes(),
-                                    batch_size,
                                     workspace.free_before,
                                     workspace.free_prelaunch,
                                     workspace.free_after,
@@ -2318,7 +2335,7 @@ fn score_streamed(
                                         })
                                         .collect();
                                     let scored =
-                                        score_cpu_batches(workspace, &batches, 0, duration, 0)?;
+                                        score_cpu_batches(workspace, &batches, 0, duration)?;
                                     apply(scored, &mut records);
                                     Ok(())
                                 },
@@ -3342,9 +3359,17 @@ mod projection_tests {
         let rows = 4_440_960;
         let slots = condition_slots(1_000, 1);
         assert_eq!(slots, 1);
-        let plan =
-            kernels::plan_column_blocks(&[rows], rows, slots, 1_024, 1, 1, 8_151 * 1024 * 1024)
-                .unwrap();
+        let shape = kernels::ScreenShape {
+            rows,
+            slots,
+            batch: 1_024,
+            tile_strides: vec![16],
+            largest_tile: 1,
+            local_hint_bytes: 0,
+        };
+        let budget = 8_151 * 1024 * 1024;
+        assert!(shape.exact_bytes(1, rows).unwrap() <= budget);
+        let plan = kernels::plan_screen_blocks(&[rows], &shape, budget, None, 1).unwrap();
         assert_eq!(plan.blocks.len(), 1);
         assert_eq!(plan.blocks[0].columns, 0..1);
     }
@@ -3456,11 +3481,11 @@ mod projection_tests {
                 driver_keys: &drivers,
             },
         ];
-        let scored = score_cpu_batches(&tuple, &batches, 0, 1, 92).unwrap();
+        let scored = score_cpu_batches(&tuple, &batches, 0, 1).unwrap();
         assert_eq!(scored.iter().map(|item| item.0).collect::<Vec<_>>(), [2, 7]);
         assert_eq!(scored[0].1, scored[1].1);
         assert!(
-            score_cpu_batches(&tuple, &[batches[0], batches[0]], 0, 1, 92)
+            score_cpu_batches(&tuple, &[batches[0], batches[0]], 0, 1)
                 .unwrap_err()
                 .contains("repeat")
         );

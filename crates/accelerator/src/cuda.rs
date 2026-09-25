@@ -306,8 +306,14 @@ impl Device {
         } else {
             self.function_capacity[function].derived_threads
         };
+        let count = u64::try_from(count).map_err(|_| "CUDA launch count is negative")?;
+        let blocks = count.div_ceil(u64::from(threads));
+        let grid_x = u32::try_from(blocks).map_err(|_| "CUDA launch grid exceeds u32")?;
+        blocks
+            .checked_mul(u64::from(threads))
+            .ok_or("CUDA launch padded lane count overflows u64")?;
         Ok(LaunchConfig {
-            grid_dim: ((count as u32).div_ceil(threads), 1, 1),
+            grid_dim: (grid_x, 1, 1),
             block_dim: (threads, 1, 1),
             shared_mem_bytes: 0,
         })
@@ -390,55 +396,6 @@ impl Device {
             (after_unit == after_one && after_plus == after_one.saturating_add(unit))
                 .then_some(unit),
         )
-    }
-
-    /// Establish the sparse dual kernel's device-local stack reservation before planning.
-    /// The planner then measures the free memory of this same physical device and context.
-    pub fn search_planning_free_bytes(&self, batch_capacity: usize) -> Result<usize, String> {
-        let count = i32::try_from(batch_capacity)
-            .map_err(|_| "search planning: batch capacity exceeds i32")?;
-        if count == 0 {
-            return Err("search planning: batch capacity is zero".into());
-        }
-        let features = vec![0_i32; batch_capacity];
-        let buckets = vec![0_i16; batch_capacity];
-        let offsets: Vec<i32> = (0..=count).collect();
-        let drivers = vec![0_i32; batch_capacity];
-        let request = Request {
-            kind: 6,
-            buffers: SearchBuffers {
-                feature_codes: &[0],
-                feature_count: 1,
-                row_count: 1,
-                ordered_rows: &[0],
-                decision_time_ms: &[1],
-                release_time_ms: &[2],
-                settlement_time_ms: &[2],
-                valid: &[1],
-                buy_win: &[1],
-                sell_win: &[0],
-                tie: &[0],
-            },
-            split_mask: &[1],
-            candidates: CandidateConditions {
-                condition_feature: &features,
-                condition_bucket: &buckets,
-                candidate_offsets: &offsets,
-                candidate_count: count,
-            },
-            sparse: Some(SparseIndex {
-                candidate_driver_key: &drivers,
-                key_chrono_offsets: &[0, 1],
-                key_chrono_rows: &[0],
-            }),
-            expiry_ms: 0,
-            direction_code: 1,
-            payout_basis: 0,
-        };
-        request.validate()?;
-        self.score(request)?;
-        self.sync("search planning", "release")?;
-        Ok(self.memory_info()?.0)
     }
 
     fn sync(&self, kernel: &str, phase: &str) -> Result<(), String> {

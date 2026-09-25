@@ -24,7 +24,7 @@ pub struct ColumnBlock {
     pub columns: Range<usize>,
 }
 
-/// Conservative peak device allocation for a tuple and its concurrent batches.
+/// Column blocks selected for screening.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ColumnBlockPlan {
     pub blocks: Vec<ColumnBlock>,
@@ -95,6 +95,9 @@ pub fn plan_screen_blocks(
     unit_hint: Option<usize>,
     max_width: usize,
 ) -> Result<ColumnBlockPlan, String> {
+    // The estimate is only a width hint. Validate the fixed shape now; exact
+    // tuple bytes are checked after the scoped index is built.
+    shape.exact_bytes(0, 0)?;
     let mut blocks = Vec::new();
     let mut start = 0;
     let mut list_len = 0usize;
@@ -113,130 +116,13 @@ pub fn plan_screen_blocks(
                 .map_or(bytes, |unit| bytes.div_ceil(unit).saturating_mul(unit))
                 .saturating_add(shape.local_hint_bytes)
         });
-        if columns <= max_width
-            && logical.is_some_and(|bytes| bytes <= budget)
-            && (columns == 1 || hinted.is_some_and(|bytes| bytes <= budget))
+        if columns == 1
+            || (columns <= max_width
+                && logical.is_some_and(|bytes| bytes <= budget)
+                && hinted.is_some_and(|bytes| bytes <= budget))
         {
             list_len = next.expect("checked");
             continue;
-        }
-        if start == index {
-            return Err(format!(
-                "screen blocks: one-column block {index} needs {} logical bytes, free budget {budget}",
-                shape.logical_bytes(1, length)?
-            ));
-        }
-        blocks.push(ColumnBlock {
-            columns: start..index,
-        });
-        start = index;
-        list_len = length;
-        let one = shape.logical_bytes(1, length)?;
-        if one > budget {
-            return Err(format!(
-                "screen blocks: one-column block {index} needs {one} logical bytes, free budget {budget}"
-            ));
-        }
-    }
-    if start < row_list_lengths.len() {
-        blocks.push(ColumnBlock {
-            columns: start..row_list_lengths.len(),
-        });
-    }
-    Ok(ColumnBlockPlan { blocks })
-}
-
-/// Greedily packs columns under a device's reported free-byte budget. `row_list_lengths` gives
-/// one chronological sparse list per column; the caller may pass a smaller budget in tests.
-pub fn plan_column_blocks(
-    row_list_lengths: &[usize],
-    row_count: usize,
-    max_conditions: usize,
-    batch_capacity: usize,
-    workers: usize,
-    split_masks: usize,
-    budget_bytes: usize,
-) -> Result<ColumnBlockPlan, String> {
-    plan_column_blocks_with_granularity(
-        row_list_lengths,
-        row_count,
-        max_conditions,
-        batch_capacity,
-        workers,
-        split_masks,
-        (budget_bytes, 1),
-    )
-}
-
-/// Plans against the allocator pool's physical reservation unit rather than only
-/// requested buffer lengths. A unit of one retains the logical-byte model.
-pub fn plan_column_blocks_with_granularity(
-    row_list_lengths: &[usize],
-    row_count: usize,
-    max_conditions: usize,
-    batch_capacity: usize,
-    workers: usize,
-    split_masks: usize,
-    budget_and_granularity: (usize, usize),
-) -> Result<ColumnBlockPlan, String> {
-    let (budget_bytes, granularity) = budget_and_granularity;
-    if row_count > i32::MAX as usize
-        || max_conditions == 0
-        || batch_capacity == 0
-        || workers == 0
-        || split_masks == 0
-        || batch_capacity > i32::MAX as usize
-        || batch_capacity
-            .checked_mul(max_conditions)
-            .is_none_or(|n| n > i32::MAX as usize)
-        || granularity == 0
-    {
-        return Err("column blocks: invalid row, condition, batch, worker, or split bound".into());
-    }
-    let rows = row_count as u128;
-    let slots = max_conditions as u128;
-    let unit = granularity as u128;
-    // Ordered rows, three time arrays, four flags, and the resident split masks.
-    let resident_row_bytes = rows * (36 + split_masks as u128);
-    // Feature IDs, bucket codes, candidate offsets, sparse driver IDs, and two full 21-i64 outputs.
-    let batch_bytes = batch_capacity as u128 * (slots * 6 + 4 + 4 + 2 * 21 * 8) + 4;
-    let concurrent_batch_bytes = batch_bytes * workers as u128;
-    let budget = budget_bytes as u128;
-    let fits = |columns: usize, list_len: usize| -> bool {
-        if columns > i32::MAX as usize
-            || columns
-                .checked_mul(max_conditions)
-                .is_none_or(|n| n > i32::MAX as usize)
-            || list_len > i32::MAX as usize
-            || list_len
-                .checked_mul(max_conditions)
-                .is_none_or(|n| n > i32::MAX as usize)
-        {
-            return false;
-        }
-        let feature_bytes = slots * columns as u128 * rows * 2;
-        let sparse_bytes = 4 * (slots * columns as u128 + 1 + slots * list_len as u128);
-        let requested = resident_row_bytes + concurrent_batch_bytes + feature_bytes + sparse_bytes;
-        requested.div_ceil(unit) * unit <= budget
-    };
-    let mut blocks = Vec::new();
-    let mut start = 0;
-    let mut list_len = 0_usize;
-    for (index, &length) in row_list_lengths.iter().enumerate() {
-        if length > i32::MAX as usize {
-            return Err(format!(
-                "column blocks: column {index} sparse row list exceeds i32"
-            ));
-        }
-        let next_len = list_len.checked_add(length);
-        if next_len.is_some_and(|n| fits(index + 1 - start, n)) {
-            list_len = next_len.expect("checked");
-            continue;
-        }
-        if start == index || !fits(1, length) {
-            return Err(format!(
-                "column blocks: column {index} cannot fit one-column block in device budget or i32 sparse bounds"
-            ));
         }
         blocks.push(ColumnBlock {
             columns: start..index,

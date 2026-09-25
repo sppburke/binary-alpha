@@ -133,7 +133,7 @@ fn main() {
         String::from_utf8_lossy(&result.stderr)
     );
     let metadata = format!(
-        "{{\n  \"compiler_path\": {},\n  \"compiler_version\": {},\n  \"host_compiler_path\": {},\n  \"host_compiler_version\": {},\n  \"host_compiler_explicit\": {},\n  \"flags\": [{}],\n  \"architecture\": {},\n  \"architecture_source\": {},\n  \"BINARY_ALPHA_CUDA_ARCH\": {},\n  \"source_order\": [{}]\n}}\n",
+        "{{\n  \"compiler_path\": {},\n  \"compiler_version\": {},\n  \"host_compiler_path\": {},\n  \"host_compiler_version\": {},\n  \"host_compiler_explicit\": {},\n  \"flags\": [{}],\n  \"architecture\": {},\n  \"architecture_source\": {},\n  \"source_order\": [{}]\n}}\n",
         quote(&compiler.display().to_string()),
         quote(&version),
         quote(&host_compiler.display().to_string()),
@@ -146,7 +146,6 @@ fn main() {
             .join(", "),
         quote(&architecture),
         quote(architecture_source),
-        quote(&architecture),
         sources
             .iter()
             .map(|symbol| quote(symbol))

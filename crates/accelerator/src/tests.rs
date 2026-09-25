@@ -34,10 +34,13 @@ fn screen_logical_budget_and_allocator_hints_are_separate() {
         local_hint_bytes: 0,
     };
     let required = shape.logical_bytes(1, 2).unwrap();
-    assert!(
+    assert_eq!(shape.exact_bytes(1, 2).unwrap(), 261);
+    assert_eq!(
         plan_screen_blocks(&[2], &shape, required - 1, None, 1)
-            .unwrap_err()
-            .contains("one-column")
+            .unwrap()
+            .blocks[0]
+            .columns,
+        0..1
     );
     for hint in [None, Some(64), Some(4096)] {
         let plan = plan_screen_blocks(&[2], &shape, required, hint, 1).unwrap();
@@ -56,51 +59,47 @@ fn screen_logical_budget_and_allocator_hints_are_separate() {
 }
 
 #[test]
-fn column_blocks_bound_memory_and_sparse_indices() {
-    let plan = plan_column_blocks(&[4; 6], 4, 2, 1, 1, 1, 600).unwrap();
+fn screen_one_column_estimate_cannot_reject_exact_tuple() {
+    let shape = ScreenShape {
+        rows: 3,
+        slots: 2,
+        batch: 4,
+        tile_strides: vec![16],
+        largest_tile: 1,
+        local_hint_bytes: 0,
+    };
+    assert_eq!(shape.logical_bytes(1, 2).unwrap(), 279);
+    assert_eq!(shape.exact_bytes(2, 2).unwrap(), 271);
+    let plan = plan_screen_blocks(&[2, 0], &shape, 271, None, 2).unwrap();
+    assert!(blocks_cover_columns(&plan.blocks, 2));
+    for block in &plan.blocks {
+        let lists = usize::from(block.columns.contains(&0)) * 2;
+        assert!(shape.exact_bytes(block.columns.len(), lists).unwrap() <= 271);
+    }
+}
+
+#[test]
+fn screen_blocks_bound_sparse_indices_and_cover_columns() {
+    let shape = ScreenShape {
+        rows: 1,
+        slots: 1,
+        batch: 1,
+        tile_strides: vec![16],
+        largest_tile: 1,
+        local_hint_bytes: 0,
+    };
+    let plan =
+        plan_screen_blocks(&[4; 6], &shape, shape.logical_bytes(1, 4).unwrap(), None, 6).unwrap();
     assert!(plan.blocks.len() >= 3, "forced small budget: {plan:?}");
     assert!(blocks_cover_columns(&plan.blocks, 6));
     assert!(
-        plan_column_blocks(&[4], 4, 2, 1, 1, 1, 1)
-            .unwrap_err()
-            .contains("one-column")
-    );
-    assert!(
-        plan_column_blocks(&[i32::MAX as usize + 1], 4, 1, 1, 1, 1, usize::MAX)
+        plan_screen_blocks(&[i32::MAX as usize + 1], &shape, usize::MAX, None, 1)
             .unwrap_err()
             .contains("exceeds i32")
     );
-    assert!(
-        plan_column_blocks(&[i32::MAX as usize], 4, 2, 1, 1, 1, usize::MAX)
-            .unwrap_err()
-            .contains("i32 sparse bounds")
-    );
-}
-
-#[test]
-fn column_blocks_count_physical_pool_reservation() {
-    // One row, one column, and one batch request 405 bytes in total.
-    let unit = 32 * 1024 * 1024;
-    let required = unit;
-    let plan = plan_column_blocks_with_granularity(&[1], 1, 1, 1, 1, 1, (required, unit)).unwrap();
-    assert_eq!(plan.blocks[0].columns, 0..1);
-    assert!(
-        plan_column_blocks_with_granularity(&[1], 1, 1, 1, 1, 1, (required - 1, unit))
-            .unwrap_err()
-            .contains("one-column")
-    );
-}
-
-#[test]
-fn column_blocks_split_before_sparse_key_count_exceeds_i32() {
-    let plan = plan_column_blocks(&[0; 32_768], 1, 65_536, 1, 1, 1, 14_000_000_000).unwrap();
-    assert!(plan.blocks.len() > 1);
-    assert!(blocks_cover_columns(&plan.blocks, 32_768));
-    assert!(
-        plan.blocks
-            .iter()
-            .all(|block| block.columns.len() * 65_536 <= i32::MAX as usize)
-    );
+    let plan = plan_screen_blocks(&[i32::MAX as usize, 1], &shape, usize::MAX, None, 2).unwrap();
+    assert_eq!(plan.blocks.len(), 2);
+    assert!(blocks_cover_columns(&plan.blocks, 2));
 }
 
 #[test]
@@ -118,8 +117,6 @@ fn column_block_coverage_detects_skipped_column() {
 
 #[test]
 fn sparse_tuple_rejects_ordered_rows_beyond_planned_residency() {
-    let plan = plan_column_blocks(&[1], 1, 1, 1, 1, 1, 405).unwrap();
-    assert_eq!(plan.blocks[0].columns, 0..1);
     let ordered_rows = [0; 1_000];
     let request = crate::search::Request {
         kind: 6,
@@ -159,7 +156,22 @@ fn sparse_tuple_rejects_ordered_rows_beyond_planned_residency() {
 fn cpu_resident_sparse_batches_match_one_shot_across_forced_blocks_and_expiries() {
     let case = &search_cases()[0];
     let rows = case.entry.len();
-    let plan = plan_column_blocks(&[rows; 6], rows, 2, 1, 1, 1, 600).unwrap();
+    let shape = ScreenShape {
+        rows,
+        slots: 2,
+        batch: 1,
+        tile_strides: vec![16],
+        largest_tile: 1,
+        local_hint_bytes: 0,
+    };
+    let plan = plan_screen_blocks(
+        &[rows; 6],
+        &shape,
+        shape.logical_bytes(1, rows).unwrap(),
+        None,
+        6,
+    )
+    .unwrap();
     assert!(plan.blocks.len() >= 3);
     assert!(blocks_cover_columns(&plan.blocks, 6));
     let ordered: Vec<i64> = (0..rows as i64).collect();
@@ -272,10 +284,10 @@ fn fused_screen_matches_basic_and_full_sparse_references() {
         value ^ (value >> 31)
     }
     let device = crate::cuda::Device::open(0).unwrap();
-    assert_eq!(
-        device.screening_function().local_bytes,
-        0,
-        "fused scorer must not spill to local memory"
+    assert!(
+        device.screening_local_hint_bytes().unwrap()
+            >= device.screening_function().local_bytes as usize,
+        "reported local memory must be included in the planning hint"
     );
     for seed in [0_u64, 17, 0x53c0_12ab, 0xa5a5_a5a5] {
         let rows = 20usize + (seed as usize % 3) * 4;
@@ -492,14 +504,6 @@ fn cuda_resident_tuple_matches_cpu_reference() {
     };
     let case = &search_cases()[0];
     let rows = case.entry.len();
-    assert!(
-        !device
-            .memory_info()
-            .and_then(|(free, _)| plan_column_blocks(&[rows], rows, 1, 1, 1, 1, free))
-            .unwrap()
-            .blocks
-            .is_empty()
-    );
     let codes = vec![0_i16; rows];
     let ordered: Vec<i64> = (0..rows as i64).collect();
     let sparse_rows: Vec<i32> = (0..rows as i32).collect();

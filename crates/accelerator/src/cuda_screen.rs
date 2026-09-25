@@ -172,13 +172,15 @@ impl Device {
         // avoid a potentially huge sparse walk while exercising the full grid.
         let probe_features = vec![0_i32; capacity];
         let probe_buckets = vec![0_i16; capacity];
-        let probe_offsets: Vec<i32> = (0..=capacity as i32).collect();
+        let probe_count = i32::try_from(capacity)
+            .map_err(|_| "score_screen_fused: probe capacity exceeds i32")?;
+        let probe_offsets: Vec<i32> = (0..=probe_count).collect();
         let probe_drivers = vec![-1_i32; capacity];
         let probe = CandidateConditions {
             condition_feature: &probe_features,
             condition_bucket: &probe_buckets,
             candidate_offsets: &probe_offsets,
-            candidate_count: capacity as i32,
+            candidate_count: probe_count,
         };
         result.score_batch(probe, &probe_drivers, 0)?;
         self.sync(k, "first launch")?;

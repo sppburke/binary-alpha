@@ -1371,6 +1371,28 @@ fn wide_search_batches_blocks_and_devices_have_exact_parity() {
                 let digest: Value =
                     serde_json::from_slice(&fs::read(digest_path).unwrap()).unwrap();
                 let first = report.lines().next().unwrap();
+                let field_count = |name: &str| {
+                    first
+                        .split_whitespace()
+                        .filter(|field| field.starts_with(name))
+                        .count()
+                };
+                for name in [
+                    "screen_batch",
+                    "screen_budget",
+                    "reservation_unit",
+                    "local_hint_bytes",
+                    "device=",
+                    "sm_",
+                    "build_target=",
+                    "screen_threads=",
+                ] {
+                    assert_eq!(
+                        field_count(name),
+                        usize::from(device != "cpu"),
+                        "{label}: {name}: {first}"
+                    );
+                }
                 let counter = |name: &str| -> u64 {
                     let words: Vec<_> = first.split_whitespace().collect();
                     words.windows(2).find(|pair| pair[0] == name).unwrap()[1]
@@ -1483,10 +1505,19 @@ fn screening_overrides_leave_family_identity_and_bytes_unchanged() {
             "{name} was not named"
         );
     }
-    let one_byte = run(Some(("BINARY_ALPHA_SCREEN_MEMORY_BUDGET_BYTES", "1")));
+    let run_exact_budget = |budget: &str| {
+        Command::new(env!("CARGO_BIN_EXE_binary-alpha"))
+            .args(["search", "--config", path.to_str().unwrap()])
+            .env("BINARY_ALPHA_SCREEN_BATCH_SIZE", "1")
+            .env("BINARY_ALPHA_SCREEN_MEMORY_BUDGET_BYTES", budget)
+            .output()
+            .unwrap()
+    };
+    let one_byte = run_exact_budget("1");
+    assert!(!one_byte.status.success());
     let error = String::from_utf8_lossy(&one_byte.stderr);
     let required: usize = error
-        .split(" needs ")
+        .split("screen tuple budget exceeded: planned ")
         .nth(1)
         .unwrap()
         .split_whitespace()
@@ -1495,12 +1526,11 @@ fn screening_overrides_leave_family_identity_and_bytes_unchanged() {
         .parse()
         .unwrap();
     let below = (required - 1).to_string();
-    let output = run(Some(("BINARY_ALPHA_SCREEN_MEMORY_BUDGET_BYTES", &below)));
+    let output = run_exact_budget(&below);
     assert!(!output.status.success());
-    assert!(
-        String::from_utf8_lossy(&output.stderr)
-            .contains(&format!("needs {required} logical bytes"))
-    );
+    assert!(String::from_utf8_lossy(&output.stderr).contains(&format!(
+        "planned {required} logical bytes, free budget {below}"
+    )));
 }
 
 /// Manual release gate: the object contains only retained records while the manifest binds
