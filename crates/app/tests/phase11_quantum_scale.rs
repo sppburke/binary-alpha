@@ -30,7 +30,7 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 const RESOURCES: &[u8] = include_bytes!("../../../configs/study_p_resources.toml");
-const RESOURCES_SHA256: &str = "4133a4379876ea6841fda537186063c29a181a4a885550c81c61da08d2ca0bd8";
+const RESOURCES_SHA256: &str = "503bae0039ecb0d94d03dc4ec8d113f532996fe9b98260fdbeb39f30367b4572";
 const DAYS: i64 = 493;
 const BARS_PER_DAY: usize = 17_280;
 const OPERATOR: &str = "synthetic-quantum-operator";
@@ -80,6 +80,35 @@ fn swap_used_kb() -> u64 {
             .unwrap()
     };
     at("SwapTotal:") - at("SwapFree:")
+}
+
+/// Swap held by `root` and its descendants; a process that exits mid-sample has released its memory.
+fn process_tree_swap_kb(root: u32) -> u64 {
+    let mut pending = vec![root];
+    let mut total = 0;
+    while let Some(pid) = pending.pop() {
+        let Ok(status) = fs::read_to_string(format!("/proc/{pid}/status")) else {
+            continue;
+        };
+        total += status
+            .lines()
+            .find_map(|line| line.strip_prefix("VmSwap:"))
+            .and_then(|kb| kb.split_whitespace().next()?.parse::<u64>().ok())
+            .unwrap_or(0);
+        let Ok(tasks) = fs::read_dir(format!("/proc/{pid}/task")) else {
+            continue;
+        };
+        for task in tasks.flatten() {
+            if let Ok(children) = fs::read_to_string(task.path().join("children")) {
+                pending.extend(
+                    children
+                        .split_whitespace()
+                        .filter_map(|pid| pid.parse::<u32>().ok()),
+                );
+            }
+        }
+    }
+    total
 }
 
 fn gpu_memory() -> (u64, u64) {
@@ -218,12 +247,16 @@ fn quantum_study_p_combined_scale() {
     );
     let sampling = Arc::new(AtomicBool::new(true));
     let peak_vram = Arc::new(AtomicU64::new(vram_before));
-    let peak_swap = Arc::new(AtomicU64::new(swap_before));
+    let peak_host_swap = Arc::new(AtomicU64::new(swap_before));
+    let peak_process_swap = Arc::new(AtomicU64::new(process_tree_swap_kb(std::process::id())));
     let sample_flag = Arc::clone(&sampling);
     let sample_peak = Arc::clone(&peak_vram);
-    let sample_swap = Arc::clone(&peak_swap);
+    let sample_host_swap = Arc::clone(&peak_host_swap);
+    let sample_process_swap = Arc::clone(&peak_process_swap);
     let sampler = std::thread::spawn(move || {
         while sample_flag.load(Ordering::Relaxed) {
+            sample_process_swap
+                .fetch_max(process_tree_swap_kb(std::process::id()), Ordering::Relaxed);
             if let Ok(output) = Command::new("nvidia-smi")
                 .args(["--query-gpu=memory.used", "--format=csv,noheader,nounits"])
                 .output()
@@ -232,7 +265,7 @@ fn quantum_study_p_combined_scale() {
             {
                 sample_peak.fetch_max(mib, Ordering::Relaxed);
             }
-            sample_swap.fetch_max(swap_used_kb(), Ordering::Relaxed);
+            sample_host_swap.fetch_max(swap_used_kb(), Ordering::Relaxed);
             std::thread::sleep(Duration::from_secs(1));
         }
     });
@@ -760,7 +793,7 @@ fn quantum_study_p_combined_scale() {
     assert!(verify.contains("verified search generation"));
     println!(
         "combined CUDA screen digest {}",
-        fs::read_to_string(cuda_digest).unwrap()
+        fs::read_to_string(&cuda_digest).unwrap()
     );
     let run_started = Instant::now();
     let run_report = cli(
@@ -769,6 +802,15 @@ fn quantum_study_p_combined_scale() {
     )
     .unwrap();
     stage("generated_portfolio_folds_outer", run_started, &run_report);
+    let development_line = run_report
+        .lines()
+        .find(|line| line.starts_with("features ") && line.contains(" development generation "))
+        .expect("research development feature report");
+    assert_eq!(common::generation(development_line), feature_generation);
+    assert!(
+        development_line.ends_with(" (already published)"),
+        "research development did not reuse standalone features: {development_line}"
+    );
     let run_generation = research::run_generation_id(
         &config.content_hash(),
         binary_alpha_app::import::CODE_REVISION,
@@ -780,6 +822,9 @@ fn quantum_study_p_combined_scale() {
     let selection =
         Selection::from_json(&object(&published, &run.selection, "selection.json")).unwrap();
     assert!(selection.folds.len() as u64 >= number(&resources, &["minimum", "folds"]));
+    assert_eq!(run.instruments[0].feature, feature_generation);
+    assert_eq!(selection.refit.len(), 1);
+    assert_eq!(selection.refit[0].generation, feature_generation);
     let chosen = &selection.choices[selection.selected.unwrap()];
     check_role(
         &published,
@@ -912,28 +957,55 @@ fn quantum_study_p_combined_scale() {
         &certification_features.into_iter().collect::<Vec<_>>(),
         certificate.scenarios.len(),
     );
+    let elapsed = started.elapsed().as_secs_f64();
+    assert!(
+        elapsed <= number(&resources, &["gate", "max_elapsed_seconds"]) as f64,
+        "combined gate took {elapsed:.3}s"
+    );
+    let cpu_digest = scratch.path("combined-cpu-screen.json");
+    let cpu_started = Instant::now();
+    let cpu_output = Command::new(env!("CARGO_BIN_EXE_binary-alpha"))
+        .args([
+            "data",
+            "verify",
+            "--manifest",
+            &manifest_uri(&published, &generation),
+        ])
+        .env("BINARY_ALPHA_TEST_SCREEN_DIGEST", &cpu_digest)
+        .output()
+        .unwrap();
+    assert!(
+        cpu_output.status.success(),
+        "CPU verify failed after {:.3}s: {}",
+        cpu_started.elapsed().as_secs_f64(),
+        String::from_utf8_lossy(&cpu_output.stderr)
+    );
+    let cpu_report = String::from_utf8(cpu_output.stdout).unwrap();
+    stage("independent_family_verify_cpu", cpu_started, &cpu_report);
+    assert!(cpu_report.contains("verified search generation"));
+    assert_eq!(
+        fs::read(&cpu_digest).unwrap(),
+        fs::read(&cuda_digest).unwrap()
+    );
     sampling.store(false, Ordering::Relaxed);
     sampler.join().unwrap();
-    let swap_growth = peak_swap
+    let host_swap_growth = peak_host_swap
         .load(Ordering::Relaxed)
         .saturating_sub(swap_before);
-    let elapsed = started.elapsed().as_secs_f64();
+    let process_swap = peak_process_swap.load(Ordering::Relaxed);
     println!(
-        "combined total {:.3}s rows {rows} conditions {} members {} survivors {} peak_rss_kb {} peak_vram_mib {} swap_growth_kb {}",
+        "combined total {:.3}s rows {rows} conditions {} members {} survivors {} peak_rss_kb {} peak_vram_mib {} peak_process_swap_kb {} host_swap_growth_kb {}",
         elapsed,
         family.resolved_conditions.as_ref().unwrap().len(),
         family_manifest.members,
         family.members.len(),
         counter(first, "peak_rss_kb"),
         peak_vram.load(Ordering::Relaxed),
-        swap_growth
+        process_swap,
+        host_swap_growth
     );
     assert!(
-        swap_growth <= number(&resources, &["gate", "max_swap_growth_kb"]),
-        "swap grew by {swap_growth} KiB"
-    );
-    assert!(
-        elapsed <= number(&resources, &["gate", "max_elapsed_seconds"]) as f64,
-        "combined gate took {elapsed:.3}s"
+        process_swap <= number(&resources, &["gate", "max_process_swap_kb"]),
+        "gate processes used {process_swap} KiB of swap"
     );
 }

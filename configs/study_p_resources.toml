@@ -2,7 +2,7 @@
 # All windows are whole UTC days, with five-second bars and end-exclusive role cuts.
 [gate]
 max_elapsed_seconds = 14400
-max_swap_growth_kb = 0
+max_process_swap_kb = 0
 base_bar_seconds = 5
 streams_seconds = [5, 15, 30, 60, 300, 900, 3600]
 # The measured synthetic plan generated rules on 5 s and 15 s while features built all seven streams.

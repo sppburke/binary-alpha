@@ -370,7 +370,7 @@ fn tuple_batches(
 }
 
 /// Process-scoped screening tuning, outside every configuration identity.
-fn test_screen_limit(name: &str) -> Result<Option<usize>, String> {
+fn screen_override(name: &str) -> Result<Option<usize>, String> {
     std::env::var_os(name)
         .map(|value| {
             value
@@ -1985,13 +1985,10 @@ fn score_streamed(
     #[cfg(feature = "cuda")]
     let packed = packed_tiles(&outcome_rows, rows)?;
     let slots = condition_slots(settings.max_conditions, conditions.len());
-    let forced_budget = test_screen_limit("BINARY_ALPHA_SCREEN_MEMORY_BUDGET_BYTES")?;
-    let forced_unit = test_screen_limit("BINARY_ALPHA_CUDA_RESERVATION_UNIT_BYTES")?;
-    let forced_batch = test_screen_limit("BINARY_ALPHA_SCREEN_BATCH_SIZE")?;
-    let _forced_threads = test_screen_limit("BINARY_ALPHA_SCREEN_THREADS_PER_BLOCK")?;
-    #[cfg(feature = "cuda")]
-    let mut budget = usize::MAX;
-    #[cfg(not(feature = "cuda"))]
+    let forced_budget = screen_override("BINARY_ALPHA_SCREEN_MEMORY_BUDGET_BYTES")?;
+    let forced_unit = screen_override("BINARY_ALPHA_CUDA_RESERVATION_UNIT_BYTES")?;
+    let forced_batch = screen_override("BINARY_ALPHA_SCREEN_BATCH_SIZE")?;
+    let _forced_threads = screen_override("BINARY_ALPHA_SCREEN_THREADS_PER_BLOCK")?;
     let mut budget = usize::MAX;
     #[cfg(feature = "cuda")]
     let mut derived_batch = if backends
