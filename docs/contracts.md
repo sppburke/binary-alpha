@@ -63,8 +63,9 @@ at one time; the system never keeps a global remembered payout.
 
 ## Artifacts
 
-Artifacts are immutable and identified by content. Google Cloud Storage owns bulk data and
-artifacts; Supabase stores references and proved transactional or metadata needs, never duplicate
+Artifacts are immutable and identified by content. Research artifacts may be published to a local
+filesystem store or Google Cloud Storage; non-research run modes require Google Cloud Storage;
+Supabase stores references and proved transactional or metadata needs, never duplicate
 bulk or execution truth. Every artifact records its schema version, the producing code revision, the
 resolved configuration hash, and the identities of its inputs. A completed evidence identity is never
 overwritten.
@@ -110,7 +111,7 @@ from a path.
 | `schema_version` | integer | `1` |
 | `run_mode` | string | `research`, `replay`, `paper`, `live` |
 | `storage.historical_data_dir` | string | a non-empty path of the retained historical-data folder; a relative path resolves against the configuration file's directory |
-| `storage.publication_uri` | string | `gs://BUCKET` or `gs://BUCKET/PREFIX` in every run mode; `file:///ABSOLUTE/DIR` only with `run_mode = "research"`, for non-live tests and the research data pipeline |
+| `storage.publication_uri` | string | `gs://BUCKET` or `gs://BUCKET/PREFIX` in every run mode; `file:///ABSOLUTE/DIR` only with `run_mode = "research"`, for all research, including splits, research runs, holdout grants, and certification |
 | `import.sources` | array of tables | optional; consumed only by `data import`, which requires at least one entry |
 | `split` | table | optional; consumed only by `data split`; declares `namespace`, development daily-root `sources`, nonempty `development` and `evaluation` arrays, and a `holdout` array that may be empty; every window is a whole-day `{ start, end }` range |
 | `instruments` | array of tables | optional; maps audit generations and selected broker history/live instruments |
@@ -884,11 +885,12 @@ caller, which must retain the source; codecs perform no source deletion.
 
 The application-owned research pipeline imports selected originals, extends Deriv ticks or Pocket
 Option five-second bars, and archives a dataset plus its matching instrument stream in private
-Google Drive. Local filesystem publication is supported for this workflow. Google Cloud Storage
-retains production, certification, and holdout authority. Catalogs cover only dataset and stream
-ready manifests and their object dependencies, including raw data, provenance, normalized data,
-profiles, and candles. They do not archive feature/model, outcome, replay, research, or
-certification generations, and introduce no Google Drive artifact-store address scheme.
+Google Drive. Local filesystem publication is supported for this workflow and for all research,
+including holdout grants and certification; non-research run modes publish to Google Cloud Storage.
+Catalogs cover only dataset and stream ready manifests and their object dependencies, including raw
+data, provenance, normalized data, profiles, and candles. They do not archive feature/model,
+outcome, replay, research, or certification generations, and introduce no Google Drive
+artifact-store address scheme.
 
 ### Pipeline document
 

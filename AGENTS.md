@@ -42,9 +42,9 @@ Distinguish not sent, sent, acknowledged, accepted, rejected, partially filled o
 
 ## Storage authority
 
-Google Cloud Storage owns immutable bulk data and artifacts. Supabase owns only a proved transactional control or metadata need and stores references rather than duplicate bulk or execution truth. Writes and operator procedures are resumable. Do not prescribe buffering, fallback, retention, or recovery until the implementing issue or current checkout proves the failure model.
+For research, Google Cloud Storage is an optional publication location for immutable data and artifacts; choosing it does not grant holdout or certification access. Supabase owns only a proved transactional control or metadata need and stores references rather than duplicate bulk or execution truth. Writes and operator procedures are resumable. Do not prescribe buffering, fallback, retention, or recovery until the implementing issue or current checkout proves the failure model.
 
-A private Google Drive archive owned by this research pipeline may hold ordinary development/evaluation market datasets and their stream outputs under immutable catalogs, and local filesystem publication is supported for that research workflow. Google Cloud Storage retains every production, certification, and holdout authority.
+A private Google Drive archive owned by this research pipeline may hold ordinary development/evaluation market datasets and their stream outputs under immutable catalogs, and local filesystem publication is supported for all research, including splits, research runs, holdout grants, and certification. Non-research run modes publish to Google Cloud Storage because configuration validation requires it.
 
 ## Rust and NVIDIA CUDA
 

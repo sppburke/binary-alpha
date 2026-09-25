@@ -44,22 +44,26 @@ The session checkpoint is also private state, not a report.
 
 ## Artifact ownership
 
-Google Cloud Storage owns immutable bulk data and artifacts. Supabase owns only a proved
+For research, Google Cloud Storage is an optional publication location for immutable data and
+artifacts; choosing it does not grant holdout or certification access. Supabase owns only a proved
 transactional control or metadata need and stores references, never duplicate bulk or execution
 truth. Writes and operator procedures are resumable, so a second agent can continue from the last
 checkpoint. A completed evidence identity is never overwritten.
 
 The research pipeline may archive ordinary development/evaluation market datasets and their
 stream outputs privately in Google Drive under immutable catalogs and publish them locally.
-Google Cloud Storage retains every production, certification, and holdout authority.
+Local publication serves all research, including splits, research runs, holdout grants, and
+certification; non-research run modes publish to Google Cloud Storage because configuration
+validation requires it.
 
 ## Historical data
 
 `storage.historical_data_dir` names the retained local copy shared by `data import` and `data fetch`; `storage.publication_uri` names the durable destination (see
 [docs/contracts.md](contracts.md), section "Historical datasets"). The Google client resolves
 Application Default Credentials from the process environment; the configuration carries only the
-bucket and prefix. A `file://` destination is accepted only under `run_mode = "research"` for
-non-live tests and the research data pipeline, and is never production truth.
+bucket and prefix. A `file://` destination is accepted only under `run_mode = "research"`, where
+it serves all research, including splits, research runs, holdout grants, and certification;
+`replay`, `paper`, and `live` require `gs://`.
 
 Import: configure the folder, the destination, and the explicit `import.sources` inventory, then run
 `binary-alpha data import --config PATH`. Sources may live anywhere outside the folder and the
@@ -145,9 +149,9 @@ Selection performs no broker, live, paper, or production action and needs no ope
 Cut research roles: declare `[split]` with a namespace, one development daily-root source per
 instrument, whole-day development and evaluation windows, and optional holdout windows. Run
 `binary-alpha data split --config PATH` with a retained folder and destination outside the source
-stores and managed pipeline stores. Use the reviewed `storage.publication_uri` on Google Cloud
-Storage with existing credentials for real holdout authority; local publication is for fixtures.
-The command prints the bounded generations and their governance declaration location.
+stores and managed pipeline stores. Publish to the reviewed `storage.publication_uri`, a local
+`file:///` store or Google Cloud Storage; holdout access and certification are governed by the
+declaration, read permits, claims, and grant, not by the publication scheme. The command prints the bounded generations and their governance declaration location.
 
 Give the source one development window and make its search window that range: historical replay
 refuses feature decisions outside the search window. Split data windows and their tokens stay whole
@@ -175,17 +179,17 @@ before any read, creates the attempt intent beneath the authoritative root, publ
 through the same owners as the individual commands, publishes the frozen stage and, after
 verification, the run record, and exits successfully awaiting holdout authorization; rerun it to
 resume the same identity after any interruption (a published frozen stage or run is verified and
-restored, never recomputed). Copy protected holdout objects to the approved bucket only under a separate
-logged byte-transfer authorization that preserves bytes, hashes, and role. After the run reports
-its identity, an operator with a distinct identity that may create but not overwrite grant objects
-runs `binary-alpha holdout grant create --config PATH --bundle-manifest URI --holdout-manifest URI
---reason TEXT` (one `--holdout-manifest` per instrument, in instrument order); the grant never
-enters tracked configuration. Rerunning `research run` then claims the protected population,
-creates the receipt, and publishes one certified or rejected result; another agent may rerun the
-same command safely, because every transfer, grant, claim, receipt, and generation uses
-deterministic identities and conditional creation and the grant is consumed once. A rejected
-result is terminal for that frozen run: it never tunes, reranks, retries, or opens another stage.
-No live service quiescence or downtime is involved.
+restored, never recomputed). If protected holdout objects need transfer to another store, copy them
+only under a separate logged byte-transfer authorization that preserves bytes, hashes, and role.
+After the run reports its identity, an operator with a distinct identity that may create but not
+overwrite grant objects runs `binary-alpha holdout grant create --config PATH --bundle-manifest URI
+--holdout-manifest URI --reason TEXT` (one `--holdout-manifest` per instrument, in instrument
+order); the grant never enters tracked configuration. Rerunning `research run` then claims the
+protected population, creates the receipt, and publishes one certified or rejected result; another
+agent may rerun the same command safely, because every transfer, grant, claim, receipt, and
+generation uses deterministic identities and conditional creation and the grant is consumed once. A
+rejected result is terminal for that frozen run: it never tunes, reranks, retries, or opens another
+stage. No live service quiescence or downtime is involved.
 
 Rollout to Google Cloud Storage: discover and reuse existing projects, buckets, identities, and
 regions first; provision the bucket and a least-privilege identity that can read and create objects

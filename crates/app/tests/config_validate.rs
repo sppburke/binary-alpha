@@ -533,7 +533,10 @@ fn live_mode_and_binding_rejections_name_the_exact_rule() {
     changed.run_mode = RunMode::Live;
     changed.live.as_mut().unwrap().replay = None;
     changed.storage.publication_uri = "file:///synthetic/publication".parse().unwrap();
-    cases.push((changed, "storage.publication_uri: a `file://` destination is the non-live test boundary and requires run_mode `research`, not `live`"));
+    cases.push((
+        changed,
+        "storage.publication_uri: a `file://` destination requires run_mode `research`, not `live`",
+    ));
     for (index, (config, reason)) in cases.into_iter().enumerate() {
         let output = validate_document(&format!("live-invalid-{index}"), &config.canonical_toml());
         assert_eq!(output.status.code(), Some(1), "case {index}");

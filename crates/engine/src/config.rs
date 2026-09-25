@@ -91,7 +91,7 @@ impl Config {
             && matches!(self.storage.publication_uri, PublicationUri::Filesystem(_))
         {
             return Err(format!(
-                "storage.publication_uri: a `file://` destination is the non-live test boundary and requires run_mode `research`, not `{}`",
+                "storage.publication_uri: a `file://` destination requires run_mode `research`, not `{}`",
                 self.run_mode.as_str()
             ));
         }
@@ -845,7 +845,7 @@ pub struct Storage {
 }
 
 /// Where ready manifests and objects are published: Google Cloud Storage in every run mode, or
-/// the filesystem implementation as the non-live test boundary under `research`.
+/// the filesystem implementation under `research`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PublicationUri {
     /// `gs://BUCKET/PREFIX`; the prefix may be empty and never starts or ends with `/`.
