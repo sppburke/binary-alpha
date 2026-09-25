@@ -61,7 +61,7 @@ validation requires it.
 `storage.historical_data_dir` names the retained local copy shared by `data import` and `data fetch`; `storage.publication_uri` names the durable destination (see
 [docs/contracts.md](contracts.md), section "Historical datasets"). The Google client resolves
 Application Default Credentials from the process environment; the configuration carries only the
-bucket and prefix. A `file://` destination is accepted only under `run_mode = "research"`, where
+bucket and prefix. A `file://` destination is accepted only under `run_mode = "research"` where
 it serves all research, including splits, research runs, holdout grants, and certification;
 `replay`, `paper`, and `live` require `gs://`.
 
@@ -151,7 +151,8 @@ instrument, whole-day development and evaluation windows, and optional holdout w
 `binary-alpha data split --config PATH` with a retained folder and destination outside the source
 stores and managed pipeline stores. Publish to the reviewed `storage.publication_uri`, a local
 `file:///` store or Google Cloud Storage; holdout access and certification are governed by the
-declaration, read permits, claims, and grant, not by the publication scheme. The command prints the bounded generations and their governance declaration location.
+declaration, read permits, claims, and grant, not by the publication scheme. The command prints
+the bounded generations and their governance declaration location.
 
 Give the source one development window and make its search window that range: historical replay
 refuses feature decisions outside the search window. Split data windows and their tokens stay whole
