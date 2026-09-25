@@ -1513,18 +1513,29 @@ fn screening_overrides_leave_family_identity_and_bytes_unchanged() {
             .output()
             .unwrap()
     };
-    let one_byte = run_exact_budget("1");
-    assert!(!one_byte.status.success());
-    let error = String::from_utf8_lossy(&one_byte.stderr);
-    let required: usize = error
-        .split("screen tuple budget exceeded: planned ")
-        .nth(1)
-        .unwrap()
-        .split_whitespace()
-        .next()
-        .unwrap()
-        .parse()
-        .unwrap();
+    // The planner rejects a column above the budget before projection; raise the budget to each
+    // named column requirement until the exact tuple check reports its planned bytes.
+    let mut budget = 1;
+    let required = loop {
+        let output = run_exact_budget(&budget.to_string());
+        assert!(!output.status.success());
+        let error = String::from_utf8_lossy(&output.stderr).into_owned();
+        let after = |marker: &str| -> Option<usize> {
+            error
+                .split(marker)
+                .nth(1)?
+                .split_whitespace()
+                .next()?
+                .parse()
+                .ok()
+        };
+        if let Some(planned) = after("screen tuple budget exceeded: planned ") {
+            break planned;
+        }
+        let column = after(" requires ").unwrap_or_else(|| panic!("{error}"));
+        assert!(column > budget, "{error}");
+        budget = column;
+    };
     let below = (required - 1).to_string();
     let output = run_exact_budget(&below);
     assert!(!output.status.success());
