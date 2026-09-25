@@ -474,6 +474,7 @@ struct Clock {
     columns: usize,
     blocks: usize,
     tuples: usize,
+    replans: usize,
     list_entries: usize,
     construction_visits: usize,
     validation_visits: usize,
@@ -856,10 +857,11 @@ pub fn family(
         });
     let line = match put {
         Put::Reused(_) => format!(
-            "{report} columns {} blocks {} tuples {} list_entries {} construction_visits {} validation_visits {} driver_visits {} transfer_bytes {} peak_rss_kb {}{gpu_report} (already published)",
+            "{report} columns {} blocks {} tuples {} replans {} list_entries {} construction_visits {} validation_visits {} driver_visits {} transfer_bytes {} peak_rss_kb {}{gpu_report} (already published)",
             clock.columns,
             clock.blocks,
             clock.tuples,
+            clock.replans,
             clock.list_entries,
             clock.construction_visits,
             clock.validation_visits,
@@ -868,7 +870,7 @@ pub fn family(
             peak_rss_kb(),
         ),
         Put::Created(_) => format!(
-            "{report} [load {:.3}s lowering {:.3}s setup_before_gpu {:.3}s device upload {:.3}s execute {:.3}s download {:.3}s bytes {} replay {:.3}s stability {:.3}s publish {:.3}s] columns {} blocks {} tuples {} list_entries {} construction_visits {} validation_visits {} driver_visits {} transfer_bytes {} peak_rss_kb {}{gpu_report}",
+            "{report} [load {:.3}s lowering {:.3}s setup_before_gpu {:.3}s device upload {:.3}s execute {:.3}s download {:.3}s bytes {} replay {:.3}s stability {:.3}s publish {:.3}s] columns {} blocks {} tuples {} replans {} list_entries {} construction_visits {} validation_visits {} driver_visits {} transfer_bytes {} peak_rss_kb {}{gpu_report}",
             clock.load.as_secs_f64(),
             clock.lowering.as_secs_f64(),
             clock.setup_before_gpu.as_secs_f64(),
@@ -882,6 +884,7 @@ pub fn family(
             clock.columns,
             clock.blocks,
             clock.tuples,
+            clock.replans,
             clock.list_entries,
             clock.construction_visits,
             clock.validation_visits,
@@ -1892,7 +1895,6 @@ fn with_screen_plan<T>(
                     || error.starts_with("screen tuple budget exceeded:"))
                     && width > 1 =>
             {
-                eprintln!("{error}; re-planning at half block width");
                 width = (width / 2).max(1);
             }
             Err(error) => return Err(error),
@@ -2414,6 +2416,7 @@ fn score_streamed(
         }
         Ok(())
     })?;
+    clock.replans = attempts - 1;
     if completed.iter().any(|&done| !done) {
         return Err("screen blocks: re-plan left candidate ranks unscored".into());
     }

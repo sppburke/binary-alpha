@@ -2191,7 +2191,9 @@ counts in the compact whole-family array. CUDA batches follow a deterministic ro
 every configured `[accelerator] devices` entry.
 Schema-1 family verification retains the identity of the original thirteen kernel sources;
 schema-2 family identity includes the fused screening source as the fourteenth.
-The created search report lists `columns C blocks K tuples T` before the visit counters.
+The created search report lists `columns C blocks K tuples T replans N` before the visit
+counters; `replans` counts plans halved after a tuple failed to fit, and the command writes
+nothing to standard error when it succeeds.
 `validation_visits` counts sparse tuple-index entries once per constructed workspace: once
 for CPU, or once per configured CUDA device entry, including repeated device ordinals.
 Candidate-driver row visits are reported separately.
@@ -2269,7 +2271,7 @@ their full-member, full-lowering and close-time CPU verification path and remain
 
 The command writes
 `search SCOPE generation GENERATION members M applicable A screened S replayed R passed P evaluated E objects 1`
-followed by stage timings, resolved columns, block tuples, sparse-list entries, sparse-list construction visits, tuple-index validation visits, candidate-driver row visits, host-to-device transfer bytes, and peak resident memory or `(already published)`, then the
+followed by stage timings, resolved columns, block tuples, re-plans, sparse-list entries, sparse-list construction visits, tuple-index validation visits, candidate-driver row visits, host-to-device transfer bytes, and peak resident memory or `(already published)`, then the
 verification line. `data verify` writes
 `verified search generation GENERATION members M applicable A replayed R passed P objects 1 bytes B`.
 

@@ -740,6 +740,11 @@ fn quantum_study_p_combined_scale() {
         search_started.elapsed().as_secs_f64(),
         String::from_utf8_lossy(&output.stderr)
     );
+    assert!(
+        output.stderr.is_empty(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     let report = String::from_utf8(output.stdout).unwrap();
     stage("generated_search_cuda", search_started, &report);
     let first = report.lines().next().unwrap();
@@ -786,6 +791,11 @@ fn quantum_study_p_combined_scale() {
         verify_output.status.success(),
         "CUDA verify failed after {:.3}s: {}",
         verify_started.elapsed().as_secs_f64(),
+        String::from_utf8_lossy(&verify_output.stderr)
+    );
+    assert!(
+        verify_output.stderr.is_empty(),
+        "{}",
         String::from_utf8_lossy(&verify_output.stderr)
     );
     let verify = String::from_utf8(verify_output.stdout).unwrap();
@@ -978,6 +988,11 @@ fn quantum_study_p_combined_scale() {
         cpu_output.status.success(),
         "CPU verify failed after {:.3}s: {}",
         cpu_started.elapsed().as_secs_f64(),
+        String::from_utf8_lossy(&cpu_output.stderr)
+    );
+    assert!(
+        cpu_output.stderr.is_empty(),
+        "{}",
         String::from_utf8_lossy(&cpu_output.stderr)
     );
     let cpu_report = String::from_utf8(cpu_output.stdout).unwrap();

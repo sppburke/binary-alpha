@@ -437,6 +437,7 @@ fn candidate_search_publishes_verifies_and_resumes() {
     for (name, expected) in [
         ("columns", 4),
         ("tuples", 2),
+        ("replans", 0),
         ("list_entries", 256),
         ("construction_visits", 768),
         ("validation_visits", 266),
