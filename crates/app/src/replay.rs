@@ -614,8 +614,8 @@ pub fn replay(config: &Config, local: &Store, destination: &Store) -> Result<Str
 }
 
 /// Binds, simulates, publishes, and reconstructs one replay generation. With `resume`, a
-/// generation whose ready manifest the destination already holds is read back instead of
-/// simulated again; the search stages reuse their completed chunks this way.
+/// generation its definition determines whose ready manifest the destination already holds is
+/// read back instead of simulated again; the search stages reuse their completed chunks this way.
 pub(crate) fn publish(
     config: &Config,
     local: &Store,

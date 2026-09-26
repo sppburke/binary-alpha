@@ -172,7 +172,17 @@ fn live_replay_drives_recorded_log_to_receipt_and_final_manifest() {
             ledger,
         )
     };
-    assert_eq!(fixture.definition().manifest.definition, identity(None));
+    let deployment: Value = serde_json::from_slice(
+        &fs::read(
+            fixture
+                .scratch
+                .path("published/live/deployments")
+                .join(format!("{}.json", final_manifest.deployment)),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(deployment["definition"], identity(None));
     assert_eq!(receipt["definition"], identity(None));
     assert_eq!(
         ledger_manifest.generation,

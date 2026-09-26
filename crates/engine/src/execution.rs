@@ -6528,6 +6528,22 @@ mod tests {
         assert_ne!(identity("r", None), identity("s", None));
         assert_ne!(identity("r", None), identity("r", Some(&ledger)));
         assert_ne!(identity("r", Some(&ledger)), identity("r", Some(&summary)));
+        // The documented bytes: the version-two domain, then the v1 identity, revision, and ledger.
+        let v1 = legacy_replay_generation_id("c", &[]);
+        assert_eq!(
+            identity("r", Some(&ledger)),
+            crate::research::digest(
+                b"binary-alpha engine replay v2\n",
+                format!("{v1}\nr\n{ledger}\n").as_bytes()
+            )
+        );
+        assert_eq!(
+            identity("r", None),
+            crate::research::digest(
+                b"binary-alpha engine replay v2\n",
+                format!("{v1}\nr\n-\n").as_bytes()
+            )
+        );
         let object = |path: &str, sha256: &str| {
             serde_json::json!({"role":"normalized","path":path,"key":crate::dataset::object_key(sha256),
                 "bytes":1,"sha256":sha256})
