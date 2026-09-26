@@ -582,6 +582,7 @@ fn quantum_study_p_combined_scale() {
         top: number(&resources, &["search", "portfolio_top"])
             .try_into()
             .unwrap(),
+        nested: false,
     });
     research.portfolio.max_policies = 128;
     research.portfolio.embargo_micros = 305_000_000;

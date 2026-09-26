@@ -1863,11 +1863,14 @@ pub struct Portfolio {
     pub evaluation: Option<Evaluation>,
 }
 
-/// Research-only rule resolved against verified, ranked development families.
+/// Research-only rule resolved against verified, ranked development families. `nested` deploys
+/// each family's first `k` generated members together, for every `k` up to `top`.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct PortfolioGenerate {
     pub top: u32,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub nested: bool,
 }
 
 impl Portfolio {
