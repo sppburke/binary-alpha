@@ -655,7 +655,7 @@ pub(crate) fn publish(
         None,
     );
     let key = manifest_key(&generation);
-    // Only a replay its definition determines is ever reused.
+    // Only a replay its definition determines resumes without simulating.
     if resume
         && definition_determines_ledger(&definition.availability, &definition.code_revision)
         && destination.head(&key)?.is_some()

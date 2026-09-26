@@ -2093,11 +2093,12 @@ obligations, capacity, and sequence; the summary identity is SHA-256 over
 A replay generation's identity is SHA-256 over `binary-alpha engine replay v2` and, one per line,
 the version-one identity, the code revision, and the ledger's SHA-256; only simulated history
 from a build whose revision names its code (not `unavailable`, not `-dirty`) records `-` instead,
-because the rest determines its ledger, and only such a build reuses a completed replay. The
-version-one identity is SHA-256 over `binary-alpha engine replay v1`, the configuration hash, and
-each instrument's identity, tick generation, feature generation, plan identity, and outcome
-generation, one per line; generations published before the code revision joined the identity keep
-it. Its objects, both role `normalized` under the content-addressed create-once rules of dataset generations, are the ledger and the summary. The ready manifest at
+because the rest determines its ledger, and only such a build resumes a completed replay without
+simulating. The version-one identity is SHA-256 over `binary-alpha engine replay v1`, the
+configuration hash, and each instrument's identity, tick generation, feature generation, plan
+identity, and outcome generation, one per line; generations published before the code revision
+joined the identity keep it. Its objects, both role `normalized` under the content-addressed
+create-once rules of dataset generations, are the ledger and the summary. The ready manifest at
 `manifests/GENERATION/ready.json`, published last and mirrored, records `kind` (`engine_replay`),
 `schema_version` (`1` for simulated history, `2` for broker-authoritative runs), `generation`, `role`, `config_hash`, `code_revision`, `availability`,
 `decision_start`, `decision_end`, `instruments`, `events`, `final_state_identity`,
