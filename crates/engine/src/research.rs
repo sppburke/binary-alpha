@@ -865,7 +865,11 @@ pub fn validate_resolved_portfolio(research: &Research, base: &Portfolio) -> Res
     .validate()
     .map_err(|reason| format!("qualification.{reason}"))?;
     for (index, scenario) in research.scenarios.iter().enumerate() {
-        let mut table = base.clone();
+        // Scenarios are assessed only under the qualification gates.
+        let mut table = Portfolio {
+            gates: research.qualification.gates.clone(),
+            ..base.clone()
+        };
         for binding in &mut table.bindings {
             let alternative = scenario
                 .alternatives
@@ -2440,6 +2444,8 @@ mod tests {
             drawdown: drawdown.map(decimal),
             unavailable_observations: unavailable,
             failure: failure.map(str::to_string),
+            decisive_minimum: None,
+            required_wins: None,
         }
     }
 
@@ -2451,6 +2457,8 @@ mod tests {
             max_drawdown: decimal("5"),
             min_decisive: None,
             min_win_rate: None,
+            min_decisive_per_day: None,
+            max_false_pass: None,
         }
     }
 

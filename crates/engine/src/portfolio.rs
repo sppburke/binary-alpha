@@ -58,6 +58,22 @@ pub struct Gates {
     pub min_decisive: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub min_win_rate: Option<Decimal>,
+    /// Decisive trades required per day of the gated replay's decision window, rounded up.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_decisive_per_day: Option<Decimal>,
+    /// The largest allowed chance that a break-even policy wins at least as often, from the exact
+    /// binomial tail at the strictest break-even of the replay's contracts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_false_pass: Option<Decimal>,
+}
+
+impl Gates {
+    fn decisive(&self) -> bool {
+        self.min_decisive.is_some()
+            || self.min_win_rate.is_some()
+            || self.min_decisive_per_day.is_some()
+            || self.max_false_pass.is_some()
+    }
 }
 
 // ----------------------------------------------------------------------------------------------
@@ -177,6 +193,29 @@ pub fn validate(portfolio: &Portfolio) -> Result<(), String> {
         && (rate.is_negative() || rate.compare(Decimal::parse("1")?)? == Ordering::Greater)
     {
         return Err("gates.min_win_rate: must lie in [0, 1]".to_string());
+    }
+    if portfolio
+        .gates
+        .min_decisive_per_day
+        .is_some_and(|rate| rate.is_negative() || rate.is_zero())
+    {
+        return Err("gates.min_decisive_per_day: must be positive".to_string());
+    }
+    if let Some(limit) = portfolio.gates.max_false_pass {
+        if limit.is_negative()
+            || limit.is_zero()
+            || limit.compare(Decimal::parse("1")?)? != Ordering::Less
+        {
+            return Err("gates.max_false_pass: must lie in (0, 1)".to_string());
+        }
+        // Checked before any run so no break-even failure can consume a claim.
+        for (index, binding) in portfolio.bindings.iter().enumerate() {
+            for alternative in &binding.alternatives {
+                crate::search::null_rate(&alternative.contract).map_err(|reason| {
+                    format!("bindings[{index}]: gates.max_false_pass needs a break-even: {reason}")
+                })?;
+            }
+        }
     }
     if portfolio
         .generate
@@ -422,7 +461,8 @@ pub fn declared_count(portfolio: &Portfolio) -> Result<u64, String> {
 
 /// Re-derives the complete ordered generated universe from verified schema-2 development
 /// families and their fitted plans. Each family's `top` eligible passing ranks become singleton
-/// subsets, deploying the exact ranked contract and envelope on that plan's instrument through
+/// subsets, or with `nested` the subsets of its first one, two, and so on up to all of them,
+/// deploying the exact ranked contract and envelope on that plan's instrument through
 /// condition-free repair zero. A fifths threshold is eligible only when one retained interval
 /// label derived from fitted edges matches it. No code position is an interval ordinal.
 pub fn generated_members(
@@ -452,6 +492,7 @@ pub fn generated_members(
     let mut members = Vec::new();
     let mut subsets = Vec::new();
     for (family_index, (family, plan)) in families.iter().zip(plans).enumerate() {
+        let mut deployed = Vec::new();
         if family.schema_version != 2 || family.plan_identity != plan.identity() {
             return Err(format!(
                 "families[{family_index}]: generation requires a schema-2 family and its fitted plan"
@@ -542,12 +583,18 @@ pub fn generated_members(
                 member: source_index,
                 ordinals,
             });
+            let deployment = Deployment {
+                member: base,
+                repair: 0,
+                binding: matching[0],
+            };
+            deployed.push(deployment);
             subsets.push(Subset {
-                deployments: vec![Deployment {
-                    member: base,
-                    repair: 0,
-                    binding: matching[0],
-                }],
+                deployments: if rule.nested {
+                    deployed.clone()
+                } else {
+                    vec![deployment]
+                },
             });
             taken += 1;
         }
@@ -949,17 +996,26 @@ pub struct Projection {
     pub unavailable_observations: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub failure: Option<String>,
+    /// The decisive minimum `min_decisive_per_day` resolved over this replay's window.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decisive_minimum: Option<u64>,
+    /// The fewest wins keeping the false-pass chance within `max_false_pass` at this count.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub required_wins: Option<u64>,
 }
 
 pub(crate) fn decisive_support_failure(projection: &Projection, gates: &Gates) -> Option<String> {
-    if gates.min_decisive.is_none() && gates.min_win_rate.is_none() {
+    if !gates.decisive() {
         return None;
     }
     let (Some(wins), Some(losses)) = (projection.wins, projection.losses) else {
         return Some("decisive trade counts are unavailable".to_string());
     };
     let decisive = u128::from(wins) + u128::from(losses);
-    let minimum = gates.min_decisive.unwrap_or(0);
+    let minimum = projection
+        .decisive_minimum
+        .or(gates.min_decisive)
+        .unwrap_or(0);
     (decisive == 0 || decisive < u128::from(minimum)).then(|| {
         format!("decisive trades {decisive} below the minimum {minimum} (zero is insufficient)")
     })
@@ -969,9 +1025,6 @@ pub(crate) fn decisive_rate_failure(
     projection: &Projection,
     gates: &Gates,
 ) -> Result<Option<String>, String> {
-    let Some(minimum) = gates.min_win_rate else {
-        return Ok(None);
-    };
     let (Some(wins), Some(losses)) = (projection.wins, projection.losses) else {
         return Ok(None);
     };
@@ -979,10 +1032,51 @@ pub(crate) fn decisive_rate_failure(
     if decisive == 0 {
         return Ok(None);
     }
-    let winning = Decimal::parse(&wins.to_string())?;
-    let required = Decimal::parse(&decisive.to_string())?.checked_mul(minimum)?;
-    Ok((winning.compare(required)? == Ordering::Less)
-        .then(|| format!("decisive win rate {wins}/{decisive} below the minimum {minimum}")))
+    if let Some(minimum) = gates.min_win_rate {
+        let winning = Decimal::parse(&wins.to_string())?;
+        let required = Decimal::parse(&decisive.to_string())?.checked_mul(minimum)?;
+        if winning.compare(required)? == Ordering::Less {
+            return Ok(Some(format!(
+                "decisive win rate {wins}/{decisive} below the minimum {minimum}"
+            )));
+        }
+    }
+    Ok(match (projection.required_wins, gates.max_false_pass) {
+        (Some(required), Some(limit)) if wins < required => Some(format!(
+            "decisive wins {wins}/{decisive} below the {required} a false-pass chance of at most {limit} requires"
+        )),
+        _ => None,
+    })
+}
+
+/// `ceil(per_day × window / one day)` in exact integer arithmetic on the decimal coefficient.
+fn window_minimum(per_day: Decimal, window_micros: i64) -> Result<u64, String> {
+    let overflow = || "gates.min_decisive_per_day: the window minimum overflows".to_string();
+    let scaled = u128::try_from(per_day.coefficient())
+        .ok()
+        .zip(u128::try_from(window_micros).ok())
+        .and_then(|(rate, window)| rate.checked_mul(window))
+        .ok_or_else(overflow)?;
+    let unit = 10_u128
+        .checked_pow(u32::from(per_day.scale()))
+        .and_then(|scale| scale.checked_mul(86_400_000_000))
+        .ok_or_else(overflow)?;
+    u64::try_from(scaled.div_ceil(unit)).map_err(|_| overflow())
+}
+
+/// The fewest of `decisive` wins whose exact upper tail at `break_even` is at most `limit`, or
+/// one more than `decisive` when none is. The tail never increases as wins increase.
+fn required_wins(decisive: u64, break_even: f64, limit: f64) -> u64 {
+    let (mut low, mut high) = (0, decisive + 1);
+    while low < high {
+        let wins = low + (high - low) / 2;
+        if crate::search::upper_tail(wins, decisive - wins, break_even) <= limit {
+            high = wins;
+        } else {
+            low = wins + 1;
+        }
+    }
+    low
 }
 
 /// Projects and gates one verified restored engine: settlement support first; only then every
@@ -992,12 +1086,36 @@ pub(crate) fn decisive_rate_failure(
 /// gate; an arithmetic error stops.
 pub fn project(engine: &Engine, gates: &Gates) -> Result<Projection, String> {
     let summary = engine.summary();
-    let decisive_gates = gates.min_decisive.is_some() || gates.min_win_rate.is_some();
+    let replay = &engine.definition().replay;
+    let decisive_gates = gates.decisive();
+    let (wins, losses) = (summary.portfolio.wins, summary.portfolio.losses);
+    let decisive_minimum = match gates.min_decisive_per_day {
+        Some(per_day) => {
+            let window = time("decision_end", &replay.decision_end)?
+                - time("decision_start", &replay.decision_start)?;
+            Some(window_minimum(per_day, window)?.max(gates.min_decisive.unwrap_or(0)))
+        }
+        None => None,
+    };
+    let required_wins = match gates.max_false_pass {
+        Some(limit) => {
+            let mut break_even: f64 = 0.0;
+            for contract in &replay.contracts {
+                break_even = break_even.max(crate::search::null_rate(contract)?.break_even);
+            }
+            let limit: f64 = limit
+                .to_string()
+                .parse()
+                .map_err(|_| "gates.max_false_pass")?;
+            Some(required_wins(wins + losses, break_even, limit))
+        }
+        None => None,
+    };
     let mut projection = Projection {
         settled: summary.portfolio.settled,
         unresolved: summary.portfolio.unresolved,
-        wins: decisive_gates.then_some(summary.portfolio.wins),
-        losses: decisive_gates.then_some(summary.portfolio.losses),
+        wins: decisive_gates.then_some(wins),
+        losses: decisive_gates.then_some(losses),
         ties: decisive_gates.then_some(summary.portfolio.ties),
         valued_at: summary.last_time_micros.map(format_event_time_micros),
         profit: None,
@@ -1005,6 +1123,8 @@ pub fn project(engine: &Engine, gates: &Gates) -> Result<Projection, String> {
         drawdown: summary.reporting.max_drawdown,
         unavailable_observations: summary.reporting.unavailable_observations,
         failure: None,
+        decisive_minimum,
+        required_wins,
     };
     if projection.settled < gates.min_settled {
         projection.failure = Some(format!(
@@ -1024,7 +1144,6 @@ pub fn project(engine: &Engine, gates: &Gates) -> Result<Projection, String> {
         projection.failure = Some(reason);
         return Ok(projection);
     }
-    let replay = &engine.definition().replay;
     let mut total = Decimal::zero(replay.reporting_scale);
     for account in engine.accounts() {
         match engine.convert(account.completed_profit, &account.currency)? {
@@ -1518,6 +1637,8 @@ mod tests {
                     drawdown: Some(Decimal::parse(drawdown).unwrap()),
                     unavailable_observations: 0,
                     failure: None,
+                    decisive_minimum: None,
+                    required_wins: None,
                 }),
             }],
             profit: Some(Decimal::parse(profit).unwrap()),
@@ -1536,6 +1657,8 @@ mod tests {
             max_drawdown: Decimal::parse("5").unwrap(),
             min_decisive: Some(2),
             min_win_rate: Some(Decimal::parse("0.5").unwrap()),
+            min_decisive_per_day: None,
+            max_false_pass: None,
         };
         let mut projection = choice("a", "1", "0")
             .folds
@@ -1570,6 +1693,42 @@ mod tests {
         projection.wins = Some(0);
         projection.losses = Some(0);
         assert!(decisive_support_failure(&projection, &gates).is_some());
+    }
+
+    #[test]
+    fn absent_window_gates_and_nesting_keep_existing_serialization() {
+        let text =
+            "min_settled = 1\nmax_unresolved = 0\nmin_profit = \"0\"\nmax_drawdown = \"1\"\n";
+        let gates: Gates = toml::from_str(text).unwrap();
+        assert_eq!(toml::to_string(&gates).unwrap(), text);
+        let generate = crate::config::PortfolioGenerate {
+            top: 2,
+            nested: false,
+        };
+        assert_eq!(toml::to_string(&generate).unwrap(), "top = 2\n");
+    }
+
+    #[test]
+    fn window_gates_scale_the_minimum_and_keep_the_false_pass_limit() {
+        let rate = Decimal::parse("1.3243").unwrap();
+        let day = 86_400_000_000;
+        assert_eq!(window_minimum(rate, 64 * day + 1_000_000).unwrap(), 85);
+        assert_eq!(window_minimum(rate, 185 * day).unwrap(), 245);
+        assert_eq!(window_minimum(rate, 49 * day + 1_000_000).unwrap(), 65);
+        assert_eq!(
+            window_minimum(Decimal::parse("2").unwrap(), day).unwrap(),
+            2
+        );
+
+        let break_even = 1.0 / 1.92;
+        let wins = required_wins(65, break_even, 0.0493);
+        assert_eq!(wins, 41);
+        assert!(crate::search::upper_tail(wins, 65 - wins, break_even) <= 0.0493);
+        assert!(crate::search::upper_tail(wins - 1, 65 - wins + 1, break_even) > 0.0493);
+        assert_eq!(required_wins(245, break_even, 0.0493), 141);
+        // A lower payout raises the break-even and so the wins required.
+        assert_eq!(required_wins(65, 1.0 / 1.87, 0.0493), 42);
+        assert_eq!(required_wins(3, break_even, 0.0493), 4);
     }
 
     #[test]
@@ -1608,6 +1767,8 @@ mod tests {
                 drawdown: Some(Decimal::parse("0.75").unwrap()),
                 unavailable_observations: 0,
                 failure: None,
+                decisive_minimum: None,
+                required_wins: None,
             }),
         });
         choice.aggregate().unwrap();

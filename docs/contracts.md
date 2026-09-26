@@ -2296,8 +2296,8 @@ ready-manifest locations of development-only search families), positive `max_pol
 `embargo_micros`, the `objective` (`profit_then_drawdown`: larger completed net profit then lower
 drawdown; `drawdown_then_profit`: lower drawdown then larger profit), the `gates` (positive
 `min_settled`, `max_unresolved`, `min_profit`, non-negative `max_drawdown`, optional
-`min_decisive`, and optional `min_win_rate` in `[0, 1]`, in the reporting currency where
-applicable), the shared funded `accounts`, the reporting contract (`reporting_currency`,
+`min_decisive`, optional `min_win_rate` in `[0, 1]`, optional positive `min_decisive_per_day`, and
+optional `max_false_pass` in `(0, 1)`, in the reporting currency where applicable), the shared funded `accounts`, the reporting contract (`reporting_currency`,
 `reporting_scale`, `max_rate_age_micros` and optional `rates`, as in `replay`), the nonempty explicit base
 universe `members` (each a `family` index, a `member` index of that family and optional
 `ordinals`, each naming a `condition` index of the member and an interval `ordinal` `0` to `4`),
@@ -2373,11 +2373,17 @@ fold drawdown. Ranking orders passing choices by the objective, then fewer deplo
 canonical identity ascending, writing one-based ranks; the first is selected. No standalone
 profit, score or admission flag prunes.
 
-When either decisive gate is configured, the projection also records wins, losses, and ties.
-Only wins and losses are decisive: zero decisive trades or fewer than `min_decisive` fails for
-insufficient evidence, even when ties satisfy `min_settled`. With sufficient decisive trades,
-`wins / (wins + losses)` below `min_win_rate` fails the economic gate using exact decimal
-comparison. Without decisive gates, these counts are absent from the projection record.
+When any decisive gate is configured, the projection also records wins, losses, and ties.
+Only wins and losses are decisive: zero decisive trades or fewer than the minimum fails for
+insufficient evidence, even when ties satisfy `min_settled`. The minimum is `min_decisive`, or
+with `min_decisive_per_day` the larger of it and `ceil(min_decisive_per_day × window / 1 day)`
+over the gated replay's own decision window, recorded as `decisive_minimum`. With sufficient
+decisive trades, `wins / (wins + losses)` below `min_win_rate` fails the economic gate using exact
+decimal comparison. With `max_false_pass`, `required_wins` records the fewest of the `n` decisive
+trades whose exact binomial upper tail at the largest break-even of the replay's contracts is at
+most the limit, or `n + 1` when none is; fewer wins fail the economic gate. Folds, the outer
+evaluation, certification, and every scenario resolve the same gates against their own window
+and contracts. Without decisive gates, these values are absent from the projection record.
 
 Only a selected choice is refitted: each refit fit builds a new plan on the full permitted
 development generation and the choice re-resolves under it; an inapplicable refit is terminal
@@ -2460,13 +2466,13 @@ observation generation per instrument, optional `splits`; holdout references are
 and declared role only and are never opened before certification); `portfolio` (exactly the
 `portfolio` table without families, folds, refit, and evaluation; a member's family index is its
 instrument index; optional `[research.portfolio.generate] top = N` replaces only `members` and
-`subsets` after the fitted development plans and ranks exist); optional `scenarios` (each a unique identifier `id` other than `baseline`, a
+`subsets` after the fitted development plans and ranks exist, with singleton subsets, or with
+`nested = true` the subsets of each family's first one, two, and so on up to all of its members); optional `scenarios` (each a unique identifier `id` other than `baseline`, a
 non-negative `acceptance_delay_micros`, and `alternatives` naming every portfolio binding exactly
 once with an exact `contract` and `envelope`; equal contract identifiers within one scenario carry
 equal terms); and `qualification` (`claim`, which must be `empirical_policy_qualification_v1`, and
 `gates`, the exact `min_settled`, `max_unresolved`, `min_profit`, `max_drawdown`, and optional
-`min_decisive` and `min_win_rate` every
-scenario must satisfy, where `min_profit` is the minimum economically useful improvement over the
+decisive gates every scenario must satisfy, each resolved per window as in the portfolio, where `min_profit` is the minimum economically useful improvement over the
 analytic zero-profit benchmark on the same initial capital). Validation lowers the declared
 settings into the existing feature, outcome, search, and portfolio tables with the source
 manifests standing in for unpublished generations and applies their validators, under the

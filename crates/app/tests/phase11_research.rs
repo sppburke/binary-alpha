@@ -230,7 +230,10 @@ impl Fixture {
                 .collect();
         }
         let research = config.research.as_mut().unwrap();
-        research.portfolio.generate = Some(PortfolioGenerate { top: 8 });
+        research.portfolio.generate = Some(PortfolioGenerate {
+            top: 8,
+            nested: false,
+        });
         research.portfolio.members.clear();
         research.portfolio.subsets.clear();
         research.portfolio.max_policies = 64;
@@ -1138,7 +1141,13 @@ fn wide_research_daily_split_certifies_without_early_holdout_access() {
     }
     let selection = fixture.selection(&run);
     let settings = selection.config.portfolio.as_ref().unwrap();
-    assert_eq!(settings.generate, Some(PortfolioGenerate { top: 8 }));
+    assert_eq!(
+        settings.generate,
+        Some(PortfolioGenerate {
+            top: 8,
+            nested: false
+        })
+    );
     assert!(
         settings
             .members
@@ -1920,7 +1929,7 @@ fn decisive_research_gates_classify_synthetic_evaluation_and_holdout() {
 fn generated_fixture(name: &str, top: u32) -> Fixture {
     let mut fixture = Fixture::new(name);
     let research = fixture.config.research.as_mut().unwrap();
-    research.portfolio.generate = Some(PortfolioGenerate { top });
+    research.portfolio.generate = Some(PortfolioGenerate { top, nested: false });
     research.portfolio.members.clear();
     research.portfolio.subsets.clear();
     for binding in &mut research.portfolio.bindings {
@@ -1941,7 +1950,13 @@ fn generated_portfolio_selects_ranked_singletons_and_verifies_run() {
     let (_, run) = fixture.run_record();
     let selection = fixture.selection(&run);
     let settings = selection.config.portfolio.as_ref().unwrap();
-    assert_eq!(settings.generate, Some(PortfolioGenerate { top: 2 }));
+    assert_eq!(
+        settings.generate,
+        Some(PortfolioGenerate {
+            top: 2,
+            nested: false
+        })
+    );
     for research in [None, fixture.config.research.clone()] {
         let mut standalone = selection.config.clone();
         standalone.research = research;
@@ -1993,6 +2008,165 @@ fn generated_portfolio_selects_ranked_singletons_and_verifies_run() {
             .contains("verified research generation")
     );
     no_access(&logged(&fixture.log()), &fixture.protected());
+}
+
+#[test]
+fn wide_research_nested_policies_resolve_window_gates_through_certification() {
+    use binary_alpha_engine::market::parse_event_time_micros as micros;
+    use binary_alpha_engine::portfolio::Projection;
+    use binary_alpha_engine::search::{null_rate, upper_tail};
+    const LIMIT: f64 = 0.9;
+    let mut fixture = generated_fixture("phase11_nested_window_gates", 2);
+    let research = fixture.config.research.as_mut().unwrap();
+    research.portfolio.generate = Some(PortfolioGenerate {
+        top: 2,
+        nested: true,
+    });
+    for gates in [
+        &mut research.portfolio.gates,
+        &mut research.qualification.gates,
+    ] {
+        gates.min_decisive = None;
+        gates.min_win_rate = None;
+        gates.min_decisive_per_day = Some(decimal("540"));
+        gates.max_false_pass = Some(decimal(&LIMIT.to_string()));
+    }
+    // The planted policy loses money under the fixture's stress terms; the gates under test are
+    // the decisive ones.
+    research.qualification.gates.min_profit = decimal("-1000");
+    fixture.save();
+    let report = fixture.run().unwrap();
+    let (_, run) = fixture.run_record();
+    assert_eq!(
+        run.state,
+        RunState::AwaitingHoldoutAuthorization,
+        "{report}"
+    );
+    let selection = fixture.selection(&run);
+    let settings = selection.config.portfolio.as_ref().unwrap();
+    // Each family's first one, then first two members deploy together.
+    let sizes: Vec<_> = settings
+        .subsets
+        .iter()
+        .map(|s| s.deployments.len())
+        .collect();
+    assert_eq!(sizes, [1, 2, 1, 2]);
+    for family in settings.subsets.chunks(2) {
+        assert_eq!(family[1].deployments[0], family[0].deployments[0]);
+    }
+
+    let research = fixture.config.research.as_ref().unwrap();
+    // 540 per day over each 640-second window is exactly 4 decisive trades.
+    let minimum = |start: &str, end: &str| {
+        let window = u128::try_from(micros(end).unwrap() - micros(start).unwrap()).unwrap();
+        u64::try_from((540 * window).div_ceil(86_400_000_000)).unwrap()
+    };
+    let strictest = |contracts: Vec<&binary_alpha_engine::execution::ContractTerms>| {
+        contracts
+            .into_iter()
+            .map(|contract| null_rate(contract).unwrap().break_even)
+            .fold(0.0, f64::max)
+    };
+    let base = strictest(
+        settings
+            .bindings
+            .iter()
+            .map(|binding| &binding.alternatives[0].contract)
+            .collect(),
+    );
+    let scenario = |id: &str| {
+        research
+            .scenarios
+            .iter()
+            .find(|scenario| scenario.id == id)
+            .map_or(base, |scenario| {
+                strictest(scenario.alternatives.iter().map(|a| &a.contract).collect())
+            })
+    };
+    let check = |projection: &Projection, expected_minimum: u64, break_even: f64| {
+        assert_eq!(projection.decisive_minimum, Some(expected_minimum));
+        let (wins, losses) = (projection.wins.unwrap(), projection.losses.unwrap());
+        let (decisive, required) = (wins + losses, projection.required_wins.unwrap());
+        assert!(
+            required > decisive || upper_tail(required, decisive - required, break_even) <= LIMIT
+        );
+        assert!(
+            required == 0 || upper_tail(required - 1, decisive + 1 - required, break_even) > LIMIT
+        );
+        let failure = projection.failure.as_deref().unwrap_or_default();
+        assert_eq!(
+            decisive >= expected_minimum && decisive > 0 && wins >= required,
+            !failure.contains("decisive"),
+            "{projection:?}"
+        );
+    };
+    let fold = &research.folds[0];
+    let fold_minimum = minimum(&fold.decision_start, &fold.decision_end);
+    assert_eq!(fold_minimum, 4);
+    for choice in &selection.choices {
+        for fold in &choice.folds {
+            check(fold.projection.as_ref().unwrap(), fold_minimum, base);
+        }
+    }
+    let selected = &selection.choices[selection.selected.unwrap()];
+    assert!(
+        selection
+            .choices
+            .iter()
+            .any(|choice| settings.subsets[choice.subset].deployments.len() == 2),
+        "{report}"
+    );
+    let evaluation = minimum(
+        &research.evaluation.decision_start,
+        &research.evaluation.decision_end,
+    );
+    for result in &run.outer {
+        check(
+            &result.outer.projection,
+            evaluation,
+            scenario(&result.scenario),
+        );
+    }
+
+    let (_, grant) = fixture.grant();
+    fixture.run().unwrap();
+    let (manifest, record) = fixture.certification(&grant);
+    let holdout = minimum(
+        &research.holdout.decision_start,
+        &research.holdout.decision_end,
+    );
+    for result in &record.scenarios {
+        check(
+            &result.outer.projection,
+            holdout,
+            scenario(&result.scenario),
+        );
+    }
+    assert!(
+        fixture
+            .verify(&manifest.generation)
+            .unwrap()
+            .contains("verified research certification"),
+        "selected subset {}",
+        selected.subset
+    );
+}
+
+#[test]
+fn false_pass_gates_reject_scenario_terms_without_a_break_even_before_any_read() {
+    let mut fixture = generated_fixture("phase11_false_pass_terms", 2);
+    let research = fixture.config.research.as_mut().unwrap();
+    research.qualification.gates.max_false_pass = Some(decimal("0.05"));
+    for alternative in &mut research.scenarios[0].alternatives {
+        alternative.contract.tie.gross_return = decimal("0");
+    }
+    fixture.save();
+    let error = fixture.run().unwrap_err();
+    assert!(
+        error.contains("gates.max_false_pass needs a break-even"),
+        "{error}"
+    );
+    assert!(logged(&fixture.log()).is_empty());
 }
 
 #[test]
