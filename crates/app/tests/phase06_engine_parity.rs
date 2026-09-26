@@ -19,6 +19,7 @@ use binary_alpha_engine::execution::{
     PathMetrics, Pause, REPLAY_SCHEMA_VERSION, RateEvent, ReplayInput, ReplayManifest, Resolution,
     RiskPolicy, RunDefinition, SUMMARY_OBJECT_PATH, SameEntry, SettlementRule, StrategySpec,
     StreamColumns, Summary, Threshold, UnresolvedReason, basis_points_text, project_fitted_label,
+    replay_generation_id,
 };
 use binary_alpha_engine::features::{FeatureManifest, FittedEncoding, Kind, ProjectionKind, Value};
 use binary_alpha_engine::market::{Currency, format_event_time_micros};
@@ -214,6 +215,20 @@ fn replay_publishes_reconstructs_and_reuses() {
     assert_eq!(verify(&manifest_path).unwrap(), lines[1]);
     let manifest = ReplayManifest::from_json(&fs::read(&manifest_path).unwrap()).unwrap();
     assert_eq!(manifest.generation, replay_generation);
+    // Clean simulated history is keyed before simulating; a dirty build by its ledger.
+    let ledger = &manifest.objects[0];
+    assert_eq!(ledger.path, EVENTS_OBJECT_PATH);
+    let revision = env!("BINARY_ALPHA_CODE_REVISION");
+    let clean = revision != "unavailable" && !revision.ends_with("-dirty");
+    assert_eq!(
+        replay_generation,
+        replay_generation_id(
+            &manifest.config_hash,
+            revision,
+            &manifest.instruments,
+            (!clean).then_some(ledger.sha256.as_str()),
+        )
+    );
     assert_eq!(manifest.schema_version, REPLAY_SCHEMA_VERSION);
     assert_eq!(manifest.config_hash, config.content_hash());
     assert_eq!(manifest.code_revision, env!("BINARY_ALPHA_CODE_REVISION"));

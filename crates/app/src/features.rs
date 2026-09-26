@@ -19,6 +19,7 @@ use sha2::{Digest, Sha256};
 
 use binary_alpha_engine::config::{Config, FeatureInstrument, StreamKey};
 use binary_alpha_engine::dataset::{DatasetRole, GenerationManifest, ObjectRecord, ObjectRole};
+use binary_alpha_engine::execution::reusable_revision;
 use binary_alpha_engine::features::{
     FEATURE_MANIFEST_KIND, FEATURE_SCHEMA_VERSION, FeatureEngine, FeatureManifest, FeatureOutput,
     FeaturePlan, FeatureStreamSummary, FitWindow, FittedEncoding, PLAN_OBJECT_PATH, Readiness,
@@ -465,10 +466,6 @@ fn fit_request_digest(request: &FitRequest<'_>) -> String {
 
 fn fit_receipt_key(digest: &str) -> String {
     format!("features/fits/{digest}")
-}
-
-fn reusable_revision(revision: &str) -> bool {
-    revision != "unavailable" && !revision.ends_with("-dirty")
 }
 
 fn write_fit_receipt(
@@ -1459,20 +1456,13 @@ pub fn verify_feature(uri: &str, store: &Store, key: &str, bytes: &[u8]) -> Resu
 #[cfg(test)]
 mod tests {
     use super::{
-        FeatureParallelism, FitReceipt, FrozenRequest, check_frozen_ready, reusable_revision,
+        FeatureParallelism, FitReceipt, FrozenRequest, check_frozen_ready,
         verify_frozen_before_revision, write_fit_receipt,
     };
     use crate::store::Store;
     use binary_alpha_engine::dataset::GenerationManifest;
     use binary_alpha_engine::features::FeatureManifest;
     use binary_alpha_engine::research::Access;
-
-    #[test]
-    fn reuse_requires_a_unique_producer_revision() {
-        assert!(reusable_revision("358940f"));
-        assert!(!reusable_revision("358940f-dirty"));
-        assert!(!reusable_revision("unavailable"));
-    }
 
     #[test]
     fn dirty_revision_checks_existing_frozen_request_and_objects() {

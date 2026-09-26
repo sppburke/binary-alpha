@@ -1585,7 +1585,7 @@ mod governed {
     use binary_alpha_engine::dataset::{DatasetRole, GenerationManifest};
     use binary_alpha_engine::execution::{
         Comparator, Direction, EventKind, FinancialEvent, ReplayManifest, Threshold,
-        replay_generation_id, signal_logic_identity,
+        legacy_replay_generation_id, signal_logic_identity,
     };
     use binary_alpha_engine::features::{
         FeatureManifest, FeaturePlan, FittedEncoding, Kind, ProjectionKind, Value as FeatureValue,
@@ -2714,7 +2714,7 @@ mod governed {
         // The storage-only configuration copy resolves the same instruments. Reuse its
         // verified bindings rather than duplicate the application's private binding logic.
         let config_hash = config.content_hash();
-        let generation = replay_generation_id(&config_hash, &replay.instruments);
+        let generation = legacy_replay_generation_id(&config_hash, &replay.instruments);
         let root = local(&config.storage.publication_uri.to_string());
         let path = root.join(format!("manifests/{generation}/ready.json"));
         let bytes = fs::read(&path).unwrap_or_else(|error| {

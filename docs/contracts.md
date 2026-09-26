@@ -2090,15 +2090,21 @@ identity is SHA-256 over `binary-alpha engine state v1` and the JSON of the acco
 obligations, capacity, and sequence; the summary identity is SHA-256 over
 `binary-alpha engine summary v1` and the summary bytes.
 
-A replay generation's identity is SHA-256 over `binary-alpha engine replay v1`, the configuration
-hash, and each instrument's identity, tick generation, feature generation, plan identity, and
-outcome generation, one per line. Its objects, both role `normalized` under the content-addressed
+A replay generation's identity is SHA-256 over `binary-alpha engine replay v2` and, one per line,
+the version-one identity, the code revision, and the ledger's SHA-256; only simulated history
+from a build whose revision names its code (not `unavailable`, not `-dirty`) records `-` instead,
+because the rest determines its ledger, and only such a build resumes a completed replay without
+simulating. The version-one identity is SHA-256 over `binary-alpha engine replay v1`, the
+configuration hash, and each instrument's identity, tick generation, feature generation, plan
+identity, and outcome generation, one per line; generations published before the code revision
+joined the identity keep it. Its objects, both role `normalized` under the content-addressed
 create-once rules of dataset generations, are the ledger and the summary. The ready manifest at
 `manifests/GENERATION/ready.json`, published last and mirrored, records `kind` (`engine_replay`),
 `schema_version` (`1` for simulated history, `2` for broker-authoritative runs), `generation`, `role`, `config_hash`, `code_revision`, `availability`,
 `decision_start`, `decision_end`, `instruments`, `events`, `final_state_identity`,
-`summary_identity`, and `objects`; a manifest whose `generation` is not the identity of its
-`config_hash` and `instruments` is rejected. The command writes
+`summary_identity`, and `objects`; a manifest whose `generation` is not one of these identities of
+its `config_hash`, `code_revision`, `availability`, `instruments`, and recorded ledger is rejected.
+The command writes
 `replay ROLE generation GENERATION instruments N events E signals S accepted A settled T unresolved U objects 2 reused R`
 followed by `[load S simulate S publish S]` or `(already published)`, then the reconstruction line.
 Before the manifest becomes ready it reconstructs the generation from the published objects under
@@ -3007,8 +3013,8 @@ authorization to connect or purchase.
 `DeploymentManifest` has `kind = "live_deployment"`, `schema_version = 1`,
 `execution_contract`, `research`, `bundle_sha256`,
 `frozen`, `selection`, `policy`, `certification`, `definition`, `config_hash`, `code_revision`,
-`broker`, `account`, and `hash`. `definition` is the existing `replay_generation_id` of the derived
-definition. `hash` covers every other field under `binary-alpha live deployment v1\n`.
+`broker`, `account`, and `hash`. `definition` is `replay_generation_id` of the derived
+definition with `-` for the ledger. `hash` covers every other field under `binary-alpha live deployment v1\n`.
 `live run`/`live replay` publish `live/deployments/<hash>.json` after warm-up validation and before
 journal restoration and lease acquisition through `put_new`, reusing identical content.
 `--deployment-manifest URI` names this object. It binds source

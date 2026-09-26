@@ -1348,19 +1348,20 @@ fn terminal_claim_archival_interrupted() {
                 bytes
             })
             .collect::<Vec<_>>();
+        let ledger_sha256 = binary_alpha_engine::research::digest(b"", &ledger_bytes);
         assert!(
             !fixture
                 .scratch
                 .path("published")
-                .join(binary_alpha_engine::dataset::object_key(
-                    &binary_alpha_engine::research::digest(b"", &ledger_bytes)
-                ))
+                .join(binary_alpha_engine::dataset::object_key(&ledger_sha256))
                 .exists(),
             "{name}: ledger bytes published"
         );
         let generation = binary_alpha_engine::execution::replay_generation_id(
             &owner.definition.definition.config_hash,
+            &owner.definition.definition.code_revision,
             &owner.definition.definition.instruments,
+            Some(&ledger_sha256),
         );
         assert!(
             !fixture

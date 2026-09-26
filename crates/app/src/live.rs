@@ -268,7 +268,12 @@ pub fn definition(config: &Config) -> Result<LiveDefinition, String> {
         selection: source.selection.clone(),
         policy: source.policy.clone(),
         certification: source.certification.clone(),
-        definition: replay_generation_id(&definition.config_hash, &definition.instruments),
+        definition: replay_generation_id(
+            &definition.config_hash,
+            &definition.code_revision,
+            &definition.instruments,
+            None,
+        ),
         config_hash: definition.config_hash.clone(),
         code_revision: definition.code_revision.clone(),
         broker: settings.broker.to_string(),

@@ -162,6 +162,32 @@ fn live_replay_drives_recorded_log_to_receipt_and_final_manifest() {
         &ledger_manifest.generation,
         "ledger/events.jsonl",
     );
+    // The deployment and receipt bind the definition identity; the supplied ledger keys its own.
+    let definition = fixture.definition().definition;
+    let identity = |ledger| {
+        binary_alpha_engine::execution::replay_generation_id(
+            &definition.config_hash,
+            &definition.code_revision,
+            &definition.instruments,
+            ledger,
+        )
+    };
+    let deployment: Value = serde_json::from_slice(
+        &fs::read(
+            fixture
+                .scratch
+                .path("published/live/deployments")
+                .join(format!("{}.json", final_manifest.deployment)),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(deployment["definition"], identity(None));
+    assert_eq!(receipt["definition"], identity(None));
+    assert_eq!(
+        ledger_manifest.generation,
+        identity(Some(&research::digest(b"", &ledger)))
+    );
     let events: Vec<binary_alpha_engine::execution::FinancialEvent> = ledger
         .split(|b| *b == b'\n')
         .filter(|l| !l.is_empty())
