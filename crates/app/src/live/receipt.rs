@@ -620,7 +620,9 @@ pub fn compute(inputs: &Inputs<'_>) -> Receipt {
         deployment: inputs.deployment.into(),
         definition: binary_alpha_engine::execution::replay_generation_id(
             &inputs.definition.config_hash,
+            &inputs.definition.code_revision,
             &inputs.definition.instruments,
+            None,
         ),
         bundle_sha256: inputs.source.bundle_sha256.clone(),
         research: inputs.source.research.clone(),

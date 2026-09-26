@@ -46,6 +46,7 @@ pub const HISTORICAL_AVAILABILITY: &str = "provider_order_simulation";
 pub const MAX_SCALE: u8 = 18;
 
 const REPLAY_GENERATION_DOMAIN_V1: &[u8] = b"binary-alpha engine replay v1\n";
+const REPLAY_GENERATION_DOMAIN_V2: &[u8] = b"binary-alpha engine replay v2\n";
 const SIGNAL_LOGIC_DOMAIN_V1: &[u8] = b"binary-alpha signal logic v1\n";
 const DEPLOYMENT_DOMAIN_V1: &[u8] = b"binary-alpha deployment strategy v1\n";
 const STATE_DOMAIN_V1: &[u8] = b"binary-alpha engine state v1\n";
@@ -1433,9 +1434,43 @@ pub struct RunDefinition {
     pub instruments: Vec<InstrumentBinding>,
 }
 
-/// The identity of a replay generation: the configuration identity and every bound input and
-/// plan identity, under the engine definition's domain.
-pub fn replay_generation_id(config_hash: &str, instruments: &[InstrumentBinding]) -> String {
+/// Whether a build revision names its code: not `unavailable` and not a `-dirty` working tree.
+pub fn reusable_revision(revision: &str) -> bool {
+    revision != "unavailable" && !revision.ends_with("-dirty")
+}
+
+/// Whether a replay's configuration, inputs, and code revision determine its ledger: simulated
+/// history from a build whose revision names its code. Any other ledger keys its own identity.
+pub fn definition_determines_ledger(availability: &str, code_revision: &str) -> bool {
+    availability == HISTORICAL_AVAILABILITY && reusable_revision(code_revision)
+}
+
+/// The identity of a replay generation: the version-one identity, the code revision whose
+/// ledger it is, and the ledger's SHA-256, one per line. Only simulated history from a build
+/// whose revision names its code, where the rest determines the ledger, records `-` instead.
+pub fn replay_generation_id(
+    config_hash: &str,
+    code_revision: &str,
+    instruments: &[InstrumentBinding],
+    ledger: Option<&str>,
+) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(REPLAY_GENERATION_DOMAIN_V2);
+    for line in [
+        legacy_replay_generation_id(config_hash, instruments).as_str(),
+        code_revision,
+        ledger.unwrap_or("-"),
+    ] {
+        hasher.update(line.as_bytes());
+        hasher.update(b"\n");
+    }
+    crate::hex(&hasher.finalize())
+}
+
+/// The version-one identity of a replay generation: the configuration identity and every bound
+/// input and plan identity. Records published before the code revision joined the identity keep
+/// it.
+pub fn legacy_replay_generation_id(config_hash: &str, instruments: &[InstrumentBinding]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(REPLAY_GENERATION_DOMAIN_V1);
     hasher.update(config_hash.as_bytes());
@@ -6385,8 +6420,9 @@ impl ReplayManifest {
     }
 
     /// Parses a replay manifest and checks what every consumer relies on: the kind and schema,
-    /// a permitted role, a generation that matches the configuration and inputs, exactly the
-    /// ledger and summary objects, and content-addressed objects with unique paths.
+    /// a permitted role, a generation that matches the configuration, code revision, inputs, and
+    /// ledger, exactly the ledger and summary objects, and content-addressed objects with unique
+    /// paths.
     pub fn from_json(bytes: &[u8]) -> Result<Self, String> {
         Self::from_json_with(bytes, Access::ORDINARY)
     }
@@ -6422,10 +6458,33 @@ impl ReplayManifest {
                     format!("a replay generation never carries holdout data; {reason}")
                 })?;
         }
-        if manifest.generation != replay_generation_id(&manifest.config_hash, &manifest.instruments)
-        {
+        // Version one, this exact ledger, or simulated history from a build that names its code.
+        let ledger = manifest
+            .objects
+            .iter()
+            .find(|object| object.path == EVENTS_OBJECT_PATH)
+            .map(|object| object.sha256.as_str());
+        let identity = |ledger| {
+            replay_generation_id(
+                &manifest.config_hash,
+                &manifest.code_revision,
+                &manifest.instruments,
+                ledger,
+            )
+        };
+        let mut accepted = vec![legacy_replay_generation_id(
+            &manifest.config_hash,
+            &manifest.instruments,
+        )];
+        if let Some(ledger) = ledger {
+            accepted.push(identity(Some(ledger)));
+        }
+        if definition_determines_ledger(&manifest.availability, &manifest.code_revision) {
+            accepted.push(identity(None));
+        }
+        if !accepted.contains(&manifest.generation) {
             return Err(format!(
-                "generation `{}` does not match the configuration hash and bound inputs",
+                "generation `{}` does not match its configuration hash, code revision, and bound inputs",
                 manifest.generation
             ));
         }
@@ -6460,6 +6519,59 @@ mod tests {
 
     fn decimal(text: &str) -> Decimal {
         Decimal::parse(text).unwrap()
+    }
+
+    #[test]
+    fn replay_identity_binds_the_revision_and_ledger_and_keeps_version_one_valid() {
+        let identity = |revision, ledger| replay_generation_id("c", revision, &[], ledger);
+        let (ledger, summary) = ("a".repeat(64), "b".repeat(64));
+        assert_ne!(identity("r", None), identity("s", None));
+        assert_ne!(identity("r", None), identity("r", Some(&ledger)));
+        assert_ne!(identity("r", Some(&ledger)), identity("r", Some(&summary)));
+        let object = |path: &str, sha256: &str| {
+            serde_json::json!({"role":"normalized","path":path,"key":crate::dataset::object_key(sha256),
+                "bytes":1,"sha256":sha256})
+        };
+        let manifest = |generation: &str| {
+            serde_json::to_vec(&serde_json::json!({"kind":REPLAY_MANIFEST_KIND,
+                "schema_version":REPLAY_SCHEMA_VERSION,"generation":generation,"role":"development",
+                "config_hash":"c","code_revision":"r","availability":HISTORICAL_AVAILABILITY,
+                "decision_start":"2026-01-01T00:00:00Z","decision_end":"2026-01-02T00:00:00Z",
+                "instruments":[],"events":1,"final_state_identity":"f","summary_identity":"s",
+                "objects":[object(EVENTS_OBJECT_PATH, &ledger), object(SUMMARY_OBJECT_PATH, &summary)]}))
+            .unwrap()
+        };
+        for generation in [
+            legacy_replay_generation_id("c", &[]),
+            identity("r", None),
+            identity("r", Some(&ledger)),
+        ] {
+            ReplayManifest::from_json(&manifest(&generation)).unwrap();
+        }
+        for generation in [identity("s", None), identity("r", Some(&summary))] {
+            assert!(
+                ReplayManifest::from_json(&manifest(&generation))
+                    .unwrap_err()
+                    .contains("does not match")
+            );
+        }
+        // Without a revision that names its code, or for a supplied ledger, only the ledger keys it.
+        for (field, value) in [("code_revision", "r-dirty"), ("availability", "supplied")] {
+            let revision = if field == "code_revision" { value } else { "r" };
+            for (generation, valid) in [
+                (identity(revision, None), false),
+                (identity(revision, Some(&ledger)), true),
+            ] {
+                let mut bytes: serde_json::Value =
+                    serde_json::from_slice(&manifest(&generation)).unwrap();
+                bytes[field] = value.into();
+                let parsed = ReplayManifest::from_json(&serde_json::to_vec(&bytes).unwrap());
+                assert_eq!(parsed.is_ok(), valid, "{field} {generation}");
+            }
+        }
+        assert!(reusable_revision("358940f"));
+        assert!(!reusable_revision("358940f-dirty"));
+        assert!(!reusable_revision("unavailable"));
     }
 
     #[test]

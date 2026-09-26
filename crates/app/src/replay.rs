@@ -18,7 +18,8 @@ use binary_alpha_engine::execution::{
     ColumnSpec, EVENTS_OBJECT_PATH, Engine, EventKind, EventSource, FinancialEvent,
     HISTORICAL_AVAILABILITY, InstrumentBinding, Observation, REPLAY_MANIFEST_KIND,
     REPLAY_SCHEMA_VERSION, REPLAY_SCHEMA_VERSION_BROKER, ReplayManifest, RunDefinition,
-    SUMMARY_OBJECT_PATH, SettlementRule, StreamColumns, replay_generation_id,
+    SUMMARY_OBJECT_PATH, SettlementRule, StreamColumns, definition_determines_ledger,
+    replay_generation_id,
 };
 use binary_alpha_engine::features::{FeaturePlan, StreamPlan, Value};
 use binary_alpha_engine::market::parse_event_time_micros;
@@ -647,9 +648,18 @@ pub(crate) fn publish(
         replay: settings.clone(),
         instruments: bound.iter().map(|bound| bound.binding.clone()).collect(),
     };
-    let generation = replay_generation_id(&definition.config_hash, &definition.instruments);
+    let generation = replay_generation_id(
+        &definition.config_hash,
+        &definition.code_revision,
+        &definition.instruments,
+        None,
+    );
     let key = manifest_key(&generation);
-    if resume && destination.head(&key)?.is_some() {
+    // Only a replay its definition determines is ever reused.
+    if resume
+        && definition_determines_ledger(&definition.availability, &definition.code_revision)
+        && destination.head(&key)?.is_some()
+    {
         let mut bytes = Vec::new();
         destination.read_to(&key, None, &mut bytes)?;
         let uri = destination.uri(&key);
@@ -764,6 +774,8 @@ pub fn publish_ledger(
     .map(|published| published.manifest)
 }
 
+/// Publishes a finished ledger under its generation's identity, which includes the ledger's
+/// SHA-256 unless the definition determines the ledger.
 fn publish_completed(
     engine: Engine,
     events_file: std::path::PathBuf,
@@ -773,9 +785,15 @@ fn publish_completed(
     simulated: std::time::Duration,
     access: Access<'_>,
 ) -> Result<Published, String> {
+    let publishing = Instant::now();
+    let events = store::identify(&events_file)?;
+    let definition = engine.definition();
     let generation = replay_generation_id(
-        &engine.definition().config_hash,
-        &engine.definition().instruments,
+        &definition.config_hash,
+        &definition.code_revision,
+        &definition.instruments,
+        (!definition_determines_ledger(&definition.availability, &definition.code_revision))
+            .then_some(events.sha256.as_str()),
     );
     let key = manifest_key(&generation);
     let summary = engine.summary().clone();
@@ -784,11 +802,7 @@ fn publish_completed(
     let files = [events_file, summary_file.finish()?];
 
     // Publish both objects, then the manifest last, and mirror it locally.
-    let publishing = Instant::now();
-    let identities: Vec<ObjectIdentity> = files
-        .iter()
-        .map(|path| store::identify(path))
-        .collect::<Result<_, _>>()?;
+    let identities: Vec<ObjectIdentity> = vec![events, store::identify(&files[1])?];
     let mut objects: Vec<ObjectRecord> = [EVENTS_OBJECT_PATH, SUMMARY_OBJECT_PATH]
         .iter()
         .zip(&identities)
