@@ -2474,7 +2474,8 @@ and manifests), and `search` (the `search` table's settings with its development
 `decision_start` and `decision_end` and without inputs or evaluation)); `folds` (each `cutoff`,
 `decision_start`, `decision_end`, and one `{ fit_manifest, assessment_manifest }` per instrument
 in instrument order); `refit` (`cutoff` and one development fit observation generation per instrument);
-`evaluation` and `holdout` (each an evaluation window: `decision_start`, `decision_end`, one
+`evaluation` and `holdout` (each an evaluation window starting at least the embargo after the
+refit cutoff and after every fold's `decision_end`: `decision_start`, `decision_end`, one
 observation generation per instrument, optional `splits`; holdout references are validated for syntax
 and declared role only and are never opened before certification); `portfolio` (exactly the
 `portfolio` table without families, folds, refit, and evaluation; a member's family index is its

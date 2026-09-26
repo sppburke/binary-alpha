@@ -2229,8 +2229,8 @@ fn later_role_evidence_and_ill_formed_inputs_are_refused_before_output() {
     assert!(error.contains("not before the cutoff"), "{error}");
     assert_eq!(snapshot(&scratch), before);
 
-    // A family discovered on data not known before every fold and refit cutoff is refused
-    // before any output: every assessment follows the data its members were found on.
+    // A family discovered on data not known before every fold cutoff is refused before any
+    // output: every fold follows the data its members were found on.
     let late = development(
         &scratch,
         "late",
