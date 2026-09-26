@@ -67,6 +67,17 @@ pub fn run(config_path: &Path, out: &mut dyn Write) -> Result<(), String> {
 // Binding on manifest bytes
 // ----------------------------------------------------------------------------------------------
 
+/// When the last observation of `input` is known: its event time, or its bar's end.
+fn known_at(field: &str, input: &GenerationManifest) -> Result<i64, String> {
+    let last_event = parse_event_time_micros(&input.coverage.last_event_time)?;
+    match input.native_granularity {
+        NativeGranularity::Tick => Ok(last_event),
+        NativeGranularity::Bar { period_seconds } => last_event
+            .checked_add(i64::from(period_seconds) * 1_000_000)
+            .ok_or_else(|| format!("{field}: the last bar end overflows")),
+    }
+}
+
 /// One resolved fit whose whole fitting coverage ends before `cutoff`.
 fn bind_fit(
     field: &str,
@@ -76,13 +87,7 @@ fn bind_fit(
 ) -> Result<features::Resolved, String> {
     let resolved =
         features::resolve(entry, access).map_err(|reason| format!("{field}: {reason}"))?;
-    let last_event = parse_event_time_micros(&resolved.input().coverage.last_event_time)?;
-    let known_at = match resolved.input().native_granularity {
-        NativeGranularity::Tick => last_event,
-        NativeGranularity::Bar { period_seconds } => last_event
-            .checked_add(i64::from(period_seconds) * 1_000_000)
-            .ok_or_else(|| format!("{field}.input_manifest: fitting bar end overflows"))?,
-    };
+    let known_at = known_at(&format!("{field}.input_manifest"), resolved.input())?;
     if known_at >= cutoff {
         let coverage = format_event_time_micros(known_at);
         return Err(format!(
@@ -91,6 +96,34 @@ fn bind_fit(
         ));
     }
     Ok(resolved)
+}
+
+/// Walk-forward: the development generation a family is discovered on is known strictly before
+/// every fold cutoff, so every fold assesses only data after what chose its members.
+pub(crate) fn discovered_before<'a>(
+    field: &str,
+    source: &ManifestUri,
+    cutoffs: impl IntoIterator<Item = &'a str>,
+    access: Access<'_>,
+) -> Result<(), String> {
+    let (_, input, _) = outcomes::bind_tick(
+        field,
+        DatasetRole::Development,
+        source,
+        "a portfolio selection",
+        access,
+    )?;
+    let known = known_at(field, &input)?;
+    for cutoff in cutoffs {
+        if known >= parse_event_time_micros(cutoff)? {
+            return Err(format!(
+                "{field}: discovery generation {} is known at {}, not before the fold cutoff {cutoff}; every fold must follow the data its members were found on",
+                input.generation,
+                format_event_time_micros(known)
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// One instrument's bound fold inputs.
@@ -647,6 +680,25 @@ pub(crate) fn select(
     check_generated(settings, &families, access)?;
     let members = engine::logical_members(settings, &families)?;
     let bound = bind(settings, access)?;
+    // Walk-forward: every family's discovery is dated strictly before every fold cutoff.
+    for (index, family) in families.iter().enumerate() {
+        let field = format!("families[{index}]");
+        let input = &family.search.development.inputs[0];
+        let (_, feature) =
+            features::feature_manifest(&field, &input.feature_manifest.to_string(), access)?;
+        if let Some(frozen_from) = &feature.frozen_from {
+            return Err(format!(
+                "{field}: development feature generation {} applies a plan frozen from generation {frozen_from}, so its fit cannot be dated against the folds",
+                feature.generation
+            ));
+        }
+        discovered_before(
+            &field,
+            &input.tick_manifest,
+            settings.folds.iter().map(|fold| fold.cutoff.as_str()),
+            access,
+        )?;
+    }
     let mut choices = choices(settings, &members)?;
     let declared = engine::declared_count(settings)?;
     let rejected = choices

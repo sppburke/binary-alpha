@@ -718,9 +718,18 @@ fn develop(
     let started = Instant::now();
 
     // 1. Every declared input is permitted in its declared role before any read; the
-    //    predecessors exist under this governance root; the attempt intent is published.
+    //    predecessors exist under this governance root; every source is known before every
+    //    fold cutoff; the attempt intent is published.
     let populations = study.permit_inputs()?;
     study.check_predecessors()?;
+    for (index, instrument) in research.instruments.iter().enumerate() {
+        portfolio::discovered_before(
+            &format!("instruments[{index}].source_manifest"),
+            &instrument.source_manifest,
+            research.folds.iter().map(|fold| fold.cutoff.as_str()),
+            access,
+        )?;
+    }
     let intent = Intent {
         schema_version: RECORD_SCHEMA_VERSION,
         study: research.study.study.clone(),

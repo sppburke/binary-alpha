@@ -390,6 +390,20 @@ pub fn validate(portfolio: &Portfolio) -> Result<(), String> {
             &evaluation.decision_end,
             portfolio.embargo_micros,
         )?;
+        // Walk-forward: the outer window follows every fold that chose the policy.
+        let start = time("evaluation.decision_start", &evaluation.decision_start)?;
+        for (index, fold) in portfolio.folds.iter().enumerate() {
+            let end = time(&format!("folds[{index}].decision_end"), &fold.decision_end)?;
+            if start
+                .checked_sub(end)
+                .is_none_or(|gap| gap < portfolio.embargo_micros)
+            {
+                return Err(format!(
+                    "evaluation.decision_start: {} begins less than the embargo after folds[{index}].decision_end",
+                    evaluation.decision_start
+                ));
+            }
+        }
         if evaluation.inputs.is_empty() {
             return Err("evaluation.inputs: at least one instrument input is required".to_string());
         }

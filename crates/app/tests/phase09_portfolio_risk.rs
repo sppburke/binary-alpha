@@ -1960,6 +1960,12 @@ fn interval_ordinals_follow_each_fold_fit() {
     assert_ne!(moved.outer, selection.outer);
 
     // Collapsed cuts (one distinct volume) make the choice inapplicable for that required fold.
+    // The evaluation follows the third fold, and its manifest does not exist: neither an
+    // infeasible selection nor a failed refit ever reads it.
+    let absent = scratch.path(&format!(
+        "published/manifests/{}/ready.json",
+        "0".repeat(64)
+    ));
     let three_folds = format!(
         "{two_folds}{}",
         fold_toml(
@@ -1975,8 +1981,8 @@ fn interval_ordinals_follow_each_fold_fit() {
             &three_folds,
             BASE_MS + 4 * HOUR_MS,
             &refit,
-            BASE_MS + 6 * HOUR_MS,
-            &evaluation,
+            BASE_MS + 10 * HOUR_MS,
+            &absent,
             32768,
             false,
         ),
@@ -2023,12 +2029,6 @@ fn interval_ordinals_follow_each_fold_fit() {
 
     // A final refit whose cuts collapse is terminal without a deployable selection; it does not
     // choose the next-ranked policy, and no outer evaluation is read.
-    // The evaluation manifest of this configuration does not exist: a failed refit never reads
-    // it.
-    let absent = scratch.path(&format!(
-        "published/manifests/{}/ready.json",
-        "0".repeat(64)
-    ));
     let refit_config = scratch.config(
         "portfolio_ordinals_refit.toml",
         &table(
@@ -2228,6 +2228,68 @@ fn later_role_evidence_and_ill_formed_inputs_are_refused_before_output() {
     let error = optimize(&scratch, &crossing).unwrap_err();
     assert!(error.contains("not before the cutoff"), "{error}");
     assert_eq!(snapshot(&scratch), before);
+
+    // A family discovered on data not known before every fold and refit cutoff is refused
+    // before any output: every assessment follows the data its members were found on.
+    let late = development(
+        &scratch,
+        "late",
+        BASE_MS + 2 * HOUR_MS,
+        &recipe(PLANTED),
+        false,
+    );
+    let (late_family, _) = family(
+        &scratch,
+        "late",
+        &late,
+        BASE_MS + 2 * HOUR_MS,
+        DIRECTION_MENU,
+        "",
+    );
+    let late_tick = GenerationManifest::from_json(&fs::read(&late.tick).unwrap()).unwrap();
+    let before = snapshot(&scratch);
+    let discovered = scratch.config("portfolio_late.toml", &table(&late_family, &fold));
+    let error = optimize(&scratch, &discovered).unwrap_err();
+    assert!(
+        error.contains(&format!(
+            "families[0]: discovery generation {} is known at {}, not before the fold cutoff {}",
+            generation_of(&late.tick),
+            late_tick.coverage.last_event_time,
+            cutoff(BASE_MS)
+        )),
+        "{error}"
+    );
+    assert_eq!(snapshot(&scratch), before);
+
+    // A family on the early slice whose plan was fitted on the later slice and applied frozen
+    // cannot be dated against the folds and is refused before any output.
+    let frozen_feature = build_features(
+        &scratch,
+        "frozen",
+        "development",
+        &dev.tick,
+        &late.profile,
+        &format!("frozen_plan = \"{}\"\n", manifest_uri(&late.feature)),
+    );
+    let frozen = Development {
+        tick: dev.tick.clone(),
+        profile: late.profile.clone(),
+        outcome: build_outcomes(&scratch, "frozen", &dev.tick, &frozen_feature),
+        feature: frozen_feature,
+    };
+    let (frozen_family, _) = family(&scratch, "frozen", &frozen, BASE_MS, DIRECTION_MENU, "");
+    let before = snapshot(&scratch);
+    let refrozen = scratch.config("portfolio_frozen.toml", &table(&frozen_family, &fold));
+    let error = optimize(&scratch, &refrozen).unwrap_err();
+    assert!(
+        error.contains(&format!(
+            "families[0]: development feature generation {} applies a plan frozen from generation {}",
+            generation_of(&frozen.feature),
+            generation_of(&late.feature)
+        )),
+        "{error}"
+    );
+    assert_eq!(snapshot(&scratch), before);
     let early = scratch.config(
         "portfolio_early.toml",
         &table(&family_manifest, &fold).replace(
@@ -2242,6 +2304,22 @@ fn later_role_evidence_and_ill_formed_inputs_are_refused_before_output() {
     assert!(
         error.contains("folds[0].decision_start")
             && error.contains("begins less than the embargo after the cutoff"),
+        "{error}"
+    );
+    // An evaluation that begins inside a fold's assessment is refused by configuration
+    // validation: the outer window follows every fold that chose the policy.
+    let inside = scratch.config(
+        "portfolio_inside.toml",
+        &format!(
+            "{}{}",
+            table(&family_manifest, &fold),
+            evaluation_toml(BASE_MS + HOUR_MS, &assessment)
+        ),
+    );
+    let error = command(&["config", "validate", "--config", inside.to_str().unwrap()]).unwrap_err();
+    assert!(
+        error.contains("evaluation.decision_start")
+            && error.contains("begins less than the embargo after folds[0].decision_end"),
         "{error}"
     );
     let reversed = scratch.config(

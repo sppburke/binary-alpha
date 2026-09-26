@@ -2317,7 +2317,7 @@ nonempty ordered list of `deployments`, one `member`, `repair` and `binding` ind
 each one development `fit` entry in the `features.instruments` form without a frozen plan and one
 `assessment_manifest` development observation generation under the [outcome binding](#outcomes)),
 the `refit` (a `cutoff` and nonempty development `fits`) and the optional `evaluation` (a window at least the embargo after the refit
-cutoff, nonempty `inputs` evaluation observation manifests and optional `splits`). The declared count,
+cutoff and after every fold's `decision_end`, nonempty `inputs` evaluation observation manifests and optional `splits`). The declared count,
 computed with checked arithmetic as the sum over subsets of the product of each deployment's
 alternative count, times the number of risk policies, must neither overflow nor exceed
 `max_policies`; the embargo must be at least every alternative's duration plus its permitted
@@ -2336,7 +2336,12 @@ Standalone `portfolio optimize` always uses explicit members and subsets; it doe
 Every declared development input is read on its manifest bytes before any output exists: a fit
 resolves through the feature owner and its last observation must be known strictly before its
 cutoff under the [outcome binding](#outcomes); an assessment observation generation must carry the
-development role (holdout is refused) and the fit's instrument; every binding's instrument must have one input in every fold and in the refit. The
+development role (holdout is refused) and the fit's instrument; every binding's instrument must have one input in every fold and in the refit.
+Folds are walk-forward: each family's development observation generation, the data its members
+were found on, must be known strictly before every fold cutoff under the same rule, and its
+development feature generation must fit its own plan rather than apply one frozen from another
+generation, whose fit could not be dated; so every fold assesses only data after the discovery,
+and the evaluation window follows every fold. The
 optional evaluation inputs are not read at all until selection and refit succeed; only then are
 their manifests read for role and instrument and their objects opened. Each family is read through
 the typed development-only reader: every manifest input must be development before `family.json`
@@ -2462,7 +2467,8 @@ identifiers, `governance_manifest` as `file:///DIR/FILE.json` or `gs://BUCKET/KE
 declaration object, optional `predecessors` attempt identifiers other than the attempt itself,
 and the non-empty declared `changes`); the ordered `instruments` (each `instrument` as
 `BROKER:PROVIDER_SYMBOL` mapping one configured `[[instruments]]` entry, `source_manifest` (the
-development family-source observation generation under the [outcome binding](#outcomes)),
+development family-source observation generation under the [outcome binding](#outcomes), known
+strictly before every fold cutoff; the run checks this before it publishes the attempt intent),
 `features` (exactly the optional new-plan settings of a `[[features.instruments]]` entry), `outcomes` (exactly the `outcomes` table without its role
 and manifests), and `search` (the `search` table's settings with its development
 `decision_start` and `decision_end` and without inputs or evaluation)); `folds` (each `cutoff`,
