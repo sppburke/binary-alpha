@@ -1064,10 +1064,10 @@ fn window_minimum(per_day: Decimal, window_micros: i64) -> Result<u64, String> {
     u64::try_from(scaled.div_ceil(unit)).map_err(|_| overflow())
 }
 
-/// The fewest of `decisive` wins whose exact upper tail at `break_even` is at most `limit`, or
-/// one more than `decisive` when none is. The tail never increases as wins increase.
+/// The fewest of `decisive` wins, at least one, whose exact upper tail at `break_even` is at most
+/// `limit`, or one more than `decisive` when none is. The tail never increases as wins increase.
 fn required_wins(decisive: u64, break_even: f64, limit: f64) -> u64 {
-    let (mut low, mut high) = (0, decisive + 1);
+    let (mut low, mut high) = (1, decisive + 1);
     while low < high {
         let wins = low + (high - low) / 2;
         if crate::search::upper_tail(wins, decisive - wins, break_even) <= limit {
@@ -1729,6 +1729,8 @@ mod tests {
         // A lower payout raises the break-even and so the wins required.
         assert_eq!(required_wins(65, 1.0 / 1.87, 0.0493), 42);
         assert_eq!(required_wins(3, break_even, 0.0493), 4);
+        // A limit just below one that rounds to one still requires a win.
+        assert_eq!(required_wins(10, break_even, 1.0), 1);
     }
 
     #[test]

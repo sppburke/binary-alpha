@@ -2034,6 +2034,10 @@ fn wide_research_nested_policies_resolve_window_gates_through_certification() {
     // The planted policy loses money under the fixture's stress terms; the gates under test are
     // the decisive ones.
     research.qualification.gates.min_profit = decimal("-1000");
+    // Fold, evaluation, and holdout decide over 640, 800, and 960 seconds.
+    for (window, candles) in [(&mut research.evaluation, 8), (&mut research.holdout, 16)] {
+        window.decision_end = time(micros(&window.decision_end).unwrap() + candles * CANDLE);
+    }
     fixture.save();
     let report = fixture.run().unwrap();
     let (_, run) = fixture.run_record();
@@ -2056,7 +2060,7 @@ fn wide_research_nested_policies_resolve_window_gates_through_certification() {
     }
 
     let research = fixture.config.research.as_ref().unwrap();
-    // 540 per day over each 640-second window is exactly 4 decisive trades.
+    // 540 per day is exactly 4, 5, and 6 decisive trades over 640, 800, and 960 seconds.
     let minimum = |start: &str, end: &str| {
         let window = u128::try_from(micros(end).unwrap() - micros(start).unwrap()).unwrap();
         u64::try_from((540 * window).div_ceil(86_400_000_000)).unwrap()
@@ -2120,6 +2124,7 @@ fn wide_research_nested_policies_resolve_window_gates_through_certification() {
         &research.evaluation.decision_start,
         &research.evaluation.decision_end,
     );
+    assert_eq!(evaluation, 5);
     for result in &run.outer {
         check(
             &result.outer.projection,
@@ -2135,6 +2140,7 @@ fn wide_research_nested_policies_resolve_window_gates_through_certification() {
         &research.holdout.decision_start,
         &research.holdout.decision_end,
     );
+    assert_eq!(holdout, 6);
     for result in &record.scenarios {
         check(
             &result.outer.projection,

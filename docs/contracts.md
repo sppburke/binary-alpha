@@ -2379,11 +2379,12 @@ insufficient evidence, even when ties satisfy `min_settled`. The minimum is `min
 with `min_decisive_per_day` the larger of it and `ceil(min_decisive_per_day × window / 1 day)`
 over the gated replay's own decision window, recorded as `decisive_minimum`. With sufficient
 decisive trades, `wins / (wins + losses)` below `min_win_rate` fails the economic gate using exact
-decimal comparison. With `max_false_pass`, `required_wins` records the fewest of the `n` decisive
-trades whose exact binomial upper tail at the largest break-even of the replay's contracts is at
-most the limit, or `n + 1` when none is; fewer wins fail the economic gate. Folds, the outer
-evaluation, certification, and every scenario resolve the same gates against their own window
-and contracts. Without decisive gates, these values are absent from the projection record.
+decimal comparison. With `max_false_pass`, `required_wins` records the fewest wins, at least one,
+of the `n` decisive trades whose exact binomial upper tail at the largest break-even of the
+replay's contracts is at most the limit, or `n + 1` when none is; fewer wins fail the economic
+gate. Folds resolve the portfolio gates, and the outer evaluation, certification, and every
+scenario the qualification gates, each against its own window and contracts. Without decisive
+gates, these values are absent from the projection record.
 
 Only a selected choice is refitted: each refit fit builds a new plan on the full permitted
 development generation and the choice re-resolves under it; an inapplicable refit is terminal
@@ -2420,7 +2421,7 @@ selection; the rerun reuses them and recomputes the rest. A schema-2 selection s
 resolved source members, each keyed by its retained `global_index`; schema-1 selections retain
 their all-member source records and remain readable. A generated schema-2 selection also records
 the declared `generate` rule in its resolved configuration. Before folds, selection and its
-verifier re-derive the complete ordered members and singleton subsets from verified development
+verifier re-derive the complete ordered members and singleton or nested subsets from verified development
 families, ranks, fitted interval edges, bindings, and condition-free repair zero, and require exact
 equality with that configuration, including an empty resolution. `data verify` on a selection checks
 the recorded configuration's hash and schema against the manifest, re-reads the families through
@@ -2488,7 +2489,7 @@ portfolio declarations are validated before search. After every development fami
 the portfolio owner takes up to `top` passing members in rank order per instrument, skipping a
 member unless each development-fifths threshold identifies exactly one low-to-high interval
 through the fitted edges and retained `interval_label`. Each generated member uses its schema-2
-global index and the derived ordinals. Its singleton subset uses repair zero and exactly one
+global index and the derived ordinals. Its deployment uses repair zero and exactly one
 binding on that instrument with a sole alternative equal to the ranked contract and search
 envelope; zero or multiple matching bindings fail. The fully resolved portfolio is validated
 before folds. When no member is eligible, generated members and subsets are both empty, so the
