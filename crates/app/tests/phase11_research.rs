@@ -2170,6 +2170,56 @@ fn false_pass_gates_reject_scenario_terms_without_a_break_even_before_any_read()
 }
 
 #[test]
+fn false_pass_gates_resolve_the_strictest_deployed_break_even() {
+    use binary_alpha_engine::search::{null_rate, upper_tail};
+    const LIMIT: f64 = 0.9;
+    let mut fixture = Fixture::new("phase11_strictest_break_even");
+    let research = fixture.config.research.as_mut().unwrap();
+    research.portfolio.gates.max_false_pass = Some(decimal(&LIMIT.to_string()));
+    fixture.save();
+    let report = fixture.run().unwrap();
+    let (_, run) = fixture.run_record();
+    let selection = fixture.selection(&run);
+    let settings = selection.config.portfolio.as_ref().unwrap();
+    let boundary = |decisive: u64, break_even: f64| {
+        (1..=decisive)
+            .find(|&wins| upper_tail(wins, decisive - wins, break_even) <= LIMIT)
+            .unwrap_or(decisive + 1)
+    };
+    // The small and large alternatives break even at 1/1.8 and 2.05/3.6, so a two-deployment
+    // choice that mixes them must resolve its wins at the larger.
+    let mut distinguished = false;
+    for choice in &selection.choices {
+        let break_evens: Vec<f64> = settings.subsets[choice.subset]
+            .deployments
+            .iter()
+            .zip(&choice.alternatives)
+            .map(|(deployment, &alternative)| {
+                let contract = &settings.bindings[deployment.binding].alternatives[alternative];
+                null_rate(&contract.contract).unwrap().break_even
+            })
+            .collect();
+        let strictest = break_evens.iter().copied().fold(0.0, f64::max);
+        for projection in choice
+            .folds
+            .iter()
+            .filter_map(|fold| fold.projection.as_ref())
+        {
+            let decisive = projection.wins.unwrap() + projection.losses.unwrap();
+            assert_eq!(
+                projection.required_wins,
+                Some(boundary(decisive, strictest)),
+                "{projection:?}"
+            );
+            distinguished |= break_evens
+                .iter()
+                .any(|&break_even| boundary(decisive, break_even) != boundary(decisive, strictest));
+        }
+    }
+    assert!(distinguished, "{report}");
+}
+
+#[test]
 fn generated_top_syntax_fails_before_search_or_any_store_read() {
     let fixture = generated_fixture("phase11_generated_top_zero", 0);
     let error = fixture.run().unwrap_err();
