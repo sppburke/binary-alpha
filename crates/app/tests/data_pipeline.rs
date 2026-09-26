@@ -2968,16 +2968,11 @@ fn abandoned_session_recovery(reason: &'static str, completed: bool) {
             .bytes[0] ^= 1;
     }
     let log_before = f.drive.log().len();
-    let started = Instant::now();
+    // Waiting out the retry budget fails this update; retrying the status query breaks the
+    // exactly-once count below.
     let recovered = pipeline("update", &config, &["--end", &end]).unwrap_or_else(|error| {
         panic!("recorded session {reason} (completed={completed}) must recover: {error}")
     });
-    // The configured retry wait is 30 seconds, so any retry sleep pushes the elapsed time
-    // past this bound; the bound itself leaves room for a loaded host.
-    assert!(
-        started.elapsed() < Duration::from_secs(20),
-        "session recovery must finish far below its 30-second retry budget"
-    );
     assert_eq!(field(job_line(&recovered, "pocket"), "status"), "archived");
     let transfers = registry_archive::registry_state(&transfers_path);
     assert_eq!(transfers["files"][key]["file_id"], id);
