@@ -2734,16 +2734,33 @@ fn research_fit_cutoff_requires_observations_known_strictly_before_it() {
                 fixture.save();
                 if offset <= 0 {
                     let error = fixture.run().unwrap_err();
-                    let field = if refit {
-                        "refit.fits[0]"
+                    // The fold fits the family's own source, so the walk-forward rule refuses
+                    // the source before the fold's fit is bound.
+                    let expected = if refit {
+                        format!(
+                            "refit.fits[0].input_manifest: the fitting coverage of generation {generation} ends at {}, not before the cutoff",
+                            time(known_at)
+                        )
                     } else {
-                        "folds[0].inputs[0].fit"
+                        format!(
+                            "instruments[0].source_manifest: discovery generation {generation} is known at {}, not before the fold cutoff {}; every fold must follow the data its members were found on",
+                            time(known_at),
+                            time(known_at + offset)
+                        )
                     };
-                    let expected = format!(
-                        "{field}.input_manifest: the fitting coverage of generation {generation} ends at {}, not before the cutoff",
-                        time(known_at)
-                    );
                     assert_eq!(error.trim_end(), format!("research: {expected}"));
+                    let study = &fixture.config.research.as_ref().unwrap().study;
+                    assert_eq!(
+                        fixture
+                            .governance_path(
+                                &fixture
+                                    .declaration
+                                    .key(&research::intent_key(&study.study, &study.attempt))
+                            )
+                            .exists(),
+                        refit,
+                        "the source is refused before the attempt intent is published"
+                    );
                     println!("cutoff bars {bars} refit {refit} offset {offset}: {error}");
                 } else {
                     let report = fixture.run().unwrap();
@@ -4599,6 +4616,18 @@ fn research_configuration_is_validated_before_any_read() {
     bad.research.as_mut().unwrap().instruments[0].source_manifest =
         bad.research.as_ref().unwrap().holdout.inputs[0].clone();
     cases.push((bad, "is declared `holdout`, not `development`"));
+    // A holdout inside the fold is refused even when it follows the refit cutoff: every outer
+    // window follows every fold that chose the policy.
+    let mut bad = original.clone();
+    let research = bad.research.as_mut().unwrap();
+    research.refit.cutoff = research.folds[0].cutoff.clone();
+    research.holdout.decision_start = research.folds[0].decision_start.clone();
+    research.holdout.decision_end = research.folds[0].decision_end.clone();
+    research.holdout.splits = None;
+    cases.push((
+        bad,
+        "holdout.evaluation.decision_start: 2026-01-05T01:00:20.000000Z begins less than the embargo after folds[0].decision_end",
+    ));
     for (i, (config, message)) in cases.into_iter().enumerate() {
         let path = fixture.scratch.path(&format!("invalid-{i}.toml"));
         write(&path, config.canonical_toml());

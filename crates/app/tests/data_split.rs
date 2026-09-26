@@ -361,9 +361,10 @@ fn research_consumes_slices(
     let published = scratch.path("published");
     let reference = |index: usize| uri(&published, &declaration.populations[index].id).to_string();
     for i in 0..2 {
-        r["instruments"][i]["source_manifest"] = reference(i * 5).into();
+        // Walk-forward: the family is found on the fold-fit slice, before the fold.
+        r["instruments"][i]["source_manifest"] = reference(i * 5 + 1).into();
         r["instruments"][i]["search"]["decision_start"] = time(BASE - DAY_MICROS).into();
-        r["instruments"][i]["search"]["decision_end"] = time(BASE + 5 * DAY_MICROS).into();
+        r["instruments"][i]["search"]["decision_end"] = time(BASE + 2 * DAY_MICROS).into();
         r["folds"][0]["inputs"][i]["fit_manifest"] = reference(i * 5 + 1).into();
         r["folds"][0]["inputs"][i]["assessment_manifest"] = reference(i * 5 + 2).into();
         r["refit"]["fits"][i] = reference(i * 5).into();
@@ -878,9 +879,10 @@ fn bar_split_research_keeps_midnight_decisions_and_preceding_reporting_split() {
         let reference =
             |slot: usize| uri(&published, &declaration.populations[index * 5 + slot].id);
         let instrument = &mut research.instruments[index];
-        instrument.source_manifest = reference(0);
+        // Walk-forward: the family is found on the fold-fit day, before the fold.
+        instrument.source_manifest = reference(1);
         instrument.search.decision_start = time(BASE);
-        instrument.search.decision_end = time(BASE + 2 * DAY_MICROS + 1_000_000);
+        instrument.search.decision_end = time(BASE + DAY_MICROS + 1_000_000);
         instrument.search.conditions = serde_json::from_value(serde_json::json!([{
             "stream":{"duration_seconds":20,"offset_seconds":0},
             "output":"candle_direction","comparator":"eq","thresholds":["up"]
@@ -986,7 +988,7 @@ fn bar_split_research_keeps_midnight_decisions_and_preceding_reporting_split() {
         .iter()
         .find(|chunk| chunk.role == "development")
         .unwrap();
-    terminal_signal(&development_replay.generation, BASE + 2 * DAY_MICROS, None);
+    terminal_signal(&development_replay.generation, BASE + DAY_MICROS, None);
     let development_summary = binary_alpha_engine::execution::Summary::from_json(&object(
         &published,
         &development_replay.generation,
