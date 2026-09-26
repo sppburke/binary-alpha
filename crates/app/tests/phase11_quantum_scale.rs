@@ -33,7 +33,7 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 const RESOURCES: &[u8] = include_bytes!("../../../configs/study_p_resources.toml");
-const RESOURCES_SHA256: &str = "503bae0039ecb0d94d03dc4ec8d113f532996fe9b98260fdbeb39f30367b4572";
+const RESOURCES_SHA256: &str = "09a7976b6cacd2c5efea2895a155898b50fc54012342df026786a82c223c37b1";
 const DAYS: i64 = 493;
 const BARS_PER_DAY: usize = 17_280;
 const OPERATOR: &str = "synthetic-quantum-operator";

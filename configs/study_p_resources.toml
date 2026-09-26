@@ -5,16 +5,16 @@ max_elapsed_seconds = 14400
 max_process_swap_kb = 0
 base_bar_seconds = 5
 streams_seconds = [5, 15, 30, 60, 300, 900, 3600]
-# The measured synthetic plan generated rules on 5 s and 15 s while features built all seven streams.
-generated_streams_seconds = [5, 15]
+# Rules on 5 s, 15 s, and 30 s resolve 1,676 synthetic conditions, dominating Study P's real 1,309.
+generated_streams_seconds = [5, 15, 30]
 expiries_seconds = [30, 45, 60, 90, 120, 180, 240, 300]
 
 [search]
 rolling_windows = [4, 8, 16, 32]
 moving_average_periods = [8, 21, 50]
 max_labels = 32
-# The measured 1,127 conditions produced 16 × C(1127, 2) = 10,152,016 members.
-max_candidates = 12000000
+# The measured 1,676 conditions produce 16 × C(1676, 2) = 22,458,400 members.
+max_candidates = 23000000
 max_conditions = 2
 screen_top = 8
 chunk_size = 8
@@ -23,21 +23,20 @@ portfolio_top = 8
 generated_output = "*"
 
 [minimum]
-# The measured synthetic development plan resolved 1,127 conditions.
-resolved_conditions = 1119
-# The measured 16 × C(1127, 2) family had 10,152,016 members.
-members = 10000000
+# Family and work floors are the real Study P development search at 97edf6c (13,697,376 members,
+# 1,309 conditions), which the synthetic gate must dominate before evaluation access (issue 54).
+resolved_conditions = 1309
+members = 13697376
 screened_survivors = 1
 folds = 1
 scenarios = 3
-# The measured synthetic development plan made 3,385,174,275,832 candidate-driver visits.
-candidate_driver_row_visits = 3000000000000
-projected_columns = 1119
-block_tuples = 1
-sparse_list_entries = 1
-construction_visits = 4969434240
-validation_visits = 1
-transfer_bytes = 1
+candidate_driver_row_visits = 4166397866608
+projected_columns = 1309
+block_tuples = 15
+sparse_list_entries = 6205416010
+construction_visits = 34813294824
+validation_visits = 6205422570
+transfer_bytes = 88259428181
 
 [roles.development]
 days = 257
