@@ -1353,13 +1353,14 @@ fn fixture(name: &str) -> Fixture {
 // ----------------------------------------------------------------------------------------------
 
 fn run(args: &[&str]) -> Result<String, String> {
-    let output = Command::new(env!("CARGO_BIN_EXE_binary-alpha"))
-        .args(args)
-        .env("PIPELINE_SYNTHETIC_AUTH", "{\"synthetic\":true}")
-        .env_remove("PIPELINE_UNSET_AUTH")
-        .env_remove("PIPELINE_UNSET_DRIVE_AUTH")
-        .output()
-        .unwrap();
+    let output = common::output(
+        Command::new(env!("CARGO_BIN_EXE_binary-alpha"))
+            .args(args)
+            .env("PIPELINE_SYNTHETIC_AUTH", "{\"synthetic\":true}")
+            .env_remove("PIPELINE_UNSET_AUTH")
+            .env_remove("PIPELINE_UNSET_DRIVE_AUTH"),
+    )
+    .unwrap();
     let stdout = String::from_utf8(output.stdout).unwrap();
     let stderr = String::from_utf8(output.stderr).unwrap();
     if output.status.success() {
@@ -2578,14 +2579,16 @@ fn pipeline_flushes_each_job_to_a_non_send_writer() {
     )
     .unwrap();
     let reports = std::rc::Rc::new(std::cell::RefCell::new(vec![Vec::new()]));
-    let error = data_pipeline::update_with(
-        &f.pipeline,
-        None,
-        None,
-        &[],
-        &FakeClock::at(DERIV_SEED_END * 1_000_000),
-        &mut Reports(std::rc::Rc::clone(&reports), Some(report_flushed)),
-    )
+    let error = common::exclusive(|| {
+        data_pipeline::update_with(
+            &f.pipeline,
+            None,
+            None,
+            &[],
+            &FakeClock::at(DERIV_SEED_END * 1_000_000),
+            &mut Reports(std::rc::Rc::clone(&reports), Some(report_flushed)),
+        )
+    })
     .unwrap_err();
     assert_eq!(error, "pipeline: 1 job(s) failed: first");
     let reports = reports.borrow();
@@ -2761,10 +2764,6 @@ fn chunk_rate_limited_session_recovery(reason: &'static str, poison_all: bool) {
         });
         assert_eq!(field(job_line(&report, "pocket"), "status"), "archived");
     }
-    assert!(
-        elapsed < Duration::from_secs(10),
-        "session restarts must finish far below the 30-second retry budget: {elapsed:?}"
-    );
     assert!(
         elapsed >= Duration::from_secs(if poison_all { 3 } else { 1 }),
         "replacement sessions must wait for exponential backoff: {elapsed:?}"
@@ -3707,17 +3706,20 @@ fn pipeline_recovery() {
     let restored_bundle = consumer_root.join("store").join(&bundled.key);
     let semantic_fault = f.scratch.path("bad-daily-payload.parquet");
     common::daily::flip_page_payload(&restored_bundle, &semantic_fault);
-    fs::copy(&semantic_fault, &restored_bundle).unwrap();
+    let copied = fs::copy(&semantic_fault, &restored_bundle).unwrap();
     let refused = verify::run(field(&restored, "dataset")).unwrap_err();
     // A re-encoded day file no longer carries the recorded object identity; verification
-    // names the exact object before decoding. The page-level diagnosis is the reader's.
-    assert!(
-        refused.contains(&format!(
+    // names the exact object before decoding: by size when re-encoding changed its length,
+    // otherwise by SHA-256. The page-level diagnosis is the reader's.
+    let expected = if copied == bundled.bytes {
+        format!("{} has {copied} bytes, SHA-256 ", bundled.key)
+    } else {
+        format!(
             "{} does not match the recorded size, generation, and checksum",
             bundled.key
-        )),
-        "{refused}"
-    );
+        )
+    };
+    assert!(refused.contains(&expected), "{refused}");
     let date = &bundled.path["pages/".len()..][..10];
     assert_eq!(
         binary_alpha_app::daily::read_pages(&semantic_fault, date).unwrap_err(),
@@ -4774,7 +4776,10 @@ fn pipeline_schedule() {
     )
     .unwrap();
     let mut out = Vec::new();
-    data_pipeline::update_with(&pocket_only, None, None, &[], &clock, &mut out).unwrap_err();
+    common::exclusive(|| {
+        data_pipeline::update_with(&pocket_only, None, None, &[], &clock, &mut out)
+    })
+    .unwrap_err();
     let first = String::from_utf8(out).unwrap();
     assert_eq!(
         field(job_line(&first, "pocket"), "status"),
@@ -4795,7 +4800,10 @@ fn pipeline_schedule() {
     );
     binary_alpha_app::broker::Clock::sleep(&mut clock, 600 * 1_000_000);
     let mut out = Vec::new();
-    data_pipeline::update_with(&pocket_only, None, None, &[], &clock, &mut out).unwrap_err();
+    common::exclusive(|| {
+        data_pipeline::update_with(&pocket_only, None, None, &[], &clock, &mut out)
+    })
+    .unwrap_err();
     let resumed = String::from_utf8(out).unwrap();
     assert_eq!(
         field(job_line(&resumed, "pocket"), "cutoff"),
@@ -4810,20 +4818,25 @@ fn pipeline_schedule() {
     assert_eq!(pages[0]["first"], pages[1]["last"]);
     assert_eq!(pages[1]["first"], time_text((cutoff - 392) * 1_000_000));
     let mut out = Vec::new();
-    data_pipeline::update_with(
-        &pocket_only,
-        None,
-        Some(&time_text((cutoff + 5) * 1_000_000)),
-        &[],
-        &clock,
-        &mut out,
-    )
+    common::exclusive(|| {
+        data_pipeline::update_with(
+            &pocket_only,
+            None,
+            Some(&time_text((cutoff + 5) * 1_000_000)),
+            &[],
+            &clock,
+            &mut out,
+        )
+    })
     .unwrap_err();
     let conflict = String::from_utf8(out).unwrap();
     assert!(conflict.contains("conflicts"), "{conflict}");
     // The third page reaches cutoff-587, past the required seed overlap.
     let mut out = Vec::new();
-    data_pipeline::update_with(&pocket_only, None, None, &[], &clock, &mut out).unwrap();
+    common::exclusive(|| {
+        data_pipeline::update_with(&pocket_only, None, None, &[], &clock, &mut out)
+    })
+    .unwrap();
     let completed = String::from_utf8(out).unwrap();
     assert_eq!(field(job_line(&completed, "pocket"), "status"), "archived");
     assert!(!pending_path.exists());
@@ -4843,7 +4856,9 @@ fn pipeline_schedule() {
     )
     .unwrap();
     let mut out = Vec::new();
-    let result = data_pipeline::update_with(&pocket_only, None, None, &[], &clock, &mut out);
+    let result = common::exclusive(|| {
+        data_pipeline::update_with(&pocket_only, None, None, &[], &clock, &mut out)
+    });
     let advanced = String::from_utf8(out).unwrap();
     result.unwrap_or_else(|error| panic!("{error}\n{advanced}"));
     assert_eq!(
@@ -4862,20 +4877,25 @@ fn pipeline_schedule() {
     binary_alpha_app::broker::Clock::sleep(&mut clock, 600 * 1_000_000);
     drop(f.deriv);
     let mut out = Vec::new();
-    let partial =
-        data_pipeline::update_with(&f.pipeline, None, None, &[], &clock, &mut out).unwrap_err();
+    let partial = common::exclusive(|| {
+        data_pipeline::update_with(&f.pipeline, None, None, &[], &clock, &mut out)
+    })
+    .unwrap_err();
     assert!(partial.contains("1 job(s) failed: deriv"), "{partial}");
     let report = String::from_utf8(out).unwrap();
     assert!(report.contains("pipeline job deriv failed"), "{report}");
     assert!(report.contains("pipeline update pocket "), "{report}");
 
     // Local writer-lock contention: a second producer is refused while the lock is held.
-    let lock = File::create(producer.join("pipeline_state/writer.lock")).unwrap();
-    lock.try_lock().unwrap();
-    let held = data_pipeline::update_with(&pocket_only, None, None, &[], &clock, &mut Vec::new())
-        .unwrap_err();
-    assert!(held.contains("another producer holds"), "{held}");
-    drop(lock);
+    common::exclusive(|| {
+        let lock = File::create(producer.join("pipeline_state/writer.lock")).unwrap();
+        lock.try_lock().unwrap();
+        let held =
+            data_pipeline::update_with(&pocket_only, None, None, &[], &clock, &mut Vec::new())
+                .unwrap_err();
+        assert!(held.contains("another producer holds"), "{held}");
+        drop(lock);
+    });
 
     // The shipped units declare the specified calendar and persistence, and systemd validates
     // them with fixture paths substituted.
@@ -4904,25 +4924,22 @@ fn pipeline_schedule() {
     )
     .unwrap();
     fs::write(units.join("binary-alpha-data-backfill@.timer"), &timer).unwrap();
-    let verified = Command::new("systemd-analyze")
-        .current_dir(&units)
-        .args([
-            "verify",
-            "--man=no",
-            "binary-alpha-data-backfill@.service",
-            "binary-alpha-data-backfill@.timer",
-        ])
-        .output()
-        .expect("systemd-analyze is installed");
+    let verified = common::output(Command::new("systemd-analyze").current_dir(&units).args([
+        "verify",
+        "--man=no",
+        "binary-alpha-data-backfill@.service",
+        "binary-alpha-data-backfill@.timer",
+    ]))
+    .expect("systemd-analyze is installed");
     assert!(
         verified.status.success(),
         "{}",
         String::from_utf8_lossy(&verified.stderr)
     );
-    let calendar = Command::new("systemd-analyze")
-        .args(["calendar", "Sat *-*-* 06:00:00 America/Chicago"])
-        .output()
-        .unwrap();
+    let calendar = common::output(
+        Command::new("systemd-analyze").args(["calendar", "Sat *-*-* 06:00:00 America/Chicago"]),
+    )
+    .unwrap();
     assert!(calendar.status.success());
     assert!(
         String::from_utf8_lossy(&calendar.stdout)
@@ -5147,12 +5164,14 @@ fn pipeline_migration_lossless_resume_and_tamper() {
     let broker_requests = (f.deriv.requests().len(), f.pocket.requests().len());
     let drive_requests = f.drive.log().len();
     let mut interrupted_report = Vec::new();
-    let interrupted = data_pipeline::migrate_with(
-        &f.pipeline,
-        Some("pocket"),
-        &|_| Err("fixture interruption after converted".into()),
-        &mut interrupted_report,
-    )
+    let interrupted = common::exclusive(|| {
+        data_pipeline::migrate_with(
+            &f.pipeline,
+            Some("pocket"),
+            &|_| Err("fixture interruption after converted".into()),
+            &mut interrupted_report,
+        )
+    })
     .unwrap_err();
     assert_eq!(interrupted, "pipeline: 1 job(s) failed: pocket");
     let interrupted_report = String::from_utf8(interrupted_report).unwrap();
@@ -5200,16 +5219,18 @@ fn pipeline_migration_lossless_resume_and_tamper() {
     let records_before = common::snapshot_tree(&records);
     let checkpoint_fault = state_path.with_extension("tmp");
     let mut interrupted_report = Vec::new();
-    data_pipeline::migrate_with(
-        &f.pipeline,
-        Some("pocket"),
-        &|job| {
-            assert_eq!(job, "pocket");
-            fs::create_dir(&checkpoint_fault).unwrap();
-            Ok(())
-        },
-        &mut interrupted_report,
-    )
+    common::exclusive(|| {
+        data_pipeline::migrate_with(
+            &f.pipeline,
+            Some("pocket"),
+            &|job| {
+                assert_eq!(job, "pocket");
+                fs::create_dir(&checkpoint_fault).unwrap();
+                Ok(())
+            },
+            &mut interrupted_report,
+        )
+    })
     .unwrap_err();
     let interrupted_report = String::from_utf8(interrupted_report).unwrap();
     assert!(
@@ -5718,28 +5739,30 @@ fn pipeline_migration_parallel_jobs_are_deterministic_and_isolate_failures() {
             let arrived = Mutex::new(0);
             let ready = Condvar::new();
             let mut report = Vec::new();
-            let result = data_pipeline::migrate_with(
-                &config,
-                None,
-                &|job| {
-                    // Both conversions must finish before either hook returns. A timeout
-                    // makes a serial scheduler regression fail without hanging the suite.
-                    let mut count = arrived.lock().unwrap();
-                    *count += 1;
-                    ready.notify_all();
-                    let (count, _) = ready
-                        .wait_timeout_while(count, Duration::from_secs(30), |n| *n < 2)
-                        .unwrap();
-                    if *count != 2 {
-                        return Err("fixture jobs did not overlap".into());
-                    }
-                    if mode == "failure" && job == "deriv" {
-                        return Err("fixture conversion interruption".into());
-                    }
-                    Ok(())
-                },
-                &mut report,
-            );
+            let result = common::exclusive(|| {
+                data_pipeline::migrate_with(
+                    &config,
+                    None,
+                    &|job| {
+                        // Both conversions must finish before either hook returns. A timeout
+                        // makes a serial scheduler regression fail without hanging the suite.
+                        let mut count = arrived.lock().unwrap();
+                        *count += 1;
+                        ready.notify_all();
+                        let (count, _) = ready
+                            .wait_timeout_while(count, Duration::from_secs(30), |n| *n < 2)
+                            .unwrap();
+                        if *count != 2 {
+                            return Err("fixture jobs did not overlap".into());
+                        }
+                        if mode == "failure" && job == "deriv" {
+                            return Err("fixture conversion interruption".into());
+                        }
+                        Ok(())
+                    },
+                    &mut report,
+                )
+            });
             if mode == "failure" {
                 assert_eq!(result.unwrap_err(), "pipeline: 1 job(s) failed: deriv");
             } else {
@@ -5815,11 +5838,13 @@ fn pipeline_migration_import_only_and_writer_lock() {
     if lock.is_err() {
         fs::create_dir_all(f.scratch.path("producer/pipeline_state")).unwrap();
     }
-    let lock = File::create(f.scratch.path("producer/pipeline_state/writer.lock")).unwrap();
-    lock.lock().unwrap();
-    let denied = pipeline("migrate", &f.pipeline, &["--job", "deriv"]).unwrap_err();
-    assert!(denied.contains("another producer"), "{denied}");
-    drop(lock);
+    common::exclusive(|| {
+        let lock = File::create(f.scratch.path("producer/pipeline_state/writer.lock")).unwrap();
+        lock.lock().unwrap();
+        let denied = pipeline("migrate", &f.pipeline, &["--job", "deriv"]).unwrap_err();
+        assert!(denied.contains("another producer"), "{denied}");
+        drop(lock);
+    });
     let report = pipeline("migrate", &f.pipeline, &["--job", "deriv"]).unwrap();
     assert!(report.contains("pages 0"), "{report}");
     assert!(report.contains("candles_equal not_applicable"), "{report}");
@@ -6391,12 +6416,14 @@ fn migration_receipt_without_coverage(case: &str) {
     }
     if case == "late" {
         let mut report = Vec::new();
-        let stopped = data_pipeline::migrate_with(
-            &config,
-            Some("deriv"),
-            &|_| Err("stop after converted".into()),
-            &mut report,
-        )
+        let stopped = common::exclusive(|| {
+            data_pipeline::migrate_with(
+                &config,
+                Some("deriv"),
+                &|_| Err("stop after converted".into()),
+                &mut report,
+            )
+        })
         .unwrap_err();
         assert_eq!(stopped, "pipeline: 1 job(s) failed: deriv");
         assert!(

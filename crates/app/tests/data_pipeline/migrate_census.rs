@@ -144,12 +144,14 @@ fn physical_responses_are_preserved_and_unresolved_are_explicit() {
 fn attributable_physical_response_added_after_conversion_blocks_verified() {
     let f = fixture("physical_census_late");
     lineage::legacy_import(&f.scratch.path("deriv-import.toml")).unwrap();
-    data_pipeline::migrate_with(
-        &f.pipeline,
-        Some("deriv"),
-        &|_| Err("fixture stop".into()),
-        &mut Vec::new(),
-    )
+    common::exclusive(|| {
+        data_pipeline::migrate_with(
+            &f.pipeline,
+            Some("deriv"),
+            &|_| Err("fixture stop".into()),
+            &mut Vec::new(),
+        )
+    })
     .unwrap_err();
     put(&f, diagnostic("deriv"));
     let error = pipeline("migrate", &f.pipeline, &["--job", "deriv"])

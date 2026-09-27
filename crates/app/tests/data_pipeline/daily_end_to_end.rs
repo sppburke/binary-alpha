@@ -229,19 +229,21 @@ fn update_supplement_preserves_continuation_claims_and_retained_rows() {
     let retained = ticks(&store, &baseline);
     let lineage = lineage_value(&store, &baseline);
     // Unknown selections fail before attempting even an already-held writer lock.
-    let lock = fs::File::open(f.scratch.path("producer/pipeline_state/writer.lock")).unwrap();
-    lock.try_lock().unwrap();
     let requests = f.deriv.requests();
-    let error = pipeline(
-        "update",
-        &f.pipeline,
-        &["--job", "deriv", "--job", "missing"],
-    )
-    .unwrap_err();
-    assert!(error.contains("unknown job missing"), "{error}");
-    assert_eq!(f.deriv.requests(), requests);
-    assert!(f.pocket.requests().is_empty());
-    drop(lock);
+    common::exclusive(|| {
+        let lock = fs::File::open(f.scratch.path("producer/pipeline_state/writer.lock")).unwrap();
+        lock.try_lock().unwrap();
+        let error = pipeline(
+            "update",
+            &f.pipeline,
+            &["--job", "deriv", "--job", "missing"],
+        )
+        .unwrap_err();
+        assert!(error.contains("unknown job missing"), "{error}");
+        assert_eq!(f.deriv.requests(), requests);
+        assert!(f.pocket.requests().is_empty());
+        drop(lock);
+    });
     // A window before the job's configured start is refused before any record or request.
     let records = f.scratch.path("producer/pipeline_state/records");
     let recorded = fs::read_dir(&records).unwrap().count();
