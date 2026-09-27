@@ -543,48 +543,50 @@ fn review_symlink_store_import_must_obey_writer_lock() {
     fs::create_dir(managed.join("store")).unwrap();
     let config = scratch.path("import.toml");
     fs::write(&config, format!("schema_version=1\nrun_mode=\"research\"\n[storage]\nhistorical_data_dir=\"{}\"\npublication_uri=\"file://{}\"\n[[import.sources]]\nkind=\"tick_parquet_daily\"\npath=\"sources/deriv\"\nbroker=\"deriv\"\nrole=\"development\"\nprice_scale=5\ninstruments=[\"AUDUSD\"]\n", managed.join("store").display(), managed.join("store").display())).unwrap();
-    let lock = File::create(state.join("writer.lock")).unwrap();
-    lock.try_lock().unwrap();
-    let normal = binary_alpha_app::import::run(&config, &mut Vec::new());
-    assert!(
-        normal
-            .as_ref()
-            .is_err_and(|e| e.contains("another producer")),
-        "normal store locks: {normal:?}"
-    );
-    fs::remove_dir(managed.join("store")).unwrap();
-    symlink(&physical, managed.join("store")).unwrap();
-    let mut report = Vec::new();
-    let outcome = binary_alpha_app::import::run(&config, &mut report);
-    eprintln!(
-        "import while writer locked: {outcome:?}; report: {}",
-        String::from_utf8_lossy(&report)
-    );
-    assert!(
-        outcome
-            .as_ref()
-            .is_err_and(|e| e.contains("symlinked managed store")),
-        "import must reject the redirected managed store: {outcome:?}"
-    );
-    let alias = scratch.path("store-alias");
-    symlink("managed/store", &alias).unwrap();
-    let text = fs::read_to_string(&config).unwrap();
-    fs::write(
-        &config,
-        text.replace(
-            managed.join("store").to_str().unwrap(),
-            alias.to_str().unwrap(),
-        ),
-    )
-    .unwrap();
-    let outcome = binary_alpha_app::import::run(&config, &mut Vec::new());
-    assert!(
-        outcome.unwrap_err().contains("symlinked managed store"),
-        "an intermediate alias must not hide the managed store"
-    );
-    drop(lock);
+    common::exclusive(|| {
+        let lock = File::create(state.join("writer.lock")).unwrap();
+        lock.try_lock().unwrap();
+        let normal = binary_alpha_app::import::run(&config, &mut Vec::new());
+        assert!(
+            normal
+                .as_ref()
+                .is_err_and(|e| e.contains("another producer")),
+            "normal store locks: {normal:?}"
+        );
+        fs::remove_dir(managed.join("store")).unwrap();
+        symlink(&physical, managed.join("store")).unwrap();
+        let mut report = Vec::new();
+        let outcome = binary_alpha_app::import::run(&config, &mut report);
+        eprintln!(
+            "import while writer locked: {outcome:?}; report: {}",
+            String::from_utf8_lossy(&report)
+        );
+        assert!(
+            outcome
+                .as_ref()
+                .is_err_and(|e| e.contains("symlinked managed store")),
+            "import must reject the redirected managed store: {outcome:?}"
+        );
+        let alias = scratch.path("store-alias");
+        symlink("managed/store", &alias).unwrap();
+        let text = fs::read_to_string(&config).unwrap();
+        fs::write(
+            &config,
+            text.replace(
+                managed.join("store").to_str().unwrap(),
+                alias.to_str().unwrap(),
+            ),
+        )
+        .unwrap();
+        let outcome = binary_alpha_app::import::run(&config, &mut Vec::new());
+        assert!(
+            outcome.unwrap_err().contains("symlinked managed store"),
+            "an intermediate alias must not hide the managed store"
+        );
+        drop(lock);
+    });
     fs::set_permissions(&state, fs::Permissions::from_mode(0o755)).unwrap();
-    let outcome = binary_alpha_app::import::run(&config, &mut Vec::new());
+    let outcome = common::exclusive(|| binary_alpha_app::import::run(&config, &mut Vec::new()));
     assert!(outcome.unwrap_err().contains("symlinked managed store"));
     fs::write(
         &config,

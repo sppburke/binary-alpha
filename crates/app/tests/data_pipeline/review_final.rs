@@ -576,18 +576,15 @@ fn proof_v1_executable() -> &'static Path {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
         let snapshot = root.join("target/review-final-proof-v1");
         fs::create_dir_all(&snapshot).unwrap();
-        let archive = Command::new("git")
-            .current_dir(&root)
-            .args([
-                "archive",
-                REVISION,
-                "Cargo.toml",
-                "Cargo.lock",
-                "rust-toolchain.toml",
-                "crates",
-            ])
-            .output()
-            .unwrap();
+        let archive = common::output(Command::new("git").current_dir(&root).args([
+            "archive",
+            REVISION,
+            "Cargo.toml",
+            "Cargo.lock",
+            "rust-toolchain.toml",
+            "crates",
+        ]))
+        .unwrap();
         assert!(
             archive.status.success(),
             "pinned historical source required: {}",
@@ -595,15 +592,18 @@ fn proof_v1_executable() -> &'static Path {
         );
         let tar = snapshot.join("source.tar");
         fs::write(&tar, archive.stdout).unwrap();
-        assert!(
+        let extracted = common::output(
             Command::new("tar")
                 .args(["-xf"])
                 .arg(&tar)
                 .arg("-C")
-                .arg(&snapshot)
-                .status()
-                .unwrap()
-                .success()
+                .arg(&snapshot),
+        )
+        .unwrap();
+        assert!(
+            extracted.status.success(),
+            "{}",
+            String::from_utf8_lossy(&extracted.stderr)
         );
         assert_eq!(
             fs::read(root.join("Cargo.lock")).unwrap(),
@@ -617,21 +617,22 @@ fn proof_v1_executable() -> &'static Path {
             .unwrap()
             .set_modified(std::time::SystemTime::now())
             .unwrap();
-        let output = Command::new(env!("CARGO"))
-            .current_dir(&snapshot)
-            .args([
-                "build",
-                "-p",
-                "binary-alpha-app",
-                "--bin",
-                "binary-alpha",
-                "--locked",
-                "--offline",
-            ])
-            .env("CARGO_TARGET_DIR", snapshot.join("build"))
-            .env("GIT_CEILING_DIRECTORIES", &snapshot)
-            .output()
-            .unwrap();
+        let output = common::output(
+            Command::new(env!("CARGO"))
+                .current_dir(&snapshot)
+                .args([
+                    "build",
+                    "-p",
+                    "binary-alpha-app",
+                    "--bin",
+                    "binary-alpha",
+                    "--locked",
+                    "--offline",
+                ])
+                .env("CARGO_TARGET_DIR", snapshot.join("build"))
+                .env("GIT_CEILING_DIRECTORIES", &snapshot),
+        )
+        .unwrap();
         assert!(
             output.status.success(),
             "historical fixture build: {}",
@@ -656,11 +657,12 @@ fn genuine_proof_v1_without_session_upgrades_only_calendar_addition() {
         .join("\n")
         + "\n";
     let command = || {
-        Command::new(old_exe)
-            .args(["data", "pipeline", "migrate", "--config"])
-            .arg(&f.pipeline)
-            .output()
-            .unwrap()
+        common::output(
+            Command::new(old_exe)
+                .args(["data", "pipeline", "migrate", "--config"])
+                .arg(&f.pipeline),
+        )
+        .unwrap()
     };
     let refused = command();
     assert!(!refused.status.success());
@@ -720,12 +722,14 @@ fn genuine_proof_v1_without_session_upgrades_only_calendar_addition() {
     );
     assert_eq!(read_json(&checkpoint), prior);
     fs::write(&core_path, &new_core).unwrap();
-    let interrupted = data_pipeline::migrate_with(
-        &f.pipeline,
-        None,
-        &|_| Err("fixture interrupted after converted".into()),
-        &mut Vec::new(),
-    )
+    let interrupted = common::exclusive(|| {
+        data_pipeline::migrate_with(
+            &f.pipeline,
+            None,
+            &|_| Err("fixture interrupted after converted".into()),
+            &mut Vec::new(),
+        )
+    })
     .unwrap_err();
     assert!(interrupted.contains("failed"));
     let converted = read_json(&checkpoint);

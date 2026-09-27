@@ -1337,9 +1337,14 @@ fn retirement_resumes_torn_local_progress_and_can_plan_again() {
     let f = fixture();
     let (path, p) = plan(&f);
     assert!(
-        binary_alpha_app::retire::run(&f.config, None, Some(&path), &mut StopAtBatch)
-            .unwrap_err()
-            .contains("fixture interruption")
+        common::exclusive(|| binary_alpha_app::retire::run(
+            &f.config,
+            None,
+            Some(&path),
+            &mut StopAtBatch
+        ))
+        .unwrap_err()
+        .contains("fixture interruption")
     );
     let log = path.with_extension("progress.jsonseq");
     let prefix = fs::read(&log).unwrap();
@@ -1467,32 +1472,34 @@ fn retirement_excludes_an_active_restore_in_another_store() {
         "binary-alpha-archive-{}.lock",
         sha256(binding.as_bytes())
     ));
-    let lock = File::open(path).unwrap();
-    lock.try_lock().unwrap();
-    let error = pipeline("retire", &f.config, &[]).unwrap_err();
-    assert!(error.contains("another operation holds this archive root"));
-    let restore = f.scratch.path("restore.toml");
-    fs::write(
-        &restore,
-        pipeline_toml(&f.scratch.path("fresh"), &f.drive.drive.base, &[], None, 1),
-    )
-    .unwrap();
-    let error = pipeline(
-        "restore",
-        &restore,
-        &[
-            "--catalog",
-            &f.new_catalog,
-            "--sha256",
-            &f.new_sha,
-            "--broker",
-            "deriv",
-            "--symbol",
-            "R_50",
-        ],
-    )
-    .unwrap_err();
-    assert!(error.contains("another operation holds this archive root"));
+    common::exclusive(|| {
+        let lock = File::open(path).unwrap();
+        lock.try_lock().unwrap();
+        let error = pipeline("retire", &f.config, &[]).unwrap_err();
+        assert!(error.contains("another operation holds this archive root"));
+        let restore = f.scratch.path("restore.toml");
+        fs::write(
+            &restore,
+            pipeline_toml(&f.scratch.path("fresh"), &f.drive.drive.base, &[], None, 1),
+        )
+        .unwrap();
+        let error = pipeline(
+            "restore",
+            &restore,
+            &[
+                "--catalog",
+                &f.new_catalog,
+                "--sha256",
+                &f.new_sha,
+                "--broker",
+                "deriv",
+                "--symbol",
+                "R_50",
+            ],
+        )
+        .unwrap_err();
+        assert!(error.contains("another operation holds this archive root"));
+    });
 }
 
 #[test]
@@ -1681,7 +1688,8 @@ fn retirement_leftover_seal_links_preserve_completed_record() {
         fs::hard_link(&completed, alias).unwrap();
     }
     let mut report = Vec::new();
-    binary_alpha_app::retire::run(&f.config, None, None, &mut report).unwrap();
+    common::exclusive(|| binary_alpha_app::retire::run(&f.config, None, None, &mut report))
+        .unwrap();
     assert!(
         fs::read(&completed).unwrap() == original,
         "allocating a new seal must never truncate a published record through its crash alias"

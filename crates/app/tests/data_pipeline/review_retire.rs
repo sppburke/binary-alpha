@@ -156,8 +156,13 @@ fn review_other_store_update_honors_unfinished_retirement() {
         }
     }
     assert!(
-        binary_alpha_app::retire::run(&f.pipeline, None, Some(&plan), &mut StopAfterProgress)
-            .is_err()
+        common::exclusive(|| binary_alpha_app::retire::run(
+            &f.pipeline,
+            None,
+            Some(&plan),
+            &mut StopAfterProgress
+        ))
+        .is_err()
     );
     assert!(plan.with_extension("progress.jsonseq").exists());
     let first = pipeline(

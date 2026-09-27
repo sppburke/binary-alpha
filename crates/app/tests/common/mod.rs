@@ -2,10 +2,12 @@
 #![allow(dead_code)]
 
 use std::borrow::Cow;
+use std::cell::Cell;
 use std::fs::{self, File};
+use std::io;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
-use std::sync::Arc;
+use std::process::{Command, Output, Stdio};
+use std::sync::{Arc, PoisonError, RwLock};
 
 use binary_alpha_engine::dataset::GenerationManifest;
 use binary_alpha_engine::market::Tick;
@@ -482,11 +484,50 @@ impl Scratch {
     }
 }
 
+/// A starting child holds a copy of every open file of this process until it executes its
+/// program, so a file lock released in-process meanwhile stays held. Children start under the
+/// shared side of this guard and in-process work that holds a file lock runs under the exclusive
+/// side; a thread inside `exclusive` may still start its own children.
+static STARTING: RwLock<()> = RwLock::new(());
+
+thread_local! {
+    static EXCLUSIVE: Cell<bool> = const { Cell::new(false) };
+}
+
+/// `Command::output` for tests: the child starts while no other thread holds a file lock.
+pub fn output(command: &mut Command) -> io::Result<Output> {
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let child = if EXCLUSIVE.get() {
+        command.spawn()
+    } else {
+        let _starting = STARTING.read().unwrap_or_else(PoisonError::into_inner);
+        command.spawn()
+    }?;
+    child.wait_with_output()
+}
+
+/// Runs `run`, which takes a file lock in this process, while no other thread starts a child.
+pub fn exclusive<T>(run: impl FnOnce() -> T) -> T {
+    if EXCLUSIVE.get() {
+        return run();
+    }
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            EXCLUSIVE.set(false);
+        }
+    }
+    let _exclusive = STARTING.write().unwrap_or_else(PoisonError::into_inner);
+    EXCLUSIVE.set(true);
+    let _reset = Reset;
+    run()
+}
+
 pub fn binary_alpha(args: &[&str]) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_binary-alpha"))
-        .args(args)
-        .output()
-        .expect("binary-alpha runs")
+    output(Command::new(env!("CARGO_BIN_EXE_binary-alpha")).args(args)).expect("binary-alpha runs")
 }
 
 /// The standard-output lines of a successful command, or the diagnostic of a failed one.
@@ -525,12 +566,13 @@ pub fn verify(manifest: &Path) -> Result<String, String> {
 /// child's peak resident kilobytes.
 pub fn timed(args: &[&str]) -> (Vec<String>, f64, u64) {
     let started = std::time::Instant::now();
-    let output = Command::new("/usr/bin/time")
-        .arg("-v")
-        .arg(env!("CARGO_BIN_EXE_binary-alpha"))
-        .args(args)
-        .output()
-        .expect("GNU time runs the command");
+    let output = output(
+        Command::new("/usr/bin/time")
+            .arg("-v")
+            .arg(env!("CARGO_BIN_EXE_binary-alpha"))
+            .args(args),
+    )
+    .expect("GNU time runs the command");
     let wall = started.elapsed().as_secs_f64();
     let stderr = String::from_utf8(output.stderr).unwrap();
     assert!(output.status.success(), "{stderr}");
@@ -900,11 +942,12 @@ pub fn logged_output(result: Output) -> Result<String, String> {
 pub fn cli(log: &Path, args: &[&str]) -> Result<String, String> {
     fs::write(log, []).unwrap();
     logged_output(
-        Command::new(env!("CARGO_BIN_EXE_binary-alpha"))
-            .args(args)
-            .env("BINARY_ALPHA_STORE_LOG", log)
-            .output()
-            .unwrap(),
+        output(
+            Command::new(env!("CARGO_BIN_EXE_binary-alpha"))
+                .args(args)
+                .env("BINARY_ALPHA_STORE_LOG", log),
+        )
+        .unwrap(),
     )
 }
 
@@ -912,12 +955,13 @@ pub fn cli(log: &Path, args: &[&str]) -> Result<String, String> {
 pub fn cli_as(log: &Path, user: &str, args: &[&str]) -> Result<String, String> {
     fs::write(log, []).unwrap();
     logged_output(
-        Command::new(env!("CARGO_BIN_EXE_binary-alpha"))
-            .args(args)
-            .env("BINARY_ALPHA_STORE_LOG", log)
-            .env("USER", user)
-            .output()
-            .unwrap(),
+        output(
+            Command::new(env!("CARGO_BIN_EXE_binary-alpha"))
+                .args(args)
+                .env("BINARY_ALPHA_STORE_LOG", log)
+                .env("USER", user),
+        )
+        .unwrap(),
     )
 }
 
