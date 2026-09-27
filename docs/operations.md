@@ -168,6 +168,25 @@ configuration. The unsliced root is never a research input. This command require
 operator task or downtime; matching Sentry issues: none. It provisions no bucket and changes no
 broker, archive, or managed store.
 
+Design the search before an attempt claims evaluation days. Generate conditions (`output = "*"`) on
+the candle streams the study's hypothesis could involve: in planted-edge tests, a menu without the
+1-hour stream missed an edge on a 1-hour feature, while a different planted test earned profit
+without its exact feature; the selected rules and their relationship to that feature were not
+recorded. More look-back periods are not free: adding them lowered profit on two slow planted
+edges, so weigh coverage against family size. When single-feature and paired edges are both
+plausible, set `min_conditions = 1` and `max_conditions = 2`. For a heuristic search, consider a
+`top` of a few hundred after sizing the family and checking available resources. The screen keeps
+the lowest raw scores, search then ranks passing survivors by development net profit, and
+`[research.portfolio.generate]` takes eligible members in rank order, so a wider screen gives the
+profit ranking real choices. In a modeled walk-forward fold test, `max_adjusted_score = 1.0` kept
+more planted-edge profit than 0.0493, and folds gated by `max_false_pass` stopped 29 of 30 no-edge
+controls. Size the family as (C + C(C−1)/2) × K members for C resolved conditions and K contracts
+at depth one to two, and set `max_candidates` to at least that count. A recorded synthetic scale
+gate ran 22,458,400 members. In logged NVIDIA GeForce RTX 5050 Laptop GPU runs, Study P's
+13,697,376-member development-only search with `top = 8` took 39:24, while a separate `top = 256`
+search including evaluation of all survivors took 48:37. The seven-stream, 167,335,216-member
+family at 16 contracts remains unmeasured.
+
 Research: use the declaration from `data split`, or author a non-sensitive governance declaration
 from authorized records (operator,
 authoritative root, namespace, and every population with its role, instrument, source, coverage,
