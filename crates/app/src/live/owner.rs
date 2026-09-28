@@ -650,8 +650,38 @@ impl Runtime {
                 .zip(generation)
                 .and_then(|(clock, generation)| clock.stall_detail(generation))
         {
+            let dispatches = self
+                .dispatches
+                .iter()
+                .map(|(command, dispatch)| {
+                    let stage = if dispatch.claim_at.is_none() {
+                        "preparing"
+                    } else {
+                        self.records
+                            .iter()
+                            .rev()
+                            .find_map(|record| match &record.kind {
+                                RecordKind::Written {
+                                    command: written, ..
+                                } if written == command => Some("written"),
+                                RecordKind::Claimed {
+                                    command: claimed, ..
+                                } if claimed == command => Some("claimed"),
+                                _ => None,
+                            })
+                            .unwrap_or("claimed")
+                    };
+                    (command, stage)
+                })
+                .collect::<Vec<_>>();
             return Err(format!(
-                "live replay: recorded log stalled before all frames and expected writes were consumed: {detail}"
+                "live replay: recorded log stalled before all frames and expected writes were consumed: {detail}; entries={:?}; vetoes={:?}; dispatches={dispatches:?}; authorization_pending={}; pending_uploads={:?}; lease_renewal_in_flight={}; last_not_sent={:?}",
+                self.health.entries,
+                self.vetoes,
+                self.authorization_pending,
+                self.uploads,
+                self.renewal.is_some(),
+                self.last_not_sent,
             ));
         }
         Ok(())

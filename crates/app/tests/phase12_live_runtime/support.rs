@@ -32,6 +32,13 @@ pub fn assert_recorded_stall(error: &str) {
         ", market=",
         ", account=",
         "; clock=",
+        "; entries=",
+        "; vetoes=",
+        "; dispatches=",
+        "; authorization_pending=",
+        "; pending_uploads=",
+        "; lease_renewal_in_flight=",
+        "; last_not_sent=",
     ] {
         assert!(error.contains(field), "missing {field}: {error}");
     }

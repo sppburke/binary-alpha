@@ -708,6 +708,7 @@ pub struct Runtime {
     proposals_pending: BTreeSet<String>,
     dispatches: BTreeMap<String, Dispatch>,
     dispatch_order: VecDeque<String>,
+    last_not_sent: Option<String>,
     measurements: BTreeMap<String, Measurements>,
     decision_receipt: Option<i64>,
     due: BTreeMap<String, (usize, i64)>,
@@ -1063,6 +1064,7 @@ impl Runtime {
             proposals_pending: BTreeSet::new(),
             dispatches: BTreeMap::new(),
             dispatch_order: VecDeque::new(),
+            last_not_sent: None,
             measurements: BTreeMap::new(),
             decision_receipt: None,
             due: BTreeMap::new(),
@@ -1709,6 +1711,7 @@ impl Runtime {
         }
     }
     fn not_sent(&mut self, command: &str, prefix: &str) -> Result<(), String> {
+        self.last_not_sent = Some(format!("{prefix}:{command}"));
         self.complete_dispatch(command)?;
         let source = self.source(&format!("{prefix}:{command}"));
         self.step(vec![Observation::NotSent {
