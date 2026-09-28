@@ -74,7 +74,6 @@ impl Runtime {
                     history.pop_front();
                 }
                 if let Some(rule) = self.pocket_rule {
-                    let mapped = pocket_options::mapped_percent(listed_percent, rule)?;
                     let mut cleared = Vec::new();
                     for binding in self
                         .definition
@@ -91,12 +90,8 @@ impl Runtime {
                             .iter()
                             .find(|terms| terms.id == binding.contract)
                             .ok_or("pocket listing: baseline missing")?;
-                        let gross = baseline.stake.checked_mul(
-                            Decimal::parse("1")?.checked_add(
-                                Decimal::parse(&mapped.to_string())?
-                                    .checked_mul(Decimal::parse("0.01")?)?,
-                            )?,
-                        )?;
+                        let gross =
+                            pocket_options::gross_return(baseline.stake, listed_percent, rule)?;
                         if gross.compare(baseline.win.gross_return)? == std::cmp::Ordering::Equal {
                             cleared.push(binding.id.clone());
                         }
@@ -195,18 +190,23 @@ impl Runtime {
             .first()
             .map(|r| r.time_micros)
             .unwrap_or(i64::MIN);
-        if closed && deal.close_time(clock_offset)? < start {
-            return Ok(());
-        }
         if closed {
             let fact = serde_json::to_string(&deal).map_err(|error| error.to_string())?;
-            if self
-                .pocket_closed
-                .insert(deal.id.clone(), fact.clone())
-                .is_some_and(|previous| previous != fact)
-            {
-                self.veto("pocket deal contradicts earlier close", true);
+            let facts = self.pocket_closed.entry(deal.id.clone()).or_default();
+            if facts.insert(fact.clone()) {
+                self.record(RecordKind::PocketClosed {
+                    deal_id: deal.id.clone(),
+                    request_id: deal.request_id,
+                    fact,
+                })?;
             }
+            if self.pocket_closed[&deal.id].len() != 1 {
+                self.veto("pocket deal contradicts earlier close", true);
+                return Ok(());
+            }
+        }
+        if closed && deal.close_time(clock_offset)? < start {
+            return Ok(());
         }
         if !self.contracts.contains_key(&deal.id) {
             self.pocket_correlation(&deal.id, false)?;
@@ -215,6 +215,9 @@ impl Runtime {
         }
         if closed {
             let command = &self.contracts[&deal.id];
+            if self.pocket_settled_agrees(command, &deal)? {
+                return Ok(());
+            }
             if !self
                 .claims
                 .get(command)
@@ -247,6 +250,90 @@ impl Runtime {
             self.step(observations)?;
         }
         Ok(())
+    }
+    fn pocket_settled_agrees(
+        &self,
+        command: &str,
+        deal: &pocket_options::Deal,
+    ) -> Result<bool, String> {
+        let written = self
+            .records
+            .iter()
+            .filter_map(|record| match &record.kind {
+                RecordKind::Written {
+                    command: bound,
+                    request_id,
+                    ..
+                } if bound == command => *request_id,
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        if written.len() != 1 || deal.request_id != Some(written[0]) {
+            return Ok(false);
+        }
+        if self
+            .records
+            .iter()
+            .filter(|record| {
+                matches!(&record.kind,
+            RecordKind::Written { request_id: Some(id), .. } if *id == written[0])
+            })
+            .count()
+            != 1
+        {
+            return Ok(false);
+        }
+        let settled = self.records.iter().find_map(|record| match &record.kind {
+            RecordKind::Ledger {
+                event:
+                    FinancialEvent {
+                        kind:
+                            EventKind::Settled {
+                                command: bound,
+                                settlement_time_micros,
+                                settlement_price_units,
+                                credit,
+                                transaction_ref,
+                                ..
+                            },
+                        ..
+                    },
+            } if bound == command => Some((
+                record.sequence,
+                *settlement_time_micros,
+                *settlement_price_units,
+                *credit,
+                transaction_ref,
+            )),
+            _ => None,
+        });
+        let Some((settled_sequence, time, price, credit, transaction)) = settled else {
+            return Ok(false);
+        };
+        let fact = serde_json::to_string(deal).map_err(|error| error.to_string())?;
+        if !self.records.iter().any(|record| record.sequence < settled_sequence
+            && matches!(&record.kind, RecordKind::PocketClosed { deal_id, request_id, fact: prior }
+                if deal_id == &deal.id && *request_id == deal.request_id && prior == &fact)) {
+            return Ok(false);
+        }
+        let scale = self
+            .definition
+            .definition
+            .instruments
+            .iter()
+            .find(|instrument| instrument.instrument.ends_with(&format!(":{}", deal.asset)))
+            .map(|instrument| PriceScale::try_from(instrument.price_scale))
+            .transpose()?
+            .ok_or("pocket deal: instrument scale missing")?;
+        Ok(deal.close_time(self.pocket_offset_minutes)? == time
+            && deal
+                .close_price
+                .as_ref()
+                .map(|price| price.price_units(scale))
+                .transpose()?
+                == price
+            && deal.gross_credit()?.compare(credit)? == std::cmp::Ordering::Equal
+            && transaction.as_deref() == Some(&format!("{}:close", deal.id)))
     }
     fn pocket_correlation(&mut self, deal_id: &str, correlated: bool) -> Result<(), String> {
         if self.uncorrelated_pocket.contains(deal_id) == correlated {
@@ -1033,6 +1120,10 @@ impl Runtime {
                 .and_then(|row| row.pocket.as_ref().map(|deal| (row, deal)))
                 .filter(|(_, deal)| {
                     self.pocket_claim_agrees(&claim, deal)
+                        && self
+                            .pocket_closed
+                            .get(&deal.id)
+                            .is_none_or(|facts| facts.len() == 1)
                         && rows
                             .iter()
                             .filter(|row| {

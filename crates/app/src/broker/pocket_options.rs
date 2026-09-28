@@ -32,6 +32,15 @@ pub fn mapped_percent(listed: u8, rule: PocketPayout) -> Result<u8, String> {
     Ok(u16::from(rule.cap_percent).min(u16::from(listed) + u16::from(rule.add_percent)) as u8)
 }
 
+pub fn gross_return(stake: Decimal, listed: u8, rule: PocketPayout) -> Result<Decimal, String> {
+    let percent = mapped_percent(listed, rule)?;
+    stake.checked_mul(
+        Decimal::parse("1")?.checked_add(
+            Decimal::parse(&percent.to_string())?.checked_mul(Decimal::parse("0.01")?)?,
+        )?,
+    )
+}
+
 pub fn fresh(listing: &Listing, at: i64, rule: PocketPayout) -> bool {
     at.checked_sub(listing.receipt_micros)
         .zip(i64::from(rule.max_age_seconds).checked_mul(1_000_000))
@@ -58,11 +67,7 @@ pub fn offer(
     {
         return Err("pocket offer: request differs from frozen terms".into());
     }
-    let percent = mapped_percent(listing.listed_percent, rule)?;
-    let fraction = Decimal::parse(&percent.to_string())?.checked_mul(Decimal::parse("0.01")?)?;
-    let gross = request
-        .stake
-        .checked_mul(Decimal::parse("1")?.checked_add(fraction)?)?;
+    let gross = gross_return(request.stake, listing.listed_percent, rule)?;
     let identity = binary_alpha_engine::research::digest(
         b"pocket assumed offer v1\n",
         &serde_json::to_vec(&(
@@ -445,29 +450,33 @@ impl PocketOptions {
                     class = true;
                 }
                 "updateAssets" if connected => {
-                    self.ingest(event)?;
+                    self.ingest_with_login(event, true)?;
                     listing = true;
                 }
                 "updateOpenedDeals" if connected => {
-                    self.ingest(event)?;
+                    self.ingest_with_login(event, true)?;
                     opened_deals = true;
                 }
                 "updateClosedDeals" if connected => {
-                    self.ingest(event)?;
+                    self.ingest_with_login(event, true)?;
                     closed_deals = true;
                 }
                 name if name.starts_with("error") || name.starts_with("fail") => {
                     return Err("pocket options: authentication rejected".into());
                 }
                 _ if connected => {
-                    self.ingest(event)?;
+                    self.ingest_with_login(event, true)?;
                 }
                 _ => return Err("pocket options: unexpected handshake order".into()),
             }
         }
         Ok(())
     }
+    #[cfg(test)]
     fn ingest(&mut self, event: Event) -> Result<Option<Deal>, String> {
+        self.ingest_with_login(event, false)
+    }
+    fn ingest_with_login(&mut self, event: Event, login: bool) -> Result<Option<Deal>, String> {
         match event.name.as_str() {
             "updateAssets" => {
                 let rows: Vec<[Box<RawValue>; 19]> = serde_json::from_slice(&event.raw)
@@ -529,7 +538,9 @@ impl PocketOptions {
                         deal.id.clone(),
                         serde_json::to_string(deal).map_err(|e| e.to_string())?,
                     )) {
-                        self.balance = None;
+                        if !login {
+                            self.balance = None;
+                        }
                         self.events.push_back(AccountEvent::PocketDeal {
                             deal: deal.clone(),
                             closed: false,
@@ -547,24 +558,7 @@ impl PocketOptions {
                     if let Some(id) = deal.request_id {
                         self.request_ids.insert(id);
                     }
-                    if self
-                        .closed
-                        .insert(
-                            (
-                                deal.id.clone(),
-                                serde_json::to_string(deal).map_err(|e| e.to_string())?,
-                            ),
-                            deal.clone(),
-                        )
-                        .is_none()
-                    {
-                        self.balance = None;
-                        self.events.push_back(AccountEvent::PocketDeal {
-                            deal: deal.clone(),
-                            closed: true,
-                            receipt_micros: event.receipt_micros,
-                        });
-                    }
+                    self.close_deal(deal.clone(), event.receipt_micros, login)?;
                 }
             }
             "successcloseOrder" => {
@@ -584,28 +578,7 @@ impl PocketOptions {
                     return Err("pocket options: close credit mismatch".into());
                 }
                 for deal in close.deals {
-                    if let Some(id) = deal.request_id {
-                        self.request_ids.insert(id);
-                    }
-                    self.opened.retain(|opened| opened.id != deal.id);
-                    if self
-                        .closed
-                        .insert(
-                            (
-                                deal.id.clone(),
-                                serde_json::to_string(&deal).map_err(|e| e.to_string())?,
-                            ),
-                            deal.clone(),
-                        )
-                        .is_none()
-                    {
-                        self.balance = None;
-                        self.events.push_back(AccountEvent::PocketDeal {
-                            deal,
-                            closed: true,
-                            receipt_micros: event.receipt_micros,
-                        });
-                    }
+                    self.close_deal(deal, event.receipt_micros, login)?;
                 }
             }
             "successopenOrder" => {
@@ -617,12 +590,41 @@ impl PocketOptions {
                 }
                 self.opened.retain(|opened| opened.id != deal.id);
                 self.opened.push(deal.clone());
-                self.balance = None;
+                if !login {
+                    self.balance = None;
+                }
                 return Ok(Some(deal));
             }
             _ => (),
         }
         Ok(None)
+    }
+    fn close_deal(&mut self, deal: Deal, receipt: i64, login: bool) -> Result<(), String> {
+        if let Some(id) = deal.request_id {
+            self.request_ids.insert(id);
+        }
+        self.opened.retain(|opened| opened.id != deal.id);
+        if self
+            .closed
+            .insert(
+                (
+                    deal.id.clone(),
+                    serde_json::to_string(&deal).map_err(|e| e.to_string())?,
+                ),
+                deal.clone(),
+            )
+            .is_none()
+        {
+            if !login {
+                self.balance = None;
+            }
+            self.events.push_back(AccountEvent::PocketDeal {
+                deal,
+                closed: true,
+                receipt_micros: receipt,
+            });
+        }
+        Ok(())
     }
     pub fn subscribe_transactions(&mut self) -> Result<(), String> {
         self.events.push_back(AccountEvent::TransactionAcknowledged);
@@ -634,7 +636,7 @@ impl PocketOptions {
             let event = self
                 .receive(deadline.saturating_sub(self.clock.now_micros()).max(0))?
                 .ok_or("pocket options: balance snapshot unavailable")?;
-            if let Some(deal) = self.ingest(event)? {
+            if let Some(deal) = self.ingest_with_login(event, false)? {
                 self.events.push_back(AccountEvent::PocketDeal {
                     deal,
                     closed: false,
@@ -678,13 +680,7 @@ impl PocketOptions {
             .settings
             .payout
             .ok_or("pocket prepare: payout missing")?;
-        let mapped = mapped_percent(listing.listed_percent, rule)?;
-        let gross = offer
-            .terms
-            .stake
-            .checked_mul(Decimal::parse("1")?.checked_add(
-                Decimal::parse(&mapped.to_string())?.checked_mul(Decimal::parse("0.01")?)?,
-            )?)?;
+        let gross = gross_return(offer.terms.stake, listing.listed_percent, rule)?;
         if !fresh(&listing, self.clock.now_micros(), rule)
             || listing.frame_sha256 != offer.payload_sha256
             || gross.compare(offer.terms.win.gross_return)? != std::cmp::Ordering::Equal
@@ -768,7 +764,7 @@ impl PocketOptions {
                 Err(reason) => return Ok(PurchaseOutcome::PossiblySent { reason }),
             };
             let receipt = event.receipt_micros;
-            match self.ingest(event) {
+            match self.ingest_with_login(event, false) {
                 Ok(Some(deal)) if deal.request_id == Some(encoded.request_id) => {
                     let (_, symbol) = offer.instrument.split_once(':').unwrap();
                     let matching = deal.asset == symbol
@@ -834,7 +830,7 @@ impl PocketOptions {
         let Some(event) = received else {
             return Ok(None);
         };
-        if let Some(deal) = self.ingest(event)? {
+        if let Some(deal) = self.ingest_with_login(event, false)? {
             self.events.push_back(AccountEvent::PocketDeal {
                 deal,
                 closed: false,
@@ -970,6 +966,18 @@ mod tests {
         let rule = session().settings.payout.unwrap();
         assert_eq!(mapped_percent(84, rule).unwrap(), 92);
         assert_eq!(mapped_percent(49, rule).unwrap(), 57);
+        assert_eq!(
+            gross_return(Decimal::parse("1").unwrap(), 84, rule)
+                .unwrap()
+                .to_string(),
+            "1.92"
+        );
+        assert_eq!(
+            gross_return(Decimal::parse("1").unwrap(), 49, rule)
+                .unwrap()
+                .to_string(),
+            "1.57"
+        );
         assert_eq!(mapped_percent(100, rule).unwrap(), 92);
         let listing = Listing {
             listed_percent: 84,
@@ -1010,6 +1018,20 @@ mod tests {
         assert_eq!(statement.rows.len(), 1);
         assert_eq!(statement.rows[0].cash.amount.to_string(), "19.2");
         assert!(account.request_ids.contains(&10_000_000));
+    }
+
+    #[test]
+    fn closed_list_removes_the_open_contract() {
+        let mut account = session();
+        let closed = deal("synthetic-deal", "TEST", "1.00100", "9.2");
+        account
+            .ingest(event("successopenOrder", closed.clone()))
+            .unwrap();
+        assert_eq!(account.open_contracts().unwrap().len(), 1);
+        account
+            .ingest(event("updateClosedDeals", json!([closed])))
+            .unwrap();
+        assert!(account.open_contracts().unwrap().is_empty());
     }
 
     #[test]
@@ -1210,5 +1232,7 @@ mod tests {
             account.write_purchase(encoded).unwrap(),
             PurchaseOutcome::PossiblySent { .. }
         ));
+        account.listings.get_mut("TEST").unwrap().listed_percent = 49;
+        assert!(account.prepare_purchase(&prepared).is_err());
     }
 }

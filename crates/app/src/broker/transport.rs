@@ -658,21 +658,15 @@ impl RecordedConnector {
                 return Ok(ReadOutcome::Frame(None));
             }
             let Some(record) = state.frames.front() else {
-                if deadline.is_some()
-                    && poll
-                    && state.pending.get(&self.session).copied().unwrap_or(0) != 0
-                {
-                    return Ok(ReadOutcome::Interrupted);
+                if deadline.is_some() {
+                    return Ok(ReadOutcome::Frame(None));
                 }
-                state = self.clock.park(
+                drop(self.clock.park(
                     state,
                     Some(&self.session),
                     RecordedWait::Read,
                     Some(Duration::from_micros(timeout.clamp(0, 10_000) as u64)),
-                );
-                if deadline.is_some() {
-                    continue;
-                }
+                ));
                 return Ok(ReadOutcome::Frame(None));
             };
             if self.session == "bootstrap" && record.session != "bootstrap" {
@@ -1548,9 +1542,7 @@ mod scheduler_regressions {
                 let mut account = recorded.session("account").unwrap();
                 account.receive_until(10_000, &clock, true).unwrap()
             });
-            wait_for_parked(&clock);
-            clock.wake("account");
-            assert!(matches!(worker.join().unwrap(), ReadOutcome::Interrupted));
+            assert!(matches!(worker.join().unwrap(), ReadOutcome::Frame(None)));
             assert_eq!(clock.now_micros(), 0);
             clock.cancel();
         });
@@ -1592,6 +1584,29 @@ mod scheduler_regressions {
             }
             assert!(matches!(worker.join().unwrap(), ReadOutcome::Frame(None)));
         });
+    }
+
+    #[test]
+    fn exhausted_recorded_log_ends_absolute_reads_after_an_expected_write() {
+        let recorded = RecordedConnector::from_jsonl(
+            "{\"session\":\"account\",\"expect\":\"42[\\\"openOrder\\\",{}]\"}",
+        )
+        .unwrap();
+        let clock = recorded.clock();
+        let mut account = recorded.session("account").unwrap();
+        account
+            .send(Frame::Text("42[\"openOrder\",{}]".into()))
+            .unwrap();
+        assert!(recorded.exhausted());
+        for deadline in [10_000, 12_000_000] {
+            assert!(matches!(
+                account
+                    .receive_until(deadline, &clock, deadline == 10_000)
+                    .unwrap(),
+                ReadOutcome::Frame(None)
+            ));
+        }
+        assert_eq!(clock.now_micros(), 0);
     }
 
     #[test]

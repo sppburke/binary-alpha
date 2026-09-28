@@ -135,10 +135,7 @@ impl Session {
                 {
                     continue;
                 }
-                if clock.now_micros() >= deadline {
-                    return Ok(None);
-                }
-                continue;
+                return Ok(None);
             };
             let receipt_micros = clock.now_micros();
             self.last_received_frame_micros = receipt_micros;

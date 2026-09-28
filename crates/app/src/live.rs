@@ -728,7 +728,7 @@ pub struct Runtime {
     continuity: Continuity,
     contracts: BTreeMap<String, String>,
     uncorrelated_pocket: BTreeSet<String>,
-    pocket_closed: BTreeMap<String, String>,
+    pocket_closed: BTreeMap<String, BTreeSet<String>>,
     claims: BTreeMap<String, Claim>,
     subscribed: BTreeSet<String>,
     subscriptions_pending: BTreeSet<String>,
@@ -921,6 +921,7 @@ impl Runtime {
                         RecordKind::Started { .. }
                             | RecordKind::Discontinuity { .. }
                             | RecordKind::PocketCorrelation { .. }
+                            | RecordKind::PocketClosed { .. }
                     )
                 }) {
                     return Err("live: journal has financial records without a ledger".into());
@@ -970,6 +971,25 @@ impl Runtime {
             }
             ids
         });
+        let mut pocket_closed: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+        for record in &records {
+            if let RecordKind::PocketClosed {
+                deal_id,
+                request_id,
+                fact,
+            } = &record.kind
+            {
+                let deal: pocket_options::Deal = serde_json::from_str(fact)
+                    .map_err(|_| "live: invalid journaled Pocket close")?;
+                if deal.id != *deal_id || deal.request_id != *request_id {
+                    return Err("live: journaled Pocket close identity mismatch".into());
+                }
+                pocket_closed
+                    .entry(deal_id.clone())
+                    .or_default()
+                    .insert(fact.clone());
+            }
+        }
         if let Some(scheduler) = &scheduler {
             scheduler.complete();
         }
@@ -1063,7 +1083,7 @@ impl Runtime {
             continuity: Continuity::default(),
             contracts: BTreeMap::new(),
             uncorrelated_pocket,
-            pocket_closed: BTreeMap::new(),
+            pocket_closed,
             claims: BTreeMap::new(),
             subscribed: BTreeSet::new(),
             subscriptions_pending: BTreeSet::new(),
@@ -1086,6 +1106,10 @@ impl Runtime {
             runtime.veto(
                 "broker portfolio contains an uncorrelated liability",
                 !runtime.uncorrelated_pocket.is_empty(),
+            );
+            runtime.veto(
+                "pocket deal contradicts earlier close",
+                runtime.pocket_closed.values().any(|facts| facts.len() > 1),
             );
             runtime.restore_due();
             runtime.compatibility()?;

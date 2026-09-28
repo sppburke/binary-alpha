@@ -3196,6 +3196,12 @@ impl Engine {
         &self.accounts
     }
 
+    pub fn proposal(&self, binding: &str) -> Option<&Proposal> {
+        self.binding_index
+            .get(binding)
+            .and_then(|index| self.proposals[*index].as_ref())
+    }
+
     /// The identity of every financial state a ledger reconstructs: accounts, open obligations,
     /// capacity, and the sequence.
     pub fn state_identity(&self) -> String {

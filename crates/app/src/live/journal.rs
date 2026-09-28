@@ -84,6 +84,11 @@ pub enum RecordKind {
         deal_id: String,
         correlated: bool,
     },
+    PocketClosed {
+        deal_id: String,
+        request_id: Option<u64>,
+        fact: String,
+    },
 }
 
 /// Local-only unfinished segment identity; this is not a cloud restore reference.
