@@ -400,6 +400,7 @@ struct RecordedLine {
 #[derive(Default)]
 struct RecordedState {
     frames: std::collections::VecDeque<RecordedLine>,
+    binary_headers: std::collections::BTreeSet<String>,
     writes: Vec<(String, String)>,
     requests: std::collections::BTreeMap<(String, u64), u64>,
     pocket_requests: std::collections::BTreeMap<u64, u64>,
@@ -565,7 +566,7 @@ impl RecordedConnector {
     }
     pub fn exhausted(&self) -> bool {
         let state = self.clock.schedule.0.lock().unwrap();
-        state.frames.is_empty() && state.in_flight.is_none()
+        state.frames.is_empty() && state.in_flight.is_none() && state.binary_headers.is_empty()
     }
     pub fn writes(&self) -> Vec<(String, String)> {
         self.clock.schedule.0.lock().unwrap().writes.clone()
@@ -711,6 +712,7 @@ impl RecordedConnector {
                 state.in_flight = Some(std::thread::current().id());
                 state.generation += 1;
                 let Some(text) = record.frame else {
+                    state.binary_headers.remove(&self.session);
                     let bytes = record.binary.unwrap();
                     let bytes = match std::str::from_utf8(&bytes) {
                         Ok(text) => replace_pocket_ids(text, &state.pocket_requests)?.into_bytes(),
@@ -718,6 +720,9 @@ impl RecordedConnector {
                     };
                     return Ok(ReadOutcome::Frame(Some(Frame::Binary(bytes))));
                 };
+                if text.starts_with("451-") {
+                    state.binary_headers.insert(self.session.clone());
+                }
                 let value: Option<serde_json::Value> = serde_json::from_str(&text).ok();
                 let id = value.as_ref().and_then(|v| {
                     let subscription = response_scope(v)
@@ -923,7 +928,8 @@ impl Transport for RecordedConnector {
         self.last_send_micros
     }
     fn recorded_end(&self) -> bool {
-        self.exhausted()
+        let state = self.clock.schedule.0.lock().unwrap();
+        state.frames.is_empty() && state.in_flight.is_none()
     }
     fn close(&mut self) -> Result<(), String> {
         Ok(())
@@ -1043,6 +1049,29 @@ mod recorded_tests {
         thread.join().unwrap();
         assert_eq!(recorded.clock().now_micros(), 11);
         assert!(recorded.exhausted());
+    }
+
+    #[test]
+    fn recorded_exhaustion_waits_for_each_binary_attachment() {
+        let log = [
+            serde_json::json!({"session":"market","at":1,"frame":"451-[\"updateStream\",{\"_placeholder\":true,\"num\":0}]"}),
+            serde_json::json!({"session":"account","at":2,"frame":"451-[\"updateAssets\",{\"_placeholder\":true,\"num\":0}]"}),
+            serde_json::json!({"session":"market","at":3,"binary":[1]}),
+        ]
+        .iter()
+        .map(|line| format!("{line}\n"))
+        .collect::<String>();
+        let recorded = RecordedConnector::from_jsonl(&log).unwrap();
+        let mut market = recorded.session("market").unwrap();
+        let mut account = recorded.session("account").unwrap();
+        assert!(matches!(market.receive(1).unwrap(), Some(Frame::Text(_))));
+        recorded.clock.complete();
+        assert!(matches!(account.receive(1).unwrap(), Some(Frame::Text(_))));
+        recorded.clock.complete();
+        assert_eq!(market.receive(1).unwrap(), Some(Frame::Binary(vec![1])));
+        recorded.clock.complete();
+        assert!(!recorded.exhausted());
+        assert!(account.recorded_end());
     }
 
     #[test]

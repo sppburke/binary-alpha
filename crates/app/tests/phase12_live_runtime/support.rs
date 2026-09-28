@@ -731,6 +731,7 @@ pub fn pocket_comprehensive_log() -> (String, Vec<String>) {
     let mut added_aged = false;
     let mut added_before_break = false;
     let mut added_after_break = false;
+    let mut added_after_break_delta = false;
     for line in sparse.lines() {
         let row: Value = serde_json::from_str(line).unwrap();
         let at = row["at"].as_i64();
@@ -754,10 +755,18 @@ pub fn pocket_comprehensive_log() -> (String, Vec<String>) {
             ));
             added_after_break = true;
         }
+        if !added_after_break_delta && at.is_some_and(|at| at >= QUOTE_START + 338_800_000) {
+            raw.push_str(&pocket_line(
+                "market",
+                QUOTE_START + 315_000_000,
+                &pocket_event("updateStream", quote(313_000_000, 101_150)),
+            ));
+            added_after_break_delta = true;
+        }
         raw.push_str(line);
         raw.push('\n');
     }
-    assert!(added_aged && added_before_break && added_after_break);
+    assert!(added_aged && added_before_break && added_after_break && added_after_break_delta);
     let foreign = json!({"id":"synthetic-foreign","asset":shared::SYMBOLS[0],"command":1,
         "amount":1,"profit":-1,"percentProfit":92,"openPrice":1.01000,"closePrice":1.01100,
         "openTimestamp":(QUOTE_START+369_000_000)/1_000_000,"openMs":0,

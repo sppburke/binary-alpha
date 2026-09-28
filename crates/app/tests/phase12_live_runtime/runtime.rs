@@ -18,6 +18,25 @@ type ReadGate = Option<(
 )>;
 type MarketGate = Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>;
 
+// Due writes at the named receipt boundaries of the sparse Pocket replay.
+const EXPECTED_SPARSE_PS: [&str; 26] = [
+    "account", "market", // initial logins
+    "market", "account", // first settlement
+    "market", "account", // second settlement
+    "market", "account", // 95 s
+    "market", "account", // 125.5 s
+    "market", "account", // 157 s binary attachment
+    "market", "account", // 187.5 s
+    "market", "account", // 219 s
+    "market", "account", // 249.5 s
+    "market", "account", // 280 s
+    "market", "account", // 310.5 s
+    "market",  // reconnect login
+    "account", // 340.6 s
+    "market",  // 370.2 s
+    "account", // 400 s
+];
+
 struct BeforeMarketRead {
     inner: Box<dyn MarketDataBroker>,
     before_crossing: MarketGate,
@@ -1278,6 +1297,12 @@ fn pocket_live_replay_trades_the_certified_quote_policy() {
     assert!(!ledger.iter().any(|event| matches!(&event.kind,
         binary_alpha_engine::execution::EventKind::Signal { close_time_micros, .. }
         if *close_time_micros == QUOTE_START + 312_800_000)));
+    assert!(ledger.iter().any(|event| matches!(&event.kind,
+        binary_alpha_engine::execution::EventKind::Signal {
+            stream, close_time_micros, quote_price_units: Some(101_150),
+            disposition: binary_alpha_engine::execution::Disposition::StaleQuote, ..
+        } if *stream == binary_alpha_engine::config::StreamKey::quote()
+            && *close_time_micros == QUOTE_START + 313_000_000)));
     let adjacent = ledger
         .iter()
         .filter_map(|event| match &event.kind {
@@ -1481,10 +1506,15 @@ fn pocket_live_replay_trades_the_certified_quote_policy() {
     assert!(log.contains("updateOpenedDeals"));
     assert!(log.contains("451-"));
     assert!(log.contains("synthetic-foreign"));
-    let expected = expected_ps.into_iter().collect::<Vec<_>>();
-    assert!(expected.len() > 12);
-    assert!(expected.iter().any(|session| session == "market"));
-    assert!(expected.iter().any(|session| session == "account"));
+    // The comprehensive log adds a final account receipt at 400.5 s.
+    let expected = EXPECTED_SPARSE_PS
+        .into_iter()
+        .chain(["market"])
+        .collect::<Vec<_>>();
+    assert_eq!(
+        expected_ps.iter().map(String::as_str).collect::<Vec<_>>(),
+        expected
+    );
     let receipts = log
         .lines()
         .filter_map(|line| {
@@ -1493,7 +1523,7 @@ fn pocket_live_replay_trades_the_certified_quote_policy() {
         })
         .collect::<Vec<_>>();
     assert!(receipts.last().unwrap() - receipts.first().unwrap() > 180_000_000);
-    let actual = log
+    let scheduled_ps = log
         .lines()
         .filter_map(|line| {
             let row: Value = serde_json::from_str(line).unwrap();
@@ -1501,19 +1531,26 @@ fn pocket_live_replay_trades_the_certified_quote_policy() {
                 .then(|| row["session"].as_str().unwrap().to_string())
         })
         .collect::<Vec<_>>();
-    assert_eq!(actual, expected);
+    assert_eq!(
+        scheduled_ps.iter().map(String::as_str).collect::<Vec<_>>(),
+        expected
+    );
 }
 
 #[test]
 fn pocket_replay_rejects_truncated_binary_attachment() {
     let fixture = Fixture::quote("phase12-pocket-truncated-binary");
-    let complete = super::support::pocket_log();
-    let log = complete
+    let mut log = super::support::pocket_log();
+    let last_receipt = log
         .lines()
-        .take_while(|line| !line.contains("451-"))
-        .chain(complete.lines().find(|line| line.contains("451-")))
-        .map(|line| format!("{line}\n"))
-        .collect::<String>();
+        .filter_map(|line| serde_json::from_str::<Value>(line).unwrap()["at"].as_i64())
+        .next_back()
+        .unwrap();
+    log.push_str(&format!(
+        "{}\n",
+        json!({"session":"market","at":last_receipt+1,
+        "frame":"451-[\"updateStream\",{\"_placeholder\":true,\"num\":0}]"})
+    ));
     write(&fixture.scratch.path("broker.jsonl"), log);
     let error = cli(
         &fixture.log(),
@@ -1748,6 +1785,10 @@ fn pocket_recorded_keepalives_cross_both_sessions_and_settle_after_reconnect() {
         .filter_map(|(session, text)| (text == "42[\"ps\",null]").then_some(session))
         .collect::<Vec<_>>();
     assert_eq!(actual_ps, expected_ps);
+    assert_eq!(
+        actual_ps.iter().map(String::as_str).collect::<Vec<_>>(),
+        EXPECTED_SPARSE_PS
+    );
     assert!(
         runtime
             .records()
@@ -2322,6 +2363,7 @@ fn pocket_reconnect_does_not_trigger_from_the_cross_break_jump() {
         live::control::FakeControl::new(QUOTE_START - 2_000_000),
     )
     .unwrap();
+    let warmup_observations = runtime.features()[0].profile().observations;
     runtime
         .run_until(|health| recorded.exhausted() && health.connection_generation >= 1)
         .unwrap();
@@ -2339,6 +2381,11 @@ fn pocket_reconnect_does_not_trigger_from_the_cross_break_jump() {
         live::journal::RecordKind::Ledger { event: binary_alpha_engine::execution::FinancialEvent {
             kind: EventKind::Signal { close_time_micros, .. }, ..
         }} if *close_time_micros == QUOTE_START + 63_500_000))
+    );
+    // Twelve pre-break and both post-break quotes reached the feature owner, including the null-delta first.
+    assert_eq!(
+        runtime.features()[0].profile().observations,
+        warmup_observations + 14
     );
     assert_eq!(
         runtime
