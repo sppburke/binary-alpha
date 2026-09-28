@@ -1,5 +1,5 @@
 use super::Clock;
-use super::transport::{Frame, Transport};
+use super::transport::{Frame, ReadOutcome, Transport};
 use serde::Deserialize;
 use serde_json::value::RawValue;
 
@@ -13,8 +13,10 @@ pub(super) struct Event {
     pub receipt_micros: i64,
 }
 
+#[derive(Debug)]
 pub(super) enum ReceiveError {
     Disconnected,
+    Interrupted,
     Transport(String),
     Framing(String),
 }
@@ -33,6 +35,7 @@ impl From<ReceiveError> for String {
     fn from(error: ReceiveError) -> Self {
         match error {
             ReceiveError::Disconnected => "socket.io: the server disconnected the namespace (an `origin` setting is usually required)".into(),
+            ReceiveError::Interrupted => "socket.io: read interrupted for queued intent".into(),
             ReceiveError::Transport(error) | ReceiveError::Framing(error) => error,
         }
     }
@@ -69,7 +72,12 @@ impl Session {
         transport
             .send(Frame::Text(encode_event("ps", "null")))
             .map_err(ReceiveError::Transport)?;
-        self.next_keepalive_micros = Some(clock.now_micros().saturating_add(KEEPALIVE_MICROS));
+        self.next_keepalive_micros = Some(
+            transport
+                .last_send_micros()
+                .unwrap_or_else(|| clock.now_micros())
+                .saturating_add(KEEPALIVE_MICROS),
+        );
         Ok(())
     }
 
@@ -78,6 +86,25 @@ impl Session {
         transport: &mut dyn Transport,
         clock: &dyn Clock,
         timeout_micros: i64,
+    ) -> Result<Option<Event>, ReceiveError> {
+        self.receive_with_poll(transport, clock, timeout_micros, false)
+    }
+
+    pub fn poll(
+        &mut self,
+        transport: &mut dyn Transport,
+        clock: &dyn Clock,
+        timeout_micros: i64,
+    ) -> Result<Option<Event>, ReceiveError> {
+        self.receive_with_poll(transport, clock, timeout_micros, true)
+    }
+
+    fn receive_with_poll(
+        &mut self,
+        transport: &mut dyn Transport,
+        clock: &dyn Clock,
+        timeout_micros: i64,
+        poll: bool,
     ) -> Result<Option<Event>, ReceiveError> {
         let deadline = clock.now_micros().saturating_add(timeout_micros.max(0));
         loop {
@@ -94,10 +121,13 @@ impl Session {
                 self.next_keepalive_micros
                     .map_or(deadline, |next| deadline.min(next))
             };
-            let Some(frame) = transport
-                .receive(wait_until.saturating_sub(clock.now_micros()).max(0))
+            let Some(frame) = (match transport
+                .receive_until(wait_until, clock, poll && self.pending.is_none())
                 .map_err(ReceiveError::Transport)?
-            else {
+            {
+                ReadOutcome::Frame(frame) => frame,
+                ReadOutcome::Interrupted => return Err(ReceiveError::Interrupted),
+            }) else {
                 if self.pending.is_none()
                     && self
                         .next_keepalive_micros
@@ -105,7 +135,10 @@ impl Session {
                 {
                     continue;
                 }
-                return Ok(None);
+                if clock.now_micros() >= deadline {
+                    return Ok(None);
+                }
+                continue;
             };
             let receipt_micros = clock.now_micros();
             self.last_received_frame_micros = receipt_micros;

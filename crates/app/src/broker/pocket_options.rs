@@ -823,7 +823,15 @@ impl PocketOptions {
         if let Some(event) = self.events.pop_front() {
             return Ok(Some(event));
         }
-        let Some(event) = self.receive(timeout)? else {
+        let received = match self
+            .session
+            .poll(&mut *self.transport, &*self.clock, timeout)
+        {
+            Ok(event) => event,
+            Err(socket_io::ReceiveError::Interrupted) => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
+        let Some(event) = received else {
             return Ok(None);
         };
         if let Some(deal) = self.ingest(event)? {
@@ -887,20 +895,25 @@ impl PocketOptions {
 mod tests {
     use super::*;
     use serde_json::{Value, json};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicI64, Ordering};
 
-    struct StillClock;
-    impl Clock for StillClock {
+    struct TestClock(Arc<AtomicI64>);
+    impl Clock for TestClock {
         fn now_micros(&self) -> i64 {
-            100_000_000
+            self.0.load(Ordering::SeqCst)
         }
-        fn sleep(&mut self, _: i64) {}
+        fn sleep(&mut self, micros: i64) {
+            self.0.fetch_add(micros, Ordering::SeqCst);
+        }
     }
-    struct NoSocket;
+    struct NoSocket(Arc<AtomicI64>);
     impl Transport for NoSocket {
         fn send(&mut self, _: Frame) -> Result<(), String> {
             Ok(())
         }
-        fn receive(&mut self, _: i64) -> Result<Option<Frame>, String> {
+        fn receive(&mut self, timeout: i64) -> Result<Option<Frame>, String> {
+            self.0.fetch_add(timeout.max(0), Ordering::SeqCst);
             Ok(None)
         }
         fn close(&mut self) -> Result<(), String> {
@@ -908,6 +921,7 @@ mod tests {
         }
     }
     fn session() -> PocketOptions {
+        let clock = Arc::new(AtomicI64::new(100_000_000));
         let settings = serde_json::from_value(json!({
             "id":"p", "endpoint":"wss://example.invalid", "credential":"SYNTHETIC",
             "account_class":"demo", "server_offset_minutes":0,
@@ -923,8 +937,8 @@ mod tests {
                 currency: "USD".to_string().try_into().unwrap(),
             },
             instruments: BTreeMap::from([("TEST".into(), PriceScale::try_from(5).unwrap())]),
-            transport: Box::new(NoSocket),
-            clock: Box::new(StillClock),
+            transport: Box::new(NoSocket(Arc::clone(&clock))),
+            clock: Box::new(TestClock(clock)),
             session: socket_io::Session::new(0),
             events: VecDeque::new(),
             listings: BTreeMap::new(),

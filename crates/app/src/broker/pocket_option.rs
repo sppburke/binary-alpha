@@ -55,6 +55,7 @@ pub fn provider_token(micros: i64, offset_minutes: i32) -> Result<WireDecimal, S
 }
 enum ReceiveError {
     Disconnected,
+    Interrupted,
     Transport(String),
     ResponseTimeout(String),
     Other(String),
@@ -73,6 +74,7 @@ impl From<ReceiveError> for String {
     fn from(error: ReceiveError) -> Self {
         match error {
             ReceiveError::Disconnected => "socket.io: the server disconnected the namespace (an `origin` setting is usually required)".into(),
+            ReceiveError::Interrupted => "socket.io: read interrupted for queued intent".into(),
             ReceiveError::Transport(error) | ReceiveError::ResponseTimeout(error) | ReceiveError::Other(error) => error,
         }
     }
@@ -81,6 +83,7 @@ impl From<socket_io::ReceiveError> for ReceiveError {
     fn from(error: socket_io::ReceiveError) -> Self {
         match error {
             socket_io::ReceiveError::Disconnected => Self::Disconnected,
+            socket_io::ReceiveError::Interrupted => Self::Interrupted,
             socket_io::ReceiveError::Transport(error) => Self::Transport(error),
             socket_io::ReceiveError::Framing(error) => Self::Other(error),
         }
@@ -243,6 +246,11 @@ impl PocketMarketData {
     fn receive(&mut self, timeout_micros: i64) -> Result<Option<Event>, ReceiveError> {
         self.session
             .receive(&mut *self.transport, &*self.clock, timeout_micros)
+            .map_err(Into::into)
+    }
+    fn poll(&mut self, timeout_micros: i64) -> Result<Option<Event>, ReceiveError> {
+        self.session
+            .poll(&mut *self.transport, &*self.clock, timeout_micros)
             .map_err(Into::into)
     }
     fn handshake(&mut self) -> Result<(), String> {
@@ -869,14 +877,15 @@ impl MarketDataBroker for PocketMarketData {
             .now_micros()
             .saturating_add(timeout_micros.max(0));
         loop {
-            let received =
-                match self.receive(deadline.saturating_sub(self.clock.now_micros()).max(0)) {
-                    Err(ReceiveError::Disconnected) => {
-                        self.reconnect_transport(false)?;
-                        return Ok(self.events.pop_front());
-                    }
-                    other => other?,
-                };
+            let received = match self.poll(deadline.saturating_sub(self.clock.now_micros()).max(0))
+            {
+                Err(ReceiveError::Interrupted) => return Ok(None),
+                Err(ReceiveError::Disconnected) => {
+                    self.reconnect_transport(false)?;
+                    return Ok(self.events.pop_front());
+                }
+                other => other?,
+            };
             let Some(event) = received else {
                 return Ok(None);
             };

@@ -508,13 +508,13 @@ pub fn pocket_keepalives(input: &str) -> (String, Vec<String>) {
         for i in 0..2 {
             if deadlines[i].is_some_and(|deadline| at >= deadline) {
                 due[i] = true;
-                deadlines[i] = Some(at + 30_000_000);
             }
         }
         for (i, name) in ["market", "account"].into_iter().enumerate() {
             if due[i] && !attachments[i] && !(i == 1 && due[0]) {
                 expect(name, &mut output);
                 due[i] = false;
+                deadlines[i] = Some(at + 30_000_000);
             }
         }
     }
@@ -577,6 +577,12 @@ pub fn pocket_sparse_keepalive_log() -> (String, Vec<String>) {
         "account",
         start + 313_900_000,
         "updateAssets",
+        json!([asset.clone()]),
+    ));
+    log.push_str(&pocket_binary(
+        "account",
+        start + 339_000_000,
+        "updateAssets",
         json!([asset]),
     ));
     let quote = |offset: i64, units: i64| {
@@ -589,54 +595,59 @@ pub fn pocket_sparse_keepalive_log() -> (String, Vec<String>) {
                 .unwrap()
         ]])
     };
-    let mut first = quote(314_000_000, 101_000);
+    let mut first = quote(340_000_000, 101_000);
     first.as_array_mut().unwrap().push(json!([
         shared::SYMBOLS[1],
         serde_json::from_str::<Value>(&format!(
             "{}.{:06}",
-            (start + 314_000_000) / 1_000_000,
-            (start + 314_000_000) % 1_000_000
+            (start + 340_000_000) / 1_000_000,
+            (start + 340_000_000) % 1_000_000
         ))
         .unwrap(),
         1.01
     ]));
     log.push_str(&pocket_binary(
         "market",
-        start + 314_200_000,
+        start + 340_200_000,
         "updateStream",
         first,
     ));
-    let mut jump = quote(314_300_000, 101_150);
+    let mut jump = quote(340_300_000, 101_150);
     jump.as_array_mut().unwrap().push(json!([
         shared::SYMBOLS[1],
         serde_json::from_str::<Value>(&format!(
             "{}.{:06}",
-            (start + 314_300_000) / 1_000_000,
-            (start + 314_300_000) % 1_000_000
+            (start + 340_300_000) / 1_000_000,
+            (start + 340_300_000) % 1_000_000
         ))
         .unwrap(),
         1.01001
     ]));
     log.push_str(&pocket_line(
         "market",
-        start + 314_500_000,
+        start + 340_400_000,
         &pocket_event("updateStream", jump),
     ));
-    log.push_str(&format!("{}\n", json!({"session":"account","at":start+314_800_000,
+    log.push_str(&format!("{}\n", json!({"session":"account","at":start+340_450_000,
         "expect":format!("42[\"openOrder\",{{\"asset\":\"{}\",\"amount\":1,\"action\":\"put\",\"isDemo\":1,\"requestId\":33333333,\"optionType\":100,\"time\":30}}]", shared::SYMBOLS[0])})));
+    log.push_str(&pocket_line(
+        "market",
+        start + 340_600_000,
+        &pocket_event("updateStream", quote(340_500_000, 101_151)),
+    ));
     let opened = json!({"id":"synthetic-three","asset":shared::SYMBOLS[0],"command":1,"amount":1,
         "profit":0,"percentProfit":92,"openPrice":1.01150,"closePrice":null,
-        "openTimestamp":(start+314_000_000)/1_000_000,"openMs":800,
-        "closeTimestamp":(start+344_000_000)/1_000_000,"isDemo":1,"currency":"USD",
+        "openTimestamp":(start+340_000_000)/1_000_000,"openMs":700,
+        "closeTimestamp":(start+370_000_000)/1_000_000,"isDemo":1,"currency":"USD",
         "requestId":33333333,"optionType":100});
     log.push_str(&pocket_line(
         "account",
-        start + 314_900_000,
+        start + 340_700_000,
         &pocket_event("successopenOrder", opened.clone()),
     ));
     log.push_str(&pocket_line(
         "account",
-        start + 315_000_000,
+        start + 340_800_000,
         &pocket_event(
             "successupdateBalance",
             json!({"isDemo":1,"balance":10000.84}),
@@ -648,16 +659,26 @@ pub fn pocket_sparse_keepalive_log() -> (String, Vec<String>) {
     closed["closeMs"] = json!(200);
     log.push_str(&pocket_line(
         "account",
-        start + 344_400_000,
+        start + 370_200_000,
         &pocket_event("successcloseOrder", json!({"profit":1.92,"deals":[closed]})),
     ));
     log.push_str(&pocket_line(
         "account",
-        start + 344_500_000,
+        start + 370_300_000,
         &pocket_event(
             "successupdateBalance",
             json!({"isDemo":1,"balance":10002.76}),
         ),
+    ));
+    log.push_str(&pocket_line(
+        "market",
+        start + 370_400_000,
+        &pocket_event("updateStream", quote(370_350_000, 101_151)),
+    ));
+    log.push_str(&pocket_line(
+        "market",
+        start + 400_000_000,
+        &pocket_event("updateStream", quote(399_900_000, 101_152)),
     ));
     pocket_keepalives(&log)
 }
@@ -1945,6 +1966,27 @@ pub fn pocket_runtime_with_market(
         Box<dyn binary_alpha_app::broker::MarketDataBroker>,
     ) -> Box<dyn binary_alpha_app::broker::MarketDataBroker>,
 ) -> Result<live::Runtime, String> {
+    pocket_runtime_with_transports(
+        fixture,
+        mode,
+        recorded,
+        control,
+        |account| Box::new(account),
+        wrap_market,
+    )
+}
+pub fn pocket_runtime_with_transports(
+    fixture: &Fixture,
+    mode: live::Mode,
+    recorded: &binary_alpha_app::broker::transport::RecordedConnector,
+    control: live::control::FakeControl,
+    wrap_account: impl FnOnce(
+        binary_alpha_app::broker::transport::RecordedConnector,
+    ) -> Box<dyn binary_alpha_app::broker::transport::Connector>,
+    wrap_market: impl FnOnce(
+        Box<dyn binary_alpha_app::broker::MarketDataBroker>,
+    ) -> Box<dyn binary_alpha_app::broker::MarketDataBroker>,
+) -> Result<live::Runtime, String> {
     use binary_alpha_app::broker::{
         AccountIdentity, pocket_option::PocketMarketData, pocket_options::PocketOptions,
     };
@@ -1982,7 +2024,7 @@ pub fn pocket_runtime_with_market(
         settings,
         account,
         &instruments,
-        Box::new(recorded.session("account")?),
+        wrap_account(recorded.session("account")?),
         Box::new(clock.clone()),
         "{}".into(),
     )?;

@@ -1,11 +1,159 @@
 use super::support::*;
-use binary_alpha_app::{broker::transport::RecordedConnector, live};
+use binary_alpha_app::{
+    broker::{self, MarketDataBroker, transport::RecordedConnector},
+    live,
+};
 use binary_alpha_engine::{
+    dataset::NativeGranularity,
+    market::{InstrumentId, PriceScale},
     portfolio::Selection,
     research::{self, CertificationManifest, Frozen},
 };
 use serde_json::{Value, json};
 use std::fs;
+
+type ReadGate = Option<(
+    std::sync::mpsc::Sender<(i64, i64)>,
+    std::sync::mpsc::Receiver<()>,
+)>;
+type MarketGate = Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>;
+
+struct BeforeMarketRead {
+    inner: Box<dyn MarketDataBroker>,
+    before_crossing: MarketGate,
+    before_settled: MarketGate,
+    jump_rows: usize,
+    hold_crossing: bool,
+    hold_settled: bool,
+}
+impl MarketDataBroker for BeforeMarketRead {
+    fn discover(&mut self) -> Result<Vec<broker::DiscoveredInstrument>, String> {
+        self.inner.discover()
+    }
+    fn history_page(
+        &mut self,
+        id: &InstrumentId,
+        scale: PriceScale,
+        before: Option<i64>,
+        granularity: NativeGranularity,
+    ) -> Result<broker::HistoryPage, String> {
+        self.inner.history_page(id, scale, before, granularity)
+    }
+    fn decode_history(
+        &self,
+        id: &InstrumentId,
+        raw: &[u8],
+        scale: PriceScale,
+        granularity: NativeGranularity,
+    ) -> Result<(Option<i32>, broker::HistoryRows), String> {
+        self.inner.decode_history(id, raw, scale, granularity)
+    }
+    fn subscribe(&mut self, id: &InstrumentId, scale: PriceScale) -> Result<(), String> {
+        self.inner.subscribe(id, scale)
+    }
+    fn next_live(&mut self, timeout: i64) -> Result<Option<broker::LiveEvent>, String> {
+        for (hold, gate) in [
+            (&mut self.hold_crossing, &mut self.before_crossing),
+            (&mut self.hold_settled, &mut self.before_settled),
+        ] {
+            if *hold {
+                let (waiting, release) = gate.take().unwrap();
+                waiting.send(()).unwrap();
+                release
+                    .recv_timeout(std::time::Duration::from_secs(10))
+                    .map_err(|_| "market read gate was not released".to_string())?;
+                *hold = false;
+            }
+        }
+        let event = self.inner.next_live(timeout)?;
+        if let Some(broker::LiveEvent::Observation(observation)) = &event {
+            if observation.provider_time_micros == QUOTE_START + 340_300_000 {
+                self.jump_rows += 1;
+                self.hold_crossing = self.jump_rows == 2;
+            }
+            if observation.provider_time_micros == QUOTE_START + 370_350_000 {
+                self.hold_settled = true;
+            }
+        }
+        Ok(event)
+    }
+    fn unsubscribe(&mut self, id: &InstrumentId) -> Result<broker::Cancellation, String> {
+        self.inner.unsubscribe(id)
+    }
+    fn reconnect(&mut self) -> Result<(), String> {
+        self.inner.reconnect()
+    }
+    fn continuity(&self) -> &broker::Continuity {
+        self.inner.continuity()
+    }
+}
+
+struct GatedPocketConnector {
+    inner: Option<RecordedConnector>,
+    long: ReadGate,
+    poll: ReadGate,
+}
+impl binary_alpha_app::broker::transport::Connector for GatedPocketConnector {
+    fn connect(
+        &mut self,
+        _: &str,
+        _: &[(String, String)],
+    ) -> Result<Box<dyn binary_alpha_app::broker::transport::Transport>, String> {
+        Ok(Box::new(GatedPocketTransport {
+            inner: self.inner.take().unwrap(),
+            long: self.long.take(),
+            poll: self.poll.take(),
+        }))
+    }
+}
+struct GatedPocketTransport {
+    inner: RecordedConnector,
+    long: ReadGate,
+    poll: ReadGate,
+}
+impl binary_alpha_app::broker::transport::Transport for GatedPocketTransport {
+    fn send(&mut self, frame: binary_alpha_app::broker::transport::Frame) -> Result<(), String> {
+        self.inner.send(frame)
+    }
+    fn receive(
+        &mut self,
+        timeout: i64,
+    ) -> Result<Option<binary_alpha_app::broker::transport::Frame>, String> {
+        self.inner.receive(timeout)
+    }
+    fn receive_until(
+        &mut self,
+        deadline: i64,
+        clock: &dyn binary_alpha_app::broker::Clock,
+        poll: bool,
+    ) -> Result<binary_alpha_app::broker::transport::ReadOutcome, String> {
+        let now = clock.now_micros();
+        let gate =
+            if !poll && now == QUOTE_START + 340_450_000 && deadline == QUOTE_START + 340_500_000 {
+                self.long.take()
+            } else if (QUOTE_START + 370_300_000..QUOTE_START + 400_000_000).contains(&now)
+                && poll
+                && deadline.saturating_sub(now) <= 10_000
+            {
+                self.poll.take()
+            } else {
+                None
+            };
+        if let Some((parked, release)) = gate {
+            parked.send((now, deadline)).unwrap();
+            release
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .map_err(|_| "Pocket read gate was not released".to_string())?;
+        }
+        self.inner.receive_until(deadline, clock, poll)
+    }
+    fn last_send_micros(&self) -> Option<i64> {
+        self.inner.last_send_micros()
+    }
+    fn close(&mut self) -> Result<(), String> {
+        self.inner.close()
+    }
+}
 
 #[test]
 fn projection_consumes_verified_bundle_and_public_envelope() {
@@ -1271,7 +1419,7 @@ fn pocket_recorded_keepalives_cross_both_sessions_and_settle_after_reconnect() {
         .as_mut()
         .unwrap()
         .compatibility
-        .observation_end = super::fixture_config::time(QUOTE_START + 370_000_000);
+        .observation_end = super::fixture_config::time(QUOTE_START + 410_000_000);
     fixture
         .config
         .live
@@ -1315,13 +1463,87 @@ fn pocket_recorded_keepalives_cross_both_sessions_and_settle_after_reconnect() {
     assert_eq!(rows[reconnect + 1]["expect"], "42[\"ps\",null]");
     assert!(expected_ps.len() > 12);
     let recorded = RecordedConnector::from_jsonl(&log).unwrap();
-    let mut runtime = pocket_runtime(
+    let (long_tx, long_rx) = std::sync::mpsc::channel();
+    let (long_release_tx, long_release_rx) = std::sync::mpsc::channel();
+    let (poll_tx, poll_rx) = std::sync::mpsc::channel();
+    let (poll_release_tx, poll_release_rx) = std::sync::mpsc::channel();
+    let (crossing_tx, crossing_rx) = std::sync::mpsc::channel();
+    let (crossing_release_tx, crossing_release_rx) = std::sync::mpsc::channel();
+    let (before_crossing_tx, before_crossing_rx) = std::sync::mpsc::channel();
+    let (before_crossing_release_tx, before_crossing_release_rx) = std::sync::mpsc::channel();
+    let (settled_tx, settled_rx) = std::sync::mpsc::channel();
+    let (settled_release_tx, settled_release_rx) = std::sync::mpsc::channel();
+    let (before_settled_tx, before_settled_rx) = std::sync::mpsc::channel();
+    let (before_settled_release_tx, before_settled_release_rx) = std::sync::mpsc::channel();
+    let mut runtime = pocket_runtime_with_transports(
         &fixture,
         live::Mode::Replay,
         &recorded,
         live::control::FakeControl::new(QUOTE_START - 2_000_000),
+        move |inner| {
+            Box::new(GatedPocketConnector {
+                inner: Some(inner),
+                long: Some((long_tx, long_release_rx)),
+                poll: Some((poll_tx, poll_release_rx)),
+            })
+        },
+        move |inner| {
+            Box::new(BeforeMarketRead {
+                inner: Box::new(super::resilience::MarketProbe {
+                    inner: Box::new(super::resilience::MarketProbe {
+                        inner,
+                        panic: false,
+                        gate: None,
+                        consumed: None,
+                        subscribe_gate: None,
+                        frame_gate: Some((
+                            QUOTE_START + 399_900_000,
+                            settled_tx,
+                            settled_release_rx,
+                        )),
+                        dropped: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                    }),
+                    panic: false,
+                    gate: None,
+                    consumed: None,
+                    subscribe_gate: None,
+                    frame_gate: Some((QUOTE_START + 340_500_000, crossing_tx, crossing_release_rx)),
+                    dropped: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                }),
+                before_crossing: Some((before_crossing_tx, before_crossing_release_rx)),
+                before_settled: Some((before_settled_tx, before_settled_release_rx)),
+                jump_rows: 0,
+                hold_crossing: false,
+                hold_settled: false,
+            })
+        },
     )
     .unwrap();
+    let gates = std::thread::spawn(move || {
+        let wait = |rx: std::sync::mpsc::Receiver<(i64, i64)>| {
+            rx.recv_timeout(std::time::Duration::from_secs(10))
+        };
+        let before_crossing = before_crossing_rx.recv_timeout(std::time::Duration::from_secs(10));
+        let long = wait(long_rx);
+        let _ = before_crossing_release_tx.send(());
+        let crossing = crossing_rx.recv_timeout(std::time::Duration::from_secs(10));
+        let _ = long_release_tx.send(());
+        let _ = crossing_release_tx.send(());
+        let before_settled = before_settled_rx.recv_timeout(std::time::Duration::from_secs(10));
+        let poll = wait(poll_rx);
+        let _ = before_settled_release_tx.send(());
+        let settled = settled_rx.recv_timeout(std::time::Duration::from_secs(10));
+        let _ = poll_release_tx.send(());
+        let _ = settled_release_tx.send(());
+        (
+            before_crossing,
+            long,
+            crossing,
+            before_settled,
+            poll,
+            settled,
+        )
+    });
     let completed = runtime
         .run_until(|_| recorded.exhausted())
         .unwrap_or_else(|error| {
@@ -1333,6 +1555,18 @@ fn pocket_recorded_keepalives_cross_both_sessions_and_settle_after_reconnect() {
             )
         })
         .unwrap();
+    let (before_crossing, long, crossing, before_settled, poll, settled) = gates.join().unwrap();
+    before_crossing.unwrap();
+    assert_eq!(
+        long.unwrap(),
+        (QUOTE_START + 340_450_000, QUOTE_START + 340_500_000)
+    );
+    crossing.unwrap();
+    before_settled.unwrap();
+    let (poll_now, poll_deadline) = poll.unwrap();
+    assert!(poll_now >= QUOTE_START + 370_300_000);
+    assert_eq!(poll_deadline - poll_now, 10_000);
+    settled.unwrap();
     let actual_ps = recorded
         .writes()
         .into_iter()

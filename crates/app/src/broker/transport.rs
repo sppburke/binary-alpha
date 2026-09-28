@@ -1,3 +1,4 @@
+use super::Clock;
 use futures_util::{SinkExt, StreamExt};
 use std::sync::{
     Arc, Condvar, Mutex,
@@ -18,9 +19,25 @@ pub enum Frame {
     Pong(Vec<u8>),
     Close,
 }
+pub enum ReadOutcome {
+    Frame(Option<Frame>),
+    Interrupted,
+}
 pub trait Transport: Send {
     fn send(&mut self, frame: Frame) -> Result<(), String>;
     fn receive(&mut self, timeout_micros: i64) -> Result<Option<Frame>, String>;
+    fn receive_until(
+        &mut self,
+        deadline_micros: i64,
+        clock: &dyn super::Clock,
+        _poll: bool,
+    ) -> Result<ReadOutcome, String> {
+        self.receive(deadline_micros.saturating_sub(clock.now_micros()).max(0))
+            .map(ReadOutcome::Frame)
+    }
+    fn last_send_micros(&self) -> Option<i64> {
+        None
+    }
     fn close(&mut self) -> Result<(), String>;
 }
 pub trait Connector: Send {
@@ -373,6 +390,7 @@ struct Parked {
 enum RecordedWait {
     Idle,
     Read,
+    ReadUntil { deadline: i64, poll: bool },
     Write,
     Rate(i64),
 }
@@ -397,6 +415,16 @@ impl RecordedState {
                         reason: RecordedWait::Rate(deadline),
                         ..
                     }) => now >= *deadline,
+                    Some(Parked {
+                        reason: RecordedWait::ReadUntil { deadline, poll },
+                        ..
+                    }) => {
+                        now >= *deadline
+                            || (*poll && self.pending.get(*session).copied().unwrap_or(0) != 0)
+                            || self.frames.front().is_some_and(|record| {
+                                record.session == *session && self.ready(record)
+                            })
+                    }
                     Some(Parked {
                         reason: RecordedWait::Idle,
                         ..
@@ -443,6 +471,7 @@ impl RecordedState {
 pub struct RecordedConnector {
     clock: ReplayClock,
     session: String,
+    last_send_micros: Option<i64>,
 }
 impl RecordedConnector {
     pub fn open(path: &std::path::Path) -> Result<Self, String> {
@@ -485,6 +514,7 @@ impl RecordedConnector {
         Ok(Self {
             clock,
             session: "market".into(),
+            last_send_micros: None,
         })
     }
     pub fn session(&self, session: &str) -> Result<Self, String> {
@@ -607,25 +637,43 @@ impl RecordedConnector {
                 .insert((self.session.clone(), scope), actual);
         }
         state.writes.push((self.session.clone(), text.into()));
+        self.last_send_micros = Some(self.clock.now_micros());
         state.generation += 1;
         self.clock.notify(&mut state);
         Ok(())
     }
-    fn receive_frame(&mut self, timeout: i64) -> Result<Option<Frame>, String> {
+    fn receive_frame(
+        &mut self,
+        timeout: i64,
+        deadline: Option<(i64, bool)>,
+    ) -> Result<ReadOutcome, String> {
         self.clock.complete();
         let mut state = self.clock.schedule.0.lock().unwrap();
+        let poll = deadline.map_or(timeout <= 10_000, |(_, poll)| poll);
         loop {
             if let Some(error) = &state.failure {
                 return Err(error.clone());
             }
+            if deadline.is_some_and(|(until, _)| self.clock.now_micros() >= until) {
+                return Ok(ReadOutcome::Frame(None));
+            }
             let Some(record) = state.frames.front() else {
-                drop(self.clock.park(
+                if deadline.is_some()
+                    && poll
+                    && state.pending.get(&self.session).copied().unwrap_or(0) != 0
+                {
+                    return Ok(ReadOutcome::Interrupted);
+                }
+                state = self.clock.park(
                     state,
                     Some(&self.session),
                     RecordedWait::Read,
                     Some(Duration::from_micros(timeout.clamp(0, 10_000) as u64)),
-                ));
-                return Ok(None);
+                );
+                if deadline.is_some() {
+                    continue;
+                }
+                return Ok(ReadOutcome::Frame(None));
             };
             if self.session == "bootstrap" && record.session != "bootstrap" {
                 return Err("recorded bootstrap: expected bootstrap response before market or account frames".into());
@@ -643,7 +691,7 @@ impl RecordedConnector {
                         Ok(text) => replace_pocket_ids(text, &state.pocket_requests)?.into_bytes(),
                         Err(_) => bytes,
                     };
-                    return Ok(Some(Frame::Binary(bytes)));
+                    return Ok(ReadOutcome::Frame(Some(Frame::Binary(bytes))));
                 };
                 let value: Option<serde_json::Value> = serde_json::from_str(&text).ok();
                 let id = value.as_ref().and_then(|v| {
@@ -660,10 +708,22 @@ impl RecordedConnector {
                     Some(id) => correlate(&text, id)?,
                     None => text,
                 };
-                return Ok(Some(Frame::Text(replace_pocket_ids(
+                return Ok(ReadOutcome::Frame(Some(Frame::Text(replace_pocket_ids(
                     &text,
                     &state.pocket_requests,
-                )?)));
+                )?))));
+            }
+            if let Some((deadline, _)) = deadline {
+                if poll && state.pending.get(&self.session).copied().unwrap_or(0) != 0 {
+                    return Ok(ReadOutcome::Interrupted);
+                }
+                state = self.clock.park(
+                    state,
+                    Some(&self.session),
+                    RecordedWait::ReadUntil { deadline, poll },
+                    None,
+                );
+                continue;
             }
             if timeout <= 10_000 {
                 // A queued intent is runnable as soon as this ordinary poll returns.
@@ -675,7 +735,7 @@ impl RecordedConnector {
                         Some(Duration::from_micros(timeout.max(0) as u64)),
                     ));
                 }
-                return Ok(None);
+                return Ok(ReadOutcome::Frame(None));
             }
             state = self
                 .clock
@@ -684,12 +744,14 @@ impl RecordedConnector {
     }
     #[cfg(test)]
     fn receive_text(&mut self, timeout: i64) -> Result<Option<String>, String> {
-        self.receive_frame(timeout)?
-            .map_or(Ok(None), |frame| match frame {
-                Frame::Text(text) => Ok(Some(text)),
-                Frame::Binary(_) => Err("recorded bootstrap: expected text frame".into()),
-                _ => unreachable!(),
-            })
+        let ReadOutcome::Frame(frame) = self.receive_frame(timeout, None)? else {
+            unreachable!()
+        };
+        frame.map_or(Ok(None), |frame| match frame {
+            Frame::Text(text) => Ok(Some(text)),
+            Frame::Binary(_) => Err("recorded bootstrap: expected text frame".into()),
+            _ => unreachable!(),
+        })
     }
 }
 fn request_kind(v: &serde_json::Value) -> Option<&'static str> {
@@ -816,7 +878,24 @@ impl Transport for RecordedConnector {
         }
     }
     fn receive(&mut self, timeout_micros: i64) -> Result<Option<Frame>, String> {
-        self.receive_frame(timeout_micros)
+        let ReadOutcome::Frame(frame) = self.receive_frame(timeout_micros, None)? else {
+            unreachable!()
+        };
+        Ok(frame)
+    }
+    fn receive_until(
+        &mut self,
+        deadline_micros: i64,
+        clock: &dyn super::Clock,
+        poll: bool,
+    ) -> Result<ReadOutcome, String> {
+        self.receive_frame(
+            deadline_micros.saturating_sub(clock.now_micros()).max(0),
+            Some((deadline_micros, poll)),
+        )
+    }
+    fn last_send_micros(&self) -> Option<i64> {
+        self.last_send_micros
     }
     fn close(&mut self) -> Result<(), String> {
         Ok(())
@@ -845,9 +924,10 @@ impl RecordedHttp {
         }
         self.0.session = "bootstrap".into();
         self.0.send_text(&format!("{method} {url}"))?;
-        let result = self
-            .0
-            .receive_frame(i64::MAX)?
+        let ReadOutcome::Frame(frame) = self.0.receive_frame(i64::MAX, None)? else {
+            unreachable!()
+        };
+        let result = frame
             .map(|frame| match frame {
                 Frame::Text(text) => text.into_bytes(),
                 Frame::Binary(bytes) => bytes,
@@ -1030,6 +1110,8 @@ mod recorded_tests {
 mod scheduler_regressions {
     use super::*;
     use crate::broker::Clock;
+    use crate::broker::socket_io::Session;
+    use std::sync::mpsc;
 
     fn blocked_scheduler() -> ReplayClock {
         RecordedConnector::from_jsonl(r#"{"session":"account","at":0,"frame":"{\"req_id\":1}"}"#)
@@ -1254,5 +1336,440 @@ mod scheduler_regressions {
             state.can_progress(0),
             "an expired poll is runnable before reacquiring the mutex"
         );
+    }
+
+    #[test]
+    fn pocket_reads_hold_absolute_deadlines_across_market_receipts() {
+        for timeout in [10_000, 40_000_000] {
+            let warm = if timeout == 10_000 { 29_995_000 } else { 0 };
+            let log = format!(
+                "{{\"session\":\"market\",\"at\":0,\"frame\":\"seed\"}}\n\
+                 {{\"session\":\"account\",\"expect\":\"42[\\\"ps\\\",null]\"}}\n\
+                 {{\"session\":\"market\",\"at\":{warm},\"frame\":\"warm\"}}\n\
+                 {{\"session\":\"market\",\"at\":30001000,\"frame\":\"crossing\"}}\n\
+                 {{\"session\":\"account\",\"expect\":\"42[\\\"ps\\\",null]\"}}\n\
+                 {{\"session\":\"account\",\"at\":30002000,\"frame\":\"42[\\\"listing\\\",{{}}]\"}}"
+            );
+            let recorded = RecordedConnector::from_jsonl(&log).unwrap();
+            let mut market = recorded.session("market").unwrap();
+            let mut account = recorded.session("account").unwrap();
+            let clock = recorded.clock();
+            assert_eq!(market.receive_text(0).unwrap(), Some("seed".into()));
+            clock.complete();
+            let mut session = Session::new(clock.now_micros());
+            session.login(&mut account, &clock).unwrap();
+            assert_eq!(market.receive_text(0).unwrap(), Some("warm".into()));
+            clock.complete();
+            let (result, done) = mpsc::channel();
+            std::thread::scope(|scope| {
+                let _cancel = CancelOnDrop(&clock);
+                scope.spawn(|| {
+                    let event = if timeout == 10_000 {
+                        session.poll(&mut account, &clock, timeout)
+                    } else {
+                        session.receive(&mut account, &clock, timeout)
+                    };
+                    clock.complete();
+                    result.send(event).unwrap();
+                });
+                let captured = 30_000_000;
+                let limit = std::time::Instant::now() + Duration::from_secs(2);
+                loop {
+                    let state = clock.schedule.0.lock().unwrap();
+                    if let Some(Parked {
+                        reason: RecordedWait::ReadUntil { deadline, poll },
+                        until: None,
+                    }) = state.parked.get("account")
+                    {
+                        assert_eq!(*deadline, captured);
+                        assert_eq!(*poll, timeout == 10_000);
+                        break;
+                    }
+                    drop(state);
+                    assert!(std::time::Instant::now() < limit, "read did not park");
+                    std::thread::yield_now();
+                }
+                assert!(
+                    done.recv_timeout(Duration::from_millis(25)).is_err(),
+                    "host time completed a recorded read"
+                );
+                assert_eq!(market.receive_text(0).unwrap(), Some("crossing".into()));
+                {
+                    let mut state = clock.schedule.0.lock().unwrap();
+                    state.in_flight = None;
+                    assert!(state.can_progress(clock.now_micros()));
+                    clock.notify(&mut state);
+                }
+                let event = done
+                    .recv_timeout(Duration::from_secs(2))
+                    .unwrap()
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(event.name, "listing");
+            });
+            assert_eq!(
+                recorded
+                    .writes()
+                    .into_iter()
+                    .filter(|(_, text)| text == "42[\"ps\",null]")
+                    .count(),
+                2
+            );
+            assert!(recorded.exhausted());
+        }
+    }
+
+    #[test]
+    fn pocket_read_keeps_calculated_deadline_before_registration() {
+        struct Gate {
+            inner: RecordedConnector,
+            captured: Option<mpsc::Sender<i64>>,
+            release: Option<mpsc::Receiver<()>>,
+        }
+        impl Transport for Gate {
+            fn send(&mut self, frame: Frame) -> Result<(), String> {
+                self.inner.send(frame)
+            }
+            fn receive(&mut self, timeout: i64) -> Result<Option<Frame>, String> {
+                self.inner.receive(timeout)
+            }
+            fn receive_until(
+                &mut self,
+                deadline: i64,
+                clock: &dyn Clock,
+                poll: bool,
+            ) -> Result<ReadOutcome, String> {
+                if let Some(captured) = self.captured.take() {
+                    captured.send(deadline).unwrap();
+                    self.release.take().unwrap().recv().unwrap();
+                }
+                self.inner.receive_until(deadline, clock, poll)
+            }
+            fn last_send_micros(&self) -> Option<i64> {
+                self.inner.last_send_micros()
+            }
+            fn close(&mut self) -> Result<(), String> {
+                self.inner.close()
+            }
+        }
+        let recorded = RecordedConnector::from_jsonl(
+            "{\"session\":\"market\",\"at\":0,\"frame\":\"seed\"}\n\
+             {\"session\":\"account\",\"expect\":\"42[\\\"ps\\\",null]\"}\n\
+             {\"session\":\"market\",\"at\":30001000,\"frame\":\"crossing\"}\n\
+             {\"session\":\"account\",\"expect\":\"42[\\\"ps\\\",null]\"}\n\
+             {\"session\":\"account\",\"at\":30002000,\"frame\":\"42[\\\"listing\\\",{}]\"}",
+        )
+        .unwrap();
+        let clock = recorded.clock();
+        let mut market = recorded.session("market").unwrap();
+        assert_eq!(market.receive_text(0).unwrap(), Some("seed".into()));
+        clock.complete();
+        let (captured, deadline) = mpsc::channel();
+        let (release, resume) = mpsc::channel();
+        let mut account = Gate {
+            inner: recorded.session("account").unwrap(),
+            captured: Some(captured),
+            release: Some(resume),
+        };
+        let mut session = Session::new(0);
+        session.login(&mut account, &clock).unwrap();
+        std::thread::scope(|scope| {
+            let _cancel = CancelOnDrop(&clock);
+            let worker = scope.spawn(|| {
+                let event = session.receive(&mut account, &clock, 40_000_000);
+                clock.complete();
+                event
+            });
+            assert_eq!(
+                deadline.recv_timeout(Duration::from_secs(2)).unwrap(),
+                30_000_000
+            );
+            assert_eq!(market.receive_text(0).unwrap(), Some("crossing".into()));
+            clock.complete();
+            release.send(()).unwrap();
+            assert_eq!(worker.join().unwrap().unwrap().unwrap().name, "listing");
+        });
+        assert!(recorded.exhausted());
+    }
+
+    #[test]
+    fn premature_pocket_write_remains_stalled() {
+        let recorded = RecordedConnector::from_jsonl(
+            "{\"session\":\"account\",\"expect\":\"42[\\\"ps\\\",null]\"}\n\
+             {\"session\":\"account\",\"expect\":\"42[\\\"ps\\\",null]\"}",
+        )
+        .unwrap();
+        let clock = recorded.clock();
+        let mut account = recorded.session("account").unwrap();
+        let mut session = Session::new(0);
+        session.login(&mut account, &clock).unwrap();
+        std::thread::scope(|scope| {
+            let _cancel = CancelOnDrop(&clock);
+            scope.spawn(|| clock.idle("market"));
+            scope.spawn(|| {
+                let _ = session.poll(&mut account, &clock, 10_000);
+            });
+            wait_for_parked(&clock);
+            assert!(clock.stalled(clock.generation()));
+            assert_eq!(recorded.writes().len(), 1);
+            clock.cancel();
+        });
+    }
+
+    #[test]
+    fn queued_intent_interrupts_only_an_ordinary_pocket_poll() {
+        let recorded = RecordedConnector::from_jsonl(
+            "{\"session\":\"account\",\"expect\":\"42[\\\"ps\\\",null]\"}",
+        )
+        .unwrap();
+        let clock = recorded.clock();
+        std::thread::scope(|scope| {
+            let _cancel = CancelOnDrop(&clock);
+            scope.spawn(|| clock.idle("market"));
+            let worker = scope.spawn(|| {
+                let mut account = recorded.session("account").unwrap();
+                account.receive_until(10_000, &clock, true).unwrap()
+            });
+            wait_for_parked(&clock);
+            assert!(clock.stalled(clock.generation()));
+            clock.wake("account");
+            assert!(!clock.stalled(clock.generation()));
+            assert!(matches!(worker.join().unwrap(), ReadOutcome::Interrupted));
+            assert_eq!(clock.now_micros(), 0);
+            clock.cancel();
+        });
+
+        let recorded = RecordedConnector::from_jsonl("").unwrap();
+        let clock = recorded.clock();
+        std::thread::scope(|scope| {
+            let _cancel = CancelOnDrop(&clock);
+            scope.spawn(|| clock.idle("market"));
+            let worker = scope.spawn(|| {
+                let mut account = recorded.session("account").unwrap();
+                account.receive_until(10_000, &clock, true).unwrap()
+            });
+            wait_for_parked(&clock);
+            clock.wake("account");
+            assert!(matches!(worker.join().unwrap(), ReadOutcome::Interrupted));
+            assert_eq!(clock.now_micros(), 0);
+            clock.cancel();
+        });
+
+        let recorded = RecordedConnector::from_jsonl(
+            "{\"session\":\"account\",\"expect\":\"42[\\\"ps\\\",null]\"}",
+        )
+        .unwrap();
+        let clock = recorded.clock();
+        {
+            let _state = clock.schedule.0.lock().unwrap();
+            clock.advance_to(29_995_000);
+        }
+        std::thread::scope(|scope| {
+            let _cancel = CancelOnDrop(&clock);
+            scope.spawn(|| clock.idle("market"));
+            let worker = scope.spawn(|| {
+                let mut account = recorded.session("account").unwrap();
+                account.receive_until(30_000_000, &clock, false).unwrap()
+            });
+            wait_for_parked(&clock);
+            assert!(matches!(
+                clock.schedule.0.lock().unwrap().parked.get("account"),
+                Some(Parked {
+                    reason: RecordedWait::ReadUntil { poll: false, .. },
+                    ..
+                })
+            ));
+            clock.wake("account");
+            wait_for_parked(&clock);
+            assert!(
+                !worker.is_finished(),
+                "queued intent interrupted a long read"
+            );
+            {
+                let mut state = clock.schedule.0.lock().unwrap();
+                clock.advance_to(30_000_000);
+                clock.notify(&mut state);
+            }
+            assert!(matches!(worker.join().unwrap(), ReadOutcome::Frame(None)));
+        });
+    }
+
+    #[test]
+    fn queued_intent_waits_for_a_pocket_binary_attachment() {
+        let recorded = RecordedConnector::from_jsonl(
+            "{\"session\":\"account\",\"at\":0,\"frame\":\"451-[\\\"listing\\\",{\\\"_placeholder\\\":true,\\\"num\\\":0}]\"}\n\
+             {\"session\":\"market\",\"at\":0,\"frame\":\"seed\"}\n\
+             {\"session\":\"account\",\"at\":0,\"binary\":[123,125]}",
+        )
+        .unwrap();
+        let clock = recorded.clock();
+        std::thread::scope(|scope| {
+            let _cancel = CancelOnDrop(&clock);
+            let worker = scope.spawn(|| {
+                let mut account = recorded.session("account").unwrap();
+                let mut session = Session::new(0);
+                let event = session.poll(&mut account, &clock, 10_000);
+                clock.complete();
+                event
+            });
+            let limit = std::time::Instant::now() + Duration::from_secs(2);
+            loop {
+                let state = clock.schedule.0.lock().unwrap();
+                if let Some(Parked {
+                    reason: RecordedWait::ReadUntil { poll: false, .. },
+                    ..
+                }) = state.parked.get("account")
+                {
+                    break;
+                }
+                drop(state);
+                assert!(std::time::Instant::now() < limit, "attachment did not park");
+                std::thread::yield_now();
+            }
+            clock.wake("account");
+            std::thread::sleep(Duration::from_millis(25));
+            assert!(!worker.is_finished(), "intent interrupted the attachment");
+            let mut market = recorded.session("market").unwrap();
+            assert_eq!(market.receive_text(0).unwrap(), Some("seed".into()));
+            clock.complete();
+            let event = worker.join().unwrap().unwrap().unwrap();
+            assert_eq!(event.name, "listing");
+            assert_eq!(event.raw, b"{}");
+        });
+    }
+
+    #[test]
+    fn recorded_read_returns_empty_before_later_account_frame() {
+        for deadline in [10_000, 12_000_000] {
+            let log = format!(
+                "{{\"session\":\"market\",\"at\":0,\"frame\":\"seed\"}}\n\
+                 {{\"session\":\"market\",\"at\":{},\"frame\":\"crossing\"}}\n\
+                 {{\"session\":\"account\",\"at\":{},\"frame\":\"later\"}}",
+                deadline + 1,
+                deadline + 2
+            );
+            let recorded = RecordedConnector::from_jsonl(&log).unwrap();
+            let clock = recorded.clock();
+            let mut market = recorded.session("market").unwrap();
+            let mut account = recorded.session("account").unwrap();
+            assert_eq!(market.receive_text(0).unwrap(), Some("seed".into()));
+            clock.complete();
+            std::thread::scope(|scope| {
+                let _cancel = CancelOnDrop(&clock);
+                let worker = scope.spawn(|| {
+                    let outcome = account
+                        .receive_until(deadline, &clock, deadline == 10_000)
+                        .unwrap();
+                    clock.complete();
+                    outcome
+                });
+                let limit = std::time::Instant::now() + Duration::from_secs(2);
+                loop {
+                    let state = clock.schedule.0.lock().unwrap();
+                    if let Some(Parked {
+                        reason: RecordedWait::ReadUntil { deadline: held, .. },
+                        until: None,
+                    }) = state.parked.get("account")
+                    {
+                        assert_eq!(*held, deadline);
+                        break;
+                    }
+                    drop(state);
+                    assert!(std::time::Instant::now() < limit, "read did not park");
+                    std::thread::yield_now();
+                }
+                std::thread::sleep(Duration::from_millis(25));
+                assert!(!worker.is_finished(), "host time completed a recorded read");
+                assert_eq!(market.receive_text(0).unwrap(), Some("crossing".into()));
+                clock.complete();
+                assert!(matches!(worker.join().unwrap(), ReadOutcome::Frame(None)));
+                assert_eq!(
+                    clock.schedule.0.lock().unwrap().frames.front().unwrap().at,
+                    Some(deadline + 2)
+                );
+            });
+        }
+    }
+
+    #[test]
+    fn pocket_keepalive_deadline_uses_the_consumed_send_instant() {
+        struct Gate {
+            inner: RecordedConnector,
+            consumed: Option<mpsc::Sender<i64>>,
+            release: Option<mpsc::Receiver<()>>,
+        }
+        impl Transport for Gate {
+            fn send(&mut self, frame: Frame) -> Result<(), String> {
+                let ps = matches!(&frame, Frame::Text(text) if text == "42[\"ps\",null]");
+                self.inner.send(frame)?;
+                if ps && let Some(consumed) = self.consumed.take() {
+                    consumed
+                        .send(self.inner.last_send_micros().unwrap())
+                        .unwrap();
+                    self.release.take().unwrap().recv().unwrap();
+                }
+                Ok(())
+            }
+            fn receive(&mut self, timeout: i64) -> Result<Option<Frame>, String> {
+                self.inner.receive(timeout)
+            }
+            fn receive_until(
+                &mut self,
+                deadline: i64,
+                clock: &dyn Clock,
+                poll: bool,
+            ) -> Result<ReadOutcome, String> {
+                self.inner.receive_until(deadline, clock, poll)
+            }
+            fn last_send_micros(&self) -> Option<i64> {
+                self.inner.last_send_micros()
+            }
+            fn close(&mut self) -> Result<(), String> {
+                self.inner.close()
+            }
+        }
+        let recorded = RecordedConnector::from_jsonl(
+            "{\"session\":\"market\",\"at\":0,\"frame\":\"seed\"}\n\
+             {\"session\":\"account\",\"expect\":\"42[\\\"ps\\\",null]\"}\n\
+             {\"session\":\"market\",\"at\":35000000,\"frame\":\"crossing\"}\n\
+             {\"session\":\"account\",\"expect\":\"42[\\\"ps\\\",null]\"}\n\
+             {\"session\":\"account\",\"at\":35000001,\"frame\":\"42[\\\"listing\\\",{}]\"}",
+        )
+        .unwrap();
+        let clock = recorded.clock();
+        let mut market = recorded.session("market").unwrap();
+        assert_eq!(market.receive_text(0).unwrap(), Some("seed".into()));
+        clock.complete();
+        let (consumed, accepted) = mpsc::channel();
+        let (release, resume) = mpsc::channel();
+        let mut account = Gate {
+            inner: recorded.session("account").unwrap(),
+            consumed: Some(consumed),
+            release: Some(resume),
+        };
+        std::thread::scope(|scope| {
+            let _cancel = CancelOnDrop(&clock);
+            let worker = scope.spawn(|| {
+                let mut session = Session::new(0);
+                session.login(&mut account, &clock).unwrap();
+                let event = session.receive(&mut account, &clock, 20_000_000);
+                clock.complete();
+                event
+            });
+            assert_eq!(accepted.recv_timeout(Duration::from_secs(2)).unwrap(), 0);
+            assert_eq!(market.receive_text(0).unwrap(), Some("crossing".into()));
+            clock.complete();
+            release.send(()).unwrap();
+            assert_eq!(worker.join().unwrap().unwrap().unwrap().name, "listing");
+        });
+        assert_eq!(
+            recorded
+                .writes()
+                .into_iter()
+                .filter(|(_, text)| text == "42[\"ps\",null]")
+                .count(),
+            2
+        );
+        assert!(recorded.exhausted());
     }
 }
