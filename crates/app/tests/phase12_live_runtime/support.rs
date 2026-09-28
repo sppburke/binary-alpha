@@ -479,6 +479,15 @@ fn pocket_binary(session: &str, at: i64, name: &str, value: Value) -> String {
     let bytes = serde_json::to_vec(&value).unwrap();
     header + &format!("{}\n", json!({"session":session,"at":at,"binary":bytes}))
 }
+fn pocket_subscriptions(log: &mut String, at: i64) {
+    for symbol in shared::SYMBOLS {
+        log.push_str(&format!(
+            "{}\n",
+            json!({"session":"market","at":at,
+                "expect":pocket_event("subscribeSymbol", json!(symbol))})
+        ));
+    }
+}
 /// Insert the writes a polled Pocket session makes as the shared replay clock advances.
 /// Input contains only ordered receipts and non-keepalive expectations.
 pub fn pocket_keepalives(input: &str) -> (String, Vec<String>) {
@@ -591,6 +600,7 @@ pub fn pocket_sparse_keepalive_log() -> (String, Vec<String>) {
         "updateAssets",
         json!([asset.clone(), second]),
     ));
+    pocket_subscriptions(&mut log, start + 312_500_001);
     log.push_str(&pocket_binary(
         "account",
         start + 313_900_000,
@@ -802,6 +812,7 @@ pub fn pocket_reconnect_log() -> String {
         "updateAssets",
         json!([asset, second]),
     ));
+    pocket_subscriptions(&mut log, QUOTE_START + 63_400_000);
     let quote = |at: i64, units: i64| {
         json!([[
             shared::SYMBOLS[0],
@@ -1260,6 +1271,7 @@ fn pocket_restart_log_with(request_id: u64, variant: u8) -> String {
             }
         }
     }
+    pocket_subscriptions(&mut log, at + 700_004);
     if !deals.is_empty() {
         log.push_str(&pocket_line(
             "account",
@@ -1355,6 +1367,7 @@ fn pocket_log_with_initial_listing(missing: bool) -> String {
             ));
         }
     }
+    pocket_subscriptions(&mut log, start - 1_299_996);
     let quote = |at: i64, units: i64| {
         let provider =
             serde_json::from_str::<Value>(&format!("{}.{:06}", at / 1_000_000, at % 1_000_000))
@@ -1542,6 +1555,80 @@ fn pocket_log_with_initial_listing(missing: bool) -> String {
         ),
     ));
     log
+}
+
+#[test]
+fn pocket_recorded_quotes_follow_market_subscriptions() {
+    let logs = [
+        pocket_log(),
+        pocket_missing_log(),
+        pocket_sparse_keepalive_log().0,
+        pocket_reconnect_log(),
+        pocket_authorization_wait_log(),
+        pocket_granted_after_early_quotes_log(),
+        pocket_aged_quote_log(),
+        pocket_foreign_partial_restart_log(1),
+        pocket_changed_old_fact_log(),
+    ];
+    let check_quote = |quote: &Value, subscribed: &[String]| {
+        assert_eq!(
+            subscribed.iter().map(String::as_str).collect::<Vec<_>>(),
+            shared::SYMBOLS
+        );
+        assert!(subscribed.iter().any(|symbol| quote[0] == *symbol));
+    };
+    for log in logs {
+        binary_alpha_app::broker::transport::RecordedConnector::from_jsonl(&log).unwrap();
+        let mut subscribed = Vec::new();
+        let mut binary_stream = false;
+        let mut quotes = 0;
+        for line in log.lines() {
+            let row: Value = serde_json::from_str(line).unwrap();
+            if row["session"] != "market" {
+                continue;
+            }
+            if let Some(expect) = row["expect"].as_str()
+                && let Some(event) = expect.strip_prefix("42")
+            {
+                let event: Value = serde_json::from_str(event).unwrap();
+                if event[0] == "subscribeSymbol" {
+                    let symbol = event[1].as_str().unwrap().to_string();
+                    assert!(!subscribed.contains(&symbol), "duplicate {symbol}");
+                    subscribed.push(symbol);
+                }
+            }
+            if let Some(frame) = row["frame"].as_str() {
+                if frame == "41" {
+                    subscribed.clear();
+                } else if let Some(event) = frame.strip_prefix("42") {
+                    let event: Value = serde_json::from_str(event).unwrap();
+                    if event[0] == "successauth" {
+                        subscribed.clear();
+                    } else if event[0] == "updateStream" {
+                        for quote in event[1].as_array().unwrap() {
+                            check_quote(quote, &subscribed);
+                            quotes += 1;
+                        }
+                    }
+                } else if let Some(event) = frame.strip_prefix("451-") {
+                    let event: Value = serde_json::from_str(event).unwrap();
+                    binary_stream = event[0] == "updateStream";
+                }
+            }
+            if let Some(bytes) = row.get("binary") {
+                if binary_stream {
+                    let bytes: Vec<u8> = serde_json::from_value(bytes.clone()).unwrap();
+                    let payload: Value = serde_json::from_slice(&bytes).unwrap();
+                    for quote in payload.as_array().unwrap() {
+                        check_quote(quote, &subscribed);
+                        quotes += 1;
+                    }
+                }
+                binary_stream = false;
+            }
+        }
+        assert!(quotes > 0);
+    }
 }
 
 /// A verified one-tick warm-up cannot supply a completed feature-history interval.
