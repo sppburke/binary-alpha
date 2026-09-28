@@ -101,6 +101,7 @@ struct OlderHistory {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct PageRow {
+    asset: Option<String>,
     time: WireDecimal,
     price: WireDecimal,
 }
@@ -686,9 +687,21 @@ impl PocketMarketData {
     pub fn history_reconnects(&self) -> u64 {
         self.history_reconnects
     }
-    fn tick_rows(&self, rows: &[PageRow], scale: PriceScale) -> Result<Vec<Tick>, String> {
+    fn tick_rows(
+        &self,
+        rows: &[PageRow],
+        asset: &str,
+        scale: PriceScale,
+    ) -> Result<Vec<Tick>, String> {
         rows.iter()
             .map(|row| {
+                if row
+                    .asset
+                    .as_deref()
+                    .is_some_and(|row_asset| row_asset != asset)
+                {
+                    return Err("pocket_option: history row asset mismatch".into());
+                }
                 row.price.require_number()?;
                 Ok(Tick {
                     event_time_micros: universal_micros(
@@ -893,11 +906,22 @@ impl MarketDataBroker for PocketMarketData {
                 response
                     .history
                     .into_iter()
-                    .map(|[time, price]| PageRow { time, price })
+                    .map(|[time, price]| PageRow {
+                        asset: None,
+                        time,
+                        price,
+                    })
                     .collect()
             }
         };
-        Ok((None, HistoryRows::Ticks(self.tick_rows(&rows, scale)?)))
+        Ok((
+            None,
+            HistoryRows::Ticks(self.tick_rows(
+                &rows,
+                instrument.provider_symbol.as_str(),
+                scale,
+            )?),
+        ))
     }
     fn subscribe(&mut self, instrument: &InstrumentId, scale: PriceScale) -> Result<(), String> {
         self.check_instrument(instrument)?;

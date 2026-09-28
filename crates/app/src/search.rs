@@ -26,7 +26,7 @@ use binary_alpha_engine::execution::{
 use binary_alpha_engine::features::Value;
 use binary_alpha_engine::outcomes::{
     InvalidReason, MISSING_INDEX, OUTCOME_MANIFEST_KIND, Outcome as Label, OutcomeBuilder,
-    OutcomeManifest, TICK_PRICE_OBJECT_PATH, TICK_TIME_OBJECT_PATH, stream_object_paths,
+    OutcomeManifest, TICK_PRICE_OBJECT_PATH, TICK_TIME_OBJECT_PATH, stream_object_paths_for,
 };
 use binary_alpha_engine::search::{
     self, ChunkRef, FAMILY_OBJECT_PATH, Family, FamilyInput, FamilyManifest, Member, RawCounts,
@@ -112,7 +112,7 @@ pub fn run(config_path: &Path, out: &mut dyn Write) -> Result<(), String> {
 
 /// One member's executable identity inside a chunk.
 type ChunkMember = (String, StrategySpec, usize);
-type ProjectedRows = BTreeMap<(u32, u32, String), Vec<i16>>;
+type ProjectedRows = BTreeMap<(binary_alpha_engine::config::StreamKey, String), Vec<i16>>;
 
 /// The bound development input: plan, instrument, and the outcome generation's stored rows.
 struct Development {
@@ -1040,17 +1040,14 @@ fn read_references(development: &Development) -> Result<Vec<i64>, String> {
         .outcome
         .streams
         .iter()
-        .find(|stream| {
-            stream.duration_seconds == base.duration_seconds
-                && stream.offset_seconds == base.offset_seconds
-        })
+        .find(|stream| stream.key() == base)
         .ok_or_else(|| {
             format!(
                 "base_stream: outcome generation {} labels no stream {base}",
                 development.outcome.generation
             )
         })?;
-    let paths = stream_object_paths(base.duration_seconds, base.offset_seconds);
+    let paths = stream_object_paths_for(base);
     from_le_bytes(
         &read_object(
             &development.outcome_store,
@@ -1232,10 +1229,7 @@ fn projection_index(
                 }
             }
             for ((output, _, _, _), row_codes) in outputs.into_iter().zip(codes) {
-                projected.insert(
-                    (stream.duration_seconds, stream.offset_seconds, output),
-                    row_codes,
-                );
+                projected.insert((stream, output), row_codes);
             }
             Ok(rows)
         })
@@ -1248,10 +1242,7 @@ fn projection_index(
     if references != clocks[base].iter().map(|row| row.0).collect::<Vec<_>>() {
         return Err("outcome references differ from bound base feature rows".into());
     }
-    let paths = stream_object_paths(
-        development.base_stream.duration_seconds,
-        development.base_stream.offset_seconds,
-    );
+    let paths = stream_object_paths_for(development.base_stream);
     let entries = from_le_bytes(
         &read_object(
             &development.outcome_store,
@@ -1353,11 +1344,7 @@ fn projection_block_from_development(
         lowered_bindings,
         |condition| {
             projected
-                .get(&(
-                    condition.stream.duration_seconds,
-                    condition.stream.offset_seconds,
-                    condition.output.clone(),
-                ))
+                .get(&(condition.stream, condition.output.clone()))
                 .map(Vec::as_slice)
                 .ok_or_else(|| "projected encoding has no row codes".to_string())
         },
@@ -1476,10 +1463,7 @@ fn device_rows(
     column: usize,
 ) -> Result<DeviceRows, String> {
     let objects = &development.outcome.objects;
-    let paths = stream_object_paths(
-        development.base_stream.duration_seconds,
-        development.base_stream.offset_seconds,
-    );
+    let paths = stream_object_paths_for(development.base_stream);
     let entries = from_le_bytes(
         &read_object(&development.outcome_store, objects, &paths[1])?,
         u32::from_le_bytes,
@@ -3493,6 +3477,7 @@ mod projection_tests {
 
     fn stream(duration_seconds: u32, offset_seconds: u32) -> StreamKey {
         StreamKey {
+            kind: binary_alpha_engine::config::StreamKind::Candle,
             duration_seconds,
             offset_seconds,
         }

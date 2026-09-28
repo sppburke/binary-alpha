@@ -758,6 +758,36 @@ fn pocket_retained_paging_live_cancellation_and_heartbeats() {
 }
 
 #[test]
+fn pocket_tick_page_row_asset_matches_page_when_present() {
+    let (broker, _) = pocket(handshake());
+    let instrument = id("pocket_option", "EURUSD_otc");
+    let decode = |raw: &str| {
+        broker.decode_history(
+            &instrument,
+            raw.as_bytes(),
+            scale(5),
+            NativeGranularity::Tick,
+        )
+    };
+    for row in [
+        r#"{"time":1789347292,"price":1.23456}"#,
+        r#"{"asset":"EURUSD_otc","time":1789347292,"price":1.23456}"#,
+    ] {
+        let raw = format!(r#"{{"asset":"EURUSD_otc","data":[{row}]}}"#);
+        assert_eq!(
+            decode(&raw).unwrap().1.ticks().unwrap()[0].price_units,
+            123456
+        );
+    }
+    let wrong =
+        r#"{"asset":"EURUSD_otc","data":[{"asset":"OTHER","time":1789347292,"price":1.23456}]}"#;
+    assert_eq!(
+        decode(wrong).unwrap_err(),
+        "pocket_option: history row asset mismatch"
+    );
+}
+
+#[test]
 fn pocket_rejects_class_membership_and_incomplete_attachments() {
     for (frames, expected) in [
         (

@@ -422,6 +422,7 @@ pub fn validate(portfolio: &Portfolio) -> Result<(), String> {
             for alternative in &binding.alternatives {
                 let id = format!("validation-{}", policy.strategies.len());
                 let stream = StreamKey {
+                    kind: crate::config::StreamKind::Candle,
                     duration_seconds: 1,
                     offset_seconds: 0,
                 };

@@ -110,6 +110,7 @@ fn definition(two: bool) -> RunDefinition {
             outcome_generation: None,
             streams: vec![StreamColumns {
                 stream: StreamKey {
+                    kind: binary_alpha_engine::config::StreamKind::Candle,
                     duration_seconds: 5,
                     offset_seconds: 0,
                 },

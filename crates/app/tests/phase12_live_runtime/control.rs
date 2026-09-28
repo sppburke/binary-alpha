@@ -45,6 +45,7 @@ fn claim(account: &str, command: &str, token: u64) -> Claim {
                 deployment_identity: "binding-deployment".into(),
                 signal_logic_identity: "logic".into(),
                 stream: StreamKey {
+                    kind: binary_alpha_engine::config::StreamKind::Candle,
                     duration_seconds: 5,
                     offset_seconds: 0,
                 },

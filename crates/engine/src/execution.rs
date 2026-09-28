@@ -6845,6 +6845,7 @@ mod tests {
     #[test]
     fn identities_canonicalize_conditions_and_exclude_economics() {
         let stream = StreamKey {
+            kind: crate::config::StreamKind::Candle,
             duration_seconds: 30,
             offset_seconds: 15,
         };

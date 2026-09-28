@@ -1594,6 +1594,7 @@ fn volume_encoding(
 ) -> binary_alpha_engine::features::FittedEncoding {
     plan(scratch, feature_generation)
         .stream(StreamKey {
+            kind: binary_alpha_engine::config::StreamKind::Candle,
             duration_seconds: 20,
             offset_seconds: 0,
         })

@@ -346,6 +346,7 @@ struct RecordedLine {
     session: String,
     at: Option<i64>,
     frame: Option<String>,
+    binary: Option<Vec<u8>>,
     expect: Option<String>,
 }
 #[derive(Default)]
@@ -416,6 +417,9 @@ impl RecordedState {
                 })
     }
     fn ready(&self, record: &RecordedLine) -> bool {
+        if record.binary.is_some() {
+            return true;
+        }
         record.frame.as_ref().is_some_and(|text| {
             let Ok(value) = serde_json::from_str::<serde_json::Value>(text) else {
                 return true;
@@ -452,12 +456,14 @@ impl RecordedConnector {
                 .map_err(|error| format!("recorded log line {}: {error}", index + 1))?;
             if !matches!(record.session.as_str(), "market" | "account" | "bootstrap")
                 || !matches!(
-                    (&record.frame, record.at, &record.expect),
-                    (Some(_), Some(_), None) | (None, _, Some(_))
+                    (&record.frame, &record.binary, record.at, &record.expect),
+                    (Some(_), None, Some(_), None)
+                        | (None, Some(_), Some(_), None)
+                        | (None, None, _, Some(_))
                 )
             {
                 return Err(format!(
-                    "recorded log line {}: expected session and either at/frame or expect",
+                    "recorded log line {}: expected session and either at/frame, at/binary or expect",
                     index + 1
                 ));
             }
@@ -590,7 +596,7 @@ impl RecordedConnector {
         self.clock.notify(&mut state);
         Ok(())
     }
-    fn receive_text(&mut self, timeout: i64) -> Result<Option<String>, String> {
+    fn receive_frame(&mut self, timeout: i64) -> Result<Option<Frame>, String> {
         self.clock.complete();
         let mut state = self.clock.schedule.0.lock().unwrap();
         loop {
@@ -616,7 +622,9 @@ impl RecordedConnector {
                 self.clock.advance_to(record.at.unwrap());
                 state.in_flight = Some(std::thread::current().id());
                 state.generation += 1;
-                let text = record.frame.unwrap();
+                let Some(text) = record.frame else {
+                    return Ok(Some(Frame::Binary(record.binary.unwrap())));
+                };
                 let value: Option<serde_json::Value> = serde_json::from_str(&text).ok();
                 let id = value.as_ref().and_then(|v| {
                     let subscription = response_scope(v)
@@ -628,10 +636,10 @@ impl RecordedConnector {
                             .and_then(|id| state.requests.get(&(self.session.clone(), id)).copied())
                     })
                 });
-                return Ok(Some(match id {
+                return Ok(Some(Frame::Text(match id {
                     Some(id) => correlate(&text, id)?,
                     None => text,
-                }));
+                })));
             }
             if timeout <= 10_000 {
                 // A queued intent is runnable as soon as this ordinary poll returns.
@@ -649,6 +657,15 @@ impl RecordedConnector {
                 .clock
                 .park(state, Some(&self.session), RecordedWait::Read, None);
         }
+    }
+    #[cfg(test)]
+    fn receive_text(&mut self, timeout: i64) -> Result<Option<String>, String> {
+        self.receive_frame(timeout)?
+            .map_or(Ok(None), |frame| match frame {
+                Frame::Text(text) => Ok(Some(text)),
+                Frame::Binary(_) => Err("recorded bootstrap: expected text frame".into()),
+                _ => unreachable!(),
+            })
     }
 }
 fn request_kind(v: &serde_json::Value) -> Option<&'static str> {
@@ -712,8 +729,7 @@ impl Transport for RecordedConnector {
         }
     }
     fn receive(&mut self, timeout_micros: i64) -> Result<Option<Frame>, String> {
-        self.receive_text(timeout_micros)
-            .map(|text| text.map(Frame::Text))
+        self.receive_frame(timeout_micros)
     }
     fn close(&mut self) -> Result<(), String> {
         Ok(())
@@ -744,8 +760,12 @@ impl RecordedHttp {
         self.0.send_text(&format!("{method} {url}"))?;
         let result = self
             .0
-            .receive_text(i64::MAX)?
-            .map(String::into_bytes)
+            .receive_frame(i64::MAX)?
+            .map(|frame| match frame {
+                Frame::Text(text) => text.into_bytes(),
+                Frame::Binary(bytes) => bytes,
+                _ => unreachable!(),
+            })
             .ok_or("recorded bootstrap: response missing".into());
         self.0.clock.complete();
         result
@@ -764,6 +784,71 @@ impl Http for RecordedHttp {
 mod recorded_tests {
     use super::*;
     use crate::broker::Clock;
+
+    #[test]
+    fn recorded_binary_and_text_frames_keep_receipt_order() {
+        let log = [
+            serde_json::json!({"session":"market","at":1,"frame":"text"}),
+            serde_json::json!({"session":"market","at":1,"binary":[0, 1, 255]}),
+            serde_json::json!({"session":"market","at":2,"frame":"last"}),
+        ]
+        .iter()
+        .map(|line| format!("{line}\n"))
+        .collect::<String>();
+        let recorded = RecordedConnector::from_jsonl(&log).unwrap();
+        let mut market = recorded.session("market").unwrap();
+        assert_eq!(market.receive(1).unwrap(), Some(Frame::Text("text".into())));
+        assert_eq!(
+            market.receive(1).unwrap(),
+            Some(Frame::Binary(vec![0, 1, 255]))
+        );
+        assert_eq!(market.receive(1).unwrap(), Some(Frame::Text("last".into())));
+        recorded.clock.complete();
+        assert!(recorded.exhausted());
+        for invalid in [
+            r#"{"session":"market","at":1,"frame":"text","binary":[1]}"#,
+            r#"{"session":"market","at":1}"#,
+            r#"{"session":"market","binary":[1]}"#,
+            r#"{"session":"market","at":1,"binary":[256]}"#,
+        ] {
+            assert!(RecordedConnector::from_jsonl(invalid).is_err());
+        }
+    }
+
+    #[test]
+    fn recorded_binary_and_text_frames_keep_global_session_order() {
+        let log = [
+            serde_json::json!({"session":"market","at":10,"binary":[1, 2]}),
+            serde_json::json!({"session":"account","at":10,"frame":"account"}),
+            serde_json::json!({"session":"market","at":11,"frame":"market"}),
+        ]
+        .iter()
+        .map(|line| format!("{line}\n"))
+        .collect::<String>();
+        let recorded = RecordedConnector::from_jsonl(&log).unwrap();
+        let mut account = recorded.session("account").unwrap();
+        let mut market = recorded.session("market").unwrap();
+        let thread = std::thread::spawn(move || {
+            assert_eq!(
+                account.receive(20_000_000).unwrap(),
+                Some(Frame::Text("account".into()))
+            );
+            account.clock.complete();
+        });
+        assert_eq!(
+            market.receive(20_000_000).unwrap(),
+            Some(Frame::Binary(vec![1, 2]))
+        );
+        market.clock.complete();
+        assert_eq!(
+            market.receive(20_000_000).unwrap(),
+            Some(Frame::Text("market".into()))
+        );
+        market.clock.complete();
+        thread.join().unwrap();
+        assert_eq!(recorded.clock().now_micros(), 11);
+        assert!(recorded.exhausted());
+    }
 
     #[test]
     fn recorded_frames_correlate_without_changing_decimal_tokens() {

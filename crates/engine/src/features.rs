@@ -20,7 +20,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::config::{
-    Bins, EncodingSpec, Encodings, FeatureInstrument, Instrument, Outputs, StreamKey,
+    Bins, EncodingSpec, Encodings, FeatureInstrument, Instrument, Outputs, StreamKey, StreamKind,
     StructureSettings,
 };
 use crate::dataset::{DatasetRole, ObjectRecord, ObjectRole, manifest_key, validate_objects};
@@ -164,6 +164,7 @@ crate::string_enum! {
     /// The computation stage that owns an output, in chain order.
     Stage "stage" {
         Candle => "candle",
+        Quote => "quote",
         TickPath => "tick_path",
         Anatomy => "anatomy",
         Rolling => "rolling",
@@ -1954,6 +1955,11 @@ mod edge_text {
 /// The frozen plan of one stream.
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 pub struct StreamPlan {
+    #[serde(
+        default = "StreamKind::candle",
+        skip_serializing_if = "StreamKind::is_candle"
+    )]
+    pub kind: StreamKind,
     pub duration_seconds: u32,
     pub offset_seconds: u32,
     pub tick_path: bool,
@@ -1965,6 +1971,7 @@ pub struct StreamPlan {
 impl StreamPlan {
     pub fn key(&self) -> StreamKey {
         StreamKey {
+            kind: self.kind,
             duration_seconds: self.duration_seconds,
             offset_seconds: self.offset_seconds,
         }
@@ -1973,7 +1980,7 @@ impl StreamPlan {
     /// The object paths of this stream's rows, structure events, sequence events, and, when
     /// the stream has encodings, encoded rows inside a feature generation.
     pub fn object_paths(&self) -> Vec<String> {
-        let mut paths = stream_object_paths(self.duration_seconds, self.offset_seconds);
+        let mut paths = stream_object_paths_for(self.key());
         if self.encodings.is_empty() {
             paths.pop();
         }
@@ -1998,10 +2005,27 @@ pub fn stream_object_paths(duration_seconds: u32, offset_seconds: u32) -> Vec<St
     ]
 }
 
+pub fn stream_object_paths_for(key: StreamKey) -> Vec<String> {
+    if key.kind == StreamKind::Candle {
+        return stream_object_paths(key.duration_seconds, key.offset_seconds);
+    }
+    vec![
+        "rows/quote.parquet".into(),
+        "events/structure_quote.parquet".into(),
+        "events/sequence_quote.parquet".into(),
+        "encoded/quote.parquet".into(),
+    ]
+}
+
 /// The development fit window: the decision-time span of the rows the encodings were fitted
 /// on, per stream, rendered as `YYYY-MM-DDTHH:MM:SS.ffffffZ`.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub struct FitWindow {
+    #[serde(
+        default = "StreamKind::candle",
+        skip_serializing_if = "StreamKind::is_candle"
+    )]
+    pub kind: StreamKind,
     pub duration_seconds: u32,
     pub offset_seconds: u32,
     pub rows: u64,
@@ -2148,6 +2172,76 @@ impl FeaturePlan {
         let settings = FormulaSettings::from_entry(entry, definition.price_scale)?;
         let mut streams = Vec::with_capacity(settings.streams.len());
         for key in &settings.streams {
+            if key.kind == StreamKind::Quote {
+                if !profile.ticks {
+                    return Err("streams: quote requires individual ticks".into());
+                }
+                let output = OutputSpec {
+                    name: "quote_delta_units".into(),
+                    kind: Kind::Int,
+                    stage: Stage::Quote,
+                    predictive: true,
+                    readiness: "null on first quote or after a continuity gap".into(),
+                };
+                if let Outputs::Named(names) = &settings.outputs
+                    && names.iter().any(|name| name != &output.name)
+                {
+                    return Err("outputs: quote supports only `quote_delta_units`".into());
+                }
+                let outputs = vec![
+                    OutputSpec {
+                        name: "close_time_micros".into(),
+                        kind: Kind::Time,
+                        stage: Stage::Quote,
+                        predictive: false,
+                        readiness: "available on every accepted quote".into(),
+                    },
+                    OutputSpec {
+                        name: "known_at_micros".into(),
+                        kind: Kind::Time,
+                        stage: Stage::Quote,
+                        predictive: false,
+                        readiness: "available on every accepted quote".into(),
+                    },
+                    output,
+                ];
+                let mut excluded = Vec::new();
+                let mut encodings = Vec::new();
+                if let Some(Encodings { outputs: specs, .. }) = &entry.encodings {
+                    if specs.len() == 1
+                        && specs[0].output == "all_supported"
+                        && specs[0].bins.is_none()
+                    {
+                        encodings.push(FittedEncoding {
+                            output: "quote_delta_units_auto_encoded".into(),
+                            input: "quote_delta_units".into(),
+                            automatic: true,
+                            encoding: ProjectionKind::DevelopmentFifths,
+                            edges: None,
+                            input_divisor: 1.0,
+                            labels: Vec::new(),
+                        });
+                    } else {
+                        for spec in specs {
+                            if let Some(encoding) =
+                                compile_encoding(spec, &outputs, &mut excluded, key)?
+                            {
+                                encodings.push(encoding);
+                            }
+                        }
+                    }
+                }
+                streams.push(StreamPlan {
+                    kind: StreamKind::Quote,
+                    duration_seconds: 0,
+                    offset_seconds: 0,
+                    tick_path: false,
+                    outputs,
+                    excluded,
+                    encodings,
+                });
+                continue;
+            }
             let spec = definition
                 .candles
                 .iter()
@@ -2302,6 +2396,7 @@ impl FeaturePlan {
                 }
             }
             streams.push(StreamPlan {
+                kind: StreamKind::Candle,
                 duration_seconds: key.duration_seconds,
                 offset_seconds: key.offset_seconds,
                 tick_path,
@@ -4887,6 +4982,7 @@ impl FeatureOutput {
 
 /// The ordered state of one planned stream.
 struct StreamState {
+    plan_index: usize,
     /// The index of this stream in the bound definition's candle list.
     definition_index: usize,
     duration_micros: i64,
@@ -4918,6 +5014,9 @@ pub struct FeatureEngine {
     ticks: bool,
     gap: Option<(i64, i64)>,
     previous_tick: Option<TickSeen>,
+    quote_previous_tick: Option<TickSeen>,
+    last_quote_tick: Option<TickSeen>,
+    quote_stream: Option<usize>,
     finalized: Vec<(usize, Candle)>,
 }
 
@@ -4989,7 +5088,12 @@ impl FeatureEngine {
         let ticks = plan.profile.ticks;
         let settings = &plan.settings;
         let mut states = Vec::with_capacity(plan.streams.len());
-        for stream_plan in &plan.streams {
+        let mut quote_stream = None;
+        for (plan_index, stream_plan) in plan.streams.iter().enumerate() {
+            if stream_plan.kind == StreamKind::Quote {
+                quote_stream = Some(plan_index);
+                continue;
+            }
             let key = stream_plan.key();
             let definition_index = definition
                 .candles
@@ -5047,6 +5151,7 @@ impl FeatureEngine {
                 )
             });
             states.push(StreamState {
+                plan_index,
                 definition_index,
                 duration_micros: i64::from(spec.duration_seconds) * MICROS_PER_SECOND,
                 offset_micros: i64::from(spec.offset_seconds) * MICROS_PER_SECOND,
@@ -5098,8 +5203,16 @@ impl FeatureEngine {
                 .as_ref()
                 .map(|gap| (seconds(gap.max_seconds), seconds(gap.reopen_seconds))),
             previous_tick: None,
+            quote_previous_tick: None,
+            last_quote_tick: None,
+            quote_stream,
             finalized: Vec::new(),
         })
+    }
+
+    /// A feed reconnect or other live continuity break cannot lend its predecessor to a quote.
+    pub fn reset_continuity(&mut self) {
+        self.quote_previous_tick = None;
     }
 
     /// Accepts the next record through the instrument stream, then folds every candle it
@@ -5109,6 +5222,37 @@ impl FeatureEngine {
         observation: Observation,
         out: &mut FeatureOutput,
     ) -> Result<(), Rejection> {
+        let quote_delta = if self.quote_stream.is_some() {
+            if let Observation::Tick(tick) = observation {
+                self.quote_previous_tick
+                    .filter(|previous| {
+                        tick.event_time_micros.unsigned_abs()
+                            <= crate::stream::MAX_EVENT_MICROS as u64
+                            && tick
+                                .event_time_micros
+                                .checked_sub(previous.event)
+                                .is_some_and(|elapsed| {
+                                    elapsed > 0 && self.gap.is_none_or(|(max, _)| elapsed <= max)
+                                })
+                    })
+                    .map(|previous| {
+                        tick.price_units
+                            .checked_sub(previous.units)
+                            .ok_or_else(|| Rejection {
+                                reason: crate::stream::RejectionReason::ArithmeticOverflow,
+                                event_micros: tick.event_time_micros,
+                                known_at_micros: tick.event_time_micros,
+                                source: self.stream.profile().source.generation,
+                                detail: "quote delta exceeds signed instrument units".into(),
+                            })
+                    })
+                    .transpose()?
+            } else {
+                None
+            }
+        } else {
+            None
+        };
         self.finalized.clear();
         self.stream.push(observation, &mut self.finalized)?;
         for (definition_index, candle) in self.finalized.drain(..) {
@@ -5132,12 +5276,36 @@ impl FeatureEngine {
                 .position(|state| state.definition_index == definition_index)
             {
                 let state = &mut self.states[index];
-                state.accept(&candle, included, self.unit, self.ticks, index, out);
+                state.accept(
+                    &candle,
+                    included,
+                    self.unit,
+                    self.ticks,
+                    state.plan_index,
+                    out,
+                );
             }
         }
         if let Observation::Tick(tick) = observation
             && self.ticks
         {
+            let duplicate = self.last_quote_tick.is_some_and(|previous| {
+                previous.event == tick.event_time_micros && previous.units == tick.price_units
+            });
+            if !duplicate && let Some(index) = self.quote_stream {
+                out.rows.push((
+                    index,
+                    FeatureRow {
+                        close_time_micros: tick.event_time_micros,
+                        known_at_micros: tick.event_time_micros,
+                        values: vec![
+                            Some(Value::Time(tick.event_time_micros)),
+                            Some(Value::Time(tick.event_time_micros)),
+                            quote_delta.map(Value::Int),
+                        ],
+                    },
+                ));
+            }
             let seen = TickSeen {
                 event: tick.event_time_micros,
                 price: tick.price_units as f64 / self.unit,
@@ -5149,6 +5317,10 @@ impl FeatureEngine {
                 }
             }
             self.previous_tick = Some(seen);
+            if !duplicate {
+                self.quote_previous_tick = Some(seen);
+                self.last_quote_tick = Some(seen);
+            }
         }
         Ok(())
     }
@@ -5543,6 +5715,11 @@ impl FittedEncoding {
 /// Summary of one stream's published rows and events.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub struct FeatureStreamSummary {
+    #[serde(
+        default = "StreamKind::candle",
+        skip_serializing_if = "StreamKind::is_candle"
+    )]
+    pub kind: StreamKind,
     pub duration_seconds: u32,
     pub offset_seconds: u32,
     pub rows: u64,
@@ -5550,6 +5727,16 @@ pub struct FeatureStreamSummary {
     pub sequence_events: u64,
     pub first_decision_time: Option<String>,
     pub last_decision_time: Option<String>,
+}
+
+impl FeatureStreamSummary {
+    pub fn key(&self) -> StreamKey {
+        StreamKey {
+            kind: self.kind,
+            duration_seconds: self.duration_seconds,
+            offset_seconds: self.offset_seconds,
+        }
+    }
 }
 
 /// The ready manifest of one feature generation. Field order is the serialization order.
@@ -5631,7 +5818,7 @@ impl FeatureManifest {
         }
         let mut allowed = vec![PLAN_OBJECT_PATH.to_string()];
         for summary in &manifest.streams {
-            let paths = stream_object_paths(summary.duration_seconds, summary.offset_seconds);
+            let paths = stream_object_paths_for(summary.key());
             for path in &paths[..3] {
                 if !manifest.objects.iter().any(|object| object.path == *path) {
                     return Err(format!("expected a `{path}` object"));
@@ -5700,6 +5887,181 @@ mod tests {
 
     fn scale(digits: u8) -> PriceScale {
         PriceScale::try_from(digits).unwrap()
+    }
+
+    #[test]
+    fn quote_stream_emits_checked_deltas_without_crossing_gaps_or_breaks() {
+        let mut request = entry(&[(5, 0)], Outputs::Named(vec!["quote_delta_units".into()]));
+        request.streams = Some(vec![StreamKey::quote()]);
+        request.tick_path_streams = None;
+        let mut reference = profile(NativeGranularity::Tick, true, &[(5, 0)]);
+        reference.definition.price_scale = scale(5);
+        let plan = FeaturePlan::resolve(&request, reference, "input").unwrap();
+        assert_eq!(plan.streams[0].key(), StreamKey::quote());
+        assert_eq!(plan.streams[0].object_paths()[0], "rows/quote.parquet");
+        assert_eq!(
+            serde_json::to_string(&StreamKey::quote()).unwrap(),
+            r#"{"kind":"quote"}"#
+        );
+        assert_eq!(
+            toml::to_string(&StreamKey::candle(5, 0)).unwrap(),
+            "duration_seconds = 5\noffset_seconds = 0\n"
+        );
+        let mut input = source(NativeGranularity::Tick, true);
+        input.price_scale = Some(scale(5));
+        let mut engine = FeatureEngine::new(&plan, input).unwrap();
+        let mut output = FeatureOutput::default();
+        let mut values = Vec::new();
+        for (seconds, units) in [
+            (0, 100_000),
+            (1, 100_150),
+            (1, 100_150),
+            (2, 99_980),
+            (5, 100_400),
+            (70, 100_500),
+        ] {
+            engine
+                .push(
+                    Observation::Tick(Tick {
+                        event_time_micros: seconds * MICROS_PER_SECOND,
+                        price_units: units,
+                    }),
+                    &mut output,
+                )
+                .unwrap();
+            values.extend(output.rows.drain(..).map(|(stream, row)| {
+                assert_eq!(stream, 0);
+                assert_eq!(row.close_time_micros, row.known_at_micros);
+                row.values[2].clone()
+            }));
+        }
+        engine.reset_continuity();
+        engine
+            .push(
+                Observation::Tick(Tick {
+                    event_time_micros: 70 * MICROS_PER_SECOND,
+                    price_units: 100_500,
+                }),
+                &mut output,
+            )
+            .unwrap();
+        assert!(output.rows.is_empty());
+        engine
+            .push(
+                Observation::Tick(Tick {
+                    event_time_micros: 71 * MICROS_PER_SECOND,
+                    price_units: 100_620,
+                }),
+                &mut output,
+            )
+            .unwrap();
+        values.extend(output.rows.drain(..).map(|(_, row)| row.values[2].clone()));
+        assert_eq!(
+            values,
+            vec![
+                None,
+                Some(Value::Int(150)),
+                Some(Value::Int(-170)),
+                None,
+                None,
+                None
+            ]
+        );
+
+        let mut input = source(NativeGranularity::Tick, true);
+        input.price_scale = Some(scale(5));
+        let mut overflow = FeatureEngine::new(&plan, input).unwrap();
+        overflow
+            .push(
+                Observation::Tick(Tick {
+                    event_time_micros: 0,
+                    price_units: i64::MAX,
+                }),
+                &mut output,
+            )
+            .unwrap();
+        output.clear();
+        let error = overflow
+            .push(
+                Observation::Tick(Tick {
+                    event_time_micros: MICROS_PER_SECOND,
+                    price_units: -2,
+                }),
+                &mut output,
+            )
+            .unwrap_err();
+        assert_eq!(
+            error.reason,
+            crate::stream::RejectionReason::ArithmeticOverflow
+        );
+        overflow
+            .push(
+                Observation::Tick(Tick {
+                    event_time_micros: MICROS_PER_SECOND,
+                    price_units: i64::MAX - 1,
+                }),
+                &mut output,
+            )
+            .unwrap();
+        assert_eq!(output.rows[0].1.values[2], Some(Value::Int(-1)));
+
+        let error = overflow
+            .push(
+                Observation::Tick(Tick {
+                    event_time_micros: i64::MIN,
+                    price_units: 0,
+                }),
+                &mut output,
+            )
+            .unwrap_err();
+        assert_eq!(error.reason, crate::stream::RejectionReason::OutOfRange);
+        let error = overflow
+            .push(
+                Observation::Tick(Tick {
+                    event_time_micros: 0,
+                    price_units: i64::MIN,
+                }),
+                &mut output,
+            )
+            .unwrap_err();
+        assert_eq!(error.reason, crate::stream::RejectionReason::BackwardsTime);
+    }
+
+    #[test]
+    fn quote_and_candle_streams_keep_distinct_indices_and_paths() {
+        let mut request = entry(&[(5, 0)], Outputs::AllSupported);
+        request.streams = Some(vec![StreamKey::quote(), StreamKey::candle(5, 0)]);
+        let plan = FeaturePlan::resolve(
+            &request,
+            profile(NativeGranularity::Tick, true, &[(5, 0)]),
+            "input",
+        )
+        .unwrap();
+        assert_ne!(
+            plan.streams[0].object_paths()[0],
+            plan.streams[1].object_paths()[0]
+        );
+        let mut engine = FeatureEngine::new(&plan, source(NativeGranularity::Tick, true)).unwrap();
+        let mut output = FeatureOutput::default();
+        for seconds in 0..=5 {
+            engine
+                .push(
+                    Observation::Tick(Tick {
+                        event_time_micros: seconds * MICROS_PER_SECOND,
+                        price_units: 1_000_000 + seconds,
+                    }),
+                    &mut output,
+                )
+                .unwrap();
+        }
+        assert_eq!(
+            output.rows.iter().filter(|(index, _)| *index == 0).count(),
+            6
+        );
+        assert_eq!(
+            output.rows.iter().filter(|(index, _)| *index == 1).count(),
+            1
+        );
     }
 
     fn definition(granularity: NativeGranularity, candles: &[(u32, u32)]) -> Instrument {
@@ -5792,6 +6154,7 @@ mod tests {
         let keys: Vec<StreamKey> = streams
             .iter()
             .map(|&(duration_seconds, offset_seconds)| StreamKey {
+                kind: crate::config::StreamKind::Candle,
                 duration_seconds,
                 offset_seconds,
             })
@@ -6744,6 +7107,7 @@ mod tests {
         };
         let mut encoded = entry(&[(5, 0), (60, 30)], Outputs::AllSupported);
         encoded.tick_path_streams = Some(vec![StreamKey {
+            kind: crate::config::StreamKind::Candle,
             duration_seconds: 5,
             offset_seconds: 0,
         }]);

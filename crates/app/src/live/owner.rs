@@ -309,7 +309,7 @@ impl Runtime {
             })
             .collect();
         self.pending_rows
-            .retain(|rows| now.saturating_sub(rows.close_micros) <= ages[rows.instrument]);
+            .retain(|rows| rows.retained_at(now, ages[rows.instrument]));
     }
     pub(super) fn check_progress(&mut self) -> Result<(), String> {
         if let Some(error) = self

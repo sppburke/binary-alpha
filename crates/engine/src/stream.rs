@@ -155,6 +155,7 @@ crate::string_enum! {
         OffGrid => "off_grid",
         NonFinite => "non_finite",
         OutOfRange => "out_of_range",
+        ArithmeticOverflow => "arithmetic_overflow",
     }
 }
 

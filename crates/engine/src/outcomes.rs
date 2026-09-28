@@ -491,14 +491,36 @@ pub fn stream_object_paths(duration_seconds: u32, offset_seconds: u32) -> [Strin
         .map(|kind| format!("{kind}/{duration_seconds}s_{offset_seconds}s.bin"))
 }
 
+pub fn stream_object_paths_for(key: crate::config::StreamKey) -> [String; 4] {
+    if key.kind == crate::config::StreamKind::Candle {
+        return stream_object_paths(key.duration_seconds, key.offset_seconds);
+    }
+    ["reference", "entry", "settlement", "reason"].map(|kind| format!("{kind}/quote.bin"))
+}
+
 /// Summary of one decision stream's labels and its ordered row mapping onto the feature rows.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub struct OutcomeStreamSummary {
+    #[serde(
+        default = "crate::config::StreamKind::candle",
+        skip_serializing_if = "crate::config::StreamKind::is_candle"
+    )]
+    pub kind: crate::config::StreamKind,
     pub duration_seconds: u32,
     pub offset_seconds: u32,
     pub rows: u64,
     pub first_reference_time: Option<String>,
     pub last_reference_time: Option<String>,
+}
+
+impl OutcomeStreamSummary {
+    pub fn key(&self) -> crate::config::StreamKey {
+        crate::config::StreamKey {
+            kind: self.kind,
+            duration_seconds: self.duration_seconds,
+            offset_seconds: self.offset_seconds,
+        }
+    }
 }
 
 /// The ready manifest of one outcome generation. Field order is the serialization order.
@@ -611,10 +633,7 @@ impl OutcomeManifest {
             TICK_PRICE_OBJECT_PATH.to_string(),
         ];
         for summary in &manifest.streams {
-            expected.extend(stream_object_paths(
-                summary.duration_seconds,
-                summary.offset_seconds,
-            ));
+            expected.extend(stream_object_paths_for(summary.key()));
         }
         let mut recorded: Vec<&str> = manifest
             .objects

@@ -22,7 +22,7 @@ use binary_alpha_engine::market::{PriceScale, format_event_time_micros};
 use binary_alpha_engine::outcomes::{
     Labels, MISSING_INDEX, OUTCOME_MANIFEST_KIND, OUTCOME_SCHEMA_VERSION, OutcomeBuilder,
     OutcomeManifest, OutcomeRule, OutcomeStreamSummary, REFERENCE_CLOCK, TICK_PRICE_OBJECT_PATH,
-    TICK_TIME_OBJECT_PATH, outcome_generation_id, stream_object_paths,
+    TICK_TIME_OBJECT_PATH, outcome_generation_id, stream_object_paths_for,
 };
 use binary_alpha_engine::research::Access;
 use binary_alpha_engine::stream::{Observation, Source};
@@ -460,10 +460,14 @@ pub(crate) fn build(
     let mut summaries = Vec::with_capacity(bound.plan.streams.len());
     for (stream, summary) in bound.plan.streams.iter().zip(&bound.feature.streams) {
         let references = read_references(&bound, stream, summary)?;
-        let stem = format!(
-            "outcomes-{generation}-{}s-{}s",
-            stream.duration_seconds, stream.offset_seconds
-        );
+        let stem = if stream.kind == binary_alpha_engine::config::StreamKind::Quote {
+            format!("outcomes-{generation}-quote")
+        } else {
+            format!(
+                "outcomes-{generation}-{}s-{}s",
+                stream.duration_seconds, stream.offset_seconds
+            )
+        };
         let mut temporaries = Vec::with_capacity(4);
         for kind in ["reference", "entry", "settlement", "reason"] {
             temporaries.push(Temporary::create(local, &format!("{stem}-{kind}"))?);
@@ -474,14 +478,12 @@ pub(crate) fn build(
             temporaries[2].write(&le_bytes(&labels.settlements, u32::to_le_bytes))?;
             temporaries[3].write(&labels.reasons)
         })?;
-        paths.extend(stream_object_paths(
-            stream.duration_seconds,
-            stream.offset_seconds,
-        ));
+        paths.extend(stream_object_paths_for(stream.key()));
         for temporary in temporaries {
             files.push(temporary.finish()?);
         }
         summaries.push(OutcomeStreamSummary {
+            kind: stream.kind,
             duration_seconds: stream.duration_seconds,
             offset_seconds: stream.offset_seconds,
             rows: summary.rows,
@@ -691,7 +693,7 @@ pub fn verify_outcome(uri: &str, store: &Store, key: &str, bytes: &[u8]) -> Resu
     let columns = manifest.rule.expiry_seconds.len() as u64;
     let (mut rows, mut cells) = (0, 0);
     for summary in &manifest.streams {
-        let paths = stream_object_paths(summary.duration_seconds, summary.offset_seconds);
+        let paths = stream_object_paths_for(summary.key());
         let cells_of_stream = dimension(summary.rows, columns)?;
         let published = fetch(&paths[0], dimension(summary.rows, 8)?)?;
         let location = published.location.clone();

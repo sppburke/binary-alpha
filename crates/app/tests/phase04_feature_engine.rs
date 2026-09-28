@@ -2288,6 +2288,7 @@ fn row_projection(
         Const(
             u8::from(
                 plan.stream(binary_alpha_engine::config::StreamKey {
+                    kind: binary_alpha_engine::config::StreamKind::Candle,
                     duration_seconds: stream.duration_seconds,
                     offset_seconds: stream.offset_seconds,
                 })

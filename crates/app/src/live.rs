@@ -395,11 +395,67 @@ pub struct Measurements {
     pub decision_to_acceptance_micros: Option<i64>,
 }
 struct PendingRows {
+    quote: bool,
     instrument: usize,
     close_micros: i64,
     bindings: BTreeSet<String>,
     observations: Vec<Observation>,
     receipt_micros: i64,
+}
+impl PendingRows {
+    fn retained_at(&self, now: i64, max_age: i64) -> bool {
+        self.quote || now.saturating_sub(self.close_micros) <= max_age
+    }
+}
+
+fn take_quote_rows(rows: &mut VecDeque<PendingRows>, authorized: bool) -> Vec<PendingRows> {
+    let mut keep = VecDeque::new();
+    let mut due = Vec::new();
+    while let Some(row) = rows.pop_front() {
+        if row.quote {
+            if authorized {
+                due.push(row);
+            }
+        } else {
+            keep.push_back(row);
+        }
+    }
+    *rows = keep;
+    due
+}
+
+#[cfg(test)]
+mod quote_row_tests {
+    use super::*;
+
+    #[test]
+    fn quote_rows_leave_the_queue_before_the_next_tick_or_authorization_reply() {
+        let row = |quote, at| PendingRows {
+            quote,
+            instrument: 0,
+            close_micros: at,
+            bindings: BTreeSet::from(["binding".into()]),
+            observations: vec![Observation::Tick {
+                instrument: 0,
+                provider_time_micros: at,
+                price_units: at,
+            }],
+            receipt_micros: at,
+        };
+        let mut waiting = VecDeque::from([row(false, 1), row(true, 2)]);
+        assert!(!waiting[0].retained_at(10, 1));
+        assert!(waiting[1].retained_at(10, 1));
+        let due = take_quote_rows(&mut waiting, true);
+        assert_eq!(due.len(), 1);
+        assert_eq!(due[0].receipt_micros, 2);
+        assert_eq!(waiting.len(), 1);
+        assert!(!waiting[0].quote);
+
+        waiting.push_back(row(true, 3));
+        assert!(take_quote_rows(&mut waiting, false).is_empty());
+        assert_eq!(waiting.len(), 1);
+        assert!(!waiting[0].quote);
+    }
 }
 struct Dispatch {
     signal: FinancialEvent,
@@ -917,6 +973,7 @@ impl Runtime {
                 || self.health.journal_sequence == 0)
         {
             self.authorization_pending = true;
+            take_quote_rows(&mut self.pending_rows, false);
             self.veto("live authorization is absent", true);
             self.workers
                 .storage
@@ -1388,6 +1445,10 @@ impl Runtime {
     fn market_event(&mut self, event: LiveEvent) -> Result<(), String> {
         match event {
             LiveEvent::Break { generation, reason } => {
+                for feature in &mut self.features {
+                    feature.reset_continuity();
+                }
+                self.pending_rows.retain(|rows| !rows.quote);
                 self.veto("market continuity", true);
                 self.warm.clear();
                 self.veto("causal warmup is incomplete", true);
@@ -1417,6 +1478,18 @@ impl Runtime {
                     }
                     return Ok(());
                 }
+                self.rows_ready()?;
+                let due = take_quote_rows(&mut self.pending_rows, !self.authorization_pending);
+                for rows in due {
+                    self.decision_receipt = Some(rows.receipt_micros);
+                    for signal in self.step(rows.observations)? {
+                        self.dispatch(signal)?;
+                        if self.interrupted {
+                            return Ok(());
+                        }
+                    }
+                }
+                self.rows_ready()?;
                 self.health.connection_generation = event.generation;
                 self.health.receipt_sequence = event.sequence;
                 self.last_provider_time = Some(event.provider_time_micros);
@@ -1487,6 +1560,8 @@ impl Runtime {
                     let strategy = self.definition.policy.replay.strategies.iter().find(|s| s.id == binding.strategy).unwrap();
                     rows.iter().any(|row| matches!(row, Observation::Row {stream,values,..} if bound.streams[*stream].stream == strategy.base_stream && row_ready(&bound.streams[*stream], values)))
                 });
+                let stream_keys: Vec<_> =
+                    bound.streams.iter().map(|stream| stream.stream).collect();
                 if ready {
                     self.warm.insert(instrument);
                 }
@@ -1517,7 +1592,40 @@ impl Runtime {
                     provider_time_micros: event.provider_time_micros,
                     price_units: event.price_units,
                 }])?;
-                if !rows.is_empty() {
+                let (candle_rows, quote_rows): (Vec<_>, Vec<_>) = rows.into_iter().partition(|row| {
+                    matches!(row, Observation::Row { stream, .. }
+                        if stream_keys[*stream].kind == binary_alpha_engine::config::StreamKind::Candle)
+                });
+                for (quote, rows) in [(false, candle_rows), (true, quote_rows)] {
+                    if rows.is_empty() || (quote && self.authorization_pending) {
+                        continue;
+                    }
+                    let group_requests: Vec<_> = requests
+                        .iter()
+                        .filter(|request| {
+                            let binding = self
+                                .definition
+                                .policy
+                                .replay
+                                .bindings
+                                .iter()
+                                .find(|b| b.id == request.binding)
+                                .expect("validated");
+                            let strategy = self
+                                .definition
+                                .policy
+                                .replay
+                                .strategies
+                                .iter()
+                                .find(|s| s.id == binding.strategy)
+                                .expect("validated");
+                            rows.iter().any(|row| {
+                                matches!(row, Observation::Row { stream, .. }
+                                if stream_keys[*stream] == strategy.base_stream)
+                            })
+                        })
+                        .cloned()
+                        .collect();
                     let close_micros = rows
                         .iter()
                         .filter_map(|row| match row {
@@ -1529,18 +1637,27 @@ impl Runtime {
                         .max()
                         .expect("base rows");
                     self.pending_rows.push_back(PendingRows {
+                        quote,
                         instrument,
                         close_micros,
                         bindings: if self.draining {
                             BTreeSet::new()
+                        } else if quote {
+                            group_requests
+                                .iter()
+                                .filter(|request| {
+                                    !self.proposals_pending.contains(&request.binding)
+                                })
+                                .map(|request| request.binding.clone())
+                                .collect()
                         } else {
-                            requests.iter().map(|r| r.binding.clone()).collect()
+                            group_requests.iter().map(|r| r.binding.clone()).collect()
                         },
                         observations: rows,
                         receipt_micros: event.receipt_micros,
                     });
                     self.prune_rows();
-                    for request in requests {
+                    for request in group_requests {
                         if self.proposals_pending.insert(request.binding.clone()) {
                             self.send(Intent::Proposal(request))?;
                         }
@@ -2656,6 +2773,7 @@ mod readiness_regressions {
         };
         let stream = StreamColumns {
             stream: StreamKey {
+                kind: binary_alpha_engine::config::StreamKind::Candle,
                 duration_seconds: 20,
                 offset_seconds: 0,
             },
