@@ -683,12 +683,18 @@ recorded log to verify listing cadence, per-row offers, request-id correlation, 
 recovery, and the final receipt. Recorded replay makes no broker connection. Keep the same
 configuration and certified bundle identity for an authorized demo observation; `live run` also
 needs its own cloud, control, broker, and exact entry authorization.
+Record an exact `42["ps",null]` expectation after every login and at each due receive boundary;
+the adapter sends it at the next eligible receive boundary after each 30-second deadline, after
+any pending binary attachment. The recorded log's
+last frame can end a pending deadline read without a replay stall.
 
+Only a fresh listing whose configured rule predicts the frozen 92% return can admit an offer.
 During observation, check that each admitted offer matches the frozen return, stale or
 ineligible listings create bounded refusals, and every accepted order's deal and balance settle
 against the Engine ledger. Review timing dimensions even when demo entries continue: an outside
 dimension still prevents promotion. A possibly sent order, contradictory deal, unmatched new
-deal, rejected release, or economic discrepancy requires exact reconciliation before new entries.
+deal, rejected release, or economic discrepancy stops new entries. Reconcile an unmatched deal
+only by its exact key; a contradictory close remains vetoed across restart and needs investigation.
 Retain the journal tail and published manifest during a restart; do not resubmit an uncertain
 order. Stop the process to roll back new entries while keeping its evidence for recovery.
 

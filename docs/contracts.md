@@ -1211,7 +1211,7 @@ WebSocket transport. Engine records remain neutral; only app wire readers know p
 | Adapter | History | Live market data | Options execution contract |
 | --- | --- | --- | --- |
 | `deriv` | raw ticks | ticks, acknowledged cancellation | proposals, claimed purchases, account transactions, contract facts, portfolio and statement |
-| `pocket_option` | raw ticks and native five-second bars | streams, cancellation sent without acknowledgement | unsupported |
+| `pocket_option` | raw ticks and native five-second bars | streams, cancellation sent without acknowledgement | demo-only claimed purchases, pushed balances, opened and closed deal facts, partial-snapshot recovery |
 
 The Deriv public connection supplies discovery, tick history and subscriptions. Authenticated
 connections first GET `{bootstrap_endpoint}/accounts` with a resolved bearer credential and
@@ -1236,6 +1236,10 @@ resolved from the named environment variable. Fresh `successauth` and
 `successupdateBalance.isDemo` matching the declared class precede market commands; selected symbols
 must occur in the observed 19-element `updateAssets` rows. Incomplete attachments never become
 observations. The adapter does not log authentication, renew credentials or generate chart points.
+Each successful login sends `42["ps",null]`; subsequent sends are due every 30 seconds at that
+session's next eligible receive boundary. A due send never splits a binary header from its
+attachment, and its wake continues the caller's pending read. Reconnect creates a new session
+and deadline. Unpolled history retains its stale-session reconnect before the next request.
 
 For candle history, Pocket Option sends `loadHistoryPeriod` with `asset`, incrementing
 `index`, a provider-clock `time` anchor, `offset = 200`, and `period = 5`. It accepts
@@ -1246,8 +1250,8 @@ must round-trip to those units. The configured provider offset is subtracted bef
 whole-second bar start on the five-second grid. Prices and volume must be finite, volume
 non-negative, price bounds consistent, and time strictly increasing. The symbol identifier must
 be constant within pages and across the retained lineage. These checks do not independently
-establish the operator's clock/source mapping. This research pipeline acquires no Pocket ticks
-and makes no tick subscription or order request.
+establish the operator's clock/source mapping. Tick history accepts page rows with `time`,
+`price`, and optional `asset`; `subscribeSymbol` supplies live ticks.
 
 Live records retain provider event time, local receipt time, the same full source identity as fetch, connection
 generation, receipt sequence and payload SHA-256. Neither pinned provider has a durable tick
@@ -2044,6 +2048,15 @@ Duplicate or contradictory matches stay unresolved. An absent sell row can prove
 `CompleteRange` coverage. Statement results carry `StatementRow { cash, payout }`; Deriv
 `recover_purchase` uses the buy row alone,
 including its payout and `transaction_time` as purchase time, without a lost acknowledgement.
+Pocket treats an unknown open deal as an uncorrelated liability regardless of purchase time.
+An unmatched close at or after deployment start also vetoes entries; one older foreign close by
+itself does not.
+Correlation is journaled and clears an uncorrelated deal only after an exact-key match. Omission
+from a partial snapshot, including an empty one, cannot clear it. Each distinct validated closed
+fact is journaled before use. Contradictory facts for one deal id veto entries, including after
+restart, and remain unresolved. New deal facts outside login invalidate the adapter's
+cached balance until a later push. Deal lists received during login retain that handshake's
+balance snapshot.
 
 The financial ledger retains admitted proposals; normalized proposals received before a signal are
 re-supplied by the input replay boundary after a restart, like ticks and feature rows. Re-supplying
@@ -2718,7 +2731,8 @@ Quote streams emit one row for each distinct accepted tick. `quote_delta_units` 
 first quote and after a gap or live continuity break, then equals the checked difference from the
 previous quote. A quote row has its own close and known-at times. Live installs every row produced
 by one tick, including candle and quote rows, in one Engine step. Quote rows are decided before
-the next tick and are discarded during an authorization wait.
+the next tick. Starting a live authorization read discards already queued quote rows; quote rows
+produced while that read is pending are also discarded. Co-produced non-quote rows are retained.
 
 Phase 12 runs one process per deployment bundle and execution account. The implemented boundaries
 are [configuration](../crates/engine/src/config.rs), the
@@ -2832,8 +2846,9 @@ is `Frozen.instruments[i].source`; its feature generation is `Selection.refit[i]
 Warm-up references do not replace these source identities. The derived definition uses the
 existing [execution identity](#identities-and-records) owner and the full runtime configuration
 hash, `schema_version = 2`, and `availability = "ordered_broker_receipts_v1"`. Configured instrument
-definitions must equal the frozen refit definitions, including currency and price scale. Only the
-Deriv options adapter is accepted. Source bundle, frozen stage, scenarios, qualification, and
+definitions must equal the frozen refit definitions, including currency and price scale. Deriv
+and demo-only Pocket options adapters are accepted; Pocket requires configured payout terms.
+Source bundle, frozen stage, scenarios, qualification, and
 certification bytes are read without mutation; no protected certification child is opened.
 
 `ContractTerms::same_economics` implements exact checked-decimal value comparison for direction,
@@ -2877,6 +2892,8 @@ serialized record bytes, excluding the newline; the first record uses sixty-four
 | `written` | `command`, `claim`, and optional Pocket `request_id`; recorded before queuing the socket write, not proof of a write or acceptance. |
 | `lease` | `state` (`acquired`, `renewed`, `released`, `lost`) and `token`. |
 | `discontinuity` | Recovery `reason`. |
+| `pocket_correlation` | `deal_id`, `correlated`; records an uncorrelated deal or its exact-key resolution. |
+| `pocket_closed` | `deal_id`, optional `request_id`, and the validated serialized closed `fact`; distinct facts for one deal id preserve a contradiction across restart. |
 
 `Journal::append` writes and synchronizes each line with `sync_data`. The sole open file is
 `<dir>/open.jsonl`; closed files are `<first>-<last>.jsonl`, with each sequence zero-padded to
@@ -3107,8 +3124,8 @@ Demo and real evidence stay distinct. Without confirmed entry and purchase facts
 fill, timing, and settlement dimensions remain unavailable. A passing synthetic fixture
 proves the contract path and still grants no real entry authority.
 
-A nonpassing mandatory dimension vetoes promotion. During observation, the first dimension in
-fixed order with status `outside_envelope` adds a persistent entry veto; `unavailable` or low
+A nonpassing mandatory dimension vetoes promotion. During observation, an `outside_envelope`
+dimension adds a persistent entry veto under the account-class rule above; `unavailable` or low
 support alone does not disable runtime entries. Observation, settlement, and reconciliation
 continue. A receipt cannot widen terms, change stake/risk/features, drop scenarios, amend
 certification, change the horizon, rerun holdout, or authorize another observation. A modeling
@@ -3126,6 +3143,7 @@ or optional expected send, in receipt order:
 {"session":"market","at":1000000,"frame":"<received text>"}
 {"session":"market","at":1000001,"binary":[52,50,91,93]}
 {"session":"account","expect":"<text sent>"}
+{"session":"account","expect":"42[\"ps\",null]"}
 {"session":"bootstrap","at":1000001,"frame":"<response text>"}
 ```
 
@@ -3138,6 +3156,8 @@ until its ordered result is delivered. An `expect` line requires an exact byte m
 top-level `req_id` correlation. Pocket `openOrder` expectations bind their recorded `requestId`
 to the generated request id in acknowledgments, closes, and deal lists. Correlation preserves
 other payload values, decimal tokens, and nested `echo_req`.
+Recorded Pocket sessions expect the `ps` write after each login and at due receive boundaries.
+An exhausted recorded log ends a pending absolute-deadline read without advancing replay time.
 Bootstrap expectations are `GET <url>` or `POST <url>`; headers are ignored. Without expectations,
 outbound requests bind response identifiers and subscription scope from the retained frames.
 Mismatches, decoding failures, and stalled logs fail before final publication. Replay uses fake
@@ -3192,7 +3212,8 @@ periodic pass, on the renewal cadence, and at finish or checkpoint interruption.
 | `open_commands`, `uncertain_commands` | Engine open count; unresolved financial count plus claimed/possibly-sent rows not already counted as possibly sent. |
 | `cloud_pending_segments`, `cloud_failed_segments` | Closed segments awaiting verified upload; segments with upload errors. |
 | `pending_rows`, `pending_proposals` | Queued base rows and outstanding binding proposal requests. |
-| `balance_reconciled` | Latest returned broker balance equals Engine cash. |
+| `balance_reconciled` | Latest returned broker balance equals Engine cash and no balance refresh is due. |
+| `authorization_pending` | A live authorization read is outstanding. |
 | `entries` | `{"state":"enabled"}` or `{"state":"disabled","reason":"..."}`; veto reasons are sorted and joined by `; `. |
 | `risk` | Current Engine `AccountState`: `id`, `currency`, `scale`, `cash`, `reserved`, `paid_basis`, `unresolved_loss`, `completed_profit`, `epoch_peak`, `lifetime_peak`, `max_drawdown`, `open`, optional `paused_until_micros`, and non-empty `blocked`. |
 
@@ -3206,9 +3227,10 @@ possibly sent until matched broker evidence or an operator-proven `not_sent` row
 an empty statement/portfolio or elapsed time never supplies that proof. Live ticks are not journaled.
 Incomplete warm-up, continuity loss, balance divergence, unresolved dispatch, liability
 discrepancy/deficit, spool bound, lease loss, missing live authorization, or outside-envelope
-compatibility disables entries. Engine risk and quote/proposal freshness checks also govern
-admission; stale queued rows are pruned. Accepted purchases without entry/due facts remain
-paid open exposure under [broker-authoritative obligations](#broker-authoritative-obligations).
+compatibility under the account-class rule above disables entries. Engine risk and quote/proposal
+freshness checks also govern admission; stale queued rows are pruned. Accepted purchases without
+entry/due facts remain paid open exposure under
+[broker-authoritative obligations](#broker-authoritative-obligations).
 Account observation, settlement, reconciliation, journal, and cloud retry remain active; a market
 tick never settles a broker-authoritative obligation. No new monitoring service or Sentry
 integration is introduced.

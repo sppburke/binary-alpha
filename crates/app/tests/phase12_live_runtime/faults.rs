@@ -10,7 +10,10 @@ use super::support::{
     scenario_rows as rows,
 };
 use binary_alpha_app::{
-    broker::{self, Clock, transport::RecordedConnector},
+    broker::{
+        self, Clock,
+        transport::{Connector, Frame, RecordedConnector, Transport},
+    },
     live::{
         self, Checkpoint, Entries,
         control::{Claim, ClaimOutcome, ClaimState, Control, FakeControl, LeaseKey},
@@ -22,7 +25,10 @@ use binary_alpha_engine::execution::{
     FinancialEvent, Resolution,
 };
 use serde_json::{Value, json};
-use std::{fs, sync::Arc};
+use std::{
+    fs,
+    sync::{Arc, mpsc},
+};
 
 fn portfolio(at: i64) -> Value {
     account(
@@ -145,6 +151,50 @@ fn run(
     control: Box<dyn Control>,
 ) -> live::Runtime {
     support::runtime_with(fixture, mode, recorded, control, |_| {}, |m| m).unwrap()
+}
+struct ContractGate {
+    inner: Box<dyn Connector>,
+    parked: mpsc::Sender<()>,
+    release: Option<mpsc::Receiver<()>>,
+}
+impl Connector for ContractGate {
+    fn connect(
+        &mut self,
+        url: &str,
+        headers: &[(String, String)],
+    ) -> Result<Box<dyn Transport>, String> {
+        Ok(Box::new(ContractGateTransport {
+            inner: self.inner.connect(url, headers)?,
+            parked: self.parked.clone(),
+            release: self.release.take().unwrap(),
+            pending: true,
+        }))
+    }
+}
+struct ContractGateTransport {
+    inner: Box<dyn Transport>,
+    parked: mpsc::Sender<()>,
+    release: mpsc::Receiver<()>,
+    pending: bool,
+}
+impl Transport for ContractGateTransport {
+    fn send(&mut self, frame: Frame) -> Result<(), String> {
+        self.inner.send(frame)
+    }
+    fn receive(&mut self, timeout: i64) -> Result<Option<Frame>, String> {
+        let frame = self.inner.receive(timeout)?;
+        if self.pending
+            && matches!(&frame, Some(Frame::Text(text)) if text.contains("\"msg_type\":\"proposal_open_contract\""))
+        {
+            self.pending = false;
+            self.parked.send(()).unwrap();
+            self.release.recv().unwrap();
+        }
+        Ok(frame)
+    }
+    fn close(&mut self) -> Result<(), String> {
+        self.inner.close()
+    }
 }
 fn stop_at(owner: &mut live::Runtime, point: Checkpoint) {
     owner.hook = Some(Box::new(move |at| at == point));
@@ -1686,13 +1736,41 @@ fn offline_settlement_scenario(name: &str, refreshed_balance: &str) {
         input.push(proposal(START + 20_000_000));
     }
     let recorded = RecordedConnector::from_jsonl(&log(&input)).unwrap();
-    let mut owner = run(&fixture, live::Mode::Live, &recorded, Box::new(control));
+    let (parked_tx, parked_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    let mut owner = support::runtime_with_io(
+        &fixture,
+        live::Mode::Live,
+        &recorded,
+        Box::new(control),
+        |_| {},
+        |market| market,
+        |inner| {
+            Box::new(ContractGate {
+                inner,
+                parked: parked_tx,
+                release: Some(release_rx),
+            })
+        },
+    )
+    .unwrap();
     assert!(!owner.health().balance_reconciled);
     assert!(
         matches!(&owner.health().entries, Entries::Disabled(r) if r.contains("broker balance differs"))
     );
     assert_eq!(owner.engine().accounts()[0].cash, decimal("9990.00"));
-    owner.run_until(|_| recorded.exhausted()).unwrap().unwrap();
+    // The contract row may reach the adapter before or after authorization completes.
+    // Drive the latter case until the adapter acknowledges that it has parked the row.
+    std::thread::scope(|scope| {
+        let release = scope.spawn(move || {
+            parked_rx
+                .recv_timeout(std::time::Duration::from_secs(30))
+                .expect("contract gate stalled");
+            release_tx.send(()).unwrap();
+        });
+        owner.run_until(|_| recorded.exhausted()).unwrap().unwrap();
+        release.join().unwrap();
+    });
     balances(&owner, "10008.83", "0", "0", "0", 0);
     if divergent {
         assert!(owner.health().warmup);
