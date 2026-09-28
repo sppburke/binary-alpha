@@ -675,7 +675,7 @@ fn candidate_search_publishes_verifies_and_resumes() {
     let odd = member(&family, &["up", "range_gt"], "odd_tie_buy");
     assert_eq!(
         family.members[odd].inapplicable.as_deref(),
-        Some("a tie nets -0.05, not zero or -1")
+        Some("a tie nets -0.05, not zero")
     );
     assert_eq!(family.members[odd].score, None);
     assert_eq!(family.members[odd].adjusted, None);
