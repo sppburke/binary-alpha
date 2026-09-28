@@ -833,7 +833,7 @@ pub fn pocket_aged_quote_log() -> String {
     log
 }
 pub fn pocket_economics_log() -> String {
-    pocket_log()
+    let log: String = pocket_log()
         .lines()
         .filter_map(|line| {
             let mut row: Value = serde_json::from_str(line).unwrap();
@@ -850,7 +850,8 @@ pub fn pocket_economics_log() -> String {
             }
             Some(format!("{}\n", row))
         })
-        .collect()
+        .collect();
+    pocket_keepalives(&log).0
 }
 pub fn pocket_reconnect_log() -> String {
     let mut log = pocket_log();
@@ -903,7 +904,7 @@ pub fn pocket_reconnect_log() -> String {
         "updateStream",
         quote(QUOTE_START + 63_800_000, 100_960),
     ));
-    log
+    pocket_keepalives(&log).0
 }
 pub fn pocket_authorization_wait_log() -> String {
     let mut log = pocket_log()
@@ -1011,7 +1012,7 @@ pub fn pocket_granted_after_early_quotes_log() -> String {
             json!({"isDemo":1,"balance":10000.92}),
         ),
     ));
-    log
+    pocket_keepalives(&log).0
 }
 pub fn pocket_old_foreign_open_log() -> String {
     let old = json!({"id":"synthetic-old-open","asset":shared::SYMBOLS[0],"command":1,
@@ -1278,7 +1279,7 @@ pub fn pocket_open_restart_log(request_id: u64) -> String {
         at + 800_000,
         &pocket_event("successupdateBalance", json!({"isDemo":1,"balance":9999})),
     ));
-    log
+    pocket_keepalives(&log).0
 }
 pub fn pocket_restart_log(request_id: u64) -> String {
     pocket_restart_log_with(request_id, 0)
@@ -1412,7 +1413,7 @@ fn pocket_restart_log_with(request_id: u64, variant: u8) -> String {
             ),
         ));
     }
-    log
+    pocket_keepalives(&log).0
 }
 fn pocket_log_with_initial_listing(missing: bool) -> String {
     let start = QUOTE_START;
@@ -1669,7 +1670,7 @@ fn pocket_log_with_initial_listing(missing: bool) -> String {
             json!({"isDemo":1,"balance":10001.84}),
         ),
     ));
-    log
+    pocket_keepalives(&log).0
 }
 
 #[test]

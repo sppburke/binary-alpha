@@ -1864,7 +1864,7 @@ fn pocket_owner_accepts_distinct_offers_for_adjacent_rows_under_one_listing() {
         .collect::<Vec<_>>()
         .join("\n")
         + "\n";
-    let recorded = RecordedConnector::from_jsonl(&log).unwrap();
+    let recorded = RecordedConnector::from_jsonl(&pocket_keepalives(&log).0).unwrap();
     let mut runtime = pocket_runtime(
         &fixture,
         live::Mode::Replay,
@@ -2363,6 +2363,18 @@ fn pocket_reconnect_does_not_trigger_from_the_cross_break_jump() {
         live::control::FakeControl::new(QUOTE_START - 2_000_000),
     )
     .unwrap();
+    let first_row_seen = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let seen = first_row_seen.clone();
+    runtime.feature_observer = Some(Box::new(move |instrument, output| {
+        if instrument == 0 {
+            for (_, row) in &output.rows {
+                if row.close_time_micros == QUOTE_START + 63_500_000 {
+                    assert_eq!(row.values[2], None);
+                    seen.store(true, std::sync::atomic::Ordering::SeqCst);
+                }
+            }
+        }
+    }));
     let warmup_observations = runtime.features()[0].profile().observations;
     runtime
         .run_until(|health| recorded.exhausted() && health.connection_generation >= 1)
@@ -2382,6 +2394,7 @@ fn pocket_reconnect_does_not_trigger_from_the_cross_break_jump() {
             kind: EventKind::Signal { close_time_micros, .. }, ..
         }} if *close_time_micros == QUOTE_START + 63_500_000))
     );
+    assert!(first_row_seen.load(std::sync::atomic::Ordering::SeqCst));
     // Twelve pre-break and both post-break quotes reached the feature owner, including the null-delta first.
     assert_eq!(
         runtime.features()[0].profile().observations,

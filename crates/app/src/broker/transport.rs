@@ -641,6 +641,11 @@ impl RecordedConnector {
             if let Some(at) = record.at {
                 self.clock.advance_to(at);
             }
+        } else if text == "42[\"ps\",null]" && !state.frames.is_empty() {
+            return Err(format!(
+                "recorded {}: ps write requires an explicit expectation at the head",
+                self.session
+            ));
         } else if let (Some(request), Some(actual)) = (&request, actual) {
             // Retained provider captures omit writes. Bind the next unconsumed response identity,
             // never the most recent response type; subscriptions retain their own scope.
@@ -932,6 +937,8 @@ impl Transport for RecordedConnector {
         state.frames.is_empty() && state.in_flight.is_none()
     }
     fn close(&mut self) -> Result<(), String> {
+        let mut state = self.clock.schedule.0.lock().unwrap();
+        state.binary_headers.remove(&self.session);
         Ok(())
     }
 }
@@ -1072,6 +1079,52 @@ mod recorded_tests {
         recorded.clock.complete();
         assert!(!recorded.exhausted());
         assert!(account.recorded_end());
+    }
+
+    #[test]
+    fn recorded_close_clears_the_disconnected_sessions_binary_header() {
+        let log = [
+            serde_json::json!({"session":"market","at":1,"frame":"451-[\"updateStream\",{\"_placeholder\":true,\"num\":0}]"}),
+            serde_json::json!({"session":"market","at":2,"frame":"41"}),
+            serde_json::json!({"session":"market","at":3,"frame":"0{}"}),
+            serde_json::json!({"session":"market","at":4,"frame":"40{}"}),
+        ]
+        .iter()
+        .map(|line| format!("{line}\n"))
+        .collect::<String>();
+        let recorded = RecordedConnector::from_jsonl(&log).unwrap();
+        let mut market = recorded.session("market").unwrap();
+        assert!(matches!(market.receive(1).unwrap(), Some(Frame::Text(_))));
+        recorded.clock.complete();
+        assert_eq!(market.receive(1).unwrap(), Some(Frame::Text("41".into())));
+        recorded.clock.complete();
+        market.close().unwrap();
+        let mut reconnected = recorded.session("market").unwrap();
+        assert_eq!(
+            reconnected.receive(1).unwrap(),
+            Some(Frame::Text("0{}".into()))
+        );
+        recorded.clock.complete();
+        assert_eq!(
+            reconnected.receive(1).unwrap(),
+            Some(Frame::Text("40{}".into()))
+        );
+        recorded.clock.complete();
+        assert!(recorded.exhausted());
+    }
+
+    #[test]
+    fn recorded_extra_pocket_keepalive_requires_a_head_expectation() {
+        let recorded =
+            RecordedConnector::from_jsonl(r#"{"session":"market","at":1,"frame":"0{}"}"#).unwrap();
+        let mut market = recorded.session("market").unwrap();
+        assert_eq!(
+            market
+                .send(Frame::Text("42[\"ps\",null]".into()))
+                .unwrap_err(),
+            "recorded market: ps write requires an explicit expectation at the head"
+        );
+        assert!(recorded.writes().is_empty());
     }
 
     #[test]
