@@ -161,46 +161,5 @@ pub fn purchase_observation(
     receipt: i64,
     kind: BrokerKind,
 ) -> execution::Observation {
-    if kind == BrokerKind::Deriv {
-        return deriv::purchase_observation(command, claim, outcome, receipt);
-    }
-    let dispatch = EventSource {
-        id: format!("pocket:dispatch:{claim}"),
-        provider_time_micros: receipt,
-        available_at_micros: receipt,
-        simulated: false,
-    };
-    match outcome {
-        PurchaseOutcome::Accepted {
-            debit,
-            liability,
-            receipt_micros,
-        } => execution::Observation::Purchased {
-            command: command.into(),
-            source: EventSource {
-                id: format!("pocket:buy:{}", liability.contract_ref),
-                provider_time_micros: liability.purchase_time_micros,
-                available_at_micros: receipt_micros,
-                simulated: false,
-            },
-            debit,
-            liability,
-        },
-        PurchaseOutcome::Rejected { receipt_micros, .. } => execution::Observation::Rejected {
-            command: command.into(),
-            source: EventSource {
-                provider_time_micros: receipt_micros,
-                available_at_micros: receipt_micros,
-                ..dispatch
-            },
-        },
-        PurchaseOutcome::ProvenNotSent { .. } => execution::Observation::NotSent {
-            command: command.into(),
-            source: dispatch,
-        },
-        PurchaseOutcome::PossiblySent { .. } => execution::Observation::PossiblySent {
-            command: command.into(),
-            source: dispatch,
-        },
-    }
+    deriv::purchase_observation_for_kind(command, claim, outcome, receipt, kind)
 }

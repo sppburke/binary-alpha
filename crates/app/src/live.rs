@@ -23,7 +23,7 @@ use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::{
-    Arc,
+    Arc, Mutex,
     atomic::{AtomicBool, Ordering},
 };
 use std::time::{Duration, Instant};
@@ -367,9 +367,24 @@ pub struct Health {
     pub cloud_failed_segments: usize,
     pub pending_rows: usize,
     pub pending_proposals: usize,
+    pub authorization_pending: bool,
     pub balance_reconciled: bool,
     pub entries: Entries,
     pub risk: AccountState,
+}
+/// A one-shot gate for deterministic authorization tests.
+#[doc(hidden)]
+pub struct AuthorizationProbe {
+    pub parked: std::sync::mpsc::Sender<()>,
+    pub release: std::sync::mpsc::Receiver<()>,
+}
+#[derive(Clone)]
+#[doc(hidden)]
+pub struct AuthorizationProbeHandle(Arc<Mutex<Option<AuthorizationProbe>>>);
+impl AuthorizationProbeHandle {
+    pub fn install(&self, probe: AuthorizationProbe) {
+        *self.0.lock().unwrap() = Some(probe);
+    }
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Checkpoint {
@@ -404,6 +419,8 @@ pub struct Measurements {
 }
 struct PendingRows {
     quote: bool,
+    quote_streams: BTreeSet<usize>,
+    candle_bindings: BTreeSet<String>,
     instrument: usize,
     close_micros: i64,
     bindings: BTreeSet<String>,
@@ -420,10 +437,23 @@ impl PendingRows {
 fn take_quote_rows(rows: &mut VecDeque<PendingRows>, authorized: bool) -> Vec<PendingRows> {
     let mut keep = VecDeque::new();
     let mut due = Vec::new();
-    while let Some(row) = rows.pop_front() {
+    while let Some(mut row) = rows.pop_front() {
         if row.quote {
             if authorized {
                 due.push(row);
+            } else {
+                row.observations.retain(|observation| {
+                    matches!(observation,
+                    Observation::Row { stream, .. } if !row.quote_streams.contains(stream))
+                });
+                if !row.observations.is_empty() {
+                    row.quote = false;
+                    row.bindings
+                        .retain(|binding| row.candle_bindings.contains(binding));
+                    row.withdraw
+                        .retain(|binding| row.candle_bindings.contains(binding));
+                    keep.push_back(row);
+                }
             }
         } else {
             keep.push_back(row);
@@ -495,6 +525,8 @@ mod quote_row_tests {
     fn quote_rows_leave_the_queue_before_the_next_tick_or_authorization_reply() {
         let row = |quote, at| PendingRows {
             quote,
+            quote_streams: BTreeSet::new(),
+            candle_bindings: BTreeSet::new(),
             instrument: 0,
             close_micros: at,
             bindings: BTreeSet::from(["binding".into()]),
@@ -539,6 +571,36 @@ mod quote_row_tests {
         assert!(matches!(rows[0], Observation::Row { stream: 0, .. }));
         let mut waiting = VecDeque::new();
         assert!(take_quote_rows(&mut waiting, true).is_empty());
+    }
+
+    #[test]
+    fn authorization_read_start_keeps_the_candle_in_a_mixed_group() {
+        let row = |stream| Observation::Row {
+            instrument: 0,
+            stream,
+            close_time_micros: 10,
+            known_at_micros: 10,
+            values: vec![Some(binary_alpha_engine::features::Value::Int(1))],
+        };
+        let mut waiting = VecDeque::from([PendingRows {
+            quote: true,
+            quote_streams: BTreeSet::from([1]),
+            candle_bindings: BTreeSet::new(),
+            instrument: 0,
+            close_micros: 10,
+            bindings: BTreeSet::from(["quote-binding".into()]),
+            withdraw: BTreeSet::new(),
+            observations: vec![row(0), row(1)],
+            receipt_micros: 10,
+        }]);
+        assert!(take_quote_rows(&mut waiting, false).is_empty());
+        assert_eq!(waiting.len(), 1);
+        assert!(!waiting[0].quote);
+        assert!(waiting[0].bindings.is_empty());
+        assert!(matches!(
+            waiting[0].observations.as_slice(),
+            [Observation::Row { stream: 0, .. }]
+        ));
     }
 
     #[test]
@@ -665,6 +727,7 @@ pub struct Runtime {
     control_time: i64,
     continuity: Continuity,
     contracts: BTreeMap<String, String>,
+    uncorrelated_pocket: BTreeSet<String>,
     claims: BTreeMap<String, Claim>,
     subscribed: BTreeSet<String>,
     subscriptions_pending: BTreeSet<String>,
@@ -915,6 +978,7 @@ impl Runtime {
                 cloud_failed_segments: 0,
                 pending_rows: 0,
                 pending_proposals: 0,
+                authorization_pending: false,
                 balance_reconciled: false,
                 entries: Entries::Enabled,
                 risk: engine.accounts()[0].clone(),
@@ -981,6 +1045,7 @@ impl Runtime {
             control_time: i64::MIN,
             continuity: Continuity::default(),
             contracts: BTreeMap::new(),
+            uncorrelated_pocket: BTreeSet::new(),
             claims: BTreeMap::new(),
             subscribed: BTreeSet::new(),
             subscriptions_pending: BTreeSet::new(),
@@ -1081,6 +1146,14 @@ impl Runtime {
     pub fn health(&self) -> &Health {
         &self.health
     }
+    #[doc(hidden)]
+    pub fn install_authorization_probe(&mut self, probe: AuthorizationProbe) {
+        self.authorization_probe_handle().install(probe);
+    }
+    #[doc(hidden)]
+    pub fn authorization_probe_handle(&self) -> AuthorizationProbeHandle {
+        AuthorizationProbeHandle(self.workers.authorization_probe.clone())
+    }
     pub fn engine(&self) -> &Engine {
         &self.engine
     }
@@ -1161,6 +1234,7 @@ impl Runtime {
                 || self.health.journal_sequence == 0)
         {
             self.authorization_pending = true;
+            self.health.authorization_pending = true;
             take_quote_rows(&mut self.pending_rows, false);
             self.veto("live authorization is absent", true);
             self.workers
@@ -1975,8 +2049,39 @@ impl Runtime {
                             quote,
                         )
                     };
+                    let candle_bindings = group_requests
+                        .iter()
+                        .filter_map(|request| {
+                            let binding = self
+                                .definition
+                                .policy
+                                .replay
+                                .bindings
+                                .iter()
+                                .find(|binding| binding.id == request.binding)?;
+                            let strategy = self
+                                .definition
+                                .policy
+                                .replay
+                                .strategies
+                                .iter()
+                                .find(|strategy| strategy.id == binding.strategy)?;
+                            (strategy.base_stream.kind
+                                == binary_alpha_engine::config::StreamKind::Candle)
+                                .then_some(request.binding.clone())
+                        })
+                        .collect();
                     self.pending_rows.push_back(PendingRows {
                         quote,
+                        candle_bindings,
+                        quote_streams: stream_keys
+                            .iter()
+                            .enumerate()
+                            .filter_map(|(index, stream)| {
+                                (stream.kind == binary_alpha_engine::config::StreamKind::Quote)
+                                    .then_some(index)
+                            })
+                            .collect(),
                         instrument,
                         close_micros,
                         withdraw,

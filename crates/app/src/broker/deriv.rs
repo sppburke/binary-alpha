@@ -1,5 +1,6 @@
 #[path = "deriv_options.rs"]
 mod options;
+pub(crate) use options::purchase_observation_for_kind;
 pub use options::{
     DerivOptions, Encoded, StatementRow, purchase_fact, purchase_observation, recover_purchase,
     to_observation,

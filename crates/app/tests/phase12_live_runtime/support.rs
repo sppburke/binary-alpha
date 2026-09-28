@@ -125,8 +125,47 @@ pub struct Fixture {
 }
 impl Fixture {
     pub fn quote(name: &str) -> Self {
+        Self::quote_streams(name, false, false)
+    }
+    pub fn quote_with_candle(name: &str) -> Self {
+        Self::quote_streams(name, true, false)
+    }
+    pub fn quote_deriv_with_candle(name: &str) -> Self {
+        Self::quote_streams(name, true, true)
+    }
+    fn quote_streams(name: &str, candle: bool, deriv: bool) -> Self {
         let scratch = Scratch::new(name);
-        let (mut config, declaration, mut datasets) = quote_fixture::build(&scratch);
+        let (mut config, mut declaration, mut datasets) = quote_fixture::build(&scratch);
+        if deriv {
+            datasets = datasets
+                .into_iter()
+                .enumerate()
+                .filter_map(|(index, dataset)| (index % 2 == 0).then_some(dataset))
+                .collect();
+            declaration
+                .populations
+                .retain(|population| population.instrument == shared::INSTRUMENTS[0]);
+            config.instruments.truncate(1);
+            for instrument in &mut config.instruments {
+                instrument.quote_currency = "USD".to_string().try_into().unwrap();
+            }
+            let research = config.research.as_mut().unwrap();
+            research.instruments.truncate(1);
+            for fold in &mut research.folds {
+                fold.inputs.truncate(1);
+            }
+            research.refit.fits.truncate(1);
+            research.evaluation.inputs.truncate(1);
+            research.holdout.inputs.truncate(1);
+        }
+        if candle {
+            let features = &mut config.research.as_mut().unwrap().instruments[0].features;
+            features.streams = Some(vec![
+                binary_alpha_engine::config::StreamKey::candle(20, 0),
+                binary_alpha_engine::config::StreamKey::quote(),
+            ]);
+            features.outputs = Some(binary_alpha_engine::config::Outputs::AllSupported);
+        }
         let (generation, bundle, run, cert) = certify(&scratch, &config, &declaration, &datasets);
         let ticks = quote_fixture::quote_ticks(BASE + 5 * HOUR);
         let warmup = shared::import_ticks(
@@ -140,16 +179,25 @@ impl Fixture {
         );
         datasets.extend(warmup.clone());
         config.research = None;
-        config.brokers = serde_json::from_value(json!([{
-            "kind":"pocket_option", "id":"pocket_option", "endpoint":"wss://example.invalid/socket.io/?EIO=4&transport=websocket",
-            "credential":"SYNTHETIC_AUTH", "account_class":"demo", "server_offset_minutes":0,
-            "payout":{"add_percent":8,"cap_percent":92,"max_age_seconds":3}
-        }])).unwrap();
+        config.brokers = if deriv {
+            serde_json::from_value(json!([{
+                "kind":"deriv", "id":"pocket_option", "public_endpoint":"ws://127.0.0.1/public",
+                "bootstrap_endpoint":"http://127.0.0.1/trading/v1/options", "app_id":"SYNTHETIC",
+                "account_class":"demo"
+            }]))
+            .unwrap()
+        } else {
+            serde_json::from_value(json!([{
+                "kind":"pocket_option", "id":"pocket_option", "endpoint":"wss://example.invalid/socket.io/?EIO=4&transport=websocket",
+                "credential":"SYNTHETIC_AUTH", "account_class":"demo", "server_offset_minutes":0,
+                "payout":{"add_percent":8,"cap_percent":92,"max_age_seconds":3}
+            }])).unwrap()
+        };
         config.live = Some(serde_json::from_value(json!({
             "execution_contract":research::EXECUTION_CONTRACT_V1,
             "bundle_manifest":uri(&scratch.root,&generation), "certification_manifest":uri(&scratch.root,&cert),
             "broker":"pocket_option", "account":"a0",
-            "warmup":warmup.iter().map(|w| uri(&scratch.root,&w.generation)).collect::<Vec<_>>(),
+            "warmup":warmup.iter().take(if deriv {1} else {2}).map(|w| uri(&scratch.root,&w.generation)).collect::<Vec<_>>(),
             "compatibility":{"observation_start":time(QUOTE_START),"observation_end":time(QUOTE_START+80_000_000),"required_account_class":"demo","min_samples":1},
             "journal":{"dir":"journal","segment_records":16,"max_spool_bytes":10_000_000},
             "control":{"host":"localhost","port":5432,"database":"synthetic","user":"synthetic","credential":"SYNTHETIC_PASSWORD",
@@ -560,6 +608,164 @@ pub fn pocket_authorization_wait_log() -> String {
     ));
     log
 }
+pub fn pocket_granted_after_early_quotes_log() -> String {
+    let start = QUOTE_START;
+    let mut log = pocket_log()
+        .lines()
+        .take_while(|line| !line.contains("updateStream"))
+        .map(|line| format!("{line}\n"))
+        .collect::<String>();
+    let quote = |offset: i64, units: i64| {
+        let at = start + offset;
+        json!([[
+            shared::SYMBOLS[0],
+            serde_json::from_str::<Value>(&format!("{}.{:06}", at / 1_000_000, at % 1_000_000))
+                .unwrap(),
+            serde_json::from_str::<Value>(&format!("{}.{:05}", units / 100_000, units % 100_000))
+                .unwrap()
+        ]])
+    };
+    let mut first = quote(0, 100_644);
+    first
+        .as_array_mut()
+        .unwrap()
+        .push(json!([shared::SYMBOLS[1], start / 1_000_000, 1.00494]));
+    log.push_str(&pocket_binary(
+        "market",
+        start + 200_000,
+        "updateStream",
+        first,
+    ));
+    log.push_str(&pocket_line(
+        "market",
+        start + 400_000,
+        &pocket_event("updateStream", quote(300_000, 100_800)),
+    ));
+    log.push_str(&pocket_line(
+        "market",
+        start + 800_000,
+        &pocket_event("updateStream", quote(700_000, 100_950)),
+    ));
+    log.push_str(&format!("{}\n", json!({"session":"account","at":start+900_000,
+        "expect":format!("42[\"openOrder\",{{\"asset\":\"{}\",\"amount\":1,\"action\":\"put\",\"isDemo\":1,\"requestId\":11111111,\"optionType\":100,\"time\":30}}]", shared::SYMBOLS[0])})));
+    let opened = json!({"id":"synthetic-late","asset":shared::SYMBOLS[0],"command":1,"amount":1,"profit":0,
+        "percentProfit":92,"openPrice":1.00950,"closePrice":null,"openTimestamp":start/1_000_000,
+        "openMs":900,"closeTimestamp":start/1_000_000+30,"isDemo":1,"currency":"USD","requestId":11111111,"optionType":100});
+    log.push_str(&pocket_line(
+        "account",
+        start + 1_000_000,
+        &pocket_event("successopenOrder", opened.clone()),
+    ));
+    log.push_str(&pocket_line(
+        "account",
+        start + 1_100_000,
+        &pocket_event("successupdateBalance", json!({"isDemo":1,"balance":9999})),
+    ));
+    log.push_str(&pocket_line(
+        "market",
+        start + 30_900_000,
+        &pocket_event("updateStream", quote(30_800_000, 100_800)),
+    ));
+    let mut closed = opened;
+    closed["profit"] = json!(0.92);
+    closed["closePrice"] = json!(1.00800);
+    closed["closeMs"] = json!(200);
+    log.push_str(&pocket_line(
+        "account",
+        start + 31_100_000,
+        &pocket_event("successcloseOrder", json!({"profit":1.92,"deals":[closed]})),
+    ));
+    log.push_str(&pocket_line(
+        "account",
+        start + 31_200_000,
+        &pocket_event(
+            "successupdateBalance",
+            json!({"isDemo":1,"balance":10000.92}),
+        ),
+    ));
+    log
+}
+pub fn pocket_old_foreign_open_log() -> String {
+    let old = json!({"id":"synthetic-old-open","asset":shared::SYMBOLS[0],"command":1,
+        "amount":1,"profit":0,"percentProfit":92,"openPrice":1.0,"closePrice":null,
+        "openTimestamp":QUOTE_START/1_000_000-7200,"openMs":0,
+        "closeTimestamp":QUOTE_START/1_000_000+3600,
+        "isDemo":1,"currency":"USD","optionType":100});
+    pocket_authorization_wait_log()
+        .lines()
+        .map(|line| {
+            let mut row: Value = serde_json::from_str(line).unwrap();
+            if row["frame"]
+                .as_str()
+                .is_some_and(|frame| frame.contains("updateOpenedDeals"))
+            {
+                row["frame"] = json!(pocket_event("updateOpenedDeals", json!([old])));
+            }
+            format!("{row}\n")
+        })
+        .collect()
+}
+pub fn pocket_new_fact_balance_log() -> String {
+    pocket_authorization_wait_log()
+        .lines()
+        .map(|line| {
+            let mut row: Value = serde_json::from_str(line).unwrap();
+            if row["session"] == "account" && row["at"] == QUOTE_START - 1_000_000 {
+                row["frame"] = json!(pocket_event(
+                    "successupdateBalance",
+                    json!({"isDemo":1,"balance":9999})
+                ));
+            }
+            format!("{row}\n")
+        })
+        .collect()
+}
+pub fn pocket_bad_live_close_log() -> String {
+    let mut log = pocket_log()
+        .lines()
+        .take_while(|line| !line.contains("successcloseOrder"))
+        .map(|line| format!("{line}\n"))
+        .collect::<String>();
+    let close = json!({"id":"synthetic-one","asset":shared::SYMBOLS[0],"command":1,
+        "amount":2,"profit":-2,"percentProfit":92,"openPrice":1.00644,"closePrice":1.00700,
+        "openTimestamp":QUOTE_START/1_000_000,"openMs":600,
+        "closeTimestamp":QUOTE_START/1_000_000+30,"closeMs":200,
+        "isDemo":1,"currency":"USD","requestId":11111111,"optionType":100});
+    log.push_str(&pocket_line(
+        "account",
+        QUOTE_START + 30_400_000,
+        &pocket_event("successcloseOrder", json!({"profit":0,"deals":[close]})),
+    ));
+    log.push_str(&pocket_line(
+        "account",
+        QUOTE_START + 30_500_000,
+        &pocket_event("successupdateBalance", json!({"isDemo":1,"balance":9999})),
+    ));
+    log
+}
+pub fn pocket_refund_on_loss_log() -> String {
+    let mut log = pocket_log()
+        .lines()
+        .take_while(|line| !line.contains("successcloseOrder"))
+        .map(|line| format!("{line}\n"))
+        .collect::<String>();
+    let closed = json!({"id":"synthetic-one","asset":shared::SYMBOLS[0],"command":1,
+        "amount":1,"profit":-0.5,"percentProfit":92,"openPrice":1.00644,"closePrice":1.00700,
+        "openTimestamp":QUOTE_START/1_000_000,"openMs":600,
+        "closeTimestamp":QUOTE_START/1_000_000+30,"closeMs":200,
+        "isDemo":1,"currency":"USD","requestId":11111111,"optionType":100});
+    log.push_str(&pocket_line(
+        "account",
+        QUOTE_START + 30_400_000,
+        &pocket_event("successcloseOrder", json!({"profit":0.5,"deals":[closed]})),
+    ));
+    log.push_str(&pocket_line(
+        "account",
+        QUOTE_START + 30_500_000,
+        &pocket_event("successupdateBalance", json!({"isDemo":1,"balance":9999.5})),
+    ));
+    log
+}
 pub fn pocket_written_prefix() -> String {
     pocket_log()
         .lines()
@@ -613,6 +819,11 @@ pub fn pocket_open_restart_log(request_id: u64) -> String {
             ));
         }
     }
+    log.push_str(&pocket_line(
+        "account",
+        at + 800_000,
+        &pocket_event("successupdateBalance", json!({"isDemo":1,"balance":9999})),
+    ));
     log
 }
 pub fn pocket_restart_log(request_id: u64) -> String {
@@ -626,6 +837,9 @@ pub fn pocket_contradictory_restart_log(request_id: u64) -> String {
 }
 pub fn pocket_empty_restart_log(request_id: u64) -> String {
     pocket_restart_log_with(request_id, 3)
+}
+pub fn pocket_foreign_partial_restart_log(request_id: u64) -> String {
+    pocket_restart_log_with(request_id, 4)
 }
 fn pocket_restart_log_with(request_id: u64, variant: u8) -> String {
     let at = QUOTE_START + 31_000_000;
@@ -647,11 +861,18 @@ fn pocket_restart_log_with(request_id: u64, variant: u8) -> String {
             vec![closed, duplicate]
         }
         2 => {
-            let mut changed = closed;
+            let mut changed = closed.clone();
             changed["command"] = json!(0);
-            vec![changed]
+            vec![closed, changed]
         }
         3 => Vec::new(),
+        4 => vec![
+            json!({"id":"synthetic-foreign-close","asset":shared::SYMBOLS[0],"command":1,
+            "amount":1,"profit":-1,"percentProfit":92,"openPrice":1.0,"closePrice":1.1,
+            "openTimestamp":QUOTE_START/1_000_000,"openMs":0,
+            "closeTimestamp":QUOTE_START/1_000_000+30,"closeMs":0,
+            "isDemo":1,"currency":"USD","requestId":44444444,"optionType":100}),
+        ],
         _ => unreachable!(),
     };
     for session in ["account", "market"] {
@@ -668,7 +889,7 @@ fn pocket_restart_log_with(request_id: u64, variant: u8) -> String {
             base + 3,
             &pocket_event(
                 "successupdateBalance",
-                json!({"isDemo":1,"balance":10000.92}),
+                json!({"isDemo":1,"balance":if variant == 4 {10000.0} else {10000.92}}),
             ),
         ));
         log.push_str(&pocket_binary(
@@ -678,17 +899,57 @@ fn pocket_restart_log_with(request_id: u64, variant: u8) -> String {
             json!([asset.clone(), second.clone()]),
         ));
         if session == "account" {
-            log.push_str(&pocket_line(
-                session,
-                base + 200_004,
-                &pocket_event("updateOpenedDeals", json!([])),
-            ));
-            log.push_str(&pocket_line(
-                session,
-                base + 200_005,
-                &pocket_event("updateClosedDeals", json!(deals.clone())),
-            ));
+            if matches!(variant, 1 | 2) {
+                for (index, deal) in deals.iter().enumerate() {
+                    log.push_str(&pocket_line(
+                        session,
+                        base + 200_004 + index as i64,
+                        &pocket_event("updateClosedDeals", json!([deal])),
+                    ));
+                }
+                log.push_str(&pocket_line(
+                    session,
+                    base + 200_006,
+                    &pocket_event("updateOpenedDeals", json!([])),
+                ));
+            } else {
+                log.push_str(&pocket_line(
+                    session,
+                    base + 200_004,
+                    &pocket_event("updateOpenedDeals", json!([])),
+                ));
+                log.push_str(&pocket_line(
+                    session,
+                    base + 200_005,
+                    &pocket_event("updateClosedDeals", json!(deals.clone())),
+                ));
+            }
         }
+    }
+    if !deals.is_empty() {
+        log.push_str(&pocket_line(
+            "account",
+            at + 800_000,
+            &pocket_event(
+                "successupdateBalance",
+                json!({"isDemo":1,"balance":if variant == 4 {10000.0} else {10000.92}}),
+            ),
+        ));
+    }
+    if variant == 4 {
+        log.push_str(&pocket_line(
+            "account",
+            at + 1_000_000,
+            &pocket_event("updateClosedDeals", json!([])),
+        ));
+        log.push_str(&pocket_line(
+            "market",
+            at + 21_000_000,
+            &pocket_event(
+                "updateStream",
+                json!([[shared::SYMBOLS[0], (at + 21_000_000) / 1_000_000, 1.0]]),
+            ),
+        ));
     }
     log
 }
@@ -749,6 +1010,11 @@ fn pocket_log_with_initial_listing(missing: bool) -> String {
             ));
         }
     }
+    log.push_str(&pocket_line(
+        "account",
+        start - 1_000_000,
+        &pocket_event("successupdateBalance", json!({"isDemo":1,"balance":10000})),
+    ));
     let quote = |at: i64, units: i64| {
         let provider =
             serde_json::from_str::<Value>(&format!("{}.{:06}", at / 1_000_000, at % 1_000_000))
@@ -770,6 +1036,16 @@ fn pocket_log_with_initial_listing(missing: bool) -> String {
         first,
     ));
     if missing {
+        log.push_str(&pocket_line(
+            "market",
+            start + 220_000,
+            &pocket_event("updateStream", quote(start + 100_000, 100_344)),
+        ));
+        log.push_str(&pocket_line(
+            "market",
+            start + 230_000,
+            &pocket_event("updateStream", quote(start + 200_000, 100_494)),
+        ));
         log.push_str(&pocket_line(
             "account",
             start + 250_000,
@@ -812,6 +1088,16 @@ fn pocket_log_with_initial_listing(missing: bool) -> String {
         start + 30_200_000,
         "updateStream",
         quote(start + 30_000_000, 100_500),
+    ));
+    log.push_str(&pocket_line(
+        "market",
+        start + 30_250_000,
+        &pocket_event("updateStream", quote(start + 30_050_000, 100_650)),
+    ));
+    log.push_str(&pocket_line(
+        "market",
+        start + 30_300_000,
+        &pocket_event("updateStream", quote(start + 30_100_000, 100_800)),
     ));
     log.push_str(&pocket_line(
         "account",
@@ -888,6 +1174,16 @@ fn pocket_log_with_initial_listing(missing: bool) -> String {
         start + 62_200_000,
         "updateStream",
         quote(start + 62_000_000, 100_700),
+    ));
+    log.push_str(&pocket_line(
+        "market",
+        start + 62_250_000,
+        &pocket_event("updateStream", quote(start + 62_050_000, 100_850)),
+    ));
+    log.push_str(&pocket_line(
+        "market",
+        start + 62_300_000,
+        &pocket_event("updateStream", quote(start + 62_100_000, 101_000)),
     ));
     log.push_str(&pocket_line(
         "account",
@@ -1064,6 +1360,109 @@ pub fn matching_log() -> String {
     lines.push(terminal.clone());
     lines.push(terminal);
     lines.concat()
+}
+pub fn deriv_quote_authorization_log() -> String {
+    let start = QUOTE_START;
+    let base = start - 2_000_000;
+    let mut log = String::new();
+    for frame in [
+        r#"{"data":[{"account_id":"SYNTHETICACCOUNT","account_type":"demo","status":"active","currency":"USD"}]}"#,
+        r#"{"data":{"url":"ws://127.0.0.1/trading/v1/options/ws/demo"}}"#,
+    ] {
+        log.push_str(&log_line("bootstrap", base, frame));
+    }
+    log.push_str(&log_line(
+        "account",
+        base,
+        r#"{"msg_type":"portfolio","req_id":21,"portfolio":{"contracts":[]}}"#,
+    ));
+    log.push_str(&log_line("account", base, &frame("transaction-ack")));
+    log.push_str(&log_line(
+        "account",
+        base,
+        &change(&frame("balance-before"), "balance", "balance", "10000"),
+    ));
+    let tick = |symbol: &str, at: i64, quote: &str| {
+        let mut value = crate::common::broker::fixture("deriv-tick-R_50.json");
+        let subscription = if symbol == shared::SYMBOLS[0] {
+            "synthetic-subscription-1"
+        } else {
+            "synthetic-subscription-2"
+        };
+        for (owner, key, replacement) in [
+            ("echo_req", "ticks", format!("\"{symbol}\"")),
+            ("tick", "symbol", format!("\"{symbol}\"")),
+            ("tick", "id", format!("\"{subscription}\"")),
+            ("subscription", "id", format!("\"{subscription}\"")),
+            ("tick", "quote", quote.into()),
+            ("tick", "epoch", (at / 1_000_000).to_string()),
+            ("tick", "pip_size", "5".into()),
+        ] {
+            value = change(&value, owner, key, &replacement);
+        }
+        value
+    };
+    log.push_str(&log_line(
+        "market",
+        start,
+        &tick(shared::SYMBOLS[0], start, "1.00644"),
+    ));
+    let proposal = |id: u64, spot: &str, side: &str| {
+        let mut value = frame("proposal-call");
+        for (owner, key, replacement) in [
+            ("echo_req", "amount", "1".into()),
+            ("echo_req", "contract_type", format!("\"{side}\"")),
+            ("echo_req", "duration", "30".into()),
+            (
+                "echo_req",
+                "underlying_symbol",
+                format!("\"{}\"", shared::SYMBOLS[0]),
+            ),
+            ("echo_req", "req_id", id.to_string()),
+            ("proposal", "ask_price", "1".into()),
+            ("proposal", "payout", "1.92".into()),
+            ("proposal", "date_start", (start / 1_000_000).to_string()),
+            (
+                "proposal",
+                "date_expiry",
+                (start / 1_000_000 + 30).to_string(),
+            ),
+            ("proposal", "spot", spot.into()),
+            ("proposal", "spot_time", (start / 1_000_000).to_string()),
+            ("proposal", "id", format!("\"synthetic-proposal-{id}\"")),
+        ] {
+            value = change(&value, owner, key, &replacement);
+        }
+        let mut value: Value = serde_json::from_str(&value).unwrap();
+        value["req_id"] = json!(id);
+        value.to_string()
+    };
+    log.push_str(&log_line(
+        "account",
+        start + 200_000,
+        &proposal(4, "1.00644", "PUT"),
+    ));
+    log.push_str(&log_line(
+        "account",
+        start + 300_000,
+        &proposal(5, "1.00644", "CALL"),
+    ));
+    log.push_str(&log_line(
+        "market",
+        start + 1_000_000,
+        &tick(shared::SYMBOLS[0], start + 1_000_000, "1.00800"),
+    ));
+    log.push_str(&log_line(
+        "account",
+        start + 1_100_000,
+        &proposal(6, "1.00800", "PUT"),
+    ));
+    log.push_str(&log_line(
+        "account",
+        start + 1_200_000,
+        &proposal(7, "1.00800", "CALL"),
+    ));
+    log
 }
 
 /// The same owner with injectable control and clock; no credentials or network are resolved.
@@ -1290,6 +1689,17 @@ pub fn pocket_runtime(
     recorded: &binary_alpha_app::broker::transport::RecordedConnector,
     control: live::control::FakeControl,
 ) -> Result<live::Runtime, String> {
+    pocket_runtime_with_market(fixture, mode, recorded, control, |market| market)
+}
+pub fn pocket_runtime_with_market(
+    fixture: &Fixture,
+    mode: live::Mode,
+    recorded: &binary_alpha_app::broker::transport::RecordedConnector,
+    control: live::control::FakeControl,
+    wrap_market: impl FnOnce(
+        Box<dyn binary_alpha_app::broker::MarketDataBroker>,
+    ) -> Box<dyn binary_alpha_app::broker::MarketDataBroker>,
+) -> Result<live::Runtime, String> {
     use binary_alpha_app::broker::{
         AccountIdentity, pocket_option::PocketMarketData, pocket_options::PocketOptions,
     };
@@ -1346,7 +1756,7 @@ pub fn pocket_runtime(
         local,
         destination,
         Box::new(control),
-        Box::new(market),
+        wrap_market(Box::new(market)),
         options,
         Box::new(clock.clone()),
         Some(clock),

@@ -157,6 +157,7 @@ impl Runtime {
             }
             Ingress::Authorization(result) => {
                 self.authorization_pending = false;
+                self.health.authorization_pending = false;
                 let manifest = &self.definition.manifest;
                 let checked = result
                     .and_then(|value| value.ok_or("live authorization is absent".into()))
@@ -194,19 +195,24 @@ impl Runtime {
             .first()
             .map(|r| r.time_micros)
             .unwrap_or(i64::MIN);
-        let fact_time = if closed {
-            deal.close_time(clock_offset)?
-        } else {
-            deal.entry_time(clock_offset)?
-        };
-        if fact_time < start {
+        if closed && deal.close_time(clock_offset)? < start {
             return Ok(());
         }
         if !self.contracts.contains_key(&deal.id) {
+            self.uncorrelated_pocket.insert(deal.id.clone());
             self.veto("broker portfolio contains an uncorrelated liability", true);
             return Ok(());
         }
         if closed {
+            let command = &self.contracts[&deal.id];
+            if !self
+                .claims
+                .get(command)
+                .is_some_and(|claim| self.pocket_claim_agrees(claim, &deal))
+            {
+                self.veto("pocket deal contradicts claim", true);
+                return Ok(());
+            }
             let scale = self
                 .definition
                 .definition
@@ -231,6 +237,60 @@ impl Runtime {
             self.step(observations)?;
         }
         Ok(())
+    }
+    fn pocket_claim_agrees(&self, claim: &Claim, deal: &pocket_options::Deal) -> bool {
+        let EventKind::Signal {
+            proposal: Some(proposal),
+            ..
+        } = &claim.signal.kind
+        else {
+            return false;
+        };
+        let Some((start, end)) = self.command_window(&claim.signal) else {
+            return false;
+        };
+        let written = self
+            .records
+            .iter()
+            .filter_map(|record| match &record.kind {
+                RecordKind::Written {
+                    command,
+                    request_id,
+                    ..
+                } if *command == claim.command => *request_id,
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let (_, symbol) = proposal.instrument.split_once(':').unwrap_or(("", ""));
+        deal.is_demo == 1
+            && written.len() == 1
+            && deal.request_id == Some(written[0])
+            && deal.currency.as_ref() == Some(&proposal.terms.currency)
+            && deal.asset == symbol
+            && deal.direction().ok() == Some(proposal.terms.direction)
+            && deal
+                .amount
+                .require_number()
+                .ok()
+                .and_then(|amount| amount.compare(proposal.terms.stake).ok())
+                == Some(std::cmp::Ordering::Equal)
+            && deal
+                .entry_time(self.pocket_offset_minutes)
+                .ok()
+                .is_some_and(|at| start <= at && at <= end)
+            && deal
+                .expiry_time(self.pocket_offset_minutes)
+                .ok()
+                .zip(deal.entry_time(self.pocket_offset_minutes).ok())
+                .is_some_and(|(expiry, entry)| {
+                    expiry - entry >= proposal.terms.duration_micros - 1_000_000
+                        && expiry - entry <= proposal.terms.duration_micros
+                })
+            && claim.contract_ref.as_ref().is_none_or(|id| id == &deal.id)
+            && !self
+                .contracts
+                .get(&deal.id)
+                .is_some_and(|command| command != &claim.command)
     }
     fn reply(&mut self, reply: Reply) -> Result<(), String> {
         let (value, timing) = match reply {
@@ -283,6 +343,17 @@ impl Runtime {
             ReplyValue::OpenContracts(contracts) => {
                 if self.recovery_pending {
                     self.recovery_open = Some(contracts);
+                } else if self.broker_kind == crate::broker::BrokerKind::PocketOption {
+                    for contract in &contracts {
+                        if !self.contracts.contains_key(&contract.contract_ref) {
+                            self.uncorrelated_pocket
+                                .insert(contract.contract_ref.clone());
+                        }
+                    }
+                    self.veto(
+                        "broker portfolio contains an uncorrelated liability",
+                        !self.uncorrelated_pocket.is_empty(),
+                    );
                 } else {
                     self.veto(
                         "broker portfolio contains an uncorrelated liability",
@@ -935,40 +1006,18 @@ impl Runtime {
             } else {
                 None
             };
-            let mut candidate = closed.and_then(|row| row.pocket.as_ref().map(|deal| (row, deal)));
-            if let Some((_, deal)) = candidate {
-                let (_, symbol) = proposal.instrument.split_once(':').unwrap_or(("", ""));
-                let agreed = deal.is_demo == 1
-                    && deal.currency.as_ref() == Some(&proposal.terms.currency)
-                    && deal.asset == symbol
-                    && deal.direction().ok() == Some(proposal.terms.direction)
-                    && deal
-                        .amount
-                        .require_number()
-                        .ok()
-                        .and_then(|amount| amount.compare(proposal.terms.stake).ok())
-                        == Some(std::cmp::Ordering::Equal)
-                    && deal
-                        .entry_time(self.pocket_offset_minutes)
-                        .ok()
-                        .is_some_and(|at| start <= at && at <= end)
-                    && deal
-                        .expiry_time(self.pocket_offset_minutes)
-                        .ok()
-                        .zip(deal.entry_time(self.pocket_offset_minutes).ok())
-                        .is_some_and(|(expiry, entry)| {
-                            expiry - entry >= proposal.terms.duration_micros - 1_000_000
-                                && expiry - entry <= proposal.terms.duration_micros
-                        })
-                    && claim.contract_ref.as_ref().is_none_or(|id| id == &deal.id)
-                    && !self
-                        .contracts
-                        .get(&deal.id)
-                        .is_some_and(|command| command != &claim.command);
-                if !agreed {
-                    candidate = None;
-                }
-            }
+            let candidate = closed
+                .and_then(|row| row.pocket.as_ref().map(|deal| (row, deal)))
+                .filter(|(_, deal)| {
+                    self.pocket_claim_agrees(&claim, deal)
+                        && rows
+                            .iter()
+                            .filter(|row| {
+                                row.pocket.as_ref().is_some_and(|other| other.id == deal.id)
+                            })
+                            .count()
+                            == 1
+                });
             if let Some((row, deal)) = candidate {
                 if matched_deals.insert(deal.id.clone()) {
                     if !self.contracts.contains_key(&deal.id) {
@@ -992,6 +1041,7 @@ impl Runtime {
                         self.subscribe_contract(&deal.id)?;
                     }
                     self.pocket_deal(deal.clone(), true, row.receipt_micros)?;
+                    self.uncorrelated_pocket.remove(&deal.id);
                 }
                 continue;
             }
@@ -1014,6 +1064,7 @@ impl Runtime {
                 if agreed {
                     self.contracts
                         .insert(contract.contract_ref.clone(), claim.command.clone());
+                    self.uncorrelated_pocket.remove(&contract.contract_ref);
                     self.step(vec![Observation::ContractUpdate {
                         command: claim.command.clone(),
                         source: self
@@ -1031,22 +1082,25 @@ impl Runtime {
                 local.state = ClaimState::PossiblySent;
             }
         }
-        let foreign_closed = rows
-            .iter()
-            .filter_map(|row| row.pocket.as_ref())
-            .any(|deal| {
-                deal.close_time(self.pocket_offset_minutes)
-                    .is_ok_and(|at| at >= deployment_start)
-                    && !matched_deals.contains(&deal.id)
-                    && !self.contracts.contains_key(&deal.id)
-            });
-        let foreign_open = contracts.iter().any(|contract| {
-            contract.purchase_time_micros >= deployment_start
-                && !self.contracts.contains_key(&contract.contract_ref)
-        });
+        for deal in rows.iter().filter_map(|row| row.pocket.as_ref()) {
+            if deal
+                .close_time(self.pocket_offset_minutes)
+                .is_ok_and(|at| at >= deployment_start)
+                && !matched_deals.contains(&deal.id)
+                && !self.contracts.contains_key(&deal.id)
+            {
+                self.uncorrelated_pocket.insert(deal.id.clone());
+            }
+        }
+        for contract in contracts {
+            if !self.contracts.contains_key(&contract.contract_ref) {
+                self.uncorrelated_pocket
+                    .insert(contract.contract_ref.clone());
+            }
+        }
         self.veto(
             "broker portfolio contains an uncorrelated liability",
-            foreign_closed || foreign_open,
+            !self.uncorrelated_pocket.is_empty(),
         );
         self.entry_gates()
     }

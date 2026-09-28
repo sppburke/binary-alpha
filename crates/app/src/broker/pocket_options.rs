@@ -103,7 +103,7 @@ pub fn offer(
     Ok(proposal)
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Deal {
     pub id: String,
     pub asset: String,
@@ -306,13 +306,14 @@ pub struct PocketOptions {
     events: VecDeque<AccountEvent>,
     listings: BTreeMap<String, Listing>,
     opened: Vec<Deal>,
-    closed: Vec<Deal>,
+    closed: BTreeMap<String, Vec<Deal>>,
     balance: Option<(Decimal, i64)>,
     last_fact_receipt: i64,
     written: BTreeSet<String>,
     request_ids: BTreeSet<u64>,
     next_request_id: u64,
-    seen_closed: BTreeSet<String>,
+    seen_open: BTreeSet<(String, String)>,
+    seen_closed: BTreeSet<(String, String)>,
 }
 
 impl PocketOptions {
@@ -360,12 +361,13 @@ impl PocketOptions {
             events: VecDeque::new(),
             listings: BTreeMap::new(),
             opened: Vec::new(),
-            closed: Vec::new(),
+            closed: BTreeMap::new(),
             balance: None,
             last_fact_receipt: i64::MIN,
             written: BTreeSet::new(),
             request_ids: BTreeSet::new(),
             next_request_id: 10_000_000 + seed,
+            seen_open: BTreeSet::new(),
             seen_closed: BTreeSet::new(),
         };
         session.handshake(&credential_json)?;
@@ -587,11 +589,17 @@ impl PocketOptions {
                     if let Some(id) = deal.request_id {
                         self.request_ids.insert(id);
                     }
-                    self.events.push_back(AccountEvent::PocketDeal {
-                        deal: deal.clone(),
-                        closed: false,
-                        receipt_micros: event.receipt_micros,
-                    });
+                    if self.seen_open.insert((
+                        deal.id.clone(),
+                        serde_json::to_string(deal).map_err(|e| e.to_string())?,
+                    )) {
+                        self.last_fact_receipt = self.last_fact_receipt.max(event.receipt_micros);
+                        self.events.push_back(AccountEvent::PocketDeal {
+                            deal: deal.clone(),
+                            closed: false,
+                            receipt_micros: event.receipt_micros,
+                        });
+                    }
                 }
                 self.opened = deals;
             }
@@ -603,7 +611,15 @@ impl PocketOptions {
                     if let Some(id) = deal.request_id {
                         self.request_ids.insert(id);
                     }
-                    if self.seen_closed.insert(deal.id.clone()) {
+                    if self.seen_closed.insert((
+                        deal.id.clone(),
+                        serde_json::to_string(deal).map_err(|e| e.to_string())?,
+                    )) {
+                        self.last_fact_receipt = self.last_fact_receipt.max(event.receipt_micros);
+                        self.closed
+                            .entry(deal.id.clone())
+                            .or_default()
+                            .push(deal.clone());
                         self.events.push_back(AccountEvent::PocketDeal {
                             deal: deal.clone(),
                             closed: true,
@@ -611,7 +627,6 @@ impl PocketOptions {
                         });
                     }
                 }
-                self.closed = deals;
             }
             "successcloseOrder" => {
                 #[derive(Deserialize)]
@@ -634,9 +649,14 @@ impl PocketOptions {
                         self.request_ids.insert(id);
                     }
                     self.opened.retain(|opened| opened.id != deal.id);
-                    self.closed.retain(|closed| closed.id != deal.id);
-                    self.closed.push(deal.clone());
-                    if self.seen_closed.insert(deal.id.clone()) {
+                    if self.seen_closed.insert((
+                        deal.id.clone(),
+                        serde_json::to_string(&deal).map_err(|e| e.to_string())?,
+                    )) {
+                        self.closed
+                            .entry(deal.id.clone())
+                            .or_default()
+                            .push(deal.clone());
                         self.events.push_back(AccountEvent::PocketDeal {
                             deal,
                             closed: true,
@@ -644,7 +664,7 @@ impl PocketOptions {
                         });
                     }
                 }
-                self.last_fact_receipt = event.receipt_micros;
+                self.last_fact_receipt = self.last_fact_receipt.max(event.receipt_micros);
             }
             "successopenOrder" => {
                 let deal: Deal = serde_json::from_slice(&event.raw)
@@ -655,7 +675,7 @@ impl PocketOptions {
                 }
                 self.opened.retain(|opened| opened.id != deal.id);
                 self.opened.push(deal.clone());
-                self.last_fact_receipt = event.receipt_micros;
+                self.last_fact_receipt = self.last_fact_receipt.max(event.receipt_micros);
                 return Ok(Some(deal));
             }
             _ => (),
@@ -898,7 +918,8 @@ impl PocketOptions {
     pub fn statement(&mut self, _: i64, _: i64) -> Result<Statement, String> {
         let rows = self
             .closed
-            .iter()
+            .values()
+            .flatten()
             .map(|deal| {
                 Ok(super::deriv::StatementRow {
                     request_id: deal.request_id,
@@ -971,12 +992,13 @@ mod tests {
             events: VecDeque::new(),
             listings: BTreeMap::new(),
             opened: Vec::new(),
-            closed: Vec::new(),
+            closed: BTreeMap::new(),
             balance: None,
             last_fact_receipt: i64::MIN,
             written: BTreeSet::new(),
             request_ids: BTreeSet::new(),
             next_request_id: 10_000_000,
+            seen_open: BTreeSet::new(),
             seen_closed: BTreeSet::new(),
         }
     }
@@ -1039,6 +1061,61 @@ mod tests {
         assert_eq!(statement.rows.len(), 1);
         assert_eq!(statement.rows[0].cash.amount.to_string(), "19.2");
         assert!(account.request_ids.contains(&10_000_000));
+    }
+
+    #[test]
+    fn partial_closed_lists_retain_distinct_ids_and_contradictory_facts() {
+        let mut account = session();
+        let first = deal("synthetic-first", "TEST", "1.00100", "9.2");
+        let mut second = first.clone();
+        second["id"] = json!("synthetic-second");
+        let mut changed = first.clone();
+        changed["command"] = json!(1);
+        for row in [&first, &second, &changed] {
+            account
+                .ingest(event("updateClosedDeals", json!([row])))
+                .unwrap();
+        }
+        let statement = account.statement(0, 200).unwrap();
+        assert_eq!(statement.rows.len(), 3);
+        assert_eq!(
+            statement
+                .rows
+                .iter()
+                .filter(|row| row.cash.contract_ref.as_deref() == Some("synthetic-first"))
+                .count(),
+            2
+        );
+        assert_eq!(
+            statement
+                .rows
+                .iter()
+                .filter(|row| row.request_id == Some(10_000_000))
+                .count(),
+            3
+        );
+    }
+
+    #[test]
+    fn a_new_deal_list_requires_a_later_balance() {
+        let mut account = session();
+        account
+            .ingest(event(
+                "successupdateBalance",
+                json!({"isDemo":1,"balance":100}),
+            ))
+            .unwrap();
+        let mut fact = event(
+            "updateOpenedDeals",
+            json!([deal("synthetic-open", "TEST", "1.00100", "0")]),
+        );
+        fact.receipt_micros += 1;
+        account.ingest(fact).unwrap();
+        assert!(account.balance().is_err());
+        let mut later = event("successupdateBalance", json!({"isDemo":1,"balance":90}));
+        later.receipt_micros += 2;
+        account.ingest(later).unwrap();
+        assert_eq!(account.balance().unwrap().to_string(), "90");
     }
 
     #[test]

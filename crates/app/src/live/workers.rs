@@ -111,6 +111,7 @@ pub(super) struct Workers {
     pub market_ack: Sender<()>,
     pub account_ack: Sender<()>,
     pub stop: Arc<AtomicBool>,
+    pub authorization_probe: Arc<Mutex<Option<AuthorizationProbe>>>,
     brokers: Vec<std::thread::JoinHandle<()>>,
     storage_thread: Option<std::thread::JoinHandle<()>>,
 }
@@ -146,6 +147,7 @@ impl Workers {
         let (market_ack, market_done) = mpsc::channel();
         let (account_ack, account_done) = mpsc::channel();
         let stop = Arc::new(AtomicBool::new(false));
+        let authorization_probe = Arc::new(Mutex::new(None::<AuthorizationProbe>));
         let tx = sender.clone();
         let stopped = stop.clone();
         let market_clock = scheduler.clone();
@@ -361,6 +363,7 @@ impl Workers {
                 }
             });
         let tx = sender.clone();
+        let probe = authorization_probe.clone();
         let storage_thread = spawn("storage", sender.clone(), move || {
             while let Ok(job) = storage_rx.recv() {
                 let event = match job {
@@ -409,6 +412,12 @@ impl Workers {
                     })(
                     )),
                 };
+                if matches!(event, Ingress::Authorization(_))
+                    && let Some(gate) = probe.lock().unwrap().take()
+                    && (gate.parked.send(()).is_err() || gate.release.recv().is_err())
+                {
+                    return;
+                }
                 if tx.send(event).is_err() {
                     return;
                 }
@@ -423,6 +432,7 @@ impl Workers {
             market_ack,
             account_ack,
             stop,
+            authorization_probe,
             brokers: vec![market_thread, account_thread],
             storage_thread: Some(storage_thread),
         }

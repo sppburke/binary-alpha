@@ -800,13 +800,18 @@ fn refused_and_due_tick_replay_prefixes_and_refused_restoration_keep_full_receip
     );
 }
 
-struct MarketProbe {
-    inner: Box<dyn MarketDataBroker>,
-    panic: bool,
-    gate: Option<(Arc<AtomicBool>, i64)>,
-    consumed: Option<Arc<AtomicBool>>,
-    subscribe_gate: Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>,
-    dropped: Arc<AtomicBool>,
+pub(super) struct MarketProbe {
+    pub(super) inner: Box<dyn MarketDataBroker>,
+    pub(super) panic: bool,
+    pub(super) gate: Option<(Arc<AtomicBool>, i64)>,
+    pub(super) consumed: Option<Arc<AtomicBool>>,
+    pub(super) subscribe_gate: Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>,
+    pub(super) frame_gate: Option<(
+        i64,
+        std::sync::mpsc::Sender<()>,
+        std::sync::mpsc::Receiver<()>,
+    )>,
+    pub(super) dropped: Arc<AtomicBool>,
 }
 impl Drop for MarketProbe {
     fn drop(&mut self) {
@@ -851,6 +856,13 @@ impl MarketDataBroker for MarketProbe {
             && let Some(consumed) = &self.consumed
         {
             consumed.store(true, Ordering::SeqCst);
+        }
+        if self.frame_gate.as_ref().is_some_and(|(at, _, _)| matches!(&event,
+            Some(broker::LiveEvent::Observation(observation)) if observation.provider_time_micros >= *at))
+        {
+            let (_, reached, release) = self.frame_gate.take().unwrap();
+            reached.send(()).unwrap();
+            release.recv_timeout(std::time::Duration::from_secs(3)).unwrap();
         }
         if let Some((gate, at)) = &self.gate
             && matches!(&event, Some(broker::LiveEvent::Observation(event)) if event.provider_time_micros >= *at)
@@ -900,6 +912,7 @@ fn market_panic_is_an_error_and_brokers_join_before_publication() {
                     gate: None,
                     consumed: None,
                     subscribe_gate: None,
+                    frame_gate: None,
                     dropped: probe,
                 })
             },
@@ -942,6 +955,7 @@ fn shutdown_during_initial_subscription_is_not_a_replay_failure() {
                 gate: None,
                 consumed: None,
                 subscribe_gate: Some((started_tx, release_rx)),
+                frame_gate: None,
                 dropped: Arc::new(AtomicBool::new(false)),
             })
         },
@@ -1091,6 +1105,49 @@ fn idle_polls_do_not_rewrite_health() {
 }
 
 use binary_alpha_app::broker::transport::{Connector, Frame, Transport};
+pub(super) struct AccountProposalProbe {
+    pub(super) inner: Box<dyn Connector>,
+    pub(super) parked: std::sync::mpsc::Sender<()>,
+    pub(super) release: Option<std::sync::mpsc::Receiver<()>>,
+}
+impl Connector for AccountProposalProbe {
+    fn connect(
+        &mut self,
+        url: &str,
+        headers: &[(String, String)],
+    ) -> Result<Box<dyn Transport>, String> {
+        Ok(Box::new(AccountProposalTransport {
+            inner: self.inner.connect(url, headers)?,
+            parked: self.parked.clone(),
+            release: self.release.take(),
+        }))
+    }
+}
+struct AccountProposalTransport {
+    inner: Box<dyn Transport>,
+    parked: std::sync::mpsc::Sender<()>,
+    release: Option<std::sync::mpsc::Receiver<()>>,
+}
+impl Transport for AccountProposalTransport {
+    fn send(&mut self, frame: Frame) -> Result<(), String> {
+        self.inner.send(frame)
+    }
+    fn receive(&mut self, timeout: i64) -> Result<Option<Frame>, String> {
+        let frame = self.inner.receive(timeout)?;
+        if matches!(&frame, Some(Frame::Text(text)) if text.contains("\"msg_type\":\"proposal\""))
+            && let Some(release) = self.release.take()
+        {
+            self.parked.send(()).unwrap();
+            release
+                .recv_timeout(std::time::Duration::from_secs(3))
+                .unwrap();
+        }
+        Ok(frame)
+    }
+    fn close(&mut self) -> Result<(), String> {
+        self.inner.close()
+    }
+}
 struct EofConnector {
     inner: Box<dyn Connector>,
     reads: Arc<std::sync::atomic::AtomicUsize>,
@@ -1380,6 +1437,7 @@ fn failed_segment_retries_on_cadence_and_owner_claim_updates_finish_before_relea
                 gate: Some((gate, START + 5_000_000)),
                 consumed: None,
                 subscribe_gate: None,
+                frame_gate: None,
                 dropped,
             })
         },
@@ -1558,6 +1616,7 @@ fn shutdown_applies_a_consumed_base_row_without_new_broker_work() {
                 gate: Some((gate, START)),
                 consumed: Some(seen),
                 subscribe_gate: None,
+                frame_gate: None,
                 dropped: joined,
             })
         },
