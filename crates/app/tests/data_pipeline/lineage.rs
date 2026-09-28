@@ -154,6 +154,7 @@ fn sparse_pocket(times: Vec<i64>) -> FakeBroker {
                 if text == "2" || text == "3" { continue; }
                 let socket_io::Packet::Event { name,argument } = socket_io::decode(&text).unwrap() else { panic!("{text}") };
                 let replies = match name.as_str() {
+                    "ps" => { assert_eq!(argument,b"null"); Vec::new() },
                     "auth" => {
                         let mut row = vec![Value::Null;19]; row[0]=json!("synthetic");row[1]=json!("AEDCNY_otc");
                         let mut r = vec![Message::Text(r#"42["successauth",{"synthetic":true}]"#.into()),Message::Text(r#"42["successupdateBalance",{"isDemo":1,"synthetic":true}]"#.into())];

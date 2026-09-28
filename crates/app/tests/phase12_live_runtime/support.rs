@@ -769,7 +769,7 @@ pub fn pocket_refund_on_loss_log() -> String {
 pub fn pocket_written_prefix() -> String {
     pocket_log()
         .lines()
-        .take_while(|line| !line.contains("\"expect\""))
+        .take_while(|line| !line.contains("openOrder"))
         .map(|line| format!("{line}\n"))
         .collect()
 }
@@ -976,6 +976,10 @@ fn pocket_log_with_initial_listing(missing: bool) -> String {
             session,
             at + 2,
             &pocket_event("successauth", json!({})),
+        ));
+        log.push_str(&format!(
+            "{}\n",
+            json!({"session":session,"at":at+2,"expect":"42[\"ps\",null]"})
         ));
         log.push_str(&pocket_line(
             session,

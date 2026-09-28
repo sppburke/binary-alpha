@@ -1,5 +1,5 @@
 //! The Pocket demo account session. Market quotes use a separate connection.
-use super::socket_io::{self, Packet};
+use super::socket_io::{self, Event};
 use super::transport::{Connector, Frame, Transport};
 use super::wire::WireDecimal;
 use super::{
@@ -290,19 +290,13 @@ impl Encoded {
     }
 }
 
-struct Event {
-    name: String,
-    raw: Vec<u8>,
-    receipt_micros: i64,
-}
-
 pub struct PocketOptions {
     settings: PocketSettings,
     account: AccountIdentity,
     instruments: BTreeMap<String, PriceScale>,
     transport: Box<dyn Transport>,
     clock: Box<dyn Clock>,
-    pending: Option<String>,
+    session: socket_io::Session,
     events: VecDeque<AccountEvent>,
     listings: BTreeMap<String, Listing>,
     opened: Vec<Deal>,
@@ -351,13 +345,14 @@ impl PocketOptions {
             .unwrap_or_default();
         let transport = connector.connect(&settings.endpoint, &headers)?;
         let seed = clock.now_micros().unsigned_abs() % 10_000_000;
+        let framing = socket_io::Session::new(clock.now_micros());
         let mut session = Self {
             settings: settings.clone(),
             account,
             instruments: selected,
             transport,
             clock,
-            pending: None,
+            session: framing,
             events: VecDeque::new(),
             listings: BTreeMap::new(),
             opened: Vec::new(),
@@ -398,69 +393,9 @@ impl PocketOptions {
         }
     }
     fn receive(&mut self, timeout: i64) -> Result<Option<Event>, String> {
-        let deadline = self.clock.now_micros().saturating_add(timeout.max(0));
-        loop {
-            let Some(frame) = self
-                .transport
-                .receive(deadline.saturating_sub(self.clock.now_micros()).max(0))?
-            else {
-                return Ok(None);
-            };
-            let receipt_micros = self.clock.now_micros();
-            match frame {
-                Frame::Ping(bytes) => self.transport.send(Frame::Pong(bytes))?,
-                Frame::Pong(_) => (),
-                Frame::Close => return Err("pocket options: account connection closed".into()),
-                Frame::Binary(raw) => {
-                    return Ok(Some(Event {
-                        name: self
-                            .pending
-                            .take()
-                            .ok_or("pocket options: binary attachment without header")?,
-                        raw,
-                        receipt_micros,
-                    }));
-                }
-                Frame::Text(text) => match socket_io::decode(&text)? {
-                    Packet::Ping => self.transport.send(Frame::Text(socket_io::PONG.into()))?,
-                    Packet::Disconnected => {
-                        return Err("pocket options: namespace disconnected".into());
-                    }
-                    Packet::BinaryHeader { name } => {
-                        if self.pending.replace(name).is_some() {
-                            return Err("pocket options: overlapping binary headers".into());
-                        }
-                    }
-                    Packet::Event { name, argument } => {
-                        if self.pending.is_some() {
-                            return Err("pocket options: incomplete binary attachment".into());
-                        }
-                        return Ok(Some(Event {
-                            name,
-                            raw: argument,
-                            receipt_micros,
-                        }));
-                    }
-                    Packet::Open => {
-                        return Ok(Some(Event {
-                            name: "open".into(),
-                            raw: Vec::new(),
-                            receipt_micros,
-                        }));
-                    }
-                    Packet::Connected => {
-                        return Ok(Some(Event {
-                            name: "connected".into(),
-                            raw: Vec::new(),
-                            receipt_micros,
-                        }));
-                    }
-                },
-            }
-            if self.clock.now_micros() >= deadline {
-                return Ok(None);
-            }
-        }
+        self.session
+            .receive(&mut *self.transport, &*self.clock, timeout)
+            .map_err(Into::into)
     }
     fn handshake(&mut self, credential: &str) -> Result<(), String> {
         let deadline = self.clock.now_micros().saturating_add(12_000_000);
@@ -492,7 +427,12 @@ impl PocketOptions {
                         .send(Frame::Text(socket_io::encode_event("auth", credential)))?;
                     connected = true;
                 }
-                "successauth" if connected => authenticated = true,
+                "successauth" if connected => {
+                    self.session
+                        .login(&mut *self.transport, &*self.clock)
+                        .map_err(String::from)?;
+                    authenticated = true;
+                }
                 "successupdateBalance" if connected => {
                     #[derive(Deserialize)]
                     struct Balance {
@@ -988,7 +928,7 @@ mod tests {
             instruments: BTreeMap::from([("TEST".into(), PriceScale::try_from(5).unwrap())]),
             transport: Box::new(NoSocket),
             clock: Box::new(StillClock),
-            pending: None,
+            session: socket_io::Session::new(0),
             events: VecDeque::new(),
             listings: BTreeMap::new(),
             opened: Vec::new(),

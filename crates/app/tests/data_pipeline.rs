@@ -289,6 +289,7 @@ fn serve_broker(kind: Kind) -> FakeBroker {
                                 panic!("unexpected client framing: {text}")
                             };
                             match name.as_str() {
+                                "ps" if authenticated => assert_eq!(argument, b"null"),
                                 "auth" if faults.reject_auth_once || (faults.reject_initial_session
                                     && serde_json::from_slice::<Value>(&argument).unwrap()["renewed"] != true) => {
                                     faults_.lock().unwrap().reject_auth_once = false;
