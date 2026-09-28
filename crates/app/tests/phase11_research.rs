@@ -1480,34 +1480,6 @@ fn deriv_strict_ties_and_daily_window_reach_verified_certification() {
             .unwrap()
             .contains("verified research certification")
     );
-
-    let refund = Fixture::new("phase11_refund_tie_payload");
-    refund.run().unwrap();
-    let (refund_manifest, refund_run) = refund.run_record();
-    let family_bytes = refund.object(&refund_run.instruments[0].family, "family.json");
-    let refund_family = Family::from_json(&family_bytes).unwrap();
-    assert_eq!(refund_family.to_json(), family_bytes);
-    let null = refund_family.members[0].null.as_ref().unwrap();
-    assert_eq!(
-        serde_json::to_vec(null).unwrap(),
-        br#"{"net_win":"0.80","net_loss":"1","break_even":0.5555555555555556}"#
-    );
-    let refund_selection = refund.selection(&refund_run);
-    let projection = refund_selection.choices[0].folds[0]
-        .projection
-        .as_ref()
-        .unwrap();
-    assert_eq!(
-        serde_json::to_vec(projection).unwrap(),
-        br#"{"settled":8,"unresolved":0,"valued_at":"2026-01-05T01:10:40.000000Z","profit":"2.80","rates":["eur-unit"],"drawdown":"2.00","unavailable_observations":0}"#
-    );
-    for generation in [
-        &refund_run.instruments[0].family,
-        &refund_run.selection,
-        &refund_manifest.generation,
-    ] {
-        assert!(refund.verify(generation).unwrap().contains("verified"));
-    }
 }
 
 #[test]

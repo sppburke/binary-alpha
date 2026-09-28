@@ -1094,25 +1094,34 @@ fn required_wins(decisive: u64, break_even: f64, limit: f64) -> u64 {
     low
 }
 
+/// Folds summary ties into losses when every replay contract's tie nets exactly its loss. Ties
+/// under mixed tie terms cannot be allocated by contract, so they fail.
 fn decisive_counts(
     contracts: &[ContractTerms],
-    wins: u64,
-    mut losses: u64,
-    mut ties: u64,
-    gated: bool,
-) -> Result<(u64, u64, u64), String> {
-    let losing = contracts
-        .iter()
-        .map(crate::search::ties_lose)
-        .collect::<Result<Vec<_>, _>>()?;
-    if gated && ties > 0 && losing.contains(&true) && losing.contains(&false) {
-        return Err("decisive gates cannot allocate summary ties across mixed tie terms".into());
+    losses: u64,
+    ties: u64,
+) -> Result<(u64, u64), String> {
+    if ties == 0 {
+        return Ok((losses, ties));
     }
-    if losing.iter().all(|&loses| loses) {
-        losses = losses.checked_add(ties).ok_or("decisive losses overflow")?;
-        ties = 0;
+    let (mut losing, mut refunding) = (false, false);
+    for contract in contracts {
+        if crate::search::ties_lose(contract)? {
+            losing = true;
+        } else {
+            refunding = true;
+        }
     }
-    Ok((wins, losses, ties))
+    match (losing, refunding) {
+        (true, true) => {
+            Err("decisive gates cannot allocate summary ties across mixed tie terms".into())
+        }
+        (true, false) => Ok((
+            losses.checked_add(ties).ok_or("decisive losses overflow")?,
+            0,
+        )),
+        _ => Ok((losses, ties)),
+    }
 }
 
 /// Projects and gates one verified restored engine: settlement support first; only then every
@@ -1124,13 +1133,16 @@ pub fn project(engine: &Engine, gates: &Gates) -> Result<Projection, String> {
     let summary = engine.summary();
     let replay = &engine.definition().replay;
     let decisive_gates = gates.decisive();
-    let (wins, losses, ties) = decisive_counts(
-        &replay.contracts,
-        summary.portfolio.wins,
-        summary.portfolio.losses,
-        summary.portfolio.ties,
-        decisive_gates,
-    )?;
+    let wins = summary.portfolio.wins;
+    let (losses, ties) = if decisive_gates {
+        decisive_counts(
+            &replay.contracts,
+            summary.portfolio.losses,
+            summary.portfolio.ties,
+        )?
+    } else {
+        (summary.portfolio.losses, summary.portfolio.ties)
+    };
     let decisive_minimum = match gates.min_decisive_per_day {
         Some(per_day) => {
             let window = time("decision_end", &replay.decision_end)?
@@ -1651,26 +1663,20 @@ mod tests {
     fn projection_folds_only_loss_equivalent_ties_and_rejects_ambiguous_mixed_counts() {
         let refund = tie_contract("1");
         let losing = tie_contract("0");
+        let mixed = [refund.clone(), losing.clone()];
         assert_eq!(
-            decisive_counts(std::slice::from_ref(&refund), 3, 2, 4, true).unwrap(),
-            (3, 2, 4)
+            decisive_counts(std::slice::from_ref(&refund), 2, 4).unwrap(),
+            (2, 4)
         );
         assert_eq!(
-            decisive_counts(std::slice::from_ref(&losing), 3, 2, 4, true).unwrap(),
-            (3, 6, 0)
+            decisive_counts(std::slice::from_ref(&losing), 2, 4).unwrap(),
+            (6, 0)
         );
-        assert_eq!(
-            decisive_counts(&[refund.clone(), losing.clone()], 3, 2, 0, true).unwrap(),
-            (3, 2, 0)
-        );
+        assert_eq!(decisive_counts(&mixed, 2, 0).unwrap(), (2, 0));
         assert!(
-            decisive_counts(&[refund.clone(), losing.clone()], 3, 2, 4, true)
+            decisive_counts(&mixed, 2, 4)
                 .unwrap_err()
                 .contains("mixed tie terms")
-        );
-        assert_eq!(
-            decisive_counts(&[refund, losing], 3, 2, 4, false).unwrap(),
-            (3, 2, 4)
         );
     }
 

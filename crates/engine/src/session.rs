@@ -128,7 +128,7 @@ pub struct DailyWindow {
 }
 
 impl DailyWindow {
-    pub fn validate(&self) -> Result<(), String> {
+    pub(crate) fn validate(&self) -> Result<(), String> {
         Zone::parse(&self.timezone)?;
         if clock(&self.start)? >= clock(&self.end)? {
             return Err("start must be before end".into());

@@ -772,7 +772,7 @@ pub fn null_rate(contract: &ContractTerms) -> Result<Null, String> {
         return Err(format!("net loss {net_loss} is not positive"));
     }
     if !tie_net.is_zero() && !ties_lose(contract)? {
-        return Err(format!("a tie nets {tie_net}, not zero or -{net_loss}"));
+        return Err(format!("a tie nets {tie_net}, not zero"));
     }
     let scale = net_win.scale().max(net_loss.scale());
     let win = net_win.rescale(scale)?.coefficient() as f64;
@@ -2132,7 +2132,7 @@ mod tests {
         );
         assert_eq!(
             null_rate(&contract("1", "0", "1.80", "0.95")).unwrap_err(),
-            "a tie nets -0.05, not zero or -1"
+            "a tie nets -0.05, not zero"
         );
     }
 
