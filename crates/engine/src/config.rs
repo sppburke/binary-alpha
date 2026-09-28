@@ -3575,6 +3575,10 @@ mod replay_tests {
         let source = table(str::to_string);
         let config = Config::parse(&source).unwrap();
         assert_eq!(config.canonical_toml(), source);
+        assert_eq!(
+            serde_json::to_vec(&config.replay.as_ref().unwrap().risk_policies[0]).unwrap(),
+            br#"{"id":"p","max_open_per_strategy":1,"same_entry":"all","deduplicate_signal_logic":false,"max_feature_age_micros":60000000,"max_quote_age_micros":0}"#
+        );
         assert_eq!(Config::parse(&config.canonical_toml()).unwrap(), config);
         let replay = config.replay.as_ref().unwrap();
         assert_eq!(replay.inputs[0].tick_manifest.generation(), "1".repeat(64));
@@ -3591,6 +3595,32 @@ mod replay_tests {
             )
         });
         assert!(Config::parse(&numeric).is_ok());
+    }
+
+    #[test]
+    fn replay_daily_window_validates_and_preserves_absent_policy_bytes() {
+        let source = table(str::to_string);
+        let old = Config::parse(&source).unwrap();
+        assert_eq!(old.canonical_toml(), source);
+        let with_window = table(|body| {
+            body.replace(
+            "max_quote_age_micros = 0\n",
+            "max_quote_age_micros = 0\ndaily_window = { timezone = \"America/New_York\", start = \"08:00:00\", end = \"15:59:58\" }\n",
+        )
+        });
+        assert!(Config::parse(&with_window).is_ok());
+        for value in [
+            "{ timezone = \"America/Chicago\", start = \"08:00:00\", end = \"15:59:58\" }",
+            "{ timezone = \"UTC\", start = \"16:00:00\", end = \"08:00:00\" }",
+            "{ timezone = \"UTC\", start = \"8:00:00\", end = \"15:59:58\" }",
+        ] {
+            let invalid = with_window.replace(
+                "{ timezone = \"America/New_York\", start = \"08:00:00\", end = \"15:59:58\" }",
+                value,
+            );
+            let error = Config::parse(&invalid).unwrap_err().to_string();
+            assert!(error.contains("risk_policies[0].daily_window"), "{error}");
+        }
     }
 
     #[test]

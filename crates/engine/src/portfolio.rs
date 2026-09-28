@@ -1094,6 +1094,36 @@ fn required_wins(decisive: u64, break_even: f64, limit: f64) -> u64 {
     low
 }
 
+/// Folds summary ties into losses when every replay contract's tie nets exactly its loss. Ties
+/// under mixed tie terms cannot be allocated by contract, so they fail.
+fn decisive_counts(
+    contracts: &[ContractTerms],
+    losses: u64,
+    ties: u64,
+) -> Result<(u64, u64), String> {
+    if ties == 0 {
+        return Ok((losses, ties));
+    }
+    let (mut losing, mut refunding) = (false, false);
+    for contract in contracts {
+        if crate::search::ties_lose(contract)? {
+            losing = true;
+        } else {
+            refunding = true;
+        }
+    }
+    match (losing, refunding) {
+        (true, true) => {
+            Err("decisive gates cannot allocate summary ties across mixed tie terms".into())
+        }
+        (true, false) => Ok((
+            losses.checked_add(ties).ok_or("decisive losses overflow")?,
+            0,
+        )),
+        _ => Ok((losses, ties)),
+    }
+}
+
 /// Projects and gates one verified restored engine: settlement support first; only then every
 /// account's native completed profit converted by the engine at the restored ledger's final
 /// event time and summed with checked arithmetic; then the engine's reporting drawdown, which
@@ -1103,7 +1133,16 @@ pub fn project(engine: &Engine, gates: &Gates) -> Result<Projection, String> {
     let summary = engine.summary();
     let replay = &engine.definition().replay;
     let decisive_gates = gates.decisive();
-    let (wins, losses) = (summary.portfolio.wins, summary.portfolio.losses);
+    let wins = summary.portfolio.wins;
+    let (losses, ties) = if decisive_gates {
+        decisive_counts(
+            &replay.contracts,
+            summary.portfolio.losses,
+            summary.portfolio.ties,
+        )?
+    } else {
+        (summary.portfolio.losses, summary.portfolio.ties)
+    };
     let decisive_minimum = match gates.min_decisive_per_day {
         Some(per_day) => {
             let window = time("decision_end", &replay.decision_end)?
@@ -1131,7 +1170,7 @@ pub fn project(engine: &Engine, gates: &Gates) -> Result<Projection, String> {
         unresolved: summary.portfolio.unresolved,
         wins: decisive_gates.then_some(wins),
         losses: decisive_gates.then_some(losses),
-        ties: decisive_gates.then_some(summary.portfolio.ties),
+        ties: decisive_gates.then_some(ties),
         valued_at: summary.last_time_micros.map(format_event_time_micros),
         profit: None,
         rates: BTreeSet::new(),
@@ -1606,6 +1645,40 @@ pub fn selection_generation_id(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn tie_contract(gross_return: &str) -> ContractTerms {
+        serde_json::from_value(serde_json::json!({
+            "id":"c", "direction":"buy", "duration_micros":900000000,
+            "currency":"usd", "stake":"1", "quoted_cost":"1", "entry_fee":"0",
+            "win":{"gross_return":"1.64","terminal_fee":"0"},
+            "loss":{"gross_return":"0","terminal_fee":"0"},
+            "tie":{"gross_return":gross_return,"terminal_fee":"0"},
+            "settlement":{"rule":"price_at_due_v1","max_settlement_delay_micros":2000000,
+                "max_tick_gap_micros":2000000}
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn projection_folds_only_loss_equivalent_ties_and_rejects_ambiguous_mixed_counts() {
+        let refund = tie_contract("1");
+        let losing = tie_contract("0");
+        let mixed = [refund.clone(), losing.clone()];
+        assert_eq!(
+            decisive_counts(std::slice::from_ref(&refund), 2, 4).unwrap(),
+            (2, 4)
+        );
+        assert_eq!(
+            decisive_counts(std::slice::from_ref(&losing), 2, 4).unwrap(),
+            (6, 0)
+        );
+        assert_eq!(decisive_counts(&mixed, 2, 0).unwrap(), (2, 0));
+        assert!(
+            decisive_counts(&mixed, 2, 4)
+                .unwrap_err()
+                .contains("mixed tie terms")
+        );
+    }
 
     #[test]
     fn mixed_radix_enumeration_cycles_the_last_deployment_fastest() {

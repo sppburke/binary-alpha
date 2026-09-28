@@ -1060,6 +1060,428 @@ fn quote_stream_builds_outcomes_and_certifies_frozen_research() {
     assert_eq!(manifest.state, "awaiting_holdout_authorization");
 }
 
+/// Spread the existing quote cells across one New York trading day, with a due tick exactly
+/// 900 seconds after each candidate and small planted wins, losses, and equal-price ties.
+fn deriv_window_ticks(day: i64) -> Vec<String> {
+    use binary_alpha_engine::market::parse_event_time_micros;
+    let mut cells: BTreeMap<i64, Vec<(i64, i64)>> = BTreeMap::new();
+    for line in quote_fixture::quote_ticks(BASE) {
+        let mut fields = line.split(',');
+        let at = parse_event_time_micros(fields.next().unwrap()).unwrap() - BASE;
+        assert_eq!(fields.next(), Some("SYNTHETIC"));
+        let price = decimal(fields.next().unwrap()).coefficient() as i64;
+        cells
+            .entry(at / 40_000_000)
+            .or_default()
+            .push((at % 40_000_000, price));
+    }
+    let mut lines = Vec::new();
+    let mut tick = |at: i64, price: i64| {
+        lines.push(format!(
+            "{},SYNTHETIC,{}.{:05}",
+            time(at),
+            price / 100_000,
+            price % 100_000
+        ));
+    };
+    for (cell, rows) in cells {
+        let start = day
+            + match cell {
+                30 => 20 * HOUR + 59 * 60_000_000 + 56_900_000,
+                31 => 21 * HOUR + 15 * 60_000_000 + 56_900_000,
+                _ => 12 * HOUR + 43 * 60_000_000 + 59_900_000 + cell * 960_000_000,
+            };
+        let center = rows[0].1;
+        let direction = if cell % 2 == 0 { 1 } else { -1 };
+        let entry = center + direction * 180;
+        for (offset, price) in rows {
+            tick(start + offset, if offset == 0 { price } else { entry });
+        }
+        let movement = match cell {
+            8 => 0,          // An equal-price tie loses the stake under strict terms.
+            1 => direction,  // Opposite the selected CALL/PUT direction.
+            _ => -direction, // A one-tick win keeps the quote delta below the signal threshold.
+        };
+        tick(start + 900_100_000, entry + movement);
+    }
+    lines
+}
+
+fn deriv_window_fixture() -> Fixture {
+    use binary_alpha_engine::session::DailyWindow;
+    let scratch = Scratch::new("phase11_deriv_ties_daily_window");
+    let (mut config, _, _) = quote_fixture::build(&scratch);
+    let symbols = ["frxEURUSD", "frxGBPUSD"];
+    let names = ["deriv:frxEURUSD", "deriv:frxGBPUSD"];
+    let source_lines = (0..5)
+        .flat_map(|day| deriv_window_ticks(BASE + day * DAY_MICROS))
+        .collect::<Vec<_>>();
+    let sources = fixture_config::import_ticks(
+        &scratch.root,
+        "deriv-window-source",
+        DatasetRole::Development,
+        "deriv",
+        &symbols,
+        &[5, 5],
+        &[source_lines.clone(), source_lines],
+    );
+    let split_root = scratch.path("deriv-split-published");
+    let mut split = binary_alpha_app::skeleton(&config);
+    split.storage.historical_data_dir =
+        serde_json::from_value(serde_json::json!(scratch.path("deriv-split-retained"))).unwrap();
+    split.storage.publication_uri = format!("file://{}", split_root.display()).parse().unwrap();
+    let day = |first, end| CoverageRange::new(BASE + first * DAY_MICROS, BASE + end * DAY_MICROS);
+    split.split = Some(DataSplit {
+        namespace: "phase11-deriv-window".into(),
+        sources: sources
+            .iter()
+            .map(|source| uri(&scratch.root, &source.generation))
+            .collect(),
+        development: vec![day(0, 1), day(1, 2), day(2, 3)],
+        evaluation: vec![day(3, 4)],
+        holdout: vec![day(4, 5)],
+    });
+    let split_path = scratch.path("deriv-split.toml");
+    write(&split_path, split.canonical_toml());
+    let report = cli_as(
+        &scratch.path("deriv-split.log"),
+        OPERATOR,
+        &["data", "split", "--config", split_path.to_str().unwrap()],
+    )
+    .unwrap();
+    let declaration_uri = report
+        .lines()
+        .last()
+        .unwrap()
+        .strip_prefix("declaration ")
+        .unwrap();
+    let declaration = Declaration::from_json(
+        &fs::read(declaration_uri.strip_prefix("file://").unwrap()).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(declaration.populations.len(), 10);
+    let mut datasets = sources;
+    datasets.extend(declaration.populations.iter().map(|population| {
+        GenerationManifest::from_json(
+            &fs::read(split_root.join(manifest_key(&population.id))).unwrap(),
+        )
+        .unwrap()
+    }));
+    config.storage = split.storage;
+    for (i, instrument) in config.instruments.iter_mut().enumerate() {
+        instrument.broker = "deriv".to_string().try_into().unwrap();
+        instrument.provider_symbol = symbols[i].to_string().try_into().unwrap();
+        instrument.quote_currency = "usd".to_string().try_into().unwrap();
+    }
+    let reference = |i: usize, slot: usize| -> ManifestUri {
+        format!(
+            "file://{}",
+            split_root
+                .join(manifest_key(&declaration.populations[i * 5 + slot].id))
+                .display()
+        )
+        .parse()
+        .unwrap()
+    };
+    let window = DailyWindow {
+        timezone: "America/New_York".into(),
+        start: "08:00:00".into(),
+        end: "15:59:58".into(),
+    };
+    let start = |day| time(BASE + day * DAY_MICROS + 12 * HOUR);
+    let end = |day| time(BASE + day * DAY_MICROS + 22 * HOUR);
+    let research = config.research.as_mut().unwrap();
+    research.study.governance_manifest = declaration_uri.into();
+    for (i, name) in names.iter().enumerate() {
+        let instrument = &mut research.instruments[i];
+        instrument.instrument = (*name).into();
+        instrument.source_manifest = reference(i, 0);
+        instrument.outcomes.expiry_seconds = vec![898, 899, 900];
+        instrument.outcomes.max_entry_delay_ms = 2_000;
+        instrument.outcomes.max_settlement_delay_ms = 2_000;
+        instrument.outcomes.max_tick_gap_ms = 900_000;
+        instrument.search.decision_start = start(0);
+        instrument.search.decision_end = end(0);
+        instrument.search.scope = Scope::Heuristic;
+        instrument.search.screen = Some(Screen {
+            max_adjusted_score: 1.0,
+            top: Some(16),
+        });
+        instrument.search.embargo_micros = 902_000_000;
+        instrument.search.risk_policy.daily_window = Some(window.clone());
+        instrument.search.account.broker = "deriv".to_string().try_into().unwrap();
+        instrument.search.account.currency = "usd".to_string().try_into().unwrap();
+        instrument.search.envelope.min_winning_net_return = decimal("0.64");
+        for contract in &mut instrument.search.contracts {
+            contract.currency = "usd".to_string().try_into().unwrap();
+            contract.duration_micros = 900_000_000;
+            contract.win.gross_return = decimal("1.64");
+            contract.tie.gross_return = decimal("0");
+            contract.settlement.max_settlement_delay_micros = 2_000_000;
+            contract.settlement.max_tick_gap_micros = 900_000_000;
+        }
+        research.folds[0].inputs[i].fit_manifest = reference(i, 0);
+        research.folds[0].inputs[i].assessment_manifest = reference(i, 1);
+        research.refit.fits[i] = reference(i, 2);
+        research.evaluation.inputs[i] = reference(i, 3);
+        research.holdout.inputs[i] = reference(i, 4);
+    }
+    research.folds[0].cutoff = end(0);
+    research.folds[0].decision_start = start(1);
+    research.folds[0].decision_end = end(1);
+    research.refit.cutoff = end(2);
+    research.evaluation.decision_start = start(3);
+    research.evaluation.decision_end = end(3);
+    research.evaluation.splits = None;
+    research.holdout.decision_start = start(4);
+    research.holdout.decision_end = end(4);
+    research.holdout.splits = None;
+    research.portfolio.embargo_micros = 902_000_000;
+    research.portfolio.accounts[0].broker = "deriv".to_string().try_into().unwrap();
+    research.portfolio.risk_policies[0].daily_window = Some(window);
+    for gates in [
+        &mut research.portfolio.gates,
+        &mut research.qualification.gates,
+    ] {
+        gates.min_decisive = Some(1);
+        gates.max_false_pass = Some(decimal("0.05"));
+    }
+    for binding in &mut research.portfolio.bindings {
+        binding.instrument = names[0].into();
+        binding.alternatives[0].contract.duration_micros = 900_000_000;
+        binding.alternatives[0].contract.win.gross_return = decimal("1.64");
+        binding.alternatives[0].contract.tie.gross_return = decimal("0");
+        binding.alternatives[0]
+            .contract
+            .settlement
+            .max_settlement_delay_micros = 2_000_000;
+        binding.alternatives[0]
+            .contract
+            .settlement
+            .max_tick_gap_micros = 900_000_000;
+        binding.alternatives[0].envelope.min_winning_net_return = decimal("0.64");
+    }
+    research.scenarios = [
+        ("delay_1", 1_000_000, 899_000_000),
+        ("delay_2", 2_000_000, 898_000_000),
+    ]
+    .into_iter()
+    .map(|(id, delay, duration)| {
+        let alternatives = research
+            .portfolio
+            .bindings
+            .iter()
+            .map(|binding| {
+                let mut alternative = binary_alpha_engine::config::ScenarioAlternative {
+                    binding: binding.id.clone(),
+                    contract: binding.alternatives[0].contract.clone(),
+                    envelope: binding.alternatives[0].envelope.clone(),
+                };
+                alternative.contract.duration_micros = duration;
+                alternative
+            })
+            .collect();
+        binary_alpha_engine::config::ResearchScenario {
+            id: id.into(),
+            acceptance_delay_micros: delay,
+            alternatives,
+        }
+    })
+    .collect();
+    let path = scratch.path("deriv-research.toml");
+    let fixture = Fixture {
+        scratch,
+        config,
+        path,
+        declaration,
+        datasets,
+    };
+    fixture.save();
+    fixture
+}
+
+#[test]
+fn deriv_strict_ties_and_daily_window_reach_verified_certification() {
+    use binary_alpha_engine::execution::{Direction, Outcome};
+    use binary_alpha_engine::search::upper_tail;
+    use binary_alpha_engine::session::DailyWindow;
+    let fixture = deriv_window_fixture();
+    let report = fixture.run().unwrap();
+    let (manifest, run) = fixture.run_record();
+    assert_eq!(
+        run.state,
+        RunState::AwaitingHoldoutAuthorization,
+        "{report}"
+    );
+    let family =
+        Family::from_json(&fixture.object(&run.instruments[0].family, "family.json")).unwrap();
+    assert!(family.applicable > 0, "{report}");
+    let selection = fixture.selection(&run);
+    assert_eq!(selection.state, State::Selected, "{report}");
+    for generation in [
+        &run.instruments[0].family,
+        &run.selection,
+        &manifest.generation,
+    ] {
+        assert!(fixture.verify(generation).unwrap().contains("verified"));
+    }
+    let frozen = selection.frozen.as_ref().unwrap();
+    let directions = frozen
+        .bindings
+        .iter()
+        .map(|binding| {
+            let direction = frozen
+                .contracts
+                .iter()
+                .find(|contract| contract.id == binding.contract)
+                .unwrap()
+                .direction;
+            (binding.id.clone(), direction)
+        })
+        .collect::<BTreeMap<_, _>>();
+    let window = DailyWindow {
+        timezone: "America/New_York".into(),
+        start: "08:00:00".into(),
+        end: "15:59:58".into(),
+    };
+    let ticks = common::read_normalized_ticks(&fixture.published(), &fixture.datasets[5]);
+    assert_eq!(run.outer.len(), 3);
+    for (result, delay) in run.outer.iter().zip([0, 1_000_000, 2_000_000]) {
+        let raw = fixture.summary(&result.outer.replay.generation);
+        let projection = &result.outer.projection;
+        assert!(raw.portfolio.ties > 0, "{}: {report}", result.scenario);
+        assert_eq!(projection.wins, Some(raw.portfolio.wins));
+        assert_eq!(
+            projection.losses,
+            Some(raw.portfolio.losses + raw.portfolio.ties)
+        );
+        assert_eq!(projection.ties, Some(0));
+        let decisive = projection.wins.unwrap() + projection.losses.unwrap();
+        let required = projection.required_wins.unwrap();
+        assert!(required <= decisive);
+        assert!(upper_tail(required, decisive - required, 1.0 / 1.64) <= 0.05);
+        assert!(upper_tail(required - 1, decisive - required + 1, 1.0 / 1.64) > 0.05);
+        let events = fixture.events(&result.outer.replay.generation);
+        let signals = events
+            .iter()
+            .filter_map(|event| match &event.kind {
+                EventKind::Signal {
+                    command: Some(command),
+                    binding,
+                    ..
+                } => {
+                    assert!(window.contains(event.time_micros).unwrap());
+                    Some((command.clone(), (event.time_micros, binding.clone())))
+                }
+                EventKind::Signal { .. } => {
+                    assert!(window.contains(event.time_micros).unwrap());
+                    None
+                }
+                _ => None,
+            })
+            .collect::<BTreeMap<_, _>>();
+        assert!(!signals.is_empty());
+        assert!(
+            signals
+                .values()
+                .any(|(at, _)| { *at == BASE + 3 * DAY_MICROS + 13 * HOUR })
+        );
+        assert!(signals.values().any(|(at, _)| {
+            *at == BASE + 3 * DAY_MICROS + 20 * HOUR + 59 * 60_000_000 + 57_000_000
+        }));
+        let mut due = BTreeMap::new();
+        for event in &events {
+            if let EventKind::Accepted {
+                command,
+                entry_time_micros,
+                entry_price_units,
+                price_time_micros,
+                due_time_micros,
+                ..
+            } = &event.kind
+            {
+                let decision = signals[command].0;
+                let entry = decision + delay;
+                let last = ticks
+                    .iter()
+                    .rev()
+                    .find(|tick| tick.event_time_micros <= entry)
+                    .unwrap();
+                assert_eq!(*entry_time_micros, Some(entry));
+                assert_eq!(*price_time_micros, Some(last.event_time_micros));
+                assert_eq!(*entry_price_units, Some(last.price_units));
+                assert_eq!(*due_time_micros, Some(decision + 900_000_000));
+                due.insert(command.clone(), (decision + 900_000_000, last.price_units));
+            }
+        }
+        assert_eq!(due.len(), signals.len());
+        let mut outcomes = (0, 0, 0);
+        for event in &events {
+            if let EventKind::Settled {
+                command,
+                settlement_time_micros,
+                settlement_price_units,
+                outcome,
+                ..
+            } = &event.kind
+            {
+                let (due_time, entry_price) = due[command];
+                let at_due = ticks
+                    .iter()
+                    .find(|tick| tick.event_time_micros >= due_time)
+                    .unwrap();
+                assert_eq!(*settlement_time_micros, at_due.event_time_micros);
+                assert_eq!(*settlement_price_units, Some(at_due.price_units));
+                let expected = match entry_price.cmp(&at_due.price_units) {
+                    std::cmp::Ordering::Equal => Outcome::Tie,
+                    std::cmp::Ordering::Less
+                        if directions[&signals[command].1] == Direction::Buy =>
+                    {
+                        Outcome::Win
+                    }
+                    std::cmp::Ordering::Greater
+                        if directions[&signals[command].1] == Direction::Sell =>
+                    {
+                        Outcome::Win
+                    }
+                    _ => Outcome::Loss,
+                };
+                assert_eq!(*outcome, expected);
+                match outcome {
+                    Outcome::Win => outcomes.0 += 1,
+                    Outcome::Loss => outcomes.1 += 1,
+                    Outcome::Tie => outcomes.2 += 1,
+                }
+            }
+        }
+        assert_eq!(
+            outcomes,
+            (raw.portfolio.wins, raw.portfolio.losses, raw.portfolio.ties)
+        );
+    }
+    let (_, grant) = fixture.grant();
+    let certified_report = fixture.run().unwrap();
+    let (certification, record) = fixture.certification(&grant);
+    assert_eq!(certification.state, "certified", "{certified_report}");
+    assert_eq!(record.verdict, Verdict::Pass);
+    assert_eq!(record.scenarios.len(), 3);
+    for result in &record.scenarios {
+        let raw = fixture.summary(&result.outer.replay.generation);
+        assert!(raw.portfolio.ties > 0);
+        assert_eq!(
+            result.outer.projection.losses,
+            Some(raw.portfolio.losses + raw.portfolio.ties)
+        );
+        assert_eq!(result.outer.projection.ties, Some(0));
+    }
+    assert!(
+        fixture
+            .verify(&certification.generation)
+            .unwrap()
+            .contains("verified research certification")
+    );
+}
+
 #[test]
 fn five_stream_generated_search_publishes_and_verifies_in_research() {
     let mut fixture = Fixture::new("phase11_generated_five_streams");
@@ -2439,7 +2861,7 @@ fn false_pass_gates_reject_scenario_terms_without_a_break_even_before_any_read()
     let research = fixture.config.research.as_mut().unwrap();
     research.qualification.gates.max_false_pass = Some(decimal("0.05"));
     for alternative in &mut research.scenarios[0].alternatives {
-        alternative.contract.tie.gross_return = decimal("0");
+        alternative.contract.tie.gross_return = decimal("0.95");
     }
     fixture.save();
     let error = fixture.run().unwrap_err();

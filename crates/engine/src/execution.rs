@@ -24,6 +24,7 @@ use crate::market::{
     split_decimal,
 };
 use crate::research::Access;
+use crate::session::DailyWindow;
 
 /// The preserved historical ledger and manifest schema.
 pub const REPLAY_SCHEMA_VERSION: u32 = 1;
@@ -636,6 +637,8 @@ pub struct Pause {
 pub struct RiskPolicy {
     pub id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub daily_window: Option<DailyWindow>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_open_per_strategy: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_open_per_duration: Option<u32>,
@@ -1064,6 +1067,11 @@ pub fn validate_with(replay: &Replay, access: Access<'_>) -> Result<(), String> 
     )?;
     for (index, policy) in replay.risk_policies.iter().enumerate() {
         let field = |name: &str| format!("risk_policies[{index}].{name}");
+        if let Some(window) = &policy.daily_window {
+            window
+                .validate()
+                .map_err(|reason| format!("{}: {reason}", field("daily_window")))?;
+        }
         for (name, limit) in [
             ("max_open_per_strategy", policy.max_open_per_strategy),
             ("max_open_per_duration", policy.max_open_per_duration),
@@ -5113,6 +5121,11 @@ impl Engine {
             return Ok(());
         }
         let binding = self.bindings[binding_index].clone();
+        if let Some(window) = &self.definition.replay.risk_policies[binding.policy].daily_window
+            && !window.contains(self.now)?
+        {
+            return Ok(());
+        }
         let strategy = &self.strategies[binding.strategy];
         let Some(row) = &self.instruments[binding.instrument].rows[strategy.base_stream] else {
             return Ok(());
@@ -5663,6 +5676,12 @@ impl Engine {
                 let scale = self.accounts[compiled.account].scale;
                 let admitted = *disposition == Disposition::Admitted;
                 let time = event.time_micros;
+                let outside_window = policy
+                    .daily_window
+                    .as_ref()
+                    .map(|window| window.contains(time))
+                    .transpose()?
+                    .is_some_and(|inside| !inside);
                 if *instrument != bound.instrument
                     || *stream != bound.streams[strategy.base_stream].stream
                     || *deployment_identity != compiled.identity
@@ -5680,6 +5699,7 @@ impl Engine {
                     || quote_price_units.is_some() != quote_time_micros.is_some()
                     || time < self.decision_start
                     || time >= self.decision_end
+                    || outside_window
                     || admitted
                         && (quote_time_micros.is_none()
                             || time - close_time_micros > policy.max_feature_age_micros

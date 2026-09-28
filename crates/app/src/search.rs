@@ -1132,16 +1132,25 @@ impl ProjectionIndex {
     }
 
     /// Schema-2 kernel slot eligibility uses installation time and the stored entry tick.
-    fn slot_mask(&self, start: i64, end: i64) -> Vec<u8> {
+    fn slot_mask(
+        &self,
+        start: i64,
+        end: i64,
+        daily_window: Option<&binary_alpha_engine::session::DailyWindow>,
+    ) -> Result<Vec<u8>, String> {
         self.base
             .iter()
             .map(|row| {
-                u8::from(
+                Ok(u8::from(
                     start <= row.installed
                         && row.installed < end
+                        && daily_window
+                            .map(|window| window.contains(row.installed))
+                            .transpose()?
+                            .unwrap_or(true)
                         && row.entry != i64::MIN
                         && row.entry >= row.installed,
-                )
+                ))
             })
             .collect()
     }
@@ -1943,7 +1952,7 @@ fn score_streamed(
         binary_alpha_engine::market::parse_event_time_micros(&settings.development.decision_start)?;
     let end =
         binary_alpha_engine::market::parse_event_time_micros(&settings.development.decision_end)?;
-    let mask = index.slot_mask(start, end);
+    let mask = index.slot_mask(start, end, settings.risk_policy.daily_window.as_ref())?;
     let mut split_mask = mask.clone();
     for (flag, &entry) in split_mask.iter_mut().zip(entry_times) {
         if entry == i64::MIN {
@@ -3500,8 +3509,8 @@ mod projection_tests {
         assert_eq!(index.latest(0, 1), Some(1)); // Same-time close 20 replaces close 5.
         assert!(index.closes[1][index.latest(0, 1).unwrap()] > index.base[0].close);
         assert_eq!(index.latest(1, 1), Some(2));
-        assert_eq!(index.slot_mask(20, 50), [1, 1, 0]); // Close 35 has entry 38 before install 40.
-        assert_eq!(index.slot_mask(30, 40), [0, 1, 0]); // Windows use installation, not close.
+        assert_eq!(index.slot_mask(20, 50, None).unwrap(), [1, 1, 0]); // Close 35 has entry 38 before install 40.
+        assert_eq!(index.slot_mask(30, 40, None).unwrap(), [0, 1, 0]); // Windows use installation, not close.
         assert_eq!(index.base[0].entry, index.base[0].installed); // Tick-finalized row keeps its stored cell.
         let scored = kernels::score_bucket_plans_cap1_basic_dual(
             &Backend::Cpu,
@@ -3509,7 +3518,7 @@ mod projection_tests {
             &[0],
             &[1],
             &[0, 1],
-            &index.slot_mask(0, 50),
+            &index.slot_mask(0, 50, None).unwrap(),
             &[0, 1, 2],
             &[20, 30, 38], // Stored entry ticks, not close or installation clocks.
             &[21, 31, 39],
@@ -3526,6 +3535,35 @@ mod projection_tests {
         assert_eq!(scored.output.buy_output[0], 2);
         assert_eq!(scored.output.buy_output[1], 1); // The tick-finalized row's stored win.
         assert_eq!(scored.output.buy_output[2], 1);
+    }
+
+    #[test]
+    fn schema_two_mask_uses_installation_inside_the_daily_window() {
+        use binary_alpha_engine::market::parse_event_time_micros as micros;
+        let at = |text| micros(text).unwrap();
+        let stream = stream(5, 0);
+        let inside = at("2026-01-05T13:00:00Z");
+        let outside = at("2026-01-05T21:00:00Z");
+        let index = ProjectionIndex::from_clocks(
+            vec![stream],
+            vec![vec![
+                (at("2026-01-05T12:59:59Z"), inside),
+                (at("2026-01-05T20:59:57Z"), outside),
+            ]],
+            stream,
+            vec![inside, outside],
+        )
+        .unwrap();
+        let window = binary_alpha_engine::session::DailyWindow {
+            timezone: "America/New_York".into(),
+            start: "08:00:00".into(),
+            end: "15:59:58".into(),
+        };
+        assert_eq!(index.slot_mask(inside, outside + 1, None).unwrap(), [1, 1]);
+        assert_eq!(
+            index.slot_mask(inside, outside + 1, Some(&window)).unwrap(),
+            [1, 0]
+        );
     }
 
     #[test]
@@ -3575,7 +3613,7 @@ mod projection_tests {
         assert_eq!(index.latest(0, 1), Some(1));
         assert_eq!(codes, [-1]);
         assert_eq!(buckets, [0]);
-        assert_eq!(index.slot_mask(20, 21), [1]);
+        assert_eq!(index.slot_mask(20, 21, None).unwrap(), [1]);
     }
 
     #[test]
