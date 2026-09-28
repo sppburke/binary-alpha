@@ -106,6 +106,7 @@ fn pocket_settings() -> PocketSettings {
         account_class: binary_alpha_engine::config::AccountClass::Demo,
         server_offset_minutes: 120,
         history_pages_in_flight: Some(1),
+        payout: None,
     }
 }
 fn pocket_ids() -> Vec<InstrumentId> {

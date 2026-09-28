@@ -1,7 +1,8 @@
 //! Broker and storage I/O workers. Only the receiver's owner changes financial state.
 use super::*;
 use crate::broker::OpenContract;
-use crate::broker::deriv::{Encoded, StatementRow};
+use crate::broker::Statement;
+use crate::broker::options::{Encoded, Options};
 use binary_alpha_engine::execution::Decimal;
 use std::sync::mpsc::{self, Receiver, Sender};
 
@@ -41,7 +42,7 @@ pub enum ReplyValue {
     Statement {
         from: i64,
         through: i64,
-        rows: Vec<StatementRow>,
+        statement: Statement,
     },
 }
 #[derive(Debug, Clone, Copy)]
@@ -133,7 +134,7 @@ fn deliver(tx: &Sender<Ingress>, ack: &Receiver<()>, stopped: &AtomicBool, event
 impl Workers {
     pub fn start(
         mut market: Box<dyn MarketDataBroker>,
-        mut options: DerivOptions,
+        mut options: Options,
         scheduler: Option<ReplayClock>,
         local: Store,
         destination: Store,
@@ -185,6 +186,10 @@ impl Workers {
                     continue;
                 }
                 let event = match market.next_live(POLL_MICROS) {
+                    Ok(Some(event @ LiveEvent::Break { .. })) => {
+                        subscribed = false;
+                        Ingress::Market(event)
+                    }
                     Ok(Some(event)) => Ingress::Market(event),
                     Ok(None) => {
                         if let Some(clock) = &market_clock {
@@ -286,10 +291,10 @@ impl Workers {
                                 }
                                 Intent::Statement { from, through } => options
                                     .statement(*from, *through)
-                                    .map(|rows| ReplyValue::Statement {
+                                    .map(|statement| ReplyValue::Statement {
                                         from: *from,
                                         through: *through,
-                                        rows,
+                                        statement,
                                     }),
                                 Intent::Subscribe(..) => {
                                     Err("account worker received market intent".into())
@@ -477,7 +482,7 @@ impl Drop for Workers {
 }
 
 fn drain_account(
-    options: &mut DerivOptions,
+    options: &mut Options,
     tx: &Sender<Ingress>,
     ack: &Receiver<()>,
     stopped: &AtomicBool,

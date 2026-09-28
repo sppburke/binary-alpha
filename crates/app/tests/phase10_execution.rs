@@ -198,6 +198,97 @@ fn row(at: i64) -> Observation {
         values: vec![Some(Value::Bool(true))],
     }
 }
+
+#[test]
+fn same_tick_candle_and_quote_rows_trigger_cross_stream_rules_in_either_order() {
+    use binary_alpha_engine::execution::{Comparator, Condition, Threshold};
+    let mut definition = definition(false);
+    let candle = definition.instruments[0].streams[0].stream;
+    let quote = StreamKey::quote();
+    definition.instruments[0].streams.push(StreamColumns {
+        stream: quote,
+        columns: vec![ColumnSpec {
+            name: "quote_delta_units".into(),
+            source: "quote_delta_units".into(),
+            kind: Kind::Int,
+            encoding: None,
+            readiness: vec![],
+            unready: vec![],
+        }],
+    });
+    let quote_positive = Condition {
+        stream: quote,
+        output: "quote_delta_units".into(),
+        comparator: Comparator::Gt,
+        threshold: Threshold::Number(0.0),
+    };
+    let candle_ready = definition.replay.strategies[0].conditions[0].clone();
+    definition.replay.strategies[0]
+        .conditions
+        .push(quote_positive.clone());
+    let mut quote_strategy = definition.replay.strategies[0].clone();
+    quote_strategy.id = "quote-base".into();
+    quote_strategy.base_stream = quote;
+    quote_strategy.conditions = vec![quote_positive, candle_ready];
+    definition.replay.strategies.push(quote_strategy);
+    let mut quote_binding = definition.replay.bindings[0].clone();
+    quote_binding.id = "quote-binding".into();
+    quote_binding.strategy = "quote-base".into();
+    definition.replay.bindings.push(quote_binding);
+    let quote_row = Observation::Row {
+        instrument: 0,
+        stream: 1,
+        close_time_micros: PURCHASE,
+        known_at_micros: PURCHASE,
+        values: vec![Some(Value::Int(150))],
+    };
+    let signals = |mut rows: Vec<Observation>| {
+        let mut engine = Engine::new(definition.clone()).unwrap();
+        engine.drain();
+        engine.step(PURCHASE, vec![tick(PURCHASE)]).unwrap();
+        engine.drain();
+        engine.step(PURCHASE, std::mem::take(&mut rows)).unwrap();
+        engine
+            .drain()
+            .into_iter()
+            .filter_map(|event| match event.kind {
+                EventKind::Signal { binding, .. } => Some(binding),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+    };
+    let replay = signals(vec![quote_row.clone(), row(PURCHASE)]);
+    let live = signals(vec![row(PURCHASE), quote_row]);
+    assert_eq!(replay, live);
+    assert_eq!(live, vec!["call", "quote-binding"]);
+    let mut split = Engine::new(definition).unwrap();
+    split.drain();
+    split.step(PURCHASE, vec![tick(PURCHASE)]).unwrap();
+    split.drain();
+    split
+        .step(
+            PURCHASE,
+            vec![Observation::Row {
+                instrument: 0,
+                stream: 1,
+                close_time_micros: PURCHASE,
+                known_at_micros: PURCHASE,
+                values: vec![Some(Value::Int(150))],
+            }],
+        )
+        .unwrap();
+    split.drain();
+    split.step(PURCHASE, vec![row(PURCHASE)]).unwrap();
+    assert_eq!(
+        split
+            .drain()
+            .iter()
+            .filter(|event| matches!(event.kind, EventKind::Signal { .. }))
+            .count(),
+        1
+    );
+    assert_eq!(candle, StreamKey::candle(5, 0));
+}
 fn quote(binding: &str, proposal: Proposal) -> Observation {
     Observation::Proposal {
         binding: binding.into(),
@@ -274,6 +365,7 @@ fn prepared(events: &[FinancialEvent], binding: &str) -> PreparedPurchase {
                     command: command.clone(),
                     proposal_identity: proposal.identity.clone(),
                     maximum_price: proposal.terms.quoted_cost,
+                    offer: None,
                 })
             }
             _ => None,
@@ -1393,6 +1485,7 @@ fn split_purchases_keep_each_encoded_command_bound_to_its_claim() {
         command: "b".into(),
         proposal_identity: proposal_b.identity,
         maximum_price: proposal_b.terms.quoted_cost,
+        offer: None,
     };
     let before = sent.lock().unwrap().len();
     let encoded_a = options.prepare_purchase(&a).unwrap();
@@ -2185,6 +2278,7 @@ fn actual_options_requests_share_trade_and_account_rate_windows() {
             dispatch_claim: "budget-claim".into(),
             proposal_identity: proposal.identity,
             maximum_price: decimal("10"),
+            offer: None,
         })
         .unwrap();
     assert!(clock.now_micros() >= after_proposal - 10 + 60 * SECOND);

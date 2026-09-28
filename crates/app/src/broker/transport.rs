@@ -354,6 +354,7 @@ struct RecordedState {
     frames: std::collections::VecDeque<RecordedLine>,
     writes: Vec<(String, String)>,
     requests: std::collections::BTreeMap<(String, u64), u64>,
+    pocket_requests: std::collections::BTreeMap<u64, u64>,
     subscriptions: std::collections::BTreeMap<(String, String), u64>,
     in_flight: Option<std::thread::ThreadId>,
     failure: Option<String>,
@@ -522,6 +523,7 @@ impl RecordedConnector {
             .insert(std::thread::current().id(), self.session.clone());
         let request: Option<serde_json::Value> = serde_json::from_str(text).ok();
         let actual = request.as_ref().and_then(|v| v["req_id"].as_u64());
+        let pocket_actual = pocket_open_request(text);
         // Sends with an explicit expectation wait for their line, never skipping another session.
         while state
             .frames
@@ -547,8 +549,16 @@ impl RecordedConnector {
             let expected_id = serde_json::from_str::<serde_json::Value>(expected)
                 .ok()
                 .and_then(|v| v["req_id"].as_u64());
+            let pocket_expected = pocket_open_request(expected);
             let comparable =
-                actual.map_or_else(|| Ok(expected.clone()), |id| correlate(expected, id))?;
+                if let (Some(recorded), Some(actual)) = (pocket_expected, pocket_actual) {
+                    replace_pocket_ids(
+                        expected,
+                        &std::collections::BTreeMap::from([(recorded, actual)]),
+                    )?
+                } else {
+                    actual.map_or_else(|| Ok(expected.clone()), |id| correlate(expected, id))?
+                };
             if comparable != text {
                 return Err(format!(
                     "recorded {}: write does not match expect",
@@ -559,6 +569,11 @@ impl RecordedConnector {
                 state
                     .requests
                     .insert((self.session.clone(), recorded), actual);
+            }
+            if let (Some(recorded), Some(actual)) = (pocket_expected, pocket_actual)
+                && state.pocket_requests.insert(recorded, actual).is_some()
+            {
+                return Err("recorded account: duplicate Pocket requestId expectation".into());
             }
             let record = state.frames.pop_front().unwrap();
             if let Some(at) = record.at {
@@ -623,7 +638,12 @@ impl RecordedConnector {
                 state.in_flight = Some(std::thread::current().id());
                 state.generation += 1;
                 let Some(text) = record.frame else {
-                    return Ok(Some(Frame::Binary(record.binary.unwrap())));
+                    let bytes = record.binary.unwrap();
+                    let bytes = match std::str::from_utf8(&bytes) {
+                        Ok(text) => replace_pocket_ids(text, &state.pocket_requests)?.into_bytes(),
+                        Err(_) => bytes,
+                    };
+                    return Ok(Some(Frame::Binary(bytes)));
                 };
                 let value: Option<serde_json::Value> = serde_json::from_str(&text).ok();
                 let id = value.as_ref().and_then(|v| {
@@ -636,10 +656,14 @@ impl RecordedConnector {
                             .and_then(|id| state.requests.get(&(self.session.clone(), id)).copied())
                     })
                 });
-                return Ok(Some(Frame::Text(match id {
+                let text = match id {
                     Some(id) => correlate(&text, id)?,
                     None => text,
-                })));
+                };
+                return Ok(Some(Frame::Text(replace_pocket_ids(
+                    &text,
+                    &state.pocket_requests,
+                )?)));
             }
             if timeout <= 10_000 {
                 // A queued intent is runnable as soon as this ordinary poll returns.
@@ -714,6 +738,69 @@ fn correlate(text: &str, id: u64) -> Result<String, String> {
     let mut result = text.to_string();
     result.replace_range(start..start + raw.get().len(), &id.to_string());
     Ok(result)
+}
+
+fn pocket_open_request(text: &str) -> Option<u64> {
+    let body = text.strip_prefix("42")?;
+    let event: serde_json::Value = serde_json::from_str(body).ok()?;
+    (event.get(0)?.as_str()? == "openOrder")
+        .then(|| event.get(1)?.get("requestId")?.as_u64())
+        .flatten()
+}
+
+/// Rewrites only numeric values of JSON `requestId` fields, retaining the other wire tokens.
+fn replace_pocket_ids(
+    text: &str,
+    ids: &std::collections::BTreeMap<u64, u64>,
+) -> Result<String, String> {
+    if ids.is_empty() || !text.contains("\"requestId\"") {
+        return Ok(text.into());
+    }
+    let json = text.strip_prefix("42").unwrap_or(text);
+    serde_json::from_str::<serde_json::Value>(json)
+        .map_err(|_| "recorded Pocket frame: malformed JSON")?;
+    let mut output = String::with_capacity(text.len());
+    let mut scan = 0;
+    let mut copied = 0;
+    while let Some(relative) = text[scan..].find("\"requestId\"") {
+        let key = scan + relative;
+        let mut value = key + "\"requestId\"".len();
+        while text
+            .as_bytes()
+            .get(value)
+            .is_some_and(|byte| byte.is_ascii_whitespace())
+        {
+            value += 1;
+        }
+        if text.as_bytes().get(value) != Some(&b':') {
+            scan = value;
+            continue;
+        }
+        value += 1;
+        while text
+            .as_bytes()
+            .get(value)
+            .is_some_and(|byte| byte.is_ascii_whitespace())
+        {
+            value += 1;
+        }
+        let end = text[value..]
+            .find(|ch: char| !ch.is_ascii_digit())
+            .map(|offset| value + offset)
+            .unwrap_or(text.len());
+        if let Ok(recorded) = text[value..end].parse::<u64>()
+            && let Some(actual) = ids.get(&recorded)
+        {
+            output.push_str(&text[copied..value]);
+            output.push_str(&actual.to_string());
+            scan = end;
+            copied = end;
+            continue;
+        }
+        scan = end.max(value);
+    }
+    output.push_str(&text[copied..]);
+    Ok(output)
 }
 impl Connector for RecordedConnector {
     fn connect(&mut self, _: &str, _: &[(String, String)]) -> Result<Box<dyn Transport>, String> {

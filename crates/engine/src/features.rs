@@ -6177,6 +6177,28 @@ mod tests {
     }
 
     #[test]
+    fn candle_plan_identity_matches_base_commit() {
+        let plan = FeaturePlan::resolve(
+            &entry(&[(5, 0)], Outputs::Named(vec!["body_bps".into()])),
+            profile(NativeGranularity::Tick, true, &[(5, 0)]),
+            "input",
+        )
+        .unwrap();
+        assert_eq!(
+            plan.to_json(),
+            include_bytes!("../tests/fixtures/candle-plan-base-43a9fb21.json")
+        );
+        assert_eq!(
+            plan.raw_identity,
+            "21a660c6719f9957cafdaf6c3701044ac233f32ec8a37d4ae1b370e6cce2e856"
+        );
+        assert_eq!(
+            plan.identity(),
+            "009c0041b1adc289ff6985fd4603bb99b94d6bb07a0f0d2dc68db0cfa2d8688a"
+        );
+    }
+
+    #[test]
     fn all_supported_fitted_numeric_and_boolean_labels_generate_conditions() {
         use crate::config::{EncodingSpec, Encodings, GeneratedSearchCondition, SearchCondition};
         let mut request = entry(&[(5, 0)], Outputs::AllSupported);

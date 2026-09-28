@@ -943,9 +943,15 @@ impl MarketDataBroker for PocketMarketData {
             .now_micros()
             .saturating_add(timeout_micros.max(0));
         loop {
-            let Some(event) =
-                self.receive(deadline.saturating_sub(self.clock.now_micros()).max(0))?
-            else {
+            let received =
+                match self.receive(deadline.saturating_sub(self.clock.now_micros()).max(0)) {
+                    Err(ReceiveError::Disconnected) => {
+                        self.reconnect_transport(false)?;
+                        return Ok(self.events.pop_front());
+                    }
+                    other => other?,
+                };
+            let Some(event) = received else {
                 return Ok(None);
             };
             match event.name.as_str() {

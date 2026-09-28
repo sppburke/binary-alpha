@@ -143,6 +143,14 @@ connection with the printed object. The program is operator tooling outside this
 its output never enters a diagnostic.
 Credentials are environment-variable names, never their values.
 
+Pocket demo live and recorded replay require `payout = { add_percent, cap_percent,
+max_age_seconds }`. A row uses the latest account listing received no later than that row and no
+older than `max_age_seconds`; its assumed payout is the smaller of `cap_percent` and the listed
+percent plus `add_percent`. Only an exact frozen offer can enter. A missing, stale, or ineligible
+listing withdraws the previous offer. Pocket real-class live and replay configurations fail
+validation before a session opens. Pocket demo may quote in a currency different from its account
+currency; the contract, accepted order, deal rows, and cash must use the account currency.
+
 `history` declares `broker`, a nonempty unique list of provider-symbol `instruments`, `role`
 (`development` or `evaluation`; `holdout` is rejected), `start`, `end`, and optional positive
 `refresh_interval_seconds`. Start and end are universal-time text forming a nonempty half-open
@@ -2029,7 +2037,12 @@ path diagnostics; missing entry/exit leaves them unavailable. Sparse exit time b
 preserved. Statement windows include the complete target second by sending exclusive
 `date_to = through_secs + 1`, paging by 100 while a full page is returned. Portfolio provides open
 liabilities using `underlying_symbol`; its local fixture is synthetic from the pinned schema.
-Statement results carry `StatementRow { cash, payout }`; `recover_purchase` uses the buy row alone,
+Statement responses identify their coverage: Deriv returns `CompleteRange`; Pocket login lists
+return `PartialSnapshot`, even when empty. Pocket closed deals correlate by one journaled
+`Written.request_id` and agreeing order facts; opened deals correlate only by a journaled deal id.
+Duplicate or contradictory matches stay unresolved. An absent sell row can prove a loss only under
+`CompleteRange` coverage. Statement results carry `StatementRow { cash, payout }`; Deriv
+`recover_purchase` uses the buy row alone,
 including its payout and `transaction_time` as purchase time, without a lost acknowledgement.
 
 The financial ledger retains admitted proposals; normalized proposals received before a signal are
@@ -2701,6 +2714,12 @@ identity.
 
 ## Live runtime
 
+Quote streams emit one row for each distinct accepted tick. `quote_delta_units` is null for the
+first quote and after a gap or live continuity break, then equals the checked difference from the
+previous quote. A quote row has its own close and known-at times. Live installs every row produced
+by one tick, including candle and quote rows, in one Engine step. Quote rows are decided before
+the next tick and are discarded during an authorization wait.
+
 Phase 12 runs one process per deployment bundle and execution account. The implemented boundaries
 are [configuration](../crates/engine/src/config.rs), the
 [pure projection](../crates/engine/src/research.rs), the
@@ -2765,7 +2784,7 @@ mutation. Existing [broker capability checks](#broker-access) still apply.
 | `live replay --config PATH` | `research` | Recorded broker frames, fake clock and control; no broker connection or broker credential resolution. | Filesystem or Google Cloud Storage. |
 | `live replay --config PATH` | `replay` | Same recorded broker semantics and fake transports. | Google Cloud Storage under its own authorization; filesystem publication is rejected. |
 | `live run --config PATH` | `paper` | Authorized feed and account observation; prepared intents become proven not sent, with no purchase claim or socket write. | Google Cloud Storage. |
-| `live run --config PATH` | `live` | Every entry requires the exact authorization below. The current adapter permits proposals only for demo USD. | Google Cloud Storage. |
+| `live run --config PATH` | `live` | Every entry requires the exact authorization below. Deriv proposals require demo USD; Pocket execution requires demo class and an exact frozen assumed offer. | Google Cloud Storage. |
 | `live authorization create …` | No run-mode argument | Operator-only creation from deployment and bundle manifests. | The deployment manifest's store root. |
 
 `paper` and `live` require `[live]` and a broker credential reference and account class. A broker
@@ -2852,10 +2871,10 @@ serialized record bytes, excluding the newline; the first record uses sixty-four
 | --- | --- |
 | `started` | `config_hash`, `definition`, `code_revision`. |
 | `ledger` | One exact `FinancialEvent` as `event`; the runtime journals every drained Engine event in order. |
-| `refused` | `binding`, `proposal` (complete proposal or `null` on request failure), `reason`. |
+| `refused` | `binding`, `proposal` (complete proposal or `null` on request failure), `reason`, and optional typed Pocket listing cause. |
 | `due_tick` | `command`, `provider_time_micros`, `price_units`; first subsequent tick at or after confirmed expiry for that command's instrument. |
 | `claimed` | `command`, `claim`, `token`; remote commit completed. |
-| `written` | `command`, `claim`; recorded before queuing the socket write, not proof of a write or acceptance. |
+| `written` | `command`, `claim`, and optional Pocket `request_id`; recorded before queuing the socket write, not proof of a write or acceptance. |
 | `lease` | `state` (`acquired`, `renewed`, `released`, `lost`) and `token`. |
 | `discontinuity` | Recovery `reason`. |
 
@@ -3047,6 +3066,11 @@ unless an outside-envelope fact already takes precedence. An otherwise matched d
 `min_samples` is `unavailable` with reason `<samples> of <required> required samples`.
 All six dimensions are mandatory, in this order:
 
+For a Pocket demo account, timing failures and listing-caused offer refusals remain promotion
+vetoes but permit further demo entries. A rejected release, an untyped refusal, an
+`economics_scope` failure, or any unrecognized cause stops entries. Other brokers retain the
+ordinary outside-envelope entry veto.
+
 | Dimension | Evidence, bound, and failure |
 | --- | --- |
 | `economics_scope` | Samples count accepted liabilities and reconciled purchases. `bound` lists baseline contract identifiers separated by commas. Different proposal economics, accepted/settled discrepancy or deficit, different terminal return/fee, or external closure is outside the envelope. Missing signal or settlement baseline is unavailable. |
@@ -3100,15 +3124,20 @@ or optional expected send, in receipt order:
 
 ```json
 {"session":"market","at":1000000,"frame":"<received text>"}
+{"session":"market","at":1000001,"binary":[52,50,91,93]}
 {"session":"account","expect":"<text sent>"}
 {"session":"bootstrap","at":1000001,"frame":"<response text>"}
 ```
 
-`session` is `market`, `account`, or `bootstrap`. A frame requires `at`; an expectation may also
+`session` is `market`, `account`, or `bootstrap`. A received row has exactly one of `frame` or
+`binary`; `binary` is the received byte array for Socket.IO binary attachments. A frame requires
+`at`; an expectation may also
 carry `at`. All supplied timestamps must be nondecreasing, including equal-time lines in file
 order. `ReplayClock` advances when the head record is consumed; a worker retains a received frame
 until its ordered result is delivered. An `expect` line requires an exact byte match after
-top-level `req_id` correlation. Correlation preserves decimal tokens and nested `echo_req`.
+top-level `req_id` correlation. Pocket `openOrder` expectations bind their recorded `requestId`
+to the generated request id in acknowledgments, closes, and deal lists. Correlation preserves
+other payload values, decimal tokens, and nested `echo_req`.
 Bootstrap expectations are `GET <url>` or `POST <url>`; headers are ignored. Without expectations,
 outbound requests bind response identifiers and subscription scope from the retained frames.
 Mismatches, decoding failures, and stalled logs fail before final publication. Replay uses fake

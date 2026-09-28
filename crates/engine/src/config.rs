@@ -138,6 +138,14 @@ impl Config {
                 .iter()
                 .find(|broker| broker.id() == &live.broker)
                 .ok_or("live.broker: broker is not declared under [[brokers]]")?;
+            if let Broker::PocketOption(settings) = broker {
+                if settings.account_class != AccountClass::Demo {
+                    return Err("live.broker: Pocket real account class is not supported".into());
+                }
+                if settings.payout.is_none() {
+                    return Err("live.broker: Pocket payout is required".into());
+                }
+            }
             match self.run_mode {
                 RunMode::Paper | RunMode::Live => {
                     if live.replay.is_some() {
@@ -382,7 +390,7 @@ impl Config {
                 return Err("inspect: broker has no live capability".into());
             }
             if inspect.proposal.is_some()
-                && (!broker.kind().capabilities().execution || broker.credential().is_none())
+                && (broker.kind() != BrokerKind::Deriv || broker.credential().is_none())
             {
                 return Err(
                     "inspect: proposal requires a Deriv broker with a credential reference".into(),
@@ -410,7 +418,7 @@ impl BrokerKind {
         Capabilities {
             history: true,
             live: true,
-            execution: self == Self::Deriv,
+            execution: true,
         }
     }
 }
@@ -472,6 +480,17 @@ pub struct PocketSettings {
     /// Maximum unconsumed candle pages, including outstanding requests; defaults to eight.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub history_pages_in_flight: Option<u16>,
+    /// Optional for market-only research configurations; required for live accounts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub payout: Option<PocketPayout>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PocketPayout {
+    pub add_percent: u8,
+    pub cap_percent: u8,
+    pub max_age_seconds: u32,
 }
 
 impl Broker {
@@ -546,6 +565,22 @@ impl Broker {
                 }
             }
             Self::PocketOption(settings) => {
+                if mode != RunMode::Research && settings.account_class != AccountClass::Demo {
+                    return Err(
+                        "pocket_option: real account class is not supported for live or replay"
+                            .into(),
+                    );
+                }
+                if mode != RunMode::Research && settings.payout.is_none() {
+                    return Err("pocket_option: payout is required for live or replay".into());
+                }
+                if let Some(payout) = settings.payout
+                    && (payout.cap_percent == 0
+                        || payout.cap_percent > 100
+                        || payout.max_age_seconds == 0)
+                {
+                    return Err("pocket_option: payout cap_percent and max_age_seconds must be positive; cap_percent must be at most 100".into());
+                }
                 if settings.history_pages_in_flight == Some(0) {
                     return Err("history_pages_in_flight must be positive".into());
                 }

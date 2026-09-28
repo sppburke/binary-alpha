@@ -1,5 +1,7 @@
 pub mod deriv;
+pub mod options;
 pub mod pocket_option;
+pub mod pocket_options;
 pub mod socket_io;
 pub mod transport;
 pub mod wire;
@@ -427,6 +429,8 @@ pub struct PreparedPurchase {
     pub command: String,
     pub proposal_identity: String,
     pub maximum_price: Decimal,
+    /// The admitted offer, including the normalized order fields Pocket must encode.
+    pub offer: Option<binary_alpha_engine::execution::Proposal>,
 }
 #[derive(Debug, Clone)]
 pub enum PurchaseOutcome {
@@ -450,6 +454,17 @@ pub enum PurchaseOutcome {
 #[derive(Debug, Clone)]
 pub enum AccountEvent {
     TransactionAcknowledged,
+    Listing {
+        instrument: InstrumentId,
+        listed_percent: u8,
+        receipt_micros: i64,
+        frame_sha256: String,
+    },
+    PocketDeal {
+        deal: pocket_options::Deal,
+        closed: bool,
+        receipt_micros: i64,
+    },
     Cash {
         fact: CashFact,
         receipt_micros: i64,
@@ -467,6 +482,17 @@ pub enum AccountEvent {
         source: EventSource,
         fact: TerminalFact,
     },
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StatementCoverage {
+    CompleteRange,
+    PartialSnapshot,
+}
+
+#[derive(Debug, Clone)]
+pub struct Statement {
+    pub coverage: StatementCoverage,
+    pub rows: Vec<deriv::StatementRow>,
 }
 #[derive(Debug, Clone)]
 pub struct OpenContract {

@@ -664,14 +664,36 @@ binary-alpha live authorization create --deployment-manifest URI --bundle-manife
 `live replay` accepts `research` or `replay`; the filesystem publication boundary still requires
 `research`. It reads a recorded broker-event log and never connects to a broker or resolves its
 credential. `live run` accepts `paper` or `live`; paper keeps account observations but does not
-purchase. Every `live` entry, including demo, requires the exact authorization object. The current
-options adapter permits proposals only for demo USD; a real account can supply observations but
-cannot obtain a supported purchase proposal. Configure the operator's Google identity to create
+purchase. Every `live` entry, including demo, requires the exact authorization object. The
+Deriv options adapter permits proposals only for demo USD; Pocket execution requires demo class
+and its frozen assumed offer. A real account can supply Deriv observations but cannot obtain a
+supported purchase proposal. Configure the operator's Google identity to create
 but not overwrite authorization objects and the runtime identity to read them. Repeat creation
 after response loss with the same bindings, operator, and reason. Any deployment/configuration/bundle/broker/account change
 requires a new exact authorization. See the [command matrix](contracts.md#live-runtime),
 [authorization object](contracts.md#authorization), and
 [compatibility receipt](contracts.md#compatibility-receipt).
+
+### Pocket demo observation
+
+The Pocket account adapter accepts demo accounts only. Configure the frozen quote policy, scale,
+account currency, warm-up tick generations, and the broker's `payout` rule before replay. Use
+`binary-alpha live replay --config PATH` with an inert credential reference and a synthetic
+recorded log to verify listing cadence, per-row offers, request-id correlation, settlement,
+recovery, and the final receipt. Recorded replay makes no broker connection. Keep the same
+configuration and certified bundle identity for an authorized demo observation; `live run` also
+needs its own cloud, control, broker, and exact entry authorization.
+
+During observation, check that each admitted offer matches the frozen return, stale or
+ineligible listings create bounded refusals, and every accepted order's deal and balance settle
+against the Engine ledger. Review timing dimensions even when demo entries continue: an outside
+dimension still prevents promotion. A possibly sent order, contradictory deal, unmatched new
+deal, rejected release, or economic discrepancy requires exact reconciliation before new entries.
+Retain the journal tail and published manifest during a restart; do not resubmit an uncertain
+order. Stop the process to roll back new entries while keeping its evidence for recovery.
+
+Production operator tasks: separately authorize any real feed, account observation, demo order,
+cloud publication, or control mutation before running them. Linked matching Sentry issues: none.
 
 ### PostgreSQL control gate
 

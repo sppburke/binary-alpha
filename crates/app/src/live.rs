@@ -28,7 +28,9 @@ use std::sync::{
 };
 use std::time::{Duration, Instant};
 
-use binary_alpha_engine::config::{AccountClass, Broker, Config, Live, RunMode};
+use binary_alpha_engine::config::{
+    AccountClass, Broker, Config, Live, PocketPayout, RunMode, StreamKey,
+};
 use binary_alpha_engine::dataset::{DatasetRole, manifest_key};
 use binary_alpha_engine::execution::{
     AccountState, BrokerLiability, CashAction, Decimal, Engine, EventKind, EventSource,
@@ -45,9 +47,11 @@ use binary_alpha_engine::stream::{Observation as StreamObservation, Source};
 use serde::{Deserialize, Serialize};
 
 use crate::broker::deriv::{
-    DerivAccounts, DerivMarketData, DerivOptions, Encoded, StatementRow, purchase_observation,
-    recover_purchase, to_observation,
+    DerivAccounts, DerivMarketData, DerivOptions, StatementRow, recover_purchase,
 };
+use crate::broker::options::{Encoded, Options, purchase_observation, to_observation};
+use crate::broker::pocket_option::PocketMarketData;
+use crate::broker::pocket_options::{self, Listing, PocketOptions};
 use crate::broker::transport::{RecordedConnector, ReplayClock, WebSocketConnector};
 use crate::broker::{
     AccountEvent, AccountIdentity, Clock, Continuity, LiveEvent, MarketDataBroker, OpenContract,
@@ -57,7 +61,7 @@ use crate::import::CODE_REVISION;
 use crate::research::{publish_record, read_key, ready_uri};
 use crate::store::{self, Store};
 use control::{Claim, ClaimOutcome, ClaimState, Control, FakeControl, Lease, LeaseKey, Postgres};
-use journal::{Journal, LeaseState, Record, RecordKind};
+use journal::{Journal, LeaseState, ListingCause, Record, RecordKind};
 
 pub const DEPLOYMENT_KIND: &str = "live_deployment";
 pub const DEPLOYMENT_SCHEMA_VERSION: u32 = 1;
@@ -210,11 +214,14 @@ pub fn definition(config: &Config) -> Result<LiveDefinition, String> {
         ),
         inputs,
     )?;
-    if !matches!(
-        config.brokers.iter().find(|b| b.id() == &settings.broker),
-        Some(Broker::Deriv(_))
-    ) {
-        return Err("live: only the current Deriv options adapter is supported".into());
+    let broker = config
+        .brokers
+        .iter()
+        .find(|b| b.id() == &settings.broker)
+        .ok_or("live: broker missing")?;
+    if matches!(broker, Broker::PocketOption(pocket) if pocket.account_class != AccountClass::Demo || pocket.payout.is_none())
+    {
+        return Err("live: Pocket demo payout settings required".into());
     }
     let bound = (0..policy.replay.inputs.len())
         .map(|i| {
@@ -242,7 +249,8 @@ pub fn definition(config: &Config) -> Result<LiveDefinition, String> {
             )
             .ok_or("live: frozen instrument is not configured")?;
         if declared.price_scale != instrument.inputs.scale
-            || declared.quote_currency != policy.replay.accounts[0].currency
+            || (matches!(broker, Broker::Deriv(_))
+                && declared.quote_currency != policy.replay.accounts[0].currency)
             || declared != &instrument.inputs.plan.profile.definition
         {
             return Err("live: configured instrument currency, scale, or feature definition differs from the frozen refit".into());
@@ -399,6 +407,7 @@ struct PendingRows {
     instrument: usize,
     close_micros: i64,
     bindings: BTreeSet<String>,
+    withdraw: BTreeSet<String>,
     observations: Vec<Observation>,
     receipt_micros: i64,
 }
@@ -424,6 +433,60 @@ fn take_quote_rows(rows: &mut VecDeque<PendingRows>, authorized: bool) -> Vec<Pe
     due
 }
 
+fn proposal_effects<'a>(
+    bindings: impl Iterator<Item = &'a str>,
+    pending: &BTreeSet<String>,
+    quote: bool,
+) -> (BTreeSet<String>, BTreeSet<String>) {
+    let mut withdraw = BTreeSet::new();
+    let mut unbound = BTreeSet::new();
+    for binding in bindings {
+        if quote && pending.contains(binding) {
+            withdraw.insert(binding.into());
+        } else {
+            unbound.insert(binding.into());
+        }
+    }
+    (unbound, withdraw)
+}
+
+fn receipt_continues(
+    pocket_demo: bool,
+    dimension: &str,
+    listing_only: bool,
+    rejected_release: bool,
+) -> bool {
+    pocket_demo
+        && !rejected_release
+        && match dimension {
+            "quote_age_entry_price" | "acceptance_delay" | "contract_timing" | "funds_release" => {
+                true
+            }
+            "offer_availability_rejection" => listing_only,
+            _ => false,
+        }
+}
+
+fn discard_quotes_during_authorization(
+    rows: &mut Vec<Observation>,
+    streams: &[StreamKey],
+    authorization_pending: bool,
+) {
+    if authorization_pending {
+        rows.retain(|row| {
+            matches!(row, Observation::Row { stream, .. }
+            if streams[*stream].kind == binary_alpha_engine::config::StreamKind::Candle)
+        });
+    }
+}
+
+fn listing_at(history: &VecDeque<Listing>, receipt_micros: i64) -> Option<&Listing> {
+    history
+        .iter()
+        .rev()
+        .find(|listing| listing.receipt_micros <= receipt_micros)
+}
+
 #[cfg(test)]
 mod quote_row_tests {
     use super::*;
@@ -435,6 +498,7 @@ mod quote_row_tests {
             instrument: 0,
             close_micros: at,
             bindings: BTreeSet::from(["binding".into()]),
+            withdraw: BTreeSet::new(),
             observations: vec![Observation::Tick {
                 instrument: 0,
                 provider_time_micros: at,
@@ -452,9 +516,94 @@ mod quote_row_tests {
         assert!(!waiting[0].quote);
 
         waiting.push_back(row(true, 3));
+        waiting.push_back(row(true, 4));
         assert!(take_quote_rows(&mut waiting, false).is_empty());
         assert_eq!(waiting.len(), 1);
         assert!(!waiting[0].quote);
+    }
+
+    #[test]
+    fn two_quotes_arriving_during_authorization_cannot_be_decided_later() {
+        let candle = StreamKey::candle(5, 0);
+        let streams = [candle, StreamKey::quote()];
+        let row = |stream, at| Observation::Row {
+            instrument: 0,
+            stream,
+            close_time_micros: at,
+            known_at_micros: at,
+            values: vec![Some(binary_alpha_engine::features::Value::Int(at))],
+        };
+        let mut rows = vec![row(0, 1), row(1, 2), row(1, 3)];
+        discard_quotes_during_authorization(&mut rows, &streams, true);
+        assert_eq!(rows.len(), 1);
+        assert!(matches!(rows[0], Observation::Row { stream: 0, .. }));
+        let mut waiting = VecDeque::new();
+        assert!(take_quote_rows(&mut waiting, true).is_empty());
+    }
+
+    #[test]
+    fn second_deriv_quote_with_a_pending_proposal_withdraws_the_prior_offer() {
+        let pending = BTreeSet::new();
+        let (first, withdrawn) = proposal_effects(["binding"].into_iter(), &pending, true);
+        assert_eq!(first, BTreeSet::from(["binding".into()]));
+        assert!(withdrawn.is_empty());
+        let pending = BTreeSet::from(["binding".into()]);
+        let (second, withdrawn) = proposal_effects(["binding"].into_iter(), &pending, true);
+        assert!(second.is_empty());
+        assert_eq!(withdrawn, BTreeSet::from(["binding".into()]));
+    }
+
+    #[test]
+    fn pocket_demo_receipt_continues_only_for_timing_and_listing_causes() {
+        for name in [
+            "quote_age_entry_price",
+            "acceptance_delay",
+            "contract_timing",
+            "funds_release",
+        ] {
+            assert!(receipt_continues(true, name, false, false));
+            assert!(!receipt_continues(false, name, false, false));
+            assert!(!receipt_continues(true, name, false, true));
+        }
+        assert!(receipt_continues(
+            true,
+            "offer_availability_rejection",
+            true,
+            false
+        ));
+        assert!(!receipt_continues(
+            true,
+            "offer_availability_rejection",
+            false,
+            false
+        ));
+        assert!(!receipt_continues(
+            true,
+            "offer_availability_rejection",
+            true,
+            true
+        ));
+        assert!(!receipt_continues(true, "economics_scope", true, false));
+        assert!(!receipt_continues(true, "unknown", true, false));
+    }
+
+    #[test]
+    fn later_account_listing_does_not_price_an_earlier_quote() {
+        let history = VecDeque::from([
+            Listing {
+                listed_percent: 84,
+                receipt_micros: 10,
+                frame_sha256: "first".into(),
+            },
+            Listing {
+                listed_percent: 49,
+                receipt_micros: 30,
+                frame_sha256: "later".into(),
+            },
+        ]);
+        assert_eq!(listing_at(&history, 20).unwrap().listed_percent, 84);
+        assert_eq!(listing_at(&history, 30).unwrap().listed_percent, 49);
+        assert!(listing_at(&history, 9).is_none());
     }
 }
 struct Dispatch {
@@ -482,6 +631,12 @@ pub struct Runtime {
     scheduler: Option<ReplayClock>,
     destination_uri: String,
     settings: Live,
+    account_identity: AccountIdentity,
+    broker_kind: crate::broker::BrokerKind,
+    pocket_rule: Option<PocketPayout>,
+    pocket_offset_minutes: i32,
+    pocket_listings: BTreeMap<String, VecDeque<Listing>>,
+    pocket_listing_state: BTreeMap<String, String>,
     dir: PathBuf,
     mode: Mode,
     health: Health,
@@ -537,7 +692,7 @@ impl Runtime {
         destination: Store,
         control: Box<dyn Control>,
         market: Box<dyn MarketDataBroker>,
-        options: DerivOptions,
+        options: impl Into<Options>,
         clock: Box<dyn Clock>,
         scheduler: Option<ReplayClock>,
         mode: Mode,
@@ -550,7 +705,7 @@ impl Runtime {
             destination,
             control,
             market,
-            options,
+            options.into(),
             clock,
             scheduler,
             mode,
@@ -566,13 +721,36 @@ impl Runtime {
         destination: Store,
         control: Box<dyn Control>,
         market: Box<dyn MarketDataBroker>,
-        options: DerivOptions,
+        mut options: Options,
         clock: Box<dyn Clock>,
         scheduler: Option<ReplayClock>,
         mode: Mode,
         monotonic: Option<(Instant, i64)>,
     ) -> Result<Self, String> {
         let settings = config.live.clone().ok_or("live: the table is required")?;
+        let pocket_rule = config
+            .brokers
+            .iter()
+            .find(|broker| broker.id() == &settings.broker)
+            .and_then(|broker| match broker {
+                Broker::PocketOption(settings) => settings.payout,
+                Broker::Deriv(_) => None,
+            });
+        let pocket_offset_minutes = config
+            .brokers
+            .iter()
+            .find(|broker| broker.id() == &settings.broker)
+            .and_then(|broker| match broker {
+                Broker::PocketOption(settings) => Some(settings.server_offset_minutes),
+                Broker::Deriv(_) => None,
+            })
+            .unwrap_or_default();
+        let account_identity = options.account().clone();
+        let broker_kind = if pocket_rule.is_some() {
+            crate::broker::BrokerKind::PocketOption
+        } else {
+            crate::broker::BrokerKind::Deriv
+        };
         let account = &definition.definition.replay.accounts[0];
         if options.account().broker != account.broker
             || options.account().account != account.id
@@ -644,6 +822,10 @@ impl Runtime {
             &definition.deployment,
             u64::from(settings.journal.segment_records),
         )?;
+        options.reserve_request_ids(records.iter().filter_map(|record| match &record.kind {
+            RecordKind::Written { request_id, .. } => *request_id,
+            _ => None,
+        }));
         let ledger: Vec<_> = records
             .iter()
             .filter_map(|record| {
@@ -766,6 +948,12 @@ impl Runtime {
             scheduler,
             destination_uri,
             settings,
+            account_identity,
+            broker_kind,
+            pocket_rule,
+            pocket_offset_minutes,
+            pocket_listings: BTreeMap::new(),
+            pocket_listing_state: BTreeMap::new(),
             dir,
             mode,
             vetoes: BTreeSet::new(),
@@ -1173,11 +1361,32 @@ impl Runtime {
             events: &events,
             refusals: &self.records,
         });
-        if let Some(dimension) = receipt
-            .dimensions
+        let pocket_demo =
+            self.pocket_rule.is_some() && self.health.account_class == AccountClass::Demo;
+        let start = parse_event_time_micros(&observation.decision_start)?;
+        let end = parse_event_time_micros(&observation.decision_end)?;
+        let in_window = |at| start <= at && at < end;
+        let listing_refusals: Vec<_> = self
+            .records
             .iter()
-            .find(|d| d.status == receipt::Status::OutsideEnvelope)
-        {
+            .filter(|record| in_window(record.time_micros))
+            .filter_map(|record| match &record.kind {
+                RecordKind::Refused { listing_cause, .. } => Some(listing_cause),
+                _ => None,
+            })
+            .collect();
+        let listing_only =
+            !listing_refusals.is_empty() && listing_refusals.iter().all(|cause| cause.is_some());
+        let rejected_release = events.iter().any(|event| {
+            in_window(event.time_micros)
+                && matches!(&event.kind, EventKind::Released { rejected: true, .. })
+        });
+        if let Some(dimension) = receipt.dimensions.iter().find(|dimension| {
+            if dimension.status != receipt::Status::OutsideEnvelope {
+                return false;
+            }
+            !receipt_continues(pocket_demo, dimension.name, listing_only, rejected_release)
+        }) {
             let reason = format!("compatibility outside envelope: {}", dimension.name);
             self.disable(&reason);
         }
@@ -1373,7 +1582,11 @@ impl Runtime {
     fn source(&self, id: &str) -> EventSource {
         let now = self.clock.now_micros();
         EventSource {
-            id: id.into(),
+            id: if self.pocket_rule.is_some() {
+                format!("pocket:{id}")
+            } else {
+                id.into()
+            },
             provider_time_micros: now,
             available_at_micros: now,
             simulated: self.mode == Mode::Replay,
@@ -1395,14 +1608,117 @@ impl Runtime {
         }
         Ok(())
     }
+    fn proposal_unavailable(&mut self, binding: &str, present: bool) {
+        self.veto(&format!("proposal unavailable: {binding}"), present);
+    }
+    fn pocket_offer(
+        &mut self,
+        request: &ProposalRequest,
+        quote: &crate::broker::LiveObservation,
+    ) -> Result<Option<Observation>, String> {
+        let rule = self
+            .pocket_rule
+            .ok_or("pocket offer: payout rule missing")?;
+        let binding = &request.binding;
+        let listing = self
+            .pocket_listings
+            .get(&quote.instrument.to_string())
+            .and_then(|history| listing_at(history, quote.receipt_micros))
+            .cloned();
+        let unavailable = match &listing {
+            None => Some((ListingCause::Missing, "missing".to_string())),
+            Some(listing) if listing.receipt_micros > quote.receipt_micros => {
+                Some((ListingCause::Missing, "future".to_string()))
+            }
+            Some(listing) if !pocket_options::fresh(listing, quote.receipt_micros, rule) => Some((
+                ListingCause::Stale,
+                format!("stale:{}:{}", listing.frame_sha256, listing.receipt_micros),
+            )),
+            Some(_) => None,
+        };
+        if let Some((cause, key)) = unavailable {
+            self.offer(binding, None)?;
+            if self.pocket_listing_state.get(binding) != Some(&key) {
+                self.pocket_listing_state.insert(binding.clone(), key);
+                self.record(RecordKind::Refused {
+                    binding: binding.clone(),
+                    proposal: None,
+                    reason: format!("Pocket listing {cause:?}"),
+                    listing_cause: Some(cause),
+                })?;
+                self.compatibility()?;
+            }
+            self.proposal_unavailable(binding, true);
+            return Ok(None);
+        }
+        let listing = listing.expect("fresh listing");
+        let bound = self
+            .definition
+            .policy
+            .replay
+            .bindings
+            .iter()
+            .find(|b| b.id == *binding)
+            .ok_or("pocket offer: binding missing")?;
+        let template = self
+            .definition
+            .policy
+            .replay
+            .contracts
+            .iter()
+            .find(|c| c.id == bound.contract)
+            .ok_or("pocket offer: contract missing")?;
+        let proposal = pocket_options::offer(
+            request,
+            template,
+            &self.account_identity,
+            quote,
+            &listing,
+            rule,
+        )?;
+        let baseline = self
+            .definition
+            .policy
+            .baseline
+            .iter()
+            .find(|c| c.id == bound.contract)
+            .ok_or("pocket offer: baseline missing")?;
+        let ineligible = !proposal.terms.same_economics(baseline)?;
+        if ineligible {
+            let key = format!(
+                "ineligible:{}:{}",
+                listing.frame_sha256, listing.receipt_micros
+            );
+            let first = self.pocket_listing_state.get(binding) != Some(&key);
+            self.pocket_listing_state.insert(binding.clone(), key);
+            let observation = if first {
+                self.offer_with_cause(binding, Some(proposal), Some(ListingCause::Ineligible))?
+            } else {
+                self.offer(binding, None)?
+            };
+            self.proposal_unavailable(binding, true);
+            return Ok(observation);
+        }
+        self.pocket_listing_state.remove(binding);
+        self.proposal_unavailable(binding, false);
+        self.offer(binding, proposal)
+    }
     /// Exact baseline admission occurs before installing the offer or reserving money.
     pub fn offer(
         &mut self,
         binding: &str,
         proposal: impl Into<Option<Proposal>>,
     ) -> Result<Option<Observation>, String> {
+        self.offer_with_cause(binding, proposal.into(), None)
+    }
+    fn offer_with_cause(
+        &mut self,
+        binding: &str,
+        proposal: Option<Proposal>,
+        listing_cause: Option<ListingCause>,
+    ) -> Result<Option<Observation>, String> {
         self.engine.withdraw_proposal(binding)?;
-        let Some(proposal) = proposal.into() else {
+        let Some(proposal) = proposal else {
             return Ok(None);
         };
         let bound = self
@@ -1433,6 +1749,7 @@ impl Runtime {
                 binding: binding.into(),
                 proposal: Some(proposal),
                 reason: format!("offer differs from exact baseline {}", baseline.id),
+                listing_cause,
             })?;
             self.compatibility()?;
             return Ok(None);
@@ -1482,6 +1799,9 @@ impl Runtime {
                 let due = take_quote_rows(&mut self.pending_rows, !self.authorization_pending);
                 for rows in due {
                     self.decision_receipt = Some(rows.receipt_micros);
+                    for binding in rows.bindings.iter().chain(&rows.withdraw) {
+                        self.offer(binding, None)?;
+                    }
                     for signal in self.step(rows.observations)? {
                         self.dispatch(signal)?;
                         if self.interrupted {
@@ -1592,14 +1912,14 @@ impl Runtime {
                     provider_time_micros: event.provider_time_micros,
                     price_units: event.price_units,
                 }])?;
-                let (candle_rows, quote_rows): (Vec<_>, Vec<_>) = rows.into_iter().partition(|row| {
-                    matches!(row, Observation::Row { stream, .. }
-                        if stream_keys[*stream].kind == binary_alpha_engine::config::StreamKind::Candle)
-                });
-                for (quote, rows) in [(false, candle_rows), (true, quote_rows)] {
-                    if rows.is_empty() || (quote && self.authorization_pending) {
-                        continue;
-                    }
+                discard_quotes_during_authorization(
+                    &mut rows,
+                    &stream_keys,
+                    self.authorization_pending,
+                );
+                if !rows.is_empty() {
+                    let quote = rows.iter().any(|row| matches!(row, Observation::Row { stream, .. }
+                        if stream_keys[*stream].kind == binary_alpha_engine::config::StreamKind::Quote));
                     let group_requests: Vec<_> = requests
                         .iter()
                         .filter(|request| {
@@ -1636,30 +1956,40 @@ impl Runtime {
                         })
                         .max()
                         .expect("base rows");
+                    let mut observations = rows;
+                    if self.pocket_rule.is_some() && !self.draining {
+                        for request in &group_requests {
+                            if let Some(offer) = self.pocket_offer(request, &event)? {
+                                observations.insert(0, offer);
+                            }
+                        }
+                    }
+                    let (bindings, withdraw) = if self.draining || self.pocket_rule.is_some() {
+                        (BTreeSet::new(), BTreeSet::new())
+                    } else {
+                        proposal_effects(
+                            group_requests
+                                .iter()
+                                .map(|request| request.binding.as_str()),
+                            &self.proposals_pending,
+                            quote,
+                        )
+                    };
                     self.pending_rows.push_back(PendingRows {
                         quote,
                         instrument,
                         close_micros,
-                        bindings: if self.draining {
-                            BTreeSet::new()
-                        } else if quote {
-                            group_requests
-                                .iter()
-                                .filter(|request| {
-                                    !self.proposals_pending.contains(&request.binding)
-                                })
-                                .map(|request| request.binding.clone())
-                                .collect()
-                        } else {
-                            group_requests.iter().map(|r| r.binding.clone()).collect()
-                        },
-                        observations: rows,
+                        withdraw,
+                        bindings,
+                        observations,
                         receipt_micros: event.receipt_micros,
                     });
                     self.prune_rows();
-                    for request in group_requests {
-                        if self.proposals_pending.insert(request.binding.clone()) {
-                            self.send(Intent::Proposal(request))?;
+                    if self.pocket_rule.is_none() {
+                        for request in group_requests {
+                            if self.proposals_pending.insert(request.binding.clone()) {
+                                self.send(Intent::Proposal(request))?;
+                            }
                         }
                     }
                     self.rows_ready()?;
@@ -1698,6 +2028,7 @@ impl Runtime {
             command: command.clone(),
             proposal_identity: proposal.identity.clone(),
             maximum_price: proposal.terms.quoted_cost,
+            offer: Some(proposal.clone()),
         };
         self.dispatch_order.push_back(command.clone());
         if self.dispatch_order.len() == 1 {
@@ -1890,6 +2221,7 @@ impl Runtime {
         self.record(RecordKind::Written {
             command: command.to_string(),
             claim: prepared.dispatch_claim.clone(),
+            request_id: encoded.request_id(),
         })?;
         if self.checkpoint(Checkpoint::DuringWrite) {
             return Ok(());
@@ -1939,6 +2271,7 @@ impl Runtime {
             &prepared.dispatch_claim,
             outcome,
             self.clock.now_micros(),
+            self.broker_kind,
         )])?;
         self.update_claim(command, state, contract.as_deref(), transaction.as_deref())?;
         if state == ClaimState::PossiblySent {
@@ -2543,40 +2876,74 @@ pub fn replay(config_path: &Path, out: &mut dyn Write) -> Result<(), String> {
     let base = config_path.parent().unwrap_or(Path::new("."));
     let (local, destination) = stores(&config, base)?;
     let definition = definition(&config)?;
-    let Broker::Deriv(broker) = config
+    let broker = config
         .brokers
         .iter()
         .find(|b| b.id() == &settings.broker)
-        .ok_or("live: broker missing")?
-    else {
-        return Err("live: Deriv broker required".into());
-    };
+        .ok_or("live: broker missing")?;
     let recorded = RecordedConnector::open(&base.join(&replay.broker_log))?;
     let clock = recorded.clock();
-    let mut broker = broker.clone();
-    broker.account_class = Some(settings.compatibility.required_account_class);
-    let address =
-        DerivAccounts::bootstrap(&broker, &mut recorded.http(), "recorded-no-credential")?;
-    let account = AccountIdentity {
-        broker: broker.id.clone(),
-        account: settings.account.clone(),
-        class: address.account_class,
-        currency: address.currency.clone(),
-    };
     let instruments = definition.instruments()?;
-    let options = DerivOptions::connect(
-        address,
-        account,
-        &instruments,
-        Box::new(recorded.session("account")?),
-        Box::new(clock.clone()),
-        broker.budgets.clone().unwrap_or_default(),
-    )?;
-    let market = DerivMarketData::connect(
-        &broker,
-        Box::new(recorded.session("market")?),
-        Box::new(clock.clone()),
-    )?;
+    let (options, market): (Options, Box<dyn MarketDataBroker>) = match broker {
+        Broker::Deriv(broker) => {
+            let mut broker = broker.clone();
+            broker.account_class = Some(settings.compatibility.required_account_class);
+            let address =
+                DerivAccounts::bootstrap(&broker, &mut recorded.http(), "recorded-no-credential")?;
+            let account = AccountIdentity {
+                broker: broker.id.clone(),
+                account: settings.account.clone(),
+                class: address.account_class,
+                currency: address.currency.clone(),
+            };
+            (
+                DerivOptions::connect(
+                    address,
+                    account,
+                    &instruments,
+                    Box::new(recorded.session("account")?),
+                    Box::new(clock.clone()),
+                    broker.budgets.clone().unwrap_or_default(),
+                )?
+                .into(),
+                Box::new(DerivMarketData::connect(
+                    &broker,
+                    Box::new(recorded.session("market")?),
+                    Box::new(clock.clone()),
+                )?),
+            )
+        }
+        Broker::PocketOption(broker) => {
+            let account = AccountIdentity {
+                broker: broker.id.clone(),
+                account: settings.account.clone(),
+                class: AccountClass::Demo,
+                currency: definition.policy.replay.accounts[0].currency.clone(),
+            };
+            let ids = instruments
+                .iter()
+                .map(|(id, _)| id.clone())
+                .collect::<Vec<_>>();
+            (
+                PocketOptions::connect(
+                    broker,
+                    account,
+                    &instruments,
+                    Box::new(recorded.session("account")?),
+                    Box::new(clock.clone()),
+                    "{}".into(),
+                )?
+                .into(),
+                Box::new(PocketMarketData::connect(
+                    broker,
+                    &ids,
+                    Box::new(recorded.session("market")?),
+                    Box::new(clock.clone()),
+                    "{}".into(),
+                )?),
+            )
+        }
+    };
     let control = FakeControl::new(clock.now_micros());
     let mut runtime = Runtime::start(
         &config,
@@ -2585,7 +2952,7 @@ pub fn replay(config_path: &Path, out: &mut dyn Write) -> Result<(), String> {
         local,
         destination,
         Box::new(control),
-        Box::new(market),
+        market,
         options,
         Box::new(clock.clone()),
         Some(clock.clone()),
@@ -2614,36 +2981,71 @@ pub fn run(config_path: &Path, out: &mut dyn Write) -> Result<(), String> {
     let (local, destination) = stores(&config, base)?;
     let definition = definition(&config)?;
     let settings = config.live.as_ref().expect("definition requires live");
-    let Broker::Deriv(broker) = config
+    let broker = config
         .brokers
         .iter()
         .find(|b| b.id() == &settings.broker)
-        .expect("validated")
-    else {
-        return Err("live: Deriv broker required".into());
-    };
-    let connector = WebSocketConnector::new()?;
-    let address = DerivAccounts::resolve(broker, &mut connector.http())?;
-    let account = AccountIdentity {
-        broker: broker.id.clone(),
-        account: settings.account.clone(),
-        class: address.account_class,
-        currency: address.currency.clone(),
-    };
+        .expect("validated");
     let instruments = definition.instruments()?;
-    let options = DerivOptions::connect(
-        address,
-        account,
-        &instruments,
-        Box::new(connector),
-        Box::new(SystemClock),
-        broker.budgets.clone().unwrap_or_default(),
-    )?;
-    let market = DerivMarketData::connect(
-        broker,
-        Box::new(WebSocketConnector::new()?),
-        Box::new(SystemClock),
-    )?;
+    let (options, market): (Options, Box<dyn MarketDataBroker>) = match broker {
+        Broker::Deriv(broker) => {
+            let connector = WebSocketConnector::new()?;
+            let address = DerivAccounts::resolve(broker, &mut connector.http())?;
+            let account = AccountIdentity {
+                broker: broker.id.clone(),
+                account: settings.account.clone(),
+                class: address.account_class,
+                currency: address.currency.clone(),
+            };
+            (
+                DerivOptions::connect(
+                    address,
+                    account,
+                    &instruments,
+                    Box::new(connector),
+                    Box::new(SystemClock),
+                    broker.budgets.clone().unwrap_or_default(),
+                )?
+                .into(),
+                Box::new(DerivMarketData::connect(
+                    broker,
+                    Box::new(WebSocketConnector::new()?),
+                    Box::new(SystemClock),
+                )?),
+            )
+        }
+        Broker::PocketOption(broker) => {
+            let credential = crate::broker::resolve_secret(&broker.credential)?;
+            let account = AccountIdentity {
+                broker: broker.id.clone(),
+                account: settings.account.clone(),
+                class: AccountClass::Demo,
+                currency: definition.policy.replay.accounts[0].currency.clone(),
+            };
+            let ids = instruments
+                .iter()
+                .map(|(id, _)| id.clone())
+                .collect::<Vec<_>>();
+            (
+                PocketOptions::connect(
+                    broker,
+                    account,
+                    &instruments,
+                    Box::new(WebSocketConnector::new()?),
+                    Box::new(SystemClock),
+                    credential.clone(),
+                )?
+                .into(),
+                Box::new(PocketMarketData::connect(
+                    broker,
+                    &ids,
+                    Box::new(WebSocketConnector::new()?),
+                    Box::new(SystemClock),
+                    credential,
+                )?),
+            )
+        }
+    };
     let control = connect_control(&settings.control, base)?;
     let end = parse_event_time_micros(&settings.compatibility.observation_end)?;
     let mut runtime = Runtime::start_at(
@@ -2653,7 +3055,7 @@ pub fn run(config_path: &Path, out: &mut dyn Write) -> Result<(), String> {
         local,
         destination,
         Box::new(control),
-        Box::new(market),
+        market,
         options,
         Box::new(SystemClock),
         None,

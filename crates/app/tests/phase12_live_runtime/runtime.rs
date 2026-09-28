@@ -923,6 +923,607 @@ fn two_instruments_ingest_once_and_evaluate_rows_in_frozen_order() {
 }
 
 #[test]
+fn pocket_certified_quote_bundle_freezes_live_ages_and_currency() {
+    let fixture = Fixture::quote("phase12-pocket-quote");
+    let definition = fixture.definition();
+    assert_eq!(definition.policy.replay.bindings.len(), 2);
+    assert_eq!(definition.policy.replay.inputs.len(), 2);
+    assert_eq!(
+        definition.policy.replay.accounts[0].currency.to_string(),
+        "USD"
+    );
+    assert_eq!(
+        definition.policy.replay.risk_policies[0].max_quote_age_micros,
+        1_000_000
+    );
+    assert_eq!(
+        definition.policy.replay.risk_policies[0].max_proposal_age_micros,
+        Some(1_000_000)
+    );
+    assert_eq!(
+        fixture.config,
+        binary_alpha_engine::config::Config::parse(&fixture.config.canonical_toml()).unwrap()
+    );
+}
+
+#[test]
+fn pocket_real_class_is_refused_before_a_recorded_session_opens() {
+    let mut fixture = Fixture::quote("phase12-pocket-real-refused");
+    let binary_alpha_engine::config::Broker::PocketOption(settings) =
+        &mut fixture.config.brokers[0]
+    else {
+        panic!("Pocket fixture")
+    };
+    settings.account_class = binary_alpha_engine::config::AccountClass::Real;
+    write(&fixture.path, fixture.config.canonical_toml());
+    let error = cli(
+        &fixture.log(),
+        &["live", "replay", "--config", fixture.path.to_str().unwrap()],
+    )
+    .unwrap_err();
+    assert!(error.contains("Pocket real account class"), "{error}");
+    assert!(!fixture.scratch.path("journal").exists());
+}
+
+#[test]
+fn pocket_live_replay_trades_the_certified_quote_policy() {
+    let fixture = Fixture::quote("phase12-pocket-live-replay");
+    write(
+        &fixture.scratch.path("broker.jsonl"),
+        super::support::pocket_log(),
+    );
+    let report = cli(
+        &fixture.log(),
+        &["live", "replay", "--config", fixture.path.to_str().unwrap()],
+    )
+    .unwrap();
+    let final_uri = report
+        .lines()
+        .find_map(|line| line.strip_prefix("live final manifest "))
+        .expect(&report);
+    let read_uri = |uri: &str| fs::read(uri.strip_prefix("file://").unwrap()).unwrap();
+    let final_manifest: live::FinalManifest = serde_json::from_slice(&read_uri(final_uri)).unwrap();
+    let receipt: Value = serde_json::from_slice(&read_uri(&final_manifest.receipt)).unwrap();
+    assert_eq!(receipt["promotion"]["eligible"], false);
+    for name in [
+        "offer_availability_rejection",
+        "acceptance_delay",
+        "contract_timing",
+        "funds_release",
+    ] {
+        assert_eq!(
+            receipt["dimensions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|dimension| dimension["name"] == name)
+                .unwrap()["status"],
+            "outside_envelope"
+        );
+    }
+    assert_eq!(receipt["dimensions"][0]["name"], "economics_scope");
+    assert_eq!(receipt["dimensions"][0]["status"], "matched");
+    let mut journal = Vec::new();
+    for segment in &final_manifest.journal_segments {
+        journal.extend(fs::read(fixture.scratch.path("published").join(&segment.key)).unwrap());
+    }
+    journal.extend(fs::read(fixture.scratch.path("journal/open.jsonl")).unwrap());
+    let records = journal
+        .split(|byte| *byte == b'\n')
+        .filter(|line| !line.is_empty())
+        .map(|line| serde_json::from_slice::<live::journal::Record>(line).unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(records.first().unwrap().sequence, 1);
+    assert_eq!(records.last().unwrap().sequence, records.len() as u64);
+    let written = records
+        .iter()
+        .filter_map(|record| match &record.kind {
+            live::journal::RecordKind::Written { request_id, .. } => *request_id,
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(written.len(), 2);
+    assert_ne!(written[0], written[1]);
+    let refused = records
+        .iter()
+        .filter(|record| {
+            matches!(
+                &record.kind,
+                live::journal::RecordKind::Refused {
+                    listing_cause: Some(live::journal::ListingCause::Ineligible),
+                    ..
+                }
+            )
+        })
+        .count();
+    assert_eq!(refused, 2, "one refusal per binding for the 49% listing");
+    assert_eq!(
+        records
+            .iter()
+            .filter(|record| matches!(
+                &record.kind,
+                live::journal::RecordKind::Refused {
+                    listing_cause: Some(live::journal::ListingCause::Stale),
+                    ..
+                }
+            ))
+            .count(),
+        4
+    );
+    let ledger = records
+        .iter()
+        .filter_map(|record| match &record.kind {
+            live::journal::RecordKind::Ledger { event } => Some(event),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    let adjacent = ledger
+        .iter()
+        .filter_map(|event| match &event.kind {
+            binary_alpha_engine::execution::EventKind::Signal {
+                close_time_micros,
+                disposition,
+                quote_price_units,
+                proposal,
+                ..
+            } if *close_time_micros >= QUOTE_START
+                && *close_time_micros < QUOTE_START + 1_000_000 =>
+            {
+                Some((
+                    *quote_price_units,
+                    *disposition,
+                    proposal.as_ref().map(|p| p.identity.clone()),
+                ))
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(adjacent.len(), 2);
+    assert_eq!(adjacent[0].0, Some(100_644));
+    assert_eq!(
+        adjacent[0].1,
+        binary_alpha_engine::execution::Disposition::Admitted
+    );
+    assert!(adjacent[0].2.is_some());
+    assert_eq!(adjacent[1].0, Some(100_800));
+    assert_eq!(
+        adjacent[1].1,
+        binary_alpha_engine::execution::Disposition::CapacityTotal
+    );
+    assert_eq!(
+        ledger
+            .iter()
+            .filter(|event| matches!(
+                event.kind,
+                binary_alpha_engine::execution::EventKind::Accepted { .. }
+            ))
+            .count(),
+        2
+    );
+    let settled = ledger
+        .iter()
+        .filter(|event| {
+            matches!(
+                event.kind,
+                binary_alpha_engine::execution::EventKind::Settled { .. }
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(settled.len(), 2);
+    assert!(
+        settled
+            .iter()
+            .all(|event| event.to_line().windows(7).any(|bytes| bytes == b"pocket:"))
+    );
+    let health: Value =
+        serde_json::from_slice(&fs::read(fixture.scratch.path("journal/health.json")).unwrap())
+            .unwrap();
+    assert_eq!(health["risk"]["cash"], "10001.84");
+    assert_eq!(health["risk"]["open"], 0);
+    assert!(final_manifest.ledger.is_some());
+}
+
+#[test]
+fn pocket_missing_listing_refuses_once_then_fresh_listing_admits() {
+    let fixture = Fixture::quote("phase12-pocket-missing-listing");
+    write(
+        &fixture.scratch.path("broker.jsonl"),
+        super::support::pocket_missing_log(),
+    );
+    let report = cli(
+        &fixture.log(),
+        &["live", "replay", "--config", fixture.path.to_str().unwrap()],
+    )
+    .unwrap();
+    let final_uri = report
+        .lines()
+        .find_map(|line| line.strip_prefix("live final manifest "))
+        .expect(&report);
+    let final_manifest: live::FinalManifest =
+        serde_json::from_slice(&fs::read(final_uri.strip_prefix("file://").unwrap()).unwrap())
+            .unwrap();
+    let mut journal = Vec::new();
+    for segment in &final_manifest.journal_segments {
+        journal.extend(fs::read(fixture.scratch.path("published").join(&segment.key)).unwrap());
+    }
+    journal.extend(fs::read(fixture.scratch.path("journal/open.jsonl")).unwrap());
+    let records = journal
+        .split(|byte| *byte == b'\n')
+        .filter(|line| !line.is_empty())
+        .map(|line| serde_json::from_slice::<live::journal::Record>(line).unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        records
+            .iter()
+            .filter(|record| matches!(
+                &record.kind,
+                live::journal::RecordKind::Refused {
+                    listing_cause: Some(live::journal::ListingCause::Missing),
+                    ..
+                }
+            ))
+            .count(),
+        2
+    );
+    assert_eq!(
+        records
+            .iter()
+            .filter(|record| matches!(&record.kind, live::journal::RecordKind::Written { .. }))
+            .count(),
+        2
+    );
+    let health: Value =
+        serde_json::from_slice(&fs::read(fixture.scratch.path("journal/health.json")).unwrap())
+            .unwrap();
+    assert_eq!(health["risk"]["cash"], "10001.84");
+}
+
+#[test]
+fn pocket_old_statement_deal_is_ignored_but_new_foreign_close_vetoes_entries() {
+    let fixture = Fixture::quote("phase12-pocket-foreign");
+    let recorded = RecordedConnector::from_jsonl(&pocket_foreign_log()).unwrap();
+    let mut runtime = pocket_runtime(
+        &fixture,
+        live::Mode::Replay,
+        &recorded,
+        live::control::FakeControl::new(QUOTE_START - 2_000_000),
+    )
+    .unwrap();
+    runtime.run_until(|_| recorded.exhausted()).unwrap();
+    assert_eq!(runtime.engine().accounts()[0].cash.to_string(), "10001.84");
+    assert!(
+        matches!(&runtime.health().entries, live::Entries::Disabled(reason) if reason.contains("uncorrelated liability"))
+    );
+}
+
+#[test]
+fn pocket_quote_beyond_frozen_age_cannot_dispatch() {
+    use binary_alpha_engine::execution::{Disposition, EventKind};
+    let fixture = Fixture::quote("phase12-pocket-aged-quote");
+    let recorded = RecordedConnector::from_jsonl(&pocket_aged_quote_log()).unwrap();
+    let mut runtime = pocket_runtime(
+        &fixture,
+        live::Mode::Replay,
+        &recorded,
+        live::control::FakeControl::new(QUOTE_START - 2_000_000),
+    )
+    .unwrap();
+    runtime.run_until(|_| recorded.exhausted()).unwrap();
+    let signals = runtime
+        .records()
+        .iter()
+        .filter_map(|record| match &record.kind {
+            live::journal::RecordKind::Ledger {
+                event:
+                    binary_alpha_engine::execution::FinancialEvent {
+                        kind:
+                            EventKind::Signal {
+                                close_time_micros,
+                                disposition,
+                                ..
+                            },
+                        ..
+                    },
+            } => Some((*close_time_micros, *disposition)),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert!(runtime.records().iter().any(|record| matches!(&record.kind,
+        live::journal::RecordKind::Ledger { event: binary_alpha_engine::execution::FinancialEvent {
+            kind: EventKind::Signal { close_time_micros, disposition: Disposition::StaleQuote, command: None, .. }, ..
+        }} if *close_time_micros == QUOTE_START + 63_000_000)), "{signals:?}");
+    assert_eq!(
+        runtime
+            .records()
+            .iter()
+            .filter(|record| matches!(&record.kind, live::journal::RecordKind::Written { .. }))
+            .count(),
+        2
+    );
+}
+
+#[test]
+fn pocket_economic_discrepancy_stops_demo_entries() {
+    let fixture = Fixture::quote("phase12-pocket-economics");
+    let recorded = RecordedConnector::from_jsonl(&pocket_economics_log()).unwrap();
+    let mut runtime = pocket_runtime(
+        &fixture,
+        live::Mode::Replay,
+        &recorded,
+        live::control::FakeControl::new(QUOTE_START - 2_000_000),
+    )
+    .unwrap();
+    let completed = runtime
+        .run_until(|_| recorded.exhausted())
+        .unwrap()
+        .unwrap();
+    assert_eq!(completed.receipt.dimensions[0].name, "economics_scope");
+    assert_eq!(
+        completed.receipt.dimensions[0].status,
+        live::receipt::Status::OutsideEnvelope
+    );
+    assert!(
+        matches!(&runtime.health().entries, live::Entries::Disabled(reason) if reason.contains("economics_scope"))
+    );
+    assert_eq!(
+        runtime
+            .records()
+            .iter()
+            .filter(|record| matches!(&record.kind, live::journal::RecordKind::Written { .. }))
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn pocket_reconnect_does_not_trigger_from_the_cross_break_jump() {
+    use binary_alpha_engine::execution::EventKind;
+    let fixture = Fixture::quote("phase12-pocket-reconnect");
+    let recorded = RecordedConnector::from_jsonl(&pocket_reconnect_log()).unwrap();
+    let mut runtime = pocket_runtime(
+        &fixture,
+        live::Mode::Replay,
+        &recorded,
+        live::control::FakeControl::new(QUOTE_START - 2_000_000),
+    )
+    .unwrap();
+    runtime
+        .run_until(|health| recorded.exhausted() && health.connection_generation >= 1)
+        .unwrap();
+    assert!(
+        runtime.records().iter().any(|record| matches!(
+            &record.kind,
+            live::journal::RecordKind::Discontinuity { .. }
+        )),
+        "generation={} records={}",
+        runtime.health().connection_generation,
+        runtime.records().len()
+    );
+    assert!(
+        !runtime.records().iter().any(|record| matches!(&record.kind,
+        live::journal::RecordKind::Ledger { event: binary_alpha_engine::execution::FinancialEvent {
+            kind: EventKind::Signal { close_time_micros, .. }, ..
+        }} if *close_time_micros == QUOTE_START + 63_500_000))
+    );
+    assert_eq!(
+        runtime
+            .records()
+            .iter()
+            .filter(|record| matches!(&record.kind, live::journal::RecordKind::Written { .. }))
+            .count(),
+        2
+    );
+}
+
+#[test]
+fn pocket_unapproved_quotes_are_ingested_without_deferred_order() {
+    let mut fixture = Fixture::quote("phase12-pocket-auth-wait");
+    fixture
+        .config
+        .live
+        .as_mut()
+        .unwrap()
+        .control
+        .renewal_interval_micros = 1;
+    let recorded = RecordedConnector::from_jsonl(&pocket_authorization_wait_log()).unwrap();
+    let mut runtime = pocket_runtime(
+        &fixture,
+        live::Mode::Live,
+        &recorded,
+        live::control::FakeControl::new(QUOTE_START - 2_000_000),
+    )
+    .unwrap();
+    runtime
+        .run_until(|health| recorded.exhausted() && health.receipt_sequence >= 4)
+        .unwrap();
+    assert_eq!(runtime.health().receipt_sequence, 4);
+    assert!(
+        matches!(&runtime.health().entries, live::Entries::Disabled(reason)
+        if reason.contains("live authorization is absent"))
+    );
+    assert_eq!(runtime.health().pending_rows, 0);
+    assert!(
+        !runtime
+            .records()
+            .iter()
+            .any(|record| matches!(&record.kind, live::journal::RecordKind::Written { .. }))
+    );
+}
+
+fn pocket_written_claim(name: &str) -> (Fixture, live::control::FakeControl, u64) {
+    use live::control::{Control, LeaseKey};
+    let fixture = Fixture::quote(name);
+    let control = live::control::FakeControl::new(QUOTE_START - 2_000_000);
+    let first = RecordedConnector::from_jsonl(&pocket_written_prefix()).unwrap();
+    let mut owner = pocket_runtime(&fixture, live::Mode::Replay, &first, control.clone()).unwrap();
+    owner.hook = Some(Box::new(|point| point == live::Checkpoint::DuringWrite));
+    assert!(owner.run_until(|_| false).unwrap().is_none());
+    drop(owner);
+    let (_, prior) = live::journal::Journal::open(
+        &fixture.scratch.path("journal"),
+        &fixture.definition().deployment,
+        16,
+    )
+    .unwrap();
+    let ids = prior
+        .iter()
+        .filter_map(|record| match &record.kind {
+            live::journal::RecordKind::Written { request_id, .. } => *request_id,
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(ids.len(), 1);
+    let key = LeaseKey {
+        broker: "pocket_option",
+        account: "a0",
+    };
+    assert_eq!(control.clone().unresolved(key).unwrap().len(), 1);
+    control.clone().advance(70_000_000);
+    (fixture, control, ids[0])
+}
+
+#[test]
+fn pocket_restart_matches_written_request_id_and_settles_closed_deal() {
+    use live::control::{ClaimState, Control, LeaseKey};
+    let (fixture, control, request_id) = pocket_written_claim("phase12-pocket-restart");
+    let restart = RecordedConnector::from_jsonl(&pocket_restart_log(request_id)).unwrap();
+    let mut restored =
+        pocket_runtime(&fixture, live::Mode::Live, &restart, control.clone()).unwrap();
+    let completed = restored
+        .run_until(|_| restart.exhausted())
+        .unwrap()
+        .unwrap();
+    let key = LeaseKey {
+        broker: "pocket_option",
+        account: "a0",
+    };
+    assert_eq!(restored.engine().accounts()[0].cash.to_string(), "10000.92");
+    assert_eq!(restored.engine().accounts()[0].open, 0);
+    assert_eq!(
+        control.clone().retained_claims(key).unwrap()[0].state,
+        ClaimState::Reconciled
+    );
+    assert_eq!(restored.records().iter().filter(|record| matches!(&record.kind,
+        live::journal::RecordKind::Ledger { event } if matches!(event.kind, binary_alpha_engine::execution::EventKind::Settled { .. }))).count(), 1);
+    assert!(completed.manifest.open_tail.is_some());
+    assert!(
+        completed
+            .receipt
+            .dimensions
+            .iter()
+            .any(|dimension| dimension.name == "contract_timing")
+    );
+}
+
+#[test]
+fn pocket_duplicate_request_id_in_statement_keeps_claim_unresolved() {
+    use live::control::{ClaimState, Control, LeaseKey};
+    let (fixture, control, request_id) = pocket_written_claim("phase12-pocket-duplicate-id");
+    let restart = RecordedConnector::from_jsonl(&pocket_duplicate_restart_log(request_id)).unwrap();
+    let mut restored =
+        pocket_runtime(&fixture, live::Mode::Live, &restart, control.clone()).unwrap();
+    restored.run_until(|_| restart.exhausted()).unwrap();
+    let key = LeaseKey {
+        broker: "pocket_option",
+        account: "a0",
+    };
+    assert_ne!(
+        control.clone().retained_claims(key).unwrap()[0].state,
+        ClaimState::Reconciled
+    );
+    assert_eq!(restored.engine().accounts()[0].open, 1);
+    assert!(
+        matches!(&restored.health().entries, live::Entries::Disabled(reason) if reason.contains("unresolved"))
+    );
+}
+
+#[test]
+fn pocket_contradictory_statement_facts_keep_claim_unresolved() {
+    use live::control::{ClaimState, Control, LeaseKey};
+    let (fixture, control, request_id) = pocket_written_claim("phase12-pocket-contradictory");
+    let restart =
+        RecordedConnector::from_jsonl(&pocket_contradictory_restart_log(request_id)).unwrap();
+    let mut restored =
+        pocket_runtime(&fixture, live::Mode::Live, &restart, control.clone()).unwrap();
+    restored.run_until(|_| restart.exhausted()).unwrap();
+    let key = LeaseKey {
+        broker: "pocket_option",
+        account: "a0",
+    };
+    assert_ne!(
+        control.clone().retained_claims(key).unwrap()[0].state,
+        ClaimState::Reconciled
+    );
+    assert_eq!(restored.engine().accounts()[0].open, 1);
+    assert!(
+        matches!(&restored.health().entries, live::Entries::Disabled(reason) if reason.contains("unresolved"))
+    );
+}
+
+#[test]
+fn pocket_partial_empty_statement_does_not_infer_a_loss() {
+    use live::control::{ClaimState, Control, LeaseKey};
+    let (fixture, control, request_id) = pocket_written_claim("phase12-pocket-partial-empty");
+    let restart = RecordedConnector::from_jsonl(&pocket_empty_restart_log(request_id)).unwrap();
+    let mut restored =
+        pocket_runtime(&fixture, live::Mode::Live, &restart, control.clone()).unwrap();
+    restored.run_until(|_| restart.exhausted()).unwrap();
+    let key = LeaseKey {
+        broker: "pocket_option",
+        account: "a0",
+    };
+    assert_ne!(
+        control.clone().retained_claims(key).unwrap()[0].state,
+        ClaimState::Reconciled
+    );
+    assert_eq!(restored.engine().accounts()[0].open, 1);
+    assert!(!restored.records().iter().any(|record| matches!(&record.kind,
+        live::journal::RecordKind::Ledger { event } if matches!(event.kind, binary_alpha_engine::execution::EventKind::Settled { .. }))));
+}
+
+#[test]
+fn pocket_open_recovery_uses_the_journaled_deal_id() {
+    use live::control::{Control, LeaseKey};
+    let fixture = Fixture::quote("phase12-pocket-open-recovery");
+    let control = live::control::FakeControl::new(QUOTE_START - 2_000_000);
+    let first = RecordedConnector::from_jsonl(&pocket_log()).unwrap();
+    let mut owner = pocket_runtime(&fixture, live::Mode::Replay, &first, control.clone()).unwrap();
+    owner.hook = Some(Box::new(|point| {
+        point == live::Checkpoint::AfterAcknowledgement
+    }));
+    assert!(owner.run_until(|_| first.exhausted()).unwrap().is_none());
+    drop(owner);
+    let (_, prior) = live::journal::Journal::open(
+        &fixture.scratch.path("journal"),
+        &fixture.definition().deployment,
+        16,
+    )
+    .unwrap();
+    let request_id = prior
+        .iter()
+        .find_map(|record| match &record.kind {
+            live::journal::RecordKind::Written { request_id, .. } => *request_id,
+            _ => None,
+        })
+        .unwrap();
+    control.clone().advance(70_000_000);
+    let recorded = RecordedConnector::from_jsonl(&pocket_open_restart_log(request_id)).unwrap();
+    let mut restored =
+        pocket_runtime(&fixture, live::Mode::Live, &recorded, control.clone()).unwrap();
+    restored.run_until(|_| recorded.exhausted()).unwrap();
+    let key = LeaseKey {
+        broker: "pocket_option",
+        account: "a0",
+    };
+    assert_eq!(control.clone().unresolved(key).unwrap().len(), 1);
+    assert_eq!(restored.engine().accounts()[0].open, 1);
+    assert_eq!(restored.engine().accounts()[0].cash.to_string(), "9999.00");
+    assert!(
+        matches!(&restored.health().entries, live::Entries::Disabled(reason) if !reason.contains("uncorrelated liability"))
+    );
+}
+
+#[test]
 fn replay_decode_failure_is_returned_before_final_publication() {
     let fixture = Fixture::new("live-malformed-tail");
     let log = matching_log() + &super::support::log_line("market", START + 5_000_000, "{malformed");
@@ -1062,7 +1663,7 @@ fn mixing_scenario_terms_across_bindings_is_refused() {
         .unwrap()
         .unwrap();
     let binding = &runtime.definition.policy.replay.bindings[1];
-    assert!(runtime.records().iter().any(|record| matches!(&record.kind,live::journal::RecordKind::Refused {binding:id,proposal:Some(_),reason} if *id == binding.id && *reason == format!("offer differs from exact baseline {}",binding.contract))));
+    assert!(runtime.records().iter().any(|record| matches!(&record.kind,live::journal::RecordKind::Refused {binding:id,proposal:Some(_),reason,..} if *id == binding.id && *reason == format!("offer differs from exact baseline {}",binding.contract))));
     assert_eq!(
         completed.receipt.dimensions[1].status,
         live::receipt::Status::OutsideEnvelope

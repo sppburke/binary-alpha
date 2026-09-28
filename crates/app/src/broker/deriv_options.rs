@@ -22,6 +22,8 @@ const MEASURED_CONTRACT_TYPES: [&str; 2] = ["CALL", "PUT"];
 
 #[derive(Debug, Clone)]
 pub struct StatementRow {
+    pub request_id: Option<u64>,
+    pub pocket: Option<crate::broker::pocket_options::Deal>,
     pub instrument: Option<String>,
     pub direction: Option<Direction>,
     pub cash: CashFact,
@@ -825,6 +827,8 @@ impl DerivOptions {
                     return Err("deriv statement: transaction outside requested range".into());
                 }
                 facts.push(StatementRow {
+                    request_id: None,
+                    pocket: None,
                     instrument: t.underlying_symbol,
                     direction: t.contract_type.as_deref().map(direction).transpose()?,
                     receipt_micros: response.receipt_micros,
@@ -881,7 +885,9 @@ pub fn to_observation(
     command_of: &dyn Fn(&str) -> Option<String>,
 ) -> Option<execution::Observation> {
     Some(match event {
-        AccountEvent::TransactionAcknowledged => return None,
+        AccountEvent::TransactionAcknowledged
+        | AccountEvent::Listing { .. }
+        | AccountEvent::PocketDeal { .. } => return None,
         AccountEvent::Cash {
             fact,
             receipt_micros,
