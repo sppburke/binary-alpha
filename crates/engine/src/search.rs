@@ -753,7 +753,7 @@ pub struct Null {
 }
 
 /// Derives the null from the contract's exact terms, including every fee. The statistic applies
-/// only when `W >= 0`, `L > 0`, and a tie nets exactly zero; `W = 0` gives a break-even of one.
+/// only when `W >= 0`, `L > 0`, and a tie nets zero or exactly `-L`; `W = 0` gives a break-even of one.
 pub fn null_rate(contract: &ContractTerms) -> Result<Null, String> {
     let purchase = contract.purchase()?;
     let net_win = contract.winning_net()?;
@@ -771,8 +771,8 @@ pub fn null_rate(contract: &ContractTerms) -> Result<Null, String> {
     if !net_loss.is_negative() && net_loss.is_zero() || net_loss.is_negative() {
         return Err(format!("net loss {net_loss} is not positive"));
     }
-    if !tie_net.is_zero() {
-        return Err(format!("a tie nets {tie_net}, not zero"));
+    if !tie_net.is_zero() && !ties_lose(contract)? {
+        return Err(format!("a tie nets {tie_net}, not zero or -{net_loss}"));
     }
     let scale = net_win.scale().max(net_loss.scale());
     let win = net_win.rescale(scale)?.coefficient() as f64;
@@ -782,6 +782,19 @@ pub fn null_rate(contract: &ContractTerms) -> Result<Null, String> {
         net_loss,
         break_even: loss / (win + loss),
     })
+}
+
+/// Whether a tie has the same exact net result as a loss under these terms.
+pub(crate) fn ties_lose(contract: &ContractTerms) -> Result<bool, String> {
+    let tie = contract
+        .tie
+        .gross_return
+        .checked_sub(contract.tie.terminal_fee)?;
+    let loss = contract
+        .loss
+        .gross_return
+        .checked_sub(contract.loss.terminal_fee)?;
+    Ok(tie.compare(loss)? == Ordering::Equal)
 }
 
 fn ln_factorial(n: u64) -> f64 {
@@ -1272,18 +1285,25 @@ pub fn screen_compact(
     screen: Option<&Screen>,
 ) -> (u64, Vec<u64>) {
     assert!(!contracts.is_empty(), "a family has at least one contract");
-    let nulls: Vec<_> = contracts.iter().map(null_rate).collect();
+    let nulls: Vec<_> = contracts
+        .iter()
+        .map(|contract| null_rate(contract).and_then(|null| Ok((null, ties_lose(contract)?))))
+        .collect();
     let mut applicable = Vec::new();
     let mut scores = Vec::new();
     for (index, record) in records.iter_mut().enumerate() {
         record.adjusted = None;
-        record.score = nulls[index % contracts.len()].as_ref().ok().map(|null| {
-            upper_tail(
-                record.raw.wins.max(0) as u64,
-                record.raw.losses.max(0) as u64,
-                null.break_even,
-            )
-        });
+        record.score = nulls[index % contracts.len()]
+            .as_ref()
+            .ok()
+            .map(|(null, ties_lose)| {
+                upper_tail(
+                    record.raw.wins.max(0) as u64,
+                    (record.raw.losses + if *ties_lose { record.raw.ties } else { 0 }).max(0)
+                        as u64,
+                    null.break_even,
+                )
+            });
         if let Some(score) = record.score {
             applicable.push(index);
             scores.push(score);
@@ -1747,6 +1767,7 @@ mod tests {
         let contracts = [
             contract("1", "0", "1.80", "1"),
             contract("1", "0", "1.80", "0.95"),
+            contract("1", "0", "1.80", "0"),
         ];
         let screens = [
             None,
@@ -1769,16 +1790,17 @@ mod tests {
                         state ^= state << 17;
                         let wins = (state % 32) as i64;
                         let losses = ((state >> 8) % 32) as i64;
+                        let ties = ((state >> 16) % 8) as i64;
                         Member {
                             global_index: None,
                             logic_identity: String::new(),
                             conditions: Vec::new(),
                             contract: String::new(),
                             raw: RawCounts {
-                                total: wins + losses,
+                                total: wins + losses + ties,
                                 wins,
                                 losses,
-                                ties: 0,
+                                ties,
                                 invalid: 0,
                             },
                             null: None,
@@ -2094,6 +2116,13 @@ mod tests {
                 .break_even,
             1.0 / 1.8
         );
+        let refund = null_rate(&contract("1", "0", "1.80", "1")).unwrap();
+        let losing = null_rate(&contract("1", "0", "1.80", "0")).unwrap();
+        assert_eq!(losing, refund);
+        assert_eq!(
+            serde_json::to_vec(&losing).unwrap(),
+            serde_json::to_vec(&refund).unwrap()
+        );
         let zero_win = null_rate(&contract("1", "0", "1", "1")).unwrap();
         assert_eq!(zero_win.break_even, 1.0);
         assert_eq!(upper_tail(5, 5, zero_win.break_even), 1.0);
@@ -2103,8 +2132,31 @@ mod tests {
         );
         assert_eq!(
             null_rate(&contract("1", "0", "1.80", "0.95")).unwrap_err(),
-            "a tie nets -0.05, not zero"
+            "a tie nets -0.05, not zero or -1"
         );
+    }
+
+    #[test]
+    fn loss_equivalent_ties_are_scored_as_losses_without_changing_raw_counts() {
+        let raw = RawCounts {
+            total: 10,
+            wins: 6,
+            losses: 2,
+            ties: 2,
+            invalid: 0,
+        };
+        let contracts = [
+            contract("1", "0", "1.64", "1"),
+            contract("1", "0", "1.64", "0"),
+        ];
+        let mut records = vec![
+            CompactMember::new(raw.clone()),
+            CompactMember::new(raw.clone()),
+        ];
+        assert_eq!(screen_compact(&mut records, &contracts, None).0, 2);
+        assert_eq!(records[0].score, Some(upper_tail(6, 2, 1.0 / 1.64)));
+        assert_eq!(records[1].score, Some(upper_tail(6, 4, 1.0 / 1.64)));
+        assert_eq!(records[1].raw, raw);
     }
 
     #[test]

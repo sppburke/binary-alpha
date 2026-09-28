@@ -37,6 +37,15 @@ fn transitions(year: i64) -> (Date, Date) {
     )
 }
 impl Zone {
+    fn parse(text: &str) -> Result<Self, String> {
+        match text {
+            "UTC" => Ok(Self::Utc),
+            "America/New_York" => Ok(Self::NewYork),
+            _ => Err(err(format!(
+                "unsupported timezone `{text}`; supported zones: UTC, America/New_York"
+            ))),
+        }
+    }
     fn check_date(self, day: Date) -> Result<(), String> {
         let (year, _, _) = civil_from_days(day);
         if matches!(self, Self::NewYork) && year < 2007 {
@@ -108,6 +117,35 @@ impl Zone {
     }
 }
 use serde::{Deserialize, Serialize};
+
+/// A half-open local-clock window for decisions at UTC instants.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DailyWindow {
+    pub timezone: String,
+    pub start: String,
+    pub end: String,
+}
+
+impl DailyWindow {
+    pub fn validate(&self) -> Result<(), String> {
+        Zone::parse(&self.timezone)?;
+        if clock(&self.start)? >= clock(&self.end)? {
+            return Err("start must be before end".into());
+        }
+        Ok(())
+    }
+
+    pub fn contains(&self, at: i64) -> Result<bool, String> {
+        let zone = Zone::parse(&self.timezone)?;
+        let seconds = at
+            .div_euclid(SECOND_MICROS)
+            .checked_add(zone.offset_at(at)?)
+            .ok_or_else(|| err("date overflow"))?
+            .rem_euclid(DAY);
+        Ok(clock(&self.start)? <= seconds && seconds < clock(&self.end)?)
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
@@ -220,15 +258,7 @@ impl Session {
             early_closes,
         } = self
         {
-            calendar.zone = match timezone.as_str() {
-                "UTC" => Zone::Utc,
-                "America/New_York" => Zone::NewYork,
-                _ => {
-                    return Err(err(format!(
-                        "unsupported timezone `{timezone}`; supported zones: UTC, America/New_York"
-                    )));
-                }
-            };
+            calendar.zone = Zone::parse(timezone)?;
             let (open, close) = (boundary(open)?, boundary(close)?);
             if open == close {
                 return Err(err(
@@ -361,6 +391,52 @@ impl Calendar {
 mod tests {
     use super::*;
     use crate::market::parse_event_time_micros as t;
+
+    #[test]
+    fn daily_window_uses_local_half_open_clock_through_dst() {
+        let window = DailyWindow {
+            timezone: "America/New_York".into(),
+            start: "01:00:00".into(),
+            end: "02:00:00".into(),
+        };
+        window.validate().unwrap();
+        for inside in [
+            "2026-03-08T06:00:00Z",
+            "2026-11-01T05:00:00Z",
+            "2026-11-01T06:00:00Z",
+            "2026-11-01T06:59:59Z",
+        ] {
+            assert!(window.contains(t(inside).unwrap()).unwrap(), "{inside}");
+        }
+        for outside in ["2026-03-08T07:00:00Z", "2026-11-01T07:00:00Z"] {
+            assert!(!window.contains(t(outside).unwrap()).unwrap(), "{outside}");
+        }
+        let utc = DailyWindow {
+            timezone: "UTC".into(),
+            start: "08:00:00".into(),
+            end: "15:59:58".into(),
+        };
+        assert!(!utc.contains(t("2026-01-01T07:59:59Z").unwrap()).unwrap());
+        assert!(utc.contains(t("2026-01-01T08:00:00Z").unwrap()).unwrap());
+        assert!(!utc.contains(t("2026-01-01T15:59:58Z").unwrap()).unwrap());
+        for invalid in [
+            DailyWindow {
+                timezone: "Europe/London".into(),
+                ..utc.clone()
+            },
+            DailyWindow {
+                start: "15:59:58".into(),
+                end: "08:00:00".into(),
+                ..utc.clone()
+            },
+            DailyWindow {
+                start: "8:00:00".into(),
+                ..utc
+            },
+        ] {
+            assert!(invalid.validate().is_err());
+        }
+    }
     fn fx() -> Session {
         Session::Weekly {
             timezone: "America/New_York".into(),

@@ -23,6 +23,7 @@ use binary_alpha_engine::execution::{
 };
 use binary_alpha_engine::features::{FeatureManifest, FittedEncoding, Kind, ProjectionKind, Value};
 use binary_alpha_engine::market::{Currency, format_event_time_micros};
+use binary_alpha_engine::session::DailyWindow;
 use common::current::import;
 use common::*;
 
@@ -711,6 +712,96 @@ fn definition(edit: impl FnOnce(&mut Replay)) -> RunDefinition {
         availability: "test_live".into(),
         replay,
         instruments: vec![instrument("b:X", '1', "plan")],
+    }
+}
+
+#[test]
+fn daily_window_skips_outside_decisions_and_rejects_forged_signals() {
+    let definition = definition(|replay| {
+        replay.risk_policies[0].daily_window = Some(DailyWindow {
+            timezone: "UTC".into(),
+            start: "00:00:00".into(),
+            end: "00:00:01".into(),
+        });
+        replay.risk_policies[0].max_feature_age_micros = 2_000_000;
+        replay.risk_policies[0].max_quote_age_micros = 2_000_000;
+    });
+    let mut outside = Engine::new(definition.clone()).unwrap();
+    outside.drain();
+    outside
+        .step(
+            1_000_010,
+            vec![tick(1_000_010, 100), row(0, 1_000_010, 1_000_010, true)],
+        )
+        .unwrap();
+    assert!(
+        !outside
+            .drain()
+            .iter()
+            .any(|event| matches!(event.kind, EventKind::Signal { .. }))
+    );
+
+    let mut inside = Engine::new(definition).unwrap();
+    let mut ledger = inside.drain();
+    inside
+        .step(10, vec![tick(10, 100), row(0, 10, 10, true)])
+        .unwrap();
+    let mut signals = inside.drain();
+    assert_eq!(
+        signals
+            .iter()
+            .filter(|event| matches!(event.kind, EventKind::Signal { .. }))
+            .count(),
+        1
+    );
+    ledger.append(&mut signals);
+    let signal = ledger
+        .iter_mut()
+        .find(|event| matches!(event.kind, EventKind::Signal { .. }))
+        .unwrap();
+    signal.time_micros = 1_000_010;
+    let error = Engine::restore(ledger.iter().map(|event| Ok(event.to_line())))
+        .err()
+        .unwrap();
+    assert!(
+        error.contains("clocks its decision could not have seen"),
+        "{error}"
+    );
+}
+
+#[test]
+fn mixed_tie_terms_require_an_unambiguous_summary_at_the_projector() {
+    use binary_alpha_engine::portfolio::{Gates, project};
+    let definition = definition(|replay| {
+        let mut strict = replay.contracts[0].clone();
+        strict.id = "strict".into();
+        strict.tie.gross_return = decimal("0");
+        replay.contracts.push(strict);
+    });
+    let gates: Gates = serde_json::from_value(serde_json::json!({
+        "min_settled":1, "max_unresolved":0, "min_profit":"-100",
+        "max_drawdown":"100", "min_decisive":1
+    }))
+    .unwrap();
+    for (exit_price, expected_ties) in [(500, 1), (520, 0)] {
+        let mut live = Live::new(definition.clone());
+        live.simulate(10, vec![tick(10, 500), row(0, 10, 10, true)]);
+        live.step(20, vec![tick(20, exit_price)]);
+        let restored = Engine::restore(live.lines.iter().cloned().map(Ok)).unwrap();
+        assert_eq!(restored.summary().portfolio.ties, expected_ties);
+        if expected_ties > 0 {
+            assert!(
+                project(&restored, &gates)
+                    .unwrap_err()
+                    .contains("mixed tie terms")
+            );
+        } else {
+            let projection = project(&restored, &gates).unwrap();
+            assert_eq!(
+                (projection.wins, projection.losses, projection.ties),
+                (Some(1), Some(0), Some(0))
+            );
+        }
     }
 }
 

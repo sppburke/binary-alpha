@@ -1909,7 +1909,7 @@ inter-arrival), `no_proposal` or `stale_proposal` for broker-authoritative bindi
 (the envelope), `capacity_strategy`, `capacity_duration`, `capacity_instrument`,
 `capacity_account`, `capacity_total` (the prospective count may equal a maximum), `insufficient_cash`,
 `unresolved_loss_account`, `unresolved_loss_total`, `conversion_unavailable`, or `admitted`; the
-record names the rate identities a total unresolved-loss conversion used. No signal is evaluated before `decision_start` or at or after `decision_end`; ticks and confirmations
+record names the rate identities a total unresolved-loss conversion used. A risk policy may set `daily_window = { timezone, start, end }`, with `timezone` either `UTC` or `America/New_York` and `start < end` in `HH:MM:SS`. A decision belongs when its UTC instant's local clock is in `[start, end)`; the skipped spring hour has no instants and both repeated autumn hours are tested. No signal is evaluated before `decision_start`, at or after `decision_end`, or outside its binding policy's daily window; restored signals obey the same limits. Ticks and confirmations
 after `decision_end` still settle existing obligations. Split labels follow the decision time and
 stay with the obligation through settlement.
 
@@ -2237,10 +2237,10 @@ free and pool memory around tuple preallocation. These diagnostic fields are out
 configuration hash, family generation, and published `family.json` identity.
 
 The statistic of a member applies when `W = winning_net() >= 0`,
-`L = purchase() + loss.terminal_fee - loss.gross_return > 0`, and the tie nets exactly zero,
+`L = purchase() + loss.terminal_fee - loss.gross_return > 0`, and the tie nets exactly zero or `-L`,
 with `p0 = L / (W + L)` from the aligned coefficients; `W = 0` or zero decisive trials gives score
 one, and an inapplicable member records its reason. The score is the one-sided exact binomial
-upper tail on decisive counts summed in log space away from the mode; the adjusted value is the
+upper tail on wins against losses plus loss-equivalent ties, summed in log space away from the mode; the adjusted value is the
 reverse cumulative minimum of `min(1, m * p / rank)` after sorting by score then member order
 over the applicable members. Heuristic scope screens members whose adjusted value exceeds
 `max_adjusted_score`, beyond the first `top` by raw score, breaking ties by global member index,
@@ -2411,7 +2411,7 @@ canonical identity ascending, writing one-based ranks; the first is selected. No
 profit, score or admission flag prunes.
 
 When any decisive gate is configured, the projection also records wins, losses, and ties.
-Only wins and losses are decisive: zero decisive trades or fewer than the minimum fails for
+A tie that nets exactly the contract's loss is projected as a loss when every replay contract has that tie term. If replay contracts mix tie terms and the summary holds ties, decisive gates fail because the summary cannot allocate those ties by contract. Refund ties remain ties. Only wins and projected losses are decisive: zero decisive trades or fewer than the minimum fails for
 insufficient evidence, even when ties satisfy `min_settled`. The minimum is `min_decisive`, or
 with `min_decisive_per_day` the larger of it and `ceil(min_decisive_per_day × window / 1 day)`
 over the gated replay's own decision window, recorded as `decisive_minimum`. With sufficient

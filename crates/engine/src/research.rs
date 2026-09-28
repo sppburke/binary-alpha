@@ -2610,6 +2610,13 @@ mod tests {
         result.losses = Some(1);
         result.ties = Some(1);
         assert_eq!(verdict(&result, &gates), Verdict::Pass);
+        // The shared projector has already folded a strict tie into the loss count.
+        result.losses = Some(2);
+        result.ties = Some(0);
+        assert!(matches!(
+            verdict(&result, &gates),
+            Verdict::EconomicFailure { .. }
+        ));
         result.wins = Some(0);
         result.losses = Some(0);
         gates.min_decisive = None;
