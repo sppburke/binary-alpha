@@ -80,6 +80,10 @@ pub enum RecordKind {
     Discontinuity {
         reason: String,
     },
+    PocketCorrelation {
+        deal_id: String,
+        correlated: bool,
+    },
 }
 
 /// Local-only unfinished segment identity; this is not a cloud restore reference.

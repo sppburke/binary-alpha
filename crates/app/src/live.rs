@@ -728,6 +728,7 @@ pub struct Runtime {
     continuity: Continuity,
     contracts: BTreeMap<String, String>,
     uncorrelated_pocket: BTreeSet<String>,
+    pocket_closed: BTreeMap<String, String>,
     claims: BTreeMap<String, Claim>,
     subscribed: BTreeSet<String>,
     subscriptions_pending: BTreeSet<String>,
@@ -917,7 +918,9 @@ impl Runtime {
                 if records.iter().any(|record| {
                     !matches!(
                         record.kind,
-                        RecordKind::Started { .. } | RecordKind::Discontinuity { .. }
+                        RecordKind::Started { .. }
+                            | RecordKind::Discontinuity { .. }
+                            | RecordKind::PocketCorrelation { .. }
                     )
                 }) {
                     return Err("live: journal has financial records without a ledger".into());
@@ -953,6 +956,20 @@ impl Runtime {
         }
         let now = clock.now_micros();
         let account_class = options.account().class;
+        let uncorrelated_pocket = records.iter().fold(BTreeSet::new(), |mut ids, record| {
+            if let RecordKind::PocketCorrelation {
+                deal_id,
+                correlated,
+            } = &record.kind
+            {
+                if *correlated {
+                    ids.remove(deal_id);
+                } else {
+                    ids.insert(deal_id.clone());
+                }
+            }
+            ids
+        });
         if let Some(scheduler) = &scheduler {
             scheduler.complete();
         }
@@ -1045,7 +1062,8 @@ impl Runtime {
             control_time: i64::MIN,
             continuity: Continuity::default(),
             contracts: BTreeMap::new(),
-            uncorrelated_pocket: BTreeSet::new(),
+            uncorrelated_pocket,
+            pocket_closed: BTreeMap::new(),
             claims: BTreeMap::new(),
             subscribed: BTreeSet::new(),
             subscriptions_pending: BTreeSet::new(),
@@ -1065,6 +1083,10 @@ impl Runtime {
             runtime.workers.sender.take();
         }
         if mode != Mode::Replay {
+            runtime.veto(
+                "broker portfolio contains an uncorrelated liability",
+                !runtime.uncorrelated_pocket.is_empty(),
+            );
             runtime.restore_due();
             runtime.compatibility()?;
         }
@@ -1145,10 +1167,6 @@ impl Runtime {
     }
     pub fn health(&self) -> &Health {
         &self.health
-    }
-    #[doc(hidden)]
-    pub fn install_authorization_probe(&mut self, probe: AuthorizationProbe) {
-        self.authorization_probe_handle().install(probe);
     }
     #[doc(hidden)]
     pub fn authorization_probe_handle(&self) -> AuthorizationProbeHandle {

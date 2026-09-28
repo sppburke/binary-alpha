@@ -198,8 +198,18 @@ impl Runtime {
         if closed && deal.close_time(clock_offset)? < start {
             return Ok(());
         }
+        if closed {
+            let fact = serde_json::to_string(&deal).map_err(|error| error.to_string())?;
+            if self
+                .pocket_closed
+                .insert(deal.id.clone(), fact.clone())
+                .is_some_and(|previous| previous != fact)
+            {
+                self.veto("pocket deal contradicts earlier close", true);
+            }
+        }
         if !self.contracts.contains_key(&deal.id) {
-            self.uncorrelated_pocket.insert(deal.id.clone());
+            self.pocket_correlation(&deal.id, false)?;
             self.veto("broker portfolio contains an uncorrelated liability", true);
             return Ok(());
         }
@@ -235,6 +245,20 @@ impl Runtime {
                 }
             }
             self.step(observations)?;
+        }
+        Ok(())
+    }
+    fn pocket_correlation(&mut self, deal_id: &str, correlated: bool) -> Result<(), String> {
+        if self.uncorrelated_pocket.contains(deal_id) == correlated {
+            self.record(RecordKind::PocketCorrelation {
+                deal_id: deal_id.to_owned(),
+                correlated,
+            })?;
+            if correlated {
+                self.uncorrelated_pocket.remove(deal_id);
+            } else {
+                self.uncorrelated_pocket.insert(deal_id.to_owned());
+            }
         }
         Ok(())
     }
@@ -346,8 +370,7 @@ impl Runtime {
                 } else if self.broker_kind == crate::broker::BrokerKind::PocketOption {
                     for contract in &contracts {
                         if !self.contracts.contains_key(&contract.contract_ref) {
-                            self.uncorrelated_pocket
-                                .insert(contract.contract_ref.clone());
+                            self.pocket_correlation(&contract.contract_ref, false)?;
                         }
                     }
                     self.veto(
@@ -1041,7 +1064,7 @@ impl Runtime {
                         self.subscribe_contract(&deal.id)?;
                     }
                     self.pocket_deal(deal.clone(), true, row.receipt_micros)?;
-                    self.uncorrelated_pocket.remove(&deal.id);
+                    self.pocket_correlation(&deal.id, true)?;
                 }
                 continue;
             }
@@ -1064,7 +1087,7 @@ impl Runtime {
                 if agreed {
                     self.contracts
                         .insert(contract.contract_ref.clone(), claim.command.clone());
-                    self.uncorrelated_pocket.remove(&contract.contract_ref);
+                    self.pocket_correlation(&contract.contract_ref, true)?;
                     self.step(vec![Observation::ContractUpdate {
                         command: claim.command.clone(),
                         source: self
@@ -1089,13 +1112,12 @@ impl Runtime {
                 && !matched_deals.contains(&deal.id)
                 && !self.contracts.contains_key(&deal.id)
             {
-                self.uncorrelated_pocket.insert(deal.id.clone());
+                self.pocket_correlation(&deal.id, false)?;
             }
         }
         for contract in contracts {
             if !self.contracts.contains_key(&contract.contract_ref) {
-                self.uncorrelated_pocket
-                    .insert(contract.contract_ref.clone());
+                self.pocket_correlation(&contract.contract_ref, false)?;
             }
         }
         self.veto(

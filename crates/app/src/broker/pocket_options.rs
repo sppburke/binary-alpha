@@ -300,14 +300,12 @@ pub struct PocketOptions {
     events: VecDeque<AccountEvent>,
     listings: BTreeMap<String, Listing>,
     opened: Vec<Deal>,
-    closed: BTreeMap<String, Vec<Deal>>,
-    balance: Option<(Decimal, i64)>,
-    last_fact_receipt: i64,
+    closed: BTreeMap<(String, String), Deal>,
+    balance: Option<Decimal>,
     written: BTreeSet<String>,
     request_ids: BTreeSet<u64>,
     next_request_id: u64,
     seen_open: BTreeSet<(String, String)>,
-    seen_closed: BTreeSet<(String, String)>,
 }
 
 impl PocketOptions {
@@ -358,12 +356,10 @@ impl PocketOptions {
             opened: Vec::new(),
             closed: BTreeMap::new(),
             balance: None,
-            last_fact_receipt: i64::MIN,
             written: BTreeSet::new(),
             request_ids: BTreeSet::new(),
             next_request_id: 10_000_000 + seed,
             seen_open: BTreeSet::new(),
-            seen_closed: BTreeSet::new(),
         };
         session.handshake(&credential_json)?;
         Ok(session)
@@ -445,7 +441,7 @@ impl PocketOptions {
                     if balance.is_demo != 1 {
                         return Err("pocket options: server account class mismatch".into());
                     }
-                    self.balance = Some((balance.balance.require_number()?, event.receipt_micros));
+                    self.balance = Some(balance.balance.require_number()?);
                     class = true;
                 }
                 "updateAssets" if connected => {
@@ -519,7 +515,7 @@ impl PocketOptions {
                 if balance.is_demo != 1 {
                     return Err("pocket options: server account class mismatch".into());
                 }
-                self.balance = Some((balance.balance.require_number()?, event.receipt_micros));
+                self.balance = Some(balance.balance.require_number()?);
             }
             "updateOpenedDeals" => {
                 let deals: Vec<Deal> = serde_json::from_slice(&event.raw)
@@ -533,7 +529,7 @@ impl PocketOptions {
                         deal.id.clone(),
                         serde_json::to_string(deal).map_err(|e| e.to_string())?,
                     )) {
-                        self.last_fact_receipt = self.last_fact_receipt.max(event.receipt_micros);
+                        self.balance = None;
                         self.events.push_back(AccountEvent::PocketDeal {
                             deal: deal.clone(),
                             closed: false,
@@ -551,15 +547,18 @@ impl PocketOptions {
                     if let Some(id) = deal.request_id {
                         self.request_ids.insert(id);
                     }
-                    if self.seen_closed.insert((
-                        deal.id.clone(),
-                        serde_json::to_string(deal).map_err(|e| e.to_string())?,
-                    )) {
-                        self.last_fact_receipt = self.last_fact_receipt.max(event.receipt_micros);
-                        self.closed
-                            .entry(deal.id.clone())
-                            .or_default()
-                            .push(deal.clone());
+                    if self
+                        .closed
+                        .insert(
+                            (
+                                deal.id.clone(),
+                                serde_json::to_string(deal).map_err(|e| e.to_string())?,
+                            ),
+                            deal.clone(),
+                        )
+                        .is_none()
+                    {
+                        self.balance = None;
                         self.events.push_back(AccountEvent::PocketDeal {
                             deal: deal.clone(),
                             closed: true,
@@ -589,14 +588,18 @@ impl PocketOptions {
                         self.request_ids.insert(id);
                     }
                     self.opened.retain(|opened| opened.id != deal.id);
-                    if self.seen_closed.insert((
-                        deal.id.clone(),
-                        serde_json::to_string(&deal).map_err(|e| e.to_string())?,
-                    )) {
-                        self.closed
-                            .entry(deal.id.clone())
-                            .or_default()
-                            .push(deal.clone());
+                    if self
+                        .closed
+                        .insert(
+                            (
+                                deal.id.clone(),
+                                serde_json::to_string(&deal).map_err(|e| e.to_string())?,
+                            ),
+                            deal.clone(),
+                        )
+                        .is_none()
+                    {
+                        self.balance = None;
                         self.events.push_back(AccountEvent::PocketDeal {
                             deal,
                             closed: true,
@@ -604,7 +607,6 @@ impl PocketOptions {
                         });
                     }
                 }
-                self.last_fact_receipt = self.last_fact_receipt.max(event.receipt_micros);
             }
             "successopenOrder" => {
                 let deal: Deal = serde_json::from_slice(&event.raw)
@@ -615,7 +617,7 @@ impl PocketOptions {
                 }
                 self.opened.retain(|opened| opened.id != deal.id);
                 self.opened.push(deal.clone());
-                self.last_fact_receipt = self.last_fact_receipt.max(event.receipt_micros);
+                self.balance = None;
                 return Ok(Some(deal));
             }
             _ => (),
@@ -628,11 +630,7 @@ impl PocketOptions {
     }
     pub fn balance(&mut self) -> Result<Decimal, String> {
         let deadline = self.clock.now_micros().saturating_add(12_000_000);
-        while self
-            .balance
-            .as_ref()
-            .is_none_or(|(_, at)| *at < self.last_fact_receipt)
-        {
+        while self.balance.is_none() {
             let event = self
                 .receive(deadline.saturating_sub(self.clock.now_micros()).max(0))?
                 .ok_or("pocket options: balance snapshot unavailable")?;
@@ -644,7 +642,7 @@ impl PocketOptions {
                 });
             }
         }
-        Ok(self.balance.as_ref().unwrap().0)
+        Ok(self.balance.unwrap())
     }
     pub fn prepare_purchase(&mut self, prepared: &PreparedPurchase) -> Result<Encoded, String> {
         let offer = prepared
@@ -859,7 +857,6 @@ impl PocketOptions {
         let rows = self
             .closed
             .values()
-            .flatten()
             .map(|deal| {
                 Ok(super::deriv::StatementRow {
                     request_id: deal.request_id,
@@ -934,12 +931,10 @@ mod tests {
             opened: Vec::new(),
             closed: BTreeMap::new(),
             balance: None,
-            last_fact_receipt: i64::MIN,
             written: BTreeSet::new(),
             request_ids: BTreeSet::new(),
             next_request_id: 10_000_000,
             seen_open: BTreeSet::new(),
-            seen_closed: BTreeSet::new(),
         }
     }
     fn deal(id: &str, asset: &str, close_price: &str, profit: &str) -> Value {
@@ -1045,15 +1040,14 @@ mod tests {
                 json!({"isDemo":1,"balance":100}),
             ))
             .unwrap();
-        let mut fact = event(
+        let fact = event(
             "updateOpenedDeals",
             json!([deal("synthetic-open", "TEST", "1.00100", "0")]),
         );
-        fact.receipt_micros += 1;
         account.ingest(fact).unwrap();
         assert!(account.balance().is_err());
         let mut later = event("successupdateBalance", json!({"isDemo":1,"balance":90}));
-        later.receipt_micros += 2;
+        later.receipt_micros += 1;
         account.ingest(later).unwrap();
         assert_eq!(account.balance().unwrap().to_string(), "90");
     }

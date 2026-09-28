@@ -708,15 +708,23 @@ pub fn pocket_old_foreign_open_log() -> String {
 pub fn pocket_new_fact_balance_log() -> String {
     pocket_authorization_wait_log()
         .lines()
-        .map(|line| {
-            let mut row: Value = serde_json::from_str(line).unwrap();
-            if row["session"] == "account" && row["at"] == QUOTE_START - 1_000_000 {
-                row["frame"] = json!(pocket_event(
-                    "successupdateBalance",
-                    json!({"isDemo":1,"balance":9999})
-                ));
+        .flat_map(|line| {
+            let row: Value = serde_json::from_str(line).unwrap();
+            if row["session"] == "account"
+                && row["frame"]
+                    .as_str()
+                    .is_some_and(|frame| frame.contains("updateClosedDeals"))
+            {
+                return vec![
+                    pocket_line(
+                        "account",
+                        row["at"].as_i64().unwrap(),
+                        &pocket_event("successupdateBalance", json!({"isDemo":1,"balance":9999})),
+                    ),
+                    format!("{row}\n"),
+                ];
             }
-            format!("{row}\n")
+            vec![format!("{row}\n")]
         })
         .collect()
 }
@@ -740,6 +748,32 @@ pub fn pocket_bad_live_close_log() -> String {
         "account",
         QUOTE_START + 30_500_000,
         &pocket_event("successupdateBalance", json!({"isDemo":1,"balance":9999})),
+    ));
+    log
+}
+pub fn pocket_changed_close_log() -> String {
+    let mut log = pocket_log()
+        .lines()
+        .take_while(|line| !line.contains("10000.92"))
+        .map(|line| format!("{line}\n"))
+        .collect::<String>();
+    let changed = json!({"id":"synthetic-one","asset":shared::SYMBOLS[0],"command":1,
+        "amount":1,"profit":0.92,"percentProfit":91,"openPrice":1.00644,"closePrice":1.00500,
+        "openTimestamp":QUOTE_START/1_000_000,"openMs":600,
+        "closeTimestamp":QUOTE_START/1_000_000+30,"closeMs":200,
+        "isDemo":1,"currency":"USD","requestId":11111111,"optionType":100});
+    log.push_str(&pocket_line(
+        "account",
+        QUOTE_START + 30_500_000,
+        &pocket_event("updateClosedDeals", json!([changed])),
+    ));
+    log.push_str(&pocket_line(
+        "account",
+        QUOTE_START + 30_600_000,
+        &pocket_event(
+            "successupdateBalance",
+            json!({"isDemo":1,"balance":10000.92}),
+        ),
     ));
     log
 }
@@ -840,6 +874,12 @@ pub fn pocket_empty_restart_log(request_id: u64) -> String {
 }
 pub fn pocket_foreign_partial_restart_log(request_id: u64) -> String {
     pocket_restart_log_with(request_id, 4)
+}
+pub fn pocket_foreign_exact_restart_log(request_id: u64) -> String {
+    pocket_restart_log(request_id).replace("synthetic-one", "synthetic-foreign-close")
+}
+pub fn pocket_foreign_omitting_restart_log(request_id: u64) -> String {
+    pocket_restart_log_with(request_id, 3).replace("10000.92", "9999")
 }
 fn pocket_restart_log_with(request_id: u64, variant: u8) -> String {
     let at = QUOTE_START + 31_000_000;

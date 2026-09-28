@@ -1143,6 +1143,32 @@ fn pocket_live_replay_trades_the_certified_quote_policy() {
         binary_alpha_engine::execution::Disposition::CapacityTotal
     );
     assert!(adjacent[1].2.is_none());
+    let first = ledger
+        .iter()
+        .find_map(|event| match &event.kind {
+            binary_alpha_engine::execution::EventKind::Signal {
+                close_time_micros,
+                proposal: Some(proposal),
+                disposition: binary_alpha_engine::execution::Disposition::Admitted,
+                ..
+            } if *close_time_micros == QUOTE_START + 300_000 => Some(proposal),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(first.spot_units, 100_644);
+    assert_eq!(first.terms.win.gross_return.to_string(), "1.92");
+    assert!(
+        !records
+            .iter()
+            .take_while(|record| !matches!(&record.kind, live::journal::RecordKind::Written { .. }))
+            .any(|record| matches!(
+                &record.kind,
+                live::journal::RecordKind::PocketCorrelation {
+                    correlated: false,
+                    ..
+                }
+            ))
+    );
     let offered = ledger
         .iter()
         .filter_map(|event| match &event.kind {
@@ -1306,6 +1332,9 @@ fn pocket_old_foreign_open_still_vetoes_entries() {
         matches!(&runtime.health().entries, live::Entries::Disabled(reason)
         if reason.contains("uncorrelated liability"))
     );
+    assert!(runtime.records().iter().any(|record| matches!(&record.kind,
+        live::journal::RecordKind::PocketCorrelation { deal_id, correlated: false }
+        if deal_id == "synthetic-old-open")));
     assert!(
         !runtime
             .records()
@@ -1347,6 +1376,36 @@ fn pocket_contradictory_live_close_posts_no_cash_and_vetoes() {
 }
 
 #[test]
+fn pocket_known_close_with_changed_percent_vetoes() {
+    let fixture = Fixture::quote("phase12-pocket-changed-close");
+    let recorded = RecordedConnector::from_jsonl(&pocket_changed_close_log()).unwrap();
+    let mut runtime = pocket_runtime(
+        &fixture,
+        live::Mode::Replay,
+        &recorded,
+        live::control::FakeControl::new(QUOTE_START - 2_000_000),
+    )
+    .unwrap();
+    runtime.run_until(|_| recorded.exhausted()).unwrap();
+    assert_eq!(runtime.engine().accounts()[0].cash.to_string(), "10000.92");
+    assert_eq!(runtime.engine().accounts()[0].open, 0);
+    assert!(
+        matches!(&runtime.health().entries, live::Entries::Disabled(reason)
+        if reason.contains("contradicts earlier close"))
+    );
+    assert_eq!(
+        runtime
+            .records()
+            .iter()
+            .filter(|record| matches!(&record.kind,
+        live::journal::RecordKind::Ledger { event }
+        if matches!(event.kind, binary_alpha_engine::execution::EventKind::Settled { .. })))
+            .count(),
+        1
+    );
+}
+
+#[test]
 fn pocket_new_deal_list_forces_fresh_balance_into_owner() {
     let fixture = Fixture::quote("phase12-pocket-new-fact-balance");
     let recorded = RecordedConnector::from_jsonl(&pocket_new_fact_balance_log()).unwrap();
@@ -1358,11 +1417,8 @@ fn pocket_new_deal_list_forces_fresh_balance_into_owner() {
     )
     .unwrap();
     runtime.run_until(|_| recorded.exhausted()).unwrap();
-    assert!(!runtime.health().balance_reconciled);
-    assert!(
-        matches!(&runtime.health().entries, live::Entries::Disabled(reason)
-        if reason.contains("balance differs"))
-    );
+    assert!(runtime.health().balance_reconciled);
+    assert_eq!(runtime.engine().accounts()[0].cash.to_string(), "10000.00");
     assert!(
         !runtime
             .records()
@@ -1542,6 +1598,10 @@ fn pocket_unapproved_quotes_are_ingested_without_deferred_order() {
     };
     let fixture = Fixture::quote_with_candle("phase12-pocket-auth-wait");
     let recorded = RecordedConnector::from_jsonl(&pocket_granted_after_early_quotes_log()).unwrap();
+    let (first_parked_tx, first_parked_rx) = mpsc::channel();
+    let (first_release_tx, first_release_rx) = mpsc::channel();
+    let (second_parked_tx, second_parked_rx) = mpsc::channel();
+    let (second_release_tx, second_release_rx) = mpsc::channel();
     let (market_parked_tx, market_parked_rx) = mpsc::channel();
     let (market_release_tx, market_release_rx) = mpsc::channel();
     let mut runtime = pocket_runtime_with_market(
@@ -1551,12 +1611,32 @@ fn pocket_unapproved_quotes_are_ingested_without_deferred_order() {
         live::control::FakeControl::new(QUOTE_START - 2_000_000),
         move |inner| {
             Box::new(super::resilience::MarketProbe {
-                inner,
+                inner: Box::new(super::resilience::MarketProbe {
+                    inner: Box::new(super::resilience::MarketProbe {
+                        inner,
+                        panic: false,
+                        gate: None,
+                        consumed: None,
+                        subscribe_gate: None,
+                        frame_gate: Some((
+                            QUOTE_START + 700_000,
+                            market_parked_tx,
+                            market_release_rx,
+                        )),
+                        dropped: Arc::new(AtomicBool::new(false)),
+                    }),
+                    panic: false,
+                    gate: None,
+                    consumed: None,
+                    subscribe_gate: None,
+                    frame_gate: Some((QUOTE_START + 300_000, second_parked_tx, second_release_rx)),
+                    dropped: Arc::new(AtomicBool::new(false)),
+                }),
                 panic: false,
                 gate: None,
                 consumed: None,
                 subscribe_gate: None,
-                frame_gate: Some((QUOTE_START + 700_000, market_parked_tx, market_release_rx)),
+                frame_gate: Some((QUOTE_START, first_parked_tx, first_release_rx)),
                 dropped: Arc::new(AtomicBool::new(false)),
             })
         },
@@ -1592,23 +1672,44 @@ fn pocket_unapproved_quotes_are_ingested_without_deferred_order() {
     .unwrap();
     let (auth_parked_tx, auth_parked_rx) = mpsc::channel();
     let (auth_release_tx, auth_release_rx) = mpsc::channel();
-    runtime.install_authorization_probe(live::AuthorizationProbe {
-        parked: auth_parked_tx,
-        release: auth_release_rx,
-    });
+    runtime
+        .authorization_probe_handle()
+        .install(live::AuthorizationProbe {
+            parked: auth_parked_tx,
+            release: auth_release_rx,
+        });
     let mut auth_parked = false;
+    let mut first_parked = false;
+    let mut second_parked = false;
     let mut market_parked = false;
+    let mut released_first = false;
+    let mut released_second = false;
     let mut released_auth = false;
     let mut released_market = false;
     let mut early_sequence = None;
     runtime
         .run_until(|health| {
             auth_parked |= auth_parked_rx.try_recv().is_ok();
+            first_parked |= first_parked_rx.try_recv().is_ok();
+            second_parked |= second_parked_rx.try_recv().is_ok();
             market_parked |= market_parked_rx.try_recv().is_ok();
-            if auth_parked
-                && market_parked
+            if auth_parked && first_parked && health.authorization_pending && !released_first {
+                first_release_tx.send(()).unwrap();
+                released_first = true;
+            }
+            if released_first
+                && second_parked
+                && health.receipt_sequence >= 2
                 && health.authorization_pending
+                && !released_second
+            {
+                second_release_tx.send(()).unwrap();
+                released_second = true;
+            }
+            if released_second
+                && market_parked
                 && health.receipt_sequence >= 3
+                && health.authorization_pending
                 && !released_auth
             {
                 early_sequence = Some(health.journal_sequence);
@@ -1644,18 +1745,18 @@ fn pocket_unapproved_quotes_are_ingested_without_deferred_order() {
             recorded.exhausted() && released_market
         })
         .unwrap();
-    assert!(released_auth && released_market);
+    assert!(auth_parked && released_first && released_second && released_auth && released_market);
     assert!(
         mixed_seen.load(Ordering::SeqCst),
         "early quote must share a tick with a candle"
     );
     let early_sequence = early_sequence.unwrap();
+    assert!(early_sequence > 0);
     assert_eq!(runtime.health().receipt_sequence, 5);
     assert!(
         runtime
             .records()
             .iter()
-            .filter(|record| record.sequence > early_sequence)
             .filter_map(|record| match &record.kind {
                 live::journal::RecordKind::Ledger { event } => Some(&event.kind),
                 _ => None,
@@ -1931,6 +2032,26 @@ fn pocket_restart_matches_written_request_id_and_settles_closed_deal() {
     let restart = RecordedConnector::from_jsonl(&pocket_restart_log(request_id)).unwrap();
     let mut restored =
         pocket_runtime(&fixture, live::Mode::Live, &restart, control.clone()).unwrap();
+    let reconciled_before_deletion = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let seen = reconciled_before_deletion.clone();
+    let claims = control.clone();
+    restored.hook = Some(Box::new(move |point| {
+        if point == live::Checkpoint::BeforeClaimDeletion {
+            assert_eq!(
+                claims
+                    .clone()
+                    .retained_claims(LeaseKey {
+                        broker: "pocket_option",
+                        account: "a0"
+                    })
+                    .unwrap()[0]
+                    .state,
+                ClaimState::Reconciled
+            );
+            seen.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+        false
+    }));
     let completed = restored
         .run_until(|_| restart.exhausted())
         .unwrap()
@@ -1956,9 +2077,14 @@ fn pocket_restart_matches_written_request_id_and_settles_closed_deal() {
             .windows(2)
             .all(|pair| pair[1].sequence == pair[0].sequence + 1)
     );
-    assert_eq!(
-        control.clone().retained_claims(key).unwrap()[0].state,
-        ClaimState::Reconciled
+    assert!(
+        reconciled_before_deletion.load(std::sync::atomic::Ordering::SeqCst)
+            || control
+                .clone()
+                .retained_claims(key)
+                .unwrap()
+                .first()
+                .is_some_and(|claim| claim.state == ClaimState::Reconciled)
     );
     assert_eq!(restored.records().iter().filter(|record| matches!(&record.kind,
         live::journal::RecordKind::Ledger { event } if matches!(event.kind, binary_alpha_engine::execution::EventKind::Settled { .. }))).count(), 1);
@@ -2031,10 +2157,53 @@ fn pocket_foreign_close_veto_survives_a_later_partial_snapshot() {
         matches!(&runtime.health().entries, live::Entries::Disabled(reason)
         if reason.contains("uncorrelated liability"))
     );
+    assert!(runtime.records().iter().any(|record| matches!(&record.kind,
+        live::journal::RecordKind::PocketCorrelation { deal_id, correlated: false }
+        if deal_id == "synthetic-foreign-close")));
     assert!(
         !runtime.records().iter().any(|record| matches!(&record.kind,
         live::journal::RecordKind::Ledger { event }
         if matches!(event.kind, binary_alpha_engine::execution::EventKind::Settled { .. })))
+    );
+    drop(runtime);
+    control.clone().advance(70_000_000);
+    let omitted =
+        RecordedConnector::from_jsonl(&pocket_foreign_omitting_restart_log(request_id)).unwrap();
+    let mut restored =
+        pocket_runtime(&fixture, live::Mode::Live, &omitted, control.clone()).unwrap();
+    restored.run_until(|_| omitted.exhausted()).unwrap();
+    assert!(
+        matches!(&restored.health().entries, live::Entries::Disabled(reason)
+        if reason.contains("uncorrelated liability"))
+    );
+    assert_eq!(
+        restored
+            .records()
+            .iter()
+            .filter(|record| matches!(&record.kind,
+        live::journal::RecordKind::PocketCorrelation { deal_id, correlated: false }
+        if deal_id == "synthetic-foreign-close"))
+            .count(),
+        1
+    );
+    drop(restored);
+    control.clone().advance(70_000_000);
+    let matched =
+        RecordedConnector::from_jsonl(&pocket_foreign_exact_restart_log(request_id)).unwrap();
+    let mut reconciled =
+        pocket_runtime(&fixture, live::Mode::Live, &matched, control.clone()).unwrap();
+    reconciled.run_until(|_| matched.exhausted()).unwrap();
+    assert!(
+        reconciled
+            .records()
+            .iter()
+            .any(|record| matches!(&record.kind,
+        live::journal::RecordKind::PocketCorrelation { deal_id, correlated: true }
+        if deal_id == "synthetic-foreign-close"))
+    );
+    assert!(
+        !matches!(&reconciled.health().entries, live::Entries::Disabled(reason)
+        if reason.contains("uncorrelated liability"))
     );
 }
 
