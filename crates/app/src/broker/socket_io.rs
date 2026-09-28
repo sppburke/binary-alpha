@@ -128,6 +128,11 @@ impl Session {
                 ReadOutcome::Frame(frame) => frame,
                 ReadOutcome::Interrupted => return Err(ReceiveError::Interrupted),
             }) else {
+                if self.pending.is_some() && transport.recorded_end() {
+                    return Err(ReceiveError::Framing(
+                        "pocket_option: recorded end with incomplete binary attachment".into(),
+                    ));
+                }
                 if self.pending.is_none()
                     && self
                         .next_keepalive_micros
@@ -204,6 +209,11 @@ impl Session {
                 },
             }
             if clock.now_micros() >= deadline {
+                if self.pending.is_some() && transport.recorded_end() {
+                    return Err(ReceiveError::Framing(
+                        "pocket_option: recorded end with incomplete binary attachment".into(),
+                    ));
+                }
                 return Ok(None);
             }
         }

@@ -221,7 +221,7 @@ impl Runtime {
             if !self
                 .claims
                 .get(command)
-                .is_some_and(|claim| self.pocket_claim_agrees(claim, &deal))
+                .is_some_and(|claim| self.pocket_claim_agrees(claim, &deal, true))
             {
                 self.veto("pocket deal contradicts claim", true);
                 return Ok(());
@@ -248,6 +248,15 @@ impl Runtime {
                 }
             }
             self.step(observations)?;
+        } else {
+            let command = &self.contracts[&deal.id];
+            if !self
+                .claims
+                .get(command)
+                .is_some_and(|claim| self.pocket_claim_agrees(claim, &deal, false))
+            {
+                self.veto("pocket deal contradicts claim", true);
+            }
         }
         Ok(())
     }
@@ -328,7 +337,12 @@ impl Runtime {
         }
         Ok(())
     }
-    fn pocket_claim_agrees(&self, claim: &Claim, deal: &pocket_options::Deal) -> bool {
+    fn pocket_claim_agrees(
+        &self,
+        claim: &Claim,
+        deal: &pocket_options::Deal,
+        require_request_id: bool,
+    ) -> bool {
         let EventKind::Signal {
             proposal: Some(proposal),
             ..
@@ -341,9 +355,10 @@ impl Runtime {
         };
         let (_, symbol) = proposal.instrument.split_once(':').unwrap_or(("", ""));
         deal.is_demo == 1
-            && self
-                .pocket_written_request_id(&claim.command)
-                .is_some_and(|id| deal.request_id == Some(id))
+            && (!require_request_id && deal.request_id.is_none()
+                || self
+                    .pocket_written_request_id(&claim.command)
+                    .is_some_and(|id| deal.request_id == Some(id)))
             && deal.currency.as_ref() == Some(&proposal.terms.currency)
             && deal.asset == symbol
             && deal.direction().ok() == Some(proposal.terms.direction)
@@ -352,6 +367,11 @@ impl Runtime {
                 .require_number()
                 .ok()
                 .and_then(|amount| amount.compare(proposal.terms.stake).ok())
+                == Some(std::cmp::Ordering::Equal)
+            && deal
+                .payout()
+                .ok()
+                .and_then(|payout| payout.compare(proposal.terms.win.gross_return).ok())
                 == Some(std::cmp::Ordering::Equal)
             && deal
                 .entry_time(self.pocket_offset_minutes)
@@ -370,6 +390,44 @@ impl Runtime {
                 .contracts
                 .get(&deal.id)
                 .is_some_and(|command| command != &claim.command)
+            && self
+                .pocket_accepted_liability(&claim.command)
+                .is_none_or(|liability| {
+                    liability.contract_ref == deal.id
+                        && liability.transaction_ref == deal.id
+                        && deal
+                            .payout()
+                            .ok()
+                            .and_then(|payout| payout.compare(liability.payout).ok())
+                            == Some(std::cmp::Ordering::Equal)
+                        && deal.entry_time(self.pocket_offset_minutes).ok()
+                            == Some(liability.purchase_time_micros)
+                })
+    }
+    fn pocket_accepted_liability(&self, command: &str) -> Option<&BrokerLiability> {
+        self.records
+            .iter()
+            .rev()
+            .find_map(|record| match &record.kind {
+                RecordKind::Ledger {
+                    event:
+                        FinancialEvent {
+                            kind:
+                                EventKind::Accepted {
+                                    command: bound,
+                                    liability: Some(liability),
+                                    ..
+                                }
+                                | EventKind::Reconciled {
+                                    command: bound,
+                                    resolution: Resolution::Purchased { liability, .. },
+                                    ..
+                                },
+                            ..
+                        },
+                } if bound == command => Some(liability),
+                _ => None,
+            })
     }
     fn pocket_written_request_id(&self, command: &str) -> Option<u64> {
         let ids = self
@@ -1132,7 +1190,7 @@ impl Runtime {
             let candidate = closed
                 .and_then(|row| row.pocket.as_ref().map(|deal| (row, deal)))
                 .filter(|(_, deal)| {
-                    self.pocket_claim_agrees(&claim, deal)
+                    self.pocket_claim_agrees(&claim, deal, true)
                         && rows
                             .iter()
                             .filter(|row| {

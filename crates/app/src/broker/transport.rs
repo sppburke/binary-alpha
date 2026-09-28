@@ -38,6 +38,9 @@ pub trait Transport: Send {
     fn last_send_micros(&self) -> Option<i64> {
         None
     }
+    fn recorded_end(&self) -> bool {
+        false
+    }
     fn close(&mut self) -> Result<(), String>;
 }
 pub trait Connector: Send {
@@ -918,6 +921,9 @@ impl Transport for RecordedConnector {
     }
     fn last_send_micros(&self) -> Option<i64> {
         self.last_send_micros
+    }
+    fn recorded_end(&self) -> bool {
+        self.exhausted()
     }
     fn close(&mut self) -> Result<(), String> {
         Ok(())

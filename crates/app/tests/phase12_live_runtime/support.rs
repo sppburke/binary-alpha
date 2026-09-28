@@ -710,6 +710,66 @@ pub fn pocket_sparse_keepalive_log() -> (String, Vec<String>) {
     ));
     pocket_keepalives(&log)
 }
+pub fn pocket_comprehensive_log() -> (String, Vec<String>) {
+    let sparse = pocket_sparse_keepalive_log().0;
+    let aged = pocket_aged_quote_log()
+        .lines()
+        .skip(pocket_log().lines().count())
+        .map(|line| format!("{line}\n"))
+        .collect::<String>();
+    let quote = |offset: i64, units: i64| {
+        let at = QUOTE_START + offset;
+        json!([[
+            shared::SYMBOLS[0],
+            serde_json::from_str::<Value>(&format!("{}.{:06}", at / 1_000_000, at % 1_000_000))
+                .unwrap(),
+            serde_json::from_str::<Value>(&format!("{}.{:05}", units / 100_000, units % 100_000))
+                .unwrap()
+        ]])
+    };
+    let mut raw = String::new();
+    let mut added_aged = false;
+    let mut added_before_break = false;
+    let mut added_after_break = false;
+    for line in sparse.lines() {
+        let row: Value = serde_json::from_str(line).unwrap();
+        let at = row["at"].as_i64();
+        if !added_aged && at.is_some_and(|at| at >= QUOTE_START + 95_000_000) {
+            raw.push_str(&aged);
+            added_aged = true;
+        }
+        if !added_before_break && at.is_some_and(|at| at >= QUOTE_START + 312_000_000) {
+            raw.push_str(&pocket_line(
+                "market",
+                QUOTE_START + 311_000_000,
+                &pocket_event("updateStream", quote(310_800_000, 100_700)),
+            ));
+            added_before_break = true;
+        }
+        if !added_after_break && at.is_some_and(|at| at >= QUOTE_START + 313_700_000) {
+            raw.push_str(&pocket_line(
+                "market",
+                QUOTE_START + 313_000_000,
+                &pocket_event("updateStream", quote(312_800_000, 101_000)),
+            ));
+            added_after_break = true;
+        }
+        raw.push_str(line);
+        raw.push('\n');
+    }
+    assert!(added_aged && added_before_break && added_after_break);
+    let foreign = json!({"id":"synthetic-foreign","asset":shared::SYMBOLS[0],"command":1,
+        "amount":1,"profit":-1,"percentProfit":92,"openPrice":1.01000,"closePrice":1.01100,
+        "openTimestamp":(QUOTE_START+369_000_000)/1_000_000,"openMs":0,
+        "closeTimestamp":(QUOTE_START+399_000_000)/1_000_000,"closeMs":0,
+        "isDemo":1,"currency":"USD","requestId":44444444,"optionType":100});
+    raw.push_str(&pocket_line(
+        "account",
+        QUOTE_START + 400_500_000,
+        &pocket_event("successcloseOrder", json!({"profit":0,"deals":[foreign]})),
+    ));
+    pocket_keepalives(&raw)
+}
 pub fn pocket_missing_log() -> String {
     pocket_log_with_initial_listing(true)
 }
@@ -770,7 +830,7 @@ pub fn pocket_economics_log() -> String {
             let mut row: Value = serde_json::from_str(line).unwrap();
             if row["at"]
                 .as_i64()
-                .is_some_and(|at| at >= QUOTE_START + 31_000_000)
+                .is_some_and(|at| at >= QUOTE_START + 30_800_000)
             {
                 return None;
             }
@@ -1085,6 +1145,52 @@ pub fn pocket_changed_close_log() -> String {
         &pocket_event(
             "successupdateBalance",
             json!({"isDemo":1,"balance":10000.92}),
+        ),
+    ));
+    log
+}
+pub fn pocket_first_close_with_changed_percent_log() -> String {
+    pocket_log()
+        .lines()
+        .take_while(|line| !line.contains("successcloseOrder"))
+        .map(|line| format!("{line}\n"))
+        .collect::<String>()
+        + &pocket_line(
+            "account",
+            QUOTE_START + 30_400_000,
+            &pocket_event(
+                "successcloseOrder",
+                json!({"profit":1.92,"deals":[{
+                    "id":"synthetic-one","asset":shared::SYMBOLS[0],"command":1,
+                    "amount":1,"profit":0.92,"percentProfit":91,"openPrice":1.00644,
+                    "closePrice":1.00500,"openTimestamp":QUOTE_START/1_000_000,
+                    "openMs":600,"closeTimestamp":QUOTE_START/1_000_000+30,
+                    "closeMs":200,"isDemo":1,"currency":"USD",
+                    "requestId":11111111,"optionType":100
+                }]}),
+            ),
+        )
+}
+pub fn pocket_open_update_with_changed_percent_log() -> String {
+    let mut log = pocket_log()
+        .lines()
+        .take_while(|line| {
+            serde_json::from_str::<Value>(line).unwrap()["at"]
+                .as_i64()
+                .is_none_or(|at| at < QUOTE_START + 800_000)
+        })
+        .map(|line| format!("{line}\n"))
+        .collect::<String>();
+    log.push_str(&pocket_line(
+        "account",
+        QUOTE_START + 750_000,
+        &pocket_event(
+            "updateOpenedDeals",
+            json!([{"id":"synthetic-one","asset":shared::SYMBOLS[0],"command":1,
+                "amount":1,"profit":0,"percentProfit":91,"openPrice":1.00644,
+                "closePrice":null,"openTimestamp":QUOTE_START/1_000_000,
+                "openMs":600,"closeTimestamp":QUOTE_START/1_000_000+30,
+                "isDemo":1,"currency":"USD","optionType":100}]),
         ),
     ));
     log

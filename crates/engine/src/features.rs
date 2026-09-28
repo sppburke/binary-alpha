@@ -5015,7 +5015,6 @@ pub struct FeatureEngine {
     gap: Option<(i64, i64)>,
     previous_tick: Option<TickSeen>,
     quote_previous_tick: Option<TickSeen>,
-    last_quote_tick: Option<TickSeen>,
     quote_stream: Option<usize>,
     finalized: Vec<(usize, Candle)>,
 }
@@ -5204,7 +5203,6 @@ impl FeatureEngine {
                 .map(|gap| (seconds(gap.max_seconds), seconds(gap.reopen_seconds))),
             previous_tick: None,
             quote_previous_tick: None,
-            last_quote_tick: None,
             quote_stream,
             finalized: Vec::new(),
         })
@@ -5289,7 +5287,7 @@ impl FeatureEngine {
         if let Observation::Tick(tick) = observation
             && self.ticks
         {
-            let duplicate = self.last_quote_tick.is_some_and(|previous| {
+            let duplicate = self.previous_tick.is_some_and(|previous| {
                 previous.event == tick.event_time_micros && previous.units == tick.price_units
             });
             if !duplicate && let Some(index) = self.quote_stream {
@@ -5319,7 +5317,6 @@ impl FeatureEngine {
             self.previous_tick = Some(seen);
             if !duplicate {
                 self.quote_previous_tick = Some(seen);
-                self.last_quote_tick = Some(seen);
             }
         }
         Ok(())

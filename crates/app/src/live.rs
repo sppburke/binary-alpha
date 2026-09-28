@@ -793,28 +793,19 @@ impl Runtime {
         monotonic: Option<(Instant, i64)>,
     ) -> Result<Self, String> {
         let settings = config.live.clone().ok_or("live: the table is required")?;
-        let pocket_rule = config
+        let broker = config
             .brokers
             .iter()
             .find(|broker| broker.id() == &settings.broker)
-            .and_then(|broker| match broker {
-                Broker::PocketOption(settings) => settings.payout,
-                Broker::Deriv(_) => None,
-            });
-        let pocket_offset_minutes = config
-            .brokers
-            .iter()
-            .find(|broker| broker.id() == &settings.broker)
-            .and_then(|broker| match broker {
-                Broker::PocketOption(settings) => Some(settings.server_offset_minutes),
-                Broker::Deriv(_) => None,
-            })
-            .unwrap_or_default();
+            .ok_or("live: configured broker missing")?;
         let account_identity = options.account().clone();
-        let broker_kind = if pocket_rule.is_some() {
-            crate::broker::BrokerKind::PocketOption
-        } else {
-            crate::broker::BrokerKind::Deriv
+        let (broker_kind, pocket_rule, pocket_offset_minutes) = match broker {
+            Broker::PocketOption(settings) => (
+                crate::broker::BrokerKind::PocketOption,
+                settings.payout,
+                settings.server_offset_minutes,
+            ),
+            Broker::Deriv(_) => (crate::broker::BrokerKind::Deriv, None, 0),
         };
         let account = &definition.definition.replay.accounts[0];
         if options.account().broker != account.broker
@@ -1746,9 +1737,6 @@ impl Runtime {
             .cloned();
         let unavailable = match &listing {
             None => Some((ListingCause::Missing, "missing".to_string())),
-            Some(listing) if listing.receipt_micros > quote.receipt_micros => {
-                Some((ListingCause::Missing, "future".to_string()))
-            }
             Some(listing) if !pocket_options::fresh(listing, quote.receipt_micros, rule) => Some((
                 ListingCause::Stale,
                 format!("stale:{}:{}", listing.frame_sha256, listing.receipt_micros),
