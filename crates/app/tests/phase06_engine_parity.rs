@@ -628,6 +628,7 @@ const HEAD: &str = "schema_version = 1\nrun_mode = \"research\"\n\n[storage]\nhi
 
 fn stream(duration_seconds: u32, offset_seconds: u32) -> StreamKey {
     StreamKey {
+        kind: binary_alpha_engine::config::StreamKind::Candle,
         duration_seconds,
         offset_seconds,
     }

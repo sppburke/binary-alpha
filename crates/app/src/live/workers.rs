@@ -1,7 +1,8 @@
 //! Broker and storage I/O workers. Only the receiver's owner changes financial state.
 use super::*;
 use crate::broker::OpenContract;
-use crate::broker::deriv::{Encoded, StatementRow};
+use crate::broker::Statement;
+use crate::broker::options::{Encoded, Options};
 use binary_alpha_engine::execution::Decimal;
 use std::sync::mpsc::{self, Receiver, Sender};
 
@@ -41,7 +42,7 @@ pub enum ReplyValue {
     Statement {
         from: i64,
         through: i64,
-        rows: Vec<StatementRow>,
+        statement: Statement,
     },
 }
 #[derive(Debug, Clone, Copy)]
@@ -110,6 +111,7 @@ pub(super) struct Workers {
     pub market_ack: Sender<()>,
     pub account_ack: Sender<()>,
     pub stop: Arc<AtomicBool>,
+    pub authorization_probe: Arc<Mutex<Option<AuthorizationProbe>>>,
     brokers: Vec<std::thread::JoinHandle<()>>,
     storage_thread: Option<std::thread::JoinHandle<()>>,
 }
@@ -133,7 +135,7 @@ fn deliver(tx: &Sender<Ingress>, ack: &Receiver<()>, stopped: &AtomicBool, event
 impl Workers {
     pub fn start(
         mut market: Box<dyn MarketDataBroker>,
-        mut options: DerivOptions,
+        mut options: Options,
         scheduler: Option<ReplayClock>,
         local: Store,
         destination: Store,
@@ -145,6 +147,7 @@ impl Workers {
         let (market_ack, market_done) = mpsc::channel();
         let (account_ack, account_done) = mpsc::channel();
         let stop = Arc::new(AtomicBool::new(false));
+        let authorization_probe = Arc::new(Mutex::new(None::<AuthorizationProbe>));
         let tx = sender.clone();
         let stopped = stop.clone();
         let market_clock = scheduler.clone();
@@ -185,6 +188,10 @@ impl Workers {
                     continue;
                 }
                 let event = match market.next_live(POLL_MICROS) {
+                    Ok(Some(event @ LiveEvent::Break { .. })) => {
+                        subscribed = false;
+                        Ingress::Market(event)
+                    }
                     Ok(Some(event)) => Ingress::Market(event),
                     Ok(None) => {
                         if let Some(clock) = &market_clock {
@@ -286,10 +293,10 @@ impl Workers {
                                 }
                                 Intent::Statement { from, through } => options
                                     .statement(*from, *through)
-                                    .map(|rows| ReplyValue::Statement {
+                                    .map(|statement| ReplyValue::Statement {
                                         from: *from,
                                         through: *through,
-                                        rows,
+                                        statement,
                                     }),
                                 Intent::Subscribe(..) => {
                                     Err("account worker received market intent".into())
@@ -356,6 +363,7 @@ impl Workers {
                 }
             });
         let tx = sender.clone();
+        let probe = authorization_probe.clone();
         let storage_thread = spawn("storage", sender.clone(), move || {
             while let Ok(job) = storage_rx.recv() {
                 let event = match job {
@@ -404,6 +412,12 @@ impl Workers {
                     })(
                     )),
                 };
+                if matches!(event, Ingress::Authorization(_))
+                    && let Some(gate) = probe.lock().unwrap().take()
+                    && (gate.parked.send(()).is_err() || gate.release.recv().is_err())
+                {
+                    return;
+                }
                 if tx.send(event).is_err() {
                     return;
                 }
@@ -418,6 +432,7 @@ impl Workers {
             market_ack,
             account_ack,
             stop,
+            authorization_probe,
             brokers: vec![market_thread, account_thread],
             storage_thread: Some(storage_thread),
         }
@@ -477,7 +492,7 @@ impl Drop for Workers {
 }
 
 fn drain_account(
-    options: &mut DerivOptions,
+    options: &mut Options,
     tx: &Sender<Ingress>,
     ack: &Receiver<()>,
     stopped: &AtomicBool,

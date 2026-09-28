@@ -3,6 +3,8 @@
 mod common;
 #[path = "common/research.rs"]
 mod fixture_config;
+#[path = "common/quote.rs"]
+mod quote_fixture;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -102,6 +104,21 @@ impl Fixture {
         Self::with_bars(Scratch::new(name), PLANTED, PLANTED, true)
     }
 
+    fn quote(name: &str) -> Self {
+        let scratch = Scratch::new(name);
+        let (config, declaration, datasets) = quote_fixture::build(&scratch);
+        let path = scratch.path("research.toml");
+        let fixture = Self {
+            scratch,
+            config,
+            path,
+            declaration,
+            datasets,
+        };
+        fixture.save();
+        fixture
+    }
+
     fn wide_split(name: &str) -> Self {
         use binary_alpha_engine::config::{NamedSearchCondition, Outputs};
         let scratch = Scratch::new(name);
@@ -109,6 +126,7 @@ impl Fixture {
         configure_bars(&mut config);
         let streams: Vec<_> = [(5, 0), (15, 5), (30, 15), (60, 30), (300, 150)]
             .map(|(duration_seconds, offset_seconds)| StreamKey {
+                kind: binary_alpha_engine::config::StreamKind::Candle,
                 duration_seconds,
                 offset_seconds,
             })
@@ -787,11 +805,268 @@ fn research_run_freezes_awaits_and_certifies() {
 }
 
 #[test]
+fn quote_stream_builds_outcomes_and_certifies_frozen_research() {
+    use binary_alpha_engine::execution::{Condition, Outcome};
+    use binary_alpha_engine::features::Value as FeatureValue;
+    let fixture = Fixture::quote("phase11_quote_stream");
+    let development = fixture.config.research.as_ref().unwrap().instruments[0]
+        .source_manifest
+        .to_string();
+    let mut standalone = binary_alpha_app::skeleton(&fixture.config);
+    standalone.instruments = fixture.config.instruments.clone();
+    let path = fixture.scratch.path("quote-standalone.toml");
+    let (_, _, _, feature, outcome) =
+        fixture.wide_standalone_setup(standalone, &path, &fixture.published(), &development);
+    let feature_manifest = FeatureManifest::from_json(
+        &fs::read(fixture.published().join(manifest_key(&feature))).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(feature_manifest.streams[0].key(), StreamKey::quote());
+    assert!(
+        feature_manifest
+            .objects
+            .iter()
+            .any(|object| object.path == "rows/quote.parquet")
+    );
+    let rows_object = feature_manifest
+        .objects
+        .iter()
+        .find(|object| object.path == "rows/quote.parquet")
+        .unwrap();
+    let (columns, rows) = common::read_table(&fixture.published().join(&rows_object.key));
+    let clock = columns
+        .iter()
+        .position(|name| name == "close_time_micros")
+        .unwrap();
+    let delta = columns
+        .iter()
+        .position(|name| name == "quote_delta_units")
+        .unwrap();
+    assert_eq!(rows.len(), 31 * 44 + 39);
+    assert_eq!(rows[0][delta], None);
+    assert_eq!(rows[1][delta], Some(FeatureValue::Int(150)));
+    let gap = rows
+        .iter()
+        .find(|row| row[clock] == Some(FeatureValue::Time(BASE + 16 * 40_000_000)))
+        .unwrap();
+    assert_eq!(
+        gap[delta], None,
+        "a large cross-gap move cannot become a signal"
+    );
+    let outcome_manifest = fixture.manifest(&outcome);
+    assert_eq!(outcome_manifest["streams"][0]["kind"], "quote");
+    assert!(
+        outcome_manifest["objects"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|object| object["path"] == "reference/quote.bin")
+    );
+
+    let report = fixture.run().unwrap();
+    let (manifest, run) = fixture.run_record();
+    assert_eq!(
+        run.state,
+        RunState::AwaitingHoldoutAuthorization,
+        "{report}"
+    );
+    no_access(&logged(&fixture.log()), &fixture.protected());
+    let family =
+        Family::from_json(&fixture.object(&run.instruments[0].family, "family.json")).unwrap();
+    assert_eq!(family.members.len(), 12);
+    let selection = fixture.selection(&run);
+    assert_eq!(selection.state, State::Selected);
+    assert_eq!(
+        selection
+            .members
+            .iter()
+            .map(|member| member.member)
+            .collect::<Vec<_>>(),
+        [0, 11]
+    );
+    assert_eq!(
+        selection.config.portfolio.as_ref().unwrap().risk_policies[0].max_open_total,
+        Some(1)
+    );
+    assert_eq!(selection.selected, Some(2));
+    assert_eq!(selection.folds.len(), 1);
+    assert_eq!(selection.folds[0].fits.len(), 2);
+    assert_eq!(selection.refit.len(), 2);
+    let frozen = selection.frozen.as_ref().unwrap();
+    assert_eq!(frozen.strategies.len(), 2);
+    assert_eq!(
+        frozen.strategies[0].conditions,
+        family.members[0].conditions
+    );
+    assert_eq!(
+        frozen.strategies[1].conditions,
+        family.members[11].conditions
+    );
+    let condition = |comparator, threshold| Condition {
+        stream: StreamKey::quote(),
+        output: "quote_delta_units".into(),
+        comparator,
+        threshold: Threshold::Number(threshold),
+    };
+    assert_eq!(
+        family.members[0].conditions,
+        vec![
+            condition(Comparator::Gt, 119.0),
+            condition(Comparator::Lt, 2_000.0)
+        ]
+    );
+    assert_eq!(
+        family.members[11].conditions,
+        vec![
+            condition(Comparator::Lt, -119.0),
+            condition(Comparator::Gt, -2_000.0)
+        ]
+    );
+    assert_eq!(family.members[0].contract, frozen.contracts[0].id);
+    assert_eq!(family.members[11].contract, frozen.contracts[1].id);
+    assert_eq!(
+        frozen
+            .contracts
+            .iter()
+            .map(|contract| (
+                contract.direction,
+                contract.duration_micros,
+                contract.win.gross_return
+            ))
+            .collect::<Vec<_>>(),
+        [
+            (
+                binary_alpha_engine::execution::Direction::Sell,
+                30_000_000,
+                decimal("1.92")
+            ),
+            (
+                binary_alpha_engine::execution::Direction::Buy,
+                30_000_000,
+                decimal("1.92")
+            ),
+        ]
+    );
+    assert!(run.frozen.is_some());
+    assert_eq!(
+        run.outer
+            .iter()
+            .map(|result| result.scenario.as_str())
+            .collect::<Vec<_>>(),
+        ["baseline", "delay_200", "delay_400", "delay_600"]
+    );
+    let ticks = common::read_normalized_ticks(&fixture.published(), &fixture.datasets[6]);
+    for (result, delay) in run.outer.iter().zip([0, 200_000, 400_000, 600_000]) {
+        assert_eq!(result.verdict, Verdict::Pass, "{}", result.scenario);
+        assert_eq!(
+            (
+                result.outer.projection.settled,
+                result.outer.projection.unresolved
+            ),
+            (32, 0)
+        );
+        let events = fixture.events(&result.outer.replay.generation);
+        let signals = events
+            .iter()
+            .filter_map(|event| match &event.kind {
+                EventKind::Signal {
+                    command: Some(command),
+                    ..
+                } => Some((command.clone(), event.time_micros)),
+                _ => None,
+            })
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(signals.len(), 32);
+        let expected = (0..32)
+            .map(|cell| BASE + 3 * HOUR + cell * 40_000_000 + 100_000)
+            .collect::<BTreeSet<_>>();
+        assert_eq!(signals.values().copied().collect::<BTreeSet<_>>(), expected);
+        assert!(
+            !signals
+                .values()
+                .any(|at| *at == BASE + 3 * HOUR + 16 * 40_000_000)
+        );
+        let mut due = BTreeMap::new();
+        for event in &events {
+            if let EventKind::Accepted {
+                command,
+                entry_time_micros,
+                entry_price_units,
+                price_time_micros,
+                due_time_micros,
+                source,
+                ..
+            } = &event.kind
+            {
+                let expected_entry = signals[command] + delay;
+                let last = ticks
+                    .iter()
+                    .rev()
+                    .find(|tick| tick.event_time_micros <= expected_entry)
+                    .unwrap();
+                let cell = (signals[command] - BASE - 3 * HOUR - 100_000) / 40_000_000;
+                let center = if cell < 16 { 100_000 } else { 100_500 };
+                let direction = if cell % 2 == 0 { 1 } else { -1 };
+                let distance = match delay {
+                    0 => 150,
+                    200_000 => 160,
+                    400_000 => 170,
+                    600_000 => 180,
+                    _ => unreachable!(),
+                };
+                assert_eq!(*entry_time_micros, Some(expected_entry));
+                assert_eq!(*price_time_micros, Some(last.event_time_micros));
+                assert_eq!(*entry_price_units, Some(last.price_units));
+                assert_eq!(*entry_price_units, Some(center + direction * distance));
+                assert_eq!(*due_time_micros, Some(expected_entry + 30_000_000));
+                assert_eq!(source.available_at_micros, expected_entry);
+                due.insert(command.clone(), expected_entry + 30_000_000);
+            }
+        }
+        assert_eq!(due.len(), 32);
+        let mut settled = 0;
+        for event in &events {
+            if let EventKind::Settled {
+                command,
+                settlement_time_micros,
+                settlement_price_units,
+                outcome,
+                profit,
+                ..
+            } = &event.kind
+            {
+                let tick = ticks
+                    .iter()
+                    .find(|tick| tick.event_time_micros >= due[command])
+                    .unwrap();
+                assert_eq!(*settlement_time_micros, tick.event_time_micros);
+                assert_eq!(*settlement_price_units, Some(tick.price_units));
+                assert_eq!(*outcome, Outcome::Win);
+                assert_eq!(*profit, decimal("0.92"));
+                settled += 1;
+            }
+        }
+        assert_eq!(settled, 32);
+    }
+    let (_, grant) = fixture.grant();
+    let report = fixture.run().unwrap();
+    let (certification, record) = fixture.certification(&grant);
+    assert_eq!(certification.state, "certified", "{report}");
+    assert_eq!(record.verdict, Verdict::Pass);
+    assert_eq!(record.scenarios.len(), 4);
+    assert!(record.scenarios.iter().all(
+        |scenario| scenario.verdict == Verdict::Pass && scenario.outer.projection.settled == 32
+    ));
+    assert_eq!(manifest.state, "awaiting_holdout_authorization");
+}
+
+#[test]
 fn five_stream_generated_search_publishes_and_verifies_in_research() {
     let mut fixture = Fixture::new("phase11_generated_five_streams");
     let streams: Vec<_> = [20, 40, 60, 80, 100]
         .into_iter()
         .map(|duration_seconds| StreamKey {
+            kind: binary_alpha_engine::config::StreamKind::Candle,
             duration_seconds,
             offset_seconds: 0,
         })
@@ -2640,6 +2915,7 @@ fn generated_fifths_ordinals_publish_and_verify_through_folds() {
         research.instruments[index].search.conditions =
             vec![SearchCondition::Generate(GeneratedSearchCondition {
                 stream: StreamKey {
+                    kind: binary_alpha_engine::config::StreamKind::Candle,
                     duration_seconds: 20,
                     offset_seconds: 0,
                 },

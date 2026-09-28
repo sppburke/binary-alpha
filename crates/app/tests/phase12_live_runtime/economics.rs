@@ -366,6 +366,7 @@ fn changing_proposal_terms_are_refused_and_recorded() {
                 binding,
                 proposal,
                 reason,
+                ..
             } => Some((binding, proposal.as_ref().unwrap(), reason)),
             _ => None,
         })
@@ -521,7 +522,8 @@ fn loss_or_tie_only_deterioration_and_debit_deficit() {
                 reason: format!(
                     "offer differs from exact baseline {}",
                     owner.definition.policy.baseline[0].id
-                )
+                ),
+                listing_cause: None,
             }
         );
         let result = owner.finish().unwrap();

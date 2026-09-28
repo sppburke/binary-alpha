@@ -1689,6 +1689,7 @@ mod tests {
         assert_eq!(family_size(3, 1, 3, 1), Some(7));
         assert_eq!(family_size(100, 1, 40, 1), None);
         let stream = StreamKey {
+            kind: crate::config::StreamKind::Candle,
             duration_seconds: 5,
             offset_seconds: 0,
         };

@@ -4,11 +4,12 @@ mod research_fixture;
 
 use binary_alpha_app::broker::deriv::{DerivAccounts, DerivAuthenticated, DerivMarketData};
 use binary_alpha_app::broker::pocket_option::{PocketMarketData, provider_token, universal_micros};
+use binary_alpha_app::broker::pocket_options::PocketOptions;
 use binary_alpha_app::broker::transport::{Connector, Frame, Transport, WebSocketConnector};
 use binary_alpha_app::broker::wire::WireDecimal;
 use binary_alpha_app::broker::{
-    Adapter, Cancellation, Clock, Continuity, HistoryPage, HistoryRows, LiveEvent,
-    MarketDataBroker, RateBudget, RateGroup,
+    AccountEvent, AccountIdentity, Adapter, Cancellation, Clock, Continuity, HistoryPage,
+    HistoryRows, LiveEvent, MarketDataBroker, RateBudget, RateGroup,
 };
 use binary_alpha_app::store::Store;
 use binary_alpha_app::{broker, fetch, verify};
@@ -23,7 +24,9 @@ use binary_alpha_engine::market::{
 };
 use binary_alpha_engine::stream::{Candle, Flags, InstrumentStream, Observation, Source};
 use common::Scratch;
-use common::broker::{FakeClock, FakeHttp, connector, correlated, fixture, replace};
+use common::broker::{
+    FakeClock, FakeHttp, connector, correlated, failing_connector, fixture, replace,
+};
 use serde::{Deserialize, de::DeserializeOwned};
 use serde_json::value::RawValue;
 use std::collections::{BTreeMap, VecDeque};
@@ -106,6 +109,7 @@ fn pocket_settings() -> PocketSettings {
         account_class: binary_alpha_engine::config::AccountClass::Demo,
         server_offset_minutes: 120,
         history_pages_in_flight: Some(1),
+        payout: None,
     }
 }
 fn pocket_ids() -> Vec<InstrumentId> {
@@ -128,6 +132,345 @@ fn pocket(frames: Vec<Frame>) -> (PocketMarketData, Arc<Mutex<Vec<Frame>>>) {
         .unwrap(),
         sent,
     )
+}
+
+type TimedSend = Arc<Mutex<Vec<(i64, Frame)>>>;
+
+struct TimedPocketConnector {
+    frames: VecDeque<(i64, Frame)>,
+    clock: FakeClock,
+    sent: Arc<Mutex<Vec<Frame>>>,
+    send_times: TimedSend,
+}
+struct TimedPocketTransport {
+    frames: VecDeque<(i64, Frame)>,
+    clock: FakeClock,
+    sent: Arc<Mutex<Vec<Frame>>>,
+    send_times: TimedSend,
+}
+impl Connector for TimedPocketConnector {
+    fn connect(&mut self, _: &str, _: &[(String, String)]) -> Result<Box<dyn Transport>, String> {
+        Ok(Box::new(TimedPocketTransport {
+            frames: std::mem::take(&mut self.frames),
+            clock: self.clock.clone(),
+            sent: Arc::clone(&self.sent),
+            send_times: Arc::clone(&self.send_times),
+        }))
+    }
+}
+impl Transport for TimedPocketTransport {
+    fn send(&mut self, frame: Frame) -> Result<(), String> {
+        self.send_times
+            .lock()
+            .unwrap()
+            .push((self.clock.now_micros(), frame.clone()));
+        self.sent.lock().unwrap().push(frame);
+        Ok(())
+    }
+    fn receive(&mut self, timeout: i64) -> Result<Option<Frame>, String> {
+        let now = self.clock.now_micros();
+        let wait = self
+            .frames
+            .front()
+            .map_or(timeout, |(at, _)| at.saturating_sub(now).min(timeout));
+        self.clock.sleep(wait.max(0));
+        Ok(
+            if self
+                .frames
+                .front()
+                .is_some_and(|(at, _)| *at <= self.clock.now_micros())
+            {
+                self.frames.pop_front().map(|(_, frame)| match frame {
+                    Frame::Binary(raw) => Frame::Binary(
+                        pocket_response(std::str::from_utf8(&raw).unwrap(), &self.sent)
+                            .into_bytes(),
+                    ),
+                    other => other,
+                })
+            } else {
+                None
+            },
+        )
+    }
+    fn close(&mut self) -> Result<(), String> {
+        self.send(Frame::Close)
+    }
+}
+fn timed_pocket(
+    frames: Vec<(i64, Frame)>,
+    clock: &FakeClock,
+) -> (Box<dyn Connector>, Arc<Mutex<Vec<Frame>>>, TimedSend) {
+    let sent = Arc::new(Mutex::new(Vec::new()));
+    let send_times = Arc::new(Mutex::new(Vec::new()));
+    (
+        Box::new(TimedPocketConnector {
+            frames: frames.into(),
+            clock: clock.clone(),
+            sent: Arc::clone(&sent),
+            send_times: Arc::clone(&send_times),
+        }),
+        sent,
+        send_times,
+    )
+}
+fn pocket_ps_times(send_times: &Mutex<Vec<(i64, Frame)>>) -> Vec<i64> {
+    send_times
+        .lock()
+        .unwrap()
+        .iter()
+        .filter_map(|(at, frame)| match frame {
+            Frame::Text(text) if text == "42[\"ps\",null]" => Some(*at),
+            _ => None,
+        })
+        .collect()
+}
+fn at_frames(at: i64, frames: Vec<Frame>) -> Vec<(i64, Frame)> {
+    frames.into_iter().map(|frame| (at, frame)).collect()
+}
+
+#[test]
+fn pocket_market_keepalive_wakes_and_delivers_later_quote() {
+    let clock = FakeClock::at(1_789_348_000_000_000);
+    let start = clock.now_micros();
+    let mut frames = at_frames(start, handshake());
+    frames.extend(at_frames(
+        start + 185_000_000,
+        attachment(
+            "updateStream",
+            r#"[["EURUSD_otc",1789348000,1.23456]]"#.into(),
+        ),
+    ));
+    let (connector, sent, times) = timed_pocket(frames, &clock);
+    let mut market = PocketMarketData::connect(
+        &pocket_settings(),
+        &pocket_ids(),
+        connector,
+        Box::new(clock.clone()),
+        "{}".into(),
+    )
+    .unwrap();
+    market.subscribe(&pocket_ids()[0], scale(5)).unwrap();
+    let quote = observation(market.next_live(200_000_000).unwrap());
+    assert_eq!(quote.receipt_micros, start + 185_000_000);
+    assert_eq!(quote.price_units, 123_456);
+    assert_eq!(
+        pocket_sent_events(&sent, "ps"),
+        vec![serde_json::Value::Null; 7]
+    );
+    assert_eq!(
+        pocket_ps_times(&times),
+        (0..=6).map(|n| start + n * 30_000_000).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn pocket_account_keepalive_wakes_and_delivers_later_listing() {
+    use binary_alpha_engine::config::AccountClass;
+    let clock = FakeClock::at(1_789_348_000_000_000);
+    let start = clock.now_micros();
+    let mut settings = pocket_settings();
+    settings.payout = Some(
+        serde_json::from_value(
+            serde_json::json!({"add_percent":8,"cap_percent":92,"max_age_seconds":120}),
+        )
+        .unwrap(),
+    );
+    let mut row = vec![serde_json::Value::Null; 19];
+    row[1] = serde_json::json!("EURUSD_otc");
+    row[5] = serde_json::json!(84);
+    let assets = serde_json::json!([row]).to_string();
+    let mut frames = at_frames(
+        start,
+        vec![
+            Frame::Text("0{}".into()),
+            Frame::Text("40{}".into()),
+            Frame::Text("42[\"successauth\",{}]".into()),
+            Frame::Text("42[\"successupdateBalance\",{\"isDemo\":1,\"balance\":10000}]".into()),
+        ],
+    );
+    frames.extend(at_frames(start, attachment("updateAssets", assets.clone())));
+    frames.extend(at_frames(
+        start,
+        vec![
+            Frame::Text("42[\"updateOpenedDeals\",[]]".into()),
+            Frame::Text("42[\"updateClosedDeals\",[]]".into()),
+        ],
+    ));
+    frames.extend(at_frames(
+        start + 185_000_000,
+        attachment("updateAssets", assets),
+    ));
+    frames.extend(at_frames(
+        start + 186_000_000,
+        vec![
+            Frame::Text("451-[\"updateAssets\",{\"_placeholder\":true,\"num\":0}]".into()),
+            Frame::Close,
+        ],
+    ));
+    let (connector, sent, times) = timed_pocket(frames, &clock);
+    let account = AccountIdentity {
+        broker: settings.id.clone(),
+        account: "synthetic".into(),
+        class: AccountClass::Demo,
+        currency: "USD".to_string().try_into().unwrap(),
+    };
+    let mut options = PocketOptions::connect(
+        &settings,
+        account,
+        &[(pocket_ids()[0].clone(), scale(5))],
+        connector,
+        Box::new(clock.clone()),
+        "{}".into(),
+    )
+    .unwrap();
+    assert!(matches!(
+        options.queued_account_event().unwrap(),
+        Some(AccountEvent::Listing {
+            listed_percent: 84,
+            ..
+        })
+    ));
+    assert!(options.queued_account_event().unwrap().is_none());
+    assert!(
+        matches!(options.next_account_event(200_000_000).unwrap(), Some(AccountEvent::Listing { listed_percent: 84, receipt_micros, .. }) if receipt_micros == start + 185_000_000)
+    );
+    assert_eq!(
+        pocket_sent_events(&sent, "ps"),
+        vec![serde_json::Value::Null; 7]
+    );
+    assert_eq!(
+        pocket_ps_times(&times),
+        (0..=6).map(|n| start + n * 30_000_000).collect::<Vec<_>>()
+    );
+    assert!(
+        options
+            .next_account_event(2_000_000)
+            .unwrap_err()
+            .contains("incomplete binary attachment")
+    );
+}
+
+#[test]
+fn pocket_inspection_read_keeps_its_deadline_across_keepalive() {
+    let clock = FakeClock::at(1_789_348_000_000_000);
+    let start = clock.now_micros();
+    let mut frames = at_frames(start, handshake());
+    frames.extend(at_frames(
+        start + 35_000_000,
+        attachment(
+            "updateStream",
+            r#"[["EURUSD_otc",1789348000,1.23456]]"#.into(),
+        ),
+    ));
+    let (connector, sent, _) = timed_pocket(frames, &clock);
+    let mut market = PocketMarketData::connect(
+        &pocket_settings(),
+        &pocket_ids(),
+        connector,
+        Box::new(clock.clone()),
+        "{}".into(),
+    )
+    .unwrap();
+    market.subscribe(&pocket_ids()[0], scale(5)).unwrap();
+    assert!(market.next_live(20_000_000).unwrap().is_none());
+    assert_eq!(clock.now_micros(), start + 20_000_000);
+    let quote = observation(market.next_live(20_000_000).unwrap());
+    assert_eq!(quote.receipt_micros, start + 35_000_000);
+    assert_eq!(
+        pocket_sent_events(&sent, "ps"),
+        vec![serde_json::Value::Null; 2]
+    );
+}
+
+#[test]
+fn pocket_history_page_keeps_its_deadline_and_match_across_keepalive() {
+    let mut clock = FakeClock::at(1_789_348_000_000_000);
+    let start = clock.now_micros();
+    let mut frames = at_frames(start, handshake());
+    frames.extend(at_frames(
+        start + 35_000_000,
+        attachment("loadHistoryPeriodFast", full_candle_page(0, 2000)),
+    ));
+    let (connector, sent, _) = timed_pocket(frames, &clock);
+    let mut market = PocketMarketData::connect(
+        &pocket_settings(),
+        &pocket_ids(),
+        connector,
+        Box::new(clock.clone()),
+        "{}".into(),
+    )
+    .unwrap();
+    clock.sleep(25_000_000);
+    let page = market
+        .history_page(
+            &pocket_ids()[0],
+            scale(5),
+            Some(2_000_000_000),
+            NativeGranularity::Bar { period_seconds: 5 },
+        )
+        .unwrap();
+    assert_eq!(page.receipt_micros, start + 35_000_000);
+    assert_candle_page(&market, &page, &pocket_ids()[0], 2000);
+    assert_eq!(market.history_reconnects(), 0);
+    assert_eq!(
+        pocket_sent_events(&sent, "ps"),
+        vec![serde_json::Value::Null; 2]
+    );
+    assert_eq!(pocket_sent_events(&sent, "loadHistoryPeriod").len(), 1);
+}
+
+#[test]
+fn pocket_reconnect_login_resets_keepalive_deadline() {
+    let mut clock = FakeClock::at(1_789_348_000_000_000);
+    let (connector, sent) = pocket_connector(vec![handshake(), handshake()], &clock);
+    let mut market = PocketMarketData::connect(
+        &pocket_settings(),
+        &pocket_ids(),
+        connector,
+        Box::new(clock.clone()),
+        "{}".into(),
+    )
+    .unwrap();
+    clock.sleep(25_000_000);
+    market.reconnect().unwrap();
+    assert!(matches!(
+        market.next_live(1).unwrap(),
+        Some(LiveEvent::Break { .. })
+    ));
+    assert!(market.next_live(20_000_000).unwrap().is_none());
+    assert_eq!(
+        pocket_sent_events(&sent, "ps"),
+        vec![serde_json::Value::Null; 2]
+    );
+    assert!(market.next_live(15_000_000).unwrap().is_none());
+    assert_eq!(
+        pocket_sent_events(&sent, "ps"),
+        vec![serde_json::Value::Null; 3]
+    );
+}
+
+#[test]
+fn pocket_keepalive_send_failure_uses_session_failure() {
+    let clock = FakeClock::at(1_789_348_000_000_000);
+    let (connector, sent) = failing_connector(vec![handshake()], &clock, 4);
+    let mut market = PocketMarketData::connect(
+        &pocket_settings(),
+        &pocket_ids(),
+        connector,
+        Box::new(clock),
+        "{}".into(),
+    )
+    .unwrap();
+    assert!(
+        market
+            .next_live(31_000_000)
+            .unwrap_err()
+            .contains("synthetic socket send failure")
+    );
+    assert_eq!(
+        pocket_sent_events(&sent, "ps"),
+        vec![serde_json::Value::Null; 2]
+    );
 }
 fn observation(event: Option<LiveEvent>) -> broker::LiveObservation {
     match event.unwrap() {
@@ -755,6 +1098,36 @@ fn pocket_retained_paging_live_cancellation_and_heartbeats() {
     assert!(sent.lock().unwrap().contains(&Frame::Text(
         "42[\"unSubscribeSymbol\",\"#AAPL_otc\"]".into()
     )));
+}
+
+#[test]
+fn pocket_tick_page_row_asset_matches_page_when_present() {
+    let (broker, _) = pocket(handshake());
+    let instrument = id("pocket_option", "EURUSD_otc");
+    let decode = |raw: &str| {
+        broker.decode_history(
+            &instrument,
+            raw.as_bytes(),
+            scale(5),
+            NativeGranularity::Tick,
+        )
+    };
+    for row in [
+        r#"{"time":1789347292,"price":1.23456}"#,
+        r#"{"asset":"EURUSD_otc","time":1789347292,"price":1.23456}"#,
+    ] {
+        let raw = format!(r#"{{"asset":"EURUSD_otc","data":[{row}]}}"#);
+        assert_eq!(
+            decode(&raw).unwrap().1.ticks().unwrap()[0].price_units,
+            123456
+        );
+    }
+    let wrong =
+        r#"{"asset":"EURUSD_otc","data":[{"asset":"OTHER","time":1789347292,"price":1.23456}]}"#;
+    assert_eq!(
+        decode(wrong).unwrap_err(),
+        "pocket_option: history row asset mismatch"
+    );
 }
 
 #[test]
@@ -1656,7 +2029,10 @@ fn pocket_history_reconnects_before_sending_on_stale_session() {
             matches!(&sent[sent_before_advance + 2], Frame::Text(text) if text.starts_with("42[\"auth\","))
         );
         assert!(
-            matches!(&sent[sent_before_advance + 3], Frame::Text(text) if text.starts_with("42[\"loadHistoryPeriod\","))
+            matches!(&sent[sent_before_advance + 3], Frame::Text(text) if text == "42[\"ps\",null]")
+        );
+        assert!(
+            matches!(&sent[sent_before_advance + 4], Frame::Text(text) if text.starts_with("42[\"loadHistoryPeriod\","))
         );
     }
 }
@@ -3155,6 +3531,7 @@ fn serve_broker(kind: &'static str) -> (String, std::thread::JoinHandle<()>, Sen
                             panic!("unexpected client framing")
                         };
                         match name.as_str() {
+                            "ps" => assert_eq!(argument, b"null"),
                             "auth" => {
                                 assert_eq!(argument, b"{\"synthetic\":true}");
                                 replies.push(Frame::Text(fixture("pocket-authenticated.txt")));

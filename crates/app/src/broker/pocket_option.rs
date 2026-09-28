@@ -1,4 +1,4 @@
-use super::socket_io::{self, Packet};
+use super::socket_io::{self, Event};
 use super::transport::{Connector, Frame, Transport};
 use super::wire::WireDecimal;
 use super::{
@@ -53,13 +53,9 @@ pub fn provider_token(micros: i64, offset_minutes: i32) -> Result<WireDecimal, S
         universal.checked_add(offset)?.normalized(),
     ))
 }
-struct Event {
-    name: String,
-    raw: Vec<u8>,
-    receipt_micros: i64,
-}
 enum ReceiveError {
     Disconnected,
+    Interrupted,
     Transport(String),
     ResponseTimeout(String),
     Other(String),
@@ -78,7 +74,18 @@ impl From<ReceiveError> for String {
     fn from(error: ReceiveError) -> Self {
         match error {
             ReceiveError::Disconnected => "socket.io: the server disconnected the namespace (an `origin` setting is usually required)".into(),
+            ReceiveError::Interrupted => "socket.io: read interrupted for queued intent".into(),
             ReceiveError::Transport(error) | ReceiveError::ResponseTimeout(error) | ReceiveError::Other(error) => error,
+        }
+    }
+}
+impl From<socket_io::ReceiveError> for ReceiveError {
+    fn from(error: socket_io::ReceiveError) -> Self {
+        match error {
+            socket_io::ReceiveError::Disconnected => Self::Disconnected,
+            socket_io::ReceiveError::Interrupted => Self::Interrupted,
+            socket_io::ReceiveError::Transport(error) => Self::Transport(error),
+            socket_io::ReceiveError::Framing(error) => Self::Other(error),
         }
     }
 }
@@ -101,6 +108,7 @@ struct OlderHistory {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct PageRow {
+    asset: Option<String>,
     time: WireDecimal,
     price: WireDecimal,
 }
@@ -168,9 +176,8 @@ pub struct PocketMarketData {
     connector: Box<dyn Connector>,
     transport: Box<dyn Transport>,
     clock: Box<dyn Clock>,
-    last_received_frame_micros: i64,
+    session: socket_io::Session,
     credential_json: String,
-    pending: Option<String>,
     discovered: Vec<DiscoveredInstrument>,
     subscribed: BTreeMap<String, (InstrumentId, PriceScale)>,
     next_index: u64,
@@ -204,16 +211,15 @@ impl PocketMarketData {
             .unwrap_or_default();
         let transport = connector.connect(&settings.endpoint, &headers)?;
         let next_index = history_index_seed(clock.now_micros());
-        let last_received_frame_micros = clock.now_micros();
+        let session = socket_io::Session::new(clock.now_micros());
         let mut broker = Self {
             settings: settings.clone(),
             instruments: instruments.to_vec(),
             connector,
             transport,
             clock,
-            last_received_frame_micros,
+            session,
             credential_json,
-            pending: None,
             discovered: Vec::new(),
             subscribed: BTreeMap::new(),
             next_index,
@@ -238,90 +244,14 @@ impl PocketMarketData {
             .map_err(ReceiveError::Transport)
     }
     fn receive(&mut self, timeout_micros: i64) -> Result<Option<Event>, ReceiveError> {
-        let deadline = self
-            .clock
-            .now_micros()
-            .saturating_add(timeout_micros.max(0));
-        loop {
-            let Some(frame) = self
-                .transport
-                .receive(deadline.saturating_sub(self.clock.now_micros()).max(0))
-                .map_err(ReceiveError::Transport)?
-            else {
-                return Ok(None);
-            };
-            let receipt_micros = self.clock.now_micros();
-            self.last_received_frame_micros = receipt_micros;
-            match frame {
-                Frame::Ping(bytes) => self
-                    .transport
-                    .send(Frame::Pong(bytes))
-                    .map_err(ReceiveError::Transport)?,
-                Frame::Pong(_) => (),
-                Frame::Close => {
-                    return Err(if self.pending.is_some() {
-                        ReceiveError::Other(
-                            "pocket_option: close with incomplete binary attachment".into(),
-                        )
-                    } else {
-                        ReceiveError::Transport("pocket_option: connection closed".into())
-                    });
-                }
-                Frame::Binary(raw) => {
-                    let name = self
-                        .pending
-                        .take()
-                        .ok_or("pocket_option: binary attachment without header")?;
-                    return Ok(Some(Event {
-                        name,
-                        raw,
-                        receipt_micros,
-                    }));
-                }
-                Frame::Text(text) => match socket_io::decode(&text)? {
-                    Packet::Disconnected => return Err(ReceiveError::Disconnected),
-                    Packet::Ping => self
-                        .transport
-                        .send(Frame::Text(socket_io::PONG.into()))
-                        .map_err(ReceiveError::Transport)?,
-                    Packet::BinaryHeader { name } => {
-                        if self.pending.is_some() {
-                            return Err("pocket_option: overlapping binary event headers".into());
-                        }
-                        self.pending = Some(name);
-                    }
-                    Packet::Event { name, argument } => {
-                        if self.pending.is_some() {
-                            return Err(
-                                "pocket_option: text event interrupted binary attachment".into()
-                            );
-                        }
-                        return Ok(Some(Event {
-                            name,
-                            raw: argument,
-                            receipt_micros,
-                        }));
-                    }
-                    Packet::Open => {
-                        return Ok(Some(Event {
-                            name: "open".into(),
-                            raw: Vec::new(),
-                            receipt_micros,
-                        }));
-                    }
-                    Packet::Connected => {
-                        return Ok(Some(Event {
-                            name: "connected".into(),
-                            raw: Vec::new(),
-                            receipt_micros,
-                        }));
-                    }
-                },
-            }
-            if self.clock.now_micros() >= deadline {
-                return Ok(None);
-            }
-        }
+        self.session
+            .receive(&mut *self.transport, &*self.clock, timeout_micros)
+            .map_err(Into::into)
+    }
+    fn poll(&mut self, timeout_micros: i64) -> Result<Option<Event>, ReceiveError> {
+        self.session
+            .poll(&mut *self.transport, &*self.clock, timeout_micros)
+            .map_err(Into::into)
     }
     fn handshake(&mut self) -> Result<(), String> {
         let deadline = self.clock.now_micros().saturating_add(12_000_000);
@@ -348,7 +278,12 @@ impl PocketMarketData {
                     )))?;
                     auth_sent = true;
                 }
-                "successauth" if auth_sent => authenticated = true,
+                "successauth" if auth_sent => {
+                    self.session
+                        .login(&mut *self.transport, &*self.clock)
+                        .map_err(ReceiveError::from)?;
+                    authenticated = true;
+                }
                 "successupdateBalance" if auth_sent => {
                     let response: BalanceClass = serde_json::from_slice(&event.raw)
                         .map_err(|_| "pocket_option: missing server account-class confirmation")?;
@@ -686,9 +621,21 @@ impl PocketMarketData {
     pub fn history_reconnects(&self) -> u64 {
         self.history_reconnects
     }
-    fn tick_rows(&self, rows: &[PageRow], scale: PriceScale) -> Result<Vec<Tick>, String> {
+    fn tick_rows(
+        &self,
+        rows: &[PageRow],
+        asset: &str,
+        scale: PriceScale,
+    ) -> Result<Vec<Tick>, String> {
         rows.iter()
             .map(|row| {
+                if row
+                    .asset
+                    .as_deref()
+                    .is_some_and(|row_asset| row_asset != asset)
+                {
+                    return Err("pocket_option: history row asset mismatch".into());
+                }
                 row.price.require_number()?;
                 Ok(Tick {
                     event_time_micros: universal_micros(
@@ -813,7 +760,7 @@ impl MarketDataBroker for PocketMarketData {
         if self
             .clock
             .now_micros()
-            .saturating_sub(self.last_received_frame_micros)
+            .saturating_sub(self.session.last_received_frame_micros)
             > 25_000_000
         {
             if self.history_reconnects >= 20 {
@@ -893,11 +840,22 @@ impl MarketDataBroker for PocketMarketData {
                 response
                     .history
                     .into_iter()
-                    .map(|[time, price]| PageRow { time, price })
+                    .map(|[time, price]| PageRow {
+                        asset: None,
+                        time,
+                        price,
+                    })
                     .collect()
             }
         };
-        Ok((None, HistoryRows::Ticks(self.tick_rows(&rows, scale)?)))
+        Ok((
+            None,
+            HistoryRows::Ticks(self.tick_rows(
+                &rows,
+                instrument.provider_symbol.as_str(),
+                scale,
+            )?),
+        ))
     }
     fn subscribe(&mut self, instrument: &InstrumentId, scale: PriceScale) -> Result<(), String> {
         self.check_instrument(instrument)?;
@@ -919,9 +877,16 @@ impl MarketDataBroker for PocketMarketData {
             .now_micros()
             .saturating_add(timeout_micros.max(0));
         loop {
-            let Some(event) =
-                self.receive(deadline.saturating_sub(self.clock.now_micros()).max(0))?
-            else {
+            let received = match self.poll(deadline.saturating_sub(self.clock.now_micros()).max(0))
+            {
+                Err(ReceiveError::Interrupted) => return Ok(None),
+                Err(ReceiveError::Disconnected) => {
+                    self.reconnect_transport(false)?;
+                    return Ok(self.events.pop_front());
+                }
+                other => other?,
+            };
+            let Some(event) = received else {
                 return Ok(None);
             };
             match event.name.as_str() {
@@ -973,7 +938,7 @@ impl PocketMarketData {
             .map(|value| vec![("Origin".into(), value.clone())])
             .unwrap_or_default();
         self.transport = self.connector.connect(&self.settings.endpoint, &headers)?;
-        self.pending = None;
+        self.session = socket_io::Session::new(self.clock.now_micros());
         for entry in self.candle_history.pages.values_mut() {
             if entry.page.is_none() {
                 entry.index = None;

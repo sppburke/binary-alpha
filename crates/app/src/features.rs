@@ -17,7 +17,7 @@ use std::time::Instant;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use binary_alpha_engine::config::{Config, FeatureInstrument, StreamKey};
+use binary_alpha_engine::config::{Config, FeatureInstrument, StreamKind};
 use binary_alpha_engine::dataset::{DatasetRole, GenerationManifest, ObjectRecord, ObjectRole};
 use binary_alpha_engine::execution::reusable_revision;
 use binary_alpha_engine::features::{
@@ -141,7 +141,7 @@ pub(crate) fn table_metadata(
     stream: &StreamPlan,
     identity: (&'static str, &str),
 ) -> Vec<(&'static str, String)> {
-    vec![
+    let mut metadata = vec![
         ("broker", plan.broker.to_string()),
         ("provider_symbol", plan.provider_symbol.to_string()),
         ("price_scale", plan.price_scale.digits().to_string()),
@@ -149,7 +149,11 @@ pub(crate) fn table_metadata(
         ("offset_seconds", stream.offset_seconds.to_string()),
         (identity.0, identity.1.to_string()),
         ("feature_schema_version", FEATURE_SCHEMA_VERSION.to_string()),
-    ]
+    ];
+    if stream.kind == StreamKind::Quote {
+        metadata.push(("stream_kind", "quote".into()));
+    }
+    metadata
 }
 
 /// Runs every configured feature build, writing one report line per instrument to `out`.
@@ -181,11 +185,10 @@ pub fn run(config_path: &Path, out: &mut dyn Write) -> Result<(), String> {
             .map_err(|reason| format!("features.instruments[{index}]: {reason}"))?;
         for stream in &item.plan.streams {
             let owned = format!(
-                "{} {} {}s/{}s",
+                "{} {} {}",
                 item.plan.instrument,
                 item.bound.input.role,
-                stream.duration_seconds,
-                stream.offset_seconds
+                stream.key()
             );
             if let Some(owner) = owners.insert(owned.clone(), index) {
                 return Err(format!(
@@ -388,13 +391,7 @@ pub(crate) fn plan_describes(plan: &FeaturePlan, manifest: &FeatureManifest) -> 
             .streams
             .iter()
             .zip(&manifest.streams)
-            .any(|(stream, summary)| {
-                stream.key()
-                    != StreamKey {
-                        duration_seconds: summary.duration_seconds,
-                        offset_seconds: summary.offset_seconds,
-                    }
-            })
+            .any(|(stream, summary)| stream.key() != summary.key())
     {
         return Err(
             "the plan does not describe the manifest's plan identity, instrument, profile, fit, and streams"
@@ -966,10 +963,14 @@ pub(crate) fn build(
     let mut temporaries = Vec::new();
     let mut outputs: Vec<StreamOutput> = Vec::with_capacity(plan.streams.len());
     for stream in &plan.streams {
-        let stem = format!(
-            "features-{raw}-{}s-{}s",
-            stream.duration_seconds, stream.offset_seconds
-        );
+        let stem = if stream.kind == StreamKind::Quote {
+            format!("features-{raw}-quote")
+        } else {
+            format!(
+                "features-{raw}-{}s-{}s",
+                stream.duration_seconds, stream.offset_seconds
+            )
+        };
         let metadata = table_metadata(&plan, stream, ("raw_identity", &raw));
         let mut open = |suffix: &str,
                         message: &str,
@@ -989,6 +990,7 @@ pub(crate) fn build(
             structure: open("structure", STRUCTURE_MESSAGE, structure_columns())?,
             sequence: open("sequence", SEQUENCE_MESSAGE, sequence_columns())?,
             summary: FeatureStreamSummary {
+                kind: stream.kind,
                 duration_seconds: stream.duration_seconds,
                 offset_seconds: stream.offset_seconds,
                 rows: 0,
@@ -1087,6 +1089,7 @@ pub(crate) fn build(
         plan.fit_windows = summaries
             .iter()
             .map(|summary| FitWindow {
+                kind: summary.kind,
                 duration_seconds: summary.duration_seconds,
                 offset_seconds: summary.offset_seconds,
                 rows: summary.rows,
@@ -1130,8 +1133,12 @@ pub(crate) fn build(
                     import::temporary_path(
                         local,
                         &format!(
-                            "features-{raw}-{}s-{}s-encoded",
-                            stream.duration_seconds, stream.offset_seconds
+                            "features-{raw}-{}-encoded",
+                            if stream.kind == StreamKind::Quote {
+                                "quote".to_string()
+                            } else {
+                                format!("{}s-{}s", stream.duration_seconds, stream.offset_seconds)
+                            }
                         ),
                     )
                 })

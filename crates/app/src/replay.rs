@@ -721,10 +721,7 @@ pub(crate) fn publish(
                 .feature
                 .streams
                 .iter()
-                .find(|summary| {
-                    summary.duration_seconds == stream.stream.duration_seconds
-                        && summary.offset_seconds == stream.stream.offset_seconds
-                })
+                .find(|summary| summary.key() == stream.stream)
                 .expect("bound streams are manifest streams");
             if cursor.rows != summary.rows {
                 return Err(format!(

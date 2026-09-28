@@ -34,10 +34,82 @@ impl Runtime {
     pub(super) fn ingress(&mut self, event: Ingress) -> Result<(), String> {
         match event {
             Ingress::Market(event) => self.market_event(event)?,
-            Ingress::Account(event) => {
-                if let Some(observation) =
-                    to_observation(event, &|contract| self.contracts.get(contract).cloned())
+            Ingress::Account(AccountEvent::Listing {
+                instrument,
+                listed_percent,
+                receipt_micros,
+                frame_sha256,
+            }) => {
+                let history = self
+                    .pocket_listings
+                    .entry(instrument.to_string())
+                    .or_default();
+                history.push_back(Listing {
+                    listed_percent,
+                    receipt_micros,
+                    frame_sha256,
+                });
+                let quote_age = self
+                    .definition
+                    .policy
+                    .replay
+                    .risk_policies
+                    .iter()
+                    .map(|risk| risk.max_quote_age_micros)
+                    .max()
+                    .unwrap_or(0);
+                let listing_age = self
+                    .pocket_rule
+                    .map(|rule| i64::from(rule.max_age_seconds).saturating_mul(1_000_000))
+                    .unwrap_or(0);
+                let cutoff = self
+                    .clock
+                    .now_micros()
+                    .saturating_sub(quote_age.saturating_add(listing_age));
+                while history.len() > 1
+                    && history
+                        .get(1)
+                        .is_some_and(|listing| listing.receipt_micros < cutoff)
                 {
+                    history.pop_front();
+                }
+                if let Some(rule) = self.pocket_rule {
+                    let mut cleared = Vec::new();
+                    for binding in self
+                        .definition
+                        .policy
+                        .replay
+                        .bindings
+                        .iter()
+                        .filter(|binding| binding.instrument == instrument.to_string())
+                    {
+                        let baseline = self
+                            .definition
+                            .policy
+                            .baseline
+                            .iter()
+                            .find(|terms| terms.id == binding.contract)
+                            .ok_or("pocket listing: baseline missing")?;
+                        let gross =
+                            pocket_options::gross_return(baseline.stake, listed_percent, rule)?;
+                        if gross.compare(baseline.win.gross_return)? == std::cmp::Ordering::Equal {
+                            cleared.push(binding.id.clone());
+                        }
+                    }
+                    for binding in cleared {
+                        self.proposal_unavailable(&binding, false);
+                    }
+                }
+            }
+            Ingress::Account(AccountEvent::PocketDeal {
+                deal,
+                closed,
+                receipt_micros,
+            }) => self.pocket_deal(deal, closed, receipt_micros)?,
+            Ingress::Account(event) => {
+                if let Some(observation) = to_observation(event, self.broker_kind, &|contract| {
+                    self.contracts.get(contract).cloned()
+                }) {
                     self.step(vec![observation])?;
                 }
             }
@@ -80,6 +152,7 @@ impl Runtime {
             }
             Ingress::Authorization(result) => {
                 self.authorization_pending = false;
+                self.health.authorization_pending = false;
                 let manifest = &self.definition.manifest;
                 let checked = result
                     .and_then(|value| value.ok_or("live authorization is absent".into()))
@@ -104,6 +177,284 @@ impl Runtime {
             Ingress::Published(result) => self.publication_result = Some(result),
         }
         Ok(())
+    }
+    fn pocket_deal(
+        &mut self,
+        deal: pocket_options::Deal,
+        closed: bool,
+        receipt: i64,
+    ) -> Result<(), String> {
+        let clock_offset = self.pocket_offset_minutes;
+        let start = self
+            .records
+            .first()
+            .map(|r| r.time_micros)
+            .unwrap_or(i64::MIN);
+        if closed && deal.close_time(clock_offset)? < start {
+            return Ok(());
+        }
+        if closed {
+            let fact = serde_json::to_string(&deal).map_err(|error| error.to_string())?;
+            let facts = self.pocket_closed.entry(deal.id.clone()).or_default();
+            if facts.insert(fact.clone()) {
+                self.record(RecordKind::PocketClosed {
+                    deal_id: deal.id.clone(),
+                    request_id: deal.request_id,
+                    fact,
+                })?;
+            }
+            if self.pocket_closed[&deal.id].len() != 1 {
+                self.veto("pocket deal contradicts earlier close", true);
+                return Ok(());
+            }
+        }
+        if !self.contracts.contains_key(&deal.id) {
+            self.pocket_correlation(&deal.id, false)?;
+            self.veto("broker portfolio contains an uncorrelated liability", true);
+            return Ok(());
+        }
+        if closed {
+            let command = &self.contracts[&deal.id];
+            if self.pocket_settled_agrees(command, &deal)? {
+                return Ok(());
+            }
+            if !self
+                .claims
+                .get(command)
+                .is_some_and(|claim| self.pocket_claim_agrees(claim, &deal, true))
+            {
+                self.veto("pocket deal contradicts claim", true);
+                return Ok(());
+            }
+            let scale = self
+                .definition
+                .definition
+                .instruments
+                .iter()
+                .find(|instrument| instrument.instrument.ends_with(&format!(":{}", deal.asset)))
+                .map(|instrument| PriceScale::try_from(instrument.price_scale))
+                .transpose()?
+                .ok_or("pocket deal: instrument scale missing")?;
+            let mut observations = Vec::new();
+            for event in [
+                deal.update(scale, clock_offset, receipt)?,
+                deal.terminal(scale, clock_offset, receipt)?,
+                deal.cash(&self.account_identity, clock_offset, receipt)?,
+            ] {
+                if let Some(observation) = to_observation(event, self.broker_kind, &|contract| {
+                    self.contracts.get(contract).cloned()
+                }) {
+                    observations.push(observation);
+                }
+            }
+            self.step(observations)?;
+        } else {
+            let command = &self.contracts[&deal.id];
+            if !self
+                .claims
+                .get(command)
+                .is_some_and(|claim| self.pocket_claim_agrees(claim, &deal, false))
+            {
+                self.veto("pocket deal contradicts claim", true);
+            }
+        }
+        Ok(())
+    }
+    fn pocket_settled_agrees(
+        &self,
+        command: &str,
+        deal: &pocket_options::Deal,
+    ) -> Result<bool, String> {
+        if !self
+            .pocket_written_request_id(command)
+            .is_some_and(|id| deal.request_id == Some(id))
+        {
+            return Ok(false);
+        }
+        let settled = self.records.iter().find_map(|record| match &record.kind {
+            RecordKind::Ledger {
+                event:
+                    FinancialEvent {
+                        kind:
+                            EventKind::Settled {
+                                command: bound,
+                                settlement_time_micros,
+                                settlement_price_units,
+                                credit,
+                                transaction_ref,
+                                ..
+                            },
+                        ..
+                    },
+            } if bound == command => Some((
+                record.sequence,
+                *settlement_time_micros,
+                *settlement_price_units,
+                *credit,
+                transaction_ref,
+            )),
+            _ => None,
+        });
+        let Some((settled_sequence, time, price, credit, transaction)) = settled else {
+            return Ok(false);
+        };
+        let fact = serde_json::to_string(deal).map_err(|error| error.to_string())?;
+        if !self.records.iter().any(|record| record.sequence < settled_sequence
+            && matches!(&record.kind, RecordKind::PocketClosed { deal_id, request_id, fact: prior }
+                if deal_id == &deal.id && *request_id == deal.request_id && prior == &fact)) {
+            return Ok(false);
+        }
+        let scale = self
+            .definition
+            .definition
+            .instruments
+            .iter()
+            .find(|instrument| instrument.instrument.ends_with(&format!(":{}", deal.asset)))
+            .map(|instrument| PriceScale::try_from(instrument.price_scale))
+            .transpose()?
+            .ok_or("pocket deal: instrument scale missing")?;
+        Ok(deal.close_time(self.pocket_offset_minutes)? == time
+            && deal
+                .close_price
+                .as_ref()
+                .map(|price| price.price_units(scale))
+                .transpose()?
+                == price
+            && deal.gross_credit()?.compare(credit)? == std::cmp::Ordering::Equal
+            && transaction.as_deref() == Some(&format!("{}:close", deal.id)))
+    }
+    fn pocket_correlation(&mut self, deal_id: &str, correlated: bool) -> Result<(), String> {
+        if self.uncorrelated_pocket.contains(deal_id) == correlated {
+            self.record(RecordKind::PocketCorrelation {
+                deal_id: deal_id.to_owned(),
+                correlated,
+            })?;
+            if correlated {
+                self.uncorrelated_pocket.remove(deal_id);
+            } else {
+                self.uncorrelated_pocket.insert(deal_id.to_owned());
+            }
+        }
+        Ok(())
+    }
+    fn pocket_claim_agrees(
+        &self,
+        claim: &Claim,
+        deal: &pocket_options::Deal,
+        require_request_id: bool,
+    ) -> bool {
+        let EventKind::Signal {
+            proposal: Some(proposal),
+            ..
+        } = &claim.signal.kind
+        else {
+            return false;
+        };
+        let Some((start, end)) = self.command_window(&claim.signal) else {
+            return false;
+        };
+        let (_, symbol) = proposal.instrument.split_once(':').unwrap_or(("", ""));
+        deal.is_demo == 1
+            && (!require_request_id && deal.request_id.is_none()
+                || self
+                    .pocket_written_request_id(&claim.command)
+                    .is_some_and(|id| deal.request_id == Some(id)))
+            && deal.currency.as_ref() == Some(&proposal.terms.currency)
+            && deal.asset == symbol
+            && deal.direction().ok() == Some(proposal.terms.direction)
+            && deal
+                .amount
+                .require_number()
+                .ok()
+                .and_then(|amount| amount.compare(proposal.terms.stake).ok())
+                == Some(std::cmp::Ordering::Equal)
+            && deal
+                .payout()
+                .ok()
+                .and_then(|payout| payout.compare(proposal.terms.win.gross_return).ok())
+                == Some(std::cmp::Ordering::Equal)
+            && deal
+                .entry_time(self.pocket_offset_minutes)
+                .ok()
+                .is_some_and(|at| start <= at && at <= end)
+            && deal
+                .expiry_time(self.pocket_offset_minutes)
+                .ok()
+                .zip(deal.entry_time(self.pocket_offset_minutes).ok())
+                .is_some_and(|(expiry, entry)| {
+                    expiry - entry >= proposal.terms.duration_micros - 1_000_000
+                        && expiry - entry <= proposal.terms.duration_micros
+                })
+            && claim.contract_ref.as_ref().is_none_or(|id| id == &deal.id)
+            && !self
+                .contracts
+                .get(&deal.id)
+                .is_some_and(|command| command != &claim.command)
+            && self
+                .pocket_accepted_liability(&claim.command)
+                .is_none_or(|liability| {
+                    liability.contract_ref == deal.id
+                        && liability.transaction_ref == deal.id
+                        && deal
+                            .payout()
+                            .ok()
+                            .and_then(|payout| payout.compare(liability.payout).ok())
+                            == Some(std::cmp::Ordering::Equal)
+                        && deal.entry_time(self.pocket_offset_minutes).ok()
+                            == Some(liability.purchase_time_micros)
+                })
+    }
+    fn pocket_accepted_liability(&self, command: &str) -> Option<&BrokerLiability> {
+        self.records
+            .iter()
+            .rev()
+            .find_map(|record| match &record.kind {
+                RecordKind::Ledger {
+                    event:
+                        FinancialEvent {
+                            kind:
+                                EventKind::Accepted {
+                                    command: bound,
+                                    liability: Some(liability),
+                                    ..
+                                }
+                                | EventKind::Reconciled {
+                                    command: bound,
+                                    resolution: Resolution::Purchased { liability, .. },
+                                    ..
+                                },
+                            ..
+                        },
+                } if bound == command => Some(liability),
+                _ => None,
+            })
+    }
+    fn pocket_written_request_id(&self, command: &str) -> Option<u64> {
+        let ids = self
+            .records
+            .iter()
+            .filter_map(|record| match &record.kind {
+                RecordKind::Written {
+                    command: bound,
+                    request_id,
+                    ..
+                } if bound == command => Some(*request_id),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let [Some(id)] = ids.as_slice() else {
+            return None;
+        };
+        (self
+            .records
+            .iter()
+            .filter(|record| {
+                matches!(&record.kind,
+            RecordKind::Written { request_id: Some(other), .. } if other == id)
+            })
+            .count()
+            == 1)
+            .then_some(*id)
     }
     fn reply(&mut self, reply: Reply) -> Result<(), String> {
         let (value, timing) = match reply {
@@ -130,7 +481,7 @@ impl Runtime {
             }
             ReplyValue::Proposal { binding, proposal } => {
                 let observation = self.offer(&binding, proposal)?;
-                self.veto(&format!("proposal unavailable: {binding}"), false);
+                self.proposal_unavailable(&binding, false);
                 self.proposal_ready(&binding, observation)?;
             }
             ReplyValue::Prepared { command, encoded } => self.prepared(&command, encoded)?,
@@ -156,6 +507,16 @@ impl Runtime {
             ReplyValue::OpenContracts(contracts) => {
                 if self.recovery_pending {
                     self.recovery_open = Some(contracts);
+                } else if self.broker_kind == crate::broker::BrokerKind::PocketOption {
+                    for contract in &contracts {
+                        if !self.contracts.contains_key(&contract.contract_ref) {
+                            self.pocket_correlation(&contract.contract_ref, false)?;
+                        }
+                    }
+                    self.veto(
+                        "broker portfolio contains an uncorrelated liability",
+                        !self.uncorrelated_pocket.is_empty(),
+                    );
                 } else {
                     self.veto(
                         "broker portfolio contains an uncorrelated liability",
@@ -168,11 +529,18 @@ impl Runtime {
             ReplyValue::Statement {
                 from,
                 through,
-                rows,
+                statement,
             } => {
                 self.recovery_pending = false;
                 if let Some(contracts) = self.recovery_open.take() {
-                    self.reconcile(&contracts, &rows, from, through, timing.received_micros)?;
+                    self.reconcile(
+                        &contracts,
+                        &statement.rows,
+                        statement.coverage,
+                        from,
+                        through,
+                        timing.received_micros,
+                    )?;
                 }
             }
         }
@@ -197,8 +565,9 @@ impl Runtime {
                     binding: request.binding.clone(),
                     proposal: None,
                     reason: reason.clone(),
+                    listing_cause: None,
                 })?;
-                self.veto(&format!("proposal unavailable: {}", request.binding), true);
+                self.proposal_unavailable(&request.binding, true);
                 self.compatibility()?;
                 self.proposal_ready(&request.binding, None)?;
             }
@@ -272,6 +641,9 @@ impl Runtime {
         {
             let rows = self.pending_rows.pop_front().unwrap();
             self.decision_receipt = Some(rows.receipt_micros);
+            for binding in &rows.withdraw {
+                self.offer(binding, None)?;
+            }
             for signal in self.step(rows.observations)? {
                 self.dispatch(signal)?;
                 if self.interrupted {
@@ -309,7 +681,7 @@ impl Runtime {
             })
             .collect();
         self.pending_rows
-            .retain(|rows| now.saturating_sub(rows.close_micros) <= ages[rows.instrument]);
+            .retain(|rows| rows.retained_at(now, ages[rows.instrument]));
     }
     pub(super) fn check_progress(&mut self) -> Result<(), String> {
         if let Some(error) = self
@@ -330,13 +702,45 @@ impl Runtime {
     pub(super) fn check_replay_progress(&self, generation: Option<u64>) -> Result<(), String> {
         if !self.authorization_pending
             && self.uploads.is_empty()
-            && self
+            && let Some(detail) = self
                 .scheduler
                 .as_ref()
                 .zip(generation)
-                .is_some_and(|(clock, generation)| clock.stalled(generation))
+                .and_then(|(clock, generation)| clock.stall_detail(generation))
         {
-            return Err("live replay: recorded log stalled before all frames and expected writes were consumed".into());
+            let dispatches = self
+                .dispatches
+                .iter()
+                .map(|(command, dispatch)| {
+                    let stage = if dispatch.claim_at.is_none() {
+                        "preparing"
+                    } else {
+                        self.records
+                            .iter()
+                            .rev()
+                            .find_map(|record| match &record.kind {
+                                RecordKind::Written {
+                                    command: written, ..
+                                } if written == command => Some("written"),
+                                RecordKind::Claimed {
+                                    command: claimed, ..
+                                } if claimed == command => Some("claimed"),
+                                _ => None,
+                            })
+                            .unwrap_or("claimed")
+                    };
+                    (command, stage)
+                })
+                .collect::<Vec<_>>();
+            return Err(format!(
+                "live replay: recorded log stalled before all frames and expected writes were consumed: {detail}; entries={:?}; vetoes={:?}; dispatches={dispatches:?}; authorization_pending={}; pending_uploads={:?}; lease_renewal_in_flight={}; last_not_sent={:?}",
+                self.health.entries,
+                self.vetoes,
+                self.authorization_pending,
+                self.uploads,
+                self.renewal.is_some(),
+                self.last_not_sent,
+            ));
         }
         Ok(())
     }
@@ -550,10 +954,14 @@ impl Runtime {
         &mut self,
         contracts: &[OpenContract],
         rows: &[StatementRow],
+        coverage: crate::broker::StatementCoverage,
         from: i64,
         through: i64,
         received: i64,
     ) -> Result<(), String> {
+        if self.pocket_rule.is_some() {
+            return self.reconcile_pocket(contracts, rows);
+        }
         self.veto("broker recovery unavailable", false);
         let observed_now = self
             .control_time
@@ -690,6 +1098,7 @@ impl Runtime {
                     fact: row.cash.clone(),
                     receipt_micros: row.receipt_micros,
                 },
+                self.broker_kind,
                 &|_| None,
             ) {
                 self.step(vec![observation])?;
@@ -706,7 +1115,8 @@ impl Runtime {
             };
             let horizon =
                 expiry.saturating_add(proposal.terms.settlement.max_settlement_delay_micros);
-            if observed_now < horizon
+            if coverage != crate::broker::StatementCoverage::CompleteRange
+                || observed_now < horizon
                 || through * 1_000_000 < horizon
                 || from * 1_000_000 > expiry
                 || rows.iter().any(|row| {
@@ -733,6 +1143,153 @@ impl Runtime {
             contracts
                 .iter()
                 .any(|c| !self.contracts.contains_key(&c.contract_ref)),
+        );
+        self.entry_gates()
+    }
+
+    fn reconcile_pocket(
+        &mut self,
+        contracts: &[OpenContract],
+        rows: &[StatementRow],
+    ) -> Result<(), String> {
+        self.veto("broker recovery unavailable", false);
+        let deployment_start = self
+            .records
+            .first()
+            .map(|record| record.time_micros)
+            .unwrap_or(i64::MIN);
+        let mut matched_deals = BTreeSet::new();
+        for claim in self.claims.values().cloned().collect::<Vec<_>>() {
+            if claim.deployment != self.definition.deployment
+                || matches!(
+                    claim.state,
+                    ClaimState::NotSent | ClaimState::Rejected | ClaimState::Reconciled
+                )
+            {
+                continue;
+            }
+            let EventKind::Signal {
+                proposal: Some(proposal),
+                ..
+            } = &claim.signal.kind
+            else {
+                continue;
+            };
+            let Some((start, end)) = self.command_window(&claim.signal) else {
+                continue;
+            };
+            let closed = if let Some(id) = self.pocket_written_request_id(&claim.command) {
+                let found = rows
+                    .iter()
+                    .filter(|row| row.request_id == Some(id))
+                    .collect::<Vec<_>>();
+                (found.len() == 1).then(|| found[0])
+            } else {
+                None
+            };
+            let candidate = closed
+                .and_then(|row| row.pocket.as_ref().map(|deal| (row, deal)))
+                .filter(|(_, deal)| {
+                    self.pocket_claim_agrees(&claim, deal, true)
+                        && rows
+                            .iter()
+                            .filter(|row| {
+                                row.pocket.as_ref().is_some_and(|other| other.id == deal.id)
+                            })
+                            .count()
+                            == 1
+                });
+            if let Some((row, deal)) = candidate {
+                let fact = serde_json::to_string(deal).map_err(|error| error.to_string())?;
+                if self
+                    .pocket_closed
+                    .get(&deal.id)
+                    .is_some_and(|facts| facts.iter().any(|retained| retained != &fact))
+                {
+                    self.veto("pocket deal contradicts earlier close", true);
+                    continue;
+                }
+                if matched_deals.insert(deal.id.clone()) {
+                    if !self.contracts.contains_key(&deal.id) {
+                        let liability = deal.liability(self.pocket_offset_minutes)?;
+                        self.step(vec![Observation::Reconciliation {
+                            command: claim.command.clone(),
+                            source: self.source(&format!("recovery-purchase:{}", claim.claim)),
+                            resolution: Resolution::Purchased {
+                                debit: deal.amount.require_number()?,
+                                liability: liability.clone(),
+                            },
+                        }])?;
+                        self.contracts
+                            .insert(deal.id.clone(), claim.command.clone());
+                        self.update_claim(
+                            &claim.command,
+                            ClaimState::Accepted,
+                            Some(&deal.id),
+                            Some(&deal.id),
+                        )?;
+                        self.subscribe_contract(&deal.id)?;
+                    }
+                    self.pocket_deal(deal.clone(), true, row.receipt_micros)?;
+                    self.pocket_correlation(&deal.id, true)?;
+                }
+                continue;
+            }
+            let opened = contracts
+                .iter()
+                .filter(|contract| claim.contract_ref.as_deref() == Some(&contract.contract_ref))
+                .collect::<Vec<_>>();
+            if let [contract] = opened.as_slice() {
+                let agreed = contract.instrument
+                    == proposal
+                        .instrument
+                        .split_once(':')
+                        .map(|(_, symbol)| symbol)
+                        .unwrap_or("")
+                    && contract.direction == proposal.terms.direction
+                    && contract.buy_price.compare(proposal.terms.stake)?
+                        == std::cmp::Ordering::Equal
+                    && start <= contract.purchase_time_micros
+                    && contract.purchase_time_micros <= end;
+                if agreed {
+                    self.contracts
+                        .insert(contract.contract_ref.clone(), claim.command.clone());
+                    self.pocket_correlation(&contract.contract_ref, true)?;
+                    self.step(vec![Observation::ContractUpdate {
+                        command: claim.command.clone(),
+                        source: self
+                            .source(&format!("pocket:recovery-open:{}", contract.contract_ref)),
+                        entry_price_units: None,
+                        entry_time_micros: Some(contract.purchase_time_micros),
+                        start_micros: contract.start_micros,
+                        expiry_micros: contract.expiry_micros,
+                    }])?;
+                    self.veto("unresolved dispatch claim", false);
+                    continue;
+                }
+            }
+            if let Some(local) = self.claims.get_mut(&claim.command) {
+                local.state = ClaimState::PossiblySent;
+            }
+        }
+        for deal in rows.iter().filter_map(|row| row.pocket.as_ref()) {
+            if deal
+                .close_time(self.pocket_offset_minutes)
+                .is_ok_and(|at| at >= deployment_start)
+                && !matched_deals.contains(&deal.id)
+                && !self.contracts.contains_key(&deal.id)
+            {
+                self.pocket_correlation(&deal.id, false)?;
+            }
+        }
+        for contract in contracts {
+            if !self.contracts.contains_key(&contract.contract_ref) {
+                self.pocket_correlation(&contract.contract_ref, false)?;
+            }
+        }
+        self.veto(
+            "broker portfolio contains an uncorrelated liability",
+            !self.uncorrelated_pocket.is_empty(),
         );
         self.entry_gates()
     }

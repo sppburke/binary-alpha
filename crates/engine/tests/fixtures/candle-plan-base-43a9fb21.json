@@ -1,0 +1,194 @@
+{
+  "schema_version": 1,
+  "kind": "feature_plan",
+  "instrument": "b:S",
+  "broker": "b",
+  "provider_symbol": "S",
+  "price_scale": 6,
+  "profile": {
+    "stream_generation": "stream",
+    "profile_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+    "source_generation": "input",
+    "role": "development",
+    "definition": {
+      "broker": "b",
+      "provider_symbol": "S",
+      "quote_currency": "USD",
+      "price_scale": 6,
+      "native_granularity": {
+        "kind": "tick"
+      },
+      "gap": {
+        "max_seconds": 2,
+        "reopen_seconds": 60
+      },
+      "frozen": {
+        "min_observations": 10,
+        "min_seconds": 5
+      },
+      "jump": {
+        "min_basis_points": 5
+      },
+      "span": {
+        "min_percent": 75
+      },
+      "candles": [
+        {
+          "duration_seconds": 5,
+          "offset_seconds": 0,
+          "min_observations": 2,
+          "hard_min_observations": 1
+        }
+      ]
+    },
+    "ticks": true
+  },
+  "development_generation": "input",
+  "settings": {
+    "streams": [
+      {
+        "duration_seconds": 5,
+        "offset_seconds": 0
+      }
+    ],
+    "outputs": [
+      "body_bps"
+    ],
+    "moving_average_periods": [
+      20,
+      50
+    ],
+    "rolling_window": 100,
+    "min_history": 20,
+    "structure": {
+      "swing_left": 3,
+      "swing_right": 3,
+      "rolling_windows": [
+        5,
+        10,
+        20
+      ],
+      "direction_window": 10,
+      "trend_efficiency_threshold": 0.35,
+      "trend_min_abs_momentum_bps": 3.0,
+      "range_efficiency_threshold": 0.25,
+      "compression_ratio_threshold": 0.7,
+      "expanded_ratio_threshold": 1.3,
+      "extreme_ratio_threshold": 1.8,
+      "pullback_min_trend_age": 3,
+      "trend_reset_sideways_bars": 3,
+      "failed_breakout_max_bars": 5
+    },
+    "price_epsilon": "0",
+    "price_epsilon_units": 0,
+    "tick_path_streams": [
+      {
+        "duration_seconds": 5,
+        "offset_seconds": 0
+      }
+    ]
+  },
+  "definitions": {
+    "tick_path": "tick_path_pressure_v1",
+    "gap_class": "gap_class_v1",
+    "structure": "structure_labels_v1",
+    "sequence": "structure_sequence_v1",
+    "candle_shape": "candle_features_v1",
+    "moving_average": "moving_average_v1",
+    "regime": "regime_v1",
+    "eligibility": "clean_v1",
+    "encoder": "encoder_v1",
+    "statistics": "rolling_statistics_v1"
+  },
+  "max_labels": 32768,
+  "raw_identity": "21a660c6719f9957cafdaf6c3701044ac233f32ec8a37d4ae1b370e6cce2e856",
+  "fit_windows": [],
+  "streams": [
+    {
+      "duration_seconds": 5,
+      "offset_seconds": 0,
+      "tick_path": true,
+      "outputs": [
+        {
+          "name": "open_time_micros",
+          "kind": "time",
+          "stage": "candle",
+          "predictive": false,
+          "readiness": "available on every accepted candle"
+        },
+        {
+          "name": "close_time_micros",
+          "kind": "time",
+          "stage": "candle",
+          "predictive": false,
+          "readiness": "available on every accepted candle"
+        },
+        {
+          "name": "known_at_micros",
+          "kind": "time",
+          "stage": "candle",
+          "predictive": false,
+          "readiness": "available on every accepted candle"
+        },
+        {
+          "name": "first_event_micros",
+          "kind": "time",
+          "stage": "candle",
+          "predictive": false,
+          "readiness": "available on every accepted candle"
+        },
+        {
+          "name": "last_event_micros",
+          "kind": "time",
+          "stage": "candle",
+          "predictive": false,
+          "readiness": "available on every accepted candle"
+        },
+        {
+          "name": "candle_ordinal",
+          "kind": "int",
+          "stage": "candle",
+          "predictive": false,
+          "readiness": "available on every accepted candle"
+        },
+        {
+          "name": "open_units",
+          "kind": "int",
+          "stage": "candle",
+          "predictive": false,
+          "readiness": "available on every accepted candle"
+        },
+        {
+          "name": "high_units",
+          "kind": "int",
+          "stage": "candle",
+          "predictive": false,
+          "readiness": "available on every accepted candle"
+        },
+        {
+          "name": "low_units",
+          "kind": "int",
+          "stage": "candle",
+          "predictive": false,
+          "readiness": "available on every accepted candle"
+        },
+        {
+          "name": "close_units",
+          "kind": "int",
+          "stage": "candle",
+          "predictive": false,
+          "readiness": "available on every accepted candle"
+        },
+        {
+          "name": "body_bps",
+          "kind": "float",
+          "stage": "anatomy",
+          "predictive": true,
+          "readiness": "unavailable when the open is zero"
+        }
+      ],
+      "excluded": [],
+      "encodings": []
+    }
+  ]
+}

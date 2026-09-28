@@ -3196,6 +3196,12 @@ impl Engine {
         &self.accounts
     }
 
+    pub fn proposal(&self, binding: &str) -> Option<&Proposal> {
+        self.binding_index
+            .get(binding)
+            .and_then(|index| self.proposals[*index].as_ref())
+    }
+
     /// The identity of every financial state a ledger reconstructs: accounts, open obligations,
     /// capacity, and the sequence.
     pub fn state_identity(&self) -> String {
@@ -6845,6 +6851,7 @@ mod tests {
     #[test]
     fn identities_canonicalize_conditions_and_exclude_economics() {
         let stream = StreamKey {
+            kind: crate::config::StreamKind::Candle,
             duration_seconds: 30,
             offset_seconds: 15,
         };

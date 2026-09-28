@@ -1603,6 +1603,7 @@ mod governed {
     use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
     const STREAM: StreamKey = StreamKey {
+        kind: binary_alpha_engine::config::StreamKind::Candle,
         duration_seconds: 30,
         offset_seconds: 15,
     };

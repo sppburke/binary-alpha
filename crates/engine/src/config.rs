@@ -138,6 +138,14 @@ impl Config {
                 .iter()
                 .find(|broker| broker.id() == &live.broker)
                 .ok_or("live.broker: broker is not declared under [[brokers]]")?;
+            if let Broker::PocketOption(settings) = broker {
+                if settings.account_class != AccountClass::Demo {
+                    return Err("live.broker: Pocket real account class is not supported".into());
+                }
+                if settings.payout.is_none() {
+                    return Err("live.broker: Pocket payout is required".into());
+                }
+            }
             match self.run_mode {
                 RunMode::Paper | RunMode::Live => {
                     if live.replay.is_some() {
@@ -382,7 +390,7 @@ impl Config {
                 return Err("inspect: broker has no live capability".into());
             }
             if inspect.proposal.is_some()
-                && (!broker.kind().capabilities().execution || broker.credential().is_none())
+                && (broker.kind() != BrokerKind::Deriv || broker.credential().is_none())
             {
                 return Err(
                     "inspect: proposal requires a Deriv broker with a credential reference".into(),
@@ -410,7 +418,7 @@ impl BrokerKind {
         Capabilities {
             history: true,
             live: true,
-            execution: self == Self::Deriv,
+            execution: true,
         }
     }
 }
@@ -472,6 +480,17 @@ pub struct PocketSettings {
     /// Maximum unconsumed candle pages, including outstanding requests; defaults to eight.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub history_pages_in_flight: Option<u16>,
+    /// Optional for market-only research configurations; required for live accounts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub payout: Option<PocketPayout>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PocketPayout {
+    pub add_percent: u8,
+    pub cap_percent: u8,
+    pub max_age_seconds: u32,
 }
 
 impl Broker {
@@ -546,6 +565,22 @@ impl Broker {
                 }
             }
             Self::PocketOption(settings) => {
+                if mode != RunMode::Research && settings.account_class != AccountClass::Demo {
+                    return Err(
+                        "pocket_option: real account class is not supported for live or replay"
+                            .into(),
+                    );
+                }
+                if mode != RunMode::Research && settings.payout.is_none() {
+                    return Err("pocket_option: payout is required for live or replay".into());
+                }
+                if let Some(payout) = settings.payout
+                    && (payout.cap_percent == 0
+                        || payout.cap_percent > 100
+                        || payout.max_age_seconds == 0)
+                {
+                    return Err("pocket_option: payout cap_percent and max_age_seconds must be positive; cap_percent must be at most 100".into());
+                }
                 if settings.history_pages_in_flight == Some(0) {
                     return Err("history_pages_in_flight must be positive".into());
                 }
@@ -1090,17 +1125,100 @@ pub struct FeatureInstrument {
     pub encodings: Option<Encodings>,
 }
 
-/// One configured duration and offset pair naming a stream of the bound definition.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
+crate::string_enum! {
+    /// The kind of decision row a feature stream emits.
+    StreamKind "stream kind" {
+        Candle => "candle",
+        Quote => "quote",
+    }
+}
+
+impl StreamKind {
+    pub const fn candle() -> Self {
+        Self::Candle
+    }
+
+    pub fn is_candle(&self) -> bool {
+        *self == Self::Candle
+    }
+}
+
+/// One configured candle duration and offset, or the per-tick quote stream.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct StreamKey {
+    pub kind: StreamKind,
     pub duration_seconds: u32,
     pub offset_seconds: u32,
 }
 
+impl<'de> Deserialize<'de> for StreamKey {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Fields {
+            #[serde(default = "StreamKind::candle")]
+            kind: StreamKind,
+            #[serde(default)]
+            duration_seconds: u32,
+            #[serde(default)]
+            offset_seconds: u32,
+        }
+        let fields = Fields::deserialize(deserializer)?;
+        if fields.kind == StreamKind::Quote
+            && (fields.duration_seconds != 0 || fields.offset_seconds != 0)
+        {
+            return Err(serde::de::Error::custom(
+                "quote stream has no duration or offset",
+            ));
+        }
+        Ok(Self {
+            kind: fields.kind,
+            duration_seconds: fields.duration_seconds,
+            offset_seconds: fields.offset_seconds,
+        })
+    }
+}
+
+impl StreamKey {
+    pub const fn candle(duration_seconds: u32, offset_seconds: u32) -> Self {
+        Self {
+            kind: StreamKind::Candle,
+            duration_seconds,
+            offset_seconds,
+        }
+    }
+
+    pub const fn quote() -> Self {
+        Self {
+            kind: StreamKind::Quote,
+            duration_seconds: 0,
+            offset_seconds: 0,
+        }
+    }
+}
+
+impl Serialize for StreamKey {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap;
+        let mut map =
+            serializer.serialize_map(Some(if self.kind == StreamKind::Quote { 1 } else { 2 }))?;
+        match self.kind {
+            StreamKind::Quote => map.serialize_entry("kind", &self.kind)?,
+            StreamKind::Candle => {
+                map.serialize_entry("duration_seconds", &self.duration_seconds)?;
+                map.serialize_entry("offset_seconds", &self.offset_seconds)?;
+            }
+        }
+        map.end()
+    }
+}
+
 impl fmt::Display for StreamKey {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}s/{}s", self.duration_seconds, self.offset_seconds)
+        match self.kind {
+            StreamKind::Candle => write!(f, "{}s/{}s", self.duration_seconds, self.offset_seconds),
+            StreamKind::Quote => f.write_str("quote"),
+        }
     }
 }
 
@@ -1287,9 +1405,14 @@ fn sorted_unique(values: &[u32]) -> bool {
 
 fn unique_streams(streams: &[StreamKey]) -> Result<(), String> {
     for (index, stream) in streams.iter().enumerate() {
-        if stream.duration_seconds == 0 || stream.offset_seconds >= stream.duration_seconds {
+        if (stream.kind == StreamKind::Quote
+            && (stream.duration_seconds != 0 || stream.offset_seconds != 0))
+            || (stream.kind == StreamKind::Candle
+                && (stream.duration_seconds == 0
+                    || stream.offset_seconds >= stream.duration_seconds))
+        {
             return Err(format!(
-                "[{index}]: stream {stream} needs a positive duration and a smaller offset"
+                "[{index}]: stream {stream} needs a valid kind, duration and offset"
             ));
         }
         if streams[..index].contains(stream) {
@@ -1388,6 +1511,12 @@ impl FeatureInstrument {
         }
         if let Some(streams) = &self.tick_path_streams {
             unique_streams(streams).map_err(|reason| format!("tick_path_streams{reason}"))?;
+            if streams
+                .iter()
+                .any(|stream| stream.kind == StreamKind::Quote)
+            {
+                return Err("tick_path_streams: quote streams have no tick path".into());
+            }
             if let Some(selected) = &self.streams
                 && let Some(stream) = streams.iter().find(|stream| !selected.contains(stream))
             {
@@ -2877,6 +3006,23 @@ end = \"2025-05-19T11:15:10Z\"
 #[cfg(test)]
 mod feature_tests {
     use super::*;
+
+    #[test]
+    fn quote_stream_key_round_trips_without_changing_candle_spelling() {
+        let quote: StreamKey = toml::from_str("kind = \"quote\"\n").unwrap();
+        assert_eq!(quote, StreamKey::quote());
+        assert_eq!(toml::to_string(&quote).unwrap(), "kind = \"quote\"\n");
+        assert_eq!(
+            toml::to_string(&StreamKey::candle(5, 0)).unwrap(),
+            "duration_seconds = 5\noffset_seconds = 0\n"
+        );
+        assert!(
+            toml::from_str::<StreamKey>("kind = \"quote\"\nduration_seconds = 5\n")
+                .unwrap_err()
+                .to_string()
+                .contains("quote stream has no duration or offset")
+        );
+    }
 
     const HEAD: &str = "schema_version = 1\nrun_mode = \"research\"\n\n[storage]\nhistorical_data_dir = \"h\"\npublication_uri = \"file:///p\"\n";
     const INPUT: &str = "file:///p/manifests/1111111111111111111111111111111111111111111111111111111111111111/ready.json";

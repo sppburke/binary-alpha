@@ -22,6 +22,8 @@ const MEASURED_CONTRACT_TYPES: [&str; 2] = ["CALL", "PUT"];
 
 #[derive(Debug, Clone)]
 pub struct StatementRow {
+    pub request_id: Option<u64>,
+    pub pocket: Option<crate::broker::pocket_options::Deal>,
     pub instrument: Option<String>,
     pub direction: Option<Direction>,
     pub cash: CashFact,
@@ -825,6 +827,8 @@ impl DerivOptions {
                     return Err("deriv statement: transaction outside requested range".into());
                 }
                 facts.push(StatementRow {
+                    request_id: None,
+                    pocket: None,
                     instrument: t.underlying_symbol,
                     direction: t.contract_type.as_deref().map(direction).transpose()?,
                     receipt_micros: response.receipt_micros,
@@ -881,7 +885,9 @@ pub fn to_observation(
     command_of: &dyn Fn(&str) -> Option<String>,
 ) -> Option<execution::Observation> {
     Some(match event {
-        AccountEvent::TransactionAcknowledged => return None,
+        AccountEvent::TransactionAcknowledged
+        | AccountEvent::Listing { .. }
+        | AccountEvent::PocketDeal { .. } => return None,
         AccountEvent::Cash {
             fact,
             receipt_micros,
@@ -926,7 +932,27 @@ pub fn purchase_observation(
     outcome: PurchaseOutcome,
     receipt: i64,
 ) -> execution::Observation {
-    let dispatch = source(format!("deriv:dispatch:{claim}"), receipt, receipt);
+    purchase_observation_for_kind(
+        command,
+        claim,
+        outcome,
+        receipt,
+        binary_alpha_engine::config::BrokerKind::Deriv,
+    )
+}
+
+pub(crate) fn purchase_observation_for_kind(
+    command: &str,
+    claim: &str,
+    outcome: PurchaseOutcome,
+    receipt: i64,
+    kind: binary_alpha_engine::config::BrokerKind,
+) -> execution::Observation {
+    let prefix = match kind {
+        binary_alpha_engine::config::BrokerKind::Deriv => "deriv",
+        binary_alpha_engine::config::BrokerKind::PocketOption => "pocket",
+    };
+    let dispatch = source(format!("{prefix}:dispatch:{claim}"), receipt, receipt);
     match outcome {
         PurchaseOutcome::Accepted {
             debit,
@@ -935,21 +961,34 @@ pub fn purchase_observation(
         } => execution::Observation::Purchased {
             command: command.into(),
             source: source(
-                format!("deriv:buy:{}", liability.transaction_ref),
+                format!(
+                    "{prefix}:buy:{}",
+                    match kind {
+                        binary_alpha_engine::config::BrokerKind::Deriv =>
+                            &liability.transaction_ref,
+                        binary_alpha_engine::config::BrokerKind::PocketOption =>
+                            &liability.contract_ref,
+                    }
+                ),
                 liability.purchase_time_micros,
                 receipt_micros,
             ),
             debit,
             liability,
         },
-        PurchaseOutcome::Rejected { receipt_micros, .. } => execution::Observation::Rejected {
-            command: command.into(),
-            source: source(
-                format!("deriv:dispatch:{claim}"),
-                receipt_micros,
-                receipt_micros,
-            ),
-        },
+        PurchaseOutcome::Rejected { receipt_micros, .. }
+            if kind == binary_alpha_engine::config::BrokerKind::Deriv =>
+        {
+            execution::Observation::Rejected {
+                command: command.into(),
+                source: source(
+                    format!("deriv:dispatch:{claim}"),
+                    receipt_micros,
+                    receipt_micros,
+                ),
+            }
+        }
+        PurchaseOutcome::Rejected { .. } => unreachable!("Pocket has no correlated rejection"),
         PurchaseOutcome::ProvenNotSent { .. } => execution::Observation::NotSent {
             command: command.into(),
             source: dispatch,
