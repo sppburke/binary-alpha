@@ -1939,6 +1939,43 @@ fn pocket_new_deal_list_forces_fresh_balance_into_owner() {
 }
 
 #[test]
+fn pocket_predeployment_closed_facts_do_not_veto_entries() {
+    let fixture = Fixture::quote("phase12-pocket-old-close-facts");
+    authorize(&fixture);
+    let first_log = pocket_log()
+        .lines()
+        .take_while(|line| !line.contains("updateStream"))
+        .map(|line| format!("{line}\n"))
+        .collect::<String>();
+    let first = RecordedConnector::from_jsonl(&first_log).unwrap();
+    let control = live::control::FakeControl::new(QUOTE_START - 2_000_000);
+    let mut runtime = pocket_runtime(&fixture, live::Mode::Live, &first, control.clone()).unwrap();
+    runtime.run_until(|_| first.exhausted()).unwrap();
+    drop(runtime);
+    control.clone().advance(70_000_000);
+    let recorded = RecordedConnector::from_jsonl(&pocket_changed_old_fact_log()).unwrap();
+    let mut runtime = pocket_runtime(&fixture, live::Mode::Live, &recorded, control).unwrap();
+    let mut entries_after_quote = None;
+    runtime
+        .run_until(|health| {
+            if health.warmup && entries_after_quote.is_none() {
+                entries_after_quote = Some(health.entries.clone());
+            }
+            recorded.exhausted() && health.warmup
+        })
+        .unwrap();
+    assert!(
+        matches!(entries_after_quote, Some(live::Entries::Enabled)),
+        "{entries_after_quote:?}"
+    );
+    assert!(
+        !runtime.records().iter().any(|record| matches!(&record.kind,
+        live::journal::RecordKind::PocketClosed { deal_id, .. }
+        if deal_id == "synthetic-older"))
+    );
+}
+
+#[test]
 fn pocket_quote_beyond_frozen_age_cannot_dispatch() {
     use binary_alpha_engine::execution::{Disposition, EventKind};
     let fixture = Fixture::quote("phase12-pocket-aged-quote");
@@ -2980,13 +3017,57 @@ fn pocket_duplicate_request_id_in_statement_keeps_claim_unresolved() {
         broker: "pocket_option",
         account: "a0",
     };
-    assert_ne!(
-        control.clone().retained_claims(key).unwrap()[0].state,
-        ClaimState::Reconciled
-    );
+    let claims = control.clone().retained_claims(key).unwrap();
+    let claim = &claims[0];
+    assert_eq!(claim.state, ClaimState::PossiblySent);
+    assert!(claim.contract_ref.is_none());
+    assert!(claim.transaction_ref.is_none());
     assert_eq!(restored.engine().accounts()[0].open, 1);
     assert!(
         matches!(&restored.health().entries, live::Entries::Disabled(reason) if reason.contains("unresolved"))
+    );
+}
+
+#[test]
+fn pocket_reused_written_request_id_keeps_claim_unresolved() {
+    use live::control::{ClaimState, Control, LeaseKey};
+    let (fixture, control, request_id) = pocket_written_claim("phase12-pocket-reused-written-id");
+    let (mut journal, records) = live::journal::Journal::open(
+        &fixture.scratch.path("journal"),
+        &fixture.definition().deployment,
+        16,
+    )
+    .unwrap();
+    journal
+        .append(
+            records.last().unwrap().time_micros + 1,
+            live::journal::RecordKind::Written {
+                command: "synthetic-other-command".into(),
+                claim: "synthetic-other-claim".into(),
+                request_id: Some(request_id),
+            },
+        )
+        .unwrap();
+    drop(journal);
+    let recorded = RecordedConnector::from_jsonl(&pocket_restart_log(request_id)).unwrap();
+    let mut runtime =
+        pocket_runtime(&fixture, live::Mode::Live, &recorded, control.clone()).unwrap();
+    runtime.run_until(|_| recorded.exhausted()).unwrap();
+    let claims = control
+        .clone()
+        .retained_claims(LeaseKey {
+            broker: "pocket_option",
+            account: "a0",
+        })
+        .unwrap();
+    assert_eq!(claims[0].state, ClaimState::PossiblySent);
+    assert!(claims[0].contract_ref.is_none());
+    assert!(
+        !runtime.records().iter().any(|record| matches!(&record.kind,
+        live::journal::RecordKind::Ledger { event }
+        if matches!(event.kind, binary_alpha_engine::execution::EventKind::Reconciled {
+            resolution: binary_alpha_engine::execution::Resolution::Purchased { .. }, ..
+        })))
     );
 }
 
@@ -3052,6 +3133,21 @@ fn pocket_foreign_close_veto_survives_a_later_partial_snapshot() {
     assert!(
         matches!(&reconciled.health().entries, live::Entries::Disabled(reason)
         if reason.contains("pocket deal contradicts earlier close"))
+    );
+    let claims = control.clone().retained_claims(key).unwrap();
+    let claim = &claims[0];
+    assert_eq!(claim.state, ClaimState::PossiblySent);
+    assert!(claim.contract_ref.is_none());
+    assert!(claim.transaction_ref.is_none());
+    assert!(
+        !reconciled
+            .records()
+            .iter()
+            .any(|record| matches!(&record.kind,
+            live::journal::RecordKind::Ledger { event }
+            if matches!(event.kind, binary_alpha_engine::execution::EventKind::Reconciled {
+                resolution: binary_alpha_engine::execution::Resolution::Purchased { .. }, ..
+            })))
     );
 }
 
@@ -3502,10 +3598,7 @@ fn stalled_recorded_log_fails_without_final_publication() {
         &["live", "replay", "--config", fixture.path.to_str().unwrap()],
     )
     .unwrap_err();
-    assert_eq!(
-        error,
-        "live replay: recorded log stalled before all frames and expected writes were consumed"
-    );
+    assert_recorded_stall(&error);
     assert!(
         !fixture
             .scratch
@@ -3618,7 +3711,11 @@ fn market_before_bootstrap_or_transaction_ack_fails_immediately() {
             &["live", "replay", "--config", fixture.path.to_str().unwrap()],
         )
         .unwrap_err();
-        assert_eq!(error, expected, "{name}");
+        if name == "transaction-ack" {
+            assert_recorded_stall(&error);
+        } else {
+            assert_eq!(error, expected, "{name}");
+        }
         assert!(
             !fixture
                 .scratch

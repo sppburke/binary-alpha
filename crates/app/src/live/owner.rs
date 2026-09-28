@@ -190,6 +190,9 @@ impl Runtime {
             .first()
             .map(|r| r.time_micros)
             .unwrap_or(i64::MIN);
+        if closed && deal.close_time(clock_offset)? < start {
+            return Ok(());
+        }
         if closed {
             let fact = serde_json::to_string(&deal).map_err(|error| error.to_string())?;
             let facts = self.pocket_closed.entry(deal.id.clone()).or_default();
@@ -204,9 +207,6 @@ impl Runtime {
                 self.veto("pocket deal contradicts earlier close", true);
                 return Ok(());
             }
-        }
-        if closed && deal.close_time(clock_offset)? < start {
-            return Ok(());
         }
         if !self.contracts.contains_key(&deal.id) {
             self.pocket_correlation(&deal.id, false)?;
@@ -256,30 +256,9 @@ impl Runtime {
         command: &str,
         deal: &pocket_options::Deal,
     ) -> Result<bool, String> {
-        let written = self
-            .records
-            .iter()
-            .filter_map(|record| match &record.kind {
-                RecordKind::Written {
-                    command: bound,
-                    request_id,
-                    ..
-                } if bound == command => *request_id,
-                _ => None,
-            })
-            .collect::<Vec<_>>();
-        if written.len() != 1 || deal.request_id != Some(written[0]) {
-            return Ok(false);
-        }
-        if self
-            .records
-            .iter()
-            .filter(|record| {
-                matches!(&record.kind,
-            RecordKind::Written { request_id: Some(id), .. } if *id == written[0])
-            })
-            .count()
-            != 1
+        if !self
+            .pocket_written_request_id(command)
+            .is_some_and(|id| deal.request_id == Some(id))
         {
             return Ok(false);
         }
@@ -360,22 +339,11 @@ impl Runtime {
         let Some((start, end)) = self.command_window(&claim.signal) else {
             return false;
         };
-        let written = self
-            .records
-            .iter()
-            .filter_map(|record| match &record.kind {
-                RecordKind::Written {
-                    command,
-                    request_id,
-                    ..
-                } if *command == claim.command => *request_id,
-                _ => None,
-            })
-            .collect::<Vec<_>>();
         let (_, symbol) = proposal.instrument.split_once(':').unwrap_or(("", ""));
         deal.is_demo == 1
-            && written.len() == 1
-            && deal.request_id == Some(written[0])
+            && self
+                .pocket_written_request_id(&claim.command)
+                .is_some_and(|id| deal.request_id == Some(id))
             && deal.currency.as_ref() == Some(&proposal.terms.currency)
             && deal.asset == symbol
             && deal.direction().ok() == Some(proposal.terms.direction)
@@ -402,6 +370,33 @@ impl Runtime {
                 .contracts
                 .get(&deal.id)
                 .is_some_and(|command| command != &claim.command)
+    }
+    fn pocket_written_request_id(&self, command: &str) -> Option<u64> {
+        let ids = self
+            .records
+            .iter()
+            .filter_map(|record| match &record.kind {
+                RecordKind::Written {
+                    command: bound,
+                    request_id,
+                    ..
+                } if bound == command => Some(*request_id),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let [Some(id)] = ids.as_slice() else {
+            return None;
+        };
+        (self
+            .records
+            .iter()
+            .filter(|record| {
+                matches!(&record.kind,
+            RecordKind::Written { request_id: Some(other), .. } if other == id)
+            })
+            .count()
+            == 1)
+            .then_some(*id)
     }
     fn reply(&mut self, reply: Reply) -> Result<(), String> {
         let (value, timing) = match reply {
@@ -649,13 +644,15 @@ impl Runtime {
     pub(super) fn check_replay_progress(&self, generation: Option<u64>) -> Result<(), String> {
         if !self.authorization_pending
             && self.uploads.is_empty()
-            && self
+            && let Some(detail) = self
                 .scheduler
                 .as_ref()
                 .zip(generation)
-                .is_some_and(|(clock, generation)| clock.stalled(generation))
+                .and_then(|(clock, generation)| clock.stall_detail(generation))
         {
-            return Err("live replay: recorded log stalled before all frames and expected writes were consumed".into());
+            return Err(format!(
+                "live replay: recorded log stalled before all frames and expected writes were consumed: {detail}"
+            ));
         }
         Ok(())
     }
@@ -1093,26 +1090,12 @@ impl Runtime {
             let Some((start, end)) = self.command_window(&claim.signal) else {
                 continue;
             };
-            let request_ids = self
-                .records
-                .iter()
-                .filter_map(|record| match &record.kind {
-                    RecordKind::Written {
-                        command,
-                        request_id: Some(id),
-                        ..
-                    } if *command == claim.command => Some(*id),
-                    _ => None,
-                })
-                .collect::<Vec<_>>();
-            let closed = if request_ids.len() == 1 {
-                let id = request_ids[0];
-                let claim_count = self.records.iter().filter(|record| matches!(&record.kind, RecordKind::Written { request_id: Some(other), .. } if *other == id)).count();
+            let closed = if let Some(id) = self.pocket_written_request_id(&claim.command) {
                 let found = rows
                     .iter()
                     .filter(|row| row.request_id == Some(id))
                     .collect::<Vec<_>>();
-                (claim_count == 1 && found.len() == 1).then(|| found[0])
+                (found.len() == 1).then(|| found[0])
             } else {
                 None
             };
@@ -1120,10 +1103,6 @@ impl Runtime {
                 .and_then(|row| row.pocket.as_ref().map(|deal| (row, deal)))
                 .filter(|(_, deal)| {
                     self.pocket_claim_agrees(&claim, deal)
-                        && self
-                            .pocket_closed
-                            .get(&deal.id)
-                            .is_none_or(|facts| facts.len() == 1)
                         && rows
                             .iter()
                             .filter(|row| {
@@ -1133,6 +1112,15 @@ impl Runtime {
                             == 1
                 });
             if let Some((row, deal)) = candidate {
+                let fact = serde_json::to_string(deal).map_err(|error| error.to_string())?;
+                if self
+                    .pocket_closed
+                    .get(&deal.id)
+                    .is_some_and(|facts| facts.iter().any(|retained| retained != &fact))
+                {
+                    self.veto("pocket deal contradicts earlier close", true);
+                    continue;
+                }
                 if matched_deals.insert(deal.id.clone()) {
                     if !self.contracts.contains_key(&deal.id) {
                         let liability = deal.liability(self.pocket_offset_minutes)?;

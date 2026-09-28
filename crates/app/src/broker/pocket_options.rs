@@ -555,9 +555,6 @@ impl PocketOptions {
                     .map_err(|_| "pocket options: invalid closed deal list")?;
                 for deal in &deals {
                     deal.validate(&self.account)?;
-                    if let Some(id) = deal.request_id {
-                        self.request_ids.insert(id);
-                    }
                     self.close_deal(deal.clone(), event.receipt_micros, login)?;
                 }
             }
@@ -1223,9 +1220,15 @@ mod tests {
         let encoded = account.prepare_purchase(&prepared).unwrap();
         assert_eq!(encoded.request_id, 10_000_000);
         account.listings.get_mut("TEST").unwrap().frame_sha256 = "changed".into();
+        let not_sent = account.write_purchase(encoded.clone()).unwrap();
+        assert!(matches!(not_sent, PurchaseOutcome::ProvenNotSent { .. }));
         assert!(matches!(
-            account.write_purchase(encoded.clone()).unwrap(),
-            PurchaseOutcome::ProvenNotSent { .. }
+            super::super::options::purchase_observation(
+                "synthetic-command", "synthetic-claim", not_sent, 100_000_000,
+                binary_alpha_engine::config::BrokerKind::PocketOption,
+            ),
+            binary_alpha_engine::execution::Observation::NotSent { source, .. }
+                if source.id.starts_with("pocket:")
         ));
         account.listings.insert("TEST".into(), listing);
         assert!(matches!(

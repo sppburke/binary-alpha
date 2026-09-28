@@ -337,14 +337,42 @@ impl ReplayClock {
     pub fn generation(&self) -> u64 {
         self.schedule.0.lock().unwrap().generation
     }
+    #[cfg(test)]
     pub fn stalled(&self, owner_generation: u64) -> bool {
+        self.stall_detail(owner_generation).is_some()
+    }
+    pub fn stall_detail(&self, owner_generation: u64) -> Option<String> {
         let state = self.schedule.0.lock().unwrap();
         // Any intervening progress requires an owner pass at the new state, including
         // equal-time frames. A timeout or repeated observation is not evidence of a stall.
-        state.generation == owner_generation
+        (state.generation == owner_generation
             && state.failure.is_none()
             && !state.frames.is_empty()
-            && !state.can_progress(self.time.load(Ordering::SeqCst))
+            && !state.can_progress(self.time.load(Ordering::SeqCst)))
+        .then(|| {
+            let head = state.frames.front().unwrap();
+            let line = if head.frame.is_some() {
+                format!("frame at={:?}", head.at)
+            } else if head.binary.is_some() {
+                format!("binary at={:?}", head.at)
+            } else {
+                format!("expect text={:?}", head.expect)
+            };
+            let parked = ["bootstrap", "market", "account"]
+                .map(|session| {
+                    let reason = state
+                        .parked
+                        .get(session)
+                        .map_or("none".into(), |wait| format!("{:?}", wait.reason));
+                    format!("{session}={reason}")
+                })
+                .join(", ");
+            format!(
+                "head session={} {line}; parked: {parked}; clock={}",
+                head.session,
+                self.time.load(Ordering::SeqCst)
+            )
+        })
     }
     pub fn cancel(&self) {
         let mut state = self.schedule.0.lock().unwrap();
@@ -386,7 +414,7 @@ struct Parked {
     until: Option<std::time::Instant>,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 enum RecordedWait {
     Idle,
     Read,
@@ -1148,12 +1176,13 @@ mod scheduler_regressions {
                 clock.sleep_until(3_600_000_000);
             });
             wait_for_parked(&scheduler);
-            let stalled = scheduler.stalled(scheduler.generation());
+            let detail = scheduler.stall_detail(scheduler.generation()).unwrap();
             scheduler.cancel();
             assert!(
-                stalled,
-                "rate-waiting session cannot consume its subscribed head frame"
+                detail.contains("head session=account frame at=Some(0)"),
+                "{detail}"
             );
+            assert!(detail.contains("account=Rate(3600000000)"), "{detail}");
         });
     }
 
@@ -1525,7 +1554,16 @@ mod scheduler_regressions {
                 account.receive_until(10_000, &clock, true).unwrap()
             });
             wait_for_parked(&clock);
-            assert!(clock.stalled(clock.generation()));
+            let detail = clock.stall_detail(clock.generation()).unwrap();
+            assert!(
+                detail.contains("head session=account expect text=Some("),
+                "{detail}"
+            );
+            assert!(
+                detail.contains("account=ReadUntil { deadline: 10000, poll: true }"),
+                "{detail}"
+            );
+            assert!(detail.contains("; clock=0"), "{detail}");
             clock.wake("account");
             assert!(!clock.stalled(clock.generation()));
             assert!(matches!(worker.join().unwrap(), ReadOutcome::Interrupted));

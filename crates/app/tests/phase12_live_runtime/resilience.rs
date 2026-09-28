@@ -1,4 +1,6 @@
-use super::support::{self, Fixture, START, change, frame, matching_log, runtime, runtime_with};
+use super::support::{
+    self, Fixture, START, assert_recorded_stall, change, frame, matching_log, runtime, runtime_with,
+};
 use super::support::{
     account_row as account, authorize, ledger_events as ledger, scenario_log as log,
     scenario_rows as rows,
@@ -242,10 +244,7 @@ fn startup_market_before_balance_fails_as_stalled() {
     )
     .err()
     .unwrap();
-    assert_eq!(
-        error,
-        "live replay: recorded log stalled before all frames and expected writes were consumed"
-    );
+    assert_recorded_stall(&error);
     assert!(
         !fixture
             .scratch

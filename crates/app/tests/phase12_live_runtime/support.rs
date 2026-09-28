@@ -25,6 +25,17 @@ pub fn write(path: &Path, bytes: impl AsRef<[u8]>) {
 pub fn cli(log: &Path, args: &[&str]) -> Result<String, String> {
     crate::common::cli_as(log, "synthetic-operator", args).map_err(|s| s.trim_end().into())
 }
+pub fn assert_recorded_stall(error: &str) {
+    assert!(error.starts_with("live replay: recorded log stalled before all frames and expected writes were consumed: head session="), "{error}");
+    for field in [
+        "; parked: bootstrap=",
+        ", market=",
+        ", account=",
+        "; clock=",
+    ] {
+        assert!(error.contains(field), "missing {field}: {error}");
+    }
+}
 pub fn object(root: &Path, generation: &str, path: &str) -> Vec<u8> {
     let manifest: Value = serde_json::from_slice(
         &fs::read(root.join("published").join(manifest_key(generation))).unwrap(),
@@ -957,6 +968,58 @@ pub fn pocket_new_fact_balance_log() -> String {
         QUOTE_START + 1_300_000,
         &pocket_event("successupdateBalance", json!({"isDemo":1,"balance":10000})),
     ));
+    log
+}
+pub fn pocket_changed_old_fact_log() -> String {
+    let changed = json!({
+        "id":"synthetic-older","asset":shared::SYMBOLS[0],
+        "command":1,"amount":1,"profit":0,"percentProfit":92,
+        "openPrice":1.0,"closePrice":1.2,
+        "openTimestamp":QUOTE_START/1_000_000-7200,"openMs":0,
+        "closeTimestamp":QUOTE_START/1_000_000-3600,"closeMs":0,
+        "isDemo":1,"currency":"USD","requestId":33333333,"optionType":100
+    });
+    let mut log: String = pocket_restart_log(33333333)
+        .lines()
+        .map(|line| {
+            let mut row: Value = serde_json::from_str(line).unwrap();
+            if row["frame"]
+                .as_str()
+                .is_some_and(|frame| frame.contains("updateClosedDeals"))
+            {
+                row["frame"] = json!(pocket_event("updateClosedDeals", json!([changed])));
+            } else if row["frame"]
+                .as_str()
+                .is_some_and(|frame| frame.contains("successupdateBalance"))
+            {
+                row["frame"] = json!(pocket_event(
+                    "successupdateBalance",
+                    json!({"isDemo":1,"balance":10000})
+                ));
+            }
+            format!("{row}\n")
+        })
+        .collect();
+    for step in 0..3 {
+        let at = QUOTE_START + 32_000_000 + step * 300_000;
+        let provider_at = at - 200_000;
+        let provider = serde_json::from_str::<Value>(&format!(
+            "{}.{:06}",
+            provider_at / 1_000_000,
+            provider_at % 1_000_000
+        ))
+        .unwrap();
+        let price = serde_json::from_str::<Value>(&format!("1.{:05}", 494 + step)).unwrap();
+        log.push_str(&pocket_binary(
+            "market",
+            at,
+            "updateStream",
+            json!([
+                [shared::SYMBOLS[0], provider, price],
+                [shared::SYMBOLS[1], provider, price]
+            ]),
+        ));
+    }
     log
 }
 pub fn pocket_bad_live_close_log() -> String {
