@@ -862,7 +862,7 @@ impl MarketDataBroker for MarketProbe {
         {
             let (_, reached, release) = self.frame_gate.take().unwrap();
             reached.send(()).unwrap();
-            release.recv_timeout(std::time::Duration::from_secs(3)).unwrap();
+            wait_for_release(&release, "market frame");
         }
         if let Some((gate, at)) = &self.gate
             && matches!(&event, Some(broker::LiveEvent::Observation(event)) if event.provider_time_micros >= *at)
@@ -1107,8 +1107,8 @@ fn idle_polls_do_not_rewrite_health() {
 use binary_alpha_app::broker::transport::{Connector, Frame, Transport};
 pub(super) struct AccountProposalProbe {
     pub(super) inner: Box<dyn Connector>,
-    pub(super) parked: std::sync::mpsc::Sender<()>,
-    pub(super) release: Option<std::sync::mpsc::Receiver<()>>,
+    pub(super) gates:
+        std::collections::VecDeque<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>,
 }
 impl Connector for AccountProposalProbe {
     fn connect(
@@ -1118,15 +1118,13 @@ impl Connector for AccountProposalProbe {
     ) -> Result<Box<dyn Transport>, String> {
         Ok(Box::new(AccountProposalTransport {
             inner: self.inner.connect(url, headers)?,
-            parked: self.parked.clone(),
-            release: self.release.take(),
+            gates: std::mem::take(&mut self.gates),
         }))
     }
 }
 struct AccountProposalTransport {
     inner: Box<dyn Transport>,
-    parked: std::sync::mpsc::Sender<()>,
-    release: Option<std::sync::mpsc::Receiver<()>>,
+    gates: std::collections::VecDeque<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>,
 }
 impl Transport for AccountProposalTransport {
     fn send(&mut self, frame: Frame) -> Result<(), String> {
@@ -1135,17 +1133,28 @@ impl Transport for AccountProposalTransport {
     fn receive(&mut self, timeout: i64) -> Result<Option<Frame>, String> {
         let frame = self.inner.receive(timeout)?;
         if matches!(&frame, Some(Frame::Text(text)) if text.contains("\"msg_type\":\"proposal\""))
-            && let Some(release) = self.release.take()
+            && let Some((parked, release)) = self.gates.pop_front()
         {
-            self.parked.send(()).unwrap();
-            release
-                .recv_timeout(std::time::Duration::from_secs(3))
-                .unwrap();
+            parked.send(()).unwrap();
+            wait_for_release(&release, "Deriv proposal reply");
         }
         Ok(frame)
     }
     fn close(&mut self) -> Result<(), String> {
         self.inner.close()
+    }
+}
+fn wait_for_release(release: &std::sync::mpsc::Receiver<()>, label: &str) {
+    loop {
+        match release.recv_timeout(std::time::Duration::from_secs(3)) {
+            Ok(()) => return,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                eprintln!("{label} gate is still waiting for the owner");
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                panic!("{label} gate lost its release sender");
+            }
+        }
     }
 }
 struct EofConnector {
