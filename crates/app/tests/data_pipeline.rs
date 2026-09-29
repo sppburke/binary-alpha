@@ -321,12 +321,12 @@ fn serve_broker(kind: Kind) -> FakeBroker {
                                         pages += 1;
                                         let anchor = request["time"].as_f64().unwrap() as i64 - POCKET_OFFSET_S;
                                         let index = request["index"].as_u64().unwrap();
-                                        assert_eq!(request["offset"], 200);
-                                        // The real window contains 40 starts, ending at the
+                                        assert_eq!(request["offset"], 750);
+                                        // The real window contains up to 150 starts, ending at the
                                         // anchor inclusive. Off-grid cutoffs include the bar
                                         // containing the cutoff; adjacent pages overlap by one bar.
                                         let last = anchor.div_euclid(5) * 5;
-                                        let first = (last - 195).max(*from);
+                                        let first = (last - (request["offset"].as_i64().unwrap() - 5)).max(*from);
                                         let rows: Vec<Value> = (first..=last)
                                             .step_by(5)
                                             .filter(|start| *start < *to)
@@ -1715,7 +1715,7 @@ fn pipeline_roundtrip() {
     // An aligned cutoff exercises matched prefetch anchors. The bar starting exactly at
     // the cutoff is present on the first page but must be withheld until it closes.
     let deriv_cutoff = DERIV_SEED_END + 1_200;
-    let pocket_cutoff = POCKET_SEED_END + 360;
+    let pocket_cutoff = POCKET_SEED_END + 1_500;
     let first = pipeline(
         "update",
         &f.pipeline,
@@ -1739,7 +1739,7 @@ fn pipeline_roundtrip() {
         bars_after,
         expected_bars(POCKET_SEED_END, pocket_fetch_start, pocket_cutoff)
     );
-    assert_eq!(bars_after.len(), 272);
+    assert_eq!(bars_after.len(), 500);
     assert_eq!(
         bars_after.last().unwrap().start_unix_s + 5,
         pocket_cutoff,
@@ -1756,10 +1756,10 @@ fn pipeline_roundtrip() {
     );
     assert_eq!(pocket_coverage.pages.len(), 3, "{pocket_coverage:?}");
     for (n, page) in pocket_coverage.pages.iter().enumerate() {
-        let anchor = pocket_cutoff - n as i64 * 195;
+        let anchor = pocket_cutoff - n as i64 * 745;
         assert_eq!(page.anchor, Some((anchor + POCKET_OFFSET_S).to_string()));
-        assert_eq!(page.rows, 40);
-        assert_eq!(page.first, Some(time_text((anchor - 195) * 1_000_000)));
+        assert_eq!(page.rows, 150);
+        assert_eq!(page.first, Some(time_text((anchor - 745) * 1_000_000)));
         assert_eq!(page.last, Some(time_text(anchor * 1_000_000)));
     }
     let pocket_requests = f.pocket.requests();
@@ -1771,7 +1771,7 @@ fn pipeline_roundtrip() {
         let request: Value = serde_json::from_str(request).unwrap();
         assert_eq!(
             request["time"].as_i64().unwrap() - POCKET_OFFSET_S,
-            pocket_cutoff - n as i64 * 195
+            pocket_cutoff - n as i64 * 745
         );
     }
     let pocket_manifest = dataset(&store, &pocket_first);
@@ -2215,7 +2215,7 @@ fn append_log_recovery() {
     )
     .unwrap();
     import(&f.scratch.path("pocket-import.toml")).unwrap();
-    let cutoff = POCKET_SEED_END + 362;
+    let cutoff = POCKET_SEED_END + 1_562;
     let end = time_text(cutoff * 1_000_000);
     fs::create_dir_all(&state).unwrap();
     fs::write(&log, b"orphan from a completed intent\n").unwrap();
@@ -2257,7 +2257,7 @@ fn append_log_recovery() {
     let request: Value = serde_json::from_str(&f.pocket.requests()[before]).unwrap();
     assert_eq!(
         request["time"].as_i64().unwrap() - POCKET_OFFSET_S,
-        cutoff - 197,
+        cutoff - 747,
         "page with interrupted append is fetched again"
     );
     assert_eq!(fs::read(&header).unwrap(), original_header);
@@ -2294,7 +2294,7 @@ fn append_log_recovery() {
         .iter()
         .map(|page| page.anchor.as_ref().unwrap().parse::<i64>().unwrap() - POCKET_OFFSET_S)
         .collect();
-    assert_eq!(anchors, [cutoff, cutoff - 197, cutoff - 392]);
+    assert_eq!(anchors, [cutoff, cutoff - 747, cutoff - 1492]);
     let verified =
         verify::run(&format!("file://{}", store.join(manifest.key()).display())).unwrap();
     assert!(
@@ -2312,6 +2312,264 @@ fn append_log_recovery() {
         bars(&store, &manifest),
         expected_bars(POCKET_SEED_END, POCKET_SEED_END - 60, cutoff)
     );
+}
+
+#[test]
+fn pipeline_resumes_retained_40_bar_page_with_150_bar_requests() {
+    let f = fixture("pipeline_mixed_candle_page_resume");
+    let producer = f.scratch.path("producer");
+    let store = producer.join("store");
+    let state = producer.join("pipeline_state/pocket");
+    let header = state.join("progress.json");
+    let log = state.join("progress.pages.jsonl");
+    fs::write(
+        f.scratch.path("pocket.toml"),
+        pocket_core(&f.pocket.url, "demo", BAR_GRANULARITY, 60, 1, 60),
+    )
+    .unwrap();
+    let config = f.scratch.path("pocket-only.toml");
+    fs::write(
+        &config,
+        pipeline_toml(
+            &producer,
+            &f.drive.base,
+            &[("pocket", "pocket.toml")],
+            None,
+            1,
+        ),
+    )
+    .unwrap();
+    let imported = import(&f.scratch.path("pocket-import.toml")).unwrap();
+    let baseline = imported_generation(&imported, "pocket_option:AEDCNY_otc");
+    let seed_manifests = binary_alpha_app::store::Store::filesystem(&store)
+        .list_manifests()
+        .unwrap();
+    let cutoff = POCKET_SEED_END + 1_562;
+    let end = time_text(cutoff * 1_000_000);
+    // Fail after opening the intent but before indexing or publishing any page. A partial
+    // 150-row descendant would conflict with the retained 40-row legacy occurrence.
+    f.pocket.set(BrokerFaults {
+        off_second: true,
+        ..Default::default()
+    });
+    let failed = pipeline("update", &config, &["--end", &end]).unwrap_err();
+    assert!(failed.contains("not a whole second"), "{failed}");
+    f.pocket.set(BrokerFaults::default());
+    assert_eq!(
+        binary_alpha_app::store::Store::filesystem(&store)
+            .list_manifests()
+            .unwrap(),
+        seed_manifests,
+        "the setup must not publish a competing partial descendant"
+    );
+    let pending = read_progress(&header);
+    assert_eq!(pending["progress"]["cutoff"], end);
+    assert_eq!(pending["progress"]["baseline"], baseline);
+    assert_eq!(pending["progress"]["pages"], json!([]));
+    assert!(fs::read(&log).unwrap().is_empty());
+    let failed_request: Value = serde_json::from_str(&f.pocket.requests()[0]).unwrap();
+    assert_eq!(failed_request["offset"], 750);
+    assert_eq!(failed_request["time"], cutoff + POCKET_OFFSET_S);
+    let capture: Value = serde_json::from_slice(include_bytes!(
+        "fixtures/pocket_legacy_candle_page_e50e1599.json"
+    ))
+    .unwrap();
+    let legacy_request = &capture["request"];
+    let legacy_bytes = capture["response"].as_str().unwrap().as_bytes();
+    let response: Value = serde_json::from_slice(legacy_bytes).unwrap();
+    let digest = binary_alpha_engine::hex(&Sha256::digest(legacy_bytes));
+    assert_eq!(digest, capture["response_sha256"]);
+    assert_eq!(digest, capture["page"]["sha256"]);
+    assert_eq!(legacy_bytes.len() as u64, capture["page"]["bytes"]);
+    assert_eq!(legacy_request["offset"], 200);
+    assert_eq!(legacy_request["asset"], "AEDCNY_otc");
+    assert_eq!(legacy_request["period"], 5);
+    assert_eq!(
+        legacy_request["time"].as_i64().unwrap().to_string(),
+        capture["page"]["anchor"].as_str().unwrap()
+    );
+    assert_eq!(legacy_request["index"], response["index"]);
+    assert_eq!(legacy_request["asset"], response["asset"]);
+    assert_eq!(legacy_request["period"], response["period"]);
+    assert_eq!(response["data"].as_array().unwrap().len(), 40);
+    assert_eq!(
+        response["data"].as_array().unwrap()[0]["time"],
+        cutoff - 197 + POCKET_OFFSET_S
+    );
+    assert_eq!(
+        response["data"].as_array().unwrap()[39]["time"],
+        cutoff - 2 + POCKET_OFFSET_S
+    );
+    fs::write(
+        store.join(binary_alpha_engine::dataset::object_key(&digest)),
+        legacy_bytes,
+    )
+    .unwrap();
+    let mut retained: binary_alpha_app::fetch::PageCoverage =
+        serde_json::from_value(capture["page"].clone()).unwrap();
+    let occurrence = retained.occurrence.as_mut().unwrap();
+    occurrence.acquisition_id = pending["acquisition_id"].as_str().unwrap().to_string();
+    occurrence.intent = Some(pending["intent"].as_str().unwrap().to_string());
+    assert_eq!(occurrence.ordinal, 0);
+    assert_eq!(retained.path, format!("raw/{digest}.json"));
+    assert_eq!(retained.rows, 40);
+    assert_eq!(retained.first, Some(time_text((cutoff - 197) * 1_000_000)));
+    assert_eq!(retained.last, Some(time_text((cutoff - 2) * 1_000_000)));
+    assert_eq!(
+        retained.anchor,
+        Some((cutoff + POCKET_OFFSET_S).to_string())
+    );
+    assert_eq!(
+        retained.anchor.as_deref().unwrap().parse::<i64>().unwrap(),
+        legacy_request["time"].as_i64().unwrap()
+    );
+    fs::write(
+        &log,
+        serde_json::to_vec(&retained)
+            .unwrap()
+            .into_iter()
+            .chain(*b"\n")
+            .collect::<Vec<_>>(),
+    )
+    .unwrap();
+    let received_path = state.join("progress.received.jsonl");
+    assert_eq!(
+        fs::read_to_string(&received_path).unwrap().lines().count(),
+        1
+    );
+    fs::write(
+        &received_path,
+        format!("{}\n", serde_json::to_string(&retained).unwrap()),
+    )
+    .unwrap();
+    let requests_before = f.pocket.requests().len();
+    let mut report = String::new();
+    for _ in 0..3 {
+        match pipeline("update", &config, &["--end", &end]) {
+            Ok(done) => {
+                report = done;
+                break;
+            }
+            Err(pending) => {
+                assert_eq!(field(job_line(&pending, "pocket"), "status"), "pending");
+                let current = read_progress(&header);
+                assert_eq!(current["progress"]["cutoff"], end);
+                assert_eq!(current["progress"]["baseline"], baseline);
+            }
+        }
+    }
+    assert!(!report.is_empty(), "mixed-size intent did not close");
+    let generation = field(job_line(&report, "pocket"), "dataset");
+    let manifest = dataset(&store, generation);
+    let coverage = coverage(&store, &manifest);
+    assert_eq!(coverage.seed.as_ref().unwrap().generation, baseline);
+    assert_eq!(
+        coverage.verified.as_ref().unwrap().start,
+        time_text((POCKET_SEED_END - 60) * 1_000_000)
+    );
+    // The captured anchor is two seconds off the five-second grid. The final candle crosses
+    // the pinned cutoff, so the exact two-second tail is unresolved, not a missing candle.
+    let last_complete = time_text((cutoff - 2) * 1_000_000);
+    assert_eq!(coverage.verified.as_ref().unwrap().end, last_complete);
+    assert_eq!(
+        coverage.shortfall.as_ref().unwrap().reason,
+        "unresolved_tail"
+    );
+    assert_eq!(
+        coverage.shortfall.as_ref().unwrap().unresolved.start,
+        last_complete
+    );
+    assert_eq!(coverage.shortfall.as_ref().unwrap().unresolved.end, end);
+    assert!(coverage.tail_shortfall.is_none());
+    assert_eq!(coverage.pages.len(), 3);
+    assert_eq!(
+        (
+            coverage.pages[0].rows,
+            coverage.pages[1].rows,
+            coverage.pages[2].rows
+        ),
+        (40, 150, 150)
+    );
+    assert_eq!(coverage.pages[0], retained);
+    assert_bundle(&store, &manifest, 3);
+    let stored_pages: Vec<_> = manifest
+        .day_inventory
+        .iter()
+        .filter(|day| day.family == binary_alpha_engine::dataset::DayFamily::Pages)
+        .flat_map(|day| {
+            binary_alpha_app::daily::read_pages(
+                &store.join(day.object.as_ref().unwrap()),
+                &day.date,
+            )
+            .unwrap()
+        })
+        .collect();
+    let stored = |page: &binary_alpha_app::fetch::PageCoverage| {
+        let occurrence = page.occurrence.as_ref().unwrap();
+        stored_pages
+            .iter()
+            .find(|stored| {
+                stored.acquisition_id == occurrence.acquisition_id
+                    && stored.ordinal == occurrence.ordinal
+            })
+            .unwrap()
+    };
+    assert_eq!(stored(&coverage.pages[0]).payload, legacy_bytes);
+    // Each published occurrence carries its request token, UTC anchor, digest and row count.
+    for page in &coverage.pages {
+        let published = stored(page);
+        let token = page.anchor.as_deref().unwrap();
+        assert_eq!(published.request_token.as_deref(), Some(token));
+        assert_eq!(
+            published.request_anchor_utc,
+            Some((token.parse::<i64>().unwrap() - POCKET_OFFSET_S) * 1_000_000)
+        );
+        assert_eq!(published.payload_sha256, page.sha256);
+        assert_eq!(published.rows, page.rows);
+    }
+    assert_eq!(
+        stored(&coverage.pages[0]).request_token.as_deref(),
+        Some(legacy_request["time"].to_string().as_str())
+    );
+    let new_requests: Vec<Value> = f.pocket.requests()[requests_before..]
+        .iter()
+        .map(|request| serde_json::from_str(request).unwrap())
+        .collect();
+    for page in &coverage.pages[1..] {
+        let bytes = &stored(page).payload;
+        assert_eq!(bytes.len() as u64, page.bytes);
+        assert_eq!(
+            binary_alpha_engine::hex(&Sha256::digest(bytes)),
+            page.sha256
+        );
+        let response: Value = serde_json::from_slice(bytes).unwrap();
+        let request = new_requests
+            .iter()
+            .find(|request| {
+                request["time"] == page.anchor.clone().unwrap().parse::<i64>().unwrap()
+                    && request["index"] == response["index"]
+            })
+            .unwrap();
+        assert_eq!(request["offset"], 750);
+        assert_eq!(request["period"], 5);
+        assert_eq!(
+            response["data"].as_array().unwrap().len(),
+            page.rows as usize
+        );
+    }
+    assert_eq!(
+        new_requests
+            .iter()
+            .find(|request| request["time"] == cutoff - 197 + POCKET_OFFSET_S)
+            .unwrap()["offset"],
+        750
+    );
+    assert_eq!(
+        bars(&store, &manifest),
+        expected_bars(POCKET_SEED_END, POCKET_SEED_END - 60, cutoff)
+    );
+    verify::run(&format!("file://{}", store.join(manifest.key()).display())).unwrap();
+    assert!(!header.exists() && !log.exists());
 }
 
 /// A malformed archived index passes transport checks, but neither restore nor a later pull
@@ -3182,7 +3440,7 @@ fn pipeline_recovery() {
 
     // Repeated one-page invocations resume backward from the same cutoff and durable cursor
     // until the seed overlap is reached, archiving partial snapshots without closing the intent.
-    let cutoff = POCKET_SEED_END + 362;
+    let cutoff = POCKET_SEED_END + 1_562;
     let end = time_text(cutoff * 1_000_000);
     let mut statuses = Vec::new();
     let mut generations = Vec::new();
@@ -3226,17 +3484,17 @@ fn pipeline_recovery() {
                 } else {
                     header_bytes = Some(header);
                 }
-                assert_eq!(pages[n]["rows"], 40);
+                assert_eq!(pages[n]["rows"], 150);
                 assert_eq!(
                     pages[n]["last"],
-                    time_text((cutoff - 2 - n as i64 * 195) * 1_000_000)
+                    time_text((cutoff - 2 - n as i64 * 745) * 1_000_000)
                 );
                 resumed_anchor = binary_alpha_engine::market::parse_event_time_micros(
                     pages.last().unwrap()["first"].as_str().unwrap(),
                 )
                 .unwrap()
                     / 1_000_000;
-                assert_eq!(resumed_anchor, cutoff - 2 - (n as i64 + 1) * 195);
+                assert_eq!(resumed_anchor, cutoff - 2 - (n as i64 + 1) * 745);
             }
         }
     }
@@ -3248,7 +3506,7 @@ fn pipeline_recovery() {
     let acquired: Vec<_> = final_coverage.pages.iter().collect();
     assert_eq!(acquired.len(), 3);
     let mut offset = 0;
-    for (page, anchor) in acquired.iter().zip([cutoff, cutoff - 197, cutoff - 392]) {
+    for (page, anchor) in acquired.iter().zip([cutoff, cutoff - 747, cutoff - 1492]) {
         assert_eq!(
             page.anchor.as_ref().unwrap().parse::<i64>().unwrap() - POCKET_OFFSET_S,
             anchor
@@ -3286,7 +3544,7 @@ fn pipeline_recovery() {
         .iter()
         .map(|page| page["anchor"].as_str().unwrap().parse::<i64>().unwrap() - POCKET_OFFSET_S)
         .collect();
-    assert_eq!(anchors, [cutoff, cutoff - 197, cutoff - 392]);
+    assert_eq!(anchors, [cutoff, cutoff - 747, cutoff - 1492]);
     // The same cutoff retains new response occurrences while reusing unchanged market days.
     let repeat = pipeline("update", &pocket_only, &["--end", &end]).unwrap();
     let repeated_generation = field(job_line(&repeat, "pocket"), "dataset");
@@ -3475,7 +3733,7 @@ fn pipeline_recovery() {
     // Transport drop after one retained page and rejected reconnect: the run fails, the page and its request receipt
     // stay durable, and the resumed run (through one token refresh) closes at the same cutoff
     // carrying that receipt.
-    let cutoff_3 = cutoff_2 + 150;
+    let cutoff_3 = cutoff_2 + 750;
     let end_3 = time_text(cutoff_3 * 1_000_000);
     // This fault requires the first response to become durable before reconnect.
     // A multi-request prefetch can hit the close while still sending its initial
@@ -3550,10 +3808,10 @@ fn pipeline_recovery() {
     fs::write(&pocket_core_path, original_pocket_core).unwrap();
     // Conflicting overlap from the provider stops publication and keeps the prior generation.
     f.pocket.set(BrokerFaults {
-        conflict_before: Some(cutoff_2),
+        conflict_before: Some(cutoff_3),
         ..Default::default()
     });
-    let end_conflict = time_text((cutoff_2 + 300) * 1_000_000);
+    let end_conflict = time_text((cutoff_3 + 750) * 1_000_000);
     let conflicting = pipeline("update", &pocket_only, &["--end", &end_conflict]).unwrap_err();
     assert!(
         conflicting.contains("conflicting or inconsistent reread"),
@@ -3783,7 +4041,7 @@ fn pipeline_recovery() {
     let received: Vec<_> = received
         .lines()
         .map(|line| serde_json::from_str::<Value>(line).unwrap())
-        .filter(|entry| entry["rows"] == 40)
+        .filter(|entry| entry["rows"] == 150)
         .map(|entry| {
             let page: binary_alpha_app::fetch::PageCoverage =
                 serde_json::from_value(entry).unwrap();
@@ -3870,7 +4128,7 @@ fn pipeline_recovery() {
             &store,
             &dataset(&store, field(job_line(&resumed, "pocket"), "dataset"))
         ),
-        expected_bars(POCKET_SEED_END, POCKET_SEED_END - 60, cutoff_2 + 300)
+        expected_bars(POCKET_SEED_END, POCKET_SEED_END - 60, cutoff_3 + 750)
     );
     let line = job_line(&resumed, "pocket");
     let final_manifest = dataset(&store, field(line, "dataset"));
@@ -4158,7 +4416,7 @@ fn pipeline_scope() {
     assert!(seed_unchanged(&producer.join("store"), &seed));
 
     // Provider response mismatches fail explicitly without publishing.
-    let end = time_text((POCKET_SEED_END + 300) * 1_000_000);
+    let end = time_text((POCKET_SEED_END + 1_500) * 1_000_000);
     for (faults, expected) in [
         (
             BrokerFaults {
@@ -4662,7 +4920,7 @@ fn pipeline_scope() {
         reject_auth_once: true,
         ..Default::default()
     });
-    let renewed_end = time_text((POCKET_SEED_END + 900) * 1_000_000);
+    let renewed_end = time_text((POCKET_SEED_END + 3_000) * 1_000_000);
     let renewed = pipeline("update", &pocket_only, &["--end", &renewed_end]).unwrap();
     assert_eq!(
         field(job_line(&renewed, "pocket"), "status"),
@@ -4676,7 +4934,7 @@ fn pipeline_scope() {
     let refused = pipeline(
         "update",
         &pocket_only,
-        &["--end", &time_text((POCKET_SEED_END + 1_200) * 1_000_000)],
+        &["--end", &time_text((POCKET_SEED_END + 3_300) * 1_000_000)],
     )
     .unwrap_err();
     assert!(
@@ -4762,7 +5020,7 @@ fn pipeline_schedule() {
     // One updater invocation under an injected clock pins its cutoff at that clock; an
     // interrupted acquisition keeps the cutoff on resume; a later invocation advances the
     // cutoff only after the intent closed.
-    let cutoff = POCKET_SEED_END + 362;
+    let cutoff = POCKET_SEED_END + 1_562;
     let mut clock = FakeClock::at(cutoff * 1_000_000);
     let pocket_only = f.scratch.path("pocket-only.toml");
     fs::write(
@@ -4794,10 +5052,10 @@ fn pipeline_schedule() {
     let pending_path = producer.join("pipeline_state/pocket/progress.json");
     let pending = read_progress(&pending_path);
     assert_eq!(pending["progress"]["pages"].as_array().unwrap().len(), 1);
-    assert_eq!(pending["progress"]["pages"][0]["rows"], 40);
+    assert_eq!(pending["progress"]["pages"][0]["rows"], 150);
     assert_eq!(
         pending["progress"]["pages"][0]["first"],
-        time_text((cutoff - 197) * 1_000_000)
+        time_text((cutoff - 747) * 1_000_000)
     );
     binary_alpha_app::broker::Clock::sleep(&mut clock, 600 * 1_000_000);
     let mut out = Vec::new();
@@ -4815,9 +5073,9 @@ fn pipeline_schedule() {
     let pending = read_progress(&pending_path);
     let pages = pending["progress"]["pages"].as_array().unwrap();
     assert_eq!(pages.len(), 2);
-    assert_eq!(pages[1]["rows"], 40);
+    assert_eq!(pages[1]["rows"], 150);
     assert_eq!(pages[0]["first"], pages[1]["last"]);
-    assert_eq!(pages[1]["first"], time_text((cutoff - 392) * 1_000_000));
+    assert_eq!(pages[1]["first"], time_text((cutoff - 1492) * 1_000_000));
     let mut out = Vec::new();
     common::exclusive(|| {
         data_pipeline::update_with(
@@ -4832,7 +5090,7 @@ fn pipeline_schedule() {
     .unwrap_err();
     let conflict = String::from_utf8(out).unwrap();
     assert!(conflict.contains("conflicts"), "{conflict}");
-    // The third page reaches cutoff-587, past the required seed overlap.
+    // The third page reaches cutoff-2237, past the required seed overlap.
     let mut out = Vec::new();
     common::exclusive(|| {
         data_pipeline::update_with(&pocket_only, None, None, &[], &clock, &mut out)

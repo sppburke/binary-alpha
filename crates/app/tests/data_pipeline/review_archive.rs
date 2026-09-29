@@ -104,7 +104,7 @@ fn standalone_pocket_acquisitions(migrate: bool) {
     }];
     let mut acquisitions = BTreeMap::new();
     let mut current = None;
-    for extra in [600, 660] {
+    for extra in [850, 900] {
         config.history.as_mut().unwrap().end = time_text((POCKET_SEED_END + extra) * 1_000_000);
         fs::write(&config_path, config.canonical_toml()).unwrap();
         let report = run(&["data", "fetch", "--config", config_path.to_str().unwrap()]).unwrap();
@@ -120,6 +120,23 @@ fn standalone_pocket_acquisitions(migrate: bool) {
             .unwrap()
             .to_string();
         assert!(key.starts_with("objects/"));
+        let page_count = manifest
+            .day_inventory
+            .iter()
+            .filter(|day| day.family == binary_alpha_engine::dataset::DayFamily::Pages)
+            .flat_map(|day| {
+                binary_alpha_app::daily::read_pages(
+                    &store.join(day.object.as_ref().unwrap()),
+                    &day.date,
+                )
+                .unwrap()
+            })
+            .filter(|page| page.acquisition_id == key)
+            .count();
+        assert!(
+            page_count >= 2,
+            "each standalone acquisition must retain multiple candle pages: {page_count}"
+        );
         acquisitions.insert(key.clone(), fs::read(store.join(key)).unwrap());
         if !migrate {
             assert_acquisition_closure(&manifest, &acquisitions);
@@ -187,7 +204,7 @@ fn standalone_pocket_acquisitions(migrate: bool) {
         )
         .parse()
         .unwrap();
-        config.history.as_mut().unwrap().end = time_text((POCKET_SEED_END + 720) * 1_000_000);
+        config.history.as_mut().unwrap().end = time_text((POCKET_SEED_END + 950) * 1_000_000);
         fs::write(&config_path, config.canonical_toml()).unwrap();
         let report = run(&["data", "fetch", "--config", config_path.to_str().unwrap()]).unwrap();
         current = Some(dataset(&store, field(&report, "generation")));

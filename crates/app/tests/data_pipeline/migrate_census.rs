@@ -689,7 +689,7 @@ fn empty_first_candle_page_is_an_unresolved_shortfall_not_a_failure() {
     let (f, root) = grid_sources("grid_empty_page", |_| ());
     let store = f.scratch.path("producer/store");
     let (imported, original) = typed(&store, &root);
-    let end = GRID_END + 7_200 + 400;
+    let end = GRID_END + 7_200 + 800;
     let report = pipeline(
         "update",
         &f.pipeline,

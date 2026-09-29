@@ -30,7 +30,7 @@ credential = "BINARY_ALPHA_POCKET_AUTH"
 credential_command = ["/absolute/path/to/python", "/absolute/path/to/tools/pocket_auth.py", "--account-class", "demo"]
 account_class = "demo" # must match authorized source; never relabel existing data
 server_offset_minutes = 120 # replace with the proved provider clock mapping
-history_pages_in_flight = 8
+history_pages_in_flight = 8 # the probed demo account was fastest at 1 with 150-bar pages (docs/operations.md)
 [history]
 broker = "pocket_option"
 instruments = ["EURUSD"]
@@ -39,5 +39,5 @@ start = "2025-05-19T00:00:00Z"
 end = "2026-09-17T00:00:00Z"
 native_granularity = { kind = "bar", period_seconds = 5 }
 overlap_seconds = 60
-max_pages = 20000 # about 45 days at 195 seconds/page, subject to elapsed/provider limits
+max_pages = 20000 # about 172 days at 745 seconds/page, subject to elapsed/provider limits
 max_elapsed_seconds = 3600

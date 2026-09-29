@@ -5,7 +5,8 @@
 # Explicit singular instruments.session is required. First update needs no data import.
 schema_version = 1
 local_root = "../historical_data"
-# Instruments worked on concurrently by one producer run; raise gradually (provider rate limits).
+# Instruments worked on concurrently by one producer run; for Pocket history on the
+# probed demo account, select one Pocket job per invocation or set this to 1.
 parallel_jobs = 4
 # Object uploads or downloads per job, each worker with its own Drive session (default 8).
 parallel_transfers = 8
@@ -25,7 +26,8 @@ retry_seconds = 900
 
 # add-job appends [[jobs]] with generated jobs/ and evidence/ relative paths.
 # History budgets in sibling templates: Deriv 6000 pages, Pocket 20000 pages,
-# max_elapsed_seconds = 3600, overlap_seconds = 60. Pocket has 8 pages in flight.
+# max_elapsed_seconds = 3600, overlap_seconds = 60. Pocket has 8 pages in flight (the adapter
+# default); the probed demo account was fastest at 1 with 150-bar pages (docs/operations.md).
 # These bound one invocation; rerun pending work at the same cutoff for a larger gap.
 # Pocket requires origin = "https://pocketoption.com"; credential_command is a program
 # and argv array (see data-pipeline-pocket.example.toml), never an inline credential.
