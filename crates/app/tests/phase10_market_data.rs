@@ -1430,7 +1430,7 @@ fn candle_adapter(
 fn full_candle_page(index: u64, anchor: i64) -> String {
     pocket_candle_page(
         index,
-        &(anchor - 195..=anchor).step_by(5).collect::<Vec<_>>(),
+        &(anchor - 745..=anchor).step_by(5).collect::<Vec<_>>(),
     )
 }
 fn assert_candle_page(
@@ -1444,7 +1444,7 @@ fn assert_candle_page(
         page,
         instrument,
         anchor,
-        &(anchor - 195..=anchor).step_by(5).collect::<Vec<_>>(),
+        &(anchor - 745..=anchor).step_by(5).collect::<Vec<_>>(),
     );
 }
 fn assert_candle_rows(
@@ -1514,7 +1514,7 @@ fn pocket_candle_prefetch_walk_batches_requests_and_preserves_each_page() {
     let index = 0;
     let mut frames = handshake();
     let raw: Vec<_> = (0..5)
-        .map(|n| full_candle_page(index + n, 2000 - n as i64 * 195))
+        .map(|n| full_candle_page(index + n, 2000 - n as i64 * 745))
         .collect();
     for page in &raw {
         frames.extend(attachment("loadHistoryPeriodFast", page.clone()));
@@ -1551,7 +1551,7 @@ fn pocket_candle_prefetch_walk_batches_requests_and_preserves_each_page() {
             *request,
             serde_json::json!({
                 "asset": "EURUSD_otc", "index": requests[0]["index"].as_u64().unwrap() + n as u64,
-                "time": 9200 - n * 195, "offset": 200, "period": 5,
+                "time": 9200 - n * 745, "offset": 750, "period": 5,
             })
         );
     }
@@ -1563,7 +1563,7 @@ fn pocket_candle_prefetch_out_of_order_keeps_original_receipt_and_default_window
     let index = 0;
     let mut frames = handshake();
     let first = full_candle_page(index, 2000);
-    let second = full_candle_page(index + 1, 1805);
+    let second = full_candle_page(index + 1, 1255);
     frames.extend(attachment("loadHistoryPeriodFast", second.clone()));
     frames.extend(attachment("loadHistoryPeriodFast", first.clone()));
     let (mut adapter, trace) = candle_adapter(vec![frames], &clock, None);
@@ -1579,13 +1579,13 @@ fn pocket_candle_prefetch_out_of_order_keeps_original_receipt_and_default_window
     assert_candle_page(&adapter, &first_page, instrument, 2000);
     clock.sleep(1000);
     let second_page = adapter
-        .history_page(instrument, scale(5), Some(1_805_000_000), granularity)
+        .history_page(instrument, scale(5), Some(1_255_000_000), granularity)
         .unwrap();
     assert_eq!(
         second_page.raw,
         pocket_response(&second, &trace.sent).as_bytes()
     );
-    assert_candle_page(&adapter, &second_page, instrument, 1805);
+    assert_candle_page(&adapter, &second_page, instrument, 1255);
     let requests = pocket_sent_events(&trace.sent, "loadHistoryPeriod");
     let index = requests[0]["index"].as_u64().unwrap();
     let arrivals = trace.arrivals.lock().unwrap();
@@ -1605,12 +1605,12 @@ fn pocket_candle_prefetch_gap_discards_skipped_anchors_and_stale_responses() {
     let clock = FakeClock::at(1_789_348_000_000_000);
     let index = 0;
     let mut frames = handshake();
-    // The third page omits 1225..=1415, reaching back to 1220 to fill 40 bars.
-    // Its first row skips the predicted 1415 anchor, even though 1220 is buffered.
-    let gap_starts: Vec<_> = std::iter::once(1220)
-        .chain((1420..=1610).step_by(5))
+    // The third page omits -975..=-235, reaching back to -980 to fill 150 bars.
+    // Its first row skips the predicted -235 anchor, even though -980 is buffered.
+    let gap_starts: Vec<_> = std::iter::once(-980)
+        .chain((-230..=510).step_by(5))
         .collect();
-    for (n, page_anchor) in [2000, 1805, 1610, 1415, 1220, 1220].into_iter().enumerate() {
+    for (n, page_anchor) in [2000, 1255, 510, -235, -980, -980].into_iter().enumerate() {
         let page = if n == 2 {
             pocket_candle_page(index + n as u64, &gap_starts)
         } else {
@@ -1622,12 +1622,12 @@ fn pocket_candle_prefetch_gap_discards_skipped_anchors_and_stale_responses() {
     let instrument = &pocket_ids()[0];
     let granularity = NativeGranularity::Bar { period_seconds: 5 };
     let mut anchor = 2_000_000_000;
-    for first in [1805, 1610, 1220, 1025] {
+    for first in [1255, 510, -980, -1725] {
         let page = adapter
             .history_page(instrument, scale(5), Some(anchor), granularity)
             .unwrap();
-        if first == 1220 {
-            assert_candle_rows(&adapter, &page, instrument, 1610, &gap_starts);
+        if first == -980 {
+            assert_candle_rows(&adapter, &page, instrument, 510, &gap_starts);
         } else {
             assert_candle_page(&adapter, &page, instrument, anchor / 1_000_000);
         }
@@ -1641,8 +1641,8 @@ fn pocket_candle_prefetch_gap_discards_skipped_anchors_and_stale_responses() {
     }
     let requests = pocket_sent_events(&trace.sent, "loadHistoryPeriod");
     assert_eq!(requests.len(), 8);
-    assert_eq!(requests[4]["time"], 8420);
-    assert_eq!(requests[5]["time"], 8420);
+    assert_eq!(requests[4]["time"], 6220);
+    assert_eq!(requests[5]["time"], 6220);
     let index = requests[0]["index"].as_u64().unwrap();
     assert_eq!(requests[5]["index"], index + 5);
     assert_eq!(trace.arrivals.lock().unwrap()[&(index + 5)].0, 8);
@@ -1655,14 +1655,14 @@ fn pocket_candle_prefetch_reconnect_resends_only_outstanding_pages() {
         let clock = FakeClock::at(1_789_348_000_000_000);
         let index = 0;
         let mut first = handshake();
-        let buffered = full_candle_page(index + 1, 1805);
+        let buffered = full_candle_page(index + 1, 1255);
         first.extend(attachment("loadHistoryPeriodFast", buffered.clone()));
         if disconnect {
             first.push(Frame::Text("41".into()));
         }
         let reconnected_index = 3;
         let mut second = handshake();
-        for (index, anchor) in [(reconnected_index, 2000), (reconnected_index + 1, 1610)] {
+        for (index, anchor) in [(reconnected_index, 2000), (reconnected_index + 1, 510)] {
             second.extend(attachment(
                 "loadHistoryPeriodFast",
                 full_candle_page(index, anchor),
@@ -1671,12 +1671,12 @@ fn pocket_candle_prefetch_reconnect_resends_only_outstanding_pages() {
         let (mut adapter, trace) = candle_adapter(vec![first, second], &clock, Some(3));
         let instrument = &pocket_ids()[0];
         let granularity = NativeGranularity::Bar { period_seconds: 5 };
-        for anchor in [2000, 1805, 1610] {
+        for anchor in [2000, 1255, 510] {
             let page = adapter
                 .history_page(instrument, scale(5), Some(anchor * 1_000_000), granularity)
                 .unwrap();
             assert_candle_page(&adapter, &page, instrument, anchor);
-            if anchor == 1805 {
+            if anchor == 1255 {
                 assert_eq!(page.raw, pocket_response(&buffered, &trace.sent).as_bytes());
                 let index = pocket_sent_events(&trace.sent, "loadHistoryPeriod")[0]["index"]
                     .as_u64()
@@ -1696,7 +1696,7 @@ fn pocket_candle_prefetch_reconnect_resends_only_outstanding_pages() {
                 .windows(2)
                 .all(|pair| pair[0]["index"].as_u64() < pair[1]["index"].as_u64())
         );
-        assert_eq!(requests[4]["time"], 8810);
+        assert_eq!(requests[4]["time"], 7710);
         assert_eq!(
             requests[4]["index"].as_u64().unwrap(),
             requests[3]["index"].as_u64().unwrap() + 1
@@ -1704,7 +1704,7 @@ fn pocket_candle_prefetch_reconnect_resends_only_outstanding_pages() {
         assert_eq!(
             requests
                 .iter()
-                .filter(|request| request["time"] == 9005)
+                .filter(|request| request["time"] == 8455)
                 .count(),
             1
         );
@@ -1718,13 +1718,13 @@ fn pocket_candle_prefetch_instrument_change_discards_buffered_and_outstanding_pa
     let clock = FakeClock::at(1_789_348_000_000_000);
     let index = 0;
     let mut frames = handshake();
-    for (n, anchor) in [(1, 1805), (0, 2000), (2, 1610)] {
+    for (n, anchor) in [(1, 1255), (0, 2000), (2, 510)] {
         frames.extend(attachment(
             "loadHistoryPeriodFast",
             full_candle_page(index + n, anchor),
         ));
     }
-    let other = replace(&full_candle_page(index + 3, 1805), "asset", "\"#AAPL_otc\"");
+    let other = replace(&full_candle_page(index + 3, 1255), "asset", "\"#AAPL_otc\"");
     frames.extend(attachment("loadHistoryPeriodFast", other.clone()));
     let (mut adapter, trace) = candle_adapter(vec![frames], &clock, Some(3));
     let ids = pocket_ids();
@@ -1733,15 +1733,15 @@ fn pocket_candle_prefetch_instrument_change_discards_buffered_and_outstanding_pa
         .history_page(&ids[0], scale(5), Some(2_000_000_000), granularity)
         .unwrap();
     let page = adapter
-        .history_page(&ids[1], scale(5), Some(1_805_000_000), granularity)
+        .history_page(&ids[1], scale(5), Some(1_255_000_000), granularity)
         .unwrap();
     assert_eq!(page.raw, pocket_response(&other, &trace.sent).as_bytes());
-    assert_candle_page(&adapter, &page, &ids[1], 1805);
+    assert_candle_page(&adapter, &page, &ids[1], 1255);
     let requests = pocket_sent_events(&trace.sent, "loadHistoryPeriod");
     assert_eq!(requests.len(), 6);
     for (n, request) in requests[3..].iter().enumerate() {
         assert_eq!(request["asset"], "#AAPL_otc");
-        assert_eq!(request["time"], 9005 - n * 195);
+        assert_eq!(request["time"], 8455 - n * 745);
     }
     assert_eq!(adapter.foreign_history_responses(), 1);
 }
@@ -1757,7 +1757,7 @@ fn pocket_candle_history_reconnects_after_second_page_and_preserves_rows() {
     ));
     first.extend(attachment(
         "loadHistoryPeriodFast",
-        full_candle_page(first_index + 1, 1805),
+        full_candle_page(first_index + 1, 1255),
     ));
     first.push(Frame::Text("41".into()));
     // The fourth request retries the outstanding page after reconnect.
@@ -1765,7 +1765,7 @@ fn pocket_candle_history_reconnects_after_second_page_and_preserves_rows() {
     let mut second = handshake();
     second.extend(attachment(
         "loadHistoryPeriodFast",
-        full_candle_page(second_index, 1610),
+        full_candle_page(second_index, 510),
     ));
     let (connector, sent) = pocket_connector(vec![first, second], &clock);
     let mut adapter = PocketMarketData::connect(
@@ -1779,7 +1779,7 @@ fn pocket_candle_history_reconnects_after_second_page_and_preserves_rows() {
     let instrument = &pocket_ids()[0];
     adapter.subscribe(instrument, scale(5)).unwrap();
     let granularity = NativeGranularity::Bar { period_seconds: 5 };
-    for anchor in [2000, 1805, 1610] {
+    for anchor in [2000, 1255, 510] {
         let page = adapter
             .history_page(instrument, scale(5), Some(anchor * 1_000_000), granularity)
             .unwrap();
@@ -1803,11 +1803,11 @@ fn pocket_candle_history_reconnects_after_second_page_and_preserves_rows() {
             .windows(2)
             .all(|pair| pair[0]["index"].as_u64() < pair[1]["index"].as_u64())
     );
-    for (request, anchor) in requests.iter().zip([9200, 9005, 8810, 8810]) {
+    for (request, anchor) in requests.iter().zip([9200, 8455, 7710, 7710]) {
         assert_eq!(
             *request,
             serde_json::json!({
-                "asset": "EURUSD_otc", "index": request["index"], "time": anchor, "offset": 200, "period": 5,
+                "asset": "EURUSD_otc", "index": request["index"], "time": anchor, "offset": 750, "period": 5,
             })
         );
     }
@@ -1856,7 +1856,7 @@ fn pocket_history_skips_foreign_assets_and_indexes_without_extending_deadline() 
             if granularity != NativeGranularity::Tick {
                 frames.extend(attachment(
                     "loadHistoryPeriodFast",
-                    full_candle_page(index + 1, -185),
+                    full_candle_page(index + 1, -735),
                 ));
             }
             if matching {
@@ -1953,7 +1953,7 @@ fn pocket_history_reconnects_after_silent_response_timeout() {
         let mut second = handshake();
         second.extend(attachment(
             "loadHistoryPeriodFast",
-            full_candle_page(u64::from(limit) + 1, 1805),
+            full_candle_page(u64::from(limit) + 1, 1255),
         ));
         let (mut adapter, trace) = candle_adapter(vec![first, second], &clock, Some(limit));
         let instrument = &pocket_ids()[0];
@@ -1965,9 +1965,9 @@ fn pocket_history_reconnects_after_silent_response_timeout() {
         assert_eq!(adapter.history_reconnects(), 0);
         let started = clock.now_micros();
         let page = adapter
-            .history_page(instrument, scale(5), Some(1_805_000_000), granularity)
+            .history_page(instrument, scale(5), Some(1_255_000_000), granularity)
             .unwrap();
-        assert_candle_page(&adapter, &page, instrument, 1805);
+        assert_candle_page(&adapter, &page, instrument, 1255);
         assert_eq!(clock.now_micros() - started, 20_000_080);
         assert_eq!(adapter.history_reconnects(), 1);
         assert_eq!(pocket_sent_events(&trace.sent, "auth").len(), 2);
@@ -1995,7 +1995,7 @@ fn pocket_history_reconnects_before_sending_on_stale_session() {
         let mut last = handshake();
         last.extend(attachment(
             "loadHistoryPeriodFast",
-            full_candle_page(1 + silent_retries, 1805),
+            full_candle_page(1 + silent_retries, 1255),
         ));
         sessions.push(last);
         let (mut adapter, trace) = candle_adapter(sessions, &clock, Some(1));
@@ -2008,9 +2008,9 @@ fn pocket_history_reconnects_before_sending_on_stale_session() {
         let sent_before_advance = trace.sent.lock().unwrap().len();
         clock.sleep(30_000_000);
         let page = adapter
-            .history_page(instrument, scale(5), Some(1_805_000_000), granularity)
+            .history_page(instrument, scale(5), Some(1_255_000_000), granularity)
             .unwrap();
-        assert_candle_page(&adapter, &page, instrument, 1805);
+        assert_candle_page(&adapter, &page, instrument, 1255);
         // A preflight reconnect leaves all three per-page retries available.
         assert_eq!(adapter.history_reconnects(), 1 + silent_retries);
         assert_eq!(
@@ -2019,7 +2019,7 @@ fn pocket_history_reconnects_before_sending_on_stale_session() {
         );
         let requests = pocket_sent_events(&trace.sent, "loadHistoryPeriod");
         assert_eq!(requests.len() as u64, 2 + silent_retries);
-        assert!(requests[1..].iter().all(|request| request["time"] == 9005));
+        assert!(requests[1..].iter().all(|request| request["time"] == 8455));
         let sent = trace.sent.lock().unwrap();
         // Close is the very first action after the clock advance: the stale connection
         // receives no further history request, and the new connection authenticates first.
@@ -2053,7 +2053,7 @@ fn pocket_history_stale_check_uses_heartbeat_receipt_and_strict_threshold() {
         frames.push(heartbeat);
         frames.extend(attachment(
             "loadHistoryPeriodFast",
-            full_candle_page(1, 1805),
+            full_candle_page(1, 1255),
         ));
         let (mut adapter, trace) = candle_adapter(vec![frames], &clock, Some(1));
         let instrument = &pocket_ids()[0];
@@ -2065,9 +2065,9 @@ fn pocket_history_stale_check_uses_heartbeat_receipt_and_strict_threshold() {
         assert!(adapter.next_live(0).unwrap().is_none());
         clock.sleep(25_000_000);
         let page = adapter
-            .history_page(instrument, scale(5), Some(1_805_000_000), granularity)
+            .history_page(instrument, scale(5), Some(1_255_000_000), granularity)
             .unwrap();
-        assert_candle_page(&adapter, &page, instrument, 1805);
+        assert_candle_page(&adapter, &page, instrument, 1255);
         assert_eq!(adapter.history_reconnects(), 0);
         assert_eq!(pocket_sent_events(&trace.sent, "auth").len(), 1);
     }
@@ -2235,7 +2235,7 @@ fn pocket_history_reconnects_after_tcp_close_between_pages() {
         runtime().block_on(async move {
             let listener = tokio::net::TcpListener::from_std(listener).unwrap();
             let mut requests = Vec::new();
-            for anchor in [2000, 1805] {
+            for anchor in [2000, 1255] {
                 let (socket, _) =
                     tokio::time::timeout(std::time::Duration::from_secs(5), listener.accept())
                         .await
@@ -2268,6 +2268,10 @@ fn pocket_history_reconnects_after_tcp_close_between_pages() {
                     let request: serde_json::Value = serde_json::from_slice(&argument).unwrap();
                     assert_eq!(request["time"], anchor + 7200);
                     assert_eq!(request["asset"], "EURUSD_otc");
+                    assert_eq!(
+                        (request["period"].as_u64(), request["offset"].as_u64()),
+                        (Some(5), Some(750))
+                    );
                     let index = request["index"].as_u64().unwrap();
                     requests.push(index);
                     for frame in
@@ -2304,7 +2308,7 @@ fn pocket_history_reconnects_after_tcp_close_between_pages() {
         "{}".into(),
     )
     .unwrap();
-    for anchor in [2000, 1805] {
+    for anchor in [2000, 1255] {
         let page = adapter
             .history_page(
                 &pocket_ids()[0],
@@ -3646,6 +3650,141 @@ struct ReadDetail {
     #[serde(default)]
     control: Option<String>,
 }
+
+#[test]
+fn binary_pocket_candle_fetch_spans_three_150_bar_pages() {
+    use futures_util::{SinkExt, StreamExt};
+    use tokio_tungstenite::tungstenite::Message;
+
+    let scratch = Scratch::new("phase10_binary_pocket_candle_pages");
+    let mut config = test_config(
+        &scratch,
+        "pocket_option",
+        "ws://127.0.0.1/socket.io/?EIO=4&transport=websocket",
+        false,
+    );
+    let granularity = NativeGranularity::Bar { period_seconds: 5 };
+    config.instruments[0].native_granularity = granularity;
+    config.instruments[0].candles[0].duration_seconds = 5;
+    let history = config.history.as_mut().unwrap();
+    history.native_granularity = granularity;
+    history.start = time_text(0);
+    history.end = time_text(2_000_000_000);
+    Config::parse(&config.canonical_toml()).unwrap();
+    let (listener, url) = loopback_listener();
+    let Broker::PocketOption(settings) = &mut config.brokers[0] else {
+        unreachable!()
+    };
+    assert_eq!(settings.history_pages_in_flight, Some(1));
+    settings.endpoint = url;
+    let server = std::thread::spawn(move || {
+        runtime().block_on(async move {
+            let listener = tokio::net::TcpListener::from_std(listener).unwrap();
+            let (socket, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(socket).await.unwrap();
+            for frame in handshake() {
+                let message = match frame {
+                    Frame::Text(text) => Message::Text(text.into()),
+                    Frame::Binary(bytes) => Message::Binary(bytes.into()),
+                    _ => unreachable!(),
+                };
+                socket.send(message).await.unwrap();
+            }
+            let mut requests = Vec::new();
+            while requests.len() < 3 {
+                let Message::Text(text) = socket.next().await.unwrap().unwrap() else {
+                    continue;
+                };
+                let Ok(broker::socket_io::Packet::Event { name, argument }) =
+                    broker::socket_io::decode(&text)
+                else {
+                    continue;
+                };
+                if name != "loadHistoryPeriod" {
+                    continue;
+                }
+                let request: serde_json::Value = serde_json::from_slice(&argument).unwrap();
+                let anchor = request["time"].as_i64().unwrap() - 7200;
+                let index = request["index"].as_u64().unwrap();
+                let payload = full_candle_page(index, anchor);
+                for frame in attachment("loadHistoryPeriodFast", payload) {
+                    let message = match frame {
+                        Frame::Text(text) => Message::Text(text.into()),
+                        Frame::Binary(bytes) => Message::Binary(bytes.into()),
+                        _ => unreachable!(),
+                    };
+                    socket.send(message).await.unwrap();
+                }
+                requests.push(request);
+            }
+            requests
+        })
+    });
+    let config_path = scratch.path("broker.toml");
+    fs::write(&config_path, config.canonical_toml()).unwrap();
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_binary-alpha"))
+        .args(["data", "fetch", "--config", config_path.to_str().unwrap()])
+        .env("PHASE10_SYNTHETIC_AUTH", "{\"synthetic\":true}")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let requests = server.join().unwrap();
+    assert_eq!(requests.len(), 3);
+    for (request, anchor) in requests.iter().zip([2000, 1255, 510]) {
+        assert_eq!(request["asset"], "EURUSD_otc");
+        assert_eq!(request["period"], 5);
+        assert_eq!(request["offset"], 750);
+        assert_eq!(request["time"], anchor + 7200);
+    }
+    let manifests = read_manifests(&scratch);
+    assert_eq!(manifests.len(), 1);
+    let manifest = &manifests[0];
+    let mut rows = Vec::new();
+    binary_alpha_app::daily::read_generation(
+        &Store::filesystem(scratch.path("published")),
+        manifest,
+        |row| {
+            let binary_alpha_app::daily::MarketRow::Bar(bar) = row else {
+                panic!("expected bar")
+            };
+            rows.push(bar);
+            Ok(())
+        },
+    )
+    .unwrap();
+    let expected: Vec<_> = (0..2000)
+        .step_by(5)
+        .map(|start_unix_s| binary_alpha_engine::market::Bar {
+            provider: (),
+            start_unix_s,
+            open: 1.25,
+            high: 1.5,
+            low: 1.0,
+            close: 1.375,
+            volume: 2.0,
+            period_s: 5,
+        })
+        .collect();
+    assert_eq!(rows, expected);
+    let pages = common::daily::pages(&scratch.path("published"), manifest);
+    assert_eq!(pages.len(), 3);
+    assert!(pages.iter().all(|page| page.rows == 150));
+    let coverage = read_coverage(&scratch, manifest);
+    assert_eq!(
+        coverage.verified,
+        Some(fetch::Range {
+            start: time_text(0),
+            end: time_text(2_000_000_000),
+        })
+    );
+    assert!(coverage.shortfall.is_none());
+    assert!(coverage.tail_shortfall.is_none());
+}
+
 #[test]
 fn binary_fetch_verify_and_inspect_both_providers_over_real_local_transports() {
     for kind in ["deriv", "pocket_option"] {

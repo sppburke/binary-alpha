@@ -386,8 +386,10 @@ Pocket uses `history_pages_in_flight = 8`, `origin = "https://pocketoption.com"`
 "--account-class", "demo"]` (an executable/argv array matching `account_class`, not a shell
 string); it prints auth JSON to stdout.
 These are portable starting settings, not a promise of coverage within an hour:
-20,000 Pocket pages span about 45 days at 195 seconds/page, but provider and elapsed limits
+20,000 Pocket pages span about 172 days at 745 seconds/page, but provider and elapsed limits
 may stop sooner; Deriv's tick density determines its span.
+On the probed Pocket demo account, select one Pocket job per invocation or set
+`parallel_jobs = 1`; concurrent history sessions timed out in the 2026-09-29 probe.
 
 Run `data pipeline update --config PIPELINE` weekly. It follows the v2 lineage, writes only
 changed daily observation/page/candle partitions, reuses unchanged days by key, and archives
@@ -465,8 +467,8 @@ job's evidence file (`{"source_identity": "…"}` plus notes); binding refuses a
 whose identity differs, and the refusal names both identities. A Pocket archive from a different
 account/source context must not be relabeled to match a demo endpoint. Configure Deriv tick history and Pocket
 five-second bar history with explicit positive overlap, page, and time limits and no foreground
-refresh. Pocket Option candle pages contain 40 five-second bars ending at the anchor inclusive,
-so backward paging steps by 195 seconds with a one-bar overlap; the
+refresh. Pocket Option candle pages contain up to 150 five-second bars ending at the anchor inclusive,
+so full-page backward paging steps by 745 seconds with a one-bar overlap; the
 2026-09-16 real-account measurement was about 4.0, 16.6, and 32.9 pages/s with 1, 4, and 8
 requests in flight, respectively (about 0.24 seconds per batch).
 Set the Pocket broker's `history_pages_in_flight` to a positive count (default 8) to control
@@ -492,6 +494,8 @@ After acquisition closes, a later update can select a new cutoff. Set `parallel_
 pipeline document to work several instruments at once (one connection each); raise it gradually,
 because provider rate limits per connection and per application identifier are not published,
 and the measured single-connection rate on Deriv is about 1.3 pages of 1000 ticks per second.
+For Pocket history on the probed demo account, select one Pocket job per invocation or set
+`parallel_jobs = 1` because concurrent history sessions timed out.
 Set `parallel_transfers` (default 8) to bound concurrent object uploads or downloads within each
 job; manifests and the catalog are still published last.
 

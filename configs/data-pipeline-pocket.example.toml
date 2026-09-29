@@ -39,5 +39,5 @@ start = "2025-05-19T00:00:00Z"
 end = "2026-09-17T00:00:00Z"
 native_granularity = { kind = "bar", period_seconds = 5 }
 overlap_seconds = 60
-max_pages = 20000 # about 45 days at 195 seconds/page, subject to elapsed/provider limits
+max_pages = 20000 # about 172 days at 745 seconds/page, subject to elapsed/provider limits
 max_elapsed_seconds = 3600

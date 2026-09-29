@@ -1242,8 +1242,9 @@ attachment, and its wake continues the caller's pending read. Reconnect creates 
 and deadline. Unpolled history retains its stale-session reconnect before the next request.
 
 For candle history, Pocket Option sends `loadHistoryPeriod` with `asset`, incrementing
-`index`, a provider-clock `time` anchor, `offset = 200`, and `period = 5`. It accepts
-`loadHistoryPeriodFast` only with matching asset, index, and period. Row objects carry
+`index`, a provider-clock `time` anchor, `offset = 750`, and `period = 5`. Tick history
+uses `offset = 200` and `period = 1`. Candle history accepts `loadHistoryPeriodFast`
+only with matching asset, index, and period. Row objects carry
 `symbol_id`, `time`, `open`, `high`, `low`, `close`, and `volume`; unknown row keys fail.
 Price text converts to exact integer units at the configured scale, and its persisted double
 must round-trip to those units. The configured provider offset is subtracted before checking a
