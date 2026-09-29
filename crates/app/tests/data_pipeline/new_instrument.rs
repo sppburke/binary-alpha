@@ -473,25 +473,38 @@ fn interrupted_empty_store_keeps_original_seed_binding() {
         assert_eq!(fs::read(state.join("progress.json")).unwrap(), pending);
         fs::write(path, original).unwrap();
     }
-    let mut reports = Vec::new();
-    for job in &f.jobs {
-        let mut completed = None;
-        for _ in 0..10 {
-            match pipeline(
-                "update",
-                &f.config,
-                &["--end", &cutoff, "--job", job.id.as_str()],
-            ) {
-                Ok(report) => {
-                    completed = Some(report);
-                    break;
+    let mut completed = None;
+    let mut pocket_final = None;
+    for _ in 0..10 {
+        match pipeline("update", &f.config, &["--end", &cutoff]) {
+            Ok(report) => {
+                assert!(pocket_final.is_some(), "Pocket completed before Deriv");
+                for job in &f.jobs {
+                    assert_eq!(field(job_line(&report, &job.id), "status"), "archived");
+                    assert_ne!(field(job_line(&report, &job.id), "dataset"), "none");
                 }
-                Err(reason) => assert_eq!(field(job_line(&reason, &job.id), "status"), "pending"),
+                completed = Some(report);
+                break;
+            }
+            Err(reason) => {
+                assert_eq!(field(job_line(&reason, &f.jobs[0].id), "status"), "pending");
+                let pocket = job_line(&reason, &f.jobs[1].id);
+                assert_eq!(field(pocket, "status"), "archived");
+                let dataset = field(pocket, "dataset");
+                assert_ne!(dataset, "none");
+                // Later unfiltered updates may publish a new overlap generation.
+                if pocket_final.is_none() {
+                    pocket_final = Some(pocket.to_string());
+                }
             }
         }
-        reports.push(completed.expect("bounded first acquisition eventually completes"));
     }
-    let report = reports.join("\n");
+    let completed = completed.expect("bounded first acquisition eventually completes");
+    let report = format!(
+        "{}\n{}",
+        job_line(&completed, &f.jobs[0].id),
+        pocket_final.expect("Pocket completed before Deriv")
+    );
     let store = f.scratch.path("producer/store");
     // The resumed acquisition publishes one uninterrupted acquisition's observation days,
     // byte for byte, and every manifest of both verifies.
