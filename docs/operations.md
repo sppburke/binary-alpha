@@ -469,10 +469,12 @@ account/source context must not be relabeled to match a demo endpoint. Configure
 five-second bar history with explicit positive overlap, page, and time limits and no foreground
 refresh. Pocket Option candle pages contain up to 150 five-second bars ending at the anchor inclusive,
 so full-page backward paging steps by 745 seconds with a one-bar overlap; the
-2026-09-16 real-account measurement was about 4.0, 16.6, and 32.9 pages/s with 1, 4, and 8
-requests in flight, respectively (about 0.24 seconds per batch).
+2026-09-16 real-account measurement, with the earlier 40-bar pages, was about 4.0, 16.6, and
+32.9 pages/s with 1, 4, and 8 requests in flight, respectively (about 0.24 seconds per batch).
 Set the Pocket broker's `history_pages_in_flight` to a positive count (default 8) to control
-candle-page prefetch on each connection.
+candle-page prefetch on each connection. On the probed demo account, 150-bar pages were fastest
+with `history_pages_in_flight = 1`: one two-day window took 45.4 s at 1 in flight and 123.1 s at 8
+(2026-09-29).
 Pocket history reconnects and resends outstanding requests with fresh indexes after a response timeout (at most three retries per page), or before sending after more than 25 seconds without a server frame, sharing the adapter's 20-reconnect limit.
 With exact broker and Drive authorization, run a bounded update:
 
