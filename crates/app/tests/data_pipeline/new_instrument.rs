@@ -500,10 +500,11 @@ fn interrupted_empty_store_keeps_original_seed_binding() {
         }
     }
     let completed = completed.expect("bounded first acquisition eventually completes");
-    // The completed update re-reads Pocket's final page at the same cutoff and publishes a newer
-    // Pocket generation covering only that page. That same-cutoff behavior predates 150-bar
-    // pages (e50e1599 re-reads one 40-bar page), so this checks its content: every bar equals
-    // the uninterrupted series and it ends at the cutoff.
+    // Pre-existing (e50e1599, both brokers; recorded for a separate fix): the one-page first
+    // invocation published a partial lineage root, and every update after the job completes
+    // re-seeds from that root rather than the completed generation, so the newer Pocket
+    // generation holds only the root's rows. Here the root is one 150-bar page ending at the
+    // cutoff, so its bar starts are exactly cutoff − 745 s through cutoff − 5 s.
     let store = f.scratch.path("producer/store");
     let latest = dataset(
         &store,
@@ -535,7 +536,7 @@ fn interrupted_empty_store_keeps_original_seed_binding() {
         (DAY2 + 800 - 745..DAY2 + 800)
             .step_by(5)
             .collect::<Vec<_>>(),
-        "latest Pocket generation is exactly the final re-read page"
+        "latest Pocket generation holds only the partial root page"
     );
     let report = format!(
         "{}\n{}",

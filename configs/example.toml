@@ -52,7 +52,9 @@ server_offset_minutes = 120
 # Required when this broker is selected for live/replay execution. Only demo is supported.
 # For a policy frozen at 92%, only a fresh listing predicting 92% admits an offer.
 payout = { add_percent = 8, cap_percent = 92, max_age_seconds = 3 }
-# Measured 2026-09-16: K=1 ~4.0 pages/s; K=4 16.6 pages/s; K=8 32.9 pages/s (~0.24 s/batch).
+# Measured 2026-09-16 on a real account with 40-bar pages (offset 200): K=1 ~4.0 pages/s;
+# K=4 16.6 pages/s; K=8 32.9 pages/s (~0.24 s/batch). Demo pages now hold 150 bars and were
+# fastest at K=1 (docs/operations.md).
 history_pages_in_flight = 8
 
 [history]
