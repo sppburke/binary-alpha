@@ -2515,6 +2515,22 @@ fn pipeline_resumes_retained_40_bar_page_with_150_bar_requests() {
             .unwrap()
     };
     assert_eq!(stored(&coverage.pages[0]).payload, legacy_bytes);
+    // Each published occurrence carries its request token, UTC anchor, digest and row count.
+    for page in &coverage.pages {
+        let published = stored(page);
+        let token = page.anchor.as_deref().unwrap();
+        assert_eq!(published.request_token.as_deref(), Some(token));
+        assert_eq!(
+            published.request_anchor_utc,
+            Some((token.parse::<i64>().unwrap() - POCKET_OFFSET_S) * 1_000_000)
+        );
+        assert_eq!(published.payload_sha256, page.sha256);
+        assert_eq!(published.rows, page.rows);
+    }
+    assert_eq!(
+        stored(&coverage.pages[0]).request_token.as_deref(),
+        Some(legacy_request["time"].to_string().as_str())
+    );
     let new_requests: Vec<Value> = f.pocket.requests()[requests_before..]
         .iter()
         .map(|request| serde_json::from_str(request).unwrap())

@@ -528,9 +528,14 @@ fn interrupted_empty_store_keeps_original_seed_binding() {
         );
     }
     assert_eq!(
-        latest_bars.last().unwrap().start_unix_s,
-        DAY2 + 800 - 5,
-        "latest Pocket generation ends at the cutoff"
+        latest_bars
+            .iter()
+            .map(|bar| bar.start_unix_s)
+            .collect::<Vec<_>>(),
+        (DAY2 + 800 - 745..DAY2 + 800)
+            .step_by(5)
+            .collect::<Vec<_>>(),
+        "latest Pocket generation is exactly the final re-read page"
     );
     let report = format!(
         "{}\n{}",

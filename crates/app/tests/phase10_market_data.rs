@@ -1935,6 +1935,14 @@ fn pocket_history_skips_foreign_assets_and_indexes_without_extending_deadline() 
                     if matching { 3 } else { 9 }
                 }
             );
+            if granularity != NativeGranularity::Tick {
+                // The page supplied at -735 answers the prefetch anchored one 745-second step back.
+                assert!(
+                    pocket_sent_events(&sent, "loadHistoryPeriod")
+                        .iter()
+                        .any(|request| request["time"] == -735 + 7200 && request["offset"] == 750)
+                );
+            }
         }
     }
 }
