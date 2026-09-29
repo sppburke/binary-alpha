@@ -500,12 +500,43 @@ fn interrupted_empty_store_keeps_original_seed_binding() {
         }
     }
     let completed = completed.expect("bounded first acquisition eventually completes");
+    // The completed update re-reads Pocket's final page at the same cutoff and publishes a newer
+    // Pocket generation covering only that page. That same-cutoff behavior predates 150-bar
+    // pages (e50e1599 re-reads one 40-bar page), so this checks its content: every bar equals
+    // the uninterrupted series and it ends at the cutoff.
+    let store = f.scratch.path("producer/store");
+    let latest = dataset(
+        &store,
+        field(job_line(&completed, &f.jobs[1].id), "dataset"),
+    );
+    let latest_bars = bars(&store, &latest);
+    assert!(!latest_bars.is_empty());
+    for bar in &latest_bars {
+        let [open, high, low, close, volume] = synthetic_bar(bar.start_unix_s);
+        assert_eq!(
+            (
+                bar.open,
+                bar.high,
+                bar.low,
+                bar.close,
+                bar.volume,
+                bar.period_s
+            ),
+            (open, high, low, close, volume, 5),
+            "latest Pocket bar at {}",
+            bar.start_unix_s
+        );
+    }
+    assert_eq!(
+        latest_bars.last().unwrap().start_unix_s,
+        DAY2 + 800 - 5,
+        "latest Pocket generation ends at the cutoff"
+    );
     let report = format!(
         "{}\n{}",
         job_line(&completed, &f.jobs[0].id),
         pocket_final.expect("Pocket completed before Deriv")
     );
-    let store = f.scratch.path("producer/store");
     // The resumed acquisition publishes one uninterrupted acquisition's observation days,
     // byte for byte, and every manifest of both verifies.
     let whole = new_jobs("new_instrument_uninterrupted", 100, None);
