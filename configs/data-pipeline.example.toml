@@ -26,7 +26,8 @@ retry_seconds = 900
 
 # add-job appends [[jobs]] with generated jobs/ and evidence/ relative paths.
 # History budgets in sibling templates: Deriv 6000 pages, Pocket 20000 pages,
-# max_elapsed_seconds = 3600, overlap_seconds = 60. Pocket has 8 pages in flight.
+# max_elapsed_seconds = 3600, overlap_seconds = 60. Pocket has 8 pages in flight (the adapter
+# default); the probed demo account was fastest at 1 with 150-bar pages (docs/operations.md).
 # These bound one invocation; rerun pending work at the same cutoff for a larger gap.
 # Pocket requires origin = "https://pocketoption.com"; credential_command is a program
 # and argv array (see data-pipeline-pocket.example.toml), never an inline credential.
