@@ -433,86 +433,98 @@ fn empty_store_add_update_archive_pull_and_whole_job_retire() {
 #[test]
 fn interrupted_empty_store_keeps_original_seed_binding() {
     let f = new_jobs("new_instrument_resume", 1, None);
-    let cutoff = time_text((DAY2 + 100) * 1_000_000);
-    let mut completed = None;
-    let mut checked_binding = false;
-    for _ in 0..10 {
-        match pipeline("update", &f.config, &["--end", &cutoff]) {
-            Ok(report) => {
-                completed = Some(report);
-                break;
-            }
-            Err(reason) => {
-                assert!(reason.contains("status pending"), "{reason}");
-                assert!(
-                    !reason.contains("configuration") || !reason.contains("conflicts"),
-                    "{reason}"
-                );
-                if !checked_binding {
-                    let requests = (f.deriv.requests(), f._pocket.requests());
-                    let mut originals = Vec::new();
-                    for job in &f.jobs {
-                        let path = f.scratch.path(job.config.to_str().unwrap());
-                        let original = fs::read_to_string(&path).unwrap();
-                        let state = f
-                            .scratch
-                            .path(&format!("producer/pipeline_state/{}", job.id));
-                        let pending = fs::read(state.join("progress.json")).unwrap();
-                        let mut effective =
-                            binary_alpha_app::load_config(&state.join("update.toml")).unwrap();
-                        effective.history.as_mut().unwrap().max_pages = None;
-                        effective.history.as_mut().unwrap().max_elapsed_seconds = None;
-                        assert_eq!(
-                            serde_json::from_slice::<Value>(&pending).unwrap()["effective_config_hash"],
-                            effective.content_hash(),
-                            "intent binds canonical core directly, including its calendar"
-                        );
-                        let mut changed =
-                            binary_alpha_engine::config::Config::parse(&original).unwrap();
-                        changed.instruments[0].session =
-                            binary_alpha_engine::config::Config::parse(&deriv_core(
-                                &f.deriv.url,
-                                60,
-                                1,
-                                600,
-                            ))
-                            .unwrap()
-                            .instruments[0]
-                                .session
-                                .clone();
-                        fs::write(&path, changed.canonical_toml()).unwrap();
-                        originals.push((path, original, state, pending));
-                    }
-                    let refused = pipeline("update", &f.config, &["--end", &cutoff]).unwrap_err();
-                    assert!(
-                        refused.contains("current effective configuration")
-                            && refused.contains("conflicts"),
-                        "{refused}"
-                    );
-                    assert_eq!((f.deriv.requests(), f._pocket.requests()), requests);
-                    for (path, original, state, pending) in originals {
-                        assert_eq!(fs::read(state.join("progress.json")).unwrap(), pending);
-                        fs::write(path, original).unwrap();
-                    }
-                    checked_binding = true;
+    let cutoff = time_text((DAY2 + 800) * 1_000_000);
+    let first = pipeline("update", &f.config, &["--end", &cutoff]).unwrap_err();
+    let requests = (f.deriv.requests(), f._pocket.requests());
+    let mut originals = Vec::new();
+    for job in &f.jobs {
+        assert_eq!(field(job_line(&first, &job.id), "status"), "pending");
+        let path = f.scratch.path(job.config.to_str().unwrap());
+        let original = fs::read_to_string(&path).unwrap();
+        let state = f
+            .scratch
+            .path(&format!("producer/pipeline_state/{}", job.id));
+        let pending = fs::read(state.join("progress.json")).unwrap();
+        let mut effective = binary_alpha_app::load_config(&state.join("update.toml")).unwrap();
+        effective.history.as_mut().unwrap().max_pages = None;
+        effective.history.as_mut().unwrap().max_elapsed_seconds = None;
+        assert_eq!(
+            serde_json::from_slice::<Value>(&pending).unwrap()["effective_config_hash"],
+            effective.content_hash(),
+            "intent binds canonical core directly, including its calendar"
+        );
+        let mut changed = binary_alpha_engine::config::Config::parse(&original).unwrap();
+        changed.instruments[0].session =
+            binary_alpha_engine::config::Config::parse(&deriv_core(&f.deriv.url, 60, 1, 600))
+                .unwrap()
+                .instruments[0]
+                .session
+                .clone();
+        fs::write(&path, changed.canonical_toml()).unwrap();
+        originals.push((path, original, state, pending));
+    }
+    let refused = pipeline("update", &f.config, &["--end", &cutoff]).unwrap_err();
+    assert!(
+        refused.contains("current effective configuration") && refused.contains("conflicts"),
+        "{refused}"
+    );
+    assert_eq!((f.deriv.requests(), f._pocket.requests()), requests);
+    for (path, original, state, pending) in originals {
+        assert_eq!(fs::read(state.join("progress.json")).unwrap(), pending);
+        fs::write(path, original).unwrap();
+    }
+    let mut reports = Vec::new();
+    for job in &f.jobs {
+        let mut completed = None;
+        for _ in 0..10 {
+            match pipeline(
+                "update",
+                &f.config,
+                &["--end", &cutoff, "--job", job.id.as_str()],
+            ) {
+                Ok(report) => {
+                    completed = Some(report);
+                    break;
                 }
+                Err(reason) => assert_eq!(field(job_line(&reason, &job.id), "status"), "pending"),
             }
         }
+        reports.push(completed.expect("bounded first acquisition eventually completes"));
     }
-    assert!(
-        checked_binding,
-        "fixture must exercise a pending calendar conflict"
-    );
-    let report = completed.expect("bounded first acquisition eventually completes");
+    let report = reports.join("\n");
     let store = f.scratch.path("producer/store");
     // The resumed acquisition publishes one uninterrupted acquisition's observation days,
     // byte for byte, and every manifest of both verifies.
     let whole = new_jobs("new_instrument_uninterrupted", 100, None);
     let whole_report = pipeline("update", &whole.config, &["--end", &cutoff]).unwrap();
-    assert_eq!(
-        observations(&f, &report),
-        observations(&whole, &whole_report)
-    );
+    let resumed = observations(&f, &report);
+    let uninterrupted = observations(&whole, &whole_report);
+    assert_eq!(resumed.len(), uninterrupted.len());
+    for (job, (resumed, uninterrupted)) in f.jobs.iter().zip(resumed.iter().zip(&uninterrupted)) {
+        assert_eq!(resumed.0, uninterrupted.0, "{} observation days", job.id);
+        assert_eq!(resumed.1.len(), uninterrupted.1.len(), "{} ticks", job.id);
+        assert_eq!(resumed.2.len(), uninterrupted.2.len(), "{} bars", job.id);
+        assert!(
+            resumed.1 == uninterrupted.1,
+            "{} ticks differ at {:?}",
+            job.id,
+            resumed
+                .1
+                .iter()
+                .zip(&uninterrupted.1)
+                .position(|(left, right)| left != right)
+        );
+        assert!(
+            resumed.2 == uninterrupted.2,
+            "{} bars differ at {:?}",
+            job.id,
+            resumed
+                .2
+                .iter()
+                .zip(&uninterrupted.2)
+                .position(|(left, right)| left != right)
+        );
+    }
     for job in &f.jobs {
         let manifest = dataset(&store, field(job_line(&report, &job.id), "dataset"));
         assert_eq!(
@@ -522,7 +534,7 @@ fn interrupted_empty_store_keeps_original_seed_binding() {
         if manifest.broker.as_str() == "deriv" {
             assert_eq!(
                 ticks(&store, &manifest),
-                deriv_ticks(DAY2 - 600, DAY2 + 100)
+                deriv_ticks(DAY2 - 600, DAY2 + 800)
                     .into_iter()
                     .map(|(time, price)| Tick {
                         event_time_micros: time * 1_000_000,
@@ -533,7 +545,7 @@ fn interrupted_empty_store_keeps_original_seed_binding() {
         } else {
             assert_eq!(
                 bars(&store, &manifest),
-                (DAY2 - 600..DAY2 + 100)
+                (DAY2 - 600..DAY2 + 800)
                     .step_by(5)
                     .map(|start| {
                         let [open, high, low, close, volume] = synthetic_bar(start);

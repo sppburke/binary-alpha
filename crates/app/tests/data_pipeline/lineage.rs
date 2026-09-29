@@ -1140,7 +1140,7 @@ fn daily_received_journal_interruption_resumes_without_deleting_unresolved_evide
         pocket_core(&f.pocket.url, "demo", BAR_GRANULARITY, 60, 1, 60),
     )
     .unwrap();
-    let end = time_text((POCKET_SEED_END + 300) * 1_000_000);
+    let end = time_text((POCKET_SEED_END + 900) * 1_000_000);
     let pending = pipeline("update", &config, &["--end", &end]).unwrap_err();
     assert!(pending.contains("status pending"), "{pending}");
     let state = f.scratch.path("producer/pipeline_state/pocket");
@@ -1220,7 +1220,7 @@ fn deferred_reclamation_survives_retirement_of_superseded_descendant() {
         pocket_core(&f.pocket.url, "demo", BAR_GRANULARITY, 60, 1, 60),
     )
     .unwrap();
-    let end = time_text((POCKET_SEED_END + 300) * 1_000_000);
+    let end = time_text((POCKET_SEED_END + 900) * 1_000_000);
     assert!(
         pipeline("update", &config, &["--end", &end])
             .unwrap_err()
@@ -1246,7 +1246,7 @@ fn deferred_reclamation_survives_retirement_of_superseded_descendant() {
     let second = pipeline(
         "update",
         &config,
-        &["--end", &time_text((POCKET_SEED_END + 600) * 1_000_000)],
+        &["--end", &time_text((POCKET_SEED_END + 1_200) * 1_000_000)],
     )
     .unwrap();
     let second_generation = field(job_line(&second, "pocket"), "dataset");
@@ -1260,7 +1260,7 @@ fn deferred_reclamation_survives_retirement_of_superseded_descendant() {
     let after_retirement = pipeline(
         "update",
         &config,
-        &["--end", &time_text((POCKET_SEED_END + 900) * 1_000_000)],
+        &["--end", &time_text((POCKET_SEED_END + 1_500) * 1_000_000)],
     );
     assert!(
         after_retirement.is_ok(),
@@ -1347,7 +1347,7 @@ fn deferred_reclamation_survives_retirement_of_superseded_descendant() {
     let resumed = pipeline(
         "update",
         &config,
-        &["--end", &time_text((POCKET_SEED_END + 1200) * 1_000_000)],
+        &["--end", &time_text((POCKET_SEED_END + 1_800) * 1_000_000)],
     )
     .unwrap();
     assert!(

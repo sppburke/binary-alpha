@@ -59,13 +59,28 @@ fn cumulative_records(job: &str, broker: &str, symbol: &str, end: i64) {
     pipeline("archive", &config, &[]).unwrap();
     let mut final_catalog = String::new();
     let mut final_digest = String::new();
-    for seconds in [120, 240] {
-        pipeline(
+    let cutoffs = if broker == "pocket_option" {
+        [900, 1_800]
+    } else {
+        [120, 240]
+    };
+    for seconds in cutoffs {
+        let update = pipeline(
             "update",
             &config,
             &["--end", &time_text((end + seconds) * 1_000_000)],
         )
         .unwrap();
+        if broker == "pocket_option" {
+            let manifest = dataset(
+                &producer.join("store"),
+                field(job_line(&update, job), "dataset"),
+            );
+            assert!(
+                coverage(&producer.join("store"), &manifest).pages.len() >= 2,
+                "each Pocket update must cross a candle page boundary"
+            );
+        }
         let report = pipeline("archive", &config, &[]).unwrap();
         final_catalog = field(job_line(&report, job), "catalog").into();
         final_digest = field(job_line(&report, job), "sha256").into();

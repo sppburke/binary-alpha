@@ -2341,34 +2341,53 @@ fn pipeline_resumes_retained_40_bar_page_with_150_bar_requests() {
     .unwrap();
     let imported = import(&f.scratch.path("pocket-import.toml")).unwrap();
     let baseline = imported_generation(&imported, "pocket_option:AEDCNY_otc");
+    let seed_manifests = binary_alpha_app::store::Store::filesystem(&store)
+        .list_manifests()
+        .unwrap();
     let cutoff = POCKET_SEED_END + 1_562;
     let end = time_text(cutoff * 1_000_000);
-    let pending_report = pipeline("update", &config, &["--end", &end]).unwrap_err();
+    // Fail after opening the intent but before indexing or publishing any page. A partial
+    // 150-row descendant would conflict with the retained 40-row legacy occurrence.
+    f.pocket.set(BrokerFaults {
+        off_second: true,
+        ..Default::default()
+    });
+    let failed = pipeline("update", &config, &["--end", &end]).unwrap_err();
+    assert!(failed.contains("not a whole second"), "{failed}");
+    f.pocket.set(BrokerFaults::default());
     assert_eq!(
-        field(job_line(&pending_report, "pocket"), "status"),
-        "pending"
+        binary_alpha_app::store::Store::filesystem(&store)
+            .list_manifests()
+            .unwrap(),
+        seed_manifests,
+        "the setup must not publish a competing partial descendant"
     );
     let pending = read_progress(&header);
     assert_eq!(pending["progress"]["cutoff"], end);
     assert_eq!(pending["progress"]["baseline"], baseline);
-    let original: binary_alpha_app::fetch::PageCoverage =
-        serde_json::from_value(pending["progress"]["pages"][0].clone()).unwrap();
-    assert_eq!(original.rows, 150);
-    let request: Value = serde_json::from_str(&f.pocket.requests()[0]).unwrap();
-    assert_eq!(request["offset"], 750);
-    let raw =
-        fs::read(store.join(binary_alpha_engine::dataset::object_key(&original.sha256))).unwrap();
-    let mut response: Value = serde_json::from_slice(&raw).unwrap();
-    response["data"] = json!(response["data"].as_array().unwrap()[110..].to_vec());
-    // Captured from the e50e1599 adapter with a scripted Pocket handshake at this cutoff.
-    let legacy_request: Value = serde_json::from_str(
-        r#"{"asset":"AEDCNY_otc","index":4340835211749111,"offset":200,"period":5,"time":1747663062}"#,
-    )
+    assert_eq!(pending["progress"]["pages"], json!([]));
+    assert!(fs::read(&log).unwrap().is_empty());
+    let failed_request: Value = serde_json::from_str(&f.pocket.requests()[0]).unwrap();
+    assert_eq!(failed_request["offset"], 750);
+    assert_eq!(failed_request["time"], cutoff + POCKET_OFFSET_S);
+    let capture: Value = serde_json::from_slice(include_bytes!(
+        "fixtures/pocket_legacy_candle_page_e50e1599.json"
+    ))
     .unwrap();
-    response["index"] = legacy_request["index"].clone();
-    let legacy_bytes = serde_json::to_vec(&response).unwrap();
+    let legacy_request = &capture["request"];
+    let legacy_bytes = capture["response"].as_str().unwrap().as_bytes();
+    let response: Value = serde_json::from_slice(legacy_bytes).unwrap();
+    let digest = binary_alpha_engine::hex(&Sha256::digest(legacy_bytes));
+    assert_eq!(digest, capture["response_sha256"]);
+    assert_eq!(digest, capture["page"]["sha256"]);
+    assert_eq!(legacy_bytes.len() as u64, capture["page"]["bytes"]);
     assert_eq!(legacy_request["offset"], 200);
-    assert_eq!(legacy_request["time"], request["time"]);
+    assert_eq!(legacy_request["asset"], "AEDCNY_otc");
+    assert_eq!(legacy_request["period"], 5);
+    assert_eq!(
+        legacy_request["time"].as_i64().unwrap().to_string(),
+        capture["page"]["anchor"].as_str().unwrap()
+    );
     assert_eq!(legacy_request["index"], response["index"]);
     assert_eq!(legacy_request["asset"], response["asset"]);
     assert_eq!(legacy_request["period"], response["period"]);
@@ -2381,19 +2400,21 @@ fn pipeline_resumes_retained_40_bar_page_with_150_bar_requests() {
         response["data"].as_array().unwrap()[39]["time"],
         cutoff - 2 + POCKET_OFFSET_S
     );
-    let digest = binary_alpha_engine::hex(&Sha256::digest(&legacy_bytes));
     fs::write(
         store.join(binary_alpha_engine::dataset::object_key(&digest)),
-        &legacy_bytes,
+        legacy_bytes,
     )
     .unwrap();
-    let mut retained = original.clone();
-    retained.path = format!("raw/{digest}.json");
-    retained.sha256 = digest.clone();
-    retained.bytes = legacy_bytes.len() as u64;
-    retained.rows = 40;
-    retained.first = Some(time_text((cutoff - 197) * 1_000_000));
-    retained.last = Some(time_text((cutoff - 2) * 1_000_000));
+    let mut retained: binary_alpha_app::fetch::PageCoverage =
+        serde_json::from_value(capture["page"].clone()).unwrap();
+    let occurrence = retained.occurrence.as_mut().unwrap();
+    occurrence.acquisition_id = pending["acquisition_id"].as_str().unwrap().to_string();
+    occurrence.intent = Some(pending["intent"].as_str().unwrap().to_string());
+    assert_eq!(occurrence.ordinal, 0);
+    assert_eq!(retained.path, format!("raw/{digest}.json"));
+    assert_eq!(retained.rows, 40);
+    assert_eq!(retained.first, Some(time_text((cutoff - 197) * 1_000_000)));
+    assert_eq!(retained.last, Some(time_text((cutoff - 2) * 1_000_000)));
     assert_eq!(
         retained.anchor,
         Some((cutoff + POCKET_OFFSET_S).to_string())
@@ -2412,16 +2433,15 @@ fn pipeline_resumes_retained_40_bar_page_with_150_bar_requests() {
     )
     .unwrap();
     let received_path = state.join("progress.received.jsonl");
-    let received = fs::read_to_string(&received_path).unwrap();
-    let mut received_lines = Vec::new();
-    for line in received.lines() {
-        let mut page: binary_alpha_app::fetch::PageCoverage = serde_json::from_str(line).unwrap();
-        if page.sha256 == original.sha256 {
-            page = retained.clone();
-        }
-        received_lines.push(serde_json::to_string(&page).unwrap());
-    }
-    fs::write(&received_path, format!("{}\n", received_lines.join("\n"))).unwrap();
+    assert_eq!(
+        fs::read_to_string(&received_path).unwrap().lines().count(),
+        1
+    );
+    fs::write(
+        &received_path,
+        format!("{}\n", serde_json::to_string(&retained).unwrap()),
+    )
+    .unwrap();
     let requests_before = f.pocket.requests().len();
     let mut report = String::new();
     for _ in 0..3 {
@@ -2447,8 +2467,19 @@ fn pipeline_resumes_retained_40_bar_page_with_150_bar_requests() {
         coverage.verified.as_ref().unwrap().start,
         time_text((POCKET_SEED_END - 60) * 1_000_000)
     );
-    assert_eq!(coverage.verified.as_ref().unwrap().end, end);
-    assert!(coverage.shortfall.is_none());
+    // The captured anchor is two seconds off the five-second grid. The final candle crosses
+    // the pinned cutoff, so the exact two-second tail is unresolved, not a missing candle.
+    let last_complete = time_text((cutoff - 2) * 1_000_000);
+    assert_eq!(coverage.verified.as_ref().unwrap().end, last_complete);
+    assert_eq!(
+        coverage.shortfall.as_ref().unwrap().reason,
+        "unresolved_tail"
+    );
+    assert_eq!(
+        coverage.shortfall.as_ref().unwrap().unresolved.start,
+        last_complete
+    );
+    assert_eq!(coverage.shortfall.as_ref().unwrap().unresolved.end, end);
     assert!(coverage.tail_shortfall.is_none());
     assert_eq!(coverage.pages.len(), 3);
     assert_eq!(
@@ -2460,19 +2491,42 @@ fn pipeline_resumes_retained_40_bar_page_with_150_bar_requests() {
         (40, 150, 150)
     );
     assert_eq!(coverage.pages[0], retained);
+    assert_bundle(&store, &manifest, 3);
+    let stored_pages: Vec<_> = manifest
+        .day_inventory
+        .iter()
+        .filter(|day| day.family == binary_alpha_engine::dataset::DayFamily::Pages)
+        .flat_map(|day| {
+            binary_alpha_app::daily::read_pages(
+                &store.join(day.object.as_ref().unwrap()),
+                &day.date,
+            )
+            .unwrap()
+        })
+        .collect();
+    let stored = |page: &binary_alpha_app::fetch::PageCoverage| {
+        let occurrence = page.occurrence.as_ref().unwrap();
+        stored_pages
+            .iter()
+            .find(|stored| {
+                stored.acquisition_id == occurrence.acquisition_id
+                    && stored.ordinal == occurrence.ordinal
+            })
+            .unwrap()
+    };
+    assert_eq!(stored(&coverage.pages[0]).payload, legacy_bytes);
     let new_requests: Vec<Value> = f.pocket.requests()[requests_before..]
         .iter()
         .map(|request| serde_json::from_str(request).unwrap())
         .collect();
     for page in &coverage.pages[1..] {
-        let bytes =
-            fs::read(store.join(binary_alpha_engine::dataset::object_key(&page.sha256))).unwrap();
+        let bytes = &stored(page).payload;
         assert_eq!(bytes.len() as u64, page.bytes);
         assert_eq!(
-            binary_alpha_engine::hex(&Sha256::digest(&bytes)),
+            binary_alpha_engine::hex(&Sha256::digest(bytes)),
             page.sha256
         );
-        let response: Value = serde_json::from_slice(&bytes).unwrap();
+        let response: Value = serde_json::from_slice(bytes).unwrap();
         let request = new_requests
             .iter()
             .find(|request| {
