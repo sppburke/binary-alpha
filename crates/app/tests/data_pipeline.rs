@@ -1469,6 +1469,91 @@ fn bars(store: &Path, manifest: &GenerationManifest) -> Vec<Bar> {
     rows
 }
 
+#[test]
+fn exponent_fetch_roundtrip() {
+    use binary_alpha_engine::dataset::coverage::{CoverageRange, DailyCoverage};
+    use binary_alpha_engine::market::float_price_units;
+
+    let scratch = Scratch::new("exponent_fetch_roundtrip");
+    let end = POCKET_START + 60;
+    let pocket = serve_broker(Kind::Pocket {
+        from: POCKET_START,
+        to: end + 5,
+    });
+    pocket.set(BrokerFaults {
+        pocket_price: Some("7.96e-7".into()),
+        ..Default::default()
+    });
+    let core = pocket_core(&pocket.url, "demo", BAR_GRANULARITY, 60, 5, 60)
+        .replace("price_scale = 6", "price_scale = 9")
+        .replace("history_pages_in_flight = 8", "history_pages_in_flight = 1")
+        .replace("2025-05-20T00:00:00Z", &time_text(end * 1_000_000));
+    let config = import_config(&scratch, "exponent", &core);
+    let report = run(&["data", "fetch", "--config", config.to_str().unwrap()]).unwrap();
+    assert!(report.contains("shortfall none"), "{report}");
+    let store = scratch.path("producer/store");
+    let manifest = dataset(&store, field(&report, "generation"));
+    let uri = format!("file://{}", store.join(manifest.key()).display());
+    let verified = run(&["data", "verify", "--manifest", &uri]).unwrap();
+    assert!(
+        verified.contains(&format!("generation {} rows 12", manifest.generation)),
+        "{verified}"
+    );
+    let rows = bars(&store, &manifest);
+    assert_eq!(manifest.row_count, 12);
+    assert_eq!(rows.len(), 12);
+    for (row, start) in rows.iter().zip((POCKET_START..end).step_by(5)) {
+        assert_eq!(row.start_unix_s, start);
+        assert_eq!(row.period_s, 5);
+        let units = [row.open, row.high, row.low, row.close]
+            .map(|price| float_price_units(price, 9.try_into().unwrap()).unwrap());
+        assert_eq!(units, [796; 4]);
+    }
+    let object = manifest
+        .objects
+        .iter()
+        .find(|object| object.path == "provenance/coverage.json")
+        .unwrap();
+    let coverage = DailyCoverage::from_json(&fs::read(store.join(&object.key)).unwrap()).unwrap();
+    coverage.check_manifest(&manifest).unwrap();
+    assert_eq!(coverage.acquisitions.len(), 1);
+    let acquisition = &coverage.acquisitions[0];
+    let requested = CoverageRange::new(POCKET_START * 1_000_000, end * 1_000_000);
+    assert_eq!(acquisition.requested, vec![requested.clone()]);
+    assert_eq!(acquisition.verified, vec![requested]);
+    assert!(acquisition.shortfalls.is_empty());
+    assert!(acquisition.unresolved.is_empty());
+
+    let requests = pocket.requests();
+    assert_eq!(requests.len(), 1);
+    let request: Value = serde_json::from_str(&requests[0]).unwrap();
+    assert_eq!(request["time"], end + POCKET_OFFSET_S);
+    let sent_rows = (POCKET_START..=end)
+        .step_by(5)
+        .map(|start| {
+            let volume = synthetic_bar(start)[4];
+            format!(
+                r#"{{"close":7.96e-7,"high":7.96e-7,"low":7.96e-7,"open":7.96e-7,"symbol_id":{POCKET_SYMBOL_ID},"time":{},"volume":{volume}}}"#,
+                start + POCKET_OFFSET_S
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    let sent = format!(
+        r#"{{"asset":"AEDCNY_otc","data":[{sent_rows}],"index":{},"period":5}}"#,
+        request["index"]
+    );
+    let pages = common::daily::pages(&store, &manifest);
+    assert_eq!(pages.len(), 1);
+    assert_eq!(pages[0].rows, 13);
+    assert_eq!(pages[0].payload, sent.as_bytes());
+    assert_eq!(
+        pages[0].payload_sha256,
+        binary_alpha_engine::hex(&Sha256::digest(sent.as_bytes()))
+    );
+    assert!(pocket.forbidden().is_empty());
+}
+
 /// The expected retained rows: the seed rows plus every provider row from `fetch_start` to
 /// the cutoff, deduplicated by time.
 fn expected_ticks(seed_end: i64, fetch_start: i64, cutoff: i64) -> Vec<Tick> {

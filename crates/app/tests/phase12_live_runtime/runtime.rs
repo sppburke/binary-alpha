@@ -3126,6 +3126,92 @@ fn pocket_written_claim_with_segments(
 }
 
 #[test]
+fn pocket_exponent_restart_matches_plain_cash_and_liabilities() {
+    use binary_alpha_engine::execution::{EventKind, Resolution};
+    use live::control::{ClaimState, Control, LeaseKey};
+
+    let mut results = Vec::new();
+    for exponent in [false, true] {
+        let (fixture, control, request_id) =
+            pocket_written_claim(&format!("phase12-pocket-exponent-restart-{exponent}"));
+        let mut log = pocket_restart_log(request_id);
+        if exponent {
+            for (plain, expanded) in [
+                (r#"\"amount\":1"#, r#"\"amount\":1e0"#),
+                (r#"\"profit\":0.92"#, r#"\"profit\":9.2e-1"#),
+                (r#"\"percentProfit\":92"#, r#"\"percentProfit\":9.2e1"#),
+                (r#"\"balance\":10000.92"#, r#"\"balance\":1.000092e4"#),
+            ] {
+                assert!(log.contains(plain), "missing {plain}");
+                log = log.replace(plain, expanded);
+            }
+        }
+        let restart = RecordedConnector::from_jsonl(&log).unwrap();
+        let mut restored =
+            pocket_runtime(&fixture, live::Mode::Live, &restart, control.clone()).unwrap();
+        let claims = control.clone();
+        restored.hook = Some(Box::new(move |point| {
+            if point == live::Checkpoint::BeforeClaimDeletion {
+                assert_eq!(
+                    claims
+                        .clone()
+                        .retained_claims(LeaseKey {
+                            broker: "pocket_option",
+                            account: "a0",
+                        })
+                        .unwrap()[0]
+                        .state,
+                    ClaimState::Reconciled
+                );
+            }
+            false
+        }));
+        restored
+            .run_until(|_| restart.exhausted())
+            .unwrap()
+            .unwrap();
+        let payout = restored
+            .records()
+            .iter()
+            .find_map(|record| match &record.kind {
+                live::journal::RecordKind::Ledger { event } => match &event.kind {
+                    EventKind::Reconciled {
+                        resolution: Resolution::Purchased { liability, .. },
+                        ..
+                    } => Some(liability.payout),
+                    _ => None,
+                },
+                _ => None,
+            })
+            .unwrap();
+        let credits = restored
+            .records()
+            .iter()
+            .filter_map(|record| match &record.kind {
+                live::journal::RecordKind::Ledger { event } => match &event.kind {
+                    EventKind::Settled { credit, .. } => Some(credit.to_string()),
+                    _ => None,
+                },
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let account = &restored.engine().accounts()[0];
+        assert_eq!(payout.to_string(), "1.92");
+        assert_eq!(credits, ["1.92"]);
+        assert_eq!(account.cash.to_string(), "10000.92");
+        assert_eq!(account.open, 0);
+        results.push((
+            payout,
+            credits,
+            account.cash,
+            account.open,
+            account.reserved,
+        ));
+    }
+    assert_eq!(results[0], results[1]);
+}
+
+#[test]
 fn pocket_restart_matches_written_request_id_and_settles_closed_deal() {
     use live::control::{ClaimState, Control, LeaseKey};
     let (fixture, control, request_id) = pocket_written_claim("phase12-pocket-restart");
