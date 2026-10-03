@@ -1222,8 +1222,9 @@ currency on balance, and supplied currency on account events. Provider errors re
 and request name; malformed-response diagnostics name the field without echoing its value. Inspection
 reports omit provider error messages, keeping echoed login ids and authenticated addresses private.
 Numeric fields are decoded from original bytes with `RawValue` and the shared exact
-Decimal/price-unit readers. Outgoing amounts are unquoted exact tokens. Used handwritten structures
-are pinned to `crates/app/schemas/deriv/production_v20260819_0`; its source inventory records the
+Decimal/price-unit readers. Unquoted broker JSON numbers in exponent form are read exactly;
+quoted strings and plain-text inputs stay plain. Outgoing amounts are unquoted exact tokens. Used
+handwritten structures are pinned to `crates/app/schemas/deriv/production_v20260819_0`; its source inventory records the
 release, archive digest, selected fields and absence of an upstream license statement. Builds do
 not download schemas. Discovery returning `RateLimit` is unavailable evidence, never a successful
 instrument inventory. Targeted `contracts_for` preserves the observed CALL/PUT `barriers:1` mapping.

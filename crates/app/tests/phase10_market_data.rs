@@ -504,7 +504,7 @@ fn exact_wire_numbers_and_socket_io_subset() {
     );
     let escaped: WireDecimal = serde_json::from_str(r#""18.8\u0033""#).unwrap();
     assert_eq!(escaped.decimal().unwrap(), Decimal::parse("18.83").unwrap());
-    for invalid in ["1e3", "null", "true", "\"1e3\""] {
+    for invalid in ["null", "true", "\"1e3\""] {
         assert!(
             serde_json::from_str::<WireDecimal>(invalid)
                 .unwrap()
@@ -548,6 +548,105 @@ fn exact_wire_numbers_and_socket_io_subset() {
     ] {
         assert!(decode(bad).is_err(), "{bad}");
     }
+}
+
+#[test]
+fn exact_exponent_wire_numbers() {
+    let mut cases = vec![
+        ("1e3".to_string(), "1000".to_string()),
+        ("7.96e-7".into(), "0.000000796".into()),
+        ("-1.5E+3".into(), "-1500".into()),
+        ("1.00e0".into(), "1.00".into()),
+        ("9007199254740993e0".into(), "9007199254740993".into()),
+        ("-0e5".into(), "-0".into()),
+        ("0.00e0".into(), "0.00".into()),
+        ("-0.00E+0".into(), "-0.00".into()),
+        ("0e-7".into(), "0.0000000".into()),
+        ("0e-400".into(), format!("0.{}", "0".repeat(400))),
+        ("0e400".into(), "0".into()),
+        ("0.1e39".into(), format!("1{}", "0".repeat(38))),
+        (format!("0.{}1e40", "0".repeat(39)), "1".into()),
+        ("1e0003".into(), "1000".into()),
+        ("1e-400".into(), format!("0.{}1", "0".repeat(399))),
+        ("1e400".into(), format!("1{}", "0".repeat(400))),
+        ("1e-19".into(), format!("0.{}1", "0".repeat(18))),
+        (
+            "1.0000000000000000000e0".into(),
+            "1.0000000000000000000".into(),
+        ),
+    ];
+    for plain in [
+        "9223372036854775807",
+        "9223372036854775808",
+        "-9223372036854775808",
+        "-9223372036854775809",
+        "170141183460469231731687303715884105727",
+        "170141183460469231731687303715884105728",
+        "-170141183460469231731687303715884105728",
+        "-170141183460469231731687303715884105729",
+    ] {
+        cases.push((format!("{plain}e0"), plain.into()));
+    }
+    cases.push((format!("0e{}", "9".repeat(2_000)), "0".into()));
+    for (exponent, plain) in cases {
+        let wire: WireDecimal = serde_json::from_str(&exponent).unwrap();
+        let control: WireDecimal = serde_json::from_str(&plain).unwrap();
+        assert_eq!(wire.token().unwrap(), exponent);
+        assert_eq!(serde_json::to_string(&wire).unwrap(), exponent);
+        match control.decimal() {
+            Ok(expected) => {
+                let actual = wire.decimal().unwrap();
+                assert_eq!(
+                    (actual.coefficient(), actual.scale()),
+                    (expected.coefficient(), expected.scale()),
+                    "{exponent} = {plain}"
+                );
+            }
+            Err(_) => assert!(wire.decimal().is_err(), "{exponent} = {plain}"),
+        }
+        for digits in 0..=18 {
+            match control.price_units(scale(digits)) {
+                Ok(expected) => assert_eq!(
+                    wire.price_units(scale(digits)).unwrap(),
+                    expected,
+                    "{exponent} = {plain} at scale {digits}"
+                ),
+                Err(_) => assert!(
+                    wire.price_units(scale(digits)).is_err(),
+                    "{exponent} = {plain} at scale {digits}"
+                ),
+            }
+        }
+    }
+    // The outcomes the equivalence above must not reach by both readers refusing.
+    let read = |token: &str| serde_json::from_str::<WireDecimal>(token).unwrap();
+    let exact = |token: &str| {
+        read(token)
+            .decimal()
+            .map(|value| (value.coefficient(), value.scale()))
+    };
+    assert_eq!(exact("1e3"), Ok((1000, 0)));
+    assert_eq!(exact("0.00e0"), Ok((0, 2)));
+    assert_eq!(exact("0e-7"), Ok((0, 7)));
+    assert_eq!(exact("0e400"), Ok((0, 0)));
+    assert_eq!(exact("9007199254740993e0"), Ok((9_007_199_254_740_993, 0)));
+    assert_eq!(exact("0.1e39"), Ok((10_i128.pow(38), 0)));
+    for refused in ["0e-400", "1e-400", "1e400", "1e-19"] {
+        assert!(exact(refused).is_err(), "{refused}");
+    }
+    assert_eq!(read("7.96e-7").price_units(scale(9)), Ok(796));
+    assert!(read("7.96e-7").price_units(scale(8)).is_err());
+    assert!(read("1.00e0").price_units(scale(1)).is_err());
+    assert_eq!(read("1.00e0").price_units(scale(2)), Ok(100));
+    assert!(read("0.00e0").price_units(scale(1)).is_err());
+    assert!((0..=18).all(|digits| read("0.1e39").price_units(scale(digits)).is_err()));
+    let huge: WireDecimal = serde_json::from_str(&format!("1e{}", "9".repeat(2_000))).unwrap();
+    assert!(huge.decimal().is_err());
+    for digits in 0..=18 {
+        assert!(huge.price_units(scale(digits)).is_err());
+    }
+    let time: WireDecimal = serde_json::from_str("0e-7").unwrap();
+    assert!(universal_micros(&time, 0).is_err());
 }
 
 #[test]
