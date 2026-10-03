@@ -1552,6 +1552,35 @@ fn exponent_fetch_roundtrip() {
         binary_alpha_engine::hex(&Sha256::digest(sent.as_bytes()))
     );
     assert!(pocket.forbidden().is_empty());
+
+    // The default plain fixture still parses to the observations `fd233165` published. Retained
+    // pages record local receipt times, so only normalized bytes are comparable across fetches.
+    let plain_scratch = Scratch::new("exponent_fetch_roundtrip_plain");
+    let plain_pocket = serve_broker(Kind::Pocket {
+        from: POCKET_START,
+        to: end + 5,
+    });
+    let plain_core = pocket_core(&plain_pocket.url, "demo", BAR_GRANULARITY, 60, 5, 60)
+        .replace("history_pages_in_flight = 8", "history_pages_in_flight = 1")
+        .replace("2025-05-20T00:00:00Z", &time_text(end * 1_000_000));
+    let plain_config = import_config(&plain_scratch, "plain", &plain_core);
+    let plain_report = run(&["data", "fetch", "--config", plain_config.to_str().unwrap()]).unwrap();
+    let plain = dataset(
+        &plain_scratch.path("producer/store"),
+        field(&plain_report, "generation"),
+    );
+    let observations = plain
+        .objects
+        .iter()
+        .find(|object| object.path == "observations/2025-05-19.parquet")
+        .unwrap();
+    assert_eq!(
+        (observations.sha256.as_str(), observations.bytes),
+        (
+            "daa237812d18f0892434b5f98e6d31b229ea095c1eebf667f1cfa8ff6a87ecc5",
+            2092
+        )
+    );
 }
 
 /// The expected retained rows: the seed rows plus every provider row from `fetch_start` to

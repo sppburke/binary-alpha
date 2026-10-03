@@ -50,6 +50,8 @@ impl WireDecimal {
     }
 }
 
+/// The exact plain spelling of an unquoted JSON exponent token, bounded before allocation: at
+/// most 18 fraction digits and 39 significant whole digits. Other tokens are returned as they are.
 fn expand_number(token: &str) -> Result<Cow<'_, str>, &'static str> {
     let Some((mantissa, exponent)) = token.split_once(['e', 'E']) else {
         return Ok(Cow::Borrowed(token));
@@ -61,60 +63,53 @@ fn expand_number(token: &str) -> Result<Cow<'_, str>, &'static str> {
     let unsigned = mantissa.strip_prefix('-').unwrap_or(mantissa);
     let (whole, fraction) = unsigned.split_once('.').unwrap_or((unsigned, ""));
     let whole = whole.trim_start_matches('0');
-    let digits = whole.bytes().chain(fraction.bytes());
-    let leading_zeros = digits.clone().take_while(|digit| *digit == b'0').count();
+    let leading_zeros = whole
+        .bytes()
+        .chain(fraction.bytes())
+        .take_while(|digit| *digit == b'0')
+        .count();
     let zero = leading_zeros == whole.len() + fraction.len();
     let backwards = exponent.starts_with('-');
-    let exponent = exponent
-        .strip_prefix(['-', '+'])
-        .unwrap_or(exponent)
-        .trim_start_matches('0');
+    let exponent = exponent.strip_prefix(['-', '+']).unwrap_or(exponent);
     let limit = if backwards {
         18
-    } else if zero {
-        fraction.len()
     } else {
         fraction.len().saturating_add(39)
     };
-    // RawValue guarantees number grammar; bound the digit string before converting it.
-    let shift = if exponent.is_empty() {
-        Some(0)
-    } else if exponent.len() > limit.checked_ilog10().unwrap_or(0) as usize + 1 {
-        None
-    } else {
-        exponent
-            .parse::<usize>()
-            .ok()
+    let shift = exponent.bytes().try_fold(0usize, |value, digit| {
+        value
+            .checked_mul(10)?
+            .checked_add(usize::from(digit - b'0'))
             .filter(|value| *value <= limit)
-    };
+    });
     let shift = match shift {
         Some(value) => value,
         None if zero && !backwards => fraction.len(),
         None => return Err("exponent exceeds exact decimal bounds"),
     };
-    let fraction_len = if backwards {
-        fraction.len().checked_add(shift)
+    let shift = if backwards {
+        -(shift as i128)
     } else {
-        Some(fraction.len().saturating_sub(shift))
-    }
-    .filter(|length| *length <= 18)
-    .ok_or("more than 18 fraction digits")?;
-    let point = if backwards {
-        whole.len().saturating_sub(shift)
-    } else {
-        whole
-            .len()
-            .checked_add(shift)
-            .ok_or("whole part overflow")?
+        shift as i128
     };
+    let fraction_len = (fraction.len() as i128 - shift).max(0);
+    if fraction_len > 18 {
+        return Err("more than 18 fraction digits");
+    }
+    let point = whole.len() as i128 + shift;
     let whole_len = if zero {
         0
     } else {
-        point.saturating_sub(leading_zeros)
+        (point - leading_zeros as i128).max(0)
     };
     if whole_len > 39 {
         return Err("more than 39 significant whole digits");
     }
+    let (whole_len, fraction_len) = (whole_len as usize, fraction_len as usize);
+    let digits = std::iter::repeat_n('0', (-point).max(0) as usize)
+        .chain(whole.chars())
+        .chain(fraction.chars())
+        .chain(std::iter::repeat('0'));
     let mut plain = String::with_capacity(
         usize::from(negative) + whole_len.max(1) + usize::from(fraction_len > 0) + fraction_len,
     );
@@ -124,24 +119,11 @@ fn expand_number(token: &str) -> Result<Cow<'_, str>, &'static str> {
     if whole_len == 0 {
         plain.push('0');
     } else {
-        plain.extend(
-            digits
-                .clone()
-                .skip(leading_zeros)
-                .take(whole_len)
-                .map(char::from),
-        );
-        plain.extend(std::iter::repeat_n(
-            '0',
-            point.saturating_sub(whole.len() + fraction.len()),
-        ));
+        plain.extend(digits.clone().skip(leading_zeros).take(whole_len));
     }
     if fraction_len > 0 {
         plain.push('.');
-        if backwards {
-            plain.extend(std::iter::repeat_n('0', shift.saturating_sub(whole.len())));
-        }
-        plain.extend(digits.skip(point).map(char::from));
+        plain.extend(digits.skip(point.max(0) as usize).take(fraction_len));
     }
     Ok(Cow::Owned(plain))
 }
