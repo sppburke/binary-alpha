@@ -529,14 +529,18 @@ impl PocketOptions {
             "updateOpenedDeals" => {
                 let deals: Vec<Deal> = serde_json::from_slice(&event.raw)
                     .map_err(|_| "pocket options: invalid opened deal list")?;
-                for deal in &deals {
+                let mut opened = Vec::new();
+                for deal in deals {
                     deal.validate(&self.account)?;
                     if let Some(id) = deal.request_id {
                         self.request_ids.insert(id);
                     }
+                    if self.known_closed(&deal.id) {
+                        continue;
+                    }
                     if self.seen_open.insert((
                         deal.id.clone(),
-                        serde_json::to_string(deal).map_err(|e| e.to_string())?,
+                        serde_json::to_string(&deal).map_err(|e| e.to_string())?,
                     )) {
                         if !login {
                             self.balance = None;
@@ -547,8 +551,9 @@ impl PocketOptions {
                             receipt_micros: event.receipt_micros,
                         });
                     }
+                    opened.push(deal);
                 }
-                self.opened = deals;
+                self.opened = opened;
             }
             "updateClosedDeals" => {
                 let deals: Vec<Deal> = serde_json::from_slice(&event.raw)
@@ -585,16 +590,23 @@ impl PocketOptions {
                 if let Some(id) = deal.request_id {
                     self.request_ids.insert(id);
                 }
-                self.opened.retain(|opened| opened.id != deal.id);
-                self.opened.push(deal.clone());
-                if !login {
-                    self.balance = None;
+                // A late or replayed open reply for a closed deal changes nothing; a matching
+                // purchase still receives it below.
+                if !self.known_closed(&deal.id) {
+                    self.opened.retain(|opened| opened.id != deal.id);
+                    self.opened.push(deal.clone());
+                    if !login {
+                        self.balance = None;
+                    }
                 }
                 return Ok(Some(deal));
             }
             _ => (),
         }
         Ok(None)
+    }
+    fn known_closed(&self, id: &str) -> bool {
+        self.closed.keys().any(|(closed, _)| closed == id)
     }
     fn close_deal(&mut self, deal: Deal, receipt: i64, login: bool) -> Result<(), String> {
         if let Some(id) = deal.request_id {
@@ -810,10 +822,18 @@ impl PocketOptions {
         Ok(())
     }
     pub fn queued_account_event(&mut self) -> Result<Option<AccountEvent>, String> {
-        Ok(self.events.pop_front())
+        // An open fact for a deal whose close is known is stale: the close governs.
+        while let Some(event) = self.events.pop_front() {
+            if !matches!(&event, AccountEvent::PocketDeal { deal, closed: false, .. }
+                if self.known_closed(&deal.id))
+            {
+                return Ok(Some(event));
+            }
+        }
+        Ok(None)
     }
     pub fn next_account_event(&mut self, timeout: i64) -> Result<Option<AccountEvent>, String> {
-        if let Some(event) = self.events.pop_front() {
+        if let Some(event) = self.queued_account_event()? {
             return Ok(Some(event));
         }
         let received = match self
@@ -834,7 +854,7 @@ impl PocketOptions {
                 receipt_micros: self.clock.now_micros(),
             });
         }
-        Ok(self.events.pop_front())
+        self.queued_account_event()
     }
     pub fn open_contracts(&mut self) -> Result<Vec<OpenContract>, String> {
         self.opened
@@ -908,6 +928,18 @@ mod tests {
         fn receive(&mut self, timeout: i64) -> Result<Option<Frame>, String> {
             self.0.fetch_add(timeout.max(0), Ordering::SeqCst);
             Ok(None)
+        }
+        fn close(&mut self) -> Result<(), String> {
+            Ok(())
+        }
+    }
+    struct Replies(VecDeque<Frame>);
+    impl Transport for Replies {
+        fn send(&mut self, _: Frame) -> Result<(), String> {
+            Ok(())
+        }
+        fn receive(&mut self, _: i64) -> Result<Option<Frame>, String> {
+            Ok(self.0.pop_front())
         }
         fn close(&mut self) -> Result<(), String> {
             Ok(())
@@ -1018,17 +1050,159 @@ mod tests {
     }
 
     #[test]
-    fn closed_list_removes_the_open_contract() {
-        let mut account = session();
-        let closed = deal("synthetic-deal", "TEST", "1.00100", "9.2");
-        account
-            .ingest(event("successopenOrder", closed.clone()))
-            .unwrap();
-        assert_eq!(account.open_contracts().unwrap().len(), 1);
-        account
-            .ingest(event("updateClosedDeals", json!([closed])))
-            .unwrap();
-        assert!(account.open_contracts().unwrap().is_empty());
+    fn known_closed_deals_never_reopen_for_orders_and_replays() {
+        use std::sync::atomic::AtomicUsize;
+        struct NoReceive(Arc<AtomicUsize>);
+        impl Transport for NoReceive {
+            fn send(&mut self, _: Frame) -> Result<(), String> {
+                Ok(())
+            }
+            fn receive(&mut self, _: i64) -> Result<Option<Frame>, String> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Err("unexpected receive after cached balance".into())
+            }
+            fn close(&mut self) -> Result<(), String> {
+                Ok(())
+            }
+        }
+        fn schedules(left: &mut [u8; 4], prefix: &mut Vec<usize>, out: &mut Vec<Vec<usize>>) {
+            if left.iter().all(|n| *n == 0) {
+                out.push(prefix.clone());
+                return;
+            }
+            for i in 0..4 {
+                if left[i] > 0 {
+                    left[i] -= 1;
+                    prefix.push(i);
+                    schedules(left, prefix, out);
+                    prefix.pop();
+                    left[i] += 1;
+                }
+            }
+        }
+        let mut cases = Vec::new();
+        schedules(&mut [1; 4], &mut Vec::new(), &mut cases);
+        assert_eq!(cases.len(), 24);
+        schedules(&mut [2; 4], &mut Vec::new(), &mut cases);
+        assert_eq!(cases.len() - 24, 2520);
+        let closed = deal("terminal", "TEST", "1.00100", "9.2");
+        let mut opened = closed.clone();
+        opened["closePrice"] = Value::Null;
+        opened["profit"] = json!(0);
+        let mut unrelated = opened.clone();
+        unrelated["id"] = json!("unrelated");
+        unrelated["requestId"] = json!(10000001);
+        let names = [
+            "successopenOrder",
+            "updateOpenedDeals",
+            "successcloseOrder",
+            "updateClosedDeals",
+        ];
+        let payloads = [
+            opened.clone(),
+            json!([opened, unrelated]),
+            json!({"profit":19.2,"deals":[closed.clone()]}),
+            json!([closed]),
+        ];
+        for order in &cases {
+            let mut account = session();
+            let mut terminal = false;
+            let mut unrelated_seen = false;
+            for &i in order {
+                let input = event(names[i], payloads[i].clone());
+                let raw = std::str::from_utf8(&input.raw).unwrap();
+                account.transport = Box::new(Replies(VecDeque::from([Frame::Text(
+                    socket_io::encode_event(names[i], raw),
+                )])));
+                let first = account.next_account_event(0).unwrap();
+                terminal |= i >= 2;
+                unrelated_seen |= i == 1;
+                let reported = account.open_contracts().unwrap();
+                assert_eq!(
+                    reported.iter().any(|c| c.contract_ref == "terminal"),
+                    !terminal,
+                    "order={order:?} event={}",
+                    names[i]
+                );
+                assert_eq!(
+                    reported.iter().any(|c| c.contract_ref == "unrelated"),
+                    unrelated_seen,
+                    "order={order:?} event={}",
+                    names[i]
+                );
+                let is_stale_open = |output: &AccountEvent| {
+                    matches!(output,
+                    AccountEvent::PocketDeal { deal, closed: false, .. }
+                    if terminal && deal.id == "terminal")
+                };
+                assert!(
+                    !first.as_ref().is_some_and(is_stale_open),
+                    "order={order:?}"
+                );
+                while let Some(output) = account.queued_account_event().unwrap() {
+                    assert!(!is_stale_open(&output), "order={order:?}");
+                }
+                let statement = account.statement(0, 200_000_000).unwrap();
+                assert_eq!(statement.coverage, StatementCoverage::PartialSnapshot);
+                assert_eq!(statement.rows.len(), usize::from(terminal));
+                if terminal {
+                    assert_eq!(statement.rows[0].cash.amount.to_string(), "19.2");
+                    assert_eq!(statement.rows[0].request_id, Some(10_000_000));
+                }
+            }
+        }
+        // Requests can ingest several facts before either event consumer drains them.
+        for close in [2, 3] {
+            for next in [false, true] {
+                let mut account = session();
+                account
+                    .ingest(event("updateOpenedDeals", json!([payloads[0]])))
+                    .unwrap();
+                assert_eq!(account.open_contracts().unwrap().len(), 1);
+                account
+                    .ingest(event(names[close], payloads[close].clone()))
+                    .unwrap();
+                assert!(account.open_contracts().unwrap().is_empty());
+                let mut delivered = Vec::new();
+                while let Some(output) = if next {
+                    account.next_account_event(0).unwrap()
+                } else {
+                    account.queued_account_event().unwrap()
+                } {
+                    delivered.push(output);
+                }
+                assert_eq!(delivered.len(), 1, "close={} next={next}", names[close]);
+                assert!(matches!(&delivered[0], AccountEvent::PocketDeal {
+                    deal, closed: true, .. } if deal.id == "terminal"));
+            }
+        }
+        for stale in [0, 1] {
+            let mut account = session();
+            account
+                .ingest(event(names[3], payloads[3].clone()))
+                .unwrap();
+            account
+                .ingest(event(
+                    "successupdateBalance",
+                    json!({"isDemo":1,"balance":109.2}),
+                ))
+                .unwrap();
+            let mut opened = payloads[0].clone();
+            opened["closeMs"] = Value::Null;
+            opened["openMs"] = json!(101);
+            opened["requestId"] = json!(10000002);
+            let payload = if stale == 1 { json!([opened]) } else { opened };
+            account.ingest(event(names[stale], payload)).unwrap();
+            let receives = Arc::new(AtomicUsize::new(0));
+            account.transport = Box::new(NoReceive(receives.clone()));
+            assert_eq!(
+                account.balance.as_ref().map(ToString::to_string).as_deref(),
+                Some("109.2")
+            );
+            assert_eq!(account.balance().unwrap().to_string(), "109.2");
+            assert_eq!(receives.load(Ordering::SeqCst), 0);
+            assert!(account.request_ids.contains(&10_000_002));
+        }
     }
 
     #[test]
@@ -1237,5 +1411,50 @@ mod tests {
         ));
         account.listings.get_mut("TEST").unwrap().listed_percent = 49;
         assert!(account.prepare_purchase(&prepared).is_err());
+        account.listings.get_mut("TEST").unwrap().listed_percent = 84;
+        let mut late_prepared = prepared.clone();
+        late_prepared.dispatch_claim = "synthetic-late-claim".into();
+        late_prepared.command = "synthetic-late-command".into();
+        let encoded = account.prepare_purchase(&late_prepared).unwrap();
+        assert_ne!(encoded.request_id, 10_000_000);
+        let mut opened = deal("late-matching", "TEST", "1.00100", "0");
+        opened["amount"] = json!(1);
+        opened["requestId"] = json!(encoded.request_id);
+        opened["closePrice"] = Value::Null;
+        let mut closed = opened.clone();
+        closed["profit"] = json!(0.92);
+        closed["closePrice"] = json!(1.00100);
+        let close = serde_json::to_string(&json!({"profit":1.92,"deals":[closed]})).unwrap();
+        let open = serde_json::to_string(&opened).unwrap();
+        account.transport = Box::new(Replies(VecDeque::from([
+            Frame::Text(socket_io::encode_event("successcloseOrder", &close)),
+            Frame::Text(socket_io::encode_event("successopenOrder", &open)),
+        ])));
+        match account.write_purchase(encoded).unwrap() {
+            PurchaseOutcome::Accepted {
+                debit, liability, ..
+            } => {
+                assert_eq!(debit.to_string(), "1");
+                assert_eq!(liability.contract_ref, "late-matching");
+                assert_eq!(liability.payout.to_string(), "1.92");
+            }
+            other => panic!("late matching reply lost financial acceptance: {other:?}"),
+        }
+        let statement = account.statement(0, 200_000_000).unwrap();
+        assert_eq!(statement.rows.len(), 1);
+        assert_eq!(statement.rows[0].cash.amount.to_string(), "1.92");
+        assert!(account.open_contracts().unwrap().is_empty());
+        assert!(matches!(
+            account.queued_account_event().unwrap(),
+            Some(AccountEvent::PocketDeal { deal, closed: true, .. })
+                if deal.id == "late-matching"
+        ));
+        assert!(matches!(
+            account.queued_account_event().unwrap(),
+            Some(AccountEvent::ContractUpdate {
+                contract_ref, entry_price_units: Some(100_000), ..
+            }) if contract_ref == "late-matching"
+        ));
+        assert!(account.queued_account_event().unwrap().is_none());
     }
 }
