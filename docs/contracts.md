@@ -2057,7 +2057,9 @@ from a partial snapshot, including an empty one, cannot clear it. Each distinct 
 fact is journaled before use. Contradictory facts for one deal id veto entries, including after
 restart, and remain unresolved. New deal facts outside login invalidate the adapter's
 cached balance until a later push. Deal lists received during login retain that handshake's
-balance snapshot.
+balance snapshot. An open fact for a deal whose close the adapter already holds is stale: it is
+never listed or delivered, causes no claim or correlation veto and does not invalidate the cached
+balance; a matching late purchase reply keeps its acceptance and entry confirmation.
 
 The financial ledger retains admitted proposals; normalized proposals received before a signal are
 re-supplied by the input replay boundary after a restart, like ticks and feature rows. Re-supplying

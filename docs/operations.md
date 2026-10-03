@@ -703,6 +703,9 @@ deal, rejected release, or economic discrepancy stops new entries. Reconcile an 
 only by its exact key; a contradictory close remains vetoed across restart and needs investigation.
 Retain the journal tail and published manifest during a restart; do not resubmit an uncertain
 order. Stop the process to roll back new entries while keeping its evidence for recovery.
+An open fact for a deal whose close the adapter already holds is stale: it is never listed or
+delivered, causes no claim or correlation veto and does not invalidate the cached balance; a
+matching late purchase reply keeps its acceptance and entry confirmation.
 
 Production operator tasks: separately authorize any real feed, account observation, demo order,
 cloud publication, or control mutation before running them. Linked matching Sentry issues: none.

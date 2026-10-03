@@ -3222,6 +3222,19 @@ fn pocket_restart_matches_written_request_id_and_settles_closed_deal() {
     );
 }
 
+fn first_pocket_close(rows: &[Value]) -> Value {
+    rows.iter()
+        .find_map(|row| {
+            row["frame"]
+                .as_str()
+                .and_then(|frame| frame.strip_prefix("42"))
+                .and_then(|frame| serde_json::from_str::<Value>(frame).ok())
+                .filter(|event| event[0] == "updateClosedDeals")
+                .map(|event| event[1][0].clone())
+        })
+        .unwrap()
+}
+
 #[test]
 fn pocket_settled_close_replay_after_claim_archival_stays_enabled() {
     use live::control::{Control, LeaseKey};
@@ -3243,16 +3256,33 @@ fn pocket_settled_close_replay_after_claim_archival_stays_enabled() {
             .is_empty()
     );
     control.clone().advance(70_000_000);
-    let repeated = RecordedConnector::from_jsonl(&pocket_restart_log(request_id)).unwrap();
+    let base = pocket_restart_log(request_id);
+    let mut opened = first_pocket_close(&scenario_rows(&base));
+    opened["profit"] = json!(0);
+    opened["closePrice"] = Value::Null;
+    opened.as_object_mut().unwrap().remove("closeMs");
+    let late = account_row(
+        QUOTE_START + 31_900_000,
+        &format!("42{}", json!(["successopenOrder", opened])),
+    );
+    let repeated = RecordedConnector::from_jsonl(&format!("{base}{late}\n")).unwrap();
     let mut runtime =
         pocket_runtime(&fixture, live::Mode::Live, &repeated, control.clone()).unwrap();
+    let restored_records = runtime.records().len();
     runtime.run_until(|_| repeated.exhausted()).unwrap();
     assert_eq!(runtime.engine().accounts()[0].open, 0);
     assert_eq!(runtime.engine().accounts()[0].cash.to_string(), "10000.92");
     assert!(runtime.health().balance_reconciled);
     assert!(
         !matches!(&runtime.health().entries, live::Entries::Disabled(reason)
-        if reason.contains("pocket deal contradicts"))
+        if reason.contains("pocket deal contradicts") || reason.contains("uncorrelated liability"))
+    );
+    assert!(
+        !runtime.records()[restored_records..]
+            .iter()
+            .any(|record| matches!(&record.kind,
+        live::journal::RecordKind::PocketCorrelation { deal_id, correlated: false }
+        if deal_id == "synthetic-one"))
     );
     assert_eq!(
         runtime
@@ -3276,6 +3306,60 @@ fn pocket_settled_close_replay_after_claim_archival_stays_enabled() {
         if reason.contains("pocket deal contradicts"))
     );
     assert_eq!(runtime.engine().accounts()[0].cash.to_string(), "10000.92");
+}
+
+#[test]
+fn pocket_stale_open_after_known_close_adds_no_veto() {
+    let fixture = Fixture::quote("phase12-pocket-stale-open-after-close");
+    let mut rows = scenario_rows(&pocket_log());
+    rows.retain(|row| row["expect"].as_str() != Some("42[\"ps\",null]"));
+    let mut opened = first_pocket_close(&rows);
+    assert_eq!(opened["id"], "synthetic-older");
+    opened["closePrice"] = Value::Null;
+    rows.retain(|row| row["at"].as_i64().unwrap() < QUOTE_START + 600_000);
+    let late = account_row(
+        QUOTE_START + 100_000,
+        &format!("42{}", json!(["successopenOrder", opened])),
+    );
+    let index = rows
+        .iter()
+        .position(|row| row["at"].as_i64().unwrap() > QUOTE_START + 100_000)
+        .unwrap();
+    rows.insert(index, late);
+    let recorded =
+        RecordedConnector::from_jsonl(&pocket_keepalives(&scenario_log(&rows)).0).unwrap();
+    let mut runtime = pocket_runtime(
+        &fixture,
+        live::Mode::Live,
+        &recorded,
+        live::control::FakeControl::new(QUOTE_START - 2_000_000),
+    )
+    .unwrap();
+    let restored_records = runtime.records().len();
+    runtime.run_until(|_| recorded.exhausted()).unwrap();
+    assert_eq!(runtime.engine().accounts()[0].cash.to_string(), "10000.00");
+    assert_eq!(runtime.engine().accounts()[0].open, 0);
+    assert!(
+        !matches!(&runtime.health().entries, live::Entries::Disabled(reason)
+        if reason.contains("uncorrelated liability") || reason.contains("contradicts claim"))
+    );
+    assert!(
+        !runtime.records()[restored_records..]
+            .iter()
+            .any(|record| matches!(&record.kind,
+        live::journal::RecordKind::PocketCorrelation { deal_id, correlated: false }
+        if deal_id == "synthetic-older"))
+    );
+    assert_eq!(
+        ledger_events(&runtime)
+            .iter()
+            .filter(|event| matches!(
+                event.kind,
+                binary_alpha_engine::execution::EventKind::Settled { .. }
+            ))
+            .count(),
+        0
+    );
 }
 
 #[test]
